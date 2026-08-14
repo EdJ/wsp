@@ -453,6 +453,11 @@ pub fn hook(store: &Store, args: &Args) -> i32 {
                 }
             }
         }
+        "workspace.created" | "workspace_created" => {
+            if let Some(ws) = env.workspace_id.clone() {
+                crate::panel::install_if_adopted(store, &ws);
+            }
+        }
         "workspace.closed" | "workspace_closed" => {
             if let Some(ws) = env.workspace_id.clone() {
                 store.clear_pin(&ws);

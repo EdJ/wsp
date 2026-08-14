@@ -14,6 +14,7 @@ mod daemon;
 mod fm;
 mod herdr;
 mod model;
+mod panel;
 mod resolve;
 mod store;
 mod sync;
@@ -180,6 +181,11 @@ fn main() {
         "hook" => cmd_agent::hook(&store, &args),
         "doctor" => cmd_agent::doctor(&store, &args),
         "daemon" => daemon::run(&store, args.has("verbose")),
+        "panel" => match args.rest.first().map(|s| s.as_str()) {
+            Some("install") => panel::install(&store, &args),
+            Some("uninstall" | "remove") => panel::uninstall(&store, &args),
+            _ => panel::run(&store),
+        },
 
         other => {
             eprintln!("wsp: unknown command `{other}`. Try `wsp help`.");
@@ -225,6 +231,9 @@ fn help() {
   wsp wip                           everything in flight, with agents
 
 {plumbing}
+  wsp panel                         the sidebar replacement (runs in a pane)
+  wsp panel install [--all]         split it into a workspace, or all of them
+  wsp panel uninstall [-w ws]       take it back out
   wsp sync [--force]                push tokens to herdr once
   wsp daemon [-v]                   events + refresh loop (herdr [[startup]])
   wsp hook <event>                  herdr event-hook entrypoint

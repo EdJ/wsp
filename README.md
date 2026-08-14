@@ -56,6 +56,28 @@ wsp wip                     # every agent, its task, and who needs you
 wsp where                   # what project am I in, and why
 ```
 
+## The panel
+
+`wsp panel` is a sidebar that runs in a pane of its own. herdr's own sidebar
+lists workspaces and hangs agents beneath them; this inverts that — the spine is
+the project tree, tasks hang off projects, agents attach to tasks, and tasks
+belonging to no project get an `inbox` heading rather than a footer number.
+
+```sh
+wsp panel install            # split it into the workspace you're standing in
+wsp panel install --all      # …or every one of them
+wsp panel uninstall
+```
+
+Install splits with `pane.split` and swaps the new pane into the narrow slot.
+It must never go back to `layout.apply`: herdr rebuilds the whole tree from
+that call and every pane in it gets a fresh terminal, which takes down any
+agent running in the workspace.
+
+Keys: `j`/`k` move, `←`/`→` fold a project, `↵` folds a project or opens a
+`⋯ n more` row or jumps to a task's agent, `1`-`9` jump straight to an agent,
+`A` shows finished tasks, `r` syncs, `q` quits.
+
 Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
 `$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
@@ -74,6 +96,7 @@ Every command takes `--json`.
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh |
+| `src/panel.rs` | the in-pane sidebar: project tree, tasks, agents |
 | `src/cmd_*.rs` | the commands |
 
 Dependencies: `serde_json`. That is the whole list, and it should stay that way —
