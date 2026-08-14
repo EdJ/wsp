@@ -138,7 +138,6 @@ pub(crate) struct Ui {
     rows: Vec<Row>,
     agents_total: usize,
     needs: usize,
-    inbox: usize,
     blocked: usize,
     sel: usize,
     message: Option<(String, Instant)>,
@@ -381,6 +380,27 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     let mut rows: Vec<Row> = Vec::new();
     let mut needs = 0;
 
+    // Unparented tasks, first. They are the only work with nowhere to belong,
+    // so they are what you triage before reading anything that already has a
+    // home — and putting them last meant scrolling past every project to find
+    // the one list that needs a decision.
+    let inbox_open = tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count();
+    let inbox_any = tasks
+        .iter()
+        .any(|t| t.project.is_none() && (view.show_done || t.status().is_open()));
+    if inbox_any {
+        let folded = view.collapsed.contains(INBOX_KEY);
+        rows.push(Row::Section {
+            key: INBOX_KEY.to_string(),
+            label: "inbox".into(),
+            count: inbox_open,
+            collapsed: folded,
+        });
+        if !folded {
+            task_rows(&tasks, None, 1, view, &agent_for_task, &mut rows, &mut needs);
+        }
+    }
+
     // Depth-first over the project tree, skipping quiet branches.
     fn walk(
         index: &Index,
@@ -435,27 +455,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         &mut needs,
     );
 
-    // Unparented tasks. These are real work with a real id — they just have
-    // nowhere in the tree to hang, so they get their own heading rather than
-    // living on as a number in the footer.
-    let inbox_open =
-        tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count();
-    let inbox_any = tasks
-        .iter()
-        .any(|t| t.project.is_none() && (view.show_done || t.status().is_open()));
-    if inbox_any {
-        let folded = view.collapsed.contains(INBOX_KEY);
-        rows.push(Row::Section {
-            key: INBOX_KEY.to_string(),
-            label: "inbox".into(),
-            count: inbox_open,
-            collapsed: folded,
-        });
-        if !folded {
-            task_rows(&tasks, None, 1, view, &agent_for_task, &mut rows, &mut needs);
-        }
-    }
-
     // Agents not attached to any task — the panel's other job is making these
     // visible, because they are the ones nobody has decided about.
     let unattached: Vec<&herdr::Agent> = agents
@@ -493,7 +492,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         rows,
         agents_total: agents.len(),
         needs,
-        inbox: tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count(),
         blocked: tasks.iter().filter(|t| t.status() == Status::Blocked).count(),
         sel: 0,
         message: None,
@@ -862,9 +860,9 @@ pub(crate) fn frame(ui: &Ui, w: usize, h: usize) -> Vec<Line> {
 
     lines.push(line(Style::Dim, "─".repeat(w)));
 
+    // No inbox count here: it is a row of its own now, at the top, where it can
+    // be folded and aimed at. Restating it would be two places to keep true.
     let mut foot = Line::default();
-    foot.push(Style::Dim, "inbox");
-    foot.push(Style::Plain, format!(" {}  ", ui.inbox));
     if ui.blocked > 0 {
         foot.push(Style::Warn, format!("blocked {}", ui.blocked));
     } else {

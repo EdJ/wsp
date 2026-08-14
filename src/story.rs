@@ -215,6 +215,13 @@ impl<'a> Driver<'a> {
         self
     }
 
+    /// Move off the current row first, then hunt. For reaching the *second*
+    /// group when the cursor already opens on the first.
+    fn down_to_next(&mut self, want: panel::RowKind) -> &mut Self {
+        self.key(Key::Down);
+        self.down_to(want)
+    }
+
     /// Press `Down` until the cursor sits on a row of `want`. Bounded by the
     /// cursor going nowhere, so a `want` that is not present terminates rather
     /// than spins.
@@ -258,7 +265,7 @@ fn scenes() -> Vec<Scene> {
 
     out.push(Driver::new(&w).scene(
         "Live",
-        "Three agents. One working a task (●), one idle on a task that is still doing — which raises the ← asking for you — and one unclaimed at the foot.",
+        "Three agents. One working a task (●), one idle on a task that is still doing — which raises the ← asking for you — and one unclaimed at the foot. The cursor opens on the inbox, because unfiled work is what you triage before reading anything that already has a home.",
     ));
 
     out.push(
@@ -269,8 +276,9 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
-            .keys(&[Key::Down, Key::Left])
-            .scene("Folded", "← on a project hides its tasks and every project beneath it."),
+            .down_to(panel::RowKind::Project)
+            .key(Key::Left)
+            .scene("Project folded", "← on a project hides its tasks and every project beneath it — audio takes vst and trance down with it."),
     );
 
     out.push(
@@ -288,21 +296,20 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
-            .down_to(panel::RowKind::Section)
-            .scene("On a group", "Groups take the cursor now. The inbox is not a project, but it is a scope — what `add` here would mean is a task belonging to nothing."),
+            .key(Key::Left)
+            .scene("Inbox folded", "← folds a group exactly as it folds a project. The count stays on the heading, so closing it loses nothing — and the tree starts where it would have anyway."),
     );
 
     out.push(
         Driver::new(&w)
-            .down_to(panel::RowKind::Section)
-            .key(Key::Left)
-            .scene("Group folded", "← folds a group exactly as it folds a project; the count stays on the heading so nothing is lost by closing it."),
+            .down_to_next(panel::RowKind::Section)
+            .scene("The other group", "Loose agents sit at the foot, after the work. Nothing can be added here — herdr owns agents — so the useful verb on this row is claim."),
     );
 
     out.push(
         Driver::new(&w)
             .key(Key::Char('G'))
-            .scene("At the foot", "G to the last row, under the loose-agents group. The cursor reports a pane to jump to rather than anything to edit — not every target is a thing you can change."),
+            .scene("At the foot", "G to the last row. The cursor reports a pane to jump to rather than anything to edit — not every target is a thing you can change."),
     );
 
     out.push(

@@ -93,6 +93,11 @@ Keys: `j`/`k` move, `←`/`→` fold a project, `↵` folds a project or opens a
 you are the blocker; the header carries the count. `⋯ n more` is the tail past
 the six-task cap.
 
+The inbox sits at the top: unfiled work is what you triage before reading
+anything that already has a home. Loose agents sit at the foot, after the work.
+Both fold like a project and take the cursor like one, so a command can be
+aimed at them.
+
 Colour carries six roles: **bold** is a project, plain is a claimed task, muted
 is an unclaimed one, dim is structure and finished work, accent is live work,
 and warn wants a decision.
