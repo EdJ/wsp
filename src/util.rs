@@ -75,6 +75,24 @@ pub fn age_days(iso: &str) -> i64 {
     epoch_secs().div_euclid(86_400) - then
 }
 
+/// This machine's name. Claims are machine-local — a workspace on the laptop
+/// means nothing on another host — and the store is shared, so anything
+/// crossing that line has to say where it came from.
+pub fn hostname() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".into())
+}
+
 pub fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }

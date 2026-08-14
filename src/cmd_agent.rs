@@ -106,6 +106,26 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         }),
     );
 
+    // The durable half. A pane id is worthless the moment the pane dies, so
+    // record the workspace instead — by id, and by the label and cwd herdr
+    // keeps in its own session file, which survive the id being reissued.
+    let ws_label = herdr::workspaces()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|w| w.id == workspace)
+        .map(|w| w.label)
+        .unwrap_or_default();
+    store.set_claim(
+        &t.id,
+        json!({
+            "workspace_id": workspace,
+            "workspace_label": ws_label,
+            "cwd": cwd,
+            "host": util::hostname(),
+            "claimed_at": util::now_iso(),
+        }),
+    );
+
     if t.status() != Status::Doing {
         t.set_status(Status::Doing);
     }
@@ -128,6 +148,87 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Rebuild bindings from claims and whatever herdr currently has open.
+///
+/// This is what makes a binding disposable. herdr restores workspaces, their
+/// layouts and their agent sessions across a restart, but pane ids are not
+/// stable across it and nothing outside wsp knows which task a pane was on.
+/// So: for every claim belonging to this host, find the workspace it names —
+/// by id, or failing that by the label and cwd herdr persists — and bind its
+/// most plausible pane.
+///
+/// Returns how many bindings were re-established.
+pub fn reconcile(store: &Store) -> usize {
+    let claims = store.claims();
+    if claims.is_empty() {
+        return 0;
+    }
+    let Ok(panes) = herdr::panes() else { return 0 };
+    let workspaces = herdr::workspaces().unwrap_or_default();
+    let host = util::hostname();
+
+    let bindings = store.bindings();
+    let already: Vec<String> = bindings
+        .values()
+        .filter_map(|b| b.get("task_id").and_then(|t| t.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    let mut fixed = 0;
+    for (task_id, c) in &claims {
+        if already.iter().any(|t| t == task_id) {
+            continue;
+        }
+        let get = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        // A claim made on another machine says nothing about this one.
+        if !get("host").is_empty() && get("host") != host {
+            continue;
+        }
+
+        let want_id = get("workspace_id");
+        let want_label = get("workspace_label");
+        let want_cwd = get("cwd");
+
+        // The id if it still names a workspace; otherwise the label and cwd,
+        // which is what survives a workspace being rebuilt under a new id.
+        let ws = workspaces
+            .iter()
+            .find(|w| w.id == want_id)
+            .or_else(|| {
+                workspaces.iter().find(|w| !want_label.is_empty() && w.label == want_label)
+            })
+            .map(|w| w.id.clone());
+        let Some(ws) = ws else { continue };
+
+        // Prefer a pane running an agent, then any pane that is not one of our
+        // own panels. A workspace normally has exactly one candidate.
+        let mut candidates: Vec<&herdr::Pane> = panes
+            .iter()
+            .filter(|p| p.workspace_id == ws && p.label != crate::panel::PANEL_LABEL)
+            .collect();
+        candidates.sort_by_key(|p| u8::from(p.agent.is_empty()));
+        let Some(pane) = candidates.first() else { continue };
+
+        store.set_binding(
+            &pane.pane_id,
+            json!({
+                "task_id": task_id,
+                "pane_id": pane.pane_id,
+                "workspace_id": ws,
+                "agent_session_id": pane.session_id,
+                "cwd": if want_cwd.is_empty() { pane.cwd.clone() } else { want_cwd.to_string() },
+                "started_at": util::now_iso(),
+                "reconciled": true,
+            }),
+        );
+        store.log_event(
+            "task-reconciled",
+            json!({ "id": task_id, "pane": pane.pane_id, "workspace": ws }),
+        );
+        fixed += 1;
+    }
+    fixed
+}
+
 pub fn release(store: &Store, args: &Args) -> i32 {
     let Some(pane) = pane_id(args) else {
         eprintln!("wsp: no pane — pass --pane or run inside herdr");
@@ -137,6 +238,10 @@ pub fn release(store: &Store, args: &Args) -> i32 {
     let removed = store.clear_binding(&pane);
     if removed {
         if let Some(task_id) = had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
+            // Releasing is a decision, so it clears the durable claim too —
+            // unlike a pane exiting, which is only ever an accident of process
+            // lifetime and must leave the intent standing.
+            store.clear_claim(task_id);
             store.log_event("task-released", json!({ "id": task_id, "pane": pane }));
         }
         let mut cache = sync::Cache::default();
@@ -447,6 +552,10 @@ pub fn hook(store: &Store, args: &Args) -> i32 {
 
     match event.as_str() {
         "pane.exited" | "pane.closed" | "pane_exited" | "pane_closed" => {
+            // Only the binding. The claim survives, because a pane exiting is
+            // an accident of process lifetime and says nothing about whether
+            // the work is still yours — this is precisely the cascade that
+            // once cleared every binding on the machine at a stroke.
             if let Some(pane) = env.pane_id.clone() {
                 if store.clear_binding(&pane) {
                     store.log_event("pane-exited", json!({ "pane": pane }));

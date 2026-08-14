@@ -183,6 +183,11 @@ fn main() {
         "sync" => cmd_agent::sync_once(&store, &args),
         "hook" => cmd_agent::hook(&store, &args),
         "doctor" => cmd_agent::doctor(&store, &args),
+        "reconcile" => {
+            let n = cmd_agent::reconcile(&store);
+            println!("reconciled {n} binding(s) from claims");
+            0
+        }
         "daemon" => daemon::run(&store, args.has("verbose")),
         "panel" => match args.rest.first().map(|s| s.as_str()) {
             Some("install") => panel::install(&store, &args),
@@ -243,6 +248,7 @@ fn help() {
   wsp daemon [-v]                   events + refresh loop (herdr [[startup]])
   wsp hook <event>                  herdr event-hook entrypoint
   wsp doctor                        integrity check
+  wsp reconcile                     rebuild bindings from claims
 
 Ids accept a bare suffix (003) or a unique title substring.
 Every command takes --json. Set WSP_HOME to relocate the store."#,

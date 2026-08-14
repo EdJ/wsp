@@ -247,6 +247,57 @@ impl Store {
     }
 
     /// Drop bindings whose pane no longer exists.
+    // ---- claims -----------------------------------------------------------
+    //
+    // A binding says which *pane* is on a task, and a pane is the most
+    // perishable identifier herdr has — ids are reissued, and one cascade of
+    // `pane.exited` once cleared every binding on this machine at a stroke.
+    //
+    // A claim says which *workspace* the task is being worked in, keyed on
+    // things herdr persists in its own session file: the workspace id, and as
+    // a fallback its label and cwd, which survive even a workspace being
+    // rebuilt under a new id. Claims outlive panes; bindings are derived from
+    // them and are free to be lost.
+
+    /// task id -> claim record
+    pub fn claims(&self) -> BTreeMap<String, Value> {
+        match self.read_json("claims.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_claim(&self, task: &str, value: Value) {
+        let mut c = self.claims();
+        c.insert(task.to_string(), value);
+        self.write_json("claims.json", &Value::Object(c.into_iter().collect()));
+    }
+
+    pub fn clear_claim(&self, task: &str) -> bool {
+        let mut c = self.claims();
+        let removed = c.remove(task).is_some();
+        if removed {
+            self.write_json("claims.json", &Value::Object(c.into_iter().collect()));
+        }
+        removed
+    }
+
+    /// Drop claims whose task no longer exists. A claim on a removed task is
+    /// the only way this file grows without bound.
+    pub fn reap_claims(&self, live_tasks: &[String]) -> usize {
+        let c = self.claims();
+        let keep: BTreeMap<String, Value> = c
+            .iter()
+            .filter(|(task, _)| live_tasks.iter().any(|t| t == *task))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let dropped = c.len() - keep.len();
+        if dropped > 0 {
+            self.write_json("claims.json", &Value::Object(keep.into_iter().collect()));
+        }
+        dropped
+    }
+
     pub fn reap_bindings(&self, live_panes: &[String]) -> usize {
         let b = self.bindings();
         let keep: BTreeMap<String, Value> = b

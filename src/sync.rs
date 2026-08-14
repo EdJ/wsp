@@ -54,7 +54,15 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
     let workspaces = herdr::workspaces()?;
     let agents = herdr::agents()?;
 
-    let live_panes: Vec<String> = agents.iter().map(|a| a.pane_id.clone()).collect();
+    // Every pane, not just the ones running an agent. Reaping against
+    // `agent.list` meant a binding to a plain shell was destroyed by the very
+    // next sync — including the one `claim` runs on its way out, so claiming
+    // from a shell silently undid itself.
+    let live_panes: Vec<String> = herdr::panes()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p.pane_id.clone())
+        .collect();
     let reaped = store.reap_bindings(&live_panes);
     let bindings = if reaped > 0 { store.bindings() } else { bindings };
 
