@@ -134,6 +134,48 @@ impl Ask {
     }
 }
 
+/// Open a workspace for a piece of work, rooted where that work lives.
+///
+/// `WSP_PROJECT` and `WSP_TASK` go into the workspace environment, so every
+/// pane inside it knows what it is for without anyone having to infer it from
+/// a path. herdr does not persist env across a restart, which is why the
+/// durable answer is a claim rather than this — but for the life of the
+/// session it is exact, and exactness is what the cwd heuristic lacks.
+fn open_workspace(
+    label: &str,
+    cwd: Option<&str>,
+    project: Option<&str>,
+    task: Option<&str>,
+) -> Result<(String, String), String> {
+    let mut env = serde_json::Map::new();
+    if let Some(p) = project {
+        env.insert("WSP_PROJECT".into(), json!(p));
+    }
+    if let Some(t) = task {
+        env.insert("WSP_TASK".into(), json!(t));
+    }
+    let mut params = json!({ "label": label, "env": env, "focus": true });
+    if let Some(c) = cwd {
+        params["cwd"] = json!(util::expand(c).display().to_string());
+    }
+    let r = herdr::call("workspace.create", params).map_err(|e| e.to_string())?;
+    let ws = r
+        .get("workspace")
+        .and_then(|w| w.get("workspace_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "workspace.create returned no id".to_string())?;
+    // The pane it opened with — what `claim` needs to bind to, since claim
+    // speaks in panes and knows nothing about workspaces.
+    let pane = r
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "workspace.create returned no pane".to_string())?;
+    Ok((ws, pane))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Pick {
     /// Move a task: land on a project, or on the inbox to unfile it.
@@ -273,6 +315,8 @@ pub(crate) struct Ui {
     message: Option<(String, Instant)>,
     self_focused: bool,
     show_done: bool,
+    /// project id -> its first root, for opening a workspace where the work is.
+    roots: std::collections::BTreeMap<String, String>,
 }
 
 /// What the cursor is sitting on, in the store's own terms rather than the
@@ -324,6 +368,19 @@ impl Ui {
 
     pub(crate) fn selected_index(&self) -> usize {
         self.sel
+    }
+
+    fn task_title(&self, task: &str) -> Option<String> {
+        self.rows.iter().find_map(|r| match r {
+            Row::Task { id, title, .. } if id == task => Some(title.clone()),
+            _ => None,
+        })
+    }
+
+    /// Where a project lives on disk, if it says. A project with no root has
+    /// nowhere to open, so the workspace lands wherever herdr defaults to.
+    fn project_root(&self, project: &str) -> Option<String> {
+        self.roots.get(project).cloned()
     }
 
     /// Which project a task row sits under.
@@ -686,6 +743,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         message: None,
         self_focused,
         show_done: view.show_done,
+        roots: snap
+            .projects
+            .iter()
+            .filter_map(|p| p.roots.first().map(|r| (p.id.clone(), r.clone())))
+            .collect(),
     }
 }
 
@@ -1374,6 +1436,9 @@ pub(crate) enum Effect {
     Focus(AgentRef),
     Sync,
     Quit,
+    /// Open a herdr workspace for this row, then claim the task into it if
+    /// there is one.
+    Open { label: String, cwd: Option<String>, project: Option<String>, task: Option<String> },
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
@@ -1616,7 +1681,7 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         }
         Key::Char('r') => Effect::Sync,
         Key::Char('?') => {
-            say(ui, "a add · s/v/d/o status · b block · m move · c claim · e/n edit · X remove");
+            say(ui, "a add · s/v/d/o status · b block · m move · c claim · O open · X remove");
             Effect::None
         }
 
@@ -1707,6 +1772,32 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
         },
 
+        // ---- open a workspace for this row ----
+        Key::Char('O') => match &target {
+            Target::Task(id) => {
+                let project = ui.project_of_task(id);
+                match ui.task_title(id) {
+                    Some(title) => Effect::Open {
+                        label: title,
+                        cwd: project.as_deref().and_then(|p| ui.project_root(p)),
+                        project,
+                        task: Some(id.clone()),
+                    },
+                    None => Effect::None,
+                }
+            }
+            Target::Project(p) => Effect::Open {
+                label: p.clone(),
+                cwd: ui.project_root(p),
+                project: Some(p.clone()),
+                task: None,
+            },
+            _ => {
+                say(ui, "nothing there to open a workspace for");
+                Effect::None
+            }
+        },
+
         // ---- destructive ----
         Key::Char('X') => match &target {
             Target::Task(id) => {
@@ -1791,6 +1882,30 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
                     let mut cache = crate::sync::Cache::default();
                     let _ = crate::sync::sync(store, &mut cache, true);
                     ui.message = Some(("synced".into(), Instant::now()));
+                    refetch = true;
+                }
+                Effect::Open { label, cwd, project, task } => {
+                    match open_workspace(&label, cwd.as_deref(), project.as_deref(), task.as_deref())
+                    {
+                        Ok((_ws, pane)) => {
+                            // The workspace exists; the durable record of what
+                            // it is for is the claim, so make it now rather
+                            // than relying on the env surviving a restart.
+                            match &task {
+                                Some(t) => {
+                                    say(&mut ui, run_wsp(&[
+                                        "claim".into(),
+                                        t.clone(),
+                                        "--pane".into(),
+                                        pane.clone(),
+                                    ])
+                                    .unwrap_or_else(|e| e));
+                                }
+                                None => say(&mut ui, format!("opened {label}")),
+                            }
+                        }
+                        Err(e) => say(&mut ui, e),
+                    }
                     refetch = true;
                 }
                 Effect::Run { argv, escalate } => {

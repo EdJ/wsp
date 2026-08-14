@@ -37,7 +37,7 @@ are published by the daemon.
 | `~/wsp/tasks/<id>.md` | one task per file: `t-YYMMDD-NNN` |
 | `~/wsp/archive/tasks/YYYY-MM/` | swept `done` tasks |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
-| `~/.local/state/wsp/` | bindings, pins, `events.jsonl` — machine-local, not in git |
+| `~/.local/state/wsp/` | claims, bindings, pins, `events.jsonl` — machine-local, not in git |
 
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
@@ -96,6 +96,7 @@ to a task's agent, `1`-`9` jump straight to an agent, `A` shows finished tasks,
 | `e` `n` | task | retitle, append a note |
 | `m` | task | move — the tree becomes the picker |
 | `c` | task or agent | claim, either direction |
+| `O` | task, project | open a herdr workspace for it, and claim it |
 | `X` | task, project | remove, after a `y`/`n` |
 
 Nothing is reimplemented here: a key builds an argv and the panel runs its own
@@ -103,6 +104,12 @@ binary, so the event log, the hooks and the git commit all happen because it is
 the same path a person at a shell takes. `wsp rename`, `wsp rm` and
 `wsp project rm` exist because the panel needed them — `edit` opens `$EDITOR`,
 which is no use to something already drawing on the screen.
+
+`O` creates the workspace rooted at the project's root, labelled after the
+work, with `WSP_PROJECT` and `WSP_TASK` in its environment — so every pane
+inside it knows what it is for instead of the cwd having to imply it. herdr
+does not persist env across a restart, which is why the durable record is the
+claim; the env is exact for the life of the session.
 
 Typing, picking and confirming are modes, not widgets: navigation and folding
 keep working inside a pick, so you hunt for a destination by reading the tree.
@@ -176,6 +183,13 @@ fast builds are a feature here, because a session-start hook runs this binary.
 - **Status is work state, not process state.** herdr's `idle`/`working` describes
   the process; `doing`/`blocked`/`review` describes the work. `wsp wip` flags the
   gap between them — process-idle on a `doing` task means a human is the blocker.
+- **Claims outlive panes; bindings do not.** A binding is keyed on a pane id,
+  the most perishable thing herdr has. A claim names the workspace — id, label
+  and cwd, all of which herdr persists — and is cleared only by `release`. A
+  pane exiting leaves the claim standing, and `wsp reconcile` rebuilds the
+  bindings from claims against whatever is currently open. The daemon does it
+  before its first sync, which is when herdr has just restored everything under
+  new pane ids.
 - **cwd is not identity.** Five workspaces share `~/git/Easter`. Resolution order
   is pin → binding → cwd → workspace label, so `wsp pin <project>` is the
   override when a directory is ambiguous.

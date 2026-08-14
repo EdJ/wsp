@@ -90,9 +90,23 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     };
 
     let env = herdr::Env::read();
-    let cwd = std::env::current_dir().map(|c| util::contract(&c)).unwrap_or_default();
-    let workspace = env.workspace_id.clone().unwrap_or_default();
     let session = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
+
+    // Claiming on behalf of another pane — from the panel, say — means the
+    // environment describes the caller, not the target. Ask herdr what that
+    // pane actually belongs to, or the claim records a workspace that nothing
+    // can later resolve.
+    let target = herdr::panes().unwrap_or_default().into_iter().find(|p| p.pane_id == pane);
+    let workspace = target
+        .as_ref()
+        .map(|p| p.workspace_id.clone())
+        .filter(|w| !w.is_empty())
+        .or_else(|| env.workspace_id.clone())
+        .unwrap_or_default();
+    let cwd = match &target {
+        Some(p) if !p.cwd.is_empty() => p.cwd.clone(),
+        _ => std::env::current_dir().map(|c| util::contract(&c)).unwrap_or_default(),
+    };
 
     store.set_binding(
         &pane,
