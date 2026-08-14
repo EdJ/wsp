@@ -465,6 +465,47 @@ pub fn next(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Change a task's title without opening an editor. `edit` shells out to
+/// `$EDITOR`, which is fine from a terminal and useless from anything that is
+/// already drawing on the screen.
+pub fn rename(store: &Store, args: &Args) -> i32 {
+    let title = args.rest.get(1..).map(|r| r.join(" ")).unwrap_or_default();
+    if title.trim().is_empty() {
+        eprintln!("usage: wsp rename <id> \"new title\"");
+        return 2;
+    }
+    mutate(store, args, "rename", |t| {
+        t.log(&format!("renamed from \"{}\"", t.title));
+        t.title = title.trim().to_string();
+    })
+}
+
+/// Retire a task. The file moves to the archive rather than being deleted:
+/// the store is a git repo, and a task carrying a decision log is worth more
+/// recoverable than gone.
+pub fn rm(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp rm <id>");
+        return 2;
+    };
+    let Some(t) = store.find_task(&needle) else {
+        eprintln!("wsp: no task matching `{needle}`");
+        return 1;
+    };
+    if let Err(e) = store.archive_task(&t) {
+        eprintln!("wsp: archive failed: {e}");
+        return 1;
+    }
+    store.log_event("task-removed", json!({ "id": t.id, "project": t.project, "title": t.title }));
+    store.git_commit(&format!("wsp: rm {} — {}", t.id, t.title));
+    if args.json() {
+        println!("{}", json!({ "removed": t.id, "archived": true }));
+    } else {
+        println!("removed {} (archived)", t.id);
+    }
+    0
+}
+
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp edit <id>");

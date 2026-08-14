@@ -74,9 +74,31 @@ It must never go back to `layout.apply`: herdr rebuilds the whole tree from
 that call and every pane in it gets a fresh terminal, which takes down any
 agent running in the workspace.
 
-Keys: `j`/`k` move, `←`/`→` fold a project, `↵` folds a project or opens a
-`⋯ n more` row or jumps to a task's agent, `1`-`9` jump straight to an agent,
-`A` shows finished tasks, `r` syncs, `q` quits.
+Keys: `j`/`k` move, `←`/`→` fold, `↵` folds or opens a `⋯ n more` row or jumps
+to a task's agent, `1`-`9` jump straight to an agent, `A` shows finished tasks,
+`r` syncs, `?` lists the verbs, `q` quits.
+
+### Managing from the panel
+
+| Key | On | Does |
+|---|---|---|
+| `a` | project, task, inbox | add a task in that scope |
+| `P` | anywhere | new project, child of the selected one |
+| `s` `v` `d` `o` | task | start, review, done, reopen |
+| `b` | task | block, asking why |
+| `e` `n` | task | retitle, append a note |
+| `m` | task | move — the tree becomes the picker |
+| `c` | task or agent | claim, either direction |
+| `X` | task, project | remove, after a `y`/`n` |
+
+Nothing is reimplemented here: a key builds an argv and the panel runs its own
+binary, so the event log, the hooks and the git commit all happen because it is
+the same path a person at a shell takes. `wsp rename`, `wsp rm` and
+`wsp project rm` exist because the panel needed them — `edit` opens `$EDITOR`,
+which is no use to something already drawing on the screen.
+
+Typing, picking and confirming are modes, not widgets: navigation and folding
+keep working inside a pick, so you hunt for a destination by reading the tree.
 
 ### What the marks mean
 

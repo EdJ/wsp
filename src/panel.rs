@@ -55,6 +55,114 @@ pub(crate) struct View {
     expanded: HashSet<String>,
     /// Include `done` tasks, and the projects that hold only those.
     show_done: bool,
+    /// Projects to show even though they hold nothing yet. A project created
+    /// from the panel is empty by definition, so the quiet-branch filter would
+    /// swallow it the instant it was made — you would type a name, press
+    /// return, and watch nothing appear.
+    reveal: HashSet<String>,
+    /// What the next keypress means.
+    pub(crate) mode: Mode,
+}
+
+/// Management needs three shapes of input beyond a single key: a value to
+/// type, a second row to point at, and a yes before something irreversible.
+/// Each is a mode rather than a widget, so the cursor and the tree keep
+/// working inside them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Mode {
+    #[default]
+    Browse,
+    Prompt {
+        verb: Ask,
+        buffer: String,
+    },
+    /// Navigation still moves the cursor; `↵` takes whatever it lands on.
+    Pick {
+        verb: Pick,
+    },
+    Confirm {
+        argv: Vec<String>,
+        question: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Ask {
+    AddTask { project: Option<String> },
+    NewProject { parent: Option<String> },
+    Block { task: String },
+    Rename { task: String },
+    Note { task: String },
+}
+
+impl Ask {
+    fn label(&self) -> &'static str {
+        match self {
+            Ask::AddTask { .. } => "task",
+            Ask::NewProject { .. } => "project",
+            Ask::Block { .. } => "why",
+            Ask::Rename { .. } => "title",
+            Ask::Note { .. } => "note",
+        }
+    }
+
+    /// The command this becomes once a value is typed.
+    fn argv(&self, value: &str) -> Vec<String> {
+        let v = value.trim().to_string();
+        match self {
+            Ask::AddTask { project: Some(p) } => {
+                vec!["add".into(), v, "-p".into(), p.clone()]
+            }
+            Ask::AddTask { project: None } => vec!["add".into(), v],
+            Ask::NewProject { parent: Some(p) } => {
+                vec!["project".into(), "add".into(), v, "--parent".into(), p.clone()]
+            }
+            Ask::NewProject { parent: None } => vec!["project".into(), "add".into(), v],
+            Ask::Block { task } => vec!["block".into(), task.clone(), v],
+            Ask::Rename { task } => vec!["rename".into(), task.clone(), v],
+            Ask::Note { task } => vec!["note".into(), task.clone(), v],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pick {
+    /// Move a task: land on a project, or on the inbox to unfile it.
+    MoveTask { task: String },
+    /// Bind a pane to the task the cursor started on.
+    PaneForTask { task: String },
+    /// Point an agent at different work — this is task 025's migration.
+    TaskForPane { pane: String },
+}
+
+impl Pick {
+    fn hint(&self) -> &'static str {
+        match self {
+            Pick::MoveTask { .. } => "move to which project?",
+            Pick::PaneForTask { .. } => "which agent takes it?",
+            Pick::TaskForPane { .. } => "which task does it take?",
+        }
+    }
+
+    /// `None` when the cursor is somewhere this pick cannot accept.
+    fn argv(&self, at: &Target) -> Option<Vec<String>> {
+        match (self, at) {
+            (Pick::MoveTask { task }, Target::Project(p)) => {
+                Some(vec!["mv".into(), task.clone(), "-p".into(), p.clone()])
+            }
+            // Unfiling. `mv` already understands `inbox` as "no project".
+            (Pick::MoveTask { task }, Target::Inbox) => {
+                Some(vec!["mv".into(), task.clone(), "-p".into(), "inbox".into()])
+            }
+            (Pick::PaneForTask { task }, Target::Pane(pane)) => {
+                Some(vec!["claim".into(), task.clone(), "--pane".into(), pane.clone()])
+            }
+            (Pick::TaskForPane { pane }, Target::Task(task)) => {
+                Some(vec!["claim".into(), task.clone(), "--pane".into(), pane.clone()])
+            }
+            _ => None,
+        }
+    }
 }
 
 enum Msg {
@@ -64,16 +172,21 @@ enum Msg {
     Tick,
 }
 
+/// A key as typed, not as interpreted. `j` used to arrive already meaning
+/// "down", which is unanswerable once a prompt needs a literal `j` — so the
+/// meaning is decided by the reducer, which knows the mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Key {
     Up,
     Down,
-    Enter,
     Left,
     Right,
-    Digit(u8),
+    Enter,
+    Esc,
+    Backspace,
     Char(char),
-    Quit,
+    /// Ctrl-C, which raw mode delivers as a byte rather than a signal.
+    Interrupt,
 }
 
 #[derive(Debug, Clone)]
@@ -90,8 +203,10 @@ enum Row {
     Task {
         /// Carried so a row can name the task it stands for. Nothing acts on a
         /// task yet; this is what the edit keys will dispatch on.
-        #[allow(dead_code)]
         id: String,
+        /// The project it sits under, so `a` on a task can add a sibling and
+        /// the row can answer questions without going back to the store.
+        project: Option<String>,
         title: String,
         depth: usize,
         status: Status,
@@ -195,6 +310,25 @@ impl Ui {
     pub(crate) fn selected_index(&self) -> usize {
         self.sel
     }
+
+    /// Which project a task row sits under.
+    fn project_of_task(&self, task: &str) -> Option<String> {
+        self.rows.iter().find_map(|r| match r {
+            Row::Task { id, project, .. } if id == task => project.clone(),
+            _ => None,
+        })
+    }
+
+    /// Open tasks rolled up under a project — what a removal would displace.
+    fn project_load(&self, project: &str) -> usize {
+        self.rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Project { id, counts, .. } if id == project => Some(counts.open),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
 }
 
 // ---- data ---------------------------------------------------------------
@@ -278,6 +412,7 @@ fn task_rows(
         }
         rows.push(Row::Task {
             id: t.id.clone(),
+            project: t.project.clone(),
             title: t.title.clone(),
             depth,
             status: t.status(),
@@ -374,7 +509,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // broken on exactly the projects it exists to reveal.
     let interesting = |id: &str| -> bool {
         let c = counts.get(id).copied().unwrap_or_default();
-        c.open > 0 || live_by_project.contains_key(id) || (view.show_done && c.done > 0)
+        c.open > 0
+            || live_by_project.contains_key(id)
+            || (view.show_done && c.done > 0)
+            || view.reveal.contains(id)
     };
 
     let mut rows: Vec<Row> = Vec::new();
@@ -821,7 +959,7 @@ fn hotkeys(rows: &[Row]) -> Vec<Option<u8>> {
 
 /// The whole panel as styled lines. No escapes, no terminal — a backend turns
 /// this into something you can look at.
-pub(crate) fn frame(ui: &Ui, w: usize, h: usize) -> Vec<Line> {
+pub(crate) fn frame(ui: &Ui, mode: &Mode, w: usize, h: usize) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
 
     let mut head = Line::default();
@@ -874,12 +1012,43 @@ pub(crate) fn frame(ui: &Ui, w: usize, h: usize) -> Vec<Line> {
     }
     lines.push(foot);
 
-    match &ui.message {
-        Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
-            lines.push(line(Style::Accent, util::truncate(m, w)))
+    // The last line belongs to whatever the panel is waiting for: a value, an
+    // answer, a destination — and only otherwise a message or the key hint.
+    lines.push(match mode {
+        Mode::Prompt { verb, buffer } => {
+            let mut l = Line::default();
+            l.push(Style::Accent, format!("{}> ", verb.label()));
+            // Show the tail once the value outruns the pane, so the caret is
+            // always the thing you can see.
+            let room = w.saturating_sub(l.width() + 1);
+            let shown: String = if buffer.chars().count() > room {
+                buffer.chars().skip(buffer.chars().count() - room).collect()
+            } else {
+                buffer.clone()
+            };
+            l.push(Style::Plain, shown);
+            l.push(Style::Accent, "▌");
+            l
         }
-        _ => lines.push(line(Style::Dim, "1-9 go  ↵ open  ←→ fold  A done  q")),
-    }
+        Mode::Confirm { question, .. } => {
+            let mut l = Line::default();
+            l.push(Style::Warn, util::truncate(question, w.saturating_sub(6)));
+            l.push(Style::Dim, "  y/n");
+            l
+        }
+        Mode::Pick { verb } => {
+            let mut l = Line::default();
+            l.push(Style::Accent, util::truncate(verb.hint(), w.saturating_sub(4)));
+            l.push(Style::Dim, "  ↵");
+            l
+        }
+        Mode::Browse => match &ui.message {
+            Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
+                line(Style::Accent, util::truncate(m, w))
+            }
+            _ => line(Style::Dim, "a s d b m c X · ↵ open · A done · ? keys"),
+        },
+    });
 
     lines.truncate(h);
     lines
@@ -1005,42 +1174,49 @@ fn spawn_input(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let Ok(mut tty) = File::open("/dev/tty") else { return };
         let mut buf = [0u8; 1];
+        // `stty min 0 time 1` makes a read with nothing waiting return 0 after
+        // ~100ms. That is what lets a bare Esc be told apart from the start of
+        // an arrow key, which is otherwise undecidable on a blocking read.
+        let next = |tty: &mut File, buf: &mut [u8; 1]| -> Option<u8> {
+            match tty.read(buf) {
+                Ok(1) => Some(buf[0]),
+                Ok(_) => None,
+                Err(_) => None,
+            }
+        };
         loop {
-            match tty.read(&mut buf) {
-                Ok(1) => {
-                    let key = match buf[0] {
-                        b'q' | 3 => Key::Quit, // raw mode delivers ctrl-c as a byte
-                        b'j' => Key::Down,
-                        b'k' => Key::Up,
-                        b'h' => Key::Left,
-                        b'l' => Key::Right,
-                        b'\r' | b'\n' => Key::Enter,
-                        b'\x1b' => {
-                            let mut seq = [0u8; 2];
-                            if tty.read(&mut seq[..1]).is_ok()
-                                && seq[0] == b'['
-                                && tty.read(&mut seq[1..]).is_ok()
-                            {
-                                match seq[1] {
-                                    b'A' => Key::Up,
-                                    b'B' => Key::Down,
-                                    b'C' => Key::Right,
-                                    b'D' => Key::Left,
-                                    _ => continue,
-                                }
-                            } else {
-                                continue;
-                            }
-                        }
-                        c if c.is_ascii_digit() && c != b'0' => Key::Digit(c - b'0'),
-                        c => Key::Char(c as char),
-                    };
-                    if tx.send(Msg::Key(key)).is_err() {
-                        return;
+            let Some(b) = next(&mut tty, &mut buf) else { continue };
+            let mut pending: Option<Key> = None;
+            let key = match b {
+                3 => Key::Interrupt,
+                b'\r' | b'\n' => Key::Enter,
+                0x7f | 0x08 => Key::Backspace,
+                b'\x1b' => match next(&mut tty, &mut buf) {
+                    // Nothing followed: a real Esc.
+                    None => Key::Esc,
+                    Some(b'[') => match next(&mut tty, &mut buf) {
+                        Some(b'A') => Key::Up,
+                        Some(b'B') => Key::Down,
+                        Some(b'C') => Key::Right,
+                        Some(b'D') => Key::Left,
+                        _ => continue,
+                    },
+                    // Esc then something else — deliver both, in order.
+                    Some(other) => {
+                        pending = Some(Key::Char(other as char));
+                        Key::Esc
                     }
+                },
+                c if c.is_ascii_graphic() || c == b' ' => Key::Char(c as char),
+                _ => continue,
+            };
+            if tx.send(Msg::Key(key)).is_err() {
+                return;
+            }
+            if let Some(p) = pending {
+                if tx.send(Msg::Key(p)).is_err() {
+                    return;
                 }
-                Ok(_) => continue,
-                Err(_) => return,
             }
         }
     });
@@ -1075,6 +1251,31 @@ fn spawn_events(tx: Sender<Msg>) {
     });
 }
 
+/// Run this binary against the store and report in a few words.
+///
+/// Output is captured, never inherited: the panel owns an alternate screen in
+/// raw mode, and a subcommand printing into it would corrupt the frame. stdin
+/// is closed so nothing can sit waiting for input the panel will never send.
+fn run_wsp(argv: &[String]) -> String {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "wsp".into());
+    let out = Command::new(exe)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => argv.join(" "),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let first = err.lines().next().unwrap_or("failed").trim();
+            first.strip_prefix("wsp: ").unwrap_or(first).to_string()
+        }
+        Err(e) => format!("cannot run wsp: {e}"),
+    }
+}
+
 fn focus(agent: &AgentRef) {
     let _ = herdr::call("workspace.focus", json!({ "workspace_id": agent.workspace }));
     let _ = herdr::call("pane.focus", json!({ "pane_id": agent.pane }));
@@ -1104,7 +1305,7 @@ pub fn run(store: &Store) -> i32 {
 
     print!("\x1b[?1049h\x1b[?25l");
     let _ = std::io::stdout().flush();
-    stty(&["raw", "-echo"]);
+    stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
     let code = event_loop(store, &rx, self_ws.as_deref());
 
@@ -1120,43 +1321,124 @@ pub(crate) enum Effect {
     Refetch,
     Focus(AgentRef),
     Sync,
+    Quit,
+    /// Argv for this binary. Running the CLI rather than reimplementing it
+    /// means the event log, the hooks and the git commit all still happen,
+    /// because it is the same code path a person at a shell would take.
+    Run(Vec<String>),
 }
 
-/// The reducer. Deliberately free of I/O — it moves the selection and the fold
-/// state and reports what else it wants done, so the storyboard can drive the
-/// same transitions the terminal does and get the same frames out.
-pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
+fn say(ui: &mut Ui, m: impl Into<String>) {
+    ui.message = Some((m.into(), Instant::now()));
+}
+
+/// Typing a value. Every printable key is text here — including `q`, which is
+/// why the input layer stopped deciding what keys mean.
+fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut buffer: String) -> Effect {
+    match k {
+        Key::Char(c) => {
+            buffer.push(c);
+            view.mode = Mode::Prompt { verb, buffer };
+            Effect::None
+        }
+        Key::Backspace => {
+            buffer.pop();
+            view.mode = Mode::Prompt { verb, buffer };
+            Effect::None
+        }
+        Key::Esc | Key::Interrupt => {
+            view.mode = Mode::Browse;
+            say(ui, "cancelled");
+            Effect::None
+        }
+        Key::Enter => {
+            if buffer.trim().is_empty() {
+                view.mode = Mode::Browse;
+                say(ui, "nothing typed");
+                return Effect::None;
+            }
+            let argv = verb.argv(&buffer);
+            if let Ask::NewProject { .. } = &verb {
+                // The CLI slugifies the name; do the same so we know what to
+                // keep visible without having to read the result back.
+                view.reveal.insert(util::slugify(&buffer));
+            }
+            view.mode = Mode::Browse;
+            Effect::Run(argv)
+        }
+        _ => Effect::None,
+    }
+}
+
+/// Pointing at a second row. Navigation is untouched, so the tree itself is
+/// the picker — no separate list to build, and folding still works while you
+/// hunt for the project you want.
+fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effect {
+    match k {
+        Key::Esc | Key::Interrupt => {
+            view.mode = Mode::Browse;
+            say(ui, "cancelled");
+            Effect::None
+        }
+        Key::Enter => match verb.argv(&ui.selected_target()) {
+            Some(argv) => {
+                view.mode = Mode::Browse;
+                Effect::Run(argv)
+            }
+            None => {
+                say(ui, "not a valid destination");
+                Effect::None
+            }
+        },
+        // Movement and folding stay live inside the pick.
+        Key::Up | Key::Down | Key::Left | Key::Right | Key::Char('j') | Key::Char('k')
+        | Key::Char('h') | Key::Char('l') => {
+            let nav = match k {
+                Key::Char('j') => Key::Down,
+                Key::Char('k') => Key::Up,
+                Key::Char('h') => Key::Left,
+                Key::Char('l') => Key::Right,
+                other => other,
+            };
+            move_or_fold(nav, ui, view)
+        }
+        _ => Effect::None,
+    }
+}
+
+fn confirm_key(k: Key, ui: &mut Ui, view: &mut View, argv: Vec<String>) -> Effect {
+    match k {
+        Key::Char('y') | Key::Char('Y') => {
+            view.mode = Mode::Browse;
+            Effect::Run(argv)
+        }
+        Key::Char('n') | Key::Char('N') | Key::Esc | Key::Interrupt | Key::Enter => {
+            view.mode = Mode::Browse;
+            say(ui, "left alone");
+            Effect::None
+        }
+        _ => Effect::None,
+    }
+}
+
+/// Cursor movement and folding, shared by browse and pick.
+fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
     let n = ui.rows.len();
     match k {
         Key::Down => {
-            let mut i = ui.sel;
-            while i + 1 < n {
-                i += 1;
-                if ui.rows[i].selectable() {
-                    break;
-                }
+            if ui.sel + 1 < n {
+                ui.sel += 1;
             }
-            ui.sel = i;
             Effect::None
         }
         Key::Up => {
-            let mut i = ui.sel;
-            while i > 0 {
-                i -= 1;
-                if ui.rows[i].selectable() {
-                    break;
-                }
-            }
-            ui.sel = i;
+            ui.sel = ui.sel.saturating_sub(1);
             Effect::None
         }
         Key::Left | Key::Right => match ui.rows.get(ui.sel) {
-            // Projects and groups fold alike; only their key differs.
             Some(Row::Project { id: key, .. }) | Some(Row::Section { key, .. }) => {
                 if k == Key::Left {
                     view.collapsed.insert(key.clone());
-                    // Folding forgets that it was showing its long tail, so
-                    // unfolding starts clean.
                     view.expanded.remove(key);
                 } else {
                     view.collapsed.remove(key);
@@ -1169,41 +1451,56 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
             _ => Effect::None,
         },
-        Key::Enter => match ui.rows.get(ui.sel) {
-            Some(Row::Project { id: key, collapsed: c, .. })
-            | Some(Row::Section { key, collapsed: c, .. }) => {
-                if *c {
-                    view.collapsed.remove(key);
-                } else {
-                    view.collapsed.insert(key.clone());
-                    view.expanded.remove(key);
-                }
-                Effect::Refetch
-            }
-            Some(Row::More { key, .. }) => {
-                view.expanded.insert(key.clone());
-                Effect::Refetch
-            }
-            Some(row) => match row.agent() {
-                Some(a) => Effect::Focus(a.clone()),
-                None => {
-                    ui.message = Some(("no agent on that task".into(), Instant::now()));
-                    Effect::None
-                }
-            },
-            None => Effect::None,
-        },
-        Key::Digit(d) => {
-            let keys = hotkeys(&ui.rows);
-            match keys
-                .iter()
-                .position(|k| *k == Some(d))
-                .and_then(|i| ui.rows[i].agent())
-            {
-                Some(a) => Effect::Focus(a.clone()),
-                None => Effect::None,
-            }
+        _ => Effect::None,
+    }
+}
+
+/// The reducer. Deliberately free of I/O — it moves the cursor, changes the
+/// mode, and reports what else it wants done, so the storyboard can drive the
+/// same transitions the terminal does and get the same frames out.
+pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
+    // Taken rather than borrowed: every branch may replace it.
+    match std::mem::take(&mut view.mode) {
+        Mode::Browse => browse_key(k, ui, view),
+        Mode::Prompt { verb, buffer } => {
+            view.mode = Mode::Prompt { verb: verb.clone(), buffer: buffer.clone() };
+            prompt_key(k, ui, view, verb, buffer)
         }
+        Mode::Pick { verb } => {
+            view.mode = Mode::Pick { verb: verb.clone() };
+            pick_key(k, ui, view, verb)
+        }
+        Mode::Confirm { argv, question } => {
+            view.mode = Mode::Confirm { argv: argv.clone(), question };
+            confirm_key(k, ui, view, argv)
+        }
+    }
+}
+
+fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
+    let n = ui.rows.len();
+    let target = ui.selected_target();
+
+    // Which project a new task should land in, read from wherever the cursor
+    // is: a project takes it directly, a task hands over its own project, and
+    // the inbox means deliberately none.
+    let scope = |t: &Target, ui: &Ui| -> Option<Option<String>> {
+        match t {
+            Target::Project(p) => Some(Some(p.clone())),
+            Target::Inbox => Some(None),
+            Target::Task(id) => Some(ui.project_of_task(id)),
+            _ => None,
+        }
+    };
+
+    match k {
+        Key::Char('q') | Key::Interrupt => Effect::Quit,
+        Key::Esc => Effect::None,
+
+        Key::Down | Key::Char('j') => move_or_fold(Key::Down, ui, view),
+        Key::Up | Key::Char('k') => move_or_fold(Key::Up, ui, view),
+        Key::Left | Key::Char('h') => move_or_fold(Key::Left, ui, view),
+        Key::Right | Key::Char('l') => move_or_fold(Key::Right, ui, view),
         Key::Char('g') => {
             ui.sel = 0;
             Effect::None
@@ -1212,23 +1509,184 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             ui.sel = n.saturating_sub(1);
             Effect::None
         }
+
+        Key::Enter => match ui.rows.get(ui.sel) {
+            Some(Row::Project { .. }) | Some(Row::Section { .. }) | Some(Row::More { .. }) => {
+                let fold = matches!(ui.rows.get(ui.sel), Some(Row::More { .. }));
+                if fold {
+                    move_or_fold(Key::Right, ui, view)
+                } else {
+                    let collapsed = matches!(
+                        ui.rows.get(ui.sel),
+                        Some(Row::Project { collapsed: true, .. })
+                            | Some(Row::Section { collapsed: true, .. })
+                    );
+                    move_or_fold(if collapsed { Key::Right } else { Key::Left }, ui, view)
+                }
+            }
+            Some(row) => match row.agent() {
+                Some(a) => Effect::Focus(a.clone()),
+                None => {
+                    say(ui, "no agent on that task");
+                    Effect::None
+                }
+            },
+            None => Effect::None,
+        },
+
+        Key::Char(d @ '1'..='9') => {
+            let want = d as u8 - b'0';
+            match hotkeys(&ui.rows)
+                .iter()
+                .position(|k| *k == Some(want))
+                .and_then(|i| ui.rows[i].agent())
+            {
+                Some(a) => Effect::Focus(a.clone()),
+                None => Effect::None,
+            }
+        }
+
+        // ---- view ----
         Key::Char('A') => {
             view.show_done = !view.show_done;
-            ui.message = Some((
-                if view.show_done { "showing done" } else { "hiding done" }.into(),
-                Instant::now(),
-            ));
+            say(ui, if view.show_done { "showing done" } else { "hiding done" });
             Effect::Refetch
         }
         Key::Char('r') => Effect::Sync,
         Key::Char('?') => {
-            ui.message = Some((
-                "j/k move · ↵ fold/open · 1-9 jump · A done · r sync · q quit".into(),
-                Instant::now(),
-            ));
+            say(ui, "a add · s/v/d/o status · b block · m move · c claim · e/n edit · X remove");
             Effect::None
         }
+
+        // ---- create ----
+        Key::Char('a') => match scope(&target, ui) {
+            Some(project) => {
+                view.mode = Mode::Prompt { verb: Ask::AddTask { project }, buffer: String::new() };
+                Effect::None
+            }
+            None => {
+                say(ui, "nowhere to add that");
+                Effect::None
+            }
+        },
+        Key::Char('P') => {
+            let parent = match &target {
+                Target::Project(p) => Some(p.clone()),
+                _ => None,
+            };
+            view.mode = Mode::Prompt { verb: Ask::NewProject { parent }, buffer: String::new() };
+            Effect::None
+        }
+
+        // ---- status, one key each ----
+        Key::Char('s') => task_verb(&target, ui, "start"),
+        Key::Char('v') => task_verb(&target, ui, "review"),
+        Key::Char('d') => task_verb(&target, ui, "done"),
+        Key::Char('o') => task_verb(&target, ui, "reopen"),
+
+        // ---- typed ----
+        Key::Char('b') => match &target {
+            Target::Task(id) => {
+                view.mode =
+                    Mode::Prompt { verb: Ask::Block { task: id.clone() }, buffer: String::new() };
+                Effect::None
+            }
+            _ => {
+                say(ui, "only a task can be blocked");
+                Effect::None
+            }
+        },
+        Key::Char('e') => match &target {
+            Target::Task(id) => {
+                view.mode =
+                    Mode::Prompt { verb: Ask::Rename { task: id.clone() }, buffer: String::new() };
+                Effect::None
+            }
+            _ => {
+                say(ui, "only a task can be retitled here");
+                Effect::None
+            }
+        },
+        Key::Char('n') => match &target {
+            Target::Task(id) => {
+                view.mode =
+                    Mode::Prompt { verb: Ask::Note { task: id.clone() }, buffer: String::new() };
+                Effect::None
+            }
+            _ => {
+                say(ui, "notes go on a task");
+                Effect::None
+            }
+        },
+
+        // ---- picked ----
+        Key::Char('m') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Pick { verb: Pick::MoveTask { task: id.clone() } };
+                Effect::None
+            }
+            _ => {
+                say(ui, "only a task moves");
+                Effect::None
+            }
+        },
+        Key::Char('c') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Pick { verb: Pick::PaneForTask { task: id.clone() } };
+                Effect::None
+            }
+            Target::Pane(p) => {
+                view.mode = Mode::Pick { verb: Pick::TaskForPane { pane: p.clone() } };
+                Effect::None
+            }
+            _ => {
+                say(ui, "claim joins a task to an agent");
+                Effect::None
+            }
+        },
+
+        // ---- destructive ----
+        Key::Char('X') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Confirm {
+                    argv: vec!["rm".into(), id.clone()],
+                    question: format!("retire {id}?"),
+                };
+                Effect::None
+            }
+            Target::Project(p) => {
+                // --force is what makes this succeed on a project that still
+                // holds work; the question says so, because the CLI would
+                // otherwise refuse and the panel would look broken.
+                let held = ui.project_load(p);
+                view.mode = Mode::Confirm {
+                    argv: vec!["project".into(), "rm".into(), p.clone(), "--force".into()],
+                    question: if held > 0 {
+                        format!("remove {p}? {held} task(s) go to inbox")
+                    } else {
+                        format!("remove {p}?")
+                    },
+                };
+                Effect::None
+            }
+            _ => {
+                say(ui, "nothing there to remove");
+                Effect::None
+            }
+        },
+
         _ => Effect::None,
+    }
+}
+
+/// Status verbs all have the same shape: one key, a task, no input.
+fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
+    match target {
+        Target::Task(id) => Effect::Run(vec![verb.to_string(), id.clone()]),
+        _ => {
+            say(ui, format!("{verb} needs a task"));
+            Effect::None
+        }
     }
 }
 
@@ -1240,16 +1698,16 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
     let mut last_fetch = Instant::now();
     let mut last_fingerprint = store.fingerprint();
 
-    let draw = |ui: &Ui, last: &mut String| {
+    let draw = |ui: &Ui, mode: &Mode, last: &mut String| {
         let (w, h) = term_size();
-        let painted = to_ansi(&frame(ui, w, h), w, h);
+        let painted = to_ansi(&frame(ui, mode, w, h), w, h);
         if painted != *last {
             print!("{painted}");
             let _ = std::io::stdout().flush();
             *last = painted;
         }
     };
-    draw(&ui, &mut last);
+    draw(&ui, &view.mode, &mut last);
 
     loop {
         let msg = match rx.recv_timeout(Duration::from_secs(60)) {
@@ -1260,8 +1718,8 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
 
         let mut refetch = false;
         match msg {
-            Msg::Key(Key::Quit) => return 0,
             Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
+                Effect::Quit => return 0,
                 Effect::None => {}
                 Effect::Refetch => refetch = true,
                 Effect::Focus(a) => focus(&a),
@@ -1269,6 +1727,10 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
                     let mut cache = crate::sync::Cache::default();
                     let _ = crate::sync::sync(store, &mut cache, true);
                     ui.message = Some(("synced".into(), Instant::now()));
+                    refetch = true;
+                }
+                Effect::Run(argv) => {
+                    say(&mut ui, run_wsp(&argv));
                     refetch = true;
                 }
             },
@@ -1304,7 +1766,7 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
             last_fingerprint = store.fingerprint();
             refetch_into(&mut ui, &Snapshot::live(store), &view, self_ws);
         }
-        draw(&ui, &mut last);
+        draw(&ui, &view.mode, &mut last);
     }
 }
 

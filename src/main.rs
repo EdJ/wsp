@@ -170,6 +170,8 @@ fn main() {
         "tag" => cmd_task::tag(&store, &args),
         "next" => cmd_task::next(&store, &args),
         "edit" => cmd_task::edit(&store, &args),
+        "rename" => cmd_task::rename(&store, &args),
+        "rm" | "remove" => cmd_task::rm(&store, &args),
         "archive" => cmd_task::archive(&store, &args),
 
         "claim" => cmd_agent::claim(&store, &args),
@@ -210,6 +212,7 @@ fn help() {
   wsp tree                          hierarchy with open counts
   wsp project show <id>             brief, tags, roots, tasks, agents
   wsp project set <id> k=v…         name/parent/status/brief/tags/roots
+  wsp project rm <id> [--force]     remove; --force orphans what it held
 
 {tasks}
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]

@@ -45,6 +45,7 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "tree" => tree(store, args),
         "show" | "get" => show(store, args),
         "set" => set(store, args),
+        "rm" | "remove" | "delete" => rm(store, args),
         other => {
             eprintln!("wsp project: unknown subcommand `{other}`");
             2
@@ -294,6 +295,69 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     if !proj.body.trim().is_empty() {
         println!("\n{}", proj.body.trim());
+    }
+    0
+}
+
+/// Remove a project. Refuses while anything still points at it, because the
+/// alternative is silently orphaning work. `--force` does the orphaning
+/// explicitly: tasks fall back to the inbox, children reparent to whatever the
+/// removed project hung from.
+pub fn rm(store: &Store, args: &Args) -> i32 {
+    // rest[0] is the `rm` subcommand itself; the id follows it.
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp project rm <id> [--force]");
+        return 2;
+    };
+    let index = Index::new(store.projects());
+    let Some(p) = index.find(&needle).cloned() else {
+        eprintln!("wsp: no project matching `{needle}`");
+        return 1;
+    };
+
+    let tasks: Vec<_> = store.tasks().into_iter().filter(|t| t.project.as_deref() == Some(p.id.as_str())).collect();
+    let children: Vec<_> = index.children(Some(&p.id)).into_iter().cloned().collect();
+
+    if (!tasks.is_empty() || !children.is_empty()) && !args.has("force") {
+        eprintln!(
+            "wsp: `{}` still holds {} task(s) and {} child project(s) — pass --force to \
+             orphan the tasks to the inbox and reparent the children",
+            p.id,
+            tasks.len(),
+            children.len()
+        );
+        return 1;
+    }
+
+    for mut t in tasks {
+        t.project = None;
+        t.log(&format!("project `{}` removed — moved to inbox", p.id));
+        t.touch();
+        if let Err(e) = store.save_task(&t) {
+            eprintln!("wsp: {}: {e}", t.id);
+            return 1;
+        }
+    }
+    for mut c in children {
+        c.parent = p.parent.clone();
+        if let Err(e) = store.save_project(&c) {
+            eprintln!("wsp: {}: {e}", c.id);
+            return 1;
+        }
+    }
+
+    let path = store.projects_dir().join(format!("{}.md", p.id));
+    if let Err(e) = std::fs::remove_file(&path) {
+        eprintln!("wsp: {}: {e}", path.display());
+        return 1;
+    }
+    store.log_event("project-removed", json!({ "id": p.id, "parent": p.parent }));
+    store.git_commit(&format!("wsp: project rm {}", p.id));
+
+    if args.json() {
+        println!("{}", json!({ "removed": p.id }));
+    } else {
+        println!("removed project {}", p.id);
     }
     0
 }

@@ -158,9 +158,10 @@ fn key_name(k: Key) -> String {
         Key::Left => "←".into(),
         Key::Right => "→".into(),
         Key::Enter => "↵".into(),
-        Key::Digit(d) => d.to_string(),
         Key::Char(c) => c.to_string(),
-        Key::Quit => "q".into(),
+        Key::Esc => "esc".into(),
+        Key::Backspace => "\u{232b}".into(),
+        Key::Interrupt => "^C".into(),
     }
 }
 
@@ -248,7 +249,7 @@ impl<'a> Driver<'a> {
                 compress(&self.log)
             },
             target: target_label(&self.ui.selected_target()),
-            html: panel::to_html(&panel::frame(&self.ui, W, H), W),
+            html: panel::to_html(&panel::frame(&self.ui, &self.view.mode, W, H), W),
         }
     }
 }
@@ -324,7 +325,76 @@ fn scenes() -> Vec<Scene> {
             .scene("Help", "? puts the key map in the message line for four seconds."),
     );
 
+    // ---- management ----
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Project)
+            .key(Key::Char('a'))
+            .type_in("Retune the plate decay")
+            .scene("Adding to a project", "a on a project opens a field in the footer. The cursor's row decides the scope, so this becomes `wsp add … -p audio` without asking which project."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .key(Key::Char('a'))
+            .type_in("Pick up milk")
+            .scene("Adding to the inbox", "The same key on the inbox group. The scope is deliberately no project, which is what the inbox means."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Task)
+            .key(Key::Char('b'))
+            .type_in("waiting on the tuning table")
+            .scene("Blocking, with a reason", "b asks why. `wsp block` requires a reason and so does the panel — a blocked task that does not say why is the one you cannot act on later."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Task)
+            .key(Key::Char('m'))
+            .scene("Moving a task", "m turns the tree itself into the picker. Navigation and folding still work, so you hunt for the destination the way you would read for it — then ↵ takes whatever the cursor is on."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Task)
+            .keys(&[Key::Char('m'), Key::Down, Key::Down])
+            .scene("Landing somewhere valid", "Still picking. A project is a destination; so is the inbox, which unfiles the task. Anything else and ↵ says so rather than doing something surprising."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Project)
+            .key(Key::Char('X'))
+            .scene("Before removing", "X asks first, and the question carries the consequence — how many tasks would be displaced — because the answer changes with the row and you should not have to remember."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Task)
+            .key(Key::Char('c'))
+            .scene("Claiming", "c from a task picks the agent that takes it. From an agent row it runs the other way — pick the task it moves to, which is how one agent hands itself from one piece of work to the next."),
+    );
+
     out
+}
+
+trait TypeIn {
+    fn type_in(&mut self, text: &str) -> &mut Self;
+}
+
+impl TypeIn for Driver<'_> {
+    /// Type a value a character at a time, through the same reducer a keyboard
+    /// would reach — so a prompt that mishandles a space or a digit shows up
+    /// here rather than in a pane.
+    fn type_in(&mut self, text: &str) -> &mut Self {
+        for c in text.chars() {
+            self.key(Key::Char(c));
+        }
+        self
+    }
 }
 
 // ---- page ---------------------------------------------------------------
