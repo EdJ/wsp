@@ -83,6 +83,10 @@ pub(crate) enum Mode {
     Confirm {
         argv: Vec<String>,
         question: String,
+        /// What to offer if `argv` is refused. The panel does not decide on
+        /// your behalf that a refusal should be overridden — it puts the
+        /// refusal on screen and asks again.
+        escalate: Option<Vec<String>>,
     },
 }
 
@@ -319,16 +323,6 @@ impl Ui {
         })
     }
 
-    /// Open tasks rolled up under a project — what a removal would displace.
-    fn project_load(&self, project: &str) -> usize {
-        self.rows
-            .iter()
-            .find_map(|r| match r {
-                Row::Project { id, counts, .. } if id == project => Some(counts.open),
-                _ => None,
-            })
-            .unwrap_or(0)
-    }
 }
 
 // ---- data ---------------------------------------------------------------
@@ -1256,7 +1250,7 @@ fn spawn_events(tx: Sender<Msg>) {
 /// Output is captured, never inherited: the panel owns an alternate screen in
 /// raw mode, and a subcommand printing into it would corrupt the frame. stdin
 /// is closed so nothing can sit waiting for input the panel will never send.
-fn run_wsp(argv: &[String]) -> String {
+fn run_wsp(argv: &[String]) -> Result<String, String> {
     let exe = std::env::current_exe().unwrap_or_else(|_| "wsp".into());
     let out = Command::new(exe)
         .args(argv)
@@ -1266,13 +1260,13 @@ fn run_wsp(argv: &[String]) -> String {
         .output();
 
     match out {
-        Ok(o) if o.status.success() => argv.join(" "),
+        Ok(o) if o.status.success() => Ok(argv.join(" ")),
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             let first = err.lines().next().unwrap_or("failed").trim();
-            first.strip_prefix("wsp: ").unwrap_or(first).to_string()
+            Err(first.strip_prefix("wsp: ").unwrap_or(first).to_string())
         }
-        Err(e) => format!("cannot run wsp: {e}"),
+        Err(e) => Err(format!("cannot run wsp: {e}")),
     }
 }
 
@@ -1325,7 +1319,7 @@ pub(crate) enum Effect {
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
-    Run(Vec<String>),
+    Run { argv: Vec<String>, escalate: Option<Vec<String>> },
 }
 
 fn say(ui: &mut Ui, m: impl Into<String>) {
@@ -1364,7 +1358,7 @@ fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut buffer: Strin
                 view.reveal.insert(util::slugify(&buffer));
             }
             view.mode = Mode::Browse;
-            Effect::Run(argv)
+            Effect::Run { argv, escalate: None }
         }
         _ => Effect::None,
     }
@@ -1383,7 +1377,7 @@ fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effect {
         Key::Enter => match verb.argv(&ui.selected_target()) {
             Some(argv) => {
                 view.mode = Mode::Browse;
-                Effect::Run(argv)
+                Effect::Run { argv, escalate: None }
             }
             None => {
                 say(ui, "not a valid destination");
@@ -1406,11 +1400,17 @@ fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effect {
     }
 }
 
-fn confirm_key(k: Key, ui: &mut Ui, view: &mut View, argv: Vec<String>) -> Effect {
+fn confirm_key(
+    k: Key,
+    ui: &mut Ui,
+    view: &mut View,
+    argv: Vec<String>,
+    escalate: Option<Vec<String>>,
+) -> Effect {
     match k {
         Key::Char('y') | Key::Char('Y') => {
             view.mode = Mode::Browse;
-            Effect::Run(argv)
+            Effect::Run { argv, escalate }
         }
         Key::Char('n') | Key::Char('N') | Key::Esc | Key::Interrupt | Key::Enter => {
             view.mode = Mode::Browse;
@@ -1470,9 +1470,13 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             view.mode = Mode::Pick { verb: verb.clone() };
             pick_key(k, ui, view, verb)
         }
-        Mode::Confirm { argv, question } => {
-            view.mode = Mode::Confirm { argv: argv.clone(), question };
-            confirm_key(k, ui, view, argv)
+        Mode::Confirm { argv, question, escalate } => {
+            view.mode = Mode::Confirm {
+                argv: argv.clone(),
+                question,
+                escalate: escalate.clone(),
+            };
+            confirm_key(k, ui, view, argv, escalate)
         }
     }
 }
@@ -1651,21 +1655,23 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 view.mode = Mode::Confirm {
                     argv: vec!["rm".into(), id.clone()],
                     question: format!("retire {id}?"),
+                    escalate: None,
                 };
                 Effect::None
             }
             Target::Project(p) => {
-                // --force is what makes this succeed on a project that still
-                // holds work; the question says so, because the CLI would
-                // otherwise refuse and the panel would look broken.
-                let held = ui.project_load(p);
+                // Deliberately without --force. If the project still holds
+                // work the CLI refuses, and that refusal becomes the next
+                // question rather than something the panel quietly overrode.
                 view.mode = Mode::Confirm {
-                    argv: vec!["project".into(), "rm".into(), p.clone(), "--force".into()],
-                    question: if held > 0 {
-                        format!("remove {p}? {held} task(s) go to inbox")
-                    } else {
-                        format!("remove {p}?")
-                    },
+                    argv: vec!["project".into(), "rm".into(), p.clone()],
+                    question: format!("remove {p}?"),
+                    escalate: Some(vec![
+                        "project".into(),
+                        "rm".into(),
+                        p.clone(),
+                        "--force".into(),
+                    ]),
                 };
                 Effect::None
             }
@@ -1682,7 +1688,7 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 /// Status verbs all have the same shape: one key, a task, no input.
 fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
     match target {
-        Target::Task(id) => Effect::Run(vec![verb.to_string(), id.clone()]),
+        Target::Task(id) => Effect::Run { argv: vec![verb.to_string(), id.clone()], escalate: None },
         _ => {
             say(ui, format!("{verb} needs a task"));
             Effect::None
@@ -1729,8 +1735,20 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
                     ui.message = Some(("synced".into(), Instant::now()));
                     refetch = true;
                 }
-                Effect::Run(argv) => {
-                    say(&mut ui, run_wsp(&argv));
+                Effect::Run { argv, escalate } => {
+                    match (run_wsp(&argv), escalate) {
+                        (Ok(m), _) => say(&mut ui, m),
+                        // Refused, and there is a stronger form of the same
+                        // command: show what the CLI said and ask again.
+                        (Err(e), Some(more)) => {
+                            view.mode = Mode::Confirm {
+                                question: e,
+                                argv: more,
+                                escalate: None,
+                            };
+                        }
+                        (Err(e), None) => say(&mut ui, e),
+                    }
                     refetch = true;
                 }
             },
