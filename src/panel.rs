@@ -46,7 +46,7 @@ const INBOX_KEY: &str = "(inbox)";
 /// event loop and handed to `collect`, which is otherwise a pure function of
 /// the store plus herdr.
 #[derive(Default)]
-struct View {
+pub(crate) struct View {
     /// Projects whose children and tasks are hidden.
     collapsed: HashSet<String>,
     /// Projects (or the inbox) showing past `MAX_TASKS_PER_PROJECT`.
@@ -63,7 +63,7 @@ enum Msg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Key {
+pub(crate) enum Key {
     Up,
     Down,
     Enter,
@@ -75,7 +75,7 @@ enum Key {
 }
 
 #[derive(Debug, Clone)]
-struct AgentRef {
+pub(crate) struct AgentRef {
     pane: String,
     workspace: String,
     state: String,
@@ -115,7 +115,20 @@ impl Row {
     }
 }
 
-struct Ui {
+/// Which sort of row the cursor is on. Exposed so a script can drive to a row
+/// by asking, rather than hard-coding how many presses it takes to get there —
+/// a count that silently rots the moment a fixture gains a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowKind {
+    Project,
+    Task,
+    More,
+    Section,
+    Agent,
+    Nothing,
+}
+
+pub(crate) struct Ui {
     rows: Vec<Row>,
     agents_total: usize,
     needs: usize,
@@ -127,7 +140,55 @@ struct Ui {
     show_done: bool,
 }
 
+impl Ui {
+    pub(crate) fn selected_kind(&self) -> RowKind {
+        match self.rows.get(self.sel) {
+            Some(Row::Project { .. }) => RowKind::Project,
+            Some(Row::Task { .. }) => RowKind::Task,
+            Some(Row::More { .. }) => RowKind::More,
+            Some(Row::Section { .. }) => RowKind::Section,
+            Some(Row::Agent { .. }) => RowKind::Agent,
+            None => RowKind::Nothing,
+        }
+    }
+
+    pub(crate) fn selected_index(&self) -> usize {
+        self.sel
+    }
+}
+
 // ---- data ---------------------------------------------------------------
+
+/// Everything `collect` reads, gathered into one value.
+///
+/// `collect` used to call the store and herdr itself, which meant the only way
+/// to see a frame was to have both running. Taking the inputs as data instead
+/// lets a fixture stand one up and render it offline — the whole point of the
+/// snapshot backend.
+pub struct Snapshot {
+    pub projects: Vec<crate::model::Project>,
+    pub tasks: Vec<Task>,
+    pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
+    pub pins: std::collections::BTreeMap<String, String>,
+    pub workspaces: Vec<herdr::Workspace>,
+    pub agents: Vec<herdr::Agent>,
+}
+
+impl Snapshot {
+    /// The live path: read the store, ask herdr. A herdr that isn't answering
+    /// degrades to an empty pane list rather than an error, so the panel still
+    /// shows the durable half.
+    fn live(store: &Store) -> Snapshot {
+        Snapshot {
+            projects: store.projects(),
+            tasks: store.tasks(),
+            bindings: store.bindings(),
+            pins: store.pins(),
+            workspaces: herdr::workspaces().unwrap_or_default(),
+            agents: herdr::agents().unwrap_or_default(),
+        }
+    }
+}
 
 fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, u8, u8, String) {
     (
@@ -189,15 +250,31 @@ fn task_rows(
     }
 }
 
-fn collect(store: &Store, view: &View, self_ws: Option<&str>) -> Ui {
-    let index = Index::new(store.projects());
-    let tasks = store.tasks();
-    let counts = resolve::counts_by_project(&index, &tasks);
-    let bindings = store.bindings();
-    let pins = store.pins();
+/// Rebuild the rows from a snapshot, keeping the cursor where it was and
+/// carrying any pending message across. Shared with the storyboard so an
+/// offline flow lands on the same row a live one would.
+pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &View, self_ws: Option<&str>) {
+    let sel = ui.sel;
+    let msg = ui.message.take();
+    *ui = collect(snap, view, self_ws);
+    ui.sel = sel.min(ui.rows.len().saturating_sub(1));
+    if !ui.rows.is_empty() && !ui.rows[ui.sel].selectable() {
+        if let Some(next) = (ui.sel..ui.rows.len()).find(|i| ui.rows[*i].selectable()) {
+            ui.sel = next;
+        }
+    }
+    ui.message = msg;
+}
 
-    let workspaces = herdr::workspaces().unwrap_or_default();
-    let agents = herdr::agents().unwrap_or_default();
+pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui {
+    let index = Index::new(snap.projects.clone());
+    let tasks = snap.tasks.clone();
+    let counts = resolve::counts_by_project(&index, &tasks);
+    let bindings = &snap.bindings;
+    let pins = &snap.pins;
+
+    let workspaces = &snap.workspaces;
+    let agents = &snap.agents;
     let self_focused = self_ws
         .and_then(|id| workspaces.iter().find(|w| w.id == id))
         .map(|w| w.focused)
@@ -233,7 +310,7 @@ fn collect(store: &Store, view: &View, self_ws: Option<&str>) -> Ui {
 
     // Which projects are worth showing: any with open tasks, or a live agent.
     let mut live_by_project: std::collections::BTreeMap<String, usize> = Default::default();
-    for a in &agents {
+    for a in agents.iter() {
         let bound_project = bound_task_of_pane(&a.pane_id)
             .and_then(|id| tasks.iter().find(|t| t.id == id))
             .and_then(|t| t.project.clone());
@@ -364,123 +441,206 @@ fn collect(store: &Store, view: &View, self_ws: Option<&str>) -> Ui {
     }
 }
 
-// ---- rendering ----------------------------------------------------------
+// ---- the view model -----------------------------------------------------
 
+/// How a run of text is drawn. Kept beside the text rather than baked into it:
+/// lines used to be built with the escapes already embedded, which is why
+/// measuring one meant scanning back over them to discount the escapes. With
+/// style held separately, width is a plain char count and the same frame can
+/// go to a terminal or to a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    Plain,
+    Dim,
+    Bold,
+    Muted,
+    Accent,
+    Warn,
+}
 
-fn vis_len(s: &str) -> usize {
-    let mut n = 0;
-    let mut esc = false;
-    for c in s.chars() {
-        if esc {
-            if c == 'm' {
-                esc = false;
-            }
-        } else if c == '\x1b' {
-            esc = true;
-        } else {
-            n += 1;
+#[derive(Debug, Clone)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Line {
+    pub spans: Vec<Span>,
+    /// Drawn inverse — the selected row.
+    pub selected: bool,
+}
+
+impl Line {
+    fn push(&mut self, style: Style, text: impl Into<String>) {
+        let text = text.into();
+        if !text.is_empty() {
+            self.spans.push(Span { text, style });
         }
     }
-    n
-}
 
-fn fitline(s: &str, w: usize) -> String {
-    let len = vis_len(s);
-    if len < w {
-        format!("{s}{}", " ".repeat(w - len))
-    } else {
-        s.to_string()
+    fn width(&self) -> usize {
+        self.spans.iter().map(|s| s.text.chars().count()).sum()
+    }
+
+    fn pad(&mut self, n: usize) {
+        self.push(Style::Plain, " ".repeat(n));
+    }
+
+    /// Pad or clip to exactly `w` columns.
+    fn fit(&mut self, w: usize) {
+        let have = self.width();
+        if have < w {
+            self.pad(w - have);
+            return;
+        }
+        if have == w {
+            return;
+        }
+        let mut left = w;
+        let mut out: Vec<Span> = Vec::new();
+        for s in self.spans.drain(..) {
+            let n = s.text.chars().count();
+            if n <= left {
+                left -= n;
+                out.push(s);
+            } else {
+                out.push(Span { text: s.text.chars().take(left).collect(), style: s.style });
+                break;
+            }
+        }
+        self.spans = out;
+    }
+
+    /// Style stripped — what the row says. For assertions, once the storyboard
+    /// grows checks as well as frames.
+    #[allow(dead_code)]
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|s| s.text.as_str()).collect()
     }
 }
 
-fn state_icon(state: &str) -> String {
+fn line(style: Style, text: impl Into<String>) -> Line {
+    let mut l = Line::default();
+    l.push(style, text);
+    l
+}
+
+fn state_dot(state: &str) -> (Style, &'static str) {
     match state {
-        "working" => format!("{ACCENT}●{OFF}"),
-        "idle" => format!("{MUTED}○{OFF}"),
-        _ => format!("{DIMC}·{OFF}"),
+        "working" => (Style::Accent, "●"),
+        "idle" => (Style::Muted, "○"),
+        _ => (Style::Dim, "·"),
     }
 }
 
-fn render_row(row: &Row, w: usize, num: Option<u8>) -> String {
+fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
+    let mut l = Line::default();
     match row {
         Row::Project { id, depth, counts, collapsed, live } => {
-            let indent = " ".repeat(*depth);
-            let caret = if *collapsed { "▸" } else { "▾" };
-            let left = format!("{indent}{DIMC}{caret}{OFF} {BOLD}{id}{OFF}");
+            l.pad(*depth);
+            l.push(Style::Dim, if *collapsed { "▸" } else { "▾" });
+            l.push(Style::Plain, " ");
+            l.push(Style::Bold, id.clone());
 
             // A done-ratio bar reads as empty until work starts landing, so the
             // right-hand column carries live workload instead: open, in flight,
             // blocked.
-            let mut parts: Vec<String> = Vec::new();
+            let mut right = Line::default();
+            let gap_before = |r: &mut Line| {
+                if !r.spans.is_empty() {
+                    r.push(Style::Plain, " ");
+                }
+            };
             if counts.open > 0 {
-                parts.push(format!("{DIMC}{}{OFF}", counts.open));
+                gap_before(&mut right);
+                right.push(Style::Dim, counts.open.to_string());
             }
             if counts.doing > 0 {
-                parts.push(format!("{ACCENT}▸{}{OFF}", counts.doing));
+                gap_before(&mut right);
+                right.push(Style::Accent, format!("▸{}", counts.doing));
             }
             if counts.blocked > 0 {
-                parts.push(format!("{WARN}■{}{OFF}", counts.blocked));
+                gap_before(&mut right);
+                right.push(Style::Warn, format!("■{}", counts.blocked));
             }
             if counts.done > 0 && counts.open == 0 {
-                parts.push(format!("{DIMC}✓{OFF}"));
+                gap_before(&mut right);
+                right.push(Style::Dim, "✓");
             }
             if *live > 0 {
-                parts.push(format!("{ACCENT}●{live}{OFF}"));
+                gap_before(&mut right);
+                right.push(Style::Accent, format!("●{live}"));
             }
-            let right = parts.join(" ");
-            let gap = w.saturating_sub(vis_len(&left) + vis_len(&right)).max(1);
-            format!("{left}{}{right}", " ".repeat(gap))
+            l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+            l.spans.extend(right.spans);
         }
         Row::Task { title, depth, status, agent, needs_you, .. } => {
-            let indent = " ".repeat(*depth);
-            let lead = match agent {
-                Some(a) => state_icon(&a.state),
+            match num {
+                Some(n) => l.push(Style::Dim, n.to_string()),
+                None => l.push(Style::Plain, " "),
+            }
+            l.pad(*depth);
+            l.push(Style::Plain, " ");
+            match agent {
+                Some(a) => {
+                    let (st, dot) = state_dot(&a.state);
+                    l.push(st, dot);
+                }
                 None => match status {
-                    Status::Blocked => format!("{WARN}■{OFF}"),
-                    Status::Review => format!("{MUTED}◆{OFF}"),
-                    Status::Done => format!("{DIMC}✓{OFF}"),
-                    _ => format!("{DIMC}·{OFF}"),
+                    Status::Blocked => l.push(Style::Warn, "■"),
+                    Status::Review => l.push(Style::Muted, "◆"),
+                    Status::Done => l.push(Style::Dim, "✓"),
+                    _ => l.push(Style::Dim, "·"),
                 },
-            };
-            let key = match num {
-                Some(n) => format!("{DIMC}{n}{OFF}"),
-                None => " ".into(),
-            };
-            let flag = if *needs_you { format!(" {WARN}←{OFF}") } else { String::new() };
-            let avail = w.saturating_sub(vis_len(&indent) + 5 + vis_len(&flag));
+            }
+            l.push(Style::Plain, " ");
+            let flag_w = if *needs_you { 2 } else { 0 };
+            let avail = w.saturating_sub(*depth + 5 + flag_w);
             let body = util::truncate(title, avail.max(4));
-            let colour = if *needs_you {
-                WARN
+            let style = if *needs_you {
+                Style::Warn
             } else if *status == Status::Done {
-                DIMC
+                Style::Dim
             } else if agent.is_some() {
-                ""
+                Style::Plain
             } else {
-                MUTED
+                Style::Muted
             };
-            format!("{key}{indent} {lead} {colour}{body}{OFF}{flag}")
+            l.push(style, body);
+            if *needs_you {
+                l.push(Style::Warn, " ←");
+            }
         }
         Row::More { depth, n, .. } => {
-            let indent = " ".repeat(*depth);
-            format!(" {indent} {DIMC}⋯{OFF} {MUTED}{n} more{OFF}")
+            l.push(Style::Plain, " ");
+            l.pad(*depth);
+            l.push(Style::Plain, " ");
+            l.push(Style::Dim, "⋯");
+            l.push(Style::Plain, " ");
+            l.push(Style::Muted, format!("{n} more"));
         }
-        Row::Section { label } => format!("{DIMC}{label}{OFF}"),
+        Row::Section { label } => l.push(Style::Dim, label.clone()),
         Row::Agent { agent, title } => {
-            let key = match num {
-                Some(n) => format!("{DIMC}{n}{OFF}"),
-                None => " ".into(),
-            };
-            let icon = state_icon(&agent.state);
-            let left = format!("{key} {icon} {MUTED}{}{OFF}", util::truncate(title, w.saturating_sub(6).max(4)));
-            let right = format!("{DIMC}{}{OFF}", util::truncate(&agent.where_, 10));
-            let gap = w.saturating_sub(vis_len(&left) + vis_len(&right));
+            match num {
+                Some(n) => l.push(Style::Dim, n.to_string()),
+                None => l.push(Style::Plain, " "),
+            }
+            l.push(Style::Plain, " ");
+            let (st, dot) = state_dot(&agent.state);
+            l.push(st, dot);
+            l.push(Style::Plain, " ");
+            l.push(Style::Muted, util::truncate(title, w.saturating_sub(6).max(4)));
+
+            let right = line(Style::Dim, util::truncate(&agent.where_, 10));
+            let gap = w.saturating_sub(l.width() + right.width());
             if gap >= 2 {
-                format!("{left}{}{right}", " ".repeat(gap))
-            } else {
-                left
+                l.pad(gap);
+                l.spans.extend(right.spans);
             }
         }
     }
+    l
 }
 
 /// Digits 1-9 address rows that lead somewhere: a terminal.
@@ -498,19 +658,25 @@ fn hotkeys(rows: &[Row]) -> Vec<Option<u8>> {
     out
 }
 
-fn render(ui: &Ui, w: usize, h: usize) -> String {
-    let mut lines: Vec<String> = Vec::new();
+/// The whole panel as styled lines. No escapes, no terminal — a backend turns
+/// this into something you can look at.
+pub(crate) fn frame(ui: &Ui, w: usize, h: usize) -> Vec<Line> {
+    let mut lines: Vec<Line> = Vec::new();
 
-    let needs = if ui.needs > 0 {
-        format!("{WARN}{} ←{OFF}", ui.needs)
+    let mut head = Line::default();
+    head.push(Style::Bold, "wsp");
+    head.push(Style::Plain, " ");
+    head.push(Style::Dim, "·");
+    head.push(Style::Plain, format!(" {} ", ui.agents_total));
+    head.push(Style::Dim, "agents ·");
+    head.push(Style::Plain, " ");
+    if ui.needs > 0 {
+        head.push(Style::Warn, format!("{} ←", ui.needs));
     } else {
-        format!("{DIMC}·{OFF}")
-    };
-    lines.push(format!(
-        "{BOLD}wsp{OFF} {DIMC}·{OFF} {} {DIMC}agents ·{OFF} {}",
-        ui.agents_total, needs
-    ));
-    lines.push(format!("{DIMC}{}{OFF}", "─".repeat(w)));
+        head.push(Style::Dim, "·");
+    }
+    lines.push(head);
+    lines.push(line(Style::Dim, "─".repeat(w)));
 
     let footer_rows = 3;
     let body_rows = h.saturating_sub(lines.len() + footer_rows);
@@ -523,37 +689,120 @@ fn render(ui: &Ui, w: usize, h: usize) -> String {
     }
 
     for (i, row) in ui.rows.iter().enumerate().skip(scroll).take(body_rows) {
-        let text = render_row(row, w, keys[i]);
-        if i == ui.sel {
-            lines.push(format!("{INV}{}{OFF}", fitline(&text, w)));
-        } else {
-            lines.push(text);
-        }
+        let mut l = render_row(row, w, keys[i]);
+        l.selected = i == ui.sel;
+        lines.push(l);
     }
     while lines.len() < h.saturating_sub(footer_rows) {
-        lines.push(String::new());
+        lines.push(Line::default());
     }
 
-    lines.push(format!("{DIMC}{}{OFF}", "─".repeat(w)));
-    let blocked = if ui.blocked > 0 {
-        format!("{WARN}blocked {}{OFF}", ui.blocked)
+    lines.push(line(Style::Dim, "─".repeat(w)));
+
+    let mut foot = Line::default();
+    foot.push(Style::Dim, "inbox");
+    foot.push(Style::Plain, format!(" {}  ", ui.inbox));
+    if ui.blocked > 0 {
+        foot.push(Style::Warn, format!("blocked {}", ui.blocked));
     } else {
-        format!("{DIMC}blocked 0{OFF}")
-    };
-    let done = if ui.show_done { format!("  {ACCENT}+done{OFF}") } else { String::new() };
-    lines.push(format!("{DIMC}inbox{OFF} {}  {}{}", ui.inbox, blocked, done));
+        foot.push(Style::Dim, "blocked 0");
+    }
+    if ui.show_done {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Accent, "+done");
+    }
+    lines.push(foot);
+
     match &ui.message {
         Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
-            lines.push(format!("{ACCENT}{}{OFF}", util::truncate(m, w)))
+            lines.push(line(Style::Accent, util::truncate(m, w)))
         }
-        _ => lines.push(format!("{DIMC}1-9 go  ↵ open  ←→ fold  A done  q{OFF}")),
+        _ => lines.push(line(Style::Dim, "1-9 go  ↵ open  ←→ fold  A done  q")),
     }
 
-    let mut out = String::from("\x1b[H\x1b[2J");
-    for (i, l) in lines.iter().take(h).enumerate() {
-        out.push_str(&format!("\x1b[{};1H", i + 1));
-        out.push_str(&fitline(l, w));
+    lines.truncate(h);
+    lines
+}
+
+// ---- backends -----------------------------------------------------------
+
+fn ansi_of(style: Style) -> &'static str {
+    match style {
+        Style::Plain => "",
+        Style::Dim => DIMC,
+        Style::Bold => BOLD,
+        Style::Muted => MUTED,
+        Style::Accent => ACCENT,
+        Style::Warn => WARN,
     }
+}
+
+/// What the live panel prints.
+///
+/// Inverse is re-asserted per span rather than wrapped around the row: every
+/// span ends with a reset, and a reset clears inverse too, so a single opening
+/// `INV` only ever highlighted a selected row up to its first styled run.
+pub(crate) fn to_ansi(frame: &[Line], w: usize, h: usize) -> String {
+    let mut out = String::from("\x1b[H\x1b[2J");
+    for (i, l) in frame.iter().take(h).enumerate() {
+        out.push_str(&format!("\x1b[{};1H", i + 1));
+        let mut l = l.clone();
+        l.fit(w);
+        for s in &l.spans {
+            if l.selected {
+                out.push_str(INV);
+            }
+            out.push_str(ansi_of(s.style));
+            out.push_str(&s.text);
+            out.push_str(OFF);
+        }
+    }
+    out
+}
+
+fn class_of(style: Style) -> &'static str {
+    match style {
+        Style::Plain => "p",
+        Style::Dim => "d",
+        Style::Bold => "b",
+        Style::Muted => "m",
+        Style::Accent => "a",
+        Style::Warn => "w",
+    }
+}
+
+fn esc_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The same frame as a block of styled spans. The panel is text, so this is
+/// not an approximation of the terminal — it is the same cells with the same
+/// colours, and it costs no font work and no new dependency.
+pub(crate) fn to_html(frame: &[Line], w: usize) -> String {
+    let mut out = String::from("<pre class=\"wsp\">");
+    for l in frame {
+        let mut l = l.clone();
+        l.fit(w);
+        out.push_str(if l.selected { "<span class=\"sel\">" } else { "<span>" });
+        for s in &l.spans {
+            out.push_str(&format!(
+                "<span class=\"{}\">{}</span>",
+                class_of(s.style),
+                esc_html(&s.text)
+            ));
+        }
+        out.push_str("</span>\n");
+    }
+    out.push_str("</pre>");
     out
 }
 
@@ -698,9 +947,125 @@ pub fn run(store: &Store) -> i32 {
     code
 }
 
+/// What a key asked for beyond changing the view.
+pub(crate) enum Effect {
+    None,
+    Refetch,
+    Focus(AgentRef),
+    Sync,
+}
+
+/// The reducer. Deliberately free of I/O — it moves the selection and the fold
+/// state and reports what else it wants done, so the storyboard can drive the
+/// same transitions the terminal does and get the same frames out.
+pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
+    let n = ui.rows.len();
+    match k {
+        Key::Down => {
+            let mut i = ui.sel;
+            while i + 1 < n {
+                i += 1;
+                if ui.rows[i].selectable() {
+                    break;
+                }
+            }
+            ui.sel = i;
+            Effect::None
+        }
+        Key::Up => {
+            let mut i = ui.sel;
+            while i > 0 {
+                i -= 1;
+                if ui.rows[i].selectable() {
+                    break;
+                }
+            }
+            ui.sel = i;
+            Effect::None
+        }
+        Key::Left | Key::Right => match ui.rows.get(ui.sel) {
+            Some(Row::Project { id, .. }) => {
+                if k == Key::Left {
+                    view.collapsed.insert(id.clone());
+                    // Folding a project forgets that it was showing its long
+                    // tail, so unfolding starts clean.
+                    view.expanded.remove(id);
+                } else {
+                    view.collapsed.remove(id);
+                }
+                Effect::Refetch
+            }
+            Some(Row::More { key, .. }) if k == Key::Right => {
+                view.expanded.insert(key.clone());
+                Effect::Refetch
+            }
+            _ => Effect::None,
+        },
+        Key::Enter => match ui.rows.get(ui.sel) {
+            Some(Row::Project { id, collapsed: c, .. }) => {
+                if *c {
+                    view.collapsed.remove(id);
+                } else {
+                    view.collapsed.insert(id.clone());
+                    view.expanded.remove(id);
+                }
+                Effect::Refetch
+            }
+            Some(Row::More { key, .. }) => {
+                view.expanded.insert(key.clone());
+                Effect::Refetch
+            }
+            Some(row) => match row.agent() {
+                Some(a) => Effect::Focus(a.clone()),
+                None => {
+                    ui.message = Some(("no agent on that task".into(), Instant::now()));
+                    Effect::None
+                }
+            },
+            None => Effect::None,
+        },
+        Key::Digit(d) => {
+            let keys = hotkeys(&ui.rows);
+            match keys
+                .iter()
+                .position(|k| *k == Some(d))
+                .and_then(|i| ui.rows[i].agent())
+            {
+                Some(a) => Effect::Focus(a.clone()),
+                None => Effect::None,
+            }
+        }
+        Key::Char('g') => {
+            ui.sel = 0;
+            Effect::None
+        }
+        Key::Char('G') => {
+            ui.sel = n.saturating_sub(1);
+            Effect::None
+        }
+        Key::Char('A') => {
+            view.show_done = !view.show_done;
+            ui.message = Some((
+                if view.show_done { "showing done" } else { "hiding done" }.into(),
+                Instant::now(),
+            ));
+            Effect::Refetch
+        }
+        Key::Char('r') => Effect::Sync,
+        Key::Char('?') => {
+            ui.message = Some((
+                "j/k move · ↵ fold/open · 1-9 jump · A done · r sync · q quit".into(),
+                Instant::now(),
+            ));
+            Effect::None
+        }
+        _ => Effect::None,
+    }
+}
+
 fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
     let mut view = View::default();
-    let mut ui = collect(store, &view, self_ws);
+    let mut ui = collect(&Snapshot::live(store), &view, self_ws);
     let mut last = String::new();
     let mut dirty = false;
     let mut last_fetch = Instant::now();
@@ -708,11 +1073,11 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
 
     let draw = |ui: &Ui, last: &mut String| {
         let (w, h) = term_size();
-        let frame = render(ui, w, h);
-        if frame != *last {
-            print!("{frame}");
+        let painted = to_ansi(&frame(ui, w, h), w, h);
+        if painted != *last {
+            print!("{painted}");
             let _ = std::io::stdout().flush();
-            *last = frame;
+            *last = painted;
         }
     };
     draw(&ui, &mut last);
@@ -727,102 +1092,17 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
         let mut refetch = false;
         match msg {
             Msg::Key(Key::Quit) => return 0,
-            Msg::Key(k) => {
-                let n = ui.rows.len();
-                match k {
-                    Key::Down => {
-                        let mut i = ui.sel;
-                        while i + 1 < n {
-                            i += 1;
-                            if ui.rows[i].selectable() {
-                                break;
-                            }
-                        }
-                        ui.sel = i;
-                    }
-                    Key::Up => {
-                        let mut i = ui.sel;
-                        while i > 0 {
-                            i -= 1;
-                            if ui.rows[i].selectable() {
-                                break;
-                            }
-                        }
-                        ui.sel = i;
-                    }
-                    Key::Left | Key::Right => match ui.rows.get(ui.sel) {
-                        Some(Row::Project { id, .. }) => {
-                            if k == Key::Left {
-                                view.collapsed.insert(id.clone());
-                                // Folding a project forgets that it was showing
-                                // its long tail, so unfolding starts clean.
-                                view.expanded.remove(id);
-                            } else {
-                                view.collapsed.remove(id);
-                            }
-                            refetch = true;
-                        }
-                        Some(Row::More { key, .. }) if k == Key::Right => {
-                            view.expanded.insert(key.clone());
-                            refetch = true;
-                        }
-                        _ => {}
-                    },
-                    Key::Enter => match ui.rows.get(ui.sel) {
-                        Some(Row::Project { id, collapsed: c, .. }) => {
-                            if *c {
-                                view.collapsed.remove(id);
-                            } else {
-                                view.collapsed.insert(id.clone());
-                                view.expanded.remove(id);
-                            }
-                            refetch = true;
-                        }
-                        Some(Row::More { key, .. }) => {
-                            view.expanded.insert(key.clone());
-                            refetch = true;
-                        }
-                        Some(row) => match row.agent() {
-                            Some(a) => focus(a),
-                            None => {
-                                ui.message = Some(("no agent on that task".into(), Instant::now()))
-                            }
-                        },
-                        None => {}
-                    },
-                    Key::Digit(d) => {
-                        let keys = hotkeys(&ui.rows);
-                        if let Some(i) = keys.iter().position(|k| *k == Some(d)) {
-                            if let Some(a) = ui.rows[i].agent() {
-                                focus(a);
-                            }
-                        }
-                    }
-                    Key::Char('g') => ui.sel = 0,
-                    Key::Char('G') => ui.sel = n.saturating_sub(1),
-                    Key::Char('A') => {
-                        view.show_done = !view.show_done;
-                        ui.message = Some((
-                            if view.show_done { "showing done" } else { "hiding done" }.into(),
-                            Instant::now(),
-                        ));
-                        refetch = true;
-                    }
-                    Key::Char('r') => {
-                        let mut cache = crate::sync::Cache::default();
-                        let _ = crate::sync::sync(store, &mut cache, true);
-                        ui.message = Some(("synced".into(), Instant::now()));
-                        refetch = true;
-                    }
-                    Key::Char('?') => {
-                        ui.message = Some((
-                            "j/k move · ↵ fold/open · 1-9 jump · A done · r sync · q quit".into(),
-                            Instant::now(),
-                        ))
-                    }
-                    _ => {}
+            Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
+                Effect::None => {}
+                Effect::Refetch => refetch = true,
+                Effect::Focus(a) => focus(&a),
+                Effect::Sync => {
+                    let mut cache = crate::sync::Cache::default();
+                    let _ = crate::sync::sync(store, &mut cache, true);
+                    ui.message = Some(("synced".into(), Instant::now()));
+                    refetch = true;
                 }
-            }
+            },
             Msg::Herdr(ws) => {
                 // An event naming our own workspace means we are probably about
                 // to be looked at: redraw now. Otherwise mark dirty and let the
@@ -853,16 +1133,7 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
         if refetch {
             last_fetch = Instant::now();
             last_fingerprint = store.fingerprint();
-            let sel = ui.sel;
-            let msg = ui.message.take();
-            ui = collect(store, &view, self_ws);
-            ui.sel = sel.min(ui.rows.len().saturating_sub(1));
-            if !ui.rows.is_empty() && !ui.rows[ui.sel].selectable() {
-                if let Some(next) = (ui.sel..ui.rows.len()).find(|i| ui.rows[*i].selectable()) {
-                    ui.sel = next;
-                }
-            }
-            ui.message = msg;
+            refetch_into(&mut ui, &Snapshot::live(store), &view, self_ws);
         }
         draw(&ui, &mut last);
     }

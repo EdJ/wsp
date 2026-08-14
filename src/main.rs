@@ -16,6 +16,7 @@ mod herdr;
 mod model;
 mod panel;
 mod resolve;
+mod story;
 mod store;
 mod sync;
 mod util;
@@ -184,6 +185,7 @@ fn main() {
         "panel" => match args.rest.first().map(|s| s.as_str()) {
             Some("install") => panel::install(&store, &args),
             Some("uninstall" | "remove") => panel::uninstall(&store, &args),
+            Some("storyboard") => story::run(&args),
             _ => panel::run(&store),
         },
 
