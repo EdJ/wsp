@@ -215,6 +215,10 @@ pub struct Resolution {
     pub source: &'static str,
 }
 
+/// Pin value meaning "deliberately no project". Distinct from an absent pin,
+/// which only means nothing has been decided.
+pub const TOP_LEVEL: &str = "(top)";
+
 pub fn resolve(
     index: &Index,
     pins: &BTreeMap<String, String>,
@@ -225,6 +229,9 @@ pub fn resolve(
 ) -> Resolution {
     if let Some(ws) = workspace_id {
         if let Some(p) = pins.get(ws) {
+            if p == TOP_LEVEL {
+                return Resolution { project: None, source: "top" };
+            }
             if index.get(p).is_some() {
                 return Resolution { project: Some(p.clone()), source: "pin" };
             }

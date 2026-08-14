@@ -25,7 +25,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
-    "json", "all", "force", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
+    "json", "all", "force", "top", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here",
 ];
 
@@ -183,6 +183,7 @@ fn main() {
         "sync" => cmd_agent::sync_once(&store, &args),
         "hook" => cmd_agent::hook(&store, &args),
         "doctor" => cmd_agent::doctor(&store, &args),
+        "adopt" => cmd_agent::adopt(&store, &args),
         "reconcile" => {
             let n = cmd_agent::reconcile(&store);
             println!("reconciled {n} binding(s) from claims");
@@ -237,6 +238,7 @@ fn help() {
   wsp claim <id>                    bind this pane to a task
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project
+  wsp pin --top [-w ws]             pin it outside the tree entirely
   wsp where                         what project am I in, and why
   wsp wip                           everything in flight, with agents
 
@@ -249,6 +251,7 @@ fn help() {
   wsp hook <event>                  herdr event-hook entrypoint
   wsp doctor                        integrity check
   wsp reconcile                     rebuild bindings from claims
+  wsp adopt [--yes]                 turn live workspaces into tasks
 
 Ids accept a bare suffix (003) or a unique title substring.
 Every command takes --json. Set WSP_HOME to relocate the store."#,

@@ -272,8 +272,25 @@ pub fn release(store: &Store, args: &Args) -> i32 {
 }
 
 pub fn pin(store: &Store, args: &Args) -> i32 {
+    // `--top` marks a workspace as belonging to no project on purpose: the
+    // home for whatever runs the whole space, and for terminals that are not
+    // work. Without it, "no project" only ever means "nothing resolved", and
+    // the two are not the same thing.
+    if args.has("top") {
+        let Some(ws) = args.get("workspace").or_else(|| herdr::Env::read().workspace_id) else {
+            eprintln!("wsp: no workspace — pass -w, or run inside herdr");
+            return 2;
+        };
+        store.set_pin(&ws, crate::resolve::TOP_LEVEL);
+        if args.json() {
+            println!("{}", json!({ "workspace": ws, "project": null, "top": true }));
+        } else {
+            println!("workspace {ws} pinned outside the project tree");
+        }
+        return 0;
+    }
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp pin <project> [-w workspace]");
+        eprintln!("usage: wsp pin <project> [-w workspace] | wsp pin --top");
         return 2;
     };
     let index = Index::new(store.projects());
@@ -689,4 +706,118 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     } else {
         1
     }
+}
+
+/// Turn live herdr workspaces into tasks the store knows about.
+///
+/// The old workspaces carry their meaning in a hand-typed label — "Trance
+/// Video", "TET -> EIN" — and nowhere else. Closing them without reading them
+/// first throws away the only record that the work exists. So: for every
+/// workspace with no claim on it, propose a task in whichever project the
+/// label or the cwd points at, and claim it there.
+///
+/// Prints a plan and does nothing unless `--yes`.
+pub fn adopt(store: &Store, args: &Args) -> i32 {
+    if !herdr::available() {
+        eprintln!("wsp: no herdr socket");
+        return 1;
+    }
+    let index = Index::new(store.projects());
+    let pins = store.pins();
+    let claims = store.claims();
+    let workspaces = herdr::workspaces().unwrap_or_default();
+    let panes = herdr::panes().unwrap_or_default();
+    let apply = args.has("yes");
+
+    // A label that is only the folder's name says nothing the cwd does not.
+    let uninformative = |label: &str, cwd: &str| -> bool {
+        let leaf = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        label.eq_ignore_ascii_case(leaf) || label.is_empty()
+    };
+
+    let mut plan: Vec<(String, String, Option<String>, String)> = Vec::new();
+    for w in &workspaces {
+        let ws_panes: Vec<&herdr::Pane> = panes
+            .iter()
+            .filter(|p| p.workspace_id == w.id && p.label != crate::panel::PANEL_LABEL)
+            .collect();
+        let Some(pane) = ws_panes.first() else { continue };
+        if claims.values().any(|c| c.get("workspace_id").and_then(|x| x.as_str()) == Some(&w.id)) {
+            continue;
+        }
+        if uninformative(&w.label, &pane.cwd) {
+            continue;
+        }
+        // A workspace deliberately outside the tree is not work to adopt.
+        if pins.get(&w.id).map(|p| p == crate::resolve::TOP_LEVEL).unwrap_or(false) {
+            continue;
+        }
+        // Label first here, deliberately: the folder is shared by ten
+        // workspaces and the label is the only thing that separates them.
+        let project = index
+            .project_for_label(&w.label)
+            .or_else(|| index.project_for_cwd(&pane.cwd))
+            .or_else(|| {
+                resolve::resolve(&index, &pins, None, Some(&w.id), Some(&w.label), Some(&pane.cwd))
+                    .project
+            });
+        plan.push((w.id.clone(), w.label.clone(), project, pane.pane_id.clone()));
+    }
+
+    if plan.is_empty() {
+        println!("nothing to adopt — every workspace is claimed or unnamed");
+        return 0;
+    }
+
+    let p = Paint::new();
+    for (ws, label, project, _) in &plan {
+        println!(
+            "{}  {}  {}",
+            p.dim(&util::pad(ws, 4)),
+            util::pad(label, 22),
+            p.dim(project.as_deref().unwrap_or("(inbox)"))
+        );
+    }
+    if !apply {
+        println!("\n{} workspace(s). Re-run with --yes to create the tasks and claim them.", plan.len());
+        return 0;
+    }
+
+    let mut made = 0;
+    for (ws, label, project, pane) in &plan {
+        let Ok(id) = store.alloc_task_id() else { continue };
+        let mut t = crate::model::Task::new(label, &id);
+        t.project = project.clone();
+        t.set_status(Status::Doing);
+        t.log(&format!("adopted from herdr workspace {ws}"));
+        if store.save_task(&t).is_err() {
+            continue;
+        }
+        store.set_claim(
+            &t.id,
+            json!({
+                "workspace_id": ws,
+                "workspace_label": label,
+                "cwd": panes.iter().find(|p| &p.pane_id == pane).map(|p| p.cwd.clone()).unwrap_or_default(),
+                "host": util::hostname(),
+                "claimed_at": util::now_iso(),
+            }),
+        );
+        store.set_binding(
+            pane,
+            json!({
+                "task_id": t.id,
+                "pane_id": pane,
+                "workspace_id": ws,
+                "cwd": "",
+                "started_at": util::now_iso(),
+                "adopted": true,
+            }),
+        );
+        store.log_event("task-adopted", json!({ "id": t.id, "workspace": ws, "label": label }));
+        made += 1;
+    }
+    store.git_commit(&format!("wsp: adopt {made} workspace(s)"));
+    println!("adopted {made} workspace(s)");
+    0
 }

@@ -154,6 +154,22 @@ panel runs. No herdr, no store, no terminal — useful for arguing about the
 design before building it. The legend above is generated from the same glyph
 constants and `Style` values the rows draw with, so it cannot drift.
 
+## Adopting what is already open
+
+```sh
+wsp pin --top -w w0     # this workspace is not work; keep it out of the tree
+wsp adopt               # what would be captured
+wsp adopt --yes         # make the tasks and claim them
+```
+
+A workspace carries its meaning in a hand-typed label — `Trance Video`,
+`TET -> EIN` — and nowhere else. `adopt` reads those, makes a task per
+workspace in whichever project the *label* points at, and claims it there.
+Label first is deliberate: ten workspaces share `~/claude/vst`, so cwd
+collapses them all onto `vst` and only the label separates trance from ein
+from verb. Workspaces whose label is just the folder name are skipped, as are
+ones already claimed and ones pinned `--top`.
+
 Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
 `$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
