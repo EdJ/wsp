@@ -1,0 +1,67 @@
+id = "edjames.wsp"
+name = "wsp"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Projects, tags and tasks for herdr — sidebar counts, agent↔task binding."
+platforms = ["macos", "linux"]
+
+# One long-lived process: herdr events + store polling -> metadata tokens.
+[[startup]]
+command = ["./run.sh", "daemon"]
+
+# Cheap, idempotent re-syncs on the events that change the picture.
+[[events]]
+on = "workspace.created"
+command = ["./run.sh", "hook", "workspace.created"]
+
+[[events]]
+on = "workspace.closed"
+command = ["./run.sh", "hook", "workspace.closed"]
+
+[[events]]
+on = "workspace.renamed"
+command = ["./run.sh", "hook", "workspace.renamed"]
+
+[[events]]
+on = "pane.exited"
+command = ["./run.sh", "hook", "pane.exited"]
+
+[[events]]
+on = "worktree.created"
+command = ["./run.sh", "hook", "worktree.created"]
+
+[[panes]]
+id = "wip"
+title = "wsp: work in progress"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["./run.sh", "pane-wip"]
+
+[[panes]]
+id = "tree"
+title = "wsp: projects"
+placement = "popup"
+width = "60%"
+height = "70%"
+command = ["./run.sh", "pane-tree"]
+
+[[panes]]
+id = "inbox"
+title = "wsp: inbox"
+placement = "popup"
+width = "60%"
+height = "50%"
+command = ["./run.sh", "pane-inbox"]
+
+[[actions]]
+id = "sync"
+title = "wsp: sync sidebar"
+contexts = ["workspace"]
+command = ["./run.sh", "sync"]
+
+[[actions]]
+id = "where"
+title = "wsp: where am I"
+contexts = ["workspace"]
+command = ["./run.sh", "pane-where"]
