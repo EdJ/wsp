@@ -37,12 +37,17 @@ const INV: &str = "\x1b[7m";
 const OFF: &str = "\x1b[0m";
 
 const MAX_TASKS_PER_PROJECT: usize = 6;
+const MAX_PANES_PER_PROJECT: usize = 4;
 
 /// Stand in for the groups that are not projects, wherever a project id is used
 /// as a key. Project ids are slugs, so the parentheses keep these out of their
 /// namespace.
 const INBOX_KEY: &str = "(inbox)";
-const UNATTACHED_KEY: &str = "(unattached)";
+const NOPROJECT_KEY: &str = "(noproject)";
+
+/// herdr's label on the panes we install. Ours are furniture and never appear
+/// in the tree as work.
+pub(crate) const PANEL_LABEL: &str = "wsp";
 
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
 /// event loop and handed to `collect`, which is otherwise a pure function of
@@ -198,7 +203,11 @@ pub(crate) struct AgentRef {
     pane: String,
     workspace: String,
     state: String,
+    /// What to call it: the agent's terminal title if there is one, otherwise
+    /// the workspace label.
     where_: String,
+    /// Whether an agent is running here, or it is just a shell.
+    agent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +231,7 @@ enum Row {
     /// A group that is not a project: the inbox, loose agents. `key` names it
     /// so it can be folded and so a command can be aimed at it.
     Section { key: String, label: String, count: usize, collapsed: bool },
-    Agent { agent: AgentRef, title: String },
+    Agent { agent: AgentRef, title: String, depth: usize },
 }
 
 impl Row {
@@ -231,9 +240,11 @@ impl Row {
     fn selectable(&self) -> bool {
         true
     }
+    /// The pane this row *is*. A task that has one is not it — the pane sits
+    /// on its own row directly beneath, and letting both answer meant two
+    /// hotkeys landing on the same terminal.
     fn agent(&self) -> Option<&AgentRef> {
         match self {
-            Row::Task { agent: Some(a), .. } => Some(a),
             Row::Agent { agent, .. } => Some(agent),
             _ => None,
         }
@@ -293,7 +304,7 @@ impl Ui {
             Some(Row::Task { id, .. }) => Target::Task(id.clone()),
             Some(Row::More { key, .. }) => Target::Overflow(key.clone()),
             Some(Row::Agent { agent, .. }) => Target::Pane(agent.pane.clone()),
-            Some(Row::Section { key, .. }) if key == UNATTACHED_KEY => Target::Unattached,
+            Some(Row::Section { key, .. }) if key == NOPROJECT_KEY => Target::Unattached,
             Some(Row::Section { key, .. }) if key == INBOX_KEY => Target::Inbox,
             Some(Row::Section { .. }) => Target::Nothing,
             None => Target::Nothing,
@@ -339,7 +350,7 @@ pub struct Snapshot {
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub pins: std::collections::BTreeMap<String, String>,
     pub workspaces: Vec<herdr::Workspace>,
-    pub agents: Vec<herdr::Agent>,
+    pub panes: Vec<herdr::Pane>,
 }
 
 impl Snapshot {
@@ -353,7 +364,7 @@ impl Snapshot {
             bindings: store.bindings(),
             pins: store.pins(),
             workspaces: herdr::workspaces().unwrap_or_default(),
-            agents: herdr::agents().unwrap_or_default(),
+            panes: herdr::panes().unwrap_or_default(),
         }
     }
 }
@@ -413,6 +424,17 @@ fn task_rows(
             agent: a.clone(),
             needs_you: *needs_you,
         });
+        // The pane working it hangs beneath, so the join is visible and the
+        // task keeps its own status glyph instead of surrendering it to the
+        // agent's — a claimed task used to look identical whether it was todo
+        // or doing.
+        if let Some(a) = a {
+            rows.push(Row::Agent {
+                title: a.where_.clone(),
+                agent: a.clone(),
+                depth: depth + 1,
+            });
+        }
     }
     if mine.len() > shown {
         rows.push(Row::More { key: key.to_string(), depth, n: mine.len() - shown });
@@ -443,7 +465,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     let pins = &snap.pins;
 
     let workspaces = &snap.workspaces;
-    let agents = &snap.agents;
+    // Our own panels are furniture, not work. Everything else is a pane
+    // someone opened, agent or not — a shell sitting in a project is a fact
+    // about that project whether or not an agent ever attaches to it.
+    let panes: Vec<&herdr::Pane> =
+        snap.panes.iter().filter(|p| p.label != PANEL_LABEL).collect();
     let self_focused = self_ws
         .and_then(|id| workspaces.iter().find(|w| w.id == id))
         .map(|w| w.focused)
@@ -461,39 +487,56 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             .and_then(|t| t.as_str())
             .map(|s| s.to_string())
     };
-    // task id -> the agent working it
+    let as_ref = |a: &herdr::Pane| AgentRef {
+        pane: a.pane_id.clone(),
+        workspace: a.workspace_id.clone(),
+        state: a.agent_status.clone(),
+        where_: if a.title.is_empty() { ws_label(&a.workspace_id) } else { a.title.clone() },
+        agent: !a.agent.is_empty(),
+    };
+
+    // task id -> the pane claimed to it
     let agent_for_task = |task_id: &str| -> Option<AgentRef> {
-        agents.iter().find_map(|a| {
-            if bound_task_of_pane(&a.pane_id).as_deref() == Some(task_id) {
-                Some(AgentRef {
-                    pane: a.pane_id.clone(),
-                    workspace: a.workspace_id.clone(),
-                    state: a.agent_status.clone(),
-                    where_: ws_label(&a.workspace_id),
-                })
-            } else {
-                None
-            }
+        panes.iter().find_map(|a| {
+            (bound_task_of_pane(&a.pane_id).as_deref() == Some(task_id)).then(|| as_ref(a))
         })
     };
 
-    // Which projects are worth showing: any with open tasks, or a live agent.
+    // Place every unclaimed pane against a project. Claimed ones already have
+    // a home: the task they are bound to.
     let mut live_by_project: std::collections::BTreeMap<String, usize> = Default::default();
-    for a in agents.iter() {
-        let bound_project = bound_task_of_pane(&a.pane_id)
-            .and_then(|id| tasks.iter().find(|t| t.id == id))
+    let mut loose_by_project: std::collections::BTreeMap<String, Vec<AgentRef>> = Default::default();
+    let mut homeless: Vec<AgentRef> = Vec::new();
+
+    for a in panes.iter() {
+        let bound = bound_task_of_pane(&a.pane_id);
+        let bound_project = bound
+            .as_ref()
+            .and_then(|id| tasks.iter().find(|t| &t.id == id))
             .and_then(|t| t.project.clone());
         let r = resolve::resolve(
             &index,
-            &pins,
+            pins,
             bound_project,
             Some(&a.workspace_id),
             Some(&ws_label(&a.workspace_id)),
             Some(&a.cwd),
         );
-        if let Some(p) = r.project {
-            for id in std::iter::once(p.clone()).chain(index.ancestors(&p)) {
-                *live_by_project.entry(id).or_insert(0) += 1;
+        match &r.project {
+            Some(p) => {
+                for id in std::iter::once(p.clone()).chain(index.ancestors(p)) {
+                    *live_by_project.entry(id).or_insert(0) += 1;
+                }
+                if bound.is_none() {
+                    loose_by_project.entry(p.clone()).or_default().push(as_ref(a));
+                }
+            }
+            // Resolves to nothing, or the workspace is deliberately pinned out
+            // of the tree. Either way it belongs to no project.
+            None => {
+                if bound.is_none() {
+                    homeless.push(as_ref(a));
+                }
             }
         }
     }
@@ -543,6 +586,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         live: &std::collections::BTreeMap<String, usize>,
         view: &View,
         tasks: &[Task],
+        loose: &std::collections::BTreeMap<String, Vec<AgentRef>>,
         interesting: &dyn Fn(&str) -> bool,
         agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
         needs: &mut usize,
@@ -567,9 +611,35 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             task_rows(tasks, Some(&p.id), depth + 1, view, agent_for_task, rows, needs);
 
             walk(
-                index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, interesting,
+                index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, loose, interesting,
                 agent_for_task, needs,
             );
+
+            // Then the panes that resolve here but are working on nothing
+            // named — the ones the old panel could not see at all, because a
+            // shell is not an agent and `agent.list` never reported them.
+            //
+            // After the children, and capped: a project whose root everything
+            // shares collects a lot of these, and they must not push its own
+            // subtree off the screen.
+            if let Some(ps) = loose.get(&p.id) {
+                let key = format!("{}/panes", p.id);
+                let shown = if view.expanded.contains(&key) {
+                    ps.len()
+                } else {
+                    ps.len().min(MAX_PANES_PER_PROJECT)
+                };
+                for a in ps.iter().take(shown) {
+                    rows.push(Row::Agent {
+                        title: a.where_.clone(),
+                        agent: a.clone(),
+                        depth: depth + 1,
+                    });
+                }
+                if ps.len() > shown {
+                    rows.push(Row::More { key, depth: depth + 1, n: ps.len() - shown });
+                }
+            }
         }
     }
 
@@ -582,47 +652,34 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         &live_by_project,
         view,
         &tasks,
+        &loose_by_project,
         &interesting,
         &agent_for_task,
         &mut needs,
     );
 
-    // Agents not attached to any task — the panel's other job is making these
-    // visible, because they are the ones nobody has decided about.
-    let unattached: Vec<&herdr::Agent> = agents
-        .iter()
-        .filter(|a| bound_task_of_pane(&a.pane_id).is_none())
-        .collect();
-    if !unattached.is_empty() {
-        let folded = view.collapsed.contains(UNATTACHED_KEY);
+    // Panes belonging to no project. Some are there because nothing resolved;
+    // some because the workspace is deliberately pinned out of the tree — the
+    // orchestrator's own home, and whatever else you opened that is not work.
+    if !homeless.is_empty() {
+        let folded = view.collapsed.contains(NOPROJECT_KEY);
         rows.push(Row::Section {
-            key: UNATTACHED_KEY.to_string(),
-            label: "unattached".into(),
-            count: unattached.len(),
+            key: NOPROJECT_KEY.to_string(),
+            label: "no project".into(),
+            count: homeless.len(),
             collapsed: folded,
         });
         if !folded {
-            for a in unattached {
-                rows.push(Row::Agent {
-                    agent: AgentRef {
-                        pane: a.pane_id.clone(),
-                        workspace: a.workspace_id.clone(),
-                        state: a.agent_status.clone(),
-                        where_: ws_label(&a.workspace_id),
-                    },
-                    title: if a.title.is_empty() {
-                        ws_label(&a.workspace_id)
-                    } else {
-                        a.title.clone()
-                    },
-                });
+            for a in homeless {
+                let title = a.where_.clone();
+                rows.push(Row::Agent { agent: a, title, depth: 1 });
             }
         }
     }
 
     Ui {
         rows,
-        agents_total: agents.len(),
+        agents_total: panes.iter().filter(|p| !p.agent.is_empty()).count(),
         needs,
         blocked: tasks.iter().filter(|t| t.status() == Status::Blocked).count(),
         sel: 0,
@@ -731,6 +788,8 @@ pub(crate) mod glyph {
     pub const DOING: &str = "▸";
     pub const MORE: &str = "⋯";
     pub const NEEDS_YOU: &str = "←";
+    /// A pane with no agent in it.
+    pub const SHELL: &str = "▫";
 }
 
 fn state_dot(state: &str) -> (Style, &'static str) {
@@ -789,17 +848,12 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             }
             l.pad(*depth);
             l.push(Style::Plain, " ");
-            match agent {
-                Some(a) => {
-                    let (st, dot) = state_dot(&a.state);
-                    l.push(st, dot);
-                }
-                None => match status {
-                    Status::Blocked => l.push(Style::Warn, glyph::BLOCKED),
-                    Status::Review => l.push(Style::Muted, glyph::REVIEW),
-                    Status::Done => l.push(Style::Dim, glyph::DONE),
-                    _ => l.push(Style::Dim, glyph::QUIET),
-                },
+            match status {
+                Status::Blocked => l.push(Style::Warn, glyph::BLOCKED),
+                Status::Review => l.push(Style::Muted, glyph::REVIEW),
+                Status::Done => l.push(Style::Dim, glyph::DONE),
+                Status::Doing => l.push(Style::Accent, glyph::DOING),
+                _ => l.push(Style::Dim, glyph::QUIET),
             }
             l.push(Style::Plain, " ");
             let flag_w = if *needs_you { 2 } else { 0 };
@@ -837,23 +891,24 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Agent { agent, title } => {
+        Row::Agent { agent, title, depth } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
             }
+            l.pad(*depth);
             l.push(Style::Plain, " ");
-            let (st, dot) = state_dot(&agent.state);
-            l.push(st, dot);
-            l.push(Style::Plain, " ");
-            l.push(Style::Muted, util::truncate(title, w.saturating_sub(6).max(4)));
-
-            let right = line(Style::Dim, util::truncate(&agent.where_, 10));
-            let gap = w.saturating_sub(l.width() + right.width());
-            if gap >= 2 {
-                l.pad(gap);
-                l.spans.extend(right.spans);
+            if agent.agent {
+                let (st, dot) = state_dot(&agent.state);
+                l.push(st, dot);
+            } else {
+                // A shell nobody is driving. Distinct from an idle agent: one
+                // has stopped, the other never started.
+                l.push(Style::Dim, glyph::SHELL);
             }
+            l.push(Style::Plain, " ");
+            let avail = w.saturating_sub(*depth + 4).max(4);
+            l.push(Style::Muted, util::truncate(title, avail));
         }
     }
     l
@@ -892,6 +947,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::QUIET)], "no agent", "nobody has picked this up"),
                 mark(&[(Style::Warn, g::BLOCKED)], "blocked", "parked, with a reason on the task"),
                 mark(&[(Style::Muted, g::REVIEW)], "review", "done enough to look at"),
+                mark(&[(Style::Accent, g::DOING)], "doing", "started — the task's own state, which it keeps even when claimed"),
                 mark(&[(Style::Dim, g::DONE)], "done", "finished — only shown under A"),
             ],
         ),
@@ -906,7 +962,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Accent, g::DOING), (Style::Accent, "3")], "in flight", "tasks someone has started"),
                 mark(&[(Style::Warn, g::BLOCKED), (Style::Warn, "1")], "blocked", "tasks parked and waiting"),
                 mark(&[(Style::Dim, g::DONE)], "all clear", "there is work here and all of it is finished"),
-                mark(&[(Style::Accent, g::WORKING), (Style::Accent, "2")], "agents", "agents that resolve to this project"),
+                mark(&[(Style::Accent, g::WORKING), (Style::Accent, "2")], "panes", "panes standing in this project, agent or not"),
             ],
         ),
         (
@@ -916,6 +972,8 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "an idle agent on a task that is still doing — it has stopped and you are the blocker"),
                 mark(&[(Style::Warn, "1 "), (Style::Warn, g::NEEDS_YOU)], "how many", "the same count, in the header"),
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
+                mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Muted, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in"),
+                mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
                 mark(&[(Style::Accent, "+done")], "showing done", "A is on, so finished work is included"),

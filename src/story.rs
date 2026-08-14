@@ -40,12 +40,24 @@ fn workspace(id: &str, label: &str, focused: bool) -> herdr::Workspace {
     }
 }
 
-fn agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Agent {
-    herdr::Agent {
+fn agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Pane {
+    herdr::Pane {
         pane_id: pane.to_string(),
         workspace_id: ws.to_string(),
+        agent: "claude".into(),
         agent_status: state.to_string(),
         title: title.to_string(),
+        ..Default::default()
+    }
+}
+
+/// A pane with nobody driving it. The panel could not see these at all before,
+/// because a shell is not an agent.
+fn shell(pane: &str, ws: &str, cwd: &str) -> herdr::Pane {
+    herdr::Pane {
+        pane_id: pane.to_string(),
+        workspace_id: ws.to_string(),
+        cwd: cwd.to_string(),
         ..Default::default()
     }
 }
@@ -54,7 +66,7 @@ fn agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Agent {
 /// bound to a task, an idle agent on a `doing` task (the "needs you" case), an
 /// unclaimed agent, a project past the task cap, and two inbox items.
 fn world() -> Snapshot {
-    let projects = vec![
+    let mut projects = vec![
         project("audio", None),
         project("vst", Some("audio")),
         project("trance", Some("vst")),
@@ -63,6 +75,10 @@ fn world() -> Snapshot {
         project("tooling", Some("meta")),
         project("wsp", Some("tooling")),
     ];
+    // Roots, so a shell's cwd can put it somewhere without anyone claiming it.
+    projects[2].roots = vec!["~/claude/trance".into()];
+    projects[3].roots = vec!["~/claude/reverb".into()];
+    projects[6].roots = vec!["~/claude/wsp".into()];
 
     let mut tasks = vec![
         task("t-001", "Apply reverb fixes from the tuning table", Some("trance"), "doing"),
@@ -88,16 +104,25 @@ fn world() -> Snapshot {
     }
 
     let workspaces = vec![
-        workspace("w0", "wsp", true),
+        workspace("w0", "orchestrator", true),
         workspace("w1", "Trance Video", false),
         workspace("w2", "Verb UI", false),
         workspace("w3", "Easter", false),
+        workspace("w4", "Trance Lite", false),
+        workspace("w5", "panel work", false),
     ];
 
     let agents = vec![
         agent("w1:p1", "w1", "working", "Trance Video"),
         agent("w2:p1", "w2", "idle", "Verb UI"),
         agent("w3:p1", "w3", "working", "◐ Unclaimed explorer"),
+        // Shells: no agent, placed purely by where they are standing.
+        shell("w4:p1", "w4", "~/claude/trance"),
+        shell("w5:p1", "w5", "~/claude/wsp"),
+        // The orchestrator's own home — resolves to no project on purpose.
+        shell("w0:p1", "w0", "~/claude"),
+        // One of ours, which must never appear as work.
+        herdr::Pane { label: panel::PANEL_LABEL.into(), pane_id: "w0:p2".into(), workspace_id: "w0".into(), ..Default::default() },
     ];
 
     // w1's agent is claimed to a doing task; w2's is claimed to a doing task
@@ -112,7 +137,7 @@ fn world() -> Snapshot {
         bindings,
         pins: BTreeMap::new(),
         workspaces,
-        agents,
+        panes: agents,
     }
 }
 
@@ -120,7 +145,7 @@ fn world() -> Snapshot {
 /// agent exists, which is most people's first sight of it.
 fn quiet_world() -> Snapshot {
     let mut s = world();
-    s.agents.clear();
+    s.panes.clear();
     s.bindings.clear();
     s
 }

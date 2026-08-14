@@ -60,8 +60,15 @@ wsp where                   # what project am I in, and why
 
 `wsp panel` is a sidebar that runs in a pane of its own. herdr's own sidebar
 lists workspaces and hangs agents beneath them; this inverts that — the spine is
-the project tree, tasks hang off projects, agents attach to tasks, and tasks
-belonging to no project get an `inbox` heading rather than a footer number.
+the project tree, tasks hang off projects, and panes hang off whichever they
+belong to: the task they claimed, or failing that the project they are standing
+in. Tasks belonging to no project get an `inbox` heading at the top; panes
+belonging to no project get a `no project` group at the foot.
+
+Panes come from `pane.list`, not `agent.list`. Most panes are a shell nobody is
+driving, and a shell sitting in a project is a fact about that project — the
+earlier version asked for agents only and so could see one pane out of
+twenty-two.
 
 ```sh
 wsp panel install            # split it into the workspace you're standing in
@@ -104,12 +111,17 @@ keep working inside a pick, so you hunt for a destination by reading the tree.
 
 | On a task | | On a project | |
 |---|---|---|---|
-| `●` | agent on it, working | `▾` `▸` | unfolded / folded |
-| `○` | agent on it, idle | `7` | open tasks, rolled up |
-| `·` | nobody on it | `▸3` | tasks in flight |
-| `■` | blocked | `■1` | tasks blocked |
-| `◆` | in review | `✓` | all work here is finished |
-| `✓` | done — only under `A` | `●2` | agents resolving here |
+| `·` | todo | `▾` `▸` | unfolded / folded |
+| `▸` | doing | `7` | open tasks, rolled up |
+| `■` | blocked | `▸3` | tasks in flight |
+| `◆` | in review | `■1` | tasks blocked |
+| `✓` | done — only under `A` | `✓` | all work here is finished |
+| | | `●2` | panes standing here |
+
+A pane gets its own row: `●` working, `○` idle, `▫` a shell with no agent in it
+— never started, as against an idle agent that stopped. A task keeps its own
+status glyph even when claimed, because the pane is on the row beneath rather
+than borrowing the task's.
 
 `←` marks an idle agent on a task that is still `doing` — it has stopped and
 you are the blocker; the header carries the count. `⋯ n more` is the tail past

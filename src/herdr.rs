@@ -67,10 +67,15 @@ pub struct Workspace {
     pub tokens: Value,
 }
 
+/// A pane. Some panes are running an agent; most are a shell someone opened.
+/// The panel needs both, because a shell sitting in a project is a fact about
+/// that project whether or not an agent ever attaches to it.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
-pub struct Agent {
+pub struct Pane {
     pub pane_id: String,
+    /// herdr's own label for the pane — `wsp` marks one of our panels.
+    pub label: String,
     pub workspace_id: String,
     pub tab_id: String,
     pub agent: String,
@@ -97,31 +102,41 @@ pub fn workspaces() -> std::io::Result<Vec<Workspace>> {
         .collect())
 }
 
-pub fn agents() -> std::io::Result<Vec<Agent>> {
+fn parse_pane(a: &Value) -> Pane {
+    Pane {
+        pane_id: sget(a, "pane_id"),
+        label: sget(a, "label"),
+        workspace_id: sget(a, "workspace_id"),
+        tab_id: sget(a, "tab_id"),
+        agent: sget(a, "agent"),
+        agent_status: sget(a, "agent_status"),
+        cwd: match sget(a, "foreground_cwd") {
+            fg if !fg.is_empty() => fg,
+            _ => sget(a, "cwd"),
+        },
+        title: sget(a, "terminal_title_stripped"),
+        focused: a.get("focused").and_then(|b| b.as_bool()).unwrap_or(false),
+        session_id: a
+            .get("agent_session")
+            .and_then(|s| s.get("value"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+/// Every pane herdr knows about, agent or not.
+pub fn panes() -> std::io::Result<Vec<Pane>> {
+    let r = call("pane.list", json!({}))?;
+    let arr = r.get("panes").and_then(|w| w.as_array()).cloned().unwrap_or_default();
+    Ok(arr.iter().map(parse_pane).collect())
+}
+
+/// Only the panes running an agent.
+pub fn agents() -> std::io::Result<Vec<Pane>> {
     let r = call("agent.list", json!({}))?;
     let arr = r.get("agents").and_then(|w| w.as_array()).cloned().unwrap_or_default();
-    Ok(arr
-        .iter()
-        .map(|a| Agent {
-            pane_id: sget(a, "pane_id"),
-            workspace_id: sget(a, "workspace_id"),
-            tab_id: sget(a, "tab_id"),
-            agent: sget(a, "agent"),
-            agent_status: sget(a, "agent_status"),
-            cwd: match sget(a, "foreground_cwd") {
-                fg if !fg.is_empty() => fg,
-                _ => sget(a, "cwd"),
-            },
-            title: sget(a, "terminal_title_stripped"),
-            focused: a.get("focused").and_then(|b| b.as_bool()).unwrap_or(false),
-            session_id: a
-                .get("agent_session")
-                .and_then(|s| s.get("value"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string(),
-        })
-        .collect())
+    Ok(arr.iter().map(parse_pane).collect())
 }
 
 fn sget(v: &Value, key: &str) -> String {
