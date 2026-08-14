@@ -526,11 +526,27 @@ fn line(style: Style, text: impl Into<String>) -> Line {
     l
 }
 
+/// The panel's whole glyph vocabulary, named once so the legend cannot drift
+/// from what the rows actually draw.
+pub(crate) mod glyph {
+    pub const OPEN: &str = "▾";
+    pub const CLOSED: &str = "▸";
+    pub const WORKING: &str = "●";
+    pub const IDLE: &str = "○";
+    pub const QUIET: &str = "·";
+    pub const BLOCKED: &str = "■";
+    pub const REVIEW: &str = "◆";
+    pub const DONE: &str = "✓";
+    pub const DOING: &str = "▸";
+    pub const MORE: &str = "⋯";
+    pub const NEEDS_YOU: &str = "←";
+}
+
 fn state_dot(state: &str) -> (Style, &'static str) {
     match state {
-        "working" => (Style::Accent, "●"),
-        "idle" => (Style::Muted, "○"),
-        _ => (Style::Dim, "·"),
+        "working" => (Style::Accent, glyph::WORKING),
+        "idle" => (Style::Muted, glyph::IDLE),
+        _ => (Style::Dim, glyph::QUIET),
     }
 }
 
@@ -539,7 +555,7 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
     match row {
         Row::Project { id, depth, counts, collapsed, live } => {
             l.pad(*depth);
-            l.push(Style::Dim, if *collapsed { "▸" } else { "▾" });
+            l.push(Style::Dim, if *collapsed { glyph::CLOSED } else { glyph::OPEN });
             l.push(Style::Plain, " ");
             l.push(Style::Bold, id.clone());
 
@@ -558,19 +574,19 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             }
             if counts.doing > 0 {
                 gap_before(&mut right);
-                right.push(Style::Accent, format!("▸{}", counts.doing));
+                right.push(Style::Accent, format!("{}{}", glyph::DOING, counts.doing));
             }
             if counts.blocked > 0 {
                 gap_before(&mut right);
-                right.push(Style::Warn, format!("■{}", counts.blocked));
+                right.push(Style::Warn, format!("{}{}", glyph::BLOCKED, counts.blocked));
             }
             if counts.done > 0 && counts.open == 0 {
                 gap_before(&mut right);
-                right.push(Style::Dim, "✓");
+                right.push(Style::Dim, glyph::DONE);
             }
             if *live > 0 {
                 gap_before(&mut right);
-                right.push(Style::Accent, format!("●{live}"));
+                right.push(Style::Accent, format!("{}{live}", glyph::WORKING));
             }
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
@@ -588,10 +604,10 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                     l.push(st, dot);
                 }
                 None => match status {
-                    Status::Blocked => l.push(Style::Warn, "■"),
-                    Status::Review => l.push(Style::Muted, "◆"),
-                    Status::Done => l.push(Style::Dim, "✓"),
-                    _ => l.push(Style::Dim, "·"),
+                    Status::Blocked => l.push(Style::Warn, glyph::BLOCKED),
+                    Status::Review => l.push(Style::Muted, glyph::REVIEW),
+                    Status::Done => l.push(Style::Dim, glyph::DONE),
+                    _ => l.push(Style::Dim, glyph::QUIET),
                 },
             }
             l.push(Style::Plain, " ");
@@ -609,14 +625,14 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             };
             l.push(style, body);
             if *needs_you {
-                l.push(Style::Warn, " ←");
+                l.push(Style::Warn, format!(" {}", glyph::NEEDS_YOU));
             }
         }
         Row::More { depth, n, .. } => {
             l.push(Style::Plain, " ");
             l.pad(*depth);
             l.push(Style::Plain, " ");
-            l.push(Style::Dim, "⋯");
+            l.push(Style::Dim, glyph::MORE);
             l.push(Style::Plain, " ");
             l.push(Style::Muted, format!("{n} more"));
         }
@@ -641,6 +657,82 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
         }
     }
     l
+}
+
+// ---- legend -------------------------------------------------------------
+
+pub(crate) struct Mark {
+    /// Drawn through the same Style the rows use, so the colour cannot drift.
+    pub sample: Line,
+    pub name: &'static str,
+    pub note: &'static str,
+}
+
+fn mark(spans: &[(Style, &str)], name: &'static str, note: &'static str) -> Mark {
+    let mut sample = Line::default();
+    for (st, t) in spans {
+        sample.push(*st, *t);
+    }
+    Mark { sample, name, note }
+}
+
+/// The vocabulary, grouped by where it appears. Built from the same glyph
+/// constants and the same `Style` values the renderer uses.
+pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
+    use glyph as g;
+    vec![
+        (
+            "On a task",
+            "The first column. When an agent is on the task it shows the agent's \
+             state — so the task's own status is not drawn, and a claimed task \
+             looks the same whether it is todo or doing.",
+            vec![
+                mark(&[(Style::Accent, g::WORKING)], "working", "an agent is on this task and busy"),
+                mark(&[(Style::Muted, g::IDLE)], "idle", "an agent is on this task and waiting"),
+                mark(&[(Style::Dim, g::QUIET)], "no agent", "nobody has picked this up"),
+                mark(&[(Style::Warn, g::BLOCKED)], "blocked", "parked, with a reason on the task"),
+                mark(&[(Style::Muted, g::REVIEW)], "review", "done enough to look at"),
+                mark(&[(Style::Dim, g::DONE)], "done", "finished — only shown under A"),
+            ],
+        ),
+        (
+            "On a project",
+            "A fold marker on the left, and on the right the workload rolled up \
+             from every project beneath it.",
+            vec![
+                mark(&[(Style::Dim, g::OPEN)], "unfolded", "tasks and child projects are showing"),
+                mark(&[(Style::Dim, g::CLOSED)], "folded", "← hides them, → brings them back"),
+                mark(&[(Style::Dim, "7")], "open", "tasks not yet done, including everything below"),
+                mark(&[(Style::Accent, g::DOING), (Style::Accent, "3")], "in flight", "tasks someone has started"),
+                mark(&[(Style::Warn, g::BLOCKED), (Style::Warn, "1")], "blocked", "tasks parked and waiting"),
+                mark(&[(Style::Dim, g::DONE)], "all clear", "there is work here and all of it is finished"),
+                mark(&[(Style::Accent, g::WORKING), (Style::Accent, "2")], "agents", "agents that resolve to this project"),
+            ],
+        ),
+        (
+            "Everywhere else",
+            "Rows and markers that are not about a single task.",
+            vec![
+                mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "an idle agent on a task that is still doing — it has stopped and you are the blocker"),
+                mark(&[(Style::Warn, "1 "), (Style::Warn, g::NEEDS_YOU)], "how many", "the same count, in the header"),
+                mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
+                mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
+                mark(&[(Style::Accent, "+done")], "showing done", "A is on, so finished work is included"),
+            ],
+        ),
+        (
+            "Colour on its own",
+            "Six roles, used consistently regardless of glyph.",
+            vec![
+                mark(&[(Style::Plain, "plain")], "claimed", "a task with an agent on it"),
+                mark(&[(Style::Muted, "muted")], "unclaimed", "a task nobody is on; agent names"),
+                mark(&[(Style::Dim, "dim")], "structure", "carets, counts, punctuation, finished work"),
+                mark(&[(Style::Bold, "bold")], "project", "project names only"),
+                mark(&[(Style::Accent, "accent")], "live", "running agents and work in flight"),
+                mark(&[(Style::Warn, "warn")], "wants a decision", "blocked, or waiting on you"),
+            ],
+        ),
+    ]
 }
 
 /// Digits 1-9 address rows that lead somewhere: a terminal.
@@ -671,7 +763,7 @@ pub(crate) fn frame(ui: &Ui, w: usize, h: usize) -> Vec<Line> {
     head.push(Style::Dim, "agents ·");
     head.push(Style::Plain, " ");
     if ui.needs > 0 {
-        head.push(Style::Warn, format!("{} ←", ui.needs));
+        head.push(Style::Warn, format!("{} {}", ui.needs, glyph::NEEDS_YOU));
     } else {
         head.push(Style::Dim, "·");
     }
@@ -787,19 +879,25 @@ fn esc_html(s: &str) -> String {
 /// The same frame as a block of styled spans. The panel is text, so this is
 /// not an approximation of the terminal — it is the same cells with the same
 /// colours, and it costs no font work and no new dependency.
+pub(crate) fn to_html_spans(l: &Line) -> String {
+    let mut out = String::new();
+    for s in &l.spans {
+        out.push_str(&format!(
+            "<span class=\"{}\">{}</span>",
+            class_of(s.style),
+            esc_html(&s.text)
+        ));
+    }
+    out
+}
+
 pub(crate) fn to_html(frame: &[Line], w: usize) -> String {
     let mut out = String::from("<pre class=\"wsp\">");
     for l in frame {
         let mut l = l.clone();
         l.fit(w);
         out.push_str(if l.selected { "<span class=\"sel\">" } else { "<span>" });
-        for s in &l.spans {
-            out.push_str(&format!(
-                "<span class=\"{}\">{}</span>",
-                class_of(s.style),
-                esc_html(&s.text)
-            ));
-        }
+        out.push_str(&to_html_spans(&l));
         out.push_str("</span>\n");
     }
     out.push_str("</pre>");

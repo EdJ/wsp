@@ -364,6 +364,40 @@ footer {
   margin-top:3rem; padding-top:1.25rem; border-top:1px solid var(--edge);
   color:var(--sub); font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
+
+h2.sec {
+  margin:0 0 1.5rem; font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--accent);
+}
+.legend { margin-bottom:3.5rem; }
+.lgroup {
+  display:grid; grid-template-columns:15rem minmax(0,1fr); gap:1.75rem;
+  align-items:start; padding-bottom:1.75rem; margin-bottom:1.75rem;
+  border-bottom:1px solid var(--edge);
+}
+.lgroup:last-child { border-bottom:0; margin-bottom:0; }
+@media (max-width:44rem) { .lgroup { grid-template-columns:1fr; gap:.9rem; } }
+.lhead h3 { margin:0 0 .45rem; font-size:1rem; font-weight:600; letter-spacing:-.01em; }
+.lhead p { margin:0; color:var(--sub); font-size:.85rem; }
+
+.legend dl { margin:0; display:flex; flex-direction:column; gap:.5rem; }
+.mark { display:grid; grid-template-columns:3.5rem minmax(0,1fr); gap:1rem; align-items:baseline; }
+.mark dt { margin:0; }
+.chip {
+  display:inline-block; min-width:3.5rem; text-align:center; padding:.25rem .4rem;
+  border-radius:5px; background:#0D1110; border:1px solid var(--edge);
+  font:12px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:#E4EAE7;
+  white-space:pre;
+}
+.chip .p { color:inherit; }
+.chip .d { color:#66736E; }
+.chip .b { font-weight:700; }
+.chip .m { color:#7D8C96; }
+.chip .a { color:#5FBFA4; }
+.chip .w { color:#E08A4B; }
+.mark dd { margin:0; display:flex; flex-direction:column; gap:.1rem; }
+.mark dd b { font-weight:600; font-size:.9rem; }
+.mark dd span { color:var(--sub); font-size:.83rem; }
 "#;
 
 
@@ -382,7 +416,25 @@ fn page(scenes: &[Scene]) -> String {
          state you could actually arrive at.</p>\
          </header>\n",
     );
-    out.push_str("<div class=\"scenes\">\n");
+    out.push_str("<section class=\"legend\"><h2 class=\"sec\">What the marks mean</h2>\n");
+    for (group, blurb, marks) in panel::legend() {
+        out.push_str(&format!(
+            "<div class=\"lgroup\"><div class=\"lhead\"><h3>{group}</h3><p>{blurb}</p></div><dl>"
+        ));
+        for m in marks {
+            out.push_str(&format!(
+                "<div class=\"mark\"><dt><span class=\"chip\">{}</span></dt>\
+                 <dd><b>{}</b><span>{}</span></dd></div>",
+                panel::to_html_spans(&m.sample),
+                m.name,
+                m.note
+            ));
+        }
+        out.push_str("</dl></div>\n");
+    }
+    out.push_str("</section>\n");
+
+    out.push_str("<h2 class=\"sec\">Frames</h2>\n<div class=\"scenes\">\n");
     for s in scenes {
         out.push_str(&format!(
             "<section class=\"scene\">\

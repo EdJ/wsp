@@ -78,6 +78,36 @@ Keys: `j`/`k` move, `←`/`→` fold a project, `↵` folds a project or opens a
 `⋯ n more` row or jumps to a task's agent, `1`-`9` jump straight to an agent,
 `A` shows finished tasks, `r` syncs, `q` quits.
 
+### What the marks mean
+
+| On a task | | On a project | |
+|---|---|---|---|
+| `●` | agent on it, working | `▾` `▸` | unfolded / folded |
+| `○` | agent on it, idle | `7` | open tasks, rolled up |
+| `·` | nobody on it | `▸3` | tasks in flight |
+| `■` | blocked | `■1` | tasks blocked |
+| `◆` | in review | `✓` | all work here is finished |
+| `✓` | done — only under `A` | `●2` | agents resolving here |
+
+`←` marks an idle agent on a task that is still `doing` — it has stopped and
+you are the blocker; the header carries the count. `⋯ n more` is the tail past
+the six-task cap.
+
+Colour carries six roles: **bold** is a project, plain is a claimed task, muted
+is an unclaimed one, dim is structure and finished work, accent is live work,
+and warn wants a decision.
+
+Note `▸` does double duty — a folded caret on the left of a project row, a
+count of tasks in flight on the right.
+
+### Storyboard
+
+`wsp panel storyboard [--out page.html]` renders the panel offline: fixtures for
+layout, and flows that push scripted keys through the same reducer the live
+panel runs. No herdr, no store, no terminal — useful for arguing about the
+design before building it. The legend above is generated from the same glyph
+constants and `Style` values the rows draw with, so it cannot drift.
+
 Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
 `$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
