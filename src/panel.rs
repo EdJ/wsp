@@ -38,9 +38,11 @@ const OFF: &str = "\x1b[0m";
 
 const MAX_TASKS_PER_PROJECT: usize = 6;
 
-/// Stands in for "no project" wherever a project id is used as a key. Project
-/// ids are slugs, so the parentheses keep it out of their namespace.
+/// Stand in for the groups that are not projects, wherever a project id is used
+/// as a key. Project ids are slugs, so the parentheses keep these out of their
+/// namespace.
 const INBOX_KEY: &str = "(inbox)";
+const UNATTACHED_KEY: &str = "(unattached)";
 
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
 /// event loop and handed to `collect`, which is otherwise a pure function of
@@ -98,13 +100,17 @@ enum Row {
     },
     /// `key` is the project the hidden tasks belong to, or `INBOX_KEY`.
     More { key: String, depth: usize, n: usize },
-    Section { label: String },
+    /// A group that is not a project: the inbox, loose agents. `key` names it
+    /// so it can be folded and so a command can be aimed at it.
+    Section { key: String, label: String, count: usize, collapsed: bool },
     Agent { agent: AgentRef, title: String },
 }
 
 impl Row {
+    /// Every row takes the cursor. A heading you cannot select is a heading you
+    /// cannot fold or add to, and both are things the groups need.
     fn selectable(&self) -> bool {
-        !matches!(self, Row::Section { .. })
+        true
     }
     fn agent(&self) -> Option<&AgentRef> {
         match self {
@@ -140,7 +146,42 @@ pub(crate) struct Ui {
     show_done: bool,
 }
 
+/// What the cursor is sitting on, in the store's own terms rather than the
+/// panel's. This is the seam the edit subcommands dispatch against: a command
+/// asks what the target is and refuses the ones it cannot act on, instead of
+/// every key having to re-read the row enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// A project id — `wsp add -p <id>`, `wsp project …`.
+    Project(String),
+    /// A task id — `wsp start` / `done` / `block` / `mv`.
+    Task(String),
+    /// A group that is not a project. Adding here means a task with no
+    /// project; there is nothing to remove.
+    Inbox,
+    /// Agents with no task. Nothing to add; the useful verb is `claim`.
+    Unattached,
+    /// A pane to jump to, not a thing to edit.
+    Pane(String),
+    /// The overflow row, which only ever opens.
+    Overflow(String),
+    Nothing,
+}
+
 impl Ui {
+    pub(crate) fn selected_target(&self) -> Target {
+        match self.rows.get(self.sel) {
+            Some(Row::Project { id, .. }) => Target::Project(id.clone()),
+            Some(Row::Task { id, .. }) => Target::Task(id.clone()),
+            Some(Row::More { key, .. }) => Target::Overflow(key.clone()),
+            Some(Row::Agent { agent, .. }) => Target::Pane(agent.pane.clone()),
+            Some(Row::Section { key, .. }) if key == UNATTACHED_KEY => Target::Unattached,
+            Some(Row::Section { key, .. }) if key == INBOX_KEY => Target::Inbox,
+            Some(Row::Section { .. }) => Target::Nothing,
+            None => Target::Nothing,
+        }
+    }
+
     pub(crate) fn selected_kind(&self) -> RowKind {
         match self.rows.get(self.sel) {
             Some(Row::Project { .. }) => RowKind::Project,
@@ -403,8 +444,16 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         .iter()
         .any(|t| t.project.is_none() && (view.show_done || t.status().is_open()));
     if inbox_any {
-        rows.push(Row::Section { label: format!("inbox  {inbox_open}") });
-        task_rows(&tasks, None, 1, view, &agent_for_task, &mut rows, &mut needs);
+        let folded = view.collapsed.contains(INBOX_KEY);
+        rows.push(Row::Section {
+            key: INBOX_KEY.to_string(),
+            label: "inbox".into(),
+            count: inbox_open,
+            collapsed: folded,
+        });
+        if !folded {
+            task_rows(&tasks, None, 1, view, &agent_for_task, &mut rows, &mut needs);
+        }
     }
 
     // Agents not attached to any task — the panel's other job is making these
@@ -414,17 +463,29 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         .filter(|a| bound_task_of_pane(&a.pane_id).is_none())
         .collect();
     if !unattached.is_empty() {
-        rows.push(Row::Section { label: format!("unattached  {}", unattached.len()) });
-        for a in unattached {
-            rows.push(Row::Agent {
-                agent: AgentRef {
-                    pane: a.pane_id.clone(),
-                    workspace: a.workspace_id.clone(),
-                    state: a.agent_status.clone(),
-                    where_: ws_label(&a.workspace_id),
-                },
-                title: if a.title.is_empty() { ws_label(&a.workspace_id) } else { a.title.clone() },
-            });
+        let folded = view.collapsed.contains(UNATTACHED_KEY);
+        rows.push(Row::Section {
+            key: UNATTACHED_KEY.to_string(),
+            label: "unattached".into(),
+            count: unattached.len(),
+            collapsed: folded,
+        });
+        if !folded {
+            for a in unattached {
+                rows.push(Row::Agent {
+                    agent: AgentRef {
+                        pane: a.pane_id.clone(),
+                        workspace: a.workspace_id.clone(),
+                        state: a.agent_status.clone(),
+                        where_: ws_label(&a.workspace_id),
+                    },
+                    title: if a.title.is_empty() {
+                        ws_label(&a.workspace_id)
+                    } else {
+                        a.title.clone()
+                    },
+                });
+            }
         }
     }
 
@@ -636,7 +697,16 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.push(Style::Plain, " ");
             l.push(Style::Muted, format!("{n} more"));
         }
-        Row::Section { label } => l.push(Style::Dim, label.clone()),
+        Row::Section { label, count, collapsed, .. } => {
+            // A caret, like a project — it folds the same way — but kept dim
+            // rather than bold, so a group still reads as not-a-project.
+            l.push(Style::Dim, if *collapsed { glyph::CLOSED } else { glyph::OPEN });
+            l.push(Style::Plain, " ");
+            l.push(Style::Muted, label.clone());
+            let right = line(Style::Dim, count.to_string());
+            l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+            l.spans.extend(right.spans);
+        }
         Row::Agent { agent, title } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
@@ -716,6 +786,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "an idle agent on a task that is still doing — it has stopped and you are the blocker"),
                 mark(&[(Style::Warn, "1 "), (Style::Warn, g::NEEDS_YOU)], "how many", "the same count, in the header"),
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
+                mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
                 mark(&[(Style::Accent, "+done")], "showing done", "A is on, so finished work is included"),
             ],
@@ -1082,14 +1153,15 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::None
         }
         Key::Left | Key::Right => match ui.rows.get(ui.sel) {
-            Some(Row::Project { id, .. }) => {
+            // Projects and groups fold alike; only their key differs.
+            Some(Row::Project { id: key, .. }) | Some(Row::Section { key, .. }) => {
                 if k == Key::Left {
-                    view.collapsed.insert(id.clone());
-                    // Folding a project forgets that it was showing its long
-                    // tail, so unfolding starts clean.
-                    view.expanded.remove(id);
+                    view.collapsed.insert(key.clone());
+                    // Folding forgets that it was showing its long tail, so
+                    // unfolding starts clean.
+                    view.expanded.remove(key);
                 } else {
-                    view.collapsed.remove(id);
+                    view.collapsed.remove(key);
                 }
                 Effect::Refetch
             }
@@ -1100,12 +1172,13 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             _ => Effect::None,
         },
         Key::Enter => match ui.rows.get(ui.sel) {
-            Some(Row::Project { id, collapsed: c, .. }) => {
+            Some(Row::Project { id: key, collapsed: c, .. })
+            | Some(Row::Section { key, collapsed: c, .. }) => {
                 if *c {
-                    view.collapsed.remove(id);
+                    view.collapsed.remove(key);
                 } else {
-                    view.collapsed.insert(id.clone());
-                    view.expanded.remove(id);
+                    view.collapsed.insert(key.clone());
+                    view.expanded.remove(key);
                 }
                 Effect::Refetch
             }

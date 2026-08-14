@@ -132,7 +132,23 @@ struct Scene {
     caption: String,
     /// The keys that produced this frame, as the reader would press them.
     gesture: String,
+    /// What a subcommand aimed at the cursor would act on.
+    target: String,
     html: String,
+}
+
+/// Reads the seam back out in the store's own vocabulary, so a scene shows
+/// what `add` or `done` would be pointed at from that row.
+fn target_label(t: &panel::Target) -> String {
+    match t {
+        panel::Target::Project(id) => format!("project {id}"),
+        panel::Target::Task(id) => format!("task {id}"),
+        panel::Target::Inbox => "the inbox".into(),
+        panel::Target::Unattached => "loose agents".into(),
+        panel::Target::Pane(p) => format!("pane {p}"),
+        panel::Target::Overflow(k) => format!("hidden tail of {k}"),
+        panel::Target::Nothing => "nothing".into(),
+    }
 }
 
 fn key_name(k: Key) -> String {
@@ -224,6 +240,7 @@ impl<'a> Driver<'a> {
             } else {
                 compress(&self.log)
             },
+            target: target_label(&self.ui.selected_target()),
             html: panel::to_html(&panel::frame(&self.ui, W, H), W),
         }
     }
@@ -267,6 +284,25 @@ fn scenes() -> Vec<Scene> {
             .down_to(panel::RowKind::More)
             .key(Key::Enter)
             .scene("Expanded", "↵ on the overflow row opens the tail in place, and the cursor holds its ground."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Section)
+            .scene("On a group", "Groups take the cursor now. The inbox is not a project, but it is a scope — what `add` here would mean is a task belonging to nothing."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Section)
+            .key(Key::Left)
+            .scene("Group folded", "← folds a group exactly as it folds a project; the count stays on the heading so nothing is lost by closing it."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .key(Key::Char('G'))
+            .scene("At the foot", "G to the last row, under the loose-agents group. The cursor reports a pane to jump to rather than anything to edit — not every target is a thing you can change."),
     );
 
     out.push(
@@ -334,6 +370,14 @@ header p { margin:0; color:var(--sub); max-width:42rem; }
 .rail { display:flex; flex-direction:column; gap:.6rem; }
 .rail h2 { margin:0; font-size:1rem; font-weight:600; letter-spacing:-.01em; }
 .rail p { margin:0; color:var(--sub); font-size:.85rem; }
+.rail p.tgt {
+  padding-top:.55rem; border-top:1px dashed var(--edge); color:var(--rail);
+  font-size:.78rem;
+}
+.rail p.tgt b {
+  color:var(--accent); font-weight:600;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
 .gesture {
   display:inline-flex; align-self:start; gap:.1rem; padding:.3rem .55rem;
   border:1px solid var(--edge); border-radius:5px; color:var(--rail);
@@ -438,10 +482,11 @@ fn page(scenes: &[Scene]) -> String {
     for s in scenes {
         out.push_str(&format!(
             "<section class=\"scene\">\
-             <div class=\"rail\"><h2>{}</h2><span class=\"gesture\">{}</span><p>{}</p></div>\
+             <div class=\"rail\"><h2>{}</h2><span class=\"gesture\">{}</span><p>{}</p>\
+             <p class=\"tgt\">cursor is on <b>{}</b></p></div>\
              <div class=\"frame\">{}</div>\
              </section>\n",
-            s.title, s.gesture, s.caption, s.html
+            s.title, s.gesture, s.caption, s.target, s.html
         ));
     }
     out.push_str("</div>\n");
