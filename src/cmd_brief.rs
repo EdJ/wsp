@@ -13,7 +13,7 @@
 
 use serde_json::json;
 
-use crate::cmd_agent::current_project;
+use crate::cmd_agent::{self, current_project};
 use crate::cmd_mandate;
 use crate::herdr;
 use crate::model::Task;
@@ -221,6 +221,19 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     // the rest in one line.
     let (far_named, far_quiet): (Vec<&&overlap::Standing>, Vec<&&overlap::Standing>) =
         far.iter().partition(|s| s.agent || s.task.is_some());
+
+    // A briefing under a mandate, with nothing in hand, *is* an agent going
+    // looking: the mandate is the permission and the list below is the
+    // backlog, so this session's next move is to pick something out of it. It
+    // is the longest of the looking windows — a whole session start — and the
+    // one nobody sent, so nothing else would have said so.
+    //
+    // Before the JSON branch because it is a fact about the pane, not about the
+    // rendering. A brief with no mandate is left alone: an agent that has to
+    // ask before it takes anything is waiting on a person, not looking.
+    if mine.is_none() && mandate.is_some() {
+        cmd_agent::say_looking(store, &world.panes, project.as_deref(), !open.is_empty());
+    }
 
     if args.json() {
         println!(

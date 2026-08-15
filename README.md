@@ -703,6 +703,22 @@ now*. Putting both on the workspace would lose the name of the work every time
 somebody started a build. A claim resets the pane to the task title, so there
 is always a way home.
 
+One sentence an agent does not have to remember to say: while it is looking for
+work, `wsp next` and `wsp brief` say it for it — `looking for work in render`,
+or `nothing actionable in render` when it asked and there was none. The claim is
+what makes an agent visible from outside, and everything before it — reading a
+backlog, writing the overview the task arrived without, deciding — used to leave
+the pane wearing whatever it was called last, which from herdr is
+indistinguishable from an agent that read its instruction and did nothing. State
+first and project second, because the sidebar cuts the right-hand end.
+
+Only a pane running an agent, and only one holding no task: a person asking
+`wsp next` from a shell is asking a question, not reporting a state, and a bound
+pane asking it is peeking past the thing it is in the middle of — `next` keeps
+that pane's own `doing` task in the running, so the answer is usually the task
+it already has. Nothing else needs a hook: `f` refuses on an agent that still
+holds a task, so an agent sent looking is unbound by the time it asks.
+
 The panel names a pane row by that label first, then its terminal title, then
 the workspace. The label is the only one of the three anybody maintains: an
 agent's terminal title is its opening prompt frozen, so a pane three tasks on

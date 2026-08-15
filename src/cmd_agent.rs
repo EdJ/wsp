@@ -240,6 +240,66 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// What a pane wears while its agent is looking for a task.
+///
+/// State first, project second, because the ellipsis falls on the right: a
+/// herdr sidebar draws 26 columns, and `looking for work in stra…` still says
+/// the thing a person scanning a column of panes is scanning for. The project
+/// is the half they can usually read off the workspace row anyway.
+fn looking_label(project: Option<&str>, found: bool) -> String {
+    match (found, project) {
+        (true, Some(p)) => format!("looking for work in {p}"),
+        (true, None) => "looking for work".into(),
+        (false, Some(p)) => format!("nothing actionable in {p}"),
+        (false, None) => "nothing actionable".into(),
+    }
+}
+
+/// Say, on the pane, that this agent has nothing in hand and is looking.
+///
+/// The gap this fills is the one between being sent to find work and having
+/// found it. `claim` names the pane after the task, so everything from the
+/// claim onwards is visible from outside — but the minute or two before it, in
+/// which an agent reads a backlog, writes an overview and decides, showed
+/// whatever the pane was called last. From herdr that is indistinguishable
+/// from an agent that read its instruction and did nothing.
+///
+/// Two conditions, and both are about the caller rather than the answer:
+///
+/// *An agent.* A person running `wsp next` in a shell is asking a question,
+/// not reporting a state, and their pane is not ours to rename.
+///
+/// *Holding nothing.* A bound pane running `next` is peeking at what comes
+/// after the thing it is in the middle of — and `next` deliberately keeps that
+/// pane's own `doing` task in the running, so the answer is often the task it
+/// already has. Renaming there would replace a true name with a false one. It
+/// is also why this needs no separate hook for the panel's `f`: `find_work`
+/// refuses on an agent that still holds a task, so an agent sent looking is
+/// unbound by the time it asks.
+///
+/// Nothing here is worth failing a command over, so every failure is silent —
+/// the same bargain `claim`'s rename makes.
+pub fn say_looking(store: &Store, panes: &[herdr::Pane], project: Option<&str>, found: bool) {
+    if !herdr::available() {
+        return;
+    }
+    let Some(pane) = herdr::Env::read().pane_id else { return };
+    let driven = panes.iter().any(|p| p.pane_id == pane && !p.agent.is_empty());
+    if !driven {
+        return;
+    }
+    let holds = store
+        .bindings()
+        .get(&pane)
+        .and_then(|b| b.get("task_id"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|id| store.task(id).is_some());
+    if holds {
+        return;
+    }
+    let _ = herdr::rename_pane(&pane, &looking_label(project, found));
+}
+
 /// `Trance Video · 3h12m` — a claim as one line.
 ///
 /// Both this and `worked_line` join what they have and skip what they do not,
@@ -1772,6 +1832,30 @@ mod tests {
         let long = "Agents should rename as they pick up new tasks, and say so";
         assert_eq!(task_label(long).unwrap().chars().count(), 44);
         assert!(task_label(long).unwrap().ends_with('…'));
+    }
+
+    /// The two states an agent with nothing in hand can be in, and the reason
+    /// the project is not what the label leads with: a herdr sidebar draws 26
+    /// columns and cuts the right-hand end, so a project-first label loses the
+    /// state — which is the half a person scanning for a free agent is reading.
+    #[test]
+    fn a_looking_pane_says_the_state_before_the_project() {
+        assert_eq!(looking_label(Some("render"), true), "looking for work in render");
+        assert_eq!(looking_label(Some("render"), false), "nothing actionable in render");
+
+        // Unscoped — `wsp next` outside any project. Still the two states.
+        assert_eq!(looking_label(None, true), "looking for work");
+        assert_eq!(looking_label(None, false), "nothing actionable");
+
+        // What survives herdr's cut is the state, for the longest slug we have.
+        let long = looking_label(Some("strata-prototype"), true);
+        assert!(long.chars().take(26).collect::<String>().starts_with("looking for work"));
+
+        // And nothing here can ever be a name the panel hunts for.
+        for l in [looking_label(Some("wsp"), true), looking_label(Some("wsp"), false)] {
+            assert_ne!(l, crate::panel::PANEL_LABEL);
+            assert_ne!(l, crate::panel::VIEW_LABEL);
+        }
     }
 
     /// The refusal says what is owed, and the log is the only place that has

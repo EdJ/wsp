@@ -754,6 +754,12 @@ pub fn next(store: &Store, args: &Args) -> i32 {
     });
 
     let Some(t) = candidates.first() else {
+        // Asked, and there was nothing — which is a state worth wearing rather
+        // than a moment. This pane stays like this until somebody hands it
+        // something, so of the two labels `say_looking` writes, this is the one
+        // that is still on screen when a person comes looking.
+        crate::cmd_agent::say_looking(store, &panes_now, scope.as_deref(), false);
+
         // "nothing actionable" on its own reads as an empty backlog, and the
         // commonest reason for landing here is the opposite — a backlog that is
         // entirely at review or entirely in other agents' hands. An agent that
@@ -781,6 +787,10 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         }
         return 0;
     };
+
+    // Named, but not yet taken up: the claim is the agent's next move and the
+    // reading of the task comes in between. The claim renames over this.
+    crate::cmd_agent::say_looking(store, &panes_now, scope.as_deref(), true);
 
     if args.json() {
         println!("{}", t.json());
