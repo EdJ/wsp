@@ -29,6 +29,11 @@ mod verbs;
 
 pub(crate) use keys::{apply_key, Effect, View};
 pub(crate) use render::{frame, glyph, legend, line, to_ansi, to_html, to_html_spans, Line, Style};
+// The live click mapping reaches `row_at` through `super::render` inside this
+// module; only the storyboard's tests need it from outside, so it is exported
+// for them alone rather than widening the surface for everyone.
+#[cfg(test)]
+pub(crate) use render::row_at;
 pub(crate) use rows::{collect, refetch_into, RowKind, Snapshot, Target, Ui};
 pub(crate) use run::{exe_stamp, stty, term_size};
 pub use install::{install, install_if_adopted, uninstall};

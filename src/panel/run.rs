@@ -209,31 +209,50 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
     draw(&ui, &view, &mut last);
 
     loop {
-        let msg = match rx.recv_timeout(Duration::from_secs(60)) {
+        let mut msg = match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(m) => m,
             Err(RecvTimeoutError::Timeout) => Msg::Tick,
             Err(RecvTimeoutError::Disconnected) => return Outcome::Quit,
         };
 
+        // Select, then activate. One click moves the cursor and does nothing
+        // else; a click on the row already under it means what `↵` means, so
+        // it *becomes* that key rather than restating what opening a row does.
+        // A click that both selects and opens is how you end up somewhere you
+        // did not ask to be, on a row you had not read — and here `↵` can
+        // focus another pane, so that is a terminal you were not looking at.
+        //
+        // Translated before the dispatch rather than inside it: only the loop
+        // knows the pane's size, and `render::row_at` is the arithmetic that
+        // drew the frame, so the row under the pointer is the row that acts.
+        if let Msg::Key(Key::Click { y, .. }) = msg {
+            let (w, h) = term_size();
+            match super::render::row_at(&ui, &view, w, h, y) {
+                Some(i) if i == ui.sel => msg = Msg::Key(Key::Enter),
+                Some(i) => {
+                    ui.sel = i;
+                    draw(&ui, &view, &mut last);
+                    continue;
+                }
+                // Furniture: the title, a rule, the blank tail, the footer.
+                None => continue,
+            }
+        }
+
+        // The tree scrolls by holding the cursor near the middle of the pane,
+        // so it has no scroll offset of its own to move: the wheel moves the
+        // cursor and the view follows. A separate offset would fight that
+        // centring every time a key moved the selection.
+        if let Msg::Key(Key::Wheel { up }) = msg {
+            for _ in 0..3 {
+                let _ = apply_key(if up { Key::Up } else { Key::Down }, &mut ui, &mut view);
+            }
+            draw(&ui, &view, &mut last);
+            continue;
+        }
+
         let mut refetch = false;
         match msg {
-            // Step one of mouse support, and the only question that matters:
-            // does a click on a pane you are not focused in reach the program
-            // running in it, or does herdr take it to move focus? Report what
-            // arrives and let a person click. Until that is answered, a click
-            // does nothing else — landing the cursor somewhere on the strength
-            // of coordinates nobody has checked is how you find out they were
-            // off by a header.
-            Msg::Key(k @ (Key::Click { .. } | Key::Wheel { .. })) => {
-                match k {
-                    Key::Click { x, y } => say(&mut ui, format!("click  col {x}  row {y}")),
-                    Key::Wheel { up } => {
-                        say(&mut ui, format!("wheel {}", if up { "up" } else { "down" }))
-                    }
-                    _ => {}
-                }
-                draw(&ui, &view, &mut last);
-            }
             Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
                 Effect::Quit => return Outcome::Quit,
                 Effect::None => {}

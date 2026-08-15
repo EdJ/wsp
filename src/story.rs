@@ -755,3 +755,82 @@ pub fn run(args: &crate::Args) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A click acts on the row under the pointer, or on nothing. Every case
+    /// here is one where being off by a single line would act on the wrong
+    /// task — silently, and looking exactly like a misplaced click.
+    fn ui_of(snap: &Snapshot, view: &panel::View) -> panel::Ui {
+        panel::collect(snap, view, Some("w0"))
+    }
+
+    #[test]
+    fn the_first_tree_row_sits_under_the_title_and_its_rule() {
+        let w = world();
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        assert_eq!(panel::row_at(&ui, &view, W, H, 0), None, "the title");
+        assert_eq!(panel::row_at(&ui, &view, W, H, 1), None, "the rule under it");
+        assert_eq!(panel::row_at(&ui, &view, W, H, 2), Some(0), "the first row");
+        assert_eq!(panel::row_at(&ui, &view, W, H, 3), Some(1));
+    }
+
+    #[test]
+    fn furniture_is_not_a_row() {
+        let w = quiet_world();
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        // Far below anything drawn: the blank tail, the rules and the footer.
+        assert_eq!(panel::row_at(&ui, &view, W, H, H - 1), None);
+        assert_eq!(panel::row_at(&ui, &view, W, H, H - 2), None);
+        assert_eq!(panel::row_at(&ui, &view, W, H, H - 3), None);
+    }
+
+    /// The tree scrolls once the cursor is past the middle, and a click has to
+    /// go through the same offset the frame drew with — otherwise clicking
+    /// works at the top of a list and acts on the wrong task further down.
+    #[test]
+    fn a_click_follows_the_scroll() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        for _ in 0..20 {
+            panel::apply_key(Key::Down, &mut ui, &mut view);
+        }
+        let first = panel::row_at(&ui, &view, W, H, 2).expect("a row at the top");
+        assert!(first > 0, "the tree has scrolled, so the top row is not row 0");
+        // Whatever is at the top, the row below it is the next one along.
+        assert_eq!(panel::row_at(&ui, &view, W, H, 3), Some(first + 1));
+        // And the selected row is where the cursor actually is.
+        let sel_y = (2..H).find(|y| panel::row_at(&ui, &view, W, H, *y) == Some(ui.selected_index()));
+        assert!(sel_y.is_some(), "the selected row is on screen and clickable");
+    }
+
+    /// Every row the frame draws must be reachable by clicking it, and no two
+    /// screen rows may claim the same one.
+    #[test]
+    fn the_mapping_is_one_to_one_over_what_is_drawn() {
+        let w = world();
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        let seen: Vec<usize> = (0..H).filter_map(|y| panel::row_at(&ui, &view, W, H, y)).collect();
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "two screen rows mapped to one row");
+
+        // Two blocks, not one: the tree scrolls and the dock is pinned beneath
+        // it, so the indices jump once where the tree was truncated. Within a
+        // block they must run consecutively, or a click is off by a line.
+        let jumps = seen.windows(2).filter(|p| p[1] != p[0] + 1).count();
+        assert!(jumps <= 1, "the mapping has more than one gap: {seen:?}");
+
+        // And every row that can be clicked can be selected by clicking it.
+        for (n, y) in (0..H).filter(|y| panel::row_at(&ui, &view, W, H, *y).is_some()).enumerate() {
+            assert_eq!(panel::row_at(&ui, &view, W, H, y), Some(seen[n]));
+        }
+    }
+}

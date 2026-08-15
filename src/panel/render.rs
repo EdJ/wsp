@@ -263,6 +263,78 @@ pub(super) fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
 }
 
 /// The whole panel as styled lines. No escapes, no terminal — a backend turns
+/// Where the frame's parts land in a pane of this size.
+///
+/// Extracted from [`frame`] rather than restated, because a click has to be
+/// turned back into a row by the *same* arithmetic that drew it. Two copies of
+/// this would agree until the day one of them gained a header, and then a
+/// click would quietly act on the row above the one under the pointer — which
+/// is the kind of wrong that gets blamed on the mouse.
+pub(super) struct Geometry {
+    /// Rows above the tree: the title and its rule.
+    pub head: usize,
+    pub map_rows: usize,
+    pub dock_rows: usize,
+    pub tree_rows: usize,
+    pub tree_len: usize,
+    pub scroll: usize,
+}
+
+pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
+    const HEAD: usize = 2;
+    const FOOTER: usize = 3;
+    let room = h.saturating_sub(HEAD + FOOTER);
+    let map_rows = if view.help {
+        help_lines(w).len().min(room.saturating_sub(MIN_TREE_ROWS))
+    } else {
+        0
+    };
+    let body_rows = room - map_rows;
+    let dock_rows = if ui.dock == 0 {
+        0
+    } else {
+        (ui.dock + 1).min(body_rows.saturating_sub(MIN_TREE_ROWS))
+    };
+    let tree_len = ui.rows.len() - ui.dock;
+    let tree_rows = body_rows - dock_rows;
+    let anchor = ui.sel.min(tree_len.saturating_sub(1));
+    Geometry {
+        head: HEAD,
+        map_rows,
+        dock_rows,
+        tree_rows,
+        tree_len,
+        scroll: scroll_for(anchor, tree_len, tree_rows),
+    }
+}
+
+/// The row a click at pane row `y` landed on, if it landed on one.
+///
+/// `None` for the title, the rule, the blank tail, the key map and the footer:
+/// a click on furniture is not a click on a row, and moving the cursor because
+/// somebody clicked a horizontal line is worse than doing nothing.
+pub(crate) fn row_at(ui: &Ui, view: &View, w: usize, h: usize, y: usize) -> Option<usize> {
+    let g = geometry(ui, view, w, h);
+
+    let drawn = g.tree_rows.min(g.tree_len.saturating_sub(g.scroll));
+    if y >= g.head && y < g.head + drawn {
+        return Some(g.scroll + (y - g.head));
+    }
+
+    // The dock sits at the bottom whatever the tree is doing, under a rule of
+    // its own. `dock_rows` counts that rule, so its rows are one fewer.
+    if g.dock_rows > 1 {
+        let first = h.saturating_sub(3 + g.map_rows + g.dock_rows) + 1;
+        if y >= first && y < first + g.dock_rows - 1 {
+            let i = g.tree_len + (y - first);
+            if i < ui.rows.len() {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// this into something you can look at.
 pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     let mode = &view.mode;
@@ -284,14 +356,13 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     lines.push(line(Style::Dim, "─".repeat(w)));
 
     let footer_rows = 3;
-    let room = h.saturating_sub(lines.len() + footer_rows);
+    let g = geometry(ui, view, w, h);
 
     // The map takes the rows it needs out of the tree's, never the other way
     // about, and its first line is a ruled heading — so it needs no separator
     // of its own and costs the tree nothing but its own height.
     let map = if view.help { help_lines(w) } else { Vec::new() };
-    let map_rows = map.len().min(room.saturating_sub(MIN_TREE_ROWS));
-    let body_rows = room - map_rows;
+    let map_rows = g.map_rows;
     let keys = hotkeys(&ui.rows);
 
     // The dock keeps its rows whatever the tree is doing. An agent with no
@@ -299,13 +370,9 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     // the bottom first, since it sorts by work and that pane has none.
     // One line of rule, so the dock reads as its own pane rather than as the
     // tail of the tree. It is only worth its row if the rows it separates fit.
-    let dock_rows = if ui.dock == 0 {
-        0
-    } else {
-        (ui.dock + 1).min(body_rows.saturating_sub(MIN_TREE_ROWS))
-    };
-    let tree_len = ui.rows.len() - ui.dock;
-    let tree_rows = body_rows - dock_rows;
+    let dock_rows = g.dock_rows;
+    let tree_len = g.tree_len;
+    let tree_rows = g.tree_rows;
 
     // Scroll on the tree's own length. A cursor down in the dock leaves the
     // tree where it was rather than dragging it to the end.
@@ -317,8 +384,7 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
         lines.push(line(Style::Dim, "  R for the whole tree"));
     }
 
-    let anchor = ui.sel.min(tree_len.saturating_sub(1));
-    let scroll = scroll_for(anchor, tree_len, tree_rows);
+    let scroll = g.scroll;
     for (i, row) in ui.rows.iter().enumerate().take(tree_len).skip(scroll).take(tree_rows) {
         let mut l = render_row(row, w, keys[i]);
         l.selected = i == ui.sel;
