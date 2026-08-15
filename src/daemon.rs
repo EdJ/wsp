@@ -15,6 +15,11 @@ const DEBOUNCE: Duration = Duration::from_millis(400);
 const TICK: Duration = Duration::from_secs(20);
 const REFRESH: Duration = Duration::from_secs(15 * 60);
 
+/// What is worth a re-sync. `pane.agent_status_changed` is not here and must
+/// not be: it is per-pane and its request requires a `pane_id`, so one entry
+/// asking for it globally refuses the entire list — see [`crate::herdr`]. The
+/// daemon has a 20s tick to fall back on, which is why this went unnoticed for
+/// as long as it did. `pane.agent_detected` is what a new agent raises.
 const EVENTS: &[&str] = &[
     "workspace.created",
     "workspace.closed",
@@ -25,7 +30,7 @@ const EVENTS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
-    "pane.agent_status_changed",
+    "pane.agent_detected",
     "worktree.created",
     "worktree.opened",
 ];

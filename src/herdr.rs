@@ -5,6 +5,11 @@
 //! `{"type":"subscription_started"}` and then streams
 //! `{"event":"workspace_focused","data":{…}}` lines on the same connection —
 //! note the stream uses underscores where subscriptions use dots.
+//!
+//! One subscription is refused unless it names a pane: `pane.agent_status_changed`
+//! is per-pane, and its request struct requires `pane_id` — there is no wildcard,
+//! `*` and `""` both answer `pane_not_found`. A subscription list is validated as
+//! a whole, so one entry missing its `pane_id` refuses every other entry with it.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -224,6 +229,17 @@ where
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        // A refused subscription arrives as one `error` reply and then the
+        // server hangs up. Without this the stream simply ends, which is
+        // indistinguishable from a clean close: the caller retries fast, sees
+        // nothing, and goes on seeing nothing. It cost this whole feature.
+        if let Some(e) = v.get("error") {
+            let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("refused");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("events.subscribe: {msg}"),
+            ));
+        }
         let Some(event) = v.get("event").and_then(|e| e.as_str()) else { continue };
         let data = v.get("data").cloned().unwrap_or(Value::Null);
         if !f(event, &data) {

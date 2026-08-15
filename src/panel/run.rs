@@ -24,9 +24,21 @@ use super::verbs::{close_view, inspect, open_workspace, pop_out, run_wsp, send_t
 
 pub(super) enum Msg {
     Key(Key),
-    /// Carries the workspace the event was about, when it named one.
-    Herdr(Option<String>),
+    Herdr(HerdrEvent),
     Tick,
+}
+
+/// A herdr event, reduced to the two things the loop decides with.
+pub(super) struct HerdrEvent {
+    /// The workspace it was about, when it named one.
+    pub(super) workspace: Option<String>,
+    /// A pane or workspace appeared, went, or gained an agent — the shape of
+    /// the tree changed, and it is worth a refetch on its own. `pane.updated`
+    /// is the other kind: it fires about twice a second on output and cursor
+    /// movement, and refetching on each would put four socket calls a second
+    /// behind every panel that happens to be looked at. Those go through the
+    /// tick gate, which coalesces them to the cadence the panel already keeps.
+    pub(super) structural: bool,
 }
 
 pub(crate) fn stty(args: &[&str]) {
@@ -84,27 +96,57 @@ pub(super) fn spawn_input(tx: Sender<Msg>) {
     });
 }
 
+/// Everything that changes what the panel would draw, and nothing that does
+/// not. `pane.agent_status_changed` is deliberately absent: it is per-pane and
+/// its request requires a `pane_id`, so asking for it globally refuses the
+/// whole list — see the note in [`crate::herdr`]. `pane.agent_detected` is the
+/// event a new agent actually raises, and `pane.updated` is the only global
+/// carrier of an agent going idle or working.
+const STRUCTURAL: &[&str] = &[
+    "workspace.created",
+    "workspace.closed",
+    "workspace.renamed",
+    "workspace.focused",
+    "pane.created",
+    "pane.closed",
+    "pane.exited",
+    "pane.agent_detected",
+];
+const CHATTY: &[&str] = &["pane.updated"];
+
+/// Subscriptions herdr scopes to a single pane. Its request struct for these
+/// requires a `pane_id`, and there is no wildcard — `*` and `""` both answer
+/// `pane_not_found`. Naming one here without a pane refuses the whole list,
+/// which is how the panel spent its life receiving no events at all.
+#[cfg(test)]
+const PER_PANE: &[&str] =
+    &["pane.agent_status_changed", "pane.output_matched", "pane.scroll_changed"];
+
+/// Does this stream event redraw the tree on its own?
+///
+/// The stream names events with underscores where the subscription used dots —
+/// `pane.agent_detected` is asked for that way and arrives as
+/// `pane_agent_detected`.
+fn structural(event: &str) -> bool {
+    STRUCTURAL.iter().any(|t| t.replace('.', "_") == event)
+}
+
 pub(super) fn spawn_events(tx: Sender<Msg>) {
     std::thread::spawn(move || loop {
         let tx2 = tx.clone();
-        let res = herdr::subscribe(
-            &[
-                "workspace.created",
-                "workspace.closed",
-                "workspace.renamed",
-                "workspace.focused",
-                "pane.created",
-                "pane.exited",
-                "pane.agent_status_changed",
-            ],
-            move |_e, d| {
-                let ws = d
-                    .get("workspace_id")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string());
-                tx2.send(Msg::Herdr(ws)).is_ok()
-            },
-        );
+        let types: Vec<&str> = STRUCTURAL.iter().chain(CHATTY).copied().collect();
+        let res = herdr::subscribe(&types, move |e, d| {
+            // `pane.created` and `pane.updated` carry the pane as an object and
+            // the workspace id inside it; the rest put it at the top level.
+            // Reading only the top level made every event about our own pane
+            // look like an event about somebody else's.
+            let ws = d
+                .get("workspace_id")
+                .or_else(|| d.get("pane").and_then(|p| p.get("workspace_id")))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+            tx2.send(Msg::Herdr(HerdrEvent { workspace: ws, structural: structural(e) })).is_ok()
+        });
         if res.is_err() {
             std::thread::sleep(Duration::from_secs(3));
         } else {
@@ -219,6 +261,9 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
     // on the first of a burst and not on the ninety after it.
     let mut took_focus = Instant::now() - Duration::from_secs(60);
     let mut last_fingerprint = store.fingerprint();
+    // Messages taken off the channel while coalescing a burst of herdr events,
+    // to be handled in the order they arrived rather than thrown away.
+    let mut carry: std::collections::VecDeque<Msg> = Default::default();
 
     let draw = |ui: &Ui, view: &View, last: &mut String| {
         let (w, h) = term_size();
@@ -232,10 +277,13 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
     draw(&ui, &view, &mut last);
 
     loop {
-        let mut msg = match rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(m) => m,
-            Err(RecvTimeoutError::Timeout) => Msg::Tick,
-            Err(RecvTimeoutError::Disconnected) => return Outcome::Quit,
+        let mut msg = match carry.pop_front() {
+            Some(m) => m,
+            None => match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(m) => m,
+                Err(RecvTimeoutError::Timeout) => Msg::Tick,
+                Err(RecvTimeoutError::Disconnected) => return Outcome::Quit,
+            },
         };
 
         // Select, then activate. One click moves the cursor and does nothing
@@ -378,15 +426,34 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                     refetch = true;
                 }
             },
-            Msg::Herdr(ws) => {
-                // An event naming our own workspace means we are probably about
-                // to be looked at. Coalesce the burst that follows a split or a
-                // focus change, then mark dirty — the tick is 200ms away and
-                // will pick it up, so there is no reason to sleep here.
-                while rx.try_recv().is_ok() {}
-                let concerns_us = ws.is_some() && ws.as_deref() == self_ws;
+            Msg::Herdr(e) => {
+                // Coalesce the burst that follows a split or a focus change.
+                // Keys are put back rather than dropped: they arrived after the
+                // event but have not been acted on, and swallowing a keystroke
+                // because a pane somewhere repainted is not a trade anyone
+                // would make. `pane.updated` alone is two events a second, so
+                // this drain runs constantly and used to eat into every burst
+                // of typing.
+                let mut structural = e.structural;
+                let mut concerns_us = e.workspace.is_some() && e.workspace.as_deref() == self_ws;
+                while let Ok(m) = rx.try_recv() {
+                    match m {
+                        Msg::Herdr(e) => {
+                            structural |= e.structural;
+                            concerns_us |=
+                                e.workspace.is_some() && e.workspace.as_deref() == self_ws;
+                        }
+                        Msg::Tick => {}
+                        held => carry.push_back(held),
+                    }
+                }
+                // A pane appeared, went, or picked up an agent: the dock and
+                // the tree are both wrong until this is drawn, so draw it. An
+                // event naming our own workspace means we are probably about to
+                // be looked at, and is worth the same. Anything else marks
+                // dirty and waits for the tick, which is 200ms away.
                 dirty = true;
-                if concerns_us || ui.self_focused {
+                if structural && (concerns_us || ui.self_focused) {
                     refetch = true;
                     dirty = false;
                 }
@@ -420,5 +487,48 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
             refetch_into(&mut ui, &Snapshot::live(store), &mut view, self_ws);
         }
         draw(&ui, &view, &mut last);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this file was written to fix. A subscription list is validated
+    /// as a whole, so one per-pane type sent without a `pane_id` refuses every
+    /// global type beside it — and `subscribe` used to read that refusal as an
+    /// empty stream. The panel drew a tree that could not change.
+    #[test]
+    fn no_subscription_is_scoped_to_a_single_pane() {
+        for t in STRUCTURAL.iter().chain(CHATTY) {
+            assert!(
+                !PER_PANE.contains(t),
+                "{t} needs a pane_id, and asking for it globally refuses the whole list",
+            );
+        }
+    }
+
+    /// A pane gaining an agent is the event the dock exists for. herdr raises
+    /// it as `pane.agent_detected`; `pane.agent_status_changed` is the one that
+    /// cannot be had globally, and is not a substitute for it.
+    #[test]
+    fn a_pane_gaining_an_agent_is_subscribed_to() {
+        assert!(STRUCTURAL.contains(&"pane.agent_detected"));
+        assert!(!STRUCTURAL.contains(&"pane.agent_status_changed"));
+        assert!(!CHATTY.contains(&"pane.agent_status_changed"));
+    }
+
+    /// Subscriptions are spelt with dots and the stream answers in underscores.
+    /// Classifying on the subscription's own spelling would make every event
+    /// non-structural, which is the same silence by another route.
+    #[test]
+    fn structural_reads_the_names_the_stream_actually_uses() {
+        assert!(structural("pane_agent_detected"));
+        assert!(structural("pane_created"));
+        assert!(structural("workspace_focused"));
+        // Asked for as `pane.updated`, and deliberately not structural: it
+        // fires about twice a second and goes through the tick gate.
+        assert!(!structural("pane_updated"));
+        assert!(!structural("pane.agent_detected"));
     }
 }
