@@ -354,6 +354,53 @@ Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
 `$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
 
+## What an agent is handed
+
+```sh
+wsp brief            # one call, for a session-start hook
+wsp brief --json
+```
+
+```
+where  meta/tooling/wsp  rust herdr
+you    t-260815-005  doing  wsp brief: what an agent is handed at session start
+under  t-260815-003  Claude Code lifecycle: agents that keep the store themselves
+open   t-260814-023  blocked   Storyboard: scripted input through the reducer…
+       t-260815-003  todo    ! Claude Code lifecycle…                   (8 open)
+       4 more · wsp ls
+others wsp             t-260815-011  Overlap: tell an agent who else is standing…
+       vst             unclaimed · ◑ Evaluate infinite canvas performance…
+```
+
+Every line of it is answerable already — `where` for the project, `ls` for the
+backlog, `wip` for the other agents. One command exists because a session-start
+hook can afford exactly one call, and because what it prints is a *briefing*
+rather than a report: the few facts an agent cannot work correctly without, in
+the order it needs them, short enough that nobody turns it off to save context.
+
+`under` is there because direction lands on a parent and the work happens a
+sub-task at a time, so the piece in hand is rarely the reason it is being done.
+A sub-task whose parent is also on the `open` list is left out of it — the
+parent's count already speaks for it, and printing both spends the cap twice on
+one piece of work.
+
+It never fails. An empty store, a herdr that is not answering, a pane belonging
+to no project: each of those is a shorter brief, not an error. A hook that
+errors on a fresh machine is a hook people delete.
+
+### The standing rules
+
+`~/wsp/agents.md`, if it exists, is printed at the end. The protocol an agent
+works to belongs in the store rather than compiled into this binary: it is
+yours to edit, versioned in git beside the tasks it talks about, and readable
+by anything that can read a file. A rule nobody can change without a rebuild is
+a rule that goes stale.
+
+It is also the only place the *trigger* can live. A skill loads on demand,
+which is no use for behaviour that has to happen without being asked — so the
+few sentences that say when to reach for the CLI have to be in front of the
+agent before it does anything, and this is the file the hook puts there.
+
 ## Sub-tasks
 
 ```sh
@@ -460,6 +507,7 @@ Every command takes `--json`.
 | `src/detail/render.rs` | a task or a project, in full |
 | `src/detail/editors.rs` | getting the editors a pop-out opened to go |
 | `src/detail/run.rs` | the detail pane itself |
+| `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_*.rs` | the commands |
 
 The panel is split where the *work* splits rather than by layer: a row's data

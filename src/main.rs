@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 mod cmd_agent;
+mod cmd_brief;
 mod cmd_project;
 mod cmd_task;
 mod daemon;
@@ -176,6 +177,7 @@ fn main() {
         "rm" | "remove" => cmd_task::rm(&store, &args),
         "archive" => cmd_task::archive(&store, &args),
 
+        "brief" => cmd_brief::brief(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "release" => cmd_agent::release(&store, &args),
         "pin" => cmd_agent::pin(&store, &args),
@@ -241,6 +243,7 @@ fn help() {
   wsp archive [--all]               sweep done tasks older than 30d
 
 {agents}
+  wsp brief                         what this pane is for, and who else is working
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project
