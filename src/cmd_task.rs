@@ -3,6 +3,7 @@
 use serde_json::json;
 
 use crate::cmd_agent::{claim_line, current_project, worked_line};
+use crate::herdr;
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
 use crate::store::Store;
@@ -709,15 +710,40 @@ pub fn next(store: &Store, args: &Args) -> i32 {
     };
     let scope_ids: Option<Vec<String>> = scope.as_ref().map(|s| index.subtree(s));
 
+    // `next` means "what do I pick up and work on", so the filter has to answer
+    // for the caller rather than for the backlog.
+    //
+    // `review` is deliberately absent, and its absence is the whole point:
+    // `Status::rank` puts it ahead of `doing` and `todo`, so it did not merely
+    // appear here, it *won* — every agent asking what to do next was handed
+    // work it had already finished and given back. `review` is where an agent
+    // stops; only a person says `done`, and a person finds that pile through
+    // `R` in the panel or `wsp wip`. `blocked` is absent for the neighbouring
+    // reason: a decision is owed, and that is not an agent's to make either.
+    let in_scope = |t: &Task| match &scope_ids {
+        Some(ids) => t.project.as_ref().map(|p| ids.contains(p)).unwrap_or(false),
+        None => true,
+    };
     let mut candidates: Vec<Task> = store
         .tasks()
         .into_iter()
-        .filter(|t| matches!(t.status(), Status::Doing | Status::Todo | Status::Review))
-        .filter(|t| match &scope_ids {
-            Some(ids) => t.project.as_ref().map(|p| ids.contains(p)).unwrap_or(false),
-            None => true,
-        })
+        .filter(|t| matches!(t.status(), Status::Doing | Status::Todo))
+        .filter(&in_scope)
         .collect();
+
+    // And nothing another live agent is already holding. `claim` refuses those,
+    // so naming one sends the caller into a guaranteed refusal — and three idle
+    // agents set going at once would otherwise all be handed the same task and
+    // all three bounce. Held by the *caller* stays: a `doing` task in this
+    // pane's own hand is precisely this pane's next piece of work.
+    let bindings = store.bindings();
+    let panes_now = if herdr::available() { herdr::panes().unwrap_or_default() } else { Vec::new() };
+    let me = crate::herdr::Env::read().pane_id;
+    let taken = |t: &Task| {
+        !crate::cmd_agent::live_holders(&bindings, &panes_now, &t.id, me.as_deref()).is_empty()
+    };
+    let held = candidates.iter().filter(|t| taken(t)).count();
+    candidates.retain(|t| !taken(t));
 
     candidates.sort_by(|a, b| {
         a.status()
@@ -728,10 +754,30 @@ pub fn next(store: &Store, args: &Args) -> i32 {
     });
 
     let Some(t) = candidates.first() else {
+        // "nothing actionable" on its own reads as an empty backlog, and the
+        // commonest reason for landing here is the opposite — a backlog that is
+        // entirely at review or entirely in other agents' hands. An agent that
+        // has just been told to find work needs to know which.
+        let waiting = store
+            .tasks()
+            .iter()
+            .filter(|t| t.status() == Status::Review)
+            .filter(|t| in_scope(t))
+            .count();
         if args.json() {
             println!("null");
         } else {
-            println!("nothing actionable");
+            let mut why: Vec<String> = Vec::new();
+            if waiting > 0 {
+                why.push(format!("{waiting} at review, waiting on a person"));
+            }
+            if held > 0 {
+                why.push(format!("{held} held by other agents"));
+            }
+            match why.is_empty() {
+                true => println!("nothing actionable"),
+                false => println!("nothing actionable — {}", why.join(" · ")),
+            }
         }
         return 0;
     };

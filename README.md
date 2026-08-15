@@ -364,6 +364,21 @@ straight out, and `wsp brief` inside it now says what it is for. Only a project
 answers; a task or the inbox would scope `wsp next` to everything, which is not
 what was asked. `wsp mandate --clear` in the pane undoes it.
 
+`wsp next` answers for the *caller*, which is what makes this loop safe to
+close. It offers `doing` and `todo` and nothing else. `review` is deliberately
+absent, and its absence is the whole point: `Status::rank` puts review ahead of
+both, so it did not merely appear in the list, it won — the first thing `f`
+ever did was hand an agent back the task it had just finished and given to a
+person. `blocked` is absent for the neighbouring reason: a decision is owed,
+and that is not an agent's to make. Nor does `next` name work another live
+agent is holding, because `claim` refuses exactly that — the two share one
+definition of "somebody else has this" — and three idle agents set going at
+once would otherwise all be handed the same task and all three bounce. Work in
+the *caller's* own hand still counts: a `doing` task this pane already holds is
+precisely this pane's next piece of work. When nothing is left, `next` says
+which of the two reasons emptied the list, because "nothing actionable" on its
+own reads as an empty backlog and usually means a busy one.
+
 Three panes are never typed into. A shell would run the sentence as a command;
 a working agent's prompt may not be a prompt at all, and a claim onto one still
 lands, it just goes untold; an agent already holding a task is refused and

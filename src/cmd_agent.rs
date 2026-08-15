@@ -11,6 +11,37 @@ use crate::sync;
 use crate::util::{self, Paint};
 use crate::Args;
 
+/// Every pane holding `task` that is not `me`, and that a live agent is
+/// driving.
+///
+/// The one definition of "somebody else has this". `claim` refuses on it and
+/// `next` declines to name it, and the two have to be the same rule: when they
+/// disagreed, `next` named work `claim` would refuse, so an agent told to find
+/// its own work was sent straight into a wall with nothing to try instead.
+///
+/// A *dead* pane's binding is not a holder — that is exactly the stale state a
+/// re-claim exists to clear. Nor is a shell's: a person at a terminal can be
+/// asked to move, and refusing on their behalf helps nobody.
+pub fn live_holders<'a>(
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    panes_now: &'a [herdr::Pane],
+    task: &str,
+    me: Option<&str>,
+) -> Vec<&'a herdr::Pane> {
+    panes_now
+        .iter()
+        .filter(|p| !p.agent.is_empty())
+        .filter(|p| Some(p.pane_id.as_str()) != me)
+        .filter(|p| {
+            bindings
+                .get(&p.pane_id)
+                .and_then(|b| b.get("task_id"))
+                .and_then(|x| x.as_str())
+                == Some(task)
+        })
+        .collect()
+}
+
 /// The project the caller is standing in. `-p` always wins; otherwise the
 /// precedence chain is pin > binding > mandate > cwd > workspace label.
 pub fn current_project(
@@ -300,6 +331,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     let displaced: Vec<String> =
         store.panes_for_task(&t.id).into_iter().filter(|p| p != &pane).collect();
 
+    let bindings_now = store.bindings();
+
     // Claiming finished work reopens it, silently: the status goes back to
     // `doing` and the task rejoins every open list on the machine. That is
     // occasionally what you want — work comes back — but never by accident,
@@ -323,11 +356,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     //
     // Refused before anything is written, so a refusal costs nothing: this
     // agent has not yet let go of whatever it was holding.
-    let held_by: Vec<&herdr::Pane> = displaced
-        .iter()
-        .filter_map(|d| panes_now.iter().find(|p| &p.pane_id == d))
-        .filter(|p| !p.agent.is_empty())
-        .collect();
+    let held_by = live_holders(&bindings_now, &panes_now, &t.id, Some(&pane));
     if !held_by.is_empty() && !args.has("force") {
         let held = store
             .claims()
