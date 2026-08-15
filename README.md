@@ -90,7 +90,13 @@ agent running in the workspace.
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
 closes it again), `esc` closes it, `E` pops the row's file out into an editor
 tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `r` syncs,
-`?` opens the key map, `q` quits.
+`?` opens the key map.
+
+`q` and `esc` both mean "put away what is in front of me": the key map first,
+then the detail pane. Neither quits the panel — it is installed furniture in
+every workspace, so losing one to a stray keystroke costs a reinstall and buys
+nothing. `ctrl-c` still quits, and `wsp panel uninstall` is the deliberate way
+out.
 
 `?` docks the key map under the tree, and `?` or `esc` puts it away — a footer
 line fits four of the two dozen keys, which is worse than showing none, because
