@@ -90,7 +90,15 @@ agent running in the workspace.
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
 closes it again), `esc` closes it, `E` pops the row's file out into an editor
 tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `r` syncs,
-`?` lists the verbs, `q` quits.
+`?` opens the key map, `q` quits.
+
+`?` draws the whole map over the tree, and `?` again puts it away — a footer
+line fits four of the twenty keys, which is worse than showing none, because it
+says there is a list and then hides most of it. While the map is up every other
+key is inert: it is open precisely because you are unsure what one of them
+does. The cursor moves with the list held around it — the selection is kept
+near the middle of the pane rather than pushed to the bottom edge, so what you
+are about to reach stays on screen beside what you have passed.
 
 ## The detail pane
 
@@ -228,7 +236,7 @@ panel runs. No herdr, no store, no terminal — useful for arguing about the
 design before building it. The legend above is generated from the same glyph
 constants and `Style` values the rows draw with, so it cannot drift.
 
-## What a task file holds
+## What a task or project file holds
 
 Frontmatter is a contract — `id`, `status`, `schema` — and every field in it has
 a command that sets it correctly. The body is yours, and carries three sections:
@@ -240,11 +248,18 @@ a command that sets it correctly. The body is yours, and carries three sections:
 | `## Log` | dated, append-only; `wsp note` writes it, nothing edits it |
 
 ```sh
-wsp edit <id>              # both sections, headings included
-wsp edit <id> --overview   # just that prose
+wsp edit <id>                    # both sections, headings included
+wsp edit <id> --overview         # just that prose
 wsp edit <id> --details
-wsp edit <id> --raw        # the whole file, when the frontmatter is the problem
+wsp edit <id> --raw              # the whole file, when the frontmatter is wrong
+wsp project edit <id> [--overview|--details|--raw]
 ```
+
+Projects carry the same two sections and take the same editors — `roots`,
+`tags`, `parent` and `status` all have `wsp project set`, so there is nothing
+in a project's frontmatter an editor needs to reach either. A row with anything
+written in it is marked `≡` in the tree, because the point of writing it down
+is being reminded it is there.
 
 `wsp edit` re-reads the task after the editor exits and carries across only the
 section you edited. An edit lasts as long as someone is typing and the file is

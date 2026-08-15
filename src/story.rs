@@ -240,6 +240,9 @@ impl<'a> Driver<'a> {
         if let panel::Effect::Refetch = panel::apply_key(k, &mut self.ui, &mut self.view) {
             panel::refetch_into(&mut self.ui, self.snap, &self.view, Some("w0"));
         }
+        // The live loop clamps the key map's scroll against the real pane; the
+        // storyboard has a fixed one, so it does the same with H.
+        self.view.clamp_help(H);
         self
     }
 
@@ -283,7 +286,7 @@ impl<'a> Driver<'a> {
                 compress(&self.log)
             },
             target: target_label(&self.ui.selected_target()),
-            html: panel::to_html(&panel::frame(&self.ui, &self.view.mode, W, H), W),
+            html: panel::to_html(&panel::frame(&self.ui, &self.view, W, H), W),
         }
     }
 }
@@ -307,6 +310,12 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .keys(&[Key::Down, Key::Down, Key::Down])
             .scene("Moving down", "j × 3. Section headings are skipped; the cursor only rests on rows that lead somewhere."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .keys(&[Key::Down; 14])
+            .scene("Halfway down", "Once the list outruns the pane the cursor is held near the middle, not pushed against the bottom edge — so what you are about to reach stays on screen beside what you have already passed. Only the two ends break it, where there is nothing further to show."),
     );
 
     out.push(
@@ -356,7 +365,7 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .key(Key::Char('?'))
-            .scene("Help", "? puts the key map in the message line for four seconds."),
+            .scene("Help", "? opens the key map over the tree, and ? again puts it away. A footer line could hold four of these; the page holds all of them, and while it is up the other keys are inert."),
     );
 
     // ---- management ----

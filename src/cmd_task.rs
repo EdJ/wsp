@@ -517,6 +517,15 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
 /// `## Log` is excluded deliberately. It is dated and append-only; `wsp note`
 /// is how you add to it, and editing history in place is how history stops
 /// being evidence.
+/// What `edit_prose` needs to know about the thing being edited. Tasks and
+/// projects differ only in where the body lives and how it is written back.
+pub struct Prose {
+    pub what: &'static str,
+    pub id: String,
+    pub body: String,
+    pub path: std::path::PathBuf,
+}
+
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp edit <id> [--overview | --details | --raw]");
@@ -526,10 +535,33 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no task matching `{needle}`");
         return 1;
     };
+    edit_prose(
+        store,
+        args,
+        Prose {
+            what: "task",
+            id: t.id.clone(),
+            body: t.body.clone(),
+            path: store.task_path(&t.id),
+        },
+    )
+}
 
+/// Edit prose without ever showing anyone the frontmatter.
+///
+/// The frontmatter is a contract — `id`, `status`, `schema` — and every field
+/// in it already has a command that sets it correctly. Handing the raw file to
+/// an editor puts a typo one keystroke away from something the tools can no
+/// longer read, for no benefit, because the part worth writing by hand is the
+/// prose. So: the body only, and only the parts meant to be written.
+///
+/// `## Log` is excluded deliberately. It is dated and append-only; `wsp note`
+/// is how you add to it, and editing history in place is how history stops
+/// being evidence.
+pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
     // The escape hatch, for when the frontmatter itself is what is wrong.
     if args.has("raw") {
-        return edit_file(store, &store.task_path(&t.id), &format!("edit {}", t.id));
+        return edit_file(store, &item.path, &format!("edit {}", item.id));
     }
 
     let one = if args.has("overview") {
@@ -541,14 +573,12 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     };
 
     let before = match one {
-        Some(sec) => t.section(sec).unwrap_or_default(),
+        Some(sec) => crate::model::section_of(&item.body, sec).unwrap_or_default(),
         None => {
-            // Both sections, headings included, so the shape is visible and a
-            // reader can move a paragraph between them.
             let mut b = String::new();
             for sec in ["Overview", "Details"] {
                 b.push_str(&format!("## {sec}\n"));
-                let text = t.section(sec).unwrap_or_default();
+                let text = crate::model::section_of(&item.body, sec).unwrap_or_default();
                 if !text.trim().is_empty() {
                     b.push_str(text.trim_end());
                     b.push('\n');
@@ -561,8 +591,8 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
 
     // A directory per edit, so the file inside can be named for the section.
     // Every terminal editor puts the filename in its status line, which makes
-    // that the one label that needs no cooperation from the editor at all.
-    let dir = std::env::temp_dir().join(format!("wsp-{}-{}", t.id, util::epoch_nanos()));
+    // that the one label needing no cooperation from the editor at all.
+    let dir = std::env::temp_dir().join(format!("wsp-{}-{}", item.id, util::epoch_nanos()));
     let _ = std::fs::create_dir_all(&dir);
     let tmp = dir.join(format!(
         "{}.md",
@@ -588,56 +618,82 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
         return 0;
     }
 
-    // Re-read before writing. An edit session lasts as long as someone is
-    // typing, and the task is a shared file — a `wsp note`, a status change
-    // from the panel, a claim — so writing back the copy we opened with would
-    // silently undo whatever happened in between. Only the edited section is
-    // carried across.
-    let Some(mut t) = store.find_task(&t.id) else {
-        eprintln!("wsp: {} disappeared while you were editing — nothing written", t.id);
-        return 1;
+    // Re-read before writing. An edit lasts as long as someone is typing and
+    // the file is shared — a note, a status change, a claim — so writing back
+    // the copy we opened with would silently undo whatever happened between.
+    let mut body = match item.what {
+        "project" => match store.project(&item.id) {
+            Some(p) => p.body,
+            None => {
+                eprintln!("wsp: {} disappeared while you were editing", item.id);
+                return 1;
+            }
+        },
+        _ => match store.task(&item.id) {
+            Some(t) => t.body,
+            None => {
+                eprintln!("wsp: {} disappeared while you were editing", item.id);
+                return 1;
+            }
+        },
     };
 
     match one {
-        Some(sec) => t.set_section(sec, &after),
+        Some(sec) => crate::model::set_section_in(&mut body, sec, &after),
         None => {
-            // Re-read the headings the editor came back with, so moving text
-            // between them does what it looks like it does.
-            let mut probe = Task::default();
-            probe.body = after.clone();
-            let ov = probe.section("Overview");
-            let de = probe.section("Details");
+            let ov = crate::model::section_of(&after, "Overview");
+            let de = crate::model::section_of(&after, "Details");
             if ov.is_none() && de.is_none() {
                 // Both headings were deleted and something was typed anyway.
                 // Keeping it under Overview is a guess; discarding it is not a
                 // guess, it is losing the only thing the user actually wrote.
-                t.set_section("Overview", after.trim());
+                crate::model::set_section_in(&mut body, "Overview", after.trim());
             } else {
-                // Text above the first heading would otherwise fall out of the
-                // file entirely, so it joins the section it sits above.
-                let loose = probe.section("").unwrap_or_default();
+                let loose = crate::model::section_of(&after, "").unwrap_or_default();
                 let overview = match (loose.trim().is_empty(), ov) {
                     (true, o) => o.unwrap_or_default(),
                     (false, Some(o)) => format!("{}\n\n{}", loose.trim(), o),
                     (false, None) => loose.trim().to_string(),
                 };
-                t.set_section("Overview", &overview);
-                t.set_section("Details", &de.unwrap_or_default());
+                crate::model::set_section_in(&mut body, "Overview", &overview);
+                crate::model::set_section_in(&mut body, "Details", &de.unwrap_or_default());
             }
         }
     }
-    t.touch();
-    if let Err(e) = store.save_task(&t) {
-        eprintln!("wsp: write failed: {e}");
-        return 1;
+
+    let saved = match item.what {
+        "project" => store.project(&item.id).map(|mut p| {
+            p.body = body;
+            store.save_project(&p)
+        }),
+        _ => store.task(&item.id).map(|mut t| {
+            t.body = body;
+            t.touch();
+            store.save_task(&t)
+        }),
+    };
+    match saved {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            eprintln!("wsp: write failed: {e}");
+            return 1;
+        }
+        None => {
+            eprintln!("wsp: {} disappeared while you were editing", item.id);
+            return 1;
+        }
     }
-    store.log_event("task-edited", json!({ "id": t.id, "section": one.unwrap_or("body") }));
-    store.git_commit(&format!("wsp: edit {} — {}", t.id, t.title));
+
+    store.log_event(
+        &format!("{}-edited", item.what),
+        json!({ "id": item.id, "section": one.unwrap_or("body") }),
+    );
+    store.git_commit(&format!("wsp: edit {} {}", item.what, item.id));
 
     if args.json() {
-        println!("{}", t.json());
+        println!("{}", json!({ "id": item.id, "edited": one.unwrap_or("body") }));
     } else {
-        println!("edited {}", t.id);
+        println!("edited {}", item.id);
     }
     0
 }

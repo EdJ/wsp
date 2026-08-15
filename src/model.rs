@@ -136,9 +136,97 @@ impl Project {
         d
     }
 
+    pub fn section(&self, name: &str) -> Option<String> {
+        section_of(&self.body, name)
+    }
+
     pub fn render(&self) -> String {
         fm::emit(&self.to_doc())
     }
+}
+
+/// Split a body into `(heading, text)`, with `""` for anything before the
+/// first heading.
+fn split_sections(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut name = String::new();
+    let mut buf = String::new();
+    for line in body.lines() {
+        match line.strip_prefix("## ") {
+            Some(h) => {
+                if !name.is_empty() || !buf.trim().is_empty() {
+                    out.push((name, buf.trim_end().to_string()));
+                }
+                name = h.trim().to_string();
+                buf = String::new();
+            }
+            None => {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+    }
+    if !name.is_empty() || !buf.trim().is_empty() {
+        out.push((name, buf.trim_end().to_string()));
+    }
+    out
+}
+
+pub fn section_of(body: &str, name: &str) -> Option<String> {
+    split_sections(body)
+        .into_iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, t)| t)
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Replace a section, or add it if absent. Sections are rewritten in the
+/// canonical order and anything the schema does not know about is kept — the
+/// body is the user's, and losing a heading nobody anticipated would be a
+/// worse failure than any it prevents.
+pub fn set_section_in(body: &mut String, name: &str, text: &str) {
+    let mut secs = split_sections(body);
+    let text = text.trim_end().to_string();
+    match secs.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        Some(slot) => slot.1 = text,
+        None if !text.trim().is_empty() => secs.push((name.to_string(), text)),
+        None => {}
+    }
+    secs.retain(|(n, t)| !(n.is_empty() && t.trim().is_empty()));
+
+    let rank = |n: &str| -> usize {
+        if n.is_empty() {
+            return 0;
+        }
+        SECTIONS
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(n))
+            .map(|i| i + 1)
+            .unwrap_or(SECTIONS.len() + 1)
+    };
+    secs.sort_by_key(|(n, _)| rank(n));
+
+    let mut out = String::new();
+    for (n, t) in secs {
+        if t.trim().is_empty() && !n.is_empty() {
+            continue;
+        }
+        if !n.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("## {n}\n"));
+        }
+        out.push_str(t.trim_end());
+        out.push('\n');
+    }
+    *body = out;
+}
+
+/// True when either prose section carries anything — what the tree uses to
+/// mark a row as having something written on it.
+pub fn has_prose(body: &str) -> bool {
+    section_of(body, "Overview").is_some() || section_of(body, "Details").is_some()
 }
 
 /// The headings a task body carries, in the order they are written.
@@ -211,84 +299,9 @@ impl Task {
         self.body.push_str(&format!("- {stamp} {line}\n"));
     }
 
-    /// Split the body into `(heading, text)`, with `""` for anything before the
-    /// first heading. Round-trips: joining the result reproduces the body up to
-    /// trailing whitespace.
-    fn sections(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = Vec::new();
-        let mut name = String::new();
-        let mut buf = String::new();
-        for line in self.body.lines() {
-            match line.strip_prefix("## ") {
-                Some(h) => {
-                    if !name.is_empty() || !buf.trim().is_empty() {
-                        out.push((name, buf.trim_end().to_string()));
-                    }
-                    name = h.trim().to_string();
-                    buf = String::new();
-                }
-                None => {
-                    buf.push_str(line);
-                    buf.push('\n');
-                }
-            }
-        }
-        if !name.is_empty() || !buf.trim().is_empty() {
-            out.push((name, buf.trim_end().to_string()));
-        }
-        out
-    }
-
     /// The text under `## <name>`, heading excluded.
     pub fn section(&self, name: &str) -> Option<String> {
-        self.sections()
-            .into_iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, t)| t)
-            .filter(|t| !t.trim().is_empty())
-    }
-
-    /// Replace a section, or add it if absent. Sections are rewritten in the
-    /// canonical order and anything the schema does not know about is kept —
-    /// the body is the user's, and losing a heading nobody anticipated would
-    /// be a worse failure than any it prevents.
-    pub fn set_section(&mut self, name: &str, text: &str) {
-        let mut secs = self.sections();
-        let text = text.trim_end().to_string();
-        match secs.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
-            Some(slot) => slot.1 = text,
-            None if !text.trim().is_empty() => secs.push((name.to_string(), text)),
-            None => {}
-        }
-        secs.retain(|(n, t)| !(n.is_empty() && t.trim().is_empty()));
-
-        let rank = |n: &str| -> usize {
-            if n.is_empty() {
-                return 0;
-            }
-            SECTIONS
-                .iter()
-                .position(|s| s.eq_ignore_ascii_case(n))
-                .map(|i| i + 1)
-                .unwrap_or(SECTIONS.len() + 1)
-        };
-        secs.sort_by_key(|(n, _)| rank(n));
-
-        let mut body = String::new();
-        for (n, t) in secs {
-            if t.trim().is_empty() && !n.is_empty() {
-                continue;
-            }
-            if !n.is_empty() {
-                if !body.is_empty() {
-                    body.push('\n');
-                }
-                body.push_str(&format!("## {n}\n"));
-            }
-            body.push_str(t.trim_end());
-            body.push('\n');
-        }
-        self.body = body;
+        section_of(&self.body, name)
     }
 
     pub fn from_doc(doc: &Doc, fallback_id: &str) -> Task {

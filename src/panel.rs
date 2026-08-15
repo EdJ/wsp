@@ -69,6 +69,24 @@ pub(crate) struct View {
     pub(crate) mode: Mode,
     /// What the detail pane is currently showing, so `↵` can close it.
     showing: Option<crate::detail::Focus>,
+    /// The key map, drawn over the tree. A line in the footer could hold four
+    /// of the twenty keys, which is worse than useless: it says there is a list
+    /// and then shows you a fifth of it.
+    help: bool,
+    /// How far down the key map is scrolled. It fits a full-height sidebar, and
+    /// a short one has to be able to reach the end.
+    help_scroll: usize,
+}
+
+impl View {
+    /// Keep the key map's scroll inside what the pane can actually show. The
+    /// reducer is deliberately free of I/O and so cannot know the height; doing
+    /// it here means `j` at the foot builds up no offset that `k` has to spend
+    /// before the map moves again.
+    pub(crate) fn clamp_help(&mut self, h: usize) {
+        let body = h.saturating_sub(HELP_CHROME);
+        self.help_scroll = self.help_scroll.min(help_len().saturating_sub(body));
+    }
 }
 
 /// Management needs three shapes of input beyond a single key: a value to
@@ -256,7 +274,14 @@ pub(crate) struct AgentRef {
 
 #[derive(Debug, Clone)]
 enum Row {
-    Project { id: String, depth: usize, counts: Counts, collapsed: bool, live: usize },
+    Project {
+        id: String,
+        depth: usize,
+        counts: Counts,
+        collapsed: bool,
+        live: usize,
+        prose: bool,
+    },
     Task {
         /// Carried so a row can name the task it stands for. Nothing acts on a
         /// task yet; this is what the edit keys will dispatch on.
@@ -269,6 +294,9 @@ enum Row {
         status: Status,
         agent: Option<AgentRef>,
         needs_you: bool,
+        /// Something is written in Overview or Details. Worth a mark: the
+        /// whole point of writing it down is being reminded it is there.
+        prose: bool,
     },
     /// `key` is the project the hidden tasks belong to, or `INBOX_KEY`.
     More { key: String, depth: usize, n: usize },
@@ -482,6 +510,7 @@ fn task_rows(
             status: t.status(),
             agent: a.clone(),
             needs_you: *needs_you,
+            prose: crate::model::has_prose(&t.body),
         });
         // The pane working it hangs beneath, so the join is visible and the
         // task keeps its own status glyph instead of surrendering it to the
@@ -661,6 +690,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 counts: counts.get(&p.id).copied().unwrap_or_default(),
                 collapsed: is_collapsed,
                 live: live.get(&p.id).copied().unwrap_or(0),
+                prose: crate::model::has_prose(&p.body),
             });
             if is_collapsed {
                 continue;
@@ -854,6 +884,8 @@ pub(crate) mod glyph {
     pub const NEEDS_YOU: &str = "←";
     /// A pane with no agent in it.
     pub const SHELL: &str = "▫";
+    /// Something is written in Overview or Details.
+    pub const NOTES: &str = "≡";
 }
 
 fn state_dot(state: &str) -> (Style, &'static str) {
@@ -867,11 +899,15 @@ fn state_dot(state: &str) -> (Style, &'static str) {
 fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
     let mut l = Line::default();
     match row {
-        Row::Project { id, depth, counts, collapsed, live } => {
+        Row::Project { id, depth, counts, collapsed, live, prose } => {
             l.pad(*depth);
             l.push(Style::Dim, if *collapsed { glyph::CLOSED } else { glyph::OPEN });
             l.push(Style::Plain, " ");
             l.push(Style::Bold, id.clone());
+            if *prose {
+                l.push(Style::Plain, " ");
+                l.push(Style::Dim, glyph::NOTES);
+            }
 
             // A done-ratio bar reads as empty until work starts landing, so the
             // right-hand column carries live workload instead: open, in flight,
@@ -905,7 +941,7 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Task { title, depth, status, agent, needs_you, .. } => {
+        Row::Task { title, depth, status, agent, needs_you, prose, .. } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
@@ -920,7 +956,9 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                 _ => l.push(Style::Dim, glyph::QUIET),
             }
             l.push(Style::Plain, " ");
-            let flag_w = if *needs_you { 2 } else { 0 };
+            // Reserve the marker's column before truncating, or a long title
+            // eats the very sign that there is more to read.
+            let flag_w = if *needs_you { 2 } else { 0 } + if *prose { 2 } else { 0 };
             let avail = w.saturating_sub(*depth + 5 + flag_w);
             let body = util::truncate(title, avail.max(4));
             let style = if *needs_you {
@@ -933,6 +971,10 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                 Style::Muted
             };
             l.push(style, body);
+            if *prose {
+                l.push(Style::Plain, " ");
+                l.push(Style::Dim, glyph::NOTES);
+            }
             if *needs_you {
                 l.push(Style::Warn, format!(" {}", glyph::NEEDS_YOU));
             }
@@ -1038,6 +1080,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Muted, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in"),
                 mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
+                mark(&[(Style::Dim, g::NOTES)], "written on", "something is in this row's Overview or Details — E opens it"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
                 mark(&[(Style::Accent, "+done")], "showing done", "A is on, so finished work is included"),
@@ -1058,6 +1101,129 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
     ]
 }
 
+// ---- the key map --------------------------------------------------------
+
+/// Every key the panel answers to, grouped the way you go looking for one:
+/// getting around, reading, then changing. Keys that do the same kind of thing
+/// share a line — `s v` is one idea, not two — because the list is read in a
+/// column thirty-four wide and length is what makes it unreadable.
+///
+/// Descriptions are written to fit that column. Anything longer is a sentence,
+/// and a sentence belongs on the row it describes, not here.
+pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    vec![
+        (
+            "move",
+            vec![
+                ("j k ↑ ↓", "up, down"),
+                ("h l ← →", "fold, unfold"),
+                ("g G", "first, last row"),
+                ("1-9", "jump to a terminal"),
+            ],
+        ),
+        (
+            "look",
+            vec![
+                ("↵", "open it, and close"),
+                ("esc", "close the view"),
+                ("E", "edit in a tab"),
+                ("A", "show finished work"),
+                ("r", "sync the sidebar"),
+                ("q", "quit"),
+            ],
+        ),
+        (
+            "change",
+            vec![
+                ("a P", "add task, project"),
+                ("s v", "start, review"),
+                ("d o", "done, reopen"),
+                ("b", "block, with a reason"),
+                ("e n", "retitle, add a note"),
+                ("m", "move — pick a project"),
+                ("c", "claim, either way"),
+                ("O", "open a workspace"),
+                ("X", "remove, after y/n"),
+            ],
+        ),
+    ]
+}
+
+/// Title, rule, rule, hint — what the key map costs before a key is drawn.
+const HELP_CHROME: usize = 4;
+
+/// One line per entry and one per heading, so the count needs no rendering and
+/// no width. What lets the scroll be clamped away from the terminal.
+fn help_len() -> usize {
+    keymap().iter().map(|(_, keys)| keys.len() + 1).sum()
+}
+
+/// The key map as rows. A heading rules off to the edge rather than sitting
+/// above a blank line: a sidebar is short, and separation has to cost nothing.
+fn help_lines(w: usize) -> Vec<Line> {
+    let keyw = keymap()
+        .iter()
+        .flat_map(|(_, keys)| keys.iter())
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    for (section, keys) in keymap() {
+        let mut head = Line::default();
+        head.push(Style::Bold, section);
+        head.push(Style::Plain, " ");
+        head.push(Style::Dim, "─".repeat(w.saturating_sub(head.width())));
+        out.push(head);
+
+        for (k, what) in keys {
+            let mut l = Line::default();
+            l.push(Style::Plain, " ");
+            l.push(Style::Plain, k);
+            l.pad(keyw - k.chars().count() + 2);
+            l.push(Style::Muted, util::truncate(what, w.saturating_sub(keyw + 3).max(4)));
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// The panel with the key map over it. A page rather than an overlay: there is
+/// nothing behind it worth half-showing, and the tree is one keypress away.
+fn help_frame(scroll: usize, w: usize, h: usize) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut head = Line::default();
+    head.push(Style::Bold, "wsp");
+    head.push(Style::Plain, " ");
+    head.push(Style::Dim, "·");
+    head.push(Style::Plain, " ");
+    head.push(Style::Muted, "keys");
+    lines.push(head);
+    lines.push(line(Style::Dim, "─".repeat(w)));
+
+    let body_rows = h.saturating_sub(HELP_CHROME);
+    let all = help_lines(w);
+    let scroll = scroll.min(all.len().saturating_sub(body_rows));
+    let shown = body_rows.min(all.len() - scroll);
+    lines.extend(all.into_iter().skip(scroll).take(body_rows));
+
+    while lines.len() < h.saturating_sub(2) {
+        lines.push(Line::default());
+    }
+    lines.push(line(Style::Dim, "─".repeat(w)));
+
+    let mut foot = line(Style::Dim, "? or esc closes");
+    let left = help_len() - scroll - shown;
+    if left > 0 {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Muted, format!("↓ {left} more"));
+    }
+    lines.push(foot);
+
+    lines.truncate(h);
+    lines
+}
+
 /// Digits 1-9 address rows that lead somewhere: a terminal.
 fn hotkeys(rows: &[Row]) -> Vec<Option<u8>> {
     let mut out = Vec::with_capacity(rows.len());
@@ -1073,9 +1239,31 @@ fn hotkeys(rows: &[Row]) -> Vec<Option<u8>> {
     out
 }
 
+/// Where the body starts, given where the cursor is.
+///
+/// The selection is held near the middle rather than pushed against an edge.
+/// Scrolling only when the cursor reaches the last row means it then *stays*
+/// there, and a cursor parked on the bottom line shows you everything you have
+/// already walked past and nothing you are about to reach. Both ends clamp, so
+/// the first and last screens do not scroll into empty space — the cursor rides
+/// up to the top and down to the foot there, which is what those screens mean.
+///
+/// Derived from `sel` every frame rather than remembered: a stored offset and a
+/// cursor are two truths about one thing, and they drift.
+fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
+    if body == 0 || n <= body {
+        return 0;
+    }
+    sel.saturating_sub(body / 2).min(n - body)
+}
+
 /// The whole panel as styled lines. No escapes, no terminal — a backend turns
 /// this into something you can look at.
-pub(crate) fn frame(ui: &Ui, mode: &Mode, w: usize, h: usize) -> Vec<Line> {
+pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
+    if view.help {
+        return help_frame(view.help_scroll, w, h);
+    }
+    let mode = &view.mode;
     let mut lines: Vec<Line> = Vec::new();
 
     let mut head = Line::default();
@@ -1097,12 +1285,7 @@ pub(crate) fn frame(ui: &Ui, mode: &Mode, w: usize, h: usize) -> Vec<Line> {
     let body_rows = h.saturating_sub(lines.len() + footer_rows);
     let keys = hotkeys(&ui.rows);
 
-    // Keep the selection in view.
-    let mut scroll = 0usize;
-    if body_rows > 0 && ui.sel >= body_rows {
-        scroll = ui.sel + 1 - body_rows;
-    }
-
+    let scroll = scroll_for(ui.sel, ui.rows.len(), body_rows);
     for (i, row) in ui.rows.iter().enumerate().skip(scroll).take(body_rows) {
         let mut l = render_row(row, w, keys[i]);
         l.selected = i == ui.sel;
@@ -1395,8 +1578,10 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
     // A project has no section machinery yet, so it gets one editor on its
     // file. Named here rather than hidden in a path, so the exception is
     // visible until it can be closed.
-    let project_file = matches!(argv.first().map(|s| s.as_str()), Some("edit-project-file"));
-    let id = argv.get(1).cloned().unwrap_or_default();
+    // `wsp edit <id>` for a task, `wsp project edit <id>` for a project. The
+    // section flags append to either, so both get the same two editors.
+    let id = argv.last().cloned().unwrap_or_default();
+    let base: Vec<String> = argv.to_vec();
 
     let Ok(r) = herdr::call(
         "tab.create",
@@ -1446,21 +1631,6 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
         format!("exec {} view {}\n", shell_quote(&exe), shell_quote(&id)),
     );
 
-    if project_file {
-        let f = util::expand(&format!("~/wsp/projects/{id}.md"));
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-        run(
-            &work,
-            format!(
-                "{} {}; herdr tab close {}\n",
-                editor,
-                shell_quote(&f.display().to_string()),
-                shell_quote(&tab)
-            ),
-        );
-        return format!("editing {label}");
-    }
-
     // One editor per section, side by side. Each buffer is prose and nothing
     // else — there is no markup left to mangle, which was the point. They are
     // safe to run together because `wsp edit` re-reads the task and writes back
@@ -1485,14 +1655,11 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
         // status line shows the other, and between them there is no way to be
         // looking at a buffer without knowing which half it is.
         let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": section }));
-        run(
-            pane,
-            format!(
-                "{} edit {} --{section}{done}\n",
-                shell_quote(&exe),
-                shell_quote(&id)
-            ),
-        );
+        let cmd = std::iter::once(shell_quote(&exe))
+            .chain(base.iter().map(|a| shell_quote(a)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        run(pane, format!("{cmd} --{section}{done}\n"));
     }
     format!("editing {label}")
 }
@@ -1818,7 +1985,43 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
     }
 }
 
+/// Reading the key map. Everything that is not scrolling or closing is
+/// swallowed: the map is open precisely because you are not sure what a key
+/// does, which is the worst possible moment for one of them to fire.
+fn help_key(k: Key, view: &mut View) -> Effect {
+    match k {
+        Key::Char('q') | Key::Interrupt => Effect::Quit,
+        // The same key both opens and closes, and esc still means put that away.
+        Key::Char('?') | Key::Esc | Key::Enter => {
+            view.help = false;
+            Effect::None
+        }
+        Key::Down | Key::Char('j') => {
+            view.help_scroll += 1;
+            Effect::None
+        }
+        Key::Up | Key::Char('k') => {
+            view.help_scroll = view.help_scroll.saturating_sub(1);
+            Effect::None
+        }
+        Key::Char('g') => {
+            view.help_scroll = 0;
+            Effect::None
+        }
+        // Past the end, and clamped back to it by the loop, which is the only
+        // place that knows how tall the pane is.
+        Key::Char('G') => {
+            view.help_scroll = help_len();
+            Effect::None
+        }
+        _ => Effect::None,
+    }
+}
+
 fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
+    if view.help {
+        return help_key(k, view);
+    }
     let n = ui.rows.len();
     let target = ui.selected_target();
 
@@ -1892,7 +2095,8 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         }
         Key::Char('r') => Effect::Sync,
         Key::Char('?') => {
-            say(ui, "↵ inspect/close · E edit · O workspace · a s d b m c X · ←→ fold");
+            view.help = true;
+            view.help_scroll = 0;
             Effect::None
         }
 
@@ -1992,10 +2196,8 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 argv: vec!["edit".into(), id.clone()],
                 label: id.clone(),
             },
-            // Projects have no section machinery yet, so this is still the
-            // file — with the same risk, and worth closing later.
             Target::Project(p) => Effect::PopOut {
-                argv: vec!["edit-project-file".into(), p.clone()],
+                argv: vec!["project".into(), "edit".into(), p.clone()],
                 label: p.clone(),
             },
             _ => {
@@ -2095,16 +2297,16 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outco
     let mut last_fetch = Instant::now();
     let mut last_fingerprint = store.fingerprint();
 
-    let draw = |ui: &Ui, mode: &Mode, last: &mut String| {
+    let draw = |ui: &Ui, view: &View, last: &mut String| {
         let (w, h) = term_size();
-        let painted = to_ansi(&frame(ui, mode, w, h), w, h);
+        let painted = to_ansi(&frame(ui, view, w, h), w, h);
         if painted != *last {
             print!("{painted}");
             let _ = std::io::stdout().flush();
             *last = painted;
         }
     };
-    draw(&ui, &view.mode, &mut last);
+    draw(&ui, &view, &mut last);
 
     loop {
         let msg = match rx.recv_timeout(Duration::from_secs(60)) {
@@ -2225,7 +2427,10 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outco
             last_fingerprint = store.fingerprint();
             refetch_into(&mut ui, &Snapshot::live(store), &view, self_ws);
         }
-        draw(&ui, &view.mode, &mut last);
+        // The reducer cannot see the pane, so it scrolls the key map without a
+        // bottom. Here is where the height is known.
+        view.clamp_help(term_size().1);
+        draw(&ui, &view, &mut last);
     }
 }
 

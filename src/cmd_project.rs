@@ -46,6 +46,7 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "show" | "get" => show(store, args),
         "set" => set(store, args),
         "rm" | "remove" | "delete" => rm(store, args),
+        "edit" => edit(store, args),
         other => {
             eprintln!("wsp project: unknown subcommand `{other}`");
             2
@@ -360,6 +361,31 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         println!("removed project {}", p.id);
     }
     0
+}
+
+/// Edit a project's prose, on the same terms as a task's: the body only, never
+/// the frontmatter. `roots`, `tags`, `parent` and `status` all have
+/// `wsp project set`, so there is nothing here an editor needs to reach.
+pub fn edit(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp project edit <id> [--overview | --details | --raw]");
+        return 2;
+    };
+    let index = Index::new(store.projects());
+    let Some(p) = index.find(&needle).cloned() else {
+        eprintln!("wsp: no project matching `{needle}`");
+        return 1;
+    };
+    crate::cmd_task::edit_prose(
+        store,
+        args,
+        crate::cmd_task::Prose {
+            what: "project",
+            id: p.id.clone(),
+            body: p.body.clone(),
+            path: store.projects_dir().join(format!("{}.md", p.id)),
+        },
+    )
 }
 
 pub fn set(store: &Store, args: &Args) -> i32 {

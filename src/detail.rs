@@ -344,6 +344,22 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         }
     }
 
+    // A project's prose, same as a task's — it is the same machinery now, and
+    // a project is the natural home for "what is this and why".
+    for name in ["Overview", "Details"] {
+        if let Some(text) = p.section(name) {
+            out.push(Line::default());
+            out.push(heading(&name.to_lowercase()));
+            for l in wrap(&text, w) {
+                if l.trim().is_empty() {
+                    out.push(Line::default());
+                } else {
+                    out.push(line(Style::Plain, l));
+                }
+            }
+        }
+    }
+
     let counts = resolve::counts_by_project(&ctx.index, &ctx.tasks);
     let c = counts.get(&p.id).copied().unwrap_or_default();
     out.push(Line::default());
