@@ -456,6 +456,14 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             say(ui, if view.show_done { "showing done" } else { "hiding done" });
             Effect::Refetch
         }
+        // The tree names work by title, which is what you read it for. The id
+        // is what you type at a shell, and there was no way to get from one to
+        // the other without opening the row.
+        Key::Char('i') => {
+            view.ids = !view.ids;
+            say(ui, if view.ids { "showing ids" } else { "hiding ids" });
+            Effect::Refetch
+        }
         Key::Char('r') => Effect::Sync,
         // Nothing else changes while it is up: the tree keeps the cursor, and
         // every key on the map still does what the map says it does — which is

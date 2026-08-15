@@ -377,6 +377,12 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .key(Key::Char('i'))
+            .scene("Showing ids", "i puts the id in front of each title — the thing you type at a shell, next to the thing you read. Off by default because thirteen characters of `t-260815-004` on every row is most of a narrow pane, and only the last three of them differ. The suffix is what `wsp start 004` resolves, so the suffix is what shows, unless another open task shares it and the date is what separates them."),
+    );
+
+    out.push(
+        Driver::new(&w)
             .down_to(panel::RowKind::Task)
             .key(Key::Char('?'))
             .scene("Help", "? docks the key map under the tree, taking the rows it needs and no more. The cursor keeps its row and every key still works, so you can read `b` and press it on the task you are looking at. ? again puts it away. The verbs come first because a short pane cuts from the bottom, and movement is the half you can find by pressing an arrow."),

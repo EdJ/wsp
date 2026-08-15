@@ -73,6 +73,10 @@ pub(super) enum Row {
         /// its children is one you would tick off without looking — and it is
         /// the row a folded sub-tree has to speak for.
         under: Counts,
+        /// What to type at a shell to mean this row, when `i` is on. Resolved
+        /// here rather than at draw time because how short it can be depends on
+        /// the other tasks, and the renderer sees one row at a time.
+        ident: Option<String>,
     },
     /// `key` is the project the hidden tasks belong to, or `INBOX_KEY`.
     More { key: String, depth: usize, n: usize },
@@ -245,6 +249,33 @@ pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, 
     )
 }
 
+/// What you would type to mean this task, and no more of it than you have to.
+///
+/// `t-260815-004` is thirteen columns of a pane that is thirty wide, and eleven
+/// of them are the same on every row. The suffix is what the CLI resolves —
+/// `wsp start 004` — so the suffix is what the panel shows, unless another
+/// open task shares it, in which case the date is the part that separates them
+/// and the whole thing has to be typed anyway.
+fn ident_of(tasks: &[Task], task: &Task) -> String {
+    let full = || task.id.strip_prefix("t-").unwrap_or(&task.id).to_string();
+    // A bare suffix resolves against *open* tasks only, so a finished one has
+    // to be named in full — showing `014` for a task `wsp show 014` cannot
+    // find would be worse than showing nothing.
+    if !task.status().is_open() {
+        return full();
+    }
+    let suffix = task.id.rsplit('-').next().unwrap_or(&task.id);
+    let taken = tasks
+        .iter()
+        .filter(|t| t.status().is_open() && t.id != task.id)
+        .any(|t| t.id.rsplit('-').next() == Some(suffix));
+    if taken {
+        full()
+    } else {
+        suffix.to_string()
+    }
+}
+
 /// Rows for the tasks of one project — or, when `project` is `None`, the tasks
 /// belonging to no project at all. The inbox went unrendered for a while
 /// because it had no equivalent of the project walk; sharing this makes that
@@ -307,6 +338,7 @@ pub(super) fn task_rows(
             // children are all done should say so rather than fall silent
             // because `A` is off.
             under: resolve::counts_under(tasks, &t.id),
+            ident: view.ids.then(|| ident_of(tasks, t)),
         });
         // The pane working it hangs beneath, so the join is visible and the
         // task keeps its own status glyph instead of surrendering it to the
@@ -654,7 +686,7 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Task { title, depth, status, agent, needs_you, prose, under, .. } => {
+        Row::Task { title, depth, status, agent, needs_you, prose, under, ident, .. } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
@@ -689,7 +721,13 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             // eats the very sign that there is more to read.
             let flag_w = if *needs_you { 2 } else { 0 } + if *prose { 2 } else { 0 };
             let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
-            let avail = w.saturating_sub(*depth + 5 + flag_w + count_w);
+            // The id is the point when it is on, so it comes out of the
+            // title's budget rather than off the end of the row.
+            let id_w = ident.as_ref().map(|i| i.chars().count() + 2).unwrap_or(0);
+            let avail = w.saturating_sub(*depth + 5 + flag_w + count_w + id_w);
+            if let Some(id) = ident {
+                l.push(Style::Dim, format!("{id}: "));
+            }
             let body = util::truncate(title, avail.max(4));
             let style = if *needs_you {
                 Style::Warn

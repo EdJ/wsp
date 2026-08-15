@@ -28,6 +28,10 @@ pub(crate) struct View {
     pub(super) expanded: HashSet<String>,
     /// Include `done` tasks, and the projects that hold only those.
     pub(super) show_done: bool,
+    /// Put each task's id in front of its title. Off by default: the tree is
+    /// for reading, and thirteen characters of id on every row is most of a
+    /// narrow pane. On when you are about to type one at a shell.
+    pub(super) ids: bool,
     /// Projects to show even though they hold nothing yet. A project created
     /// from the panel is empty by definition, so the quiet-branch filter would
     /// swallow it the instant it was made — you would type a name, press
@@ -104,7 +108,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
             vec![
                 ("↵ esc", "open it, close it"),
                 ("E", "edit in a tab"),
-                ("A r", "show done, sync"),
+                ("A i r", "show done, ids, sync"),
                 ("q", "quit"),
             ],
         ),
