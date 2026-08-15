@@ -127,11 +127,22 @@ keep updating while you type — that context was exactly what editing in a bare
 buffer cost. Each section gets its own editor on its own buffer, containing
 prose and nothing else: there is no `##` left to mangle. They are safe to run
 together because `wsp edit` re-reads the task and writes back only its own
-section. `W` in the context pane saves and closes both editors at once. It sends the
-save-and-quit for your `$EDITOR` — `Esc :wq` for the vi family, `^O ^X` for
-nano, and so on, with `vi` assumed when `$EDITOR` is unset. The `Esc` matters:
-without it, an editor sitting in insert mode would take `:wq` as text and save
-that. An editor it does not recognise is named rather than guessed at.
+section. `W` in the context pane saves and closes both editors at once. It sends two
+things: an abort — `Ctrl-C` for the vi family, `Ctrl-G` for emacs — and then
+the save-and-quit, `:wqa` or `^O ^X` or whatever that editor wants. `vi` is
+assumed when `$EDITOR` is unset, and an editor it does not recognise is named
+rather than guessed at.
+
+Both halves earn their place. The abort clears insert mode, a half-typed `:`
+command, a pending operator, a *Press ENTER* prompt, and `q:` — which opens
+vim's command-line window, where `Esc` does nothing and `:wq` is just text. And
+they go as **separate writes**, because vim discards pending type-ahead when it
+takes an interrupt: send both together and the command is eaten, leaving
+exactly the stuck pane this is meant to prevent. The quit is `wqa`, so a split
+made inside the editor does not leave the pane behind.
+
+If a pane still will not close, `W` says which, and pressing it again closes
+them outright.
 
 Quitting the editors by hand works the same way: the second one to go takes the
 tab with it, and quitting the first leaves it standing because closing then

@@ -416,7 +416,16 @@ fn glyph_for(s: Status) -> &'static str {
 /// Driving another program by keystroke is a guess, so the guess is written
 /// down where it can be corrected rather than buried. `vi` is the default
 /// because that is what an unset `$EDITOR` means.
-fn save_and_quit_keys(editor: &str) -> Option<&'static str> {
+///
+/// Each sequence leads with that editor's "abort whatever is pending", which
+/// is doing more work than it looks like. `q:` opens vim's command-line
+/// window, and `Esc` does not close it — the buffer just takes `:wq` as text.
+/// `Ctrl-C` leaves it, and also drops insert mode, a half-typed `:` command, a
+/// pending operator and a "Press ENTER" prompt.
+///
+/// The quit is `wqa`, not `wq`: someone who has split inside their editor
+/// would otherwise close one window and leave the pane sitting there.
+fn save_and_quit_keys(editor: &str, force: bool) -> Option<(&'static str, String)> {
     let name = editor
         .rsplit('/')
         .next()
@@ -424,52 +433,101 @@ fn save_and_quit_keys(editor: &str) -> Option<&'static str> {
         .split_whitespace()
         .next()
         .unwrap_or("");
+    let bang = if force { "!" } else { "" };
     match name {
-        // Esc first: in insert mode `:wq` would otherwise be typed into the
-        // text and then saved, which is the one outcome worse than not saving.
-        "" | "vi" | "vim" | "nvim" | "view" | "hx" | "helix" => Some("\x1b:wq\r"),
-        "nano" | "pico" => Some("\x0f\r\x18"),
-        "emacs" | "emacsclient" => Some("\x18\x13\x18\x03"),
-        "micro" => Some("\x13\x11"),
+        "" | "vi" | "vim" | "nvim" | "view" | "hx" | "helix" => {
+            Some(("\x03", format!("\x1b:wqa{bang}\r")))
+        }
+        "nano" | "pico" => Some(("\x03", "\x0f\r\x18".into())),
+        "emacs" | "emacsclient" => Some(("\x07", "\x18\x13\x18\x03".into())),
+        "micro" => Some(("\x1b", "\x13\x11".into())),
         _ => None,
     }
 }
 
-/// Tell every editor sharing this tab to save and quit.
-///
-/// The tab closes itself once the second one exits — that machinery already
-/// exists — so this only has to get them to leave.
-fn close_editors() -> String {
+/// The outcome of asking the editors to leave.
+enum Closing {
+    /// Everything asked to go has gone, or there was nothing to ask.
+    Done(String),
+    /// These panes did not close. A second `W` forces them.
+    Stuck(Vec<String>),
+}
+
+fn siblings_of(me: &str) -> Vec<herdr::Pane> {
+    let Ok(panes) = herdr::panes() else { return Vec::new() };
+    let Some(mine) = panes.iter().find(|p| p.pane_id == me) else { return Vec::new() };
+    let tab = mine.tab_id.clone();
+    panes.into_iter().filter(|p| p.tab_id == tab && p.pane_id != me).collect()
+}
+
+/// Tell every editor sharing this tab to save and quit, and check that they
+/// did. The tab closes itself once the second one exits — that machinery
+/// already exists — so this only has to get them to leave.
+fn close_editors(force_these: &[String]) -> Closing {
     let env = herdr::Env::read();
     let Some(me) = env.pane_id else {
-        return "no pane id — cannot find the editors".into();
+        return Closing::Done("no pane id — cannot find the editors".into());
     };
-    let Ok(panes) = herdr::panes() else {
-        return "herdr is not answering".into();
-    };
-    let Some(mine) = panes.iter().find(|p| p.pane_id == me) else {
-        return "cannot place this pane".into();
-    };
+
+    // A second W after a stuck one: the user has now said it twice, so take
+    // the panes down and accept losing whatever would not save.
+    if !force_these.is_empty() {
+        let mut gone = 0;
+        for p in force_these {
+            if herdr::call("pane.close", json!({ "pane_id": p })).is_ok() {
+                gone += 1;
+            }
+        }
+        return Closing::Done(format!("forced {gone} closed"));
+    }
 
     let editor = std::env::var("EDITOR").unwrap_or_default();
-    let Some(keys) = save_and_quit_keys(&editor) else {
-        return format!("don't know how to save {editor} — quit it yourself");
+    let targets: Vec<String> = siblings_of(&me).into_iter().map(|p| p.pane_id).collect();
+    if targets.is_empty() {
+        return Closing::Done("nothing open beside this".into());
+    }
+    let Some((abort, commit)) = save_and_quit_keys(&editor, false) else {
+        return Closing::Done(format!("don't know how to save {editor} — quit it yourself"));
     };
 
-    let siblings: Vec<&herdr::Pane> = panes
-        .iter()
-        .filter(|p| p.tab_id == mine.tab_id && p.pane_id != me)
-        .collect();
-    if siblings.is_empty() {
-        return "nothing open beside this".into();
+    let send = |panes: &[String], text: &str| {
+        for p in panes {
+            let _ = herdr::call("pane.send_text", json!({ "pane_id": p, "text": text }));
+        }
+    };
+    let still_open = |want: &[String]| -> Vec<String> {
+        let live: Vec<String> = siblings_of(&me).into_iter().map(|p| p.pane_id).collect();
+        want.iter().filter(|p| live.contains(p)).cloned().collect()
+    };
+
+    // Two sends, not one. Vim throws away pending type-ahead when it takes an
+    // interrupt, so a Ctrl-C and the command in the same write means the
+    // command is eaten and the editor just sits there — which is exactly the
+    // stuck pane this was meant to prevent.
+    send(&targets, abort);
+    std::thread::sleep(Duration::from_millis(150));
+    send(&targets, &commit);
+    std::thread::sleep(Duration::from_millis(900));
+    let left = still_open(&targets);
+    if left.is_empty() {
+        return Closing::Done(format!("saved {}", targets.len()));
     }
-    for p in &siblings {
-        let _ = herdr::call(
-            "pane.send_text",
-            json!({ "pane_id": p.pane_id, "text": keys }),
-        );
+
+    // Something refused. Most often a buffer vim will not write without a
+    // bang, or a modal it wanted an answer to. Try once harder before giving
+    // up, since a stuck pane with no explanation is the worst outcome.
+    if let Some((abort, forced)) = save_and_quit_keys(&editor, true) {
+        send(&left, abort);
+        std::thread::sleep(Duration::from_millis(150));
+        send(&left, &forced);
+        std::thread::sleep(Duration::from_millis(900));
     }
-    format!("saving {}", siblings.len())
+    let left = still_open(&targets);
+    if left.is_empty() {
+        Closing::Done("saved".into())
+    } else {
+        Closing::Stuck(left)
+    }
 }
 
 // ---- the pane -----------------------------------------------------------
@@ -502,6 +560,8 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     let mut seen: Option<(Focus, u64)> = None;
     let mut quit = false;
     let mut reload = false;
+    // Panes a previous W could not get rid of. A second W closes them outright.
+    let mut stuck: Vec<String> = Vec::new();
     let Ok(mut tty) = std::fs::File::open("/dev/tty") else { return 1 };
 
     while !quit && !reload {
@@ -531,7 +591,19 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             // immediately rather than after the rest of a tick.
             Ok(1) if buf[0] == b'q' || buf[0] == 3 => quit = true,
             Ok(1) if buf[0] == b'W' => {
-                let msg = close_editors();
+                let outcome = close_editors(&stuck);
+                let msg = match outcome {
+                    Closing::Done(m) => {
+                        stuck.clear();
+                        m
+                    }
+                    Closing::Stuck(panes) => {
+                        let names: Vec<&str> =
+                            panes.iter().map(|p| p.as_str()).collect();
+                        stuck = panes.clone();
+                        format!("{} would not close — W again to force", names.join(" "))
+                    }
+                };
                 let (w, _) = panel::term_size();
                 let mut l = Line::default();
                 l.push(Style::Accent, util::truncate(&msg, w));
