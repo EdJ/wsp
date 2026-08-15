@@ -267,6 +267,9 @@ pub(crate) enum Key {
     Enter,
     Esc,
     Backspace,
+    /// The far ends of the list, for anyone who does not think in `g`/`G`.
+    Home,
+    End,
     Char(char),
     /// Ctrl-C, which raw mode delivers as a byte rather than a signal.
     Interrupt,
@@ -1224,7 +1227,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
             vec![
                 ("j k ↑ ↓", "up, down"),
                 ("h l ← →", "fold, unfold"),
-                ("g G", "first, last row"),
+                ("g G ⇱ ⇲", "first, last row"),
                 ("1-9", "jump to a terminal"),
             ],
         ),
@@ -1532,47 +1535,24 @@ fn spawn_input(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let Ok(mut tty) = File::open("/dev/tty") else { return };
         let mut buf = [0u8; 1];
-        // `stty min 0 time 1` makes a read with nothing waiting return 0 after
-        // ~100ms. That is what lets a bare Esc be told apart from the start of
-        // an arrow key, which is otherwise undecidable on a blocking read.
-        let next = |tty: &mut File, buf: &mut [u8; 1]| -> Option<u8> {
-            match tty.read(buf) {
-                Ok(1) => Some(buf[0]),
-                Ok(_) => None,
-                Err(_) => None,
-            }
-        };
+        let mut keys = crate::input::Keys::new();
+        let mut out: Vec<Key> = Vec::new();
         loop {
-            let Some(b) = next(&mut tty, &mut buf) else { continue };
-            let mut pending: Option<Key> = None;
-            let key = match b {
-                3 => Key::Interrupt,
-                b'\r' | b'\n' => Key::Enter,
-                0x7f | 0x08 => Key::Backspace,
-                b'\x1b' => match next(&mut tty, &mut buf) {
-                    // Nothing followed: a real Esc.
-                    None => Key::Esc,
-                    Some(b'[') => match next(&mut tty, &mut buf) {
-                        Some(b'A') => Key::Up,
-                        Some(b'B') => Key::Down,
-                        Some(b'C') => Key::Right,
-                        Some(b'D') => Key::Left,
-                        _ => continue,
-                    },
-                    // Esc then something else — deliver both, in order.
-                    Some(other) => {
-                        pending = Some(Key::Char(other as char));
-                        Key::Esc
-                    }
-                },
-                c if c.is_ascii_graphic() || c == b' ' => Key::Char(c as char),
-                _ => continue,
-            };
-            if tx.send(Msg::Key(key)).is_err() {
-                return;
+            match tty.read(&mut buf) {
+                Ok(1) => keys.feed(buf[0], &mut out),
+                // `stty min 0 time 1` makes a read with nothing waiting come
+                // back empty after ~100ms, and that silence is the only thing
+                // that tells a bare Esc from the start of an arrow key.
+                Ok(_) => keys.idle(&mut out),
+                // A tty that has started erroring will keep erroring, so this
+                // must not become a spin. Treat it as silence, slowly.
+                Err(_) => {
+                    keys.idle(&mut out);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
-            if let Some(p) = pending {
-                if tx.send(Msg::Key(p)).is_err() {
+            for k in out.drain(..) {
+                if tx.send(Msg::Key(k)).is_err() {
                     return;
                 }
             }
@@ -2106,11 +2086,11 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         Key::Up | Key::Char('k') => move_or_fold(Key::Up, ui, view),
         Key::Left | Key::Char('h') => move_or_fold(Key::Left, ui, view),
         Key::Right | Key::Char('l') => move_or_fold(Key::Right, ui, view),
-        Key::Char('g') => {
+        Key::Char('g') | Key::Home => {
             ui.sel = 0;
             Effect::None
         }
-        Key::Char('G') => {
+        Key::Char('G') | Key::End => {
             ui.sel = n.saturating_sub(1);
             Effect::None
         }

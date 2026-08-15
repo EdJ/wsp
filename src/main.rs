@@ -14,6 +14,7 @@ mod daemon;
 mod detail;
 mod fm;
 mod herdr;
+mod input;
 mod model;
 mod panel;
 mod resolve;

@@ -433,6 +433,7 @@ Every command takes `--json`.
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh |
+| `src/input.rs` | terminal bytes → keys: the escape-sequence parser |
 | `src/panel.rs` | the in-pane sidebar: project tree, tasks, panes |
 | `src/detail.rs` | the detail pane: one task or project, in full |
 | `src/cmd_*.rs` | the commands |
@@ -464,3 +465,13 @@ fast builds are a feature here, because a session-start hook runs this binary.
   override when a directory is ambiguous.
 - **Tags are inherited.** A task in `trance` also matches `-t juce` and `-t dsp`
   from `vst` and `audio` above it.
+- **Every escape sequence is consumed whole.** Reading a fixed two bytes after
+  `ESC` matches the four arrows and leaves the tail of everything else in the
+  buffer, where the next read hands it over as typing: page-up put a `~` in a
+  task title, and ctrl-up put `;5A`. `src/input.rs` follows the grammar
+  instead — parameters, intermediates, final byte, the string sequences a
+  terminal replies to a query with, and the three bytes an X10 mouse report
+  hides *after* its final. A sequence nothing here answers to is dropped in
+  silence rather than spilled. Bare `ESC` is the one thing bytes cannot settle,
+  so `stty min 0 time 1` settles it: a read that comes back empty means there
+  was nothing behind it, and it was the key.

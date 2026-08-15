@@ -16,7 +16,8 @@ use serde_json::json;
 
 use crate::herdr;
 use crate::model::{Status, Task};
-use crate::panel::{self, line, Line, Style};
+use crate::input;
+use crate::panel::{self, line, Key, Line, Style};
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util;
@@ -687,6 +688,8 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     // Panes a previous W could not get rid of. A second W closes them outright.
     let mut stuck: Vec<String> = Vec::new();
     let Ok(mut tty) = std::fs::File::open("/dev/tty") else { return 1 };
+    let mut keys = input::Keys::new();
+    let mut pressed: Vec<Key> = Vec::new();
 
     while !quit && !reload {
         if started_as.is_some() && panel::exe_stamp() != started_as {
@@ -712,99 +715,97 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
         match tty.read(&mut buf) {
             // `min 0 time 1` gives a 100ms read timeout, so this doubles as
             // the poll interval — no separate sleep, and a keypress is felt
-            // immediately rather than after the rest of a tick.
-            Ok(1) if buf[0] == b'q' || buf[0] == 3 => {
-                // In an edit tab, `q` takes the whole thing down — leaving two
-                // editors behind with the context gone is a tab that can only
-                // confuse. `W` is the one that saves; this is its opposite, and
-                // the footer says so.
-                let me = herdr::Env::read().pane_id.unwrap_or_default();
-                let editors = edit_tab_siblings(&me);
-                if !editors.is_empty() {
-                    let ed = std::env::var("EDITOR").unwrap_or_default();
-                    if let Some((abort, discard)) = discard_and_quit_keys(&ed) {
-                        for p in &editors {
-                            let _ = herdr::call(
-                                "pane.send_text",
-                                json!({ "pane_id": p.pane_id, "text": abort }),
-                            );
+            // immediately rather than after the rest of a tick. The empty read
+            // is also what settles a lone Esc, so it goes to the parser too.
+            Ok(1) => keys.feed(buf[0], &mut pressed),
+            Ok(_) => keys.idle(&mut pressed),
+            Err(_) => {
+                keys.idle(&mut pressed);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        for k in pressed.drain(..) {
+            match k {
+                Key::Char('q') | Key::Interrupt => {
+                    // In an edit tab, `q` takes the whole thing down — leaving two
+                    // editors behind with the context gone is a tab that can only
+                    // confuse. `W` is the one that saves; this is its opposite, and
+                    // the footer says so.
+                    let me = herdr::Env::read().pane_id.unwrap_or_default();
+                    let editors = edit_tab_siblings(&me);
+                    if !editors.is_empty() {
+                        let ed = std::env::var("EDITOR").unwrap_or_default();
+                        if let Some((abort, discard)) = discard_and_quit_keys(&ed) {
+                            for p in &editors {
+                                let _ = herdr::call(
+                                    "pane.send_text",
+                                    json!({ "pane_id": p.pane_id, "text": abort }),
+                                );
+                            }
+                            std::thread::sleep(Duration::from_millis(150));
+                            for p in &editors {
+                                let _ = herdr::call(
+                                    "pane.send_text",
+                                    json!({ "pane_id": p.pane_id, "text": discard }),
+                                );
+                            }
+                            std::thread::sleep(Duration::from_millis(600));
                         }
-                        std::thread::sleep(Duration::from_millis(150));
-                        for p in &editors {
-                            let _ = herdr::call(
-                                "pane.send_text",
-                                json!({ "pane_id": p.pane_id, "text": discard }),
-                            );
+                        // Close the tab whether or not they went quietly: `q` is a
+                        // decision to be rid of this, and a pane that would not
+                        // quit must not be able to veto it.
+                        if let Ok(panes) = herdr::panes() {
+                            if let Some(mine) = panes.iter().find(|p| p.pane_id == me) {
+                                let _ = herdr::call(
+                                    "tab.close",
+                                    json!({ "tab_id": mine.tab_id }),
+                                );
+                            }
                         }
-                        std::thread::sleep(Duration::from_millis(600));
                     }
-                    // Close the tab whether or not they went quietly: `q` is a
-                    // decision to be rid of this, and a pane that would not
-                    // quit must not be able to veto it.
-                    if let Ok(panes) = herdr::panes() {
-                        if let Some(mine) = panes.iter().find(|p| p.pane_id == me) {
-                            let _ = herdr::call(
-                                "tab.close",
-                                json!({ "tab_id": mine.tab_id }),
-                            );
-                        }
+                    quit = true;
+                }
+                // Arrows say the same thing as h/l for anyone who does not think
+                // in vim, and now say it by the same path — so an arrow reports
+                // what it could not do, which it used to swallow.
+                Key::Char('h') | Key::Char('l') | Key::Left | Key::Right => {
+                    let left = matches!(k, Key::Char('h') | Key::Left);
+                    let msg = focus_by_position(left);
+                    if !msg.is_empty() {
+                        let (w, _) = panel::term_size();
+                        let mut l = Line::default();
+                        l.push(Style::Warn, util::truncate(&msg, w));
+                        l.fit(w);
+                        print!("\x1b[999;1H{}", panel::to_ansi(&[l], w, 1).trim_start_matches("\x1b[H\x1b[2J"));
+                        let _ = std::io::stdout().flush();
                     }
                 }
-                quit = true;
-            }
-            // Arrows say the same thing as h/l for anyone who does not think
-            // in vim. `min 0 time 1` means the tail of the sequence is already
-            // waiting, so reading it cannot block.
-            Ok(1) if buf[0] == b'\x1b' => {
-                let mut seq = [0u8; 2];
-                if tty.read(&mut seq[..1]).is_ok() && seq[0] == b'[' && tty.read(&mut seq[1..]).is_ok() {
-                    match seq[1] {
-                        b'D' => {
-                            focus_by_position(true);
+                Key::Char('W') => {
+                    let outcome = close_editors(&stuck);
+                    let msg = match outcome {
+                        Closing::Done(m) => {
+                            stuck.clear();
+                            m
                         }
-                        b'C' => {
-                            focus_by_position(false);
+                        Closing::Stuck(panes) => {
+                            let names: Vec<&str> =
+                                panes.iter().map(|p| p.as_str()).collect();
+                            stuck = panes.clone();
+                            format!("{} would not close — W again to force", names.join(" "))
                         }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(1) if buf[0] == b'h' || buf[0] == b'l' => {
-                let msg = focus_by_position(buf[0] == b'h');
-                if !msg.is_empty() {
+                    };
                     let (w, _) = panel::term_size();
                     let mut l = Line::default();
-                    l.push(Style::Warn, util::truncate(&msg, w));
+                    l.push(Style::Accent, util::truncate(&msg, w));
                     l.fit(w);
                     print!("\x1b[999;1H{}", panel::to_ansi(&[l], w, 1).trim_start_matches("\x1b[H\x1b[2J"));
                     let _ = std::io::stdout().flush();
+                    // Force a repaint once they are gone.
+                    seen = None;
                 }
+                _ => {}
             }
-            Ok(1) if buf[0] == b'W' => {
-                let outcome = close_editors(&stuck);
-                let msg = match outcome {
-                    Closing::Done(m) => {
-                        stuck.clear();
-                        m
-                    }
-                    Closing::Stuck(panes) => {
-                        let names: Vec<&str> =
-                            panes.iter().map(|p| p.as_str()).collect();
-                        stuck = panes.clone();
-                        format!("{} would not close — W again to force", names.join(" "))
-                    }
-                };
-                let (w, _) = panel::term_size();
-                let mut l = Line::default();
-                l.push(Style::Accent, util::truncate(&msg, w));
-                l.fit(w);
-                print!("\x1b[999;1H{}", panel::to_ansi(&[l], w, 1).trim_start_matches("\x1b[H\x1b[2J"));
-                let _ = std::io::stdout().flush();
-                // Force a repaint once they are gone.
-                seen = None;
-            }
-            Ok(_) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 

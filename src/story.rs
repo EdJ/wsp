@@ -207,6 +207,8 @@ fn key_name(k: Key) -> String {
         Key::Enter => "↵".into(),
         Key::Char(c) => c.to_string(),
         Key::Esc => "esc".into(),
+        Key::Home => "⇱".into(),
+        Key::End => "⇲".into(),
         Key::Backspace => "\u{232b}".into(),
         Key::Interrupt => "^C".into(),
     }
