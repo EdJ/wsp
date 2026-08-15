@@ -127,7 +127,35 @@ fn expand_short(s: &str) -> String {
     }
 }
 
+/// Die quietly when whatever was reading us stops.
+///
+/// Rust's runtime sets `SIGPIPE` to `SIG_IGN` before `main`, which turns a
+/// closed pipe into a write error, and `println!` panics on a write error. So
+/// `wsp ls | head` printed a panic and a note about `RUST_BACKTRACE` to stderr
+/// — for doing the most ordinary thing anyone does with a list. Worse for an
+/// agent than for a person: the output looked right, and the failure was in a
+/// stream it may not even be reading.
+///
+/// Putting the default disposition back is the whole fix. `head` closing the
+/// pipe then kills us the way it kills `ls`, which is what every other tool in
+/// the pipeline already does.
+///
+/// Declared here rather than taken from `libc`: this is two lines and one
+/// constant, against a dependency the README promises not to add.
+fn die_on_broken_pipe() {
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
 fn main() {
+    die_on_broken_pipe();
+
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = Args::parse(argv);
 
