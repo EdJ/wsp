@@ -58,6 +58,13 @@ pub(super) struct Shared {
     /// carry — not by argument, it simply was not added when `w` was.
     agents: bool,
     ids: bool,
+    /// `F`. It changes how much of a row you can read rather than which rows
+    /// there are, which is why it is easy to leave out of a list of filters —
+    /// but it is a dock you turn on and go on working under, not a glance. Left
+    /// behind, it came off every time herdr swapped which panel was on screen,
+    /// and the titles went back to their first twenty-five characters with
+    /// nothing having asked for that.
+    focus: bool,
     cursor: Cursor,
     /// Where the tree is scrolled to. Shared because the panel you arrive at
     /// should be looking at what the one you left was looking at, and the
@@ -85,6 +92,7 @@ impl Shared {
             review_only: view.review_only,
             agents: view.agents,
             ids: view.ids,
+            focus: view.focus,
             cursor: cursor.into(),
             scroll: view.scroll,
         }
@@ -100,6 +108,7 @@ impl Shared {
         view.review_only = self.review_only;
         view.agents = self.agents;
         view.ids = self.ids;
+        view.focus = self.focus;
         view.scroll = self.scroll;
         self.cursor
     }
@@ -113,6 +122,7 @@ impl Shared {
             "review_only": self.review_only,
             "agents": self.agents,
             "ids": self.ids,
+            "focus": self.focus,
             "cursor": target_to_json(&self.cursor.target),
             "docked": self.cursor.docked,
             "scroll": self.scroll,
@@ -135,6 +145,7 @@ impl Shared {
             review_only: flag("review_only"),
             agents: flag("agents"),
             ids: flag("ids"),
+            focus: flag("focus"),
             cursor: Cursor {
                 target: v.get("cursor").map(target_from_json).unwrap_or(Target::Nothing),
                 docked: flag("docked"),
@@ -271,6 +282,32 @@ mod tests {
         after.agents = true;
         Shared::from_json(&old).apply(&mut after);
         assert!(!after.agents, "a file written before this field read as the agents view");
+    }
+
+    /// `F` travels too. It is a dock you leave up while you read down a tree of
+    /// long titles, so losing it on a workspace switch — or on the reload that
+    /// follows every rebuild of the binary — is the same reset as losing the
+    /// folds, arriving by a route nobody presses a key for.
+    ///
+    /// And, as with `w`, a file written before the field existed has to read as
+    /// off: during an install the panels cross over one at a time, and the old
+    /// one goes on writing the old shape while the new one reads it.
+    #[test]
+    fn the_focus_dock_travels_between_panels() {
+        let mut v = View::default();
+        v.focus = true;
+        let shared = Shared::of(&v, Target::Task("t-260815-129".into()));
+
+        let mut fresh = View::default();
+        assert!(!fresh.focus);
+        Shared::from_json(&shared.to_json()).apply(&mut fresh);
+        assert!(fresh.focus, "F did not follow the panel you switched to");
+
+        let old = serde_json::json!({ "show_done": true });
+        let mut after = View::default();
+        after.focus = true;
+        Shared::from_json(&old).apply(&mut after);
+        assert!(!after.focus, "a file written before this field left the dock up");
     }
 
     /// Sets are unordered, and the write is skipped by comparing text. If the
