@@ -1597,6 +1597,60 @@ mod tests {
         );
     }
 
+    /// Put the cursor on a row by what it is, the way [`on_pane`] does.
+    fn on_target(ui: &mut panel::Ui, want: panel::Target) {
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == want {
+                return;
+            }
+        }
+        panic!("no row for {want:?}");
+    }
+
+    /// `O` and `S` are one command with one flag between them, and the flag is
+    /// the whole difference between a place to work and a colleague. The panel
+    /// works out neither the title nor the root: `wsp spawn` resolves both from
+    /// the store, which is what stopped `O` opening a workspace in the panel's
+    /// own directory for every task under a project whose root is its parent's.
+    #[test]
+    fn o_and_s_are_the_same_verb_with_and_without_somebody_in_it() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_target(&mut ui, panel::Target::Task("t-003".into()));
+        match press(&mut ui, &mut view, 'O') {
+            panel::Effect::Spawn { argv, .. } => assert_eq!(argv, ["spawn", "t-003"]),
+            _ => panic!("O on a task opens a workspace for it"),
+        }
+        match press(&mut ui, &mut view, 'S') {
+            panel::Effect::Spawn { argv, .. } => {
+                assert_eq!(argv, ["spawn", "t-003", "--agent"])
+            }
+            _ => panic!("S on a task puts an agent on it"),
+        }
+
+        // A project takes both too — a workspace rooted in its checkout, and an
+        // agent standing in it with nothing claimed. `-p`, because a project id
+        // and a task id are resolved differently and guessing between them is
+        // the panel's job here rather than the CLI's: the panel knows which row
+        // it is standing on.
+        on_target(&mut ui, panel::Target::Project("verb".into()));
+        match press(&mut ui, &mut view, 'S') {
+            panel::Effect::Spawn { argv, .. } => {
+                assert_eq!(argv, ["spawn", "-p", "verb", "--agent"])
+            }
+            _ => panic!("S on a project opens one there"),
+        }
+
+        // The inbox is a heading, not a place. Neither key has anything to make
+        // a workspace out of, and saying so beats opening one in the dark.
+        on_target(&mut ui, panel::Target::Inbox);
+        assert!(matches!(press(&mut ui, &mut view, 'S'), panel::Effect::None));
+        assert!(matches!(press(&mut ui, &mut view, 'O'), panel::Effect::None));
+    }
+
     /// The dock's own verb: the panel works out what the pane is for and types
     /// `wsp next` into it. The project is named in the sentence rather than
     /// left to the agent's own resolution, so the two can never disagree.
