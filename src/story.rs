@@ -298,8 +298,9 @@ struct Driver<'a> {
 
 impl<'a> Driver<'a> {
     fn new(snap: &'a Snapshot) -> Driver<'a> {
-        let view = panel::View::default();
+        let mut view = panel::View::default();
         let ui = panel::collect(snap, &view, Some("w0"));
+        panel::place(&ui, &mut view, W, H);
         Driver { snap, view, ui, log: Vec::new() }
     }
 
@@ -310,6 +311,11 @@ impl<'a> Driver<'a> {
         if let panel::Effect::Refetch = panel::apply_key(k, &mut self.ui, &mut self.view) {
             panel::refetch_into(&mut self.ui, self.snap, &mut self.view, Some("w0"));
         }
+        // And the loop draws, which is where the view keeps its place. A
+        // driver that skipped this would leave the tree deciding its offset
+        // from the cursor alone, every key, for ever — the arrangement this
+        // scrolling replaced.
+        panel::place(&self.ui, &mut self.view, W, H);
         self
     }
 
@@ -395,7 +401,7 @@ impl<'a> Driver<'a> {
         }
     }
 
-    fn scene(&self, title: &str, caption: &str) -> Scene {
+    fn scene(&mut self, title: &str, caption: &str) -> Scene {
         Scene {
             title: title.to_string(),
             caption: caption.to_string(),
@@ -405,7 +411,7 @@ impl<'a> Driver<'a> {
                 compress(&self.log)
             },
             target: target_label(&self.ui.selected_target()),
-            html: panel::to_html(&panel::frame(&self.ui, &self.view, W, H), W),
+            html: panel::to_html(&panel::frame(&self.ui, &mut self.view, W, H), W),
         }
     }
 }
@@ -434,7 +440,7 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .keys(&[Key::Down; 14])
-            .scene("Halfway down", "Once the list outruns the pane the cursor is held near the middle, not pushed against the bottom edge — so what you are about to reach stays on screen beside what you have already passed. Only the two ends break it, where there is nothing further to show."),
+            .scene("Halfway down", "Fourteen rows of travel, and the tree has moved by four. The view has a position of its own and keeps it: the cursor crosses the pane, and only once it is within two rows of the foot does the tree give ground, one row at a time. Turning round costs nothing — the rows above the cursor are the ones already on screen."),
     );
 
     out.push(
@@ -586,7 +592,7 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .key(Key::Char('?'))
             .keys(&[Key::Down; 14])
-            .scene("Moving with it up", "The tree carries on underneath. It has fewer rows to work with, so it scrolls sooner — but the cursor is still held in the middle of what is left, rather than the map being allowed to push it off the bottom."),
+            .scene("Moving with it up", "The tree carries on underneath. It has fewer rows to work with, so the cursor runs out of pane sooner and the tree starts moving sooner — but the map is never allowed to push the cursor off the bottom, and the two rows of lookahead beyond it survive whatever the pane is down to."),
     );
 
     // ---- management ----
@@ -991,10 +997,15 @@ mod tests {
     fn showing(snap: &Snapshot, keys: &[Key]) -> (panel::Ui, panel::View) {
         let mut view = panel::View::default();
         let mut ui = ui_of(snap, &view);
+        panel::place(&ui, &mut view, W, H);
         for k in keys {
             if let panel::Effect::Refetch = panel::apply_key(*k, &mut ui, &mut view) {
                 panel::refetch_into(&mut ui, snap, &mut view, Some("w0"));
             }
+            // The draw between one key and the next, which is where the view
+            // keeps its place. Skipping it leaves a panel whose tree derives
+            // its offset from the cursor every frame — the thing this replaced.
+            panel::place(&ui, &mut view, W, H);
         }
         (ui, view)
     }
@@ -1072,7 +1083,7 @@ mod tests {
     #[test]
     fn the_header_strip_is_the_same_whatever_the_view() {
         let w = world();
-        let marks = |ui: &panel::Ui, view: &panel::View| -> String {
+        let marks = |ui: &panel::Ui, view: &mut panel::View| -> String {
             panel::frame(ui, view, W, H)[0]
                 .text()
                 .chars()
@@ -1083,17 +1094,17 @@ mod tests {
         // spare, working, quiet.
         let want = "←■○○●●·";
 
-        let (ui, view) = showing(&w, &[]);
-        assert_eq!(marks(&ui, &view), want, "at rest");
-        let (ui, view) = showing(&w, &[Key::Char('R')]);
-        assert_eq!(marks(&ui, &view), want, "under the review filter");
-        let (ui, view) = showing(&w, &[Key::Char('w')]);
-        assert_eq!(marks(&ui, &view), want, "in the agents view");
+        let (ui, mut view) = showing(&w, &[]);
+        assert_eq!(marks(&ui, &mut view), want, "at rest");
+        let (ui, mut view) = showing(&w, &[Key::Char('R')]);
+        assert_eq!(marks(&ui, &mut view), want, "under the review filter");
+        let (ui, mut view) = showing(&w, &[Key::Char('w')]);
+        assert_eq!(marks(&ui, &mut view), want, "in the agents view");
 
         // Nobody running: the strip has nothing to say and says that instead of
         // drawing a bare zero.
-        let (ui, view) = showing(&quiet_world(), &[]);
-        assert!(panel::frame(&ui, &view, W, H)[0].text().contains("no agents"));
+        let (ui, mut view) = showing(&quiet_world(), &[]);
+        assert!(panel::frame(&ui, &mut view, W, H)[0].text().contains("no agents"));
     }
 
     /// The lines under an agent are that agent said at length, so a click on
@@ -1146,7 +1157,7 @@ mod tests {
         let (mut ui, mut view) = showing(&w, &[]);
         // Narrow enough that seven marks cannot fit beside the name and total.
         let narrow = 10;
-        let clipped = panel::frame(&ui, &view, narrow, H)[0].text();
+        let clipped = panel::frame(&ui, &mut view, narrow, H)[0].text();
         assert!(clipped.contains(panel::glyph::MORE), "{clipped}");
         let at = clipped.chars().position(|c| c.to_string() == panel::glyph::MORE).unwrap();
         assert_eq!(panel::click(&mut ui, &mut view, narrow, H, at, 0), panel::Hit::Rest);
@@ -1224,17 +1235,17 @@ mod tests {
     #[test]
     fn the_agents_view_and_the_review_filter_each_put_the_other_away() {
         let w = world();
-        let foot = |ui: &panel::Ui, view: &panel::View| panel::frame(ui, view, W, H)[H - 2].text();
+        let foot = |ui: &panel::Ui, view: &mut panel::View| panel::frame(ui, view, W, H)[H - 2].text();
 
-        let (ui, view) = showing(&w, &[Key::Char('R')]);
-        assert!(foot(&ui, &view).contains("review only"));
+        let (ui, mut view) = showing(&w, &[Key::Char('R')]);
+        assert!(foot(&ui, &mut view).contains("review only"));
 
-        let (ui, view) = showing(&w, &[Key::Char('R'), Key::Char('w')]);
-        let f = foot(&ui, &view);
+        let (ui, mut view) = showing(&w, &[Key::Char('R'), Key::Char('w')]);
+        let f = foot(&ui, &mut view);
         assert!(f.contains("agents") && !f.contains("review only"), "{f}");
 
-        let (ui, view) = showing(&w, &[Key::Char('w'), Key::Char('R')]);
-        let f = foot(&ui, &view);
+        let (ui, mut view) = showing(&w, &[Key::Char('w'), Key::Char('R')]);
+        let f = foot(&ui, &mut view);
         assert!(f.contains("review only") && !f.contains("agents"), "{f}");
     }
 
@@ -1295,9 +1306,9 @@ mod tests {
         );
     }
 
-    /// The tree scrolls once the cursor is past the middle, and a click has to
-    /// go through the same offset the frame drew with — otherwise clicking
-    /// works at the top of a list and acts on the wrong task further down.
+    /// The tree scrolls once the cursor has crossed it, and a click has to go
+    /// through the same offset the frame drew with — otherwise clicking works
+    /// at the top of a list and acts on the wrong task further down.
     #[test]
     fn a_click_follows_the_scroll() {
         let w = world();
@@ -1305,6 +1316,7 @@ mod tests {
         let mut ui = ui_of(&w, &view);
         for _ in 0..20 {
             panel::apply_key(Key::Down, &mut ui, &mut view);
+            panel::place(&ui, &mut view, W, H);
         }
         let first = panel::row_at(&ui, &view, W, H, 2).expect("a row at the top");
         assert!(first > 0, "the tree has scrolled, so the top row is not row 0");
@@ -1319,7 +1331,7 @@ mod tests {
     /// check: what `row_at` says is at screen row `y` must be what `frame`
     /// actually *drew* at `y`. Comparing the mapping against its own
     /// arithmetic proves only that it is self-consistent.
-    fn assert_mapping_matches_frame(ui: &panel::Ui, view: &panel::View, at: &str) {
+    fn assert_mapping_matches_frame(ui: &panel::Ui, view: &mut panel::View, at: &str) {
         let drawn = panel::frame(ui, view, W, H);
         for y in 0..H {
             let Some(i) = panel::row_at(ui, view, W, H, y) else { continue };
@@ -1346,7 +1358,7 @@ mod tests {
                     view.set_focus_for_test(focus);
                     let mut ui = ui_of(&w, &view);
                     for n in 0..26 {
-                        let drawn = panel::frame(&ui, &view, W, h);
+                        let drawn = panel::frame(&ui, &mut view, W, h);
                         for y in 0..h {
                             let Some(i) = panel::row_at(&ui, &view, W, h, y) else { continue };
                             let want = panel::spans_of(&panel::render_row_for_test(&ui, i, W));
@@ -1364,9 +1376,14 @@ mod tests {
     }
 
     /// Ed: "when we scroll they no longer align as expected". This is why.
-    /// Selecting recentres the tree, so the row you clicked slides out from
-    /// under the pointer — and the second click of select-then-activate lands
-    /// on whatever moved into its place.
+    /// Selecting recentred the tree, so the row you clicked slid out from under
+    /// the pointer — and the second click of select-then-activate landed on
+    /// whatever moved into its place.
+    ///
+    /// The view keeps its own position now, so a click in the middle of the
+    /// pane cannot move it at all. What this still guards is the edge: a
+    /// keystroke landing two rows from the foot is owed rows beyond it and
+    /// scrolls the tree to get them, and the same row reached by pointer is not.
     #[test]
     fn clicking_a_row_leaves_it_where_it_was() {
         let w = world();
@@ -1375,8 +1392,12 @@ mod tests {
         // Scroll into the middle of a list long enough to move.
         for _ in 0..14 {
             panel::apply_key(Key::Down, &mut ui, &mut view);
+            panel::place(&ui, &mut view, W, H);
         }
-        for y in [2usize, 3, 6, 9] {
+        // Every clickable row on the pane, not a handful near the top: the row
+        // that would move is the one at the edge, and which screen row that is
+        // depends on how tall the dock happens to be today.
+        for y in 0..H {
             let Some(i) = panel::row_at(&ui, &view, W, H, y) else { continue };
             // Whichever of these the cursor happens to be parked on is a click
             // that activates, and this is a test about the other kind. Asked
@@ -1399,39 +1420,103 @@ mod tests {
         }
     }
 
-    /// The wheel moves the selection, the way `j`/`k` do — the tree scrolls by
-    /// holding the cursor near the middle, so moving the cursor *is* the
-    /// scroll. A view offset of its own left the highlight behind, which is
-    /// not what the panel has ever done.
+    /// The view has a position and keeps it: the cursor crosses a still pane,
+    /// and only pushes the tree when it runs out of pane to cross.
+    ///
+    /// The tree used to be drawn from the cursor alone, held in the middle, so
+    /// every row of travel scrolled everything — you could not read two rows
+    /// without the one you had just read moving. The cost was clearest on
+    /// turning round: `k` after a run of `j` re-scrolled at once, when what you
+    /// were going back to had been on the pane the whole time.
     #[test]
-    fn the_wheel_moves_the_selection() {
+    fn the_cursor_crosses_the_pane_before_the_pane_moves() {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
-        let start = ui.selected_index();
-        panel::wheel(&mut ui, &mut view, false);
-        assert!(ui.selected_index() > start, "down should move the cursor down");
-        let mid = ui.selected_index();
-        panel::wheel(&mut ui, &mut view, true);
-        assert!(ui.selected_index() < mid, "up should move it back");
+        panel::place(&ui, &mut view, W, H);
+        let top = |ui: &panel::Ui, view: &panel::View| panel::row_at(ui, view, W, H, 2);
+        let mut down = |ui: &mut panel::Ui, view: &mut panel::View| {
+            panel::apply_key(Key::Down, ui, view);
+            panel::place(ui, view, W, H);
+        };
+
+        // Opening at the top, the first rows of travel move nothing: the
+        // cursor has a pane in front of it to walk through.
+        let start = top(&ui, &view);
+        assert_eq!(start, Some(0), "the tree opens at its first row");
+        for n in 0..4 {
+            down(&mut ui, &mut view);
+            assert_eq!(top(&ui, &view), start, "the tree moved on press {}", n + 1);
+        }
+
+        // Far enough down and the cursor reaches the foot, where there is
+        // nothing left to cross and the tree has to give.
+        for _ in 0..14 {
+            down(&mut ui, &mut view);
+        }
+        let moved = top(&ui, &view);
+        assert!(moved > start, "the tree should scroll once the cursor reaches the foot");
+
+        // And turning round is free. The rows above the cursor are the ones
+        // already on the pane, so going back to them is cursor travel and
+        // nothing else.
+        for n in 0..4 {
+            panel::apply_key(Key::Up, &mut ui, &mut view);
+            panel::place(&ui, &mut view, W, H);
+            assert_eq!(top(&ui, &view), moved, "the tree moved going back up, press {}", n + 1);
+        }
+    }
+
+    /// Ed: "overscrolling has dead travel — scrolling back up does nothing
+    /// until the overshoot is walked off". This is why, and it goes with the
+    /// view having a position of its own.
+    ///
+    /// The wheel used to be three of what `j` does, because there was no view
+    /// position to move: the cursor was the scroll. At the end of the tree the
+    /// clamp stops the view while the cursor goes on to the foot, so every
+    /// notch past the end bought half a pane of cursor travel that a wheel back
+    /// up had to spend before anything on screen moved.
+    #[test]
+    fn a_wheel_back_up_moves_the_view_at_once() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        panel::place(&ui, &mut view, W, H);
+        let top = |ui: &panel::Ui, view: &panel::View| panel::row_at(ui, view, W, H, 2);
+
+        // Down to the end, and well past it: the wheel against the last screen
+        // is a burst of events that move nothing.
+        for _ in 0..12 {
+            panel::wheel(&mut ui, &mut view, W, H, false);
+        }
+        let bottom = top(&ui, &view);
+        panel::wheel(&mut ui, &mut view, W, H, false);
+        assert_eq!(top(&ui, &view), bottom, "the last screen is the last screen");
+
+        // And the very next notch upward moves the view — no travel to undo.
+        panel::wheel(&mut ui, &mut view, W, H, true);
+        assert!(top(&ui, &view) < bottom, "a wheel up should move the view straight away");
     }
 
     /// And the cursor is on the pane throughout, which is what makes the next
-    /// keystroke continue from where you are looking.
+    /// keystroke continue from where you are looking. The wheel moves the view
+    /// and drags the cursor only when the view would leave it behind, so most
+    /// notches do not move it at all.
     #[test]
     fn scrolling_keeps_the_cursor_on_the_pane() {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        panel::place(&ui, &mut view, W, H);
         let visible = |ui: &panel::Ui, view: &panel::View| {
             (0..H).any(|y| panel::row_at(ui, view, W, H, y) == Some(ui.selected_index()))
         };
         for n in 0..12 {
-            panel::wheel(&mut ui, &mut view, false);
+            panel::wheel(&mut ui, &mut view, W, H, false);
             assert!(visible(&ui, &view), "after {} scrolls down", n + 1);
         }
         for n in 0..20 {
-            panel::wheel(&mut ui, &mut view, true);
+            panel::wheel(&mut ui, &mut view, W, H, true);
             assert!(visible(&ui, &view), "after {} scrolls up", n + 1);
         }
     }
@@ -1463,7 +1548,7 @@ mod tests {
         let title = "Plan the demo video: what it shows, in what order, and which of the three \
                      patches is worth the first thirty seconds";
 
-        let drawn = panel::frame(&d.ui, &d.view, W, H);
+        let drawn = panel::frame(&d.ui, &mut d.view, W, H);
         assert_eq!(dock_text(&drawn, W), title);
 
         // And the row it came from cannot say it, which is why the dock exists.
@@ -1480,7 +1565,7 @@ mod tests {
         d.key(Key::Char('F'));
         for n in 0..20 {
             d.key(Key::Down);
-            let drawn = panel::frame(&d.ui, &d.view, W, H);
+            let drawn = panel::frame(&d.ui, &mut d.view, W, H);
             let want = panel::full_text_for_test(&d.ui, d.ui.selected_index());
             assert!(
                 dock_text(&drawn, W).starts_with(&want),
@@ -1500,7 +1585,7 @@ mod tests {
         let rows_of = |id: &str| {
             let mut d = Driver::new(&w);
             d.to_task(id).key(Key::Char('F'));
-            let drawn = panel::frame(&d.ui, &d.view, W, H);
+            let drawn = panel::frame(&d.ui, &mut d.view, W, H);
             let rule = "─".repeat(W);
             let rules: Vec<usize> =
                 drawn.iter().enumerate().filter(|(_, l)| l.text() == rule).map(|(i, _)| i).collect();
@@ -1529,8 +1614,9 @@ mod tests {
     #[test]
     fn the_mapping_matches_the_frame_at_rest() {
         let w = world();
-        let view = panel::View::default();
-        assert_mapping_matches_frame(&ui_of(&w, &view), &view, "at rest");
+        let mut view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        assert_mapping_matches_frame(&ui, &mut view, "at rest");
     }
 
     #[test]
@@ -1540,7 +1626,7 @@ mod tests {
         let mut ui = ui_of(&w, &view);
         for n in 0..24 {
             panel::apply_key(Key::Down, &mut ui, &mut view);
-            assert_mapping_matches_frame(&ui, &view, &format!("after {} down", n + 1));
+            assert_mapping_matches_frame(&ui, &mut view, &format!("after {} down", n + 1));
         }
     }
 
@@ -2079,7 +2165,7 @@ mod tests {
 
         // The title outruns the pane by a long way, so what is on screen is
         // its tail — the end being where the caret is, and where typing goes.
-        let shown = panel::frame(&ui, &view, W, H)[H - 1].text();
+        let shown = panel::frame(&ui, &mut view, W, H)[H - 1].text();
         let tail: String = title.chars().skip(title.chars().count() - 12).collect();
         assert!(shown.contains(&tail), "the prompt should hold the title: {shown}");
 
@@ -2110,7 +2196,7 @@ mod tests {
         on_task(&mut ui, "t-002");
         panel::apply_key(Key::Char('e'), &mut ui, &mut view);
         panel::apply_key(Key::KillLine, &mut ui, &mut view);
-        let shown = panel::frame(&ui, &view, W, H)[H - 1].text();
+        let shown = panel::frame(&ui, &mut view, W, H)[H - 1].text();
         assert!(!shown.contains(&tail), "ctrl-u should clear the line: {shown}");
     }
 }

@@ -205,12 +205,29 @@ it says there is a list and then hides most of it.
 The map takes the rows it needs and no more, and **nothing else changes while
 it is up**: the cursor keeps its row and every key still does what the map says
 it does, so you can read `b` and press it on the task you were already looking
-at. The tree simply has fewer rows to work with, and it goes on holding the
-selection near the middle of them rather than letting the map push it off the
-bottom. That centring is how the tree scrolls generally — a cursor parked on
-the last visible row shows you everything you have walked past and nothing you
-are about to reach; only the two ends of the list break it, where there is
-nothing further to show.
+at. The tree simply has fewer rows to work with, and never lets the map push
+the cursor off the bottom of them.
+
+### How the tree scrolls
+
+The view has a position of its own and keeps it. The cursor moves through it,
+and the tree only gives ground when the cursor would otherwise walk off the
+pane — two rows early, so there is always something beyond the cursor to read
+towards, and one row at a time. Both ends clamp: on the first and last screens
+the cursor rides up to the top and down to the foot, because there is nothing
+further to show there.
+
+The point of a view with a position is that most movement moves nothing else.
+Reading down a pane costs no repaint of the rows you have already read, and
+turning round costs nothing at all — what you are going back to has been on
+screen the whole time. The tree used to be drawn from the cursor alone, held in
+the middle of the pane, which meant every single row of travel scrolled
+everything on screen.
+
+The wheel moves the view rather than the cursor, three rows a notch, and drags
+the cursor only when the view would leave it behind. A click moves the cursor
+and never the view: a pointer is owed the row staying exactly where it was
+clicked, which is the one case that gets no lookahead.
 
 The verbs are listed first because a pane too short for the whole map cuts from
 the bottom, and movement is the half you can find by pressing an arrow and

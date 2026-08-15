@@ -11,12 +11,13 @@
 //! Carrying any of those across would be worse than the reset it is fixing.
 //!
 //! `scroll` *is* carried, which it was not at first and should have been. The
-//! tree normally has no scroll offset of its own — it holds the cursor near the
-//! middle and the window follows, so sharing the cursor shares where the tree
-//! sits. A click is the exception: it pins the row under the pointer, and a
-//! pinned view that did not travel left the panel you switched to showing the
-//! same rows from a different place, which reads as exactly the reset this was
-//! supposed to end.
+//! tree has a scroll offset of its own now, and the cursor no longer says where
+//! it sits: the same row can be at the top of one pane and at the foot of
+//! another. Carrying the cursor without it left the panel you switched to
+//! showing the same rows from a different place, which reads as exactly the
+//! reset this was supposed to end. Back when the offset was derived from the
+//! cursor, only a click could produce one worth carrying — that is why this
+//! field was thought of as the pointer's.
 //!
 //! Carrying a field is only half of it: something has to write. The mouse was
 //! the half that did not, for longer than the field was missing — the wheel and
@@ -58,9 +59,10 @@ pub(super) struct Shared {
     agents: bool,
     ids: bool,
     cursor: Cursor,
-    /// Only ever set by a click, and cleared by the next keystroke. Shared
-    /// because the panel you arrive at should be looking at what the one you
-    /// left was looking at, however it came to be looking there.
+    /// Where the tree is scrolled to. Shared because the panel you arrive at
+    /// should be looking at what the one you left was looking at, and the
+    /// cursor does not say that on its own: the view has a position, and the
+    /// same row can be at the top of one pane and at the foot of another.
     scroll: Option<usize>,
 }
 
@@ -281,9 +283,10 @@ mod tests {
         assert_eq!(rendered(&a), rendered(&b));
     }
 
-    /// A click pins the row under the pointer, and that pin is the one part of
-    /// where the tree sits that the cursor does not imply. Left behind, the
-    /// panel you switch to shows the same rows from a different place.
+    /// Where the tree is scrolled to is the part of where it sits that the
+    /// cursor does not imply — the same row can be at the top of one pane and
+    /// at the foot of another. Left behind, the panel you switch to shows the
+    /// same rows from a different place.
     #[test]
     fn a_pinned_view_travels_with_the_rest() {
         let mut v = View::default();

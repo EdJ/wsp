@@ -309,17 +309,49 @@ pub(super) fn focus_lines(ui: &Ui, w: usize) -> Vec<Line> {
 /// reason the map is open.
 pub(super) const MIN_TREE_ROWS: usize = 6;
 
-/// Where the body starts, given where the cursor is.
+/// Rows kept beyond the cursor when the cursor is what moved. Enough to read
+/// where you are going without the view moving under every keystroke: at two,
+/// eleven of the fourteen rows on a normal pane are still when you press `j`.
+pub(super) const LOOKAHEAD: usize = 2;
+
+/// Where the view sits, given where it sat and where the cursor is now.
 ///
-/// The selection is held near the middle rather than pushed against an edge.
-/// Scrolling only when the cursor reaches the last row means it then *stays*
-/// there, and a cursor parked on the bottom line shows you everything you have
-/// already walked past and nothing you are about to reach. Both ends clamp, so
-/// the first and last screens do not scroll into empty space — the cursor rides
-/// up to the top and down to the foot there, which is what those screens mean.
+/// The view has a position of its own and keeps it. What the cursor may do is
+/// push it: `sel` has to be on the pane, with `off` rows of company beyond it
+/// where there are rows to spare, and the nearest position satisfying that is
+/// the one taken — so reading down the tree moves the cursor through a still
+/// pane until it reaches the far end, and only then does the tree move.
 ///
-/// Derived from `sel` every frame rather than remembered: a stored offset and a
-/// cursor are two truths about one thing, and they drift.
+/// This used to be derived from `sel` alone, holding it in the middle of the
+/// pane. That is a view with no position: every row of travel scrolled the
+/// whole tree, so nothing on screen but the cursor stayed where you last read
+/// it, and the two half-screens at the ends — where the clamp stops the view
+/// but not the cursor — were the only still ones. A remembered offset and a
+/// cursor are two truths about one thing and they do drift, which is why this
+/// is a clamp rather than a read: the stored value is never trusted, only
+/// brought back into the range that keeps the cursor on the pane.
+///
+/// Both ends still clamp, so the first and last screens do not scroll into
+/// empty space — the cursor rides up to the top and down to the foot there,
+/// which is what those screens mean.
+pub(super) fn scroll_to(at: usize, sel: usize, n: usize, body: usize, off: usize) -> usize {
+    if body == 0 || n <= body {
+        return 0;
+    }
+    let last = n - body;
+    // Never more than half a pane of company, or the two demands cross and
+    // there is no position that answers both.
+    let off = off.min((body - 1) / 2);
+    // The window is `at ..= at + body - 1`. Wanting `sel` inside it with `off`
+    // to spare at each end is a floor and a ceiling on `at`.
+    let ceil = sel.saturating_sub(off);
+    let floor = (sel + off + 1).saturating_sub(body);
+    at.clamp(floor.min(ceil), ceil).min(last)
+}
+
+/// Where a view with no position of its own starts: the cursor near the
+/// middle, which is the best a first frame can do — it has no travel behind it
+/// to say which way you are reading.
 pub(super) fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
     if body == 0 || n <= body {
         return 0;
@@ -335,7 +367,7 @@ pub(super) fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
 /// this would agree until the day one of them gained a header, and then a
 /// click would quietly act on the row above the one under the pointer — which
 /// is the kind of wrong that gets blamed on the mouse.
-pub(super) struct Geometry {
+pub(crate) struct Geometry {
     /// Rows above the tree: the title and its rule.
     pub head: usize,
     pub map_rows: usize,
@@ -345,6 +377,19 @@ pub(super) struct Geometry {
     pub tree_rows: usize,
     pub tree_len: usize,
     pub scroll: usize,
+}
+
+/// Work out the geometry and leave the view holding the offset it was drawn
+/// at. The one place `scroll` is written by the panel itself.
+///
+/// A caller that draws gets this for nothing. Anything that drives the panel
+/// without a terminal — the storyboard, a test — has to take the step too, or
+/// it is exercising a view that never keeps its place, which is the whole of
+/// what the scrolling now is.
+pub(crate) fn place(ui: &Ui, view: &mut View, w: usize, h: usize) -> Geometry {
+    let g = geometry(ui, view, w, h);
+    view.scroll = Some(g.scroll);
+    g
 }
 
 pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
@@ -376,12 +421,21 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     };
     let tree_len = ui.rows.len() - ui.dock;
     let tree_rows = body_rows - dock_rows;
-    let anchor = ui.sel.min(tree_len.saturating_sub(1));
     let scroll = match view.scroll {
-        // Clamped rather than trusted: the tree changes under a pointer that
-        // is not moving, and an offset past the end would draw a blank pane.
-        Some(s) => s.min(tree_len.saturating_sub(tree_rows)),
-        None => scroll_for(anchor, tree_len, tree_rows),
+        // A cursor down in the dock is not in the tree, and the tree owes it
+        // nothing: the dock is pinned and always drawn, so following a cursor
+        // into it would scroll the tree to its end to answer a question about
+        // a row that was on screen the whole time.
+        Some(s) if ui.sel >= tree_len => s.min(tree_len.saturating_sub(tree_rows)),
+        // Only the keyboard is owed lookahead. A click is owed the opposite —
+        // the row staying exactly where the pointer found it — and the wheel
+        // has just said where it wants the view, so neither may be answered by
+        // moving the tree under it.
+        Some(s) => {
+            let off = if view.keyed { LOOKAHEAD } else { 0 };
+            scroll_to(s, ui.sel, tree_len, tree_rows, off)
+        }
+        None => scroll_for(ui.sel.min(tree_len.saturating_sub(1)), tree_len, tree_rows),
     };
     Geometry { head: HEAD, map_rows, focus_rows, dock_rows, tree_rows, tree_len, scroll }
 }
@@ -503,15 +557,22 @@ pub(crate) fn strip_at(ui: &Ui, w: usize, x: usize) -> Option<StripHit> {
 }
 
 /// this into something you can look at.
-pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
-    let mode = &view.mode;
+///
+/// `&mut` for one field: the view keeps the position it was last drawn at, and
+/// this is where it is drawn. [`geometry`] is the rule and stays a function of
+/// what it is given — every other caller of it, a click especially, needs the
+/// answer this frame used, which is why the frame writes it back rather than
+/// leaving each of them to derive its own.
+pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(header(ui, w));
     lines.push(line(Style::Dim, "─".repeat(w)));
 
     let footer_rows = 3;
-    let g = geometry(ui, view, w, h);
+    let g = place(ui, view, w, h);
+    let view = &*view;
+    let mode = &view.mode;
 
     // The map takes the rows it needs out of the tree's, never the other way
     // about, and its first line is a ruled heading — so it needs no separator

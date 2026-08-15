@@ -342,7 +342,10 @@ pub(super) fn event_loop(
     // to be handled in the order they arrived rather than thrown away.
     let mut carry: std::collections::VecDeque<Msg> = Default::default();
 
-    let draw = |ui: &Ui, view: &View, last: &mut String| {
+    // `&mut` on the view because the frame is where the tree's scroll offset
+    // is decided, and the view keeps it: the click handler two branches below
+    // has to read the offset the pane in front of the reader is drawn with.
+    let draw = |ui: &Ui, view: &mut View, last: &mut String| {
         let (w, h) = term_size();
         let painted = to_ansi(&frame(ui, view, w, h), w, h);
         if painted != *last {
@@ -351,7 +354,7 @@ pub(super) fn event_loop(
             *last = painted;
         }
     };
-    draw(&ui, &view, &mut last);
+    draw(&ui, &mut view, &mut last);
 
     loop {
         let mut msg = match carry.pop_front() {
@@ -395,21 +398,21 @@ pub(super) fn event_loop(
                 super::keys::Hit::Rest => msg = Msg::Key(Key::Char('w')),
                 super::keys::Hit::Select => {
                     shared::share(store, &view, ui.cursor(), &mut agreed);
-                    draw(&ui, &view, &mut last);
+                    draw(&ui, &mut view, &mut last);
                     continue;
                 }
                 super::keys::Hit::Nothing => continue,
             }
         }
 
-        // The tree scrolls by holding the cursor near the middle of the pane,
-        // so it has no scroll offset of its own to move: the wheel moves the
-        // cursor and the view follows. A separate offset would fight that
-        // centring every time a key moved the selection.
+        // The wheel moves the view, so it needs the pane's size the way a
+        // click does: how far three rows is depends on nothing, but where the
+        // last screen ends depends on how many rows the tree has been given.
         if let Msg::Key(Key::Wheel { up }) = msg {
-            super::keys::wheel(&mut ui, &mut view, up);
+            let (w, h) = term_size();
+            super::keys::wheel(&mut ui, &mut view, w, h, up);
             shared::share(store, &view, ui.cursor(), &mut agreed);
-            draw(&ui, &view, &mut last);
+            draw(&ui, &mut view, &mut last);
             continue;
         }
 
@@ -626,7 +629,7 @@ pub(super) fn event_loop(
         if is_key {
             shared::share(store, &view, ui.cursor(), &mut agreed);
         }
-        draw(&ui, &view, &mut last);
+        draw(&ui, &mut view, &mut last);
     }
 }
 

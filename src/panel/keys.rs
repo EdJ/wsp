@@ -62,15 +62,25 @@ pub(crate) struct View {
     /// swallow it the instant it was made — you would type a name, press
     /// return, and watch nothing appear.
     pub(super) reveal: HashSet<String>,
-    /// A scroll offset the *pointer* set, if it has. The tree normally scrolls
-    /// by holding the cursor near the middle, which is right for a keyboard
-    /// and wrong for a mouse: selecting a row would recentre the tree and
-    /// slide that row out from under the pointer, so the second click of
-    /// select-then-activate landed on whatever moved into its place.
+    /// Where the tree is scrolled to: the row drawn on its top line. `None`
+    /// until a frame has placed it, which is the only moment anything derives
+    /// it from the cursor.
     ///
-    /// So the pointer drives the view directly and the keyboard goes on
-    /// centring — any keystroke clears this and hands the view back.
+    /// The view has a position of its own and keeps it. What moves it is the
+    /// wheel, which sets it outright, and a cursor that would otherwise walk
+    /// off the pane, which pushes it by as little as will do — see
+    /// [`super::render::scroll_to`]. Written by the frame that drew it, so a
+    /// click reads the offset the pane in front of you is actually using.
     pub(super) scroll: Option<usize>,
+    /// The cursor moved under the keyboard rather than the pointer.
+    ///
+    /// The two want opposite things of the view when the selection lands near
+    /// an edge. A keyboard is aiming: it is owed rows beyond the cursor,
+    /// because a cursor on the last line shows you everything you have walked
+    /// past and nothing you are about to reach. A pointer is not: the row has
+    /// to stay exactly where it was clicked, or the second click of
+    /// select-then-activate lands on whatever slid into its place.
+    pub(super) keyed: bool,
     /// What the next keypress means.
     pub(crate) mode: Mode,
     /// What the detail pane is currently showing, so `↵` can close it.
@@ -410,16 +420,41 @@ pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 /// The reducer. Deliberately free of I/O — it moves the cursor, changes the
 /// mode, and reports what else it wants done, so the storyboard can drive the
 /// same transitions the terminal does and get the same frames out.
-/// The wheel moves the selection, three rows at a time.
+/// The wheel moves the view, three rows at a time, and the cursor only if the
+/// view would leave it behind.
 ///
-/// Deliberately the same thing `j`/`k` do, three times over — not a scroll
-/// offset of its own. The tree scrolls by holding the cursor near the middle
-/// of the pane, and that centring *is* the scrolling: move the cursor and the
-/// view follows. An offset the pointer owned separately made the highlight
-/// wander off the pane, which is a different feature nobody asked for.
-pub(crate) fn wheel(ui: &mut Ui, view: &mut View, up: bool) {
-    for _ in 0..3 {
-        let _ = apply_key(if up { Key::Up } else { Key::Down }, ui, view);
+/// It used to be three of what `j` does, because the view had no position to
+/// move — the cursor was the scroll. That is why scrolling back up did nothing
+/// until the overshoot was walked off: the clamp stops the view at the last
+/// screen while the cursor goes on to the foot, so a wheel-up had half a pane
+/// of cursor travel to undo before anything moved. Here the wheel says where
+/// the view goes and the view goes there.
+pub(crate) fn wheel(ui: &mut Ui, view: &mut View, w: usize, h: usize, up: bool) {
+    const STEP: usize = 3;
+    let g = super::render::geometry(ui, view, w, h);
+    let last = g.tree_len.saturating_sub(g.tree_rows);
+    let to = if up { g.scroll.saturating_sub(STEP) } else { (g.scroll + STEP).min(last) };
+    view.scroll = Some(to);
+    // The pointer is not aiming, so the view owes the cursor no lookahead —
+    // only a place on the pane.
+    view.keyed = false;
+    // A cursor in the dock is not in the tree and the tree does not carry it.
+    if ui.sel >= g.tree_len || g.tree_rows == 0 {
+        return;
+    }
+    let floor = to;
+    let ceil = (to + g.tree_rows - 1).min(g.tree_len - 1);
+    if ui.sel < floor || ui.sel > ceil {
+        let want = ui.sel.clamp(floor, ceil);
+        // A line under an agent cannot hold the cursor. Step off it inwards —
+        // away from the edge the cursor was just clamped to — or the cursor
+        // lands one row outside the pane and the next frame drags the view
+        // back to it, undoing part of the scroll that put it there.
+        ui.sel = if ui.rows[want].selectable() {
+            want
+        } else {
+            step(&ui.rows, want, want == floor)
+        };
     }
 }
 
@@ -472,16 +507,20 @@ pub(crate) fn click(ui: &mut Ui, view: &mut View, w: usize, h: usize, x: usize, 
                 return Hit::Nothing;
             }
             view.scroll = Some(at);
+            view.keyed = false;
             ui.sel = owner;
             Hit::Select
         }
         Some(i) if i == ui.sel => Hit::Activate,
         Some(i) => {
-            // Pin the view before moving the cursor. Selecting normally
-            // recentres the tree, which would slide the row out from under the
-            // pointer that chose it — and the second click of
-            // select-then-activate would land on whatever replaced it.
+            // The view is where the frame left it, and this says so rather
+            // than assuming: a click is the one gesture that can arrive before
+            // any frame has drawn. `keyed` is the part that matters — a
+            // pointer is owed the row staying under it, so the cursor landing
+            // two rows from the foot must not scroll the tree to make room
+            // beyond it, which is what a keystroke landing there is owed.
             view.scroll = Some(at);
+            view.keyed = false;
             ui.sel = i;
             Hit::Select
         }
@@ -513,11 +552,13 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
         }
     };
-    // The keyboard gives the view back to the cursor, but only once the cursor
-    // has actually moved: a verb, or the `↵` a click turns into, must not
-    // jerk the tree out from under the pointer that asked for it.
+    // Only once the cursor has actually moved: a verb, or the `↵` a click
+    // turns into, must not jerk the tree out from under the pointer that asked
+    // for it. The view stays where it is either way — what this says is that
+    // the next frame owes the cursor rows beyond it, because somebody is
+    // reading in a direction rather than pointing at a row.
     if ui.sel != sel_before {
-        view.scroll = None;
+        view.keyed = true;
     }
     effect
 }
