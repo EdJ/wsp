@@ -204,7 +204,7 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
     out.push(line(Style::Dim, "─".repeat(w)));
     out.push(line(
         Style::Dim,
-        "o/d go to an editor · W save and close · q close",
+        "h/l go left or right · W save and close · q close",
     ));
     out
 }
@@ -464,21 +464,49 @@ fn save_and_quit_keys(editor: &str, force: bool) -> Option<(&'static str, String
     }
 }
 
-/// Move focus to the sibling pane herdr labelled `want`.
+/// Focus the leftmost or rightmost pane below this one.
 ///
-/// herdr already has `prefix+h/j/k/l` for this, but that is a two-step reach
-/// for a pane you are looking straight at. From the context, `o` and `d` name
-/// the halves directly.
-fn focus_sibling(want: &str) -> String {
+/// By position, not by name. Naming them — `o` for overview, `d` for details —
+/// put the key for the left pane under the right hand and vice versa, which is
+/// backwards every single time. `h` and `l` are left and right on the keyboard,
+/// in vim, and in herdr's own `prefix+h/l`, so the same reach means the same
+/// thing in all three.
+///
+/// The geometry comes from herdr rather than from the layout this code happens
+/// to build, so it stays true if that layout ever changes.
+fn focus_by_position(leftmost: bool) -> String {
     let Some(me) = herdr::Env::read().pane_id else {
         return "no pane id".into();
     };
-    match siblings_of(&me).into_iter().find(|p| p.label == want) {
+    let sibs = siblings_of(&me);
+    if sibs.is_empty() {
+        return "nothing open beside this".into();
+    }
+
+    let rects = herdr::call("pane.layout", json!({ "pane_id": me }))
+        .ok()
+        .and_then(|r| r.get("layout").and_then(|l| l.get("panes").cloned()))
+        .and_then(|p| p.as_array().cloned())
+        .unwrap_or_default();
+    let x_of = |id: &str| -> i64 {
+        rects
+            .iter()
+            .find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(id))
+            .and_then(|p| p.get("rect"))
+            .and_then(|r| r.get("x"))
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0)
+    };
+
+    let mut ordered: Vec<&herdr::Pane> = sibs.iter().collect();
+    ordered.sort_by_key(|p| x_of(&p.pane_id));
+    let target = if leftmost { ordered.first() } else { ordered.last() };
+    match target {
         Some(p) => {
             let _ = herdr::call("pane.focus", json!({ "pane_id": p.pane_id }));
             String::new()
         }
-        None => format!("no {want} pane here"),
+        None => "nothing to focus".into(),
     }
 }
 
@@ -627,9 +655,25 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             // the poll interval — no separate sleep, and a keypress is felt
             // immediately rather than after the rest of a tick.
             Ok(1) if buf[0] == b'q' || buf[0] == 3 => quit = true,
-            Ok(1) if buf[0] == b'o' || buf[0] == b'd' => {
-                let want = if buf[0] == b'o' { "overview" } else { "details" };
-                let msg = focus_sibling(want);
+            // Arrows say the same thing as h/l for anyone who does not think
+            // in vim. `min 0 time 1` means the tail of the sequence is already
+            // waiting, so reading it cannot block.
+            Ok(1) if buf[0] == b'\x1b' => {
+                let mut seq = [0u8; 2];
+                if tty.read(&mut seq[..1]).is_ok() && seq[0] == b'[' && tty.read(&mut seq[1..]).is_ok() {
+                    match seq[1] {
+                        b'D' => {
+                            focus_by_position(true);
+                        }
+                        b'C' => {
+                            focus_by_position(false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(1) if buf[0] == b'h' || buf[0] == b'l' => {
+                let msg = focus_by_position(buf[0] == b'h');
                 if !msg.is_empty() {
                     let (w, _) = panel::term_size();
                     let mut l = Line::default();

@@ -146,8 +146,14 @@ buffer cost. Each section gets its own editor on its own buffer, containing
 prose and nothing else: there is no `##` left to mangle. They are safe to run
 together because `wsp edit` re-reads the task and writes back only its own
 section. The tab opens with the **context** focused, not an editor — so `W` and `q` are
-under your hands before you have committed to typing anything. From there `o`
-and `d` jump straight to the overview or details editor.
+under your hands before you have committed to typing anything. From there `h`
+and `l`, or `←` and `→`, go to the pane on that side of the screen.
+
+By position, not by name: `o` for overview and `d` for details put the key for
+the *left* pane under the right hand, which is backwards every time you reach
+for it. `h` and `l` are left and right on the keyboard, in vim, and in herdr's
+own `prefix+h/l`. The side is resolved from herdr's actual geometry rather than
+from the layout this code happens to build, so it stays true if that changes.
 
 Getting back, and moving around generally, is herdr's own: `prefix+h/j/k/l`
 focuses the pane left/down/up/right, where the prefix is whatever
