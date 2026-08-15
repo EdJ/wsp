@@ -166,6 +166,69 @@ fn name_after_task(pane: &str, workspace: &str, title: &str) -> Option<String> {
     herdr::rename_workspace(workspace, &label).ok().map(|_| label)
 }
 
+/// `wsp say "<what you are doing>"` — an agent says where it has got to.
+///
+/// The pane takes the sentence; the workspace keeps the task. That division is
+/// the whole design: a workspace answers *what is this work*, which changes
+/// when the task changes, and a pane answers *what is happening in there right
+/// now*, which changes all the time. Putting both on the workspace would mean
+/// the sidebar losing the name of the work every time somebody started a build.
+///
+/// `--clear`, or an empty sentence, puts the task's own name back — so there is
+/// always a way home that does not need the agent to remember what it was
+/// called. A claim resets it too, which is why `claim` names the pane as well
+/// as the workspace rather than leaving it to this.
+pub fn say(store: &Store, args: &Args) -> i32 {
+    let Some(pane) = pane_id(args) else {
+        eprintln!("wsp: no pane to name — run this inside a herdr pane, or pass --pane");
+        return 2;
+    };
+    if !herdr::available() {
+        eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
+        return 1;
+    }
+
+    let said = args.text(0);
+    let said = said.trim();
+
+    // Home is the task this pane holds. Without one there is nothing to fall
+    // back to, so the label is cleared outright and herdr goes back to naming
+    // the pane whatever it named it before.
+    let home = store
+        .bindings()
+        .get(&pane)
+        .and_then(|b| b.get("task_id"))
+        .and_then(|t| t.as_str())
+        .and_then(|id| store.task(id))
+        .and_then(|t| task_label(&t.title));
+
+    let label = match (said.is_empty() || args.has("clear"), &home) {
+        (true, Some(h)) => Some(h.clone()),
+        (true, None) => None,
+        (false, _) => task_label(said),
+    };
+
+    let r = match &label {
+        Some(l) => herdr::rename_pane(&pane, l),
+        None => herdr::call("pane.rename", json!({ "pane_id": pane, "label": null })).map(|_| ()),
+    };
+    if let Err(e) = r {
+        eprintln!("wsp: {e}");
+        return 1;
+    }
+
+    if args.json() {
+        println!("{}", json!({ "pane": pane, "label": label }));
+    } else {
+        let p = Paint::new();
+        match &label {
+            Some(l) => println!("{} {}", p.dim(&format!("{pane} ·")), l),
+            None => println!("{}", p.dim(&format!("{pane} · cleared"))),
+        }
+    }
+    0
+}
+
 /// `Trance Video · 3h12m` — a claim as one line.
 ///
 /// Both this and `worked_line` join what they have and skip what they do not,
@@ -557,13 +620,23 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
 /// by id, or failing that by the label and cwd herdr persists — and bind its
 /// most plausible pane.
 ///
-/// Returns how many bindings were re-established.
-pub fn reconcile(store: &Store) -> usize {
+/// What one pass put right.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Reconciled {
+    /// Bindings re-established from claims.
+    pub bound: usize,
+    /// Workspaces and panes given the name of the task they hold.
+    pub named: usize,
+}
+
+/// Returns what it put right.
+pub fn reconcile(store: &Store) -> Reconciled {
+    let mut out = Reconciled::default();
     let claims = store.claims();
     if claims.is_empty() {
-        return 0;
+        return out;
     }
-    let Ok(panes) = herdr::panes() else { return 0 };
+    let Ok(panes) = herdr::panes() else { return out };
     let workspaces = herdr::workspaces().unwrap_or_default();
     let host = util::hostname();
 
@@ -579,7 +652,6 @@ pub fn reconcile(store: &Store) -> usize {
     // back from a restart bound to the *older* task, the one it had left.
     let mut taken: Vec<String> = bindings.keys().cloned().collect();
 
-    let mut fixed = 0;
     for (task_id, c) in &claims {
         if already.iter().any(|t| t == task_id) {
             continue;
@@ -631,9 +703,59 @@ pub fn reconcile(store: &Store) -> usize {
             "task-reconciled",
             json!({ "id": task_id, "pane": pane.pane_id, "workspace": ws }),
         );
-        fixed += 1;
+        out.bound += 1;
     }
-    fixed
+
+    out.named = name_bound(store, &panes, &workspaces);
+    out
+}
+
+/// Give every bound pane, and the workspace it stands in, the name of the task
+/// it is holding.
+///
+/// `claim` does this at the moment it happens, which covers everything claimed
+/// since — but only that. A pane that took its task up before any of this
+/// existed keeps whatever herdr called it, and a claim whose rename was
+/// dropped on a slow socket keeps it too, silently, because the rename is not
+/// worth failing a claim over. This is where both are put right.
+///
+/// Deliberately not in `sync`: that runs every tick, and a name reasserted
+/// every tick is a name you cannot change by hand. Here it runs when the
+/// daemon starts and when somebody asks — so a name you type survives until
+/// the next reconcile, which is the trade the user picked on t-260815-041.
+fn name_bound(
+    store: &Store,
+    panes: &[herdr::Pane],
+    workspaces: &[herdr::Workspace],
+) -> usize {
+    let tasks = store.tasks();
+    let mut named = 0;
+    for (pane_id, b) in store.bindings() {
+        let Some(label) = b
+            .get("task_id")
+            .and_then(|t| t.as_str())
+            .and_then(|id| tasks.iter().find(|t| t.id == id))
+            .and_then(|t| task_label(&t.title))
+        else {
+            continue;
+        };
+        let Some(pane) = panes.iter().find(|p| p.pane_id == pane_id) else { continue };
+
+        let mut touched = false;
+        if pane.label != label {
+            touched |= herdr::rename_pane(&pane.pane_id, &label).is_ok();
+        }
+        // A workspace nobody named reads back as the agent or the folder, so
+        // the comparison can never say "already right" — it says "not the task
+        // title", which is the same answer and the one that matters.
+        if workspaces.iter().any(|w| w.id == pane.workspace_id && w.label != label) {
+            touched |= herdr::rename_workspace(&pane.workspace_id, &label).is_ok();
+        }
+        if touched {
+            named += 1;
+        }
+    }
+    named
 }
 
 pub fn release(store: &Store, args: &Args) -> i32 {

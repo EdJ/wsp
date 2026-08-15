@@ -592,6 +592,27 @@ name you typed, too, and prints what it overwrote:
 
 That last line is the undo: `herdr workspace rename w0 wsp`.
 
+A claim is the only moment it happens, so a pane that took its work up before
+any of this existed keeps whatever herdr called it. `wsp reconcile` backfills —
+it names every bound pane and its workspace after the task it holds, and picks
+up any claim whose rename was dropped on a slow socket. The daemon runs it at
+startup, so a herdr restart heals the lot.
+
+Not in `sync`. That runs every tick, and a name reasserted every tick is a name
+you cannot change by hand; here a name you type survives until the next
+reconcile.
+
+```sh
+wsp say "reading the claim guard"   # the pane says where you have got to
+wsp say --clear                     # back to the task's own name
+```
+
+The pane takes the sentence and the workspace keeps the task — a workspace
+answers *what is this work*, a pane answers *what is happening in there right
+now*. Putting both on the workspace would lose the name of the work every time
+somebody started a build. A claim resets the pane to the task title, so there
+is always a way home.
+
 ## What an agent is handed
 
 ```sh
