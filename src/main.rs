@@ -266,7 +266,7 @@ fn help() {
 {projects}
   wsp init                          create the store at ~/wsp
   wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…
-  wsp project ls [--tag T]          list projects
+  wsp project ls|projects [--tag T] list projects
   wsp tree                          hierarchy with open counts
   wsp project show <id>             brief, tags, roots, tasks, agents
   wsp project set <id> k=v…         name/parent/status/brief/tags/roots
@@ -285,10 +285,12 @@ fn help() {
   wsp note <id> "text"              append to the log
   wsp edit <id> [--overview|--details|--decisions]  prose, in $EDITOR
   wsp edit <id> --overview --from F|-    …or from a file, or stdin
+  wsp rename <id> "title"           retitle it; the old title goes in the log
   wsp mv <id> -p proj               reassign, sub-tree and all
   wsp mv <id> --parent <id>|none    re-parent it, or detach it
   wsp tag <id> +dsp -ui             adjust tags
   wsp next [-p proj]                highest-priority actionable task
+  wsp rm <id>                       retire it to the archive
   wsp archive [--all]               sweep done tasks older than 30d
 
 {agents}
@@ -298,6 +300,7 @@ fn help() {
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project
   wsp pin --top [-w ws]             pin it outside the tree entirely
+  wsp unpin [-w ws]                 take the pin off again
   wsp where                         what project am I in, and why
   wsp wip                           everything in flight, with agents
   wsp overlap                       who else is standing in this tree
@@ -325,4 +328,77 @@ Every command takes --json. Set WSP_HOME to relocate the store."#,
         agents = h("AGENTS"),
         plumbing = h("PLUMBING"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    /// The help is the map, and a verb that is not on it does not exist as far
+    /// as anyone reading is concerned. `wsp rename` had been there for weeks —
+    /// the panel's `e` key runs it — and a task was filed saying renaming was
+    /// impossible, with four titles left wrong in another project because the
+    /// work stopped rather than being worked around. Nothing was broken; the
+    /// map was short of three lines.
+    ///
+    /// So the map is checked against the territory: every arm of the dispatch
+    /// has to appear in the help, under its own name or one of its aliases.
+    /// Read out of this file rather than from a table both sides share, because
+    /// a table is a third thing to keep true — this way the check reads exactly
+    /// what a person reads, and what the binary actually answers to.
+    const SRC: &str = include_str!("main.rs");
+
+    fn dispatch() -> Vec<Vec<String>> {
+        let body = SRC
+            .split("let code = match args.cmd.as_str() {")
+            .nth(1)
+            .expect("the dispatch moved")
+            .split("\n    };")
+            .next()
+            .unwrap();
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let Some((left, _)) = line.split_once("=>") else { continue };
+            let left = left.trim();
+            // An arm is one or more string literals: `"rm" | "remove" =>`.
+            if !left.starts_with('"') || !left.ends_with('"') {
+                continue;
+            }
+            let names: Vec<String> = left
+                .split('|')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                .collect();
+            if !names.is_empty() {
+                out.push(names);
+            }
+        }
+        out
+    }
+
+    fn help_text() -> &'static str {
+        SRC.split("fn help()").nth(1).expect("the help moved")
+    }
+
+    #[test]
+    fn every_verb_the_binary_answers_to_is_on_the_map() {
+        let help = help_text();
+        // `wsp start|review|reopen` puts three verbs on one line, so a name
+        // counts wherever it is followed by a space, a newline or the next
+        // alternative.
+        let named = |n: &str| {
+            [
+                format!("wsp {n} "),
+                format!("wsp {n}\n"),
+                format!("wsp {n}|"),
+                format!("|{n} "),
+                format!("|{n}|"),
+            ]
+            .iter()
+            .any(|pat| help.contains(pat))
+        };
+        let arms = dispatch();
+        assert!(arms.len() > 20, "the dispatch parse found only {} arms", arms.len());
+        let missing: Vec<&Vec<String>> =
+            arms.iter().filter(|names| !names.iter().any(|n| named(n))).collect();
+        assert!(missing.is_empty(), "verbs the help never mentions: {missing:?}");
+    }
 }

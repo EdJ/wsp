@@ -564,6 +564,14 @@ been reachable from `E` and from the CLI with nothing recording that anyone had
 been there — which is the failure the rule was written against, arriving by a
 door the rule did not mention.
 
+A title is not prose and is not edited here: `wsp rename <id> "new title"` is
+the verb, and it writes `renamed from "…"` into the log on its way past. That
+record is the point. A task that quietly became about something else, with no
+sign in the file that it ever meant anything different, is how a backlog drifts
+away from the plan it is supposed to be — and the id is what commits and other
+tasks refer to, so a rename has to be the cheap operation rather than
+delete-and-recreate. From the panel it is `e`, which runs exactly this.
+
 ```sh
 wsp edit <id>                    # every prose section, headings included
 wsp edit <id> --overview         # just that prose
