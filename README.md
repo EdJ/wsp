@@ -298,7 +298,24 @@ wsp edit <id> --overview         # just that prose
 wsp edit <id> --details
 wsp edit <id> --raw              # the whole file, when the frontmatter is wrong
 wsp project edit <id> [--overview|--details|--raw]
+
+wsp edit <id> --overview -       # …or from stdin, for something without hands
+wsp edit <id> --details --from notes.md
 ```
+
+`$EDITOR` is the answer for a person and no answer at all for anything else. An
+agent that can only append to the log writes tasks with a title and nothing
+under them, which is most of what makes a decomposed task unreadable a day
+later — so the same prose can arrive from a file, or from a bare `-` meaning
+stdin, spelled the way `cat -` spells it. It takes the same path back: the task
+is re-read first, only the section asked for is carried across, and `## Log`
+stays out of reach. Whitespace at the end is not an edit, or an agent rewriting
+the same brief would touch the task and make a commit every time.
+
+`--raw --from` is refused. `--raw` is the one path that reaches the
+frontmatter, and the point of `--from` is that nobody is reading what goes
+past: a generated file landing on `status:` is not an edit, it is a task the
+tools can no longer read.
 
 Projects carry the same two sections and take the same editors — `roots`,
 `tags`, `parent` and `status` all have `wsp project set`, so there is nothing

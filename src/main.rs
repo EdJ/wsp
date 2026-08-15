@@ -233,6 +233,8 @@ fn help() {
   wsp done <id> [--force]           complete; --force over open sub-tasks
   wsp block <id> "reason"           park it, and say why
   wsp note <id> "text"              append to the log
+  wsp edit <id> [--overview|--details]   prose, in $EDITOR
+  wsp edit <id> --overview --from F|-    …or from a file, or stdin
   wsp mv <id> -p proj               reassign
   wsp tag <id> +dsp -ui             adjust tags
   wsp next [-p proj]                highest-priority actionable task

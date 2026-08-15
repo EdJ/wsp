@@ -635,6 +635,34 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     )
 }
 
+/// Where prose comes from when nobody is typing it: `--from <path>`, or a bare
+/// `-` for stdin, spelled the way every other tool spells it.
+///
+/// `-` is a positional rather than `--from`'s value because a lone dash is not
+/// a path — it is the conventional name for the stream, and taking it as an
+/// argument is what `cat -` and `git apply -` have always done.
+fn prose_source(args: &Args) -> Option<String> {
+    if args.rest.iter().any(|a| a == "-") {
+        return Some("-".into());
+    }
+    match args.get("from") {
+        // `--from` with nothing usable after it. A missing path is a mistake
+        // worth reporting rather than an editor session nobody asked for.
+        Some(v) if v == "true" => Some("-".into()),
+        other => other,
+    }
+}
+
+fn read_source(src: &str) -> std::io::Result<String> {
+    if src == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        return Ok(s);
+    }
+    std::fs::read_to_string(util::expand(src))
+}
+
 /// Edit prose without ever showing anyone the frontmatter.
 ///
 /// The frontmatter is a contract — `id`, `status`, `schema` — and every field
@@ -649,6 +677,14 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
 pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
     // The escape hatch, for when the frontmatter itself is what is wrong.
     if args.has("raw") {
+        if prose_source(args).is_some() {
+            // `--raw` is the one path that reaches the frontmatter, and the
+            // whole point of `--from` is that nobody is reading what goes by.
+            // A generated file landing on `status:` is not an edit, it is a
+            // task the tools can no longer read.
+            eprintln!("wsp: --from writes prose; --raw is for a person and a frontmatter that is wrong");
+            return 2;
+        }
         return edit_file(store, &item.path, &format!("edit {}", item.id));
     }
 
@@ -677,29 +713,50 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         }
     };
 
-    // A directory per edit, so the file inside can be named for the section.
-    // Every terminal editor puts the filename in its status line, which makes
-    // that the one label needing no cooperation from the editor at all.
-    let dir = std::env::temp_dir().join(format!("wsp-{}-{}", item.id, util::epoch_nanos()));
-    let _ = std::fs::create_dir_all(&dir);
-    let tmp = dir.join(format!(
-        "{}.md",
-        one.map(|s| s.to_lowercase()).unwrap_or_else(|| "body".into())
-    ));
-    if let Err(e) = crate::store::write_atomic(&tmp, &before) {
-        eprintln!("wsp: cannot stage the edit: {e}");
-        return 1;
-    }
-    let code = launch_editor(&tmp);
-    let after = std::fs::read_to_string(&tmp).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_dir(&dir);
-
-    if code != 0 {
-        eprintln!("wsp: editor exited {code} — nothing written");
-        return 1;
-    }
-    if after == before {
+    // Where the new prose comes from. `$EDITOR` is the answer for a person and
+    // no answer at all for anything else: an agent that can only ever append a
+    // log line writes tasks with a title and nothing under it, which is most of
+    // what makes a decomposed task unreadable a day later.
+    let after = match prose_source(args) {
+        Some(src) => match read_source(&src) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("wsp: cannot read {}: {e}", if src == "-" { "stdin" } else { &src });
+                return 1;
+            }
+        },
+        None => {
+            // A directory per edit, so the file inside can be named for the
+            // section. Every terminal editor puts the filename in its status
+            // line, which makes that the one label needing no cooperation from
+            // the editor at all.
+            let dir =
+                std::env::temp_dir().join(format!("wsp-{}-{}", item.id, util::epoch_nanos()));
+            let _ = std::fs::create_dir_all(&dir);
+            let tmp = dir.join(format!(
+                "{}.md",
+                one.map(|s| s.to_lowercase()).unwrap_or_else(|| "body".into())
+            ));
+            if let Err(e) = crate::store::write_atomic(&tmp, &before) {
+                eprintln!("wsp: cannot stage the edit: {e}");
+                return 1;
+            }
+            let code = launch_editor(&tmp);
+            let text = std::fs::read_to_string(&tmp).unwrap_or_default();
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_dir(&dir);
+            if code != 0 {
+                eprintln!("wsp: editor exited {code} — nothing written");
+                return 1;
+            }
+            text
+        }
+    };
+    // Trailing whitespace is not an edit. It matters more than it sounds:
+    // prose arriving from a file rather than an editor differs by a newline
+    // often enough that an agent rewriting the same brief would otherwise
+    // touch the task and make a commit every time.
+    if after.trim_end() == before.trim_end() {
         if !args.json() {
             println!("unchanged");
         }
