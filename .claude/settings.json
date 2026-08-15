@@ -1,0 +1,7 @@
+{
+  "_comment": "Project settings for this repo, merged over ~/.claude/settings.json. The figma plugin brings its own MCP server, its tool roster and ten skills into every session's system prompt — measured at 3,552 tokens against an otherwise identical scratch project on 2026-08-15 (28,315 -> 24,763 prompt tokens for a one-word turn). None of it is reachable from a Rust TUI. Turned off here rather than globally: the design and VST work next door uses it. Delete this file to get it back. The two LSP plugins were measured in the same run and cost nothing here, so they are left alone.",
+
+  "enabledPlugins": {
+    "figma@claude-plugins-official": false
+  }
+}
