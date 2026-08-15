@@ -178,6 +178,12 @@ made inside the editor does not leave the pane behind.
 If a pane still will not close, `W` says which, and pressing it again closes
 them outright.
 
+`q` is the opposite of `W`: it tells the editors to quit *without* saving and
+closes the tab, whether or not they go quietly — a pane that will not quit must
+not be able to veto a decision to be rid of the thing. In a view opened from the
+sidebar there is no edit tab to close, so `q` closes only itself; closing that
+tab would take the panel and whatever you were working in with it.
+
 Quitting the editors by hand works the same way: the second one to go takes the
 tab with it, and quitting the first leaves it standing because closing then
 would take the other's work.

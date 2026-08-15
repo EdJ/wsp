@@ -204,7 +204,7 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
     out.push(line(Style::Dim, "─".repeat(w)));
     out.push(line(
         Style::Dim,
-        "h/l go left or right · W save and close · q close",
+        "h/l left or right · W save and close · q close, discarding",
     ));
     out
 }
@@ -510,6 +510,37 @@ fn focus_by_position(leftmost: bool) -> String {
     }
 }
 
+/// What to send an editor to make it leave *without* saving — the counterpart
+/// to `save_and_quit_keys`, and what `q` means once there is a `W` that saves.
+fn discard_and_quit_keys(editor: &str) -> Option<(&'static str, &'static str)> {
+    let name = editor
+        .rsplit('/')
+        .next()
+        .unwrap_or(editor)
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    match name {
+        "" | "vi" | "vim" | "nvim" | "view" | "hx" | "helix" => Some(("\x03", "\x1b:qa!\r")),
+        // nano asks; `n` is the answer to "save modified buffer?".
+        "nano" | "pico" => Some(("\x03", "\x18n")),
+        "emacs" | "emacsclient" => Some(("\x07", "\x18\x03n\r")),
+        "micro" => Some(("\x1b", "\x11n")),
+        _ => None,
+    }
+}
+
+/// The panes this view shares a tab with, and whether they are editors we put
+/// there. A view opened from the sidebar shares its tab with the panel and
+/// whatever you were working in — closing *that* tab would take the sidebar
+/// and your work pane with it, which is emphatically not what `q` means.
+fn edit_tab_siblings(me: &str) -> Vec<herdr::Pane> {
+    siblings_of(me)
+        .into_iter()
+        .filter(|p| p.label == "overview" || p.label == "details")
+        .collect()
+}
+
 /// The outcome of asking the editors to leave.
 enum Closing {
     /// Everything asked to go has gone, or there was nothing to ask.
@@ -654,7 +685,45 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             // `min 0 time 1` gives a 100ms read timeout, so this doubles as
             // the poll interval — no separate sleep, and a keypress is felt
             // immediately rather than after the rest of a tick.
-            Ok(1) if buf[0] == b'q' || buf[0] == 3 => quit = true,
+            Ok(1) if buf[0] == b'q' || buf[0] == 3 => {
+                // In an edit tab, `q` takes the whole thing down — leaving two
+                // editors behind with the context gone is a tab that can only
+                // confuse. `W` is the one that saves; this is its opposite, and
+                // the footer says so.
+                let me = herdr::Env::read().pane_id.unwrap_or_default();
+                let editors = edit_tab_siblings(&me);
+                if !editors.is_empty() {
+                    let ed = std::env::var("EDITOR").unwrap_or_default();
+                    if let Some((abort, discard)) = discard_and_quit_keys(&ed) {
+                        for p in &editors {
+                            let _ = herdr::call(
+                                "pane.send_text",
+                                json!({ "pane_id": p.pane_id, "text": abort }),
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(150));
+                        for p in &editors {
+                            let _ = herdr::call(
+                                "pane.send_text",
+                                json!({ "pane_id": p.pane_id, "text": discard }),
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(600));
+                    }
+                    // Close the tab whether or not they went quietly: `q` is a
+                    // decision to be rid of this, and a pane that would not
+                    // quit must not be able to veto it.
+                    if let Ok(panes) = herdr::panes() {
+                        if let Some(mine) = panes.iter().find(|p| p.pane_id == me) {
+                            let _ = herdr::call(
+                                "tab.close",
+                                json!({ "tab_id": mine.tab_id }),
+                            );
+                        }
+                    }
+                }
+                quit = true;
+            }
             // Arrows say the same thing as h/l for anyone who does not think
             // in vim. `min 0 time 1` means the tail of the sequence is already
             // waiting, so reading it cannot block.
