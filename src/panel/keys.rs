@@ -15,7 +15,7 @@ use crate::input::Key;
 use crate::util;
 
 use super::rows::{AgentRef, Row, Ui};
-use super::verbs::{browse_key, Ask, Pick};
+use super::verbs::{browse_key, claim_tell, Ask, Pick, Tell};
 
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
 /// event loop and handed to `collect`, which is otherwise a pure function of
@@ -120,7 +120,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("s v", "start, review"),
                 ("d o", "done, reopen"),
                 ("b e n", "block, retitle, note"),
-                ("m c", "move, claim"),
+                ("m c f", "move, claim, find work"),
                 ("O", "open a workspace"),
                 ("X", "remove, after y/n"),
             ],
@@ -166,7 +166,14 @@ pub(crate) enum Effect {
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
-    Run { argv: Vec<String>, escalate: Option<Vec<String>> },
+    ///
+    /// `then` is what to say to an agent once it has worked — a claim that
+    /// nobody tells the agent about leaves it sitting idle on work it now
+    /// holds. Withheld if the command is refused: the sentence would be a lie.
+    Run { argv: Vec<String>, escalate: Option<Vec<String>>, then: Option<Tell> },
+    /// Type into an agent's pane. The only effect that changes nothing at all
+    /// in the store — what it changes is what an agent is about to do.
+    Tell(Tell),
 }
 
 pub(super) fn say(ui: &mut Ui, m: impl Into<String>) {
@@ -205,7 +212,7 @@ pub(super) fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut bu
                 view.reveal.insert(util::slugify(&buffer));
             }
             view.mode = Mode::Browse;
-            Effect::Run { argv, escalate: None }
+            Effect::Run { argv, escalate: None, then: None }
         }
         _ => Effect::None,
     }
@@ -223,8 +230,12 @@ pub(super) fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effe
         }
         Key::Enter => match verb.argv(&ui.selected_target()) {
             Some(argv) => {
+                // Worked out here, while both ends of the pick are still in
+                // hand: once this returns, the pane it named is just a string
+                // in an argv.
+                let then = claim_tell(&verb, &ui.selected_target(), ui);
                 view.mode = Mode::Browse;
-                Effect::Run { argv, escalate: None }
+                Effect::Run { argv, escalate: None, then }
             }
             None => {
                 say(ui, "not a valid destination");
@@ -257,7 +268,7 @@ pub(super) fn confirm_key(
     match k {
         Key::Char('y') | Key::Char('Y') => {
             view.mode = Mode::Browse;
-            Effect::Run { argv, escalate }
+            Effect::Run { argv, escalate, then: None }
         }
         Key::Char('n') | Key::Char('N') | Key::Esc | Key::Interrupt | Key::Enter => {
             view.mode = Mode::Browse;

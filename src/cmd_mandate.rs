@@ -39,9 +39,17 @@ pub fn in_scope(index: &Index, mandated: &str, project: Option<&str>) -> bool {
 
 /// The project this workspace is mandated to work, if any.
 pub fn current(store: &Store, workspace: Option<&str>) -> Option<String> {
-    let ws = workspace?;
-    let m = store.mandates();
-    let rec = m.get(ws)?;
+    from_map(&store.mandates(), workspace?)
+}
+
+/// The same answer, from a map somebody has already read.
+///
+/// The panel holds every mandate in its snapshot and asks about twenty panes
+/// per refresh; going back to the file for each of them would be twenty reads
+/// of one small map. Kept here rather than open-coded there so the host rule
+/// below has exactly one home.
+pub fn from_map(mandates: &std::collections::BTreeMap<String, serde_json::Value>, workspace: &str) -> Option<String> {
+    let rec = mandates.get(workspace)?;
     // A mandate names a machine as well as a workspace: workspace ids are
     // herdr's and mean nothing on another host, the same reason a claim
     // carries one.

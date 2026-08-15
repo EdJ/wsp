@@ -20,7 +20,7 @@ use crate::util;
 use super::install::{list_panes, store_env};
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, View};
-use super::rows::{hotkeys, Target, Ui};
+use super::rows::{hotkeys, AgentRef, Target, Ui};
 use super::{PANEL_LABEL, VIEW_LABEL};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +165,109 @@ impl Pick {
     }
 }
 
+
+/// A sentence to type into an agent's pane, and the line the footer shows for
+/// having typed it.
+///
+/// A claim is a fact in the store and nothing at all in the pane it names: an
+/// idle agent goes on sitting at its prompt until somebody types in it. This is
+/// the missing half — the panel could always change the work, and never tell
+/// anyone about it.
+///
+/// A prompt rather than a command. What goes in is what a person would type,
+/// which means the agent reads the store itself and the panel is not quietly
+/// deciding on its behalf what `next` should have said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Tell {
+    pub(crate) pane: String,
+    pub(crate) text: String,
+    /// Thirty-four columns' worth. The sentence above is for the agent; this is
+    /// for the person who pressed the key.
+    pub(crate) note: String,
+}
+
+/// Send an agent looking for its own work.
+pub(super) fn tell_find_work(a: &AgentRef, project: &str) -> Tell {
+    Tell {
+        pane: a.pane.clone(),
+        text: format!(
+            "Find your next piece of work: run `wsp next -p {project}`, `wsp claim` what it \
+             names, then do it. If nothing is actionable, say so and stop."
+        ),
+        note: format!("{} → looking in {project}", a.where_),
+    }
+}
+
+/// Tell an agent about a task it has just been handed.
+///
+/// `wsp brief` rather than the id alone: the brief is what a session gets on
+/// the way in, so an agent handed work mid-session lands in the same place it
+/// would have started from — its project, its claim, the decisions that bind it
+/// and who else is in the tree.
+pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
+    Tell {
+        pane: a.pane.clone(),
+        text: format!("You have been claimed onto {task}. Run `wsp brief`, then work it."),
+        note: format!("{} → {task}", a.where_),
+    }
+}
+
+/// Which claim, in which direction, and whether the pane it names is in any
+/// state to be told. `None` covers a busy agent and a shell alike: the claim
+/// itself still lands, and it is only the sentence that is withheld.
+pub(super) fn claim_tell(verb: &Pick, at: &Target, ui: &Ui) -> Option<Tell> {
+    let (task, pane) = match (verb, at) {
+        (Pick::PaneForTask { task }, Target::Pane(pane)) => (task, pane),
+        (Pick::TaskForPane { pane }, Target::Task(task)) => (task, pane),
+        _ => return None,
+    };
+    let a = ui.agent_at_pane(pane)?;
+    // A shell would run the sentence as a command; a working agent is in the
+    // middle of something, and its prompt may not even be a prompt.
+    (a.agent && a.state == "idle").then(|| tell_claimed(a, task))
+}
+
+/// Type a sentence into a pane and press return.
+///
+/// Two writes with a pause between, the same bargain the editor panes make: a
+/// TUI that takes a burst of input as a paste swallows the return on the end of
+/// it, and the sentence then sits in the prompt unsent — which looks exactly
+/// like an agent that read the instruction and ignored it.
+pub(super) fn send_tell(t: &Tell) -> Result<(), String> {
+    herdr::call("pane.send_text", json!({ "pane_id": t.pane, "text": t.text }))
+        .map_err(|e| e.to_string())?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    herdr::call("pane.send_text", json!({ "pane_id": t.pane, "text": "\r" }))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `f`: send an idle agent to find its own work.
+///
+/// The counterpart to `c`, and the difference is who picks: `c` hands over a
+/// task you chose, this hands over a project and lets the agent choose inside
+/// it. Both end in the same place — a sentence in a pane.
+fn find_work(a: &AgentRef, ui: &mut Ui) -> Effect {
+    if !a.agent {
+        say(ui, "a shell has nobody to tell");
+        return Effect::None;
+    }
+    if let Some(t) = &a.task {
+        say(ui, format!("it holds {t} — v hands that back first"));
+        return Effect::None;
+    }
+    if a.state != "idle" {
+        say(ui, "it is working — leave it be");
+        return Effect::None;
+    }
+    let Some(project) = a.project.clone() else {
+        say(ui, "no project here — pin or mandate it first");
+        return Effect::None;
+    };
+    let tell = tell_find_work(a, &project);
+    say(ui, tell.note.clone());
+    Effect::Tell(tell)
+}
 
 /// Shut the workspace's detail pane, if it has one.
 pub(super) fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
@@ -590,6 +693,15 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Effect::None
             }
         },
+        // The dock's own verb. `c` needs you to have decided what the work is;
+        // this needs only that there is some.
+        Key::Char('f') => match ui.rows.get(ui.sel).and_then(|r| r.agent()).cloned() {
+            Some(a) => find_work(&a, ui),
+            None => {
+                say(ui, "f sets an agent looking — aim it at one");
+                Effect::None
+            }
+        },
 
         // ---- pop out, full size, in an editor ----
         Key::Char('E') => match &target {
@@ -686,6 +798,7 @@ pub(super) fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
     match target {
         Target::Task(id) => Effect::Run {
             argv: vec![verb.to_string(), id.clone()],
+            then: None,
             // `done` on a parent with open sub-tasks is refused by the CLI.
             // Carry the stronger form so that refusal becomes the next
             // question — the same shape `X` on a project already takes, and

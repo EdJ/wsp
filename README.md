@@ -319,6 +319,7 @@ disturbing a layout you will come back to.
 | `E` | task, project | edit its prose full-screen in a tab |
 | `m` | task | move — the tree becomes the picker |
 | `c` | task or agent | claim, either direction — and how an agent moves on |
+| `f` | idle agent | send it to find its own work |
 | `O` | task, project | open a herdr workspace for it, and claim it |
 | `X` | task, project | remove, after a `y`/`n` |
 
@@ -336,6 +337,28 @@ claim; the env is exact for the life of the session.
 
 Typing, picking and confirming are modes, not widgets: navigation and folding
 keep working inside a pick, so you hunt for a destination by reading the tree.
+
+`c` and `f` are the two answers to one question, and the difference is who
+picks the work. Both end in the same place: a sentence typed into the agent's
+pane. A claim is a fact in the store and nothing at all in the pane it names —
+an idle agent goes on sitting at its prompt until somebody types in it — so
+`c` carries "you have been claimed onto `<id>`, run `wsp brief`", and `f`
+carries "run `wsp next -p <proj>`, claim what it names, do it".
+
+The project in that sentence comes from the same chain the agent's own
+`wsp where` would use — pin, then mandate, then cwd, then workspace label — so
+the panel can never send a pane to work somewhere it would disagree it is.
+Note that this is *not* the branch of the tree the row is drawn under: a pane
+mandated to `data` while standing in the `wsp` checkout is drawn where it
+stands and told what it is for.
+
+Three panes are never typed into. A shell would run the sentence as a command;
+a working agent's prompt may not be a prompt at all, and a claim onto one still
+lands, it just goes untold; an agent already holding a task is refused and
+pointed at `v`. The sentence goes as two writes with a pause between, the same
+bargain the editor panes make — a TUI that reads a burst of input as a paste
+swallows the return on the end of it, and the instruction then sits in the
+prompt unsent, which looks exactly like an agent that read it and ignored it.
 
 ### What the marks mean
 

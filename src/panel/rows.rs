@@ -45,6 +45,15 @@ pub(crate) struct AgentRef {
     pub(super) where_: String,
     /// Whether an agent is running here, or it is just a shell.
     pub(super) agent: bool,
+    /// The task claimed to this pane, if it holds one. Carried so a verb aimed
+    /// at the pane can refuse on the ground that matters — it already has work
+    /// — rather than on where the row happens to sit.
+    pub(super) task: Option<String>,
+    /// The project this pane would take work from: its mandate if it has one,
+    /// else wherever it is standing. Deliberately not the same question as
+    /// which branch of the tree the row is drawn under — standing direction
+    /// says what a pane is *for*, and the tree places it by where it *is*.
+    pub(super) project: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +227,14 @@ impl Ui {
         self.roots.get(project).cloned()
     }
 
+    /// The row for a pane, wherever in the tree it is drawn. A claim names a
+    /// pane that may be nowhere near the cursor — `c` on a task picks one from
+    /// the dock — so the pane has to be found rather than read off the
+    /// selection.
+    pub(super) fn agent_at_pane(&self, pane: &str) -> Option<&AgentRef> {
+        self.rows.iter().filter_map(|r| r.agent()).find(|a| a.pane == pane)
+    }
+
     /// Which project a task row sits under.
     pub(super) fn project_of_task(&self, task: &str) -> Option<String> {
         self.rows.iter().find_map(|r| match r {
@@ -239,6 +256,10 @@ pub struct Snapshot {
     pub tasks: Vec<Task>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub pins: std::collections::BTreeMap<String, String>,
+    /// workspace id -> mandate record. Here because a pane with no task still
+    /// has a project it is *for*, and that is the one the panel sends it to
+    /// look in.
+    pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
     pub workspaces: Vec<herdr::Workspace>,
     pub panes: Vec<herdr::Pane>,
 }
@@ -253,6 +274,7 @@ impl Snapshot {
             tasks: store.tasks(),
             bindings: store.bindings(),
             pins: store.pins(),
+            mandates: store.mandates(),
             workspaces: herdr::workspaces().unwrap_or_default(),
             panes: herdr::panes().unwrap_or_default(),
         }
@@ -450,18 +472,26 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             .and_then(|t| t.as_str())
             .map(|s| s.to_string())
     };
-    let as_ref = |a: &herdr::Pane| AgentRef {
+    // `project` is what the pane would take *work* from, which the caller has
+    // usually just resolved for its own reasons — passed in rather than worked
+    // out again here, because resolution canonicalises every project root and
+    // this runs four times a second against every pane on the machine.
+    let as_ref = |a: &herdr::Pane, project: Option<String>| AgentRef {
         pane: a.pane_id.clone(),
         workspace: a.workspace_id.clone(),
         state: a.agent_status.clone(),
         where_: if a.title.is_empty() { ws_label(&a.workspace_id) } else { a.title.clone() },
         agent: !a.agent.is_empty(),
+        task: bound_task_of_pane(&a.pane_id),
+        project,
     };
 
-    // task id -> the pane claimed to it
+    // task id -> the pane claimed to it. No project: a pane holding a task is
+    // not looking for one, and every verb that would ask refuses on the task
+    // first.
     let agent_for_task = |task_id: &str| -> Option<AgentRef> {
         panes.iter().find_map(|a| {
-            (bound_task_of_pane(&a.pane_id).as_deref() == Some(task_id)).then(|| as_ref(a))
+            (bound_task_of_pane(&a.pane_id).as_deref() == Some(task_id)).then(|| as_ref(a, None))
         })
     };
 
@@ -491,6 +521,13 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             Some(&ws_label(&a.workspace_id)),
             Some(&a.cwd),
         );
+        // Where it stands places the row; standing direction says what it is
+        // for, and that is what a verb sends it to work. A mandate on `data`
+        // and a cwd in `wsp` are both true at once — the tree wants the second
+        // and `f` wants the first.
+        let direction = crate::cmd_mandate::from_map(&snap.mandates, &a.workspace_id)
+            .filter(|p| index.get(p).is_some())
+            .or_else(|| r.project.clone());
         match &r.project {
             Some(p) => {
                 for id in std::iter::once(p.clone()).chain(index.ancestors(p)) {
@@ -498,9 +535,9 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 }
                 if bound.is_none() {
                     if a.agent.is_empty() {
-                        loose_by_project.entry(p.clone()).or_default().push(as_ref(a));
+                        loose_by_project.entry(p.clone()).or_default().push(as_ref(a, direction));
                     } else {
-                        unassigned.push(as_ref(a));
+                        unassigned.push(as_ref(a, direction));
                     }
                 }
             }
@@ -513,9 +550,9 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                     // group. An agent is a person's worth of attention going
                     // spare, and goes in the dock.
                     if a.agent.is_empty() {
-                        homeless.push(as_ref(a));
+                        homeless.push(as_ref(a, direction));
                     } else {
-                        unassigned.push(as_ref(a));
+                        unassigned.push(as_ref(a, direction));
                     }
                 }
             }

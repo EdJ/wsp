@@ -19,7 +19,7 @@ use crate::store::Store;
 use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, AgentRef, Snapshot, Ui};
-use super::verbs::{close_view, inspect, open_workspace, pop_out, run_wsp};
+use super::verbs::{close_view, inspect, open_workspace, pop_out, run_wsp, send_tell};
 
 
 pub(super) enum Msg {
@@ -334,7 +334,11 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                     }
                     refetch = true;
                 }
-                Effect::Run { argv, escalate } => {
+                Effect::Tell(t) => match send_tell(&t) {
+                    Ok(()) => say(&mut ui, t.note),
+                    Err(e) => say(&mut ui, e),
+                },
+                Effect::Run { argv, escalate, then } => {
                     match (run_wsp(&argv), escalate) {
                         (Ok(m), _) => {
                             // Land the cursor on whatever was just created, so
@@ -348,6 +352,16 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                                     say(&mut ui, format!("{id} added · E to write it up"));
                                 }
                                 _ => say(&mut ui, m.label),
+                            }
+                            // Only now the command has actually worked. The
+                            // footer takes the sentence's line over the
+                            // command's: what you want to know about a claim
+                            // is whether the agent was told.
+                            if let Some(t) = then {
+                                match send_tell(&t) {
+                                    Ok(()) => say(&mut ui, t.note),
+                                    Err(e) => say(&mut ui, e),
+                                }
                             }
                         }
                         // Refused, and there is a stronger form of the same

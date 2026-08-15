@@ -139,6 +139,14 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         agent("w1:p1", "w1", "working", "Trance Video"),
         agent("w2:p1", "w2", "idle", "Verb UI"),
         agent("w3:p1", "w3", "working", "◐ Unclaimed explorer"),
+        // The other half of the dock: an agent that has stopped and holds
+        // nothing. It is standing in a project root, so `f` knows where to send
+        // it without anyone having said.
+        {
+            let mut a = agent("w4:p2", "w4", "idle", "spare hands");
+            a.cwd = "~/claude/trance".into();
+            a
+        },
         // Shells: no agent, placed purely by where they are standing.
         shell("w4:p1", "w4", "~/claude/trance"),
         shell("w5:p1", "w5", "~/claude/wsp"),
@@ -154,11 +162,18 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
     bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
     bindings.insert("w2:p1".to_string(), json!({ "task_id": "t-003" }));
 
+    // w3 stands in no project at all — it is the unclaimed explorer at the foot
+    // — and is still *for* something. Standing direction is the only thing that
+    // can say so, and it is what `f` sends it to look in.
+    let mut mandates = BTreeMap::new();
+    mandates.insert("w3".to_string(), json!({ "project": "verb" }));
+
     Snapshot {
         projects,
         tasks,
         bindings,
         pins: BTreeMap::new(),
+        mandates,
         workspaces,
         panes: agents,
     }
@@ -376,6 +391,12 @@ fn scenes() -> Vec<Scene> {
             .down_to(panel::RowKind::Agent)
             .keys(&[Key::Char('G'), Key::Char('c')])
             .scene("Handing work to an idle agent", "The dock holds every agent with no task, ruled off at the foot and pinned there — the tree above it scrolls and this does not. It is the one row you most need to see and the first the tree would push off the bottom, since the tree sorts by work and these panes have none. `c` on one turns the tree into the picker: choose what it takes."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .keys(&[Key::Char('G'), Key::Char('f')])
+            .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command."),
     );
 
     out.push(
@@ -958,6 +979,135 @@ mod tests {
         // And every row that can be clicked can be selected by clicking it.
         for (n, y) in (0..H).filter(|y| panel::row_at(&ui, &view, W, H, *y).is_some()).enumerate() {
             assert_eq!(panel::row_at(&ui, &view, W, H, y), Some(seen[n]));
+        }
+    }
+
+    // ---- telling an agent -----------------------------------------------
+
+    /// Put the cursor on the row for a pane. By target rather than by counting
+    /// presses: a fixture that gains a task must not silently move the row a
+    /// test thought it was aiming at.
+    fn on_pane(ui: &mut panel::Ui, pane: &str) {
+        let want = panel::Target::Pane(pane.to_string());
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == want {
+                return;
+            }
+        }
+        panic!("no row for pane {pane}");
+    }
+
+    fn press(ui: &mut panel::Ui, view: &mut panel::View, c: char) -> panel::Effect {
+        panel::apply_key(Key::Char(c), ui, view)
+    }
+
+    /// The dock's own verb: the panel works out what the pane is for and types
+    /// `wsp next` into it. The project is named in the sentence rather than
+    /// left to the agent's own resolution, so the two can never disagree.
+    #[test]
+    fn f_sends_an_idle_agent_looking_in_its_own_project() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w4:p2");
+        match press(&mut ui, &mut view, 'f') {
+            panel::Effect::Tell(t) => {
+                assert_eq!(t.pane, "w4:p2");
+                assert!(t.text.contains("wsp next -p trance"), "said: {}", t.text);
+            }
+            _ => panic!("f on an idle unassigned agent should tell it something"),
+        }
+    }
+
+    /// Standing direction beats the directory. A pane mandated to one project
+    /// while sitting in another's checkout is *for* the mandate — and the panel
+    /// has to agree with the answer `wsp where` would give inside that pane, or
+    /// it sends an agent to work somewhere it will refuse to be.
+    #[test]
+    fn a_mandate_beats_where_the_pane_is_standing() {
+        let mut w = world();
+        w.mandates.insert("w4".into(), json!({ "project": "verb" }));
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w4:p2");
+        match press(&mut ui, &mut view, 'f') {
+            panel::Effect::Tell(t) => {
+                assert!(t.text.contains("wsp next -p verb"), "said: {}", t.text);
+            }
+            _ => panic!("a mandated pane is still tellable"),
+        }
+    }
+
+    /// Two panes nothing may be typed into: a shell would run the sentence as a
+    /// command, and a working agent's prompt may not be a prompt at all.
+    #[test]
+    fn nothing_is_typed_into_a_shell_or_a_busy_agent() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_pane(&mut ui, "w5:p1"); // a shell standing in ~/claude/wsp
+        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+
+        on_pane(&mut ui, "w3:p1"); // an agent working, holding no task
+        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+
+        on_pane(&mut ui, "w1:p1"); // an agent already holding t-001
+        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+    }
+
+    /// The other door to the same place. A claim is a fact in the store and
+    /// nothing at all in the pane it names, so handing a task to an idle agent
+    /// has to carry the sentence that tells it.
+    #[test]
+    fn claiming_onto_an_idle_agent_tells_it_what_it_now_holds() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        // `c` on a task turns the tree into the picker; the pick lands on a pane.
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Task("t-020".into()) {
+                break;
+            }
+        }
+        press(&mut ui, &mut view, 'c');
+        on_pane(&mut ui, "w4:p2");
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["claim", "t-020", "--pane", "w4:p2"]);
+                let t = then.expect("an idle agent handed a task is told about it");
+                assert_eq!(t.pane, "w4:p2");
+                assert!(t.text.contains("t-020"), "said: {}", t.text);
+            }
+            _ => panic!("the pick should run a claim"),
+        }
+    }
+
+    /// The claim still lands on a busy agent — it is only the typing that is
+    /// withheld, because the store is safe to change and a pane in the middle
+    /// of something is not.
+    #[test]
+    fn claiming_onto_a_busy_agent_still_claims_and_says_nothing() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Task("t-020".into()) {
+                break;
+            }
+        }
+        press(&mut ui, &mut view, 'c');
+        on_pane(&mut ui, "w3:p1");
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["claim", "t-020", "--pane", "w3:p1"]);
+                assert!(then.is_none(), "a working agent is not typed into");
+            }
+            _ => panic!("the pick should run a claim"),
         }
     }
 }
