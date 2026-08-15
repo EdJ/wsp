@@ -1529,6 +1529,74 @@ pub fn hook(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Lines the index would drop that HEAD has and the files on disk still have.
+///
+/// Both arguments are `git diff --numstat` output: the first HEAD against the
+/// index, the second HEAD against the working tree. Per path, the index's
+/// deletions minus the disk's are what staging that path would throw away and
+/// nothing would still hold — the disk's own deletions are somebody's edit,
+/// which is theirs to make.
+///
+/// That subtraction is what keeps this quiet for the ordinary case. An agent
+/// halfway through the commit procedure has staged what it wrote, so the index
+/// and the disk delete the same lines and the difference is zero; it stays zero
+/// while they carry on editing, because everything the index drops the disk
+/// drops too. Only an index holding something *older* than both — a `read-tree`
+/// or a `reset` that landed on the shared file — deletes what the disk still
+/// has.
+fn index_loss(staged: &str, disk: &str) -> u64 {
+    let deletions = |numstat: &str| -> std::collections::BTreeMap<String, u64> {
+        numstat
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                let (_add, del, path) = (f.next()?, f.next()?, f.next()?);
+                // `-` for a binary file, where git counts no lines at all.
+                Some((path.to_string(), del.parse::<u64>().ok()?))
+            })
+            .collect()
+    };
+    let disk = deletions(disk);
+    deletions(staged)
+        .iter()
+        .map(|(path, del)| del.saturating_sub(disk.get(path).copied().unwrap_or(0)))
+        .sum()
+}
+
+/// The same question, asked of a working tree.
+///
+/// `GIT_INDEX_FILE` is stripped deliberately. The commit procedure has every
+/// agent working through a private index, so a `doctor` run from inside one
+/// would otherwise inspect that agent's own staging and pronounce the shared
+/// index — the one that is actually loaded — healthy.
+///
+/// `--no-renames` for the same reason a rename would break it: numstat writes
+/// a rename as `old => new` in one field, which matches nothing in the other
+/// listing and would count the whole file as loss.
+fn tree_index_loss(root: &std::path::Path) -> Option<u64> {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    // One call answers three questions at once: a directory that is not a git
+    // repo fails here, and so does a repo with no commit to be behind.
+    let staged = git(&["diff", "--cached", "--numstat", "--no-renames"])?;
+    if staged.trim().is_empty() {
+        return Some(0);
+    }
+    let disk = git(&["diff", "--numstat", "--no-renames", "HEAD"])?;
+    Some(index_loss(&staged, &disk))
+}
+
 pub fn doctor(store: &Store, args: &Args) -> i32 {
     let mut problems: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -1559,6 +1627,44 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         for r in &p.roots {
             if !util::expand(r).exists() {
                 problems.push(format!("project {} root does not exist: {}", p.id, r));
+            }
+        }
+    }
+
+    // A loaded index in a tree agents share.
+    //
+    // `git add` writes to one `.git/index` for everybody standing in a tree,
+    // and whoever commits takes whatever is in it — which the commit procedure
+    // answers by having each agent work through a private `GIT_INDEX_FILE`. The
+    // failure that leaves behind is silent: one `read-tree` or `reset` run
+    // without that variable set puts an *older* tree in the shared index, where
+    // it sits looking like nothing at all until somebody who skipped the
+    // procedure — or a person at a shell — runs a plain `git commit` and takes
+    // it. On 2026-08-15 that was 4,962 lines behind HEAD in `~/claude/wsp` for
+    // most of an afternoon, and every fact needed to say so was already here.
+    //
+    // Declared roots only. wsp knows where a project's work lives because
+    // somebody said so, and a check that went hunting for git repositories
+    // would be reporting on trees nobody asked it about.
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    for p in &index.projects {
+        for r in &p.roots {
+            let root = util::real(r);
+            if seen.contains(&root) || !root.exists() {
+                continue;
+            }
+            seen.push(root.clone());
+            match tree_index_loss(&root) {
+                Some(lost) if lost > 0 => {
+                    problems.push(format!(
+                        "{}: the staged index would drop {lost} line(s) that HEAD has and the files still have",
+                        util::contract(&root)
+                    ));
+                    problems.push(
+                        "  a plain `git commit` there takes it as it stands — `git read-tree HEAD`, with no GIT_INDEX_FILE set, puts it back".into(),
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -1832,6 +1938,41 @@ mod tests {
         let long = "Agents should rename as they pick up new tasks, and say so";
         assert_eq!(task_label(long).unwrap().chars().count(), 44);
         assert!(task_label(long).unwrap().ends_with('…'));
+    }
+
+    /// The subtraction that separates a loaded index from an agent halfway
+    /// through the commit procedure. Deletions the disk makes too are somebody
+    /// editing; deletions only the index makes are work nothing else holds.
+    #[test]
+    fn only_the_index_deleting_what_the_disk_keeps_counts_as_loss() {
+        // The incident: an old tree in the shared index. The disk has the file
+        // as HEAD left it, and staging it would drop four lines.
+        let staged = "0\t4\tsrc/panel.rs\n";
+        assert_eq!(index_loss(staged, ""), 4);
+
+        // An agent that staged what it wrote: both listings say the same
+        // thing, because the index holds exactly what is on disk.
+        assert_eq!(index_loss("2\t1\tsrc/panel.rs\n", "2\t1\tsrc/panel.rs\n"), 0);
+
+        // …and carried on editing afterwards. The disk has moved further from
+        // HEAD than the index has, which is the normal direction of travel.
+        assert_eq!(index_loss("2\t1\tsrc/panel.rs\n", "9\t3\tsrc/panel.rs\n"), 0);
+
+        // A deletion made on purpose — the file is gone from the disk as well,
+        // so the index is not holding the only copy of anything.
+        assert_eq!(index_loss("0\t40\tsrc/old.rs\n", "0\t40\tsrc/old.rs\n"), 0);
+
+        // Per path, not in total: one file legitimately staged does not pay
+        // for another the index would revert.
+        let staged = "2\t1\tsrc/a.rs\n0\t30\tsrc/b.rs\n";
+        let disk = "2\t1\tsrc/a.rs\n";
+        assert_eq!(index_loss(staged, disk), 30);
+
+        // A binary file counts no lines at all, and `-` is not a number.
+        assert_eq!(index_loss("-\t-\tdoc/screenshot.png\n", ""), 0);
+
+        // A clean index is the common answer and has no listing to read.
+        assert_eq!(index_loss("", ""), 0);
     }
 
     /// The two states an agent with nothing in hand can be in, and the reason

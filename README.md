@@ -1263,8 +1263,33 @@ spot of the check we were relying on at the time.
 | Explicit paths (`git add <file>`) | staging a file you never meant to name | anything already staged in the shared index by someone else |
 | Reading `git diff --cached` | a hunk you did not write, if you read the **file list** and not just the hunks | nothing — but only if you actually read it; every swept hunk looked plausible in isolation |
 | Isolated build in a worktree | what you wrongly left *out*, and what you took in that only compiles against uncommitted work | whose commit it is; a coherent tree under the wrong author's message compiles perfectly |
-| A private `GIT_INDEX_FILE` | the other agent's staged work entering your commit | the working tree; two people still editing one file |
+| A private `GIT_INDEX_FILE` | the other agent's staged work entering your commit | the working tree; two people still editing one file; **the shared index, which nobody is now reading** |
+| `wsp doctor` | a shared index holding something older than HEAD, in any declared project root | a shared index holding something *newer* — staged work is indistinguishable from staged work |
 | `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one |
+
+### The index nobody looks at
+
+The seventh incident is the shape of the fix for the second. Once every agent
+commits through a private `GIT_INDEX_FILE`, nobody reads `.git/index` again —
+and one `git read-tree` or `git reset` run without that variable set puts an
+older tree in it, where it sits looking like nothing at all. It was 4,962 lines
+behind HEAD in this repo for most of an afternoon. Nothing was lost, because
+everyone in the tree was following the procedure and none of them touched it;
+the loss was one plain `git commit` away, from an agent that skipped a step or a
+person at a shell.
+
+`wsp doctor` reads it now, for every root a project declares. The rule is not
+"something is staged" — that is an agent halfway through committing, and it is
+none of doctor's business. It is **lines the index would drop that HEAD has and
+the files on disk still have**: per path, the index's deletions minus the
+disk's. Staged work subtracts to zero, and stays zero while its author carries
+on editing, because everything the index drops the disk drops too. Only an index
+holding something older than both survives the subtraction. Doctor strips
+`GIT_INDEX_FILE` before asking, or it would inspect the caller's private index —
+the one that is fine — and pronounce the loaded one healthy.
+
+`git read-tree HEAD`, with no `GIT_INDEX_FILE` set, puts it back. It writes the
+index and touches no file in the working tree.
 
 ### Do not search a release binary for a string
 
