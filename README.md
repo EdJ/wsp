@@ -320,6 +320,7 @@ disturbing a layout you will come back to.
 | `m` | task | move — the tree becomes the picker |
 | `c` | task or agent | claim, either direction — and how an agent moves on |
 | `f` | idle agent | send it to find its own work |
+| | | asks which project, and remembers, if it stands nowhere |
 | `O` | task, project | open a herdr workspace for it, and claim it |
 | `X` | task, project | remove, after a `y`/`n` |
 
@@ -351,6 +352,17 @@ the panel can never send a pane to work somewhere it would disagree it is.
 Note that this is *not* the branch of the tree the row is drawn under: a pane
 mandated to `data` while standing in the `wsp` checkout is drawn where it
 stands and told what it is for.
+
+Most panes resolve to nothing, and that is not the odd case — herdr reports
+where a pane's *shell* started, which for every agent launched from `~/claude`
+is the directory above every checkout in it. So `f` on a pane it cannot place
+turns the tree into the picker and asks which project it works, and the answer
+becomes a **mandate** rather than being spent on the one keystroke: picking a
+project for an idle agent *is* standing direction — "work here without asking"
+is the whole content of the gesture — so the next `f` on that pane goes
+straight out, and `wsp brief` inside it now says what it is for. Only a project
+answers; a task or the inbox would scope `wsp next` to everything, which is not
+what was asked. `wsp mandate --clear` in the pane undoes it.
 
 Three panes are never typed into. A shell would run the sentence as a command;
 a working agent's prompt may not be a prompt at all, and a claim onto one still

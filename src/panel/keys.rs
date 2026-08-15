@@ -15,7 +15,7 @@ use crate::input::Key;
 use crate::util;
 
 use super::rows::{AgentRef, Row, Ui};
-use super::verbs::{browse_key, claim_tell, Ask, Pick, Tell};
+use super::verbs::{browse_key, pick_tell, Ask, Pick, Tell};
 
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
 /// event loop and handed to `collect`, which is otherwise a pure function of
@@ -233,7 +233,7 @@ pub(super) fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effe
                 // Worked out here, while both ends of the pick are still in
                 // hand: once this returns, the pane it named is just a string
                 // in an argv.
-                let then = claim_tell(&verb, &ui.selected_target(), ui);
+                let then = pick_tell(&verb, &ui.selected_target(), ui);
                 view.mode = Mode::Browse;
                 Effect::Run { argv, escalate: None, then }
             }

@@ -133,6 +133,8 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         workspace("w3", "Easter", false),
         workspace("w4", "Trance Lite", false),
         workspace("w5", "panel work", false),
+        // A label that matches no project, for a pane that stands nowhere.
+        workspace("w6", "scratch", false),
     ];
 
     let agents = vec![
@@ -147,6 +149,12 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
             a.cwd = "~/claude/trance".into();
             a
         },
+        // And the case that is actually commonest: an idle agent that resolves
+        // to nothing at all. herdr reports where a pane's *shell* started, and
+        // an agent launched from the directory above every checkout is standing
+        // in no project by that measure — which is why `f` has to be able to
+        // ask rather than refuse.
+        agent("w6:p1", "w6", "idle", ""),
         // Shells: no agent, placed purely by where they are standing.
         shell("w4:p1", "w4", "~/claude/trance"),
         shell("w5:p1", "w5", "~/claude/wsp"),
@@ -162,11 +170,9 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
     bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
     bindings.insert("w2:p1".to_string(), json!({ "task_id": "t-003" }));
 
-    // w3 stands in no project at all — it is the unclaimed explorer at the foot
-    // — and is still *for* something. Standing direction is the only thing that
-    // can say so, and it is what `f` sends it to look in.
-    let mut mandates = BTreeMap::new();
-    mandates.insert("w3".to_string(), json!({ "project": "verb" }));
+    // Empty on purpose. Standing direction is what `f` writes when it has to
+    // ask, so a world that starts with one would hide the question.
+    let mandates = BTreeMap::new();
 
     Snapshot {
         projects,
@@ -395,8 +401,14 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
-            .keys(&[Key::Char('G'), Key::Char('f')])
+            .keys(&[Key::Char('G'), Key::Up, Key::Char('f')])
             .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .keys(&[Key::Char('G'), Key::Char('f')])
+            .scene("Asking where it works", "The commonest pane of all: an idle agent standing in no project, because herdr reports where a pane's *shell* started and that is one directory above every checkout. `f` asks rather than refusing — and the answer is written down as a mandate, so the next `f` on that pane goes straight out. Picking a project for an idle agent *is* standing direction; there was never anything else it could mean."),
     );
 
     out.push(
@@ -1084,6 +1096,58 @@ mod tests {
             }
             _ => panic!("the pick should run a claim"),
         }
+    }
+
+    /// The commonest pane there is: an agent that resolves to no project,
+    /// because herdr reports where its *shell* started and that is one
+    /// directory above every checkout. Refusing there made `f` useless, so it
+    /// asks — and writes the answer down as a mandate, which is what stops it
+    /// asking twice.
+    #[test]
+    fn an_agent_that_stands_nowhere_is_asked_where_it_works() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w6:p1");
+
+        // No sentence yet — the panel does not know what to say.
+        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+
+        // The tree is now the picker, and a project answers it.
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Project("verb".into()) {
+                break;
+            }
+        }
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["mandate", "verb", "-w", "w6"]);
+                let t = then.expect("and it is told to go and look");
+                assert_eq!(t.pane, "w6:p1");
+                assert!(t.text.contains("wsp next -p verb"), "said: {}", t.text);
+            }
+            _ => panic!("the pick should set the mandate"),
+        }
+    }
+
+    /// The pick refuses what it cannot answer with. Landing on a task or the
+    /// inbox is not a project, and `wsp next` scoped to neither is `wsp next`
+    /// over everything — which is not what was asked.
+    #[test]
+    fn only_a_project_answers_where_it_works() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w6:p1");
+        press(&mut ui, &mut view, 'f');
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Task("t-020".into()) {
+                break;
+            }
+        }
+        assert!(matches!(panel::apply_key(Key::Enter, &mut ui, &mut view), panel::Effect::None));
     }
 
     /// The claim still lands on a busy agent — it is only the typing that is

@@ -133,6 +133,10 @@ pub(crate) enum Pick {
     PaneForTask { task: String },
     /// Point an agent at different work — this is task 025's migration.
     TaskForPane { pane: String },
+    /// Say what an idle agent is *for*, when nothing else can. Lands on a
+    /// project and becomes a mandate, so the next `f` on that pane needs no
+    /// picking at all.
+    WorkForAgent { pane: String, workspace: String },
 }
 
 impl Pick {
@@ -141,6 +145,7 @@ impl Pick {
             Pick::MoveTask { .. } => "move to which project?",
             Pick::PaneForTask { .. } => "which agent takes it?",
             Pick::TaskForPane { .. } => "which task does it take?",
+            Pick::WorkForAgent { .. } => "which project does it work?",
         }
     }
 
@@ -159,6 +164,14 @@ impl Pick {
             }
             (Pick::TaskForPane { pane }, Target::Task(task)) => {
                 Some(vec!["claim".into(), task.clone(), "--pane".into(), pane.clone()])
+            }
+            // A mandate rather than nothing at all. Picking a project for an
+            // idle agent *is* standing direction — "work here without asking"
+            // is the whole content of the gesture — and recording it is what
+            // stops the same question being asked every time. The sentence that
+            // follows is what makes it act on it now.
+            (Pick::WorkForAgent { workspace, .. }, Target::Project(p)) => {
+                Some(vec!["mandate".into(), p.clone(), "-w".into(), workspace.clone()])
             }
             _ => None,
         }
@@ -212,19 +225,25 @@ pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
     }
 }
 
-/// Which claim, in which direction, and whether the pane it names is in any
-/// state to be told. `None` covers a busy agent and a shell alike: the claim
-/// itself still lands, and it is only the sentence that is withheld.
-pub(super) fn claim_tell(verb: &Pick, at: &Target, ui: &Ui) -> Option<Tell> {
-    let (task, pane) = match (verb, at) {
-        (Pick::PaneForTask { task }, Target::Pane(pane)) => (task, pane),
-        (Pick::TaskForPane { pane }, Target::Task(task)) => (task, pane),
-        _ => return None,
+/// What a pick has to say to the pane it named, once its command has worked.
+///
+/// `None` covers a busy agent and a shell alike, and covers them the same way:
+/// the command itself still lands, and it is only the sentence that is
+/// withheld. A shell would run it as a command; a working agent is in the
+/// middle of something, and its prompt may not even be a prompt.
+pub(super) fn pick_tell(verb: &Pick, at: &Target, ui: &Ui) -> Option<Tell> {
+    let told = |pane: &str, f: &dyn Fn(&AgentRef) -> Tell| -> Option<Tell> {
+        let a = ui.agent_at_pane(pane)?;
+        (a.agent && a.state == "idle").then(|| f(a))
     };
-    let a = ui.agent_at_pane(pane)?;
-    // A shell would run the sentence as a command; a working agent is in the
-    // middle of something, and its prompt may not even be a prompt.
-    (a.agent && a.state == "idle").then(|| tell_claimed(a, task))
+    match (verb, at) {
+        (Pick::PaneForTask { task }, Target::Pane(pane)) => told(pane, &|a| tell_claimed(a, task)),
+        (Pick::TaskForPane { pane }, Target::Task(task)) => told(pane, &|a| tell_claimed(a, task)),
+        (Pick::WorkForAgent { pane, .. }, Target::Project(p)) => {
+            told(pane, &|a| tell_find_work(a, p))
+        }
+        _ => None,
+    }
 }
 
 /// Type a sentence into a pane and press return.
@@ -247,7 +266,14 @@ pub(super) fn send_tell(t: &Tell) -> Result<(), String> {
 /// The counterpart to `c`, and the difference is who picks: `c` hands over a
 /// task you chose, this hands over a project and lets the agent choose inside
 /// it. Both end in the same place — a sentence in a pane.
-fn find_work(a: &AgentRef, ui: &mut Ui) -> Effect {
+///
+/// A pane that resolves to no project is the common case rather than the odd
+/// one, and refusing there made `f` useless: herdr reports where a pane's
+/// *shell* started, which for every agent launched from `~/claude` is the
+/// parent of the checkout it actually works in — one directory above every
+/// project root there is. So the fallback is to ask, and the answer is
+/// recorded as a mandate rather than spent on one keystroke.
+fn find_work(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
     if !a.agent {
         say(ui, "a shell has nobody to tell");
         return Effect::None;
@@ -261,7 +287,9 @@ fn find_work(a: &AgentRef, ui: &mut Ui) -> Effect {
         return Effect::None;
     }
     let Some(project) = a.project.clone() else {
-        say(ui, "no project here — pin or mandate it first");
+        view.mode = Mode::Pick {
+            verb: Pick::WorkForAgent { pane: a.pane.clone(), workspace: a.workspace.clone() },
+        };
         return Effect::None;
     };
     let tell = tell_find_work(a, &project);
@@ -696,7 +724,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // The dock's own verb. `c` needs you to have decided what the work is;
         // this needs only that there is some.
         Key::Char('f') => match ui.rows.get(ui.sel).and_then(|r| r.agent()).cloned() {
-            Some(a) => find_work(&a, ui),
+            Some(a) => find_work(&a, ui, view),
             None => {
                 say(ui, "f sets an agent looking — aim it at one");
                 Effect::None
