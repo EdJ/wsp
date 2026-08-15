@@ -92,13 +92,23 @@ closes it again), `esc` closes it, `E` pops the row's file out into an editor
 tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `r` syncs,
 `?` opens the key map, `q` quits.
 
-`?` draws the whole map over the tree, and `?` again puts it away — a footer
-line fits four of the twenty keys, which is worse than showing none, because it
-says there is a list and then hides most of it. While the map is up every other
-key is inert: it is open precisely because you are unsure what one of them
-does. The cursor moves with the list held around it — the selection is kept
-near the middle of the pane rather than pushed to the bottom edge, so what you
-are about to reach stays on screen beside what you have passed.
+`?` docks the key map under the tree, and `?` or `esc` puts it away — a footer
+line fits four of the two dozen keys, which is worse than showing none, because
+it says there is a list and then hides most of it.
+
+The map takes the rows it needs and no more, and **nothing else changes while
+it is up**: the cursor keeps its row and every key still does what the map says
+it does, so you can read `b` and press it on the task you were already looking
+at. The tree simply has fewer rows to work with, and it goes on holding the
+selection near the middle of them rather than letting the map push it off the
+bottom. That centring is how the tree scrolls generally — a cursor parked on
+the last visible row shows you everything you have walked past and nothing you
+are about to reach; only the two ends of the list break it, where there is
+nothing further to show.
+
+The verbs are listed first because a pane too short for the whole map cuts from
+the bottom, and movement is the half you can find by pressing an arrow and
+watching. The footer says how many lines it could not fit.
 
 ## The detail pane
 
@@ -135,7 +145,17 @@ keep updating while you type — that context was exactly what editing in a bare
 buffer cost. Each section gets its own editor on its own buffer, containing
 prose and nothing else: there is no `##` left to mangle. They are safe to run
 together because `wsp edit` re-reads the task and writes back only its own
-section. `W` in the context pane saves and closes both editors at once. It sends two
+section. The tab opens with the **context** focused, not an editor — so `W` and `q` are
+under your hands before you have committed to typing anything. From there `o`
+and `d` jump straight to the overview or details editor.
+
+Getting back, and moving around generally, is herdr's own: `prefix+h/j/k/l`
+focuses the pane left/down/up/right, where the prefix is whatever
+`[keys] prefix` says in `~/.config/herdr/config.toml`. There was no reason to
+reinvent that; `o` and `d` exist only because naming a pane you are looking
+straight at beats a two-step reach for it.
+
+`W` in the context pane saves and closes both editors at once. It sends two
 things: an abort — `Ctrl-C` for the vi family, `Ctrl-G` for emacs — and then
 the save-and-quit, `:wqa` or `^O ^X` or whatever that editor wants. `vi` is
 assumed when `$EDITOR` is unset, and an editor it does not recognise is named

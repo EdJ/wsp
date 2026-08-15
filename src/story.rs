@@ -240,9 +240,6 @@ impl<'a> Driver<'a> {
         if let panel::Effect::Refetch = panel::apply_key(k, &mut self.ui, &mut self.view) {
             panel::refetch_into(&mut self.ui, self.snap, &self.view, Some("w0"));
         }
-        // The live loop clamps the key map's scroll against the real pane; the
-        // storyboard has a fixed one, so it does the same with H.
-        self.view.clamp_help(H);
         self
     }
 
@@ -364,8 +361,16 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .down_to(panel::RowKind::Task)
             .key(Key::Char('?'))
-            .scene("Help", "? opens the key map over the tree, and ? again puts it away. A footer line could hold four of these; the page holds all of them, and while it is up the other keys are inert."),
+            .scene("Help", "? docks the key map under the tree, taking the rows it needs and no more. The cursor keeps its row and every key still works, so you can read `b` and press it on the task you are looking at. ? again puts it away. The verbs come first because a short pane cuts from the bottom, and movement is the half you can find by pressing an arrow."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .key(Key::Char('?'))
+            .keys(&[Key::Down; 14])
+            .scene("Moving with it up", "The tree carries on underneath. It has fewer rows to work with, so it scrolls sooner — but the cursor is still held in the middle of what is left, rather than the map being allowed to push it off the bottom."),
     );
 
     // ---- management ----

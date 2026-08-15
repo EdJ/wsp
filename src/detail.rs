@@ -202,7 +202,10 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
         out.push(Line::default());
     }
     out.push(line(Style::Dim, "─".repeat(w)));
-    out.push(line(Style::Dim, "q close · W save and close the editors"));
+    out.push(line(
+        Style::Dim,
+        "o/d go to an editor · W save and close · q close",
+    ));
     out
 }
 
@@ -461,6 +464,24 @@ fn save_and_quit_keys(editor: &str, force: bool) -> Option<(&'static str, String
     }
 }
 
+/// Move focus to the sibling pane herdr labelled `want`.
+///
+/// herdr already has `prefix+h/j/k/l` for this, but that is a two-step reach
+/// for a pane you are looking straight at. From the context, `o` and `d` name
+/// the halves directly.
+fn focus_sibling(want: &str) -> String {
+    let Some(me) = herdr::Env::read().pane_id else {
+        return "no pane id".into();
+    };
+    match siblings_of(&me).into_iter().find(|p| p.label == want) {
+        Some(p) => {
+            let _ = herdr::call("pane.focus", json!({ "pane_id": p.pane_id }));
+            String::new()
+        }
+        None => format!("no {want} pane here"),
+    }
+}
+
 /// The outcome of asking the editors to leave.
 enum Closing {
     /// Everything asked to go has gone, or there was nothing to ask.
@@ -606,6 +627,18 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             // the poll interval — no separate sleep, and a keypress is felt
             // immediately rather than after the rest of a tick.
             Ok(1) if buf[0] == b'q' || buf[0] == 3 => quit = true,
+            Ok(1) if buf[0] == b'o' || buf[0] == b'd' => {
+                let want = if buf[0] == b'o' { "overview" } else { "details" };
+                let msg = focus_sibling(want);
+                if !msg.is_empty() {
+                    let (w, _) = panel::term_size();
+                    let mut l = Line::default();
+                    l.push(Style::Warn, util::truncate(&msg, w));
+                    l.fit(w);
+                    print!("\x1b[999;1H{}", panel::to_ansi(&[l], w, 1).trim_start_matches("\x1b[H\x1b[2J"));
+                    let _ = std::io::stdout().flush();
+                }
+            }
             Ok(1) if buf[0] == b'W' => {
                 let outcome = close_editors(&stuck);
                 let msg = match outcome {

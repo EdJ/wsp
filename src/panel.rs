@@ -69,24 +69,12 @@ pub(crate) struct View {
     pub(crate) mode: Mode,
     /// What the detail pane is currently showing, so `↵` can close it.
     showing: Option<crate::detail::Focus>,
-    /// The key map, drawn over the tree. A line in the footer could hold four
+    /// The key map, docked under the tree. A line in the footer could hold four
     /// of the twenty keys, which is worse than useless: it says there is a list
-    /// and then shows you a fifth of it.
+    /// and then shows you a fifth of it. It takes the rows it needs and no
+    /// more, because you read it to press one of the keys in it — and the row
+    /// you would press it on has to still be there, and still be selected.
     help: bool,
-    /// How far down the key map is scrolled. It fits a full-height sidebar, and
-    /// a short one has to be able to reach the end.
-    help_scroll: usize,
-}
-
-impl View {
-    /// Keep the key map's scroll inside what the pane can actually show. The
-    /// reducer is deliberately free of I/O and so cannot know the height; doing
-    /// it here means `j` at the foot builds up no offset that `k` has to spend
-    /// before the map moves again.
-    pub(crate) fn clamp_help(&mut self, h: usize) {
-        let body = h.saturating_sub(HELP_CHROME);
-        self.help_scroll = self.help_scroll.min(help_len().saturating_sub(body));
-    }
 }
 
 /// Management needs three shapes of input beyond a single key: a value to
@@ -1103,15 +1091,39 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
 
 // ---- the key map --------------------------------------------------------
 
-/// Every key the panel answers to, grouped the way you go looking for one:
-/// getting around, reading, then changing. Keys that do the same kind of thing
-/// share a line — `s v` is one idea, not two — because the list is read in a
-/// column thirty-four wide and length is what makes it unreadable.
+/// Every key the panel answers to. Keys that do the same kind of thing share a
+/// line — `s v` is one idea, not two — because the map is read in a column
+/// thirty-four wide, and length is what pushes the tree off the screen.
+///
+/// The verbs come first. Movement is the half you can find by pressing an arrow
+/// and watching; `X` is not. So when a short pane can only fit part of this,
+/// what it fits is the part that cannot be guessed.
 ///
 /// Descriptions are written to fit that column. Anything longer is a sentence,
 /// and a sentence belongs on the row it describes, not here.
 pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
     vec![
+        (
+            "change",
+            vec![
+                ("a P", "add task, project"),
+                ("s v", "start, review"),
+                ("d o", "done, reopen"),
+                ("b e n", "block, retitle, note"),
+                ("m c", "move, claim"),
+                ("O", "open a workspace"),
+                ("X", "remove, after y/n"),
+            ],
+        ),
+        (
+            "look",
+            vec![
+                ("↵ esc", "open it, close it"),
+                ("E", "edit in a tab"),
+                ("A r", "show done, sync"),
+                ("q", "quit"),
+            ],
+        ),
         (
             "move",
             vec![
@@ -1121,41 +1133,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("1-9", "jump to a terminal"),
             ],
         ),
-        (
-            "look",
-            vec![
-                ("↵", "open it, and close"),
-                ("esc", "close the view"),
-                ("E", "edit in a tab"),
-                ("A", "show finished work"),
-                ("r", "sync the sidebar"),
-                ("q", "quit"),
-            ],
-        ),
-        (
-            "change",
-            vec![
-                ("a P", "add task, project"),
-                ("s v", "start, review"),
-                ("d o", "done, reopen"),
-                ("b", "block, with a reason"),
-                ("e n", "retitle, add a note"),
-                ("m", "move — pick a project"),
-                ("c", "claim, either way"),
-                ("O", "open a workspace"),
-                ("X", "remove, after y/n"),
-            ],
-        ),
     ]
-}
-
-/// Title, rule, rule, hint — what the key map costs before a key is drawn.
-const HELP_CHROME: usize = 4;
-
-/// One line per entry and one per heading, so the count needs no rendering and
-/// no width. What lets the scroll be clamped away from the terminal.
-fn help_len() -> usize {
-    keymap().iter().map(|(_, keys)| keys.len() + 1).sum()
 }
 
 /// The key map as rows. A heading rules off to the edge rather than sitting
@@ -1188,41 +1166,10 @@ fn help_lines(w: usize) -> Vec<Line> {
     out
 }
 
-/// The panel with the key map over it. A page rather than an overlay: there is
-/// nothing behind it worth half-showing, and the tree is one keypress away.
-fn help_frame(scroll: usize, w: usize, h: usize) -> Vec<Line> {
-    let mut lines = Vec::new();
-    let mut head = Line::default();
-    head.push(Style::Bold, "wsp");
-    head.push(Style::Plain, " ");
-    head.push(Style::Dim, "·");
-    head.push(Style::Plain, " ");
-    head.push(Style::Muted, "keys");
-    lines.push(head);
-    lines.push(line(Style::Dim, "─".repeat(w)));
-
-    let body_rows = h.saturating_sub(HELP_CHROME);
-    let all = help_lines(w);
-    let scroll = scroll.min(all.len().saturating_sub(body_rows));
-    let shown = body_rows.min(all.len() - scroll);
-    lines.extend(all.into_iter().skip(scroll).take(body_rows));
-
-    while lines.len() < h.saturating_sub(2) {
-        lines.push(Line::default());
-    }
-    lines.push(line(Style::Dim, "─".repeat(w)));
-
-    let mut foot = line(Style::Dim, "? or esc closes");
-    let left = help_len() - scroll - shown;
-    if left > 0 {
-        foot.push(Style::Plain, "  ");
-        foot.push(Style::Muted, format!("↓ {left} more"));
-    }
-    lines.push(foot);
-
-    lines.truncate(h);
-    lines
-}
+/// Rows the tree keeps whatever the map wants. A cursor with no neighbours
+/// above or below it is not a tree you can aim with, and aiming is the whole
+/// reason the map is open.
+const MIN_TREE_ROWS: usize = 6;
 
 /// Digits 1-9 address rows that lead somewhere: a terminal.
 fn hotkeys(rows: &[Row]) -> Vec<Option<u8>> {
@@ -1260,9 +1207,6 @@ fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
 /// The whole panel as styled lines. No escapes, no terminal — a backend turns
 /// this into something you can look at.
 pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
-    if view.help {
-        return help_frame(view.help_scroll, w, h);
-    }
     let mode = &view.mode;
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1282,7 +1226,14 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     lines.push(line(Style::Dim, "─".repeat(w)));
 
     let footer_rows = 3;
-    let body_rows = h.saturating_sub(lines.len() + footer_rows);
+    let room = h.saturating_sub(lines.len() + footer_rows);
+
+    // The map takes the rows it needs out of the tree's, never the other way
+    // about, and its first line is a ruled heading — so it needs no separator
+    // of its own and costs the tree nothing but its own height.
+    let map = if view.help { help_lines(w) } else { Vec::new() };
+    let map_rows = map.len().min(room.saturating_sub(MIN_TREE_ROWS));
+    let body_rows = room - map_rows;
     let keys = hotkeys(&ui.rows);
 
     let scroll = scroll_for(ui.sel, ui.rows.len(), body_rows);
@@ -1291,9 +1242,11 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
         l.selected = i == ui.sel;
         lines.push(l);
     }
-    while lines.len() < h.saturating_sub(footer_rows) {
+    while lines.len() < h.saturating_sub(footer_rows + map_rows) {
         lines.push(Line::default());
     }
+    let hidden = map.len() - map_rows;
+    lines.extend(map.into_iter().take(map_rows));
 
     lines.push(line(Style::Dim, "─".repeat(w)));
 
@@ -1344,6 +1297,17 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
         Mode::Browse => match &ui.message {
             Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
                 line(Style::Accent, util::truncate(m, w))
+            }
+            // With the map up, the hint is a fifth of what is already on
+            // screen. What the line is worth then is the way out — and an
+            // honest count of what the pane was too short to hold.
+            _ if view.help => {
+                let mut l = line(Style::Dim, "? or esc closes");
+                if hidden > 0 {
+                    l.push(Style::Plain, "  ");
+                    l.push(Style::Muted, format!("{hidden} more"));
+                }
+                l
             }
             _ => line(Style::Dim, "↵ open · E edit · a add · ? keys"),
         },
@@ -1988,40 +1952,7 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 /// Reading the key map. Everything that is not scrolling or closing is
 /// swallowed: the map is open precisely because you are not sure what a key
 /// does, which is the worst possible moment for one of them to fire.
-fn help_key(k: Key, view: &mut View) -> Effect {
-    match k {
-        Key::Char('q') | Key::Interrupt => Effect::Quit,
-        // The same key both opens and closes, and esc still means put that away.
-        Key::Char('?') | Key::Esc | Key::Enter => {
-            view.help = false;
-            Effect::None
-        }
-        Key::Down | Key::Char('j') => {
-            view.help_scroll += 1;
-            Effect::None
-        }
-        Key::Up | Key::Char('k') => {
-            view.help_scroll = view.help_scroll.saturating_sub(1);
-            Effect::None
-        }
-        Key::Char('g') => {
-            view.help_scroll = 0;
-            Effect::None
-        }
-        // Past the end, and clamped back to it by the loop, which is the only
-        // place that knows how tall the pane is.
-        Key::Char('G') => {
-            view.help_scroll = help_len();
-            Effect::None
-        }
-        _ => Effect::None,
-    }
-}
-
 fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
-    if view.help {
-        return help_key(k, view);
-    }
     let n = ui.rows.len();
     let target = ui.selected_target();
 
@@ -2039,7 +1970,12 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 
     match k {
         Key::Char('q') | Key::Interrupt => Effect::Quit,
-        // Esc is the universal "put that away".
+        // Esc is the universal "put that away", and the map is what is in front
+        // of you: it goes first, the detail pane once it is gone.
+        Key::Esc if view.help => {
+            view.help = false;
+            Effect::None
+        }
         Key::Esc => Effect::CloseView,
 
         Key::Down | Key::Char('j') => move_or_fold(Key::Down, ui, view),
@@ -2094,9 +2030,11 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::Refetch
         }
         Key::Char('r') => Effect::Sync,
+        // Nothing else changes while it is up: the tree keeps the cursor, and
+        // every key on the map still does what the map says it does — which is
+        // the only way to read one and act on it in the same breath.
         Key::Char('?') => {
-            view.help = true;
-            view.help_scroll = 0;
+            view.help = !view.help;
             Effect::None
         }
 
@@ -2427,9 +2365,6 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outco
             last_fingerprint = store.fingerprint();
             refetch_into(&mut ui, &Snapshot::live(store), &view, self_ws);
         }
-        // The reducer cannot see the pane, so it scrolls the key map without a
-        // bottom. Here is where the height is known.
-        view.clamp_help(term_size().1);
         draw(&ui, &view, &mut last);
     }
 }
