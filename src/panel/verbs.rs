@@ -14,6 +14,7 @@ use serde_json::json;
 
 use crate::herdr;
 use crate::input::Key;
+use crate::model::Priority;
 use crate::store::Store;
 
 use super::install::list_panes;
@@ -686,6 +687,30 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         Key::Char('v') => task_verb(&target, ui, "review"),
         Key::Char('d') => task_verb(&target, ui, "done"),
         Key::Char('o') => task_verb(&target, ui, "reopen"),
+
+        // ---- what comes first here ----
+        //
+        // One key for three values, cycled rather than typed: the levels are
+        // `high`, `low` and `normal` and a prompt for one of three words is a
+        // mode to enter and leave for something a keystroke settles. Blind
+        // cycles are a trap, so this one is not blind — the row redraws with
+        // its mark under the cursor, the footer carries the argv, which names
+        // the level in words, and `Priority::cycled` puts `normal` last so
+        // holding the key returns you to where you started.
+        Key::Char('!') => match &target {
+            Target::Task(id) => {
+                let want = ui.priority_of_task(id).unwrap_or(Priority::Normal).cycled();
+                Effect::Run {
+                    argv: vec!["prio".into(), id.clone(), want.as_str().into()],
+                    escalate: None,
+                    then: None,
+                }
+            }
+            _ => {
+                say(ui, "priority is a task's place in its project");
+                Effect::None
+            }
+        },
 
         // ---- typed ----
         Key::Char('b') => match &target {

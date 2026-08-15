@@ -5,7 +5,7 @@
 //! panel's `Snapshot` makes, for the same reason.
 
 use crate::herdr;
-use crate::model::{Status, Task};
+use crate::model::{Priority, Status, Task};
 use crate::panel::{self, line, Line, Style};
 use crate::resolve::{self, Index};
 use crate::store::Store;
@@ -398,7 +398,18 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         for t in own {
             let mut l = Line::default();
             l.push(status_style(t.status()), format!("{} ", glyph_for(t.status())));
-            l.push(Style::Plain, util::truncate(&t.title, w.saturating_sub(2)));
+            // The same marks the tree draws, in the same order they sorted the
+            // list — a row that leads for a reason has to carry it here too,
+            // or this pane and the panel beside it disagree about why. As a
+            // column, not a flag: this pane is wide and the list is read down.
+            let prio = t.priority();
+            let ink = match prio {
+                Priority::High => Style::Warn,
+                Priority::Low => Style::Dim,
+                Priority::Normal => Style::Plain,
+            };
+            l.push(ink, format!("{} ", prio.mark()));
+            l.push(Style::Plain, util::truncate(&t.title, w.saturating_sub(4)));
             out.push(l);
         }
     }

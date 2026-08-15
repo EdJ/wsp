@@ -128,6 +128,12 @@ pub(crate) mod glyph {
     pub const SHELL: &str = "▫";
     /// Something is written in Overview or Details.
     pub const NOTES: &str = "≡";
+    /// Ahead of its project's other work, and behind it. Taken from the model
+    /// so the panel and the CLI cannot end up marking the same task two ways.
+    /// `normal` is absent on purpose: the tree draws it as no column at all,
+    /// where a list draws it as an empty one.
+    pub const HIGH: &str = crate::model::Priority::High.mark();
+    pub const LOW: &str = crate::model::Priority::Low.mark();
 }
 
 pub(crate) struct Mark {
@@ -163,6 +169,19 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Muted, g::REVIEW)], "review", "done enough to look at"),
                 mark(&[(Style::Accent, g::DOING)], "doing", "started — the task's own state, which it keeps even when claimed"),
                 mark(&[(Style::Dim, g::DONE)], "done", "finished — only shown under A"),
+            ],
+        ),
+        (
+            "Priority, on a task",
+            "Where a task sits among the others in its own project — `!` cycles \
+             it. It orders the list and nothing else: two tasks in different \
+             projects are never in the same list, so a `!` here never outranks \
+             anything over there. Under status, so `!` on work not started \
+             does not jump it above work already in hand.",
+            vec![
+                mark(&[(Style::Warn, g::HIGH)], "high", "do this one first, in this project"),
+                mark(&[(Style::Dim, g::LOW)], "low", "sunk to the foot of the project — kept, not next"),
+                mark(&[(Style::Muted, "no mark")], "normal", "what almost everything is; drawn as nothing at all"),
             ],
         ),
         (

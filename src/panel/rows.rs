@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use crate::herdr;
-use crate::model::{Status, Task};
+use crate::model::{Priority, Status, Task};
 use crate::resolve::{self, Counts, Index};
 use crate::store::Store;
 use crate::util;
@@ -172,6 +172,10 @@ pub(super) enum Row {
         title: String,
         depth: usize,
         status: Status,
+        /// Where it sits in its project's queue. Carried on the row because
+        /// `!` has to know what it is cycling away from, and because it is
+        /// what the rows are ordered by beneath status.
+        priority: Priority,
         agent: Option<AgentRef>,
         needs_you: bool,
         /// Something is written in Overview or Details. Worth a mark: the
@@ -460,6 +464,16 @@ impl Ui {
             _ => None,
         })
     }
+
+    /// What it is now, so one key can say what it becomes. Read off the row
+    /// for the same reason the title is: the frame in front of you is what the
+    /// keystroke is answering.
+    pub(super) fn priority_of_task(&self, task: &str) -> Option<Priority> {
+        self.rows.iter().find_map(|r| match r {
+            Row::Task { id, priority, .. } if id == task => Some(*priority),
+            _ => None,
+        })
+    }
 }
 
 /// Everything `collect` reads, gathered into one value.
@@ -527,11 +541,17 @@ pub(crate) fn pane_name(label: &str, title: &str, workspace: &str) -> String {
         .to_string()
 }
 
-pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, u8, u8, String) {
+pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, u8, u8, u8, String) {
     (
         u8::from(!needs_you),
         u8::from(!has_agent),
         t.status().rank(),
+        // Under status, not over it: `!` on something not started must not
+        // jump it above work already in hand. This is the whole of what
+        // priority does here — it orders one project's tasks against each
+        // other, and the tree is what keeps that comparison local, since two
+        // tasks in different projects are never in the same list to sort.
+        t.priority().rank(),
         t.id.clone(),
     )
 }
@@ -620,6 +640,7 @@ pub(super) fn task_rows(
             title: t.title.clone(),
             depth: depth + sub,
             status: t.status(),
+            priority: t.priority(),
             agent: a.clone(),
             needs_you,
             prose: crate::model::has_prose(&t.body),
@@ -1159,7 +1180,7 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Task { title, depth, status, agent, needs_you, prose, under, ident, .. } => {
+        Row::Task { title, depth, status, priority, agent, needs_you, prose, under, ident, .. } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
@@ -1188,11 +1209,28 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             // Reserve the marker's column before truncating, or a long title
             // eats the very sign that there is more to read.
             let flag_w = if *needs_you { 2 } else { 0 } + if *prose { 2 } else { 0 };
+            // Priority is drawn only when it is not `normal`, so it costs the
+            // other nine rows in ten nothing at all. A column reserved on
+            // every row to say "unremarkable" is two of the thirty-four this
+            // pane has.
+            let prio = match priority {
+                Priority::High => Some((Style::Warn, glyph::HIGH)),
+                Priority::Low => Some((Style::Dim, glyph::LOW)),
+                Priority::Normal => None,
+            };
+            let prio_w = if prio.is_some() { 2 } else { 0 };
             let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
             // The id is the point when it is on, so it comes out of the
             // title's budget rather than off the end of the row.
             let id_w = ident.as_ref().map(|i| i.chars().count() + 2).unwrap_or(0);
-            let avail = w.saturating_sub(*depth + 5 + flag_w + count_w + id_w);
+            let avail = w.saturating_sub(*depth + 5 + flag_w + count_w + id_w + prio_w);
+            // Before the id and the title, not after them: it is read down the
+            // column, and a mark that moves left and right with the length of
+            // what precedes it is one you have to hunt for on every row.
+            if let Some((st, g)) = prio {
+                l.push(st, g);
+                l.push(Style::Plain, " ");
+            }
             if let Some(id) = ident {
                 l.push(Style::Dim, format!("{id}: "));
             }

@@ -260,6 +260,7 @@ fn main() {
         "reopen" | "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
         "tag" => cmd_task::tag(&store, &args),
+        "prio" | "priority" => cmd_task::prio(&store, &args),
         "next" => cmd_task::next(&store, &args),
         "edit" => cmd_task::edit(&store, &args),
         "rename" => cmd_task::rename(&store, &args),
@@ -341,6 +342,7 @@ fn help() {
   wsp mv <id> -p proj               reassign, sub-tree and all
   wsp mv <id> --parent <id>|none    re-parent it, or detach it
   wsp tag <id> +dsp -ui             adjust tags
+  wsp prio <id> high|normal|low     what comes first inside its project
   wsp next [-p proj]                highest-priority actionable task
   wsp rm <id>                       retire it to the archive
   wsp archive [--all]               sweep done tasks older than 30d

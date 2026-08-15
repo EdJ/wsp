@@ -60,6 +60,7 @@ wsp ls                      # open tasks for the project you're standing in
 wsp inbox                   # tasks with no project
 wsp start 003               # ids accept a bare suffix or a title substring
 wsp block 003 "waiting on the tuning table decision"
+wsp prio 003 high           # what comes first inside its project
 wsp done 003
 wsp tree                    # hierarchy with rolled-up counts
 wsp wip                     # every agent, its task, and who needs you
@@ -429,6 +430,7 @@ disturbing a layout you will come back to.
 | `s` `v` `d` `o` | task | start, review, done, reopen |
 | `b` | task | block, asking why |
 | `e` `n` | task | retitle, append a note |
+| `!` | task | priority: high, then low, then normal again |
 | `E` | task, project | edit its prose full-screen in a tab |
 | `m` | task | move — the tree becomes the picker |
 | `c` | task or agent | claim, either direction — and how an agent moves on |
@@ -531,6 +533,11 @@ than borrowing the task's.
 you are the blocker; the header carries the count. `⋯ n more` is the tail past
 the six-task cap, which counts top-level work only: a sub-task is never hidden
 while its parent is on screen.
+
+`!` and `↓` are priority: ahead of the rest of this project's work, and behind
+it. `normal` has no mark, because nearly everything is normal and a column
+reserved to say so is two of the thirty-four a sidebar has. See
+[Priority](#priority) for what the order means.
 
 A task with work under it carries the same right-hand counts a project does —
 open, `▸` in flight, `■` blocked, `✓` when everything beneath it is finished.
@@ -1112,6 +1119,39 @@ project by a half-applied move is precisely the state the rule exists to
 prevent. `counts_under` and the carry walk the tree through one shared function
 for the same reason `tally` is shared: two walks are two chances to disagree
 about what "beneath" means.
+
+## Priority
+
+```sh
+wsp add "Port the reverb fix" -p trance --prio high
+wsp prio 003 high            # …or say so afterwards, which is the usual way
+wsp prio 003 normal          # and take it back
+```
+
+Three levels — `high`, `normal`, `low` — and `normal` is what almost everything
+is. The field is old; being able to *change* it is not. `--prio` on `add` used
+to be the only way to set it, which put the decision at the one moment you know
+least about the work and then left it there. Phases 3 and 4 of the strata plan
+traded places, `high` stayed on the one that had become later, and every agent
+asking `wsp next` was pointed at the wrong end of the plan by a field nobody
+could move.
+
+**It orders one project's tasks against each other, and nothing else.** There is
+no global queue and no number to compete over: `!` on a task in `trance` says
+what comes first *in trance*, and says nothing at all about anything in `wsp`.
+The tree is what keeps that honest — two tasks in different projects are never
+in the same list to be sorted.
+
+**Under status, not over it.** `ls`, `brief`, `next` and the panel all sort by
+status first and priority second, so raising something that has not been started
+does not float it above work already in hand. Priority breaks ties among tasks
+that are otherwise equally ready; it does not interrupt.
+
+A change lands in the task's own log — `priority normal → high` — because a
+backlog whose order moves with no record is one nobody can read a week later.
+Setting the level a task already has does nothing at all: no log line, no
+commit. From the panel it is `!`, which cycles `high` → `low` → `normal`, so
+the same key both sets it and puts it back.
 
 ## Standing direction
 

@@ -224,6 +224,17 @@ pub fn inbox(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The priority column, in the colours a terminal list uses: the one that
+/// means "a decision is owed here" for `high`, and structure for `low`, which
+/// is a task saying it is content to wait.
+pub fn paint_prio(p: &Paint, prio: Priority) -> String {
+    match prio {
+        Priority::High => p.yellow(prio.mark()),
+        Priority::Low => p.dim(prio.mark()),
+        Priority::Normal => prio.mark().to_string(),
+    }
+}
+
 fn print_tasks(tasks: &[Task], p: &Paint, show_project: bool) {
     let idw = tasks.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
     // Children under their parent, indented. The parent carries what is still
@@ -246,11 +257,7 @@ fn print_tasks(tasks: &[Task], p: &Paint, show_project: bool) {
             Status::Review => p.yellow(&util::pad("review", 8)),
             other => p.dim(&util::pad(other.as_str(), 8)),
         };
-        let prio = match t.priority() {
-            Priority::High => p.yellow("!"),
-            Priority::Low => p.dim("·"),
-            Priority::Normal => " ".into(),
-        };
+        let prio = paint_prio(p, t.priority());
         let project = if show_project {
             p.dim(&format!("  [{}]", t.project.clone().unwrap_or_else(|| "inbox".into())))
         } else {
@@ -364,6 +371,19 @@ fn mutate<F>(store: &Store, args: &Args, verb: &str, f: F) -> i32
 where
     F: FnOnce(&mut Task),
 {
+    mutate_saying(store, args, verb, None, f)
+}
+
+/// `mutate`, with a word about what changed on the end of the receipt.
+///
+/// The line `mutate` prints is the task's status, which is the whole receipt
+/// for the six verbs that change it and says nothing at all for one whose job
+/// is a different field — `wsp prio 047 low` would answer `· t-260815-047
+/// todo`, which is true and is not what was asked about.
+fn mutate_saying<F>(store: &Store, args: &Args, verb: &str, said: Option<&str>, f: F) -> i32
+where
+    F: FnOnce(&mut Task),
+{
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp {verb} <id>");
         return 2;
@@ -395,6 +415,9 @@ where
             _ => p.dim("·"),
         };
         println!("{} {}  {}  {}", mark, p.bold(&t.id), p.dim(t.status().as_str()), t.title);
+        if let Some(s) = said {
+            println!("  {}", p.dim(s));
+        }
     }
     0
 }
@@ -699,6 +722,49 @@ pub fn tag(store: &Store, args: &Args) -> i32 {
                 t.tags.push(c.clone());
             }
         }
+    })
+}
+
+/// Change a task's priority after it exists.
+///
+/// `--prio` on `add` was the only way to set this, which put the decision at
+/// the one moment you know least about the work — and left it there. Nothing
+/// could move it afterwards: no `set`, no flag on any other verb, and
+/// `project set k=v` is projects-only. It bit a phase swap in
+/// strata-prototype, where the two phases traded places and `high` stayed on
+/// the one that had become later, pointing every agent asking `wsp next` at
+/// the wrong end of the plan.
+///
+/// A verb of its own rather than `wsp set <id> priority=high`: every other
+/// field here is changed by a verb that says what it means, and a second,
+/// general spelling of them all is a worse thing to own than one more line of
+/// help.
+pub fn prio(store: &Store, args: &Args) -> i32 {
+    let Some(level) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp prio <id> high|normal|low");
+        return 2;
+    };
+    let Some(want) = Priority::parse(&level) else {
+        eprintln!("wsp: priority must be high|normal|low");
+        return 2;
+    };
+    // Setting the level it already has is not a change, and `mutate` cannot
+    // tell: it would spend a log line, an event and a commit recording that
+    // somebody typed what was already true. The panel's one key cycles, so
+    // this is reachable by accident from there as well as by a script.
+    if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
+        if t.priority() == want {
+            if args.json() {
+                println!("{}", t.json());
+            } else {
+                println!("{} already {}", t.id, want.as_str());
+            }
+            return 0;
+        }
+    }
+    mutate_saying(store, args, "prio", Some(&format!("priority {}", want.as_str())), |t| {
+        t.log(&format!("priority {} → {}", t.priority().as_str(), want.as_str()));
+        t.priority_raw = want.as_str().to_string();
     })
 }
 
@@ -1229,4 +1295,72 @@ pub fn archive(store: &Store, args: &Args) -> i32 {
         println!("archived {moved} task(s)");
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        store.ensure_dirs().unwrap();
+        store
+    }
+
+    fn task_with(store: &Store, id: &str, level: &str) -> Task {
+        let mut t = Task::new("Retune the early reflections", id);
+        t.project = Some("verb".into());
+        t.priority_raw = level.into();
+        store.save_task(&t).unwrap();
+        t
+    }
+
+    /// The floor this verb exists for: a level set at `add` used to be the
+    /// level for ever. A phase swap in strata-prototype left `high` on the
+    /// phase that had become later, and every agent asking `wsp next` was sent
+    /// to the wrong end of the plan, because nothing could move it.
+    #[test]
+    fn a_priority_can_be_changed_after_the_task_is_made() {
+        let store = scratch("prio-set");
+        task_with(&store, "t-260815-047", "normal");
+
+        let code = prio(&store, &Args::synth("prio", &["047", "high"], &[]));
+        assert_eq!(code, 0);
+
+        let t = store.find_task("047").expect("the task");
+        assert_eq!(t.priority(), Priority::High);
+        // Written down, because a backlog whose order changes with no record
+        // is one nobody can read a week later.
+        assert!(t.body.contains("priority normal → high"), "the log should carry it: {}", t.body);
+    }
+
+    /// Setting the level it already has is not a change. `mutate` cannot tell
+    /// the difference, and the panel's one key cycles — so this is reachable
+    /// by a fumbled keystroke, and it would spend a log line, an event and a
+    /// commit on recording that nothing happened.
+    #[test]
+    fn setting_the_level_it_already_has_writes_nothing() {
+        let store = scratch("prio-same");
+        task_with(&store, "t-260815-047", "high");
+
+        assert_eq!(prio(&store, &Args::synth("prio", &["047", "high"], &[])), 0);
+        let t = store.find_task("047").expect("the task");
+        assert_eq!(t.priority(), Priority::High);
+        assert!(!t.body.contains("priority"), "nothing should have been logged: {}", t.body);
+    }
+
+    /// A level it does not know is refused rather than rounded to `normal`:
+    /// `wsp prio 047 urgent` silently demoting the task it was meant to raise
+    /// is the worst answer available.
+    #[test]
+    fn an_unknown_level_is_refused_and_changes_nothing() {
+        let store = scratch("prio-bad");
+        task_with(&store, "t-260815-047", "high");
+
+        assert_eq!(prio(&store, &Args::synth("prio", &["047", "urgent"], &[])), 2);
+        assert_eq!(prio(&store, &Args::synth("prio", &["047"], &[])), 2);
+        assert_eq!(store.find_task("047").expect("the task").priority(), Priority::High);
+    }
 }

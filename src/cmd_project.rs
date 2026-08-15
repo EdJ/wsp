@@ -250,11 +250,17 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
     let tasks = store.tasks();
     let scope = index.subtree(&proj.id);
-    let mine: Vec<_> = tasks
+    let mut mine: Vec<_> = tasks
         .iter()
         .filter(|t| t.project.as_ref().map(|p| scope.contains(p)).unwrap_or(false))
         .filter(|t| t.status().is_open())
         .collect();
+    // Raised work leads, deferred work sinks, and everything else stays in the
+    // order it was filed. A stable sort by priority alone, deliberately: this
+    // list is a project's backlog read top to bottom, and id order is how it
+    // was written down — reordering it by status as well would be a different
+    // list, and `wsp ls` is already that one.
+    mine.sort_by_key(|t| t.priority().rank());
 
     if args.json() {
         println!(
@@ -332,10 +338,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         println!("\n{}", p.dim("OPEN TASKS"));
         for t in &mine {
             println!(
-                "  {}  {}  {}",
+                "  {}  {}  {} {}",
                 p.dim(&t.id),
                 util::pad(t.status().as_str(), 8),
-                util::truncate(&t.title, 60)
+                crate::cmd_task::paint_prio(&p, t.priority()),
+                util::truncate(&t.title, 58)
             );
         }
     }

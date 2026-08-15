@@ -84,6 +84,42 @@ impl Priority {
             Priority::Low => 2,
         }
     }
+
+    /// The one column a list gives this, wherever the list is drawn.
+    ///
+    /// Here rather than at each of the four places that draw it, because the
+    /// two surfaces had already drifted once: `ls` marked `low` and `brief`
+    /// did not, so the same task read as ordinary in one and deferred in the
+    /// other. Colour is each surface's own — `Paint` in a terminal, `Style` in
+    /// the panel — but the glyph is one fact.
+    ///
+    /// `normal` is a space, not nothing: the mark is a column that lines up
+    /// down a list, and a column that closes up when there is nothing in it
+    /// moves every title on the rows around it.
+    pub const fn mark(&self) -> &'static str {
+        match self {
+            Priority::High => "!",
+            Priority::Normal => " ",
+            Priority::Low => "↓",
+        }
+    }
+
+    /// The order one key steps through, for the panel.
+    ///
+    /// Three values and one key, so the order is the whole design: `high`
+    /// comes off `normal` because raising something is what a person reaching
+    /// for that key nearly always means, and `low` comes next so the rarer
+    /// deliberate demotion needs a second press rather than a second key.
+    /// `normal` last makes the cycle its own undo — hold the key and you come
+    /// back to where you started, which is what saves a blind cycle from being
+    /// a trap.
+    pub fn cycled(&self) -> Priority {
+        match self {
+            Priority::Normal => Priority::High,
+            Priority::High => Priority::Low,
+            Priority::Low => Priority::Normal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

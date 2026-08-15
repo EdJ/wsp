@@ -160,6 +160,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("s v", "start, review"),
                 ("d o", "done, reopen"),
                 ("b e n", "block, retitle, note"),
+                ("!", "high, low, normal"),
                 ("m c f", "move, claim, find work"),
                 ("O S", "a terminal, an agent"),
                 ("X", "remove, after y/n"),

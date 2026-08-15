@@ -346,7 +346,7 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
 
     if shown > 0 {
         for (i, t) in open.iter().take(shown).enumerate() {
-            let prio = if t.priority() == crate::model::Priority::High { p.yellow("!") } else { " ".into() };
+            let prio = crate::cmd_task::paint_prio(&p, t.priority());
             let under = resolve::counts_under(&tasks, &t.id);
             let kids = if under.open > 0 { p.dim(&format!("  ({} open)", under.open)) } else { String::new() };
             row(

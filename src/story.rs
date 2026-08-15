@@ -32,6 +32,14 @@ fn task(id: &str, title: &str, proj: Option<&str>, status: &str) -> Task {
     t
 }
 
+/// Neither `high` nor `low` is common, and a fixture where every task is
+/// `normal` cannot show either mark — nor the thing they are for, which is one
+/// task sitting above or below its neighbours in the same project.
+fn prio(mut t: Task, level: &str) -> Task {
+    t.priority_raw = level.to_string();
+    t
+}
+
 fn workspace(id: &str, label: &str, focused: bool) -> herdr::Workspace {
     herdr::Workspace {
         id: id.to_string(),
@@ -87,11 +95,14 @@ fn world() -> Snapshot {
         // run to a median of sixty-four characters and a tenth of them past a
         // hundred, against the twenty-five a row can draw. A fixture where
         // every title fits is a fixture that cannot show what F is for.
-        task(
-            "t-002",
-            "Plan the demo video: what it shows, in what order, and which of the three patches is worth the first thirty seconds",
-            Some("trance"),
-            "doing",
+        prio(
+            task(
+                "t-002",
+                "Plan the demo video: what it shows, in what order, and which of the three patches is worth the first thirty seconds",
+                Some("trance"),
+                "doing",
+            ),
+            "low",
         ),
         // Doing, with an idle agent on it — the one combination that raises the
         // "needs you" arrow, because the work is live and the process is not.
@@ -127,12 +138,15 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
     ];
     // Enough to overflow the per-project cap and produce a `n more` row.
     for i in 1..=8 {
-        tasks.push(task(
+        let t = task(
             &format!("t-1{i:02}"),
             &format!("Panel work item number {i}"),
             Some("wsp"),
             "todo",
-        ));
+        );
+        // One of the eight raised, so the list is not in id order and the row
+        // that broke the order says why it did.
+        tasks.push(if i == 5 { prio(t, "high") } else { t });
     }
 
     let workspaces = vec![
@@ -2166,6 +2180,83 @@ mod tests {
             }
         }
         panic!("no row for task {id}");
+    }
+
+    /// One key for three values, and the order it steps through is the whole
+    /// of the design: `high` first, because raising something is what a person
+    /// reaching for `!` nearly always means, and `normal` last so holding the
+    /// key returns you to where you started rather than stranding you.
+    #[test]
+    fn one_key_steps_a_task_through_its_priorities() {
+        use crate::model::Priority;
+
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_task(&mut ui, "t-101");
+        match panel::apply_key(Key::Char('!'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["prio", "t-101", "high"]),
+            _ => panic!("! on an ordinary task should raise it"),
+        }
+
+        // And on the one the fixture already raised it goes down, not nowhere:
+        // a key that only ever means `high` cannot put a task back.
+        on_task(&mut ui, "t-105");
+        match panel::apply_key(Key::Char('!'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["prio", "t-105", "low"]),
+            _ => panic!("! on a raised task should lower it"),
+        }
+        assert_eq!(Priority::High.cycled().cycled(), Priority::Normal, "three presses is a round trip");
+
+        // Nowhere else. A project has no priority, and running `prio` against
+        // its id would be a command about a task that does not exist.
+        on_kind(&mut ui, panel::RowKind::Project);
+        assert!(matches!(
+            panel::apply_key(Key::Char('!'), &mut ui, &mut view),
+            panel::Effect::None
+        ));
+    }
+
+    /// What the key is for. Priority orders a project's own tasks and does
+    /// nothing across projects — the tree is what keeps that local, since two
+    /// tasks under different projects are never in one list to sort — and the
+    /// row that broke id order carries the mark that says why it did.
+    #[test]
+    fn priority_orders_a_project_and_marks_the_rows_it_moved() {
+        let w = world();
+        let view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        let mut order: Vec<(String, String)> = Vec::new();
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if let panel::Target::Task(id) = ui.selected_target() {
+                order.push((id, panel::render_row_for_test(&ui, i, W).text()));
+            }
+        }
+        let at = |id: &str| {
+            order.iter().position(|(x, _)| x == id).unwrap_or_else(|| panic!("no row for {id}"))
+        };
+        let row = |id: &str| order[at(id)].1.clone();
+
+        // t-105 is raised and t-101..t-104 are not, so it leads a list that is
+        // otherwise in id order.
+        assert!(at("t-105") < at("t-101"), "a raised task leads its project");
+        assert!(at("t-101") < at("t-102"), "and the rest keep their order");
+        assert!(row("t-105").contains(panel::glyph::HIGH), "unexplained: {}", row("t-105"));
+        assert!(!row("t-101").contains(panel::glyph::HIGH), "normal is drawn as nothing");
+
+        // Lowered, t-002 sits under its project-mate — and `verb`, a different
+        // project entirely, is untouched by either.
+        assert!(at("t-001") < at("t-002"), "a lowered task sinks");
+        assert!(row("t-002").contains(panel::glyph::LOW), "unexplained: {}", row("t-002"));
+
+        // The mark comes out of the title's budget, not off the end of the
+        // row: t-002 is the longest title in the fixture by a distance.
+        for (id, text) in &order {
+            assert!(text.chars().count() <= W, "{id} overran the pane: {text}");
+        }
     }
 
     /// A retitle is nearly always a correction — a word swapped, a clause
