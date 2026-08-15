@@ -843,6 +843,15 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         c.open > 0
             || live_by_project.contains_key(id)
             || (view.show_done && c.done > 0)
+            // A project holding nothing at all is not a quiet branch. There is
+            // no work behind the row to go and look at, so folding it away
+            // tidies nothing — it takes the project itself out of the panel,
+            // and `a`, `X`, `O` and `S` are all pressed on that row. Retiring a
+            // project's last task used to leave the project unreachable from
+            // the panel that had just emptied it, with the CLI the only way
+            // back. Distinct from all-finished, which stays quiet: `show_done`
+            // is the question that asks for that.
+            || (c.open == 0 && c.done == 0)
             || view.reveal.contains(id)
     };
 

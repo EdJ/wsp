@@ -1870,4 +1870,38 @@ mod tests {
             _ => panic!("the pick should run a claim"),
         }
     }
+
+    /// A project that holds nothing keeps its row. The quiet-branch filter is
+    /// about work you are not looking at, and a project with no work at all is
+    /// not that: hiding it takes the row `a`, `X` and `O` are pressed on out of
+    /// the tree, so retiring a project's last task leaves the project itself
+    /// unreachable from the panel that removed it.
+    #[test]
+    fn a_project_left_empty_keeps_its_row() {
+        // Nobody running: an agent standing in a project keeps its row up on
+        // its own, and this is about the row a project has when it has only
+        // itself.
+        let mut w = quiet_world();
+        // What `X` on the last two tasks under `trance` leaves behind.
+        w.tasks.retain(|t| t.project.as_deref() != Some("trance"));
+
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        assert!(
+            !ui.rows_for_target(&panel::Target::Project("trance".into())).is_empty(),
+            "the project the tasks were removed from is still in the tree"
+        );
+
+        // And the filter it is not: a project whose work is all finished goes
+        // on being folded away until `show_done` asks for it.
+        let mut w = quiet_world();
+        for t in w.tasks.iter_mut().filter(|t| t.project.as_deref() == Some("trance")) {
+            t.status_raw = "done".into();
+        }
+        let ui = ui_of(&w, &view);
+        assert!(
+            ui.rows_for_target(&panel::Target::Project("trance".into())).is_empty(),
+            "finished work is quiet, not empty"
+        );
+    }
 }

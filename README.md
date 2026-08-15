@@ -478,6 +478,13 @@ A task with work under it carries the same right-hand counts a project does —
 open, `▸` in flight, `■` blocked, `✓` when everything beneath it is finished.
 Same numbers, one level down.
 
+A branch with no open work folds itself away until `A` asks for it. A project
+holding *nothing at all* is the exception and always shows: there is no work
+behind that row to go and look at, so hiding it tidies nothing — it takes the
+project itself out of the panel, and that row is what `a`, `X`, `O` and `S` are
+pressed on. So retiring a project's last task leaves the project where it was,
+and a project that has never held a task can still be given one from here.
+
 The inbox sits at the top: unfiled work is what you triage before reading
 anything that already has a home. A `no project` group sits at the foot for
 panes that resolved nowhere. Both fold like a project and take the cursor like
