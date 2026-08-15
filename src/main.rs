@@ -217,6 +217,7 @@ fn main() {
         "archive" => cmd_task::archive(&store, &args),
 
         "brief" => cmd_brief::brief(&store, &args),
+        "commit-help" => cmd_brief::commit_help(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "mandate" => cmd_mandate::mandate(&store, &args),
         "release" => cmd_agent::release(&store, &args),
@@ -295,6 +296,7 @@ fn help() {
 
 {agents}
   wsp brief                         what this pane is for, and who else is working
+  wsp commit-help                   how to commit in a tree somebody else is in
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp release                       unbind this pane

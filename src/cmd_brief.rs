@@ -68,6 +68,57 @@ fn rules(store: &Store) -> Option<String> {
     Some(out)
 }
 
+/// `wsp commit-help` — the shared-tree commit procedure, asked for rather than
+/// imposed.
+///
+/// It was two thirds of `agents.md`, which meant the brief spent fifty lines on
+/// git ritual in every session, before the agent reading it knew whether it
+/// would commit anything at all. Most sessions never stage a thing; the ones
+/// that do are about to read it carefully anyway. So the brief keeps one line
+/// pointing here, and the procedure is read at the moment it is used.
+///
+/// In the store beside `agents.md`, for the reason [`rules`] gives: it is the
+/// user's to write, and it changes when the tooling does rather than when this
+/// binary is rebuilt.
+pub fn commit_help(store: &Store, args: &Args) -> i32 {
+    let path = store.root.join("committing.md");
+    let text = std::fs::read_to_string(&path)
+        .ok()
+        .map(|t| t.trim_end().to_string())
+        .filter(|t| !t.is_empty());
+
+    if args.json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "path": util::contract(&path),
+                "text": text,
+            }))
+            .unwrap_or_default()
+        );
+        return i32::from(text.is_none());
+    }
+
+    match text {
+        Some(t) => {
+            println!("{t}");
+            0
+        }
+        // Unlike the brief, this one is allowed to fail: it was asked for, and
+        // an empty answer to "how do I commit here" is worse than none. Say
+        // where the file goes and where the reasoning lives.
+        None => {
+            let p = Paint::new();
+            eprintln!("{} no {}", p.yellow("✗"), util::contract(&path));
+            eprintln!(
+                "  {}",
+                p.dim("the procedure it should hold is the *Two agents in one tree* section of the wsp README")
+            );
+            1
+        }
+    }
+}
+
 pub fn brief(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
     let tasks = store.tasks();

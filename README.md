@@ -870,6 +870,18 @@ which is no use for behaviour that has to happen without being asked — so the
 few sentences that say when to reach for the CLI have to be in front of the
 agent before it does anything, and this is the file the hook puts there.
 
+Which is the argument for keeping it short. The commit procedure was two thirds
+of it, so every session read fifty lines of git ritual on the way in, before
+knowing whether it would stage anything at all — and most never do. It lives in
+`~/wsp/committing.md` now, printed on request by `wsp commit-help`, with one
+line in `agents.md` pointing there. Same store and the same reasons; the
+difference is that a procedure is read at the moment it is used, and a trigger
+has to be read before it is.
+
+```sh
+wsp commit-help      # ~/wsp/committing.md, when you are about to stage
+```
+
 ### Where an agent stops
 
 ```sh
@@ -1162,10 +1174,10 @@ which had been opening edit tabs all afternoon.
 Use `cmp` against a clean isolated build, or run a command whose output only
 the new code can produce.
 
-The procedure that follows from all of it is in `~/wsp/agents.md`, in the order
-you actually do it. The short version: commit through your own index, read the
-file list before the hunks, prove it in a worktree, and verify the artefact
-rather than the intention.
+The procedure that follows from all of it is `wsp commit-help`, in the order you
+actually do it. The short version: commit through your own index, read the file
+list before the hunks, prove it in a worktree, and verify the artefact rather
+than the intention.
 
 ### What none of it fixes
 

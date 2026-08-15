@@ -632,6 +632,22 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         for other in &displaced {
             println!("  {}", p.dim(&format!("taken from {other}")));
         }
+        // A title and nothing under it. The brief asks every agent to write the
+        // work down because a bare title is unreadable a day later, and then the
+        // claim hands it exactly that and says nothing — so the first move is to
+        // reconstruct an overview from a sentence, silently, and get it wrong.
+        // Said here because this is the one moment it is still cheap: the task
+        // is in hand, nothing has been built on a guess about it yet, and the
+        // person who knows what it meant may still be at the keyboard.
+        if t.section("Overview").is_none() {
+            println!(
+                "  {}",
+                p.dim(&format!(
+                    "no overview — please write one before you start: wsp edit {} --overview -",
+                    t.id
+                ))
+            );
+        }
         // Claiming is the moment an agent commits to a tree, and the moment it
         // is cheapest to be told it is not alone in one. On 2026-08-15 two
         // agents worked this repo for twenty minutes without knowing, and this
