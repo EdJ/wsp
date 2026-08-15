@@ -262,6 +262,23 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         None => out.push(field("pane", "", Style::Dim)),
     }
 
+    // The prose, in the order it is written: what this is, then what the work
+    // needs. Both are optional and an empty one draws nothing rather than an
+    // empty heading.
+    for name in ["Overview", "Details"] {
+        if let Some(text) = t.section(name) {
+            out.push(Line::default());
+            out.push(heading(&name.to_lowercase()));
+            for l in wrap(&text, w) {
+                if l.trim().is_empty() {
+                    out.push(Line::default());
+                } else {
+                    out.push(line(Style::Plain, l));
+                }
+            }
+        }
+    }
+
     // The log, newest first — the reason the body exists is to be read after
     // the fact, and after the fact the last line is the one that matters.
     let log: Vec<&str> = t

@@ -1386,12 +1386,26 @@ fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
 /// A tab rather than a split: the store is Markdown and editing a task means
 /// its whole body — notes, acceptance criteria, the log — which wants width,
 /// and a tab gives that without disturbing a layout you will come back to.
-fn pop_out(path: &str, label: &str, self_ws: Option<&str>) -> String {
+fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
     let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
-    let file = util::expand(path);
-    if !file.exists() {
-        return format!("no file at {path}");
-    }
+    // A project has no `wsp edit` yet; fall back to its file, named here so the
+    // exception is visible rather than hidden in a path.
+    let cmd: Vec<String> = match argv.first().map(|s| s.as_str()) {
+        Some("edit-project-file") => {
+            let f = util::expand(&format!("~/wsp/projects/{}.md", argv[1]));
+            if !f.exists() {
+                return format!("no file for {}", argv[1]);
+            }
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+            vec![editor, f.display().to_string()]
+        }
+        _ => {
+            let exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "wsp".into());
+            std::iter::once(exe).chain(argv.iter().cloned()).collect()
+        }
+    };
     let r = herdr::call(
         "tab.create",
         json!({ "workspace_id": ws, "label": label, "focus": true }),
@@ -1404,13 +1418,10 @@ fn pop_out(path: &str, label: &str, self_ws: Option<&str>) -> String {
         .map(|s| s.to_string());
     let Some(pane) = pane else { return "tab reported no pane".into() };
 
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let text = cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
     let _ = herdr::call(
         "pane.send_text",
-        json!({
-            "pane_id": pane,
-            "text": format!("exec {} {}\n", editor, shell_quote(&file.display().to_string())),
-        }),
+        json!({ "pane_id": pane, "text": format!("exec {text}\n") }),
     );
     format!("editing {label}")
 }
@@ -1539,8 +1550,8 @@ pub(crate) enum Effect {
     Inspect(crate::detail::Focus),
     /// Shut the detail pane.
     CloseView,
-    /// Open the row's file full-size, in an editor, in a tab of its own.
-    PopOut { path: String, label: String },
+    /// Open the row full-size in a tab of its own, to be written in.
+    PopOut { argv: Vec<String>, label: String },
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
@@ -1873,12 +1884,17 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 
         // ---- pop out, full size, in an editor ----
         Key::Char('E') => match &target {
+            // `wsp edit`, not the file: it opens the prose and keeps the
+            // frontmatter out of reach, which is the difference between a typo
+            // and a task the tools can no longer read.
             Target::Task(id) => Effect::PopOut {
-                path: format!("~/wsp/tasks/{id}.md"),
+                argv: vec!["edit".into(), id.clone()],
                 label: id.clone(),
             },
+            // Projects have no section machinery yet, so this is still the
+            // file — with the same risk, and worth closing later.
             Target::Project(p) => Effect::PopOut {
-                path: format!("~/wsp/projects/{p}.md"),
+                argv: vec!["edit-project-file".into(), p.clone()],
                 label: p.clone(),
             },
             _ => {
@@ -2022,8 +2038,8 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
                     }
                     view.showing = None;
                 }
-                Effect::PopOut { path, label } => {
-                    say(&mut ui, pop_out(&path, &label, self_ws));
+                Effect::PopOut { argv, label } => {
+                    say(&mut ui, pop_out(&argv, &label, self_ws));
                 }
                 Effect::Open { label, cwd, project, task } => {
                     match open_workspace(&label, cwd.as_deref(), project.as_deref(), task.as_deref())

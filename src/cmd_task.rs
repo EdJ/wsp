@@ -506,28 +506,140 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Edit a task's prose, without ever showing anyone the frontmatter.
+///
+/// The frontmatter is a contract — `id`, `status`, `schema` — and every field
+/// in it already has a command that sets it correctly. Handing the raw file to
+/// an editor puts a typo in `status:` one keystroke away from a task the tools
+/// can no longer read, for no benefit, because the part worth writing by hand
+/// is the prose. So: the body only, and only the parts meant to be written.
+///
+/// `## Log` is excluded deliberately. It is dated and append-only; `wsp note`
+/// is how you add to it, and editing history in place is how history stops
+/// being evidence.
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp edit <id>");
+        eprintln!("usage: wsp edit <id> [--overview | --details | --raw]");
         return 2;
     };
-    let Some(t) = store.find_task(&needle) else {
+    let Some(mut t) = store.find_task(&needle) else {
         eprintln!("wsp: no task matching `{needle}`");
         return 1;
     };
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    let status = std::process::Command::new(editor).arg(store.task_path(&t.id)).status();
-    match status {
-        Ok(s) if s.success() => {
-            store.git_commit(&format!("wsp: edit {}", t.id));
-            0
+
+    // The escape hatch, for when the frontmatter itself is what is wrong.
+    if args.has("raw") {
+        return edit_file(store, &store.task_path(&t.id), &format!("edit {}", t.id));
+    }
+
+    let one = if args.has("overview") {
+        Some("Overview")
+    } else if args.has("details") {
+        Some("Details")
+    } else {
+        None
+    };
+
+    let before = match one {
+        Some(sec) => t.section(sec).unwrap_or_default(),
+        None => {
+            // Both sections, headings included, so the shape is visible and a
+            // reader can move a paragraph between them.
+            let mut b = String::new();
+            for sec in ["Overview", "Details"] {
+                b.push_str(&format!("## {sec}\n"));
+                let text = t.section(sec).unwrap_or_default();
+                if !text.trim().is_empty() {
+                    b.push_str(text.trim_end());
+                    b.push('\n');
+                }
+                b.push('\n');
+            }
+            b
         }
-        Ok(_) => 1,
-        Err(e) => {
-            eprintln!("wsp: cannot launch editor: {e}");
-            1
+    };
+
+    let tmp = std::env::temp_dir().join(format!("wsp-{}-{}.md", t.id, util::epoch_nanos()));
+    if let Err(e) = crate::store::write_atomic(&tmp, &before) {
+        eprintln!("wsp: cannot stage the edit: {e}");
+        return 1;
+    }
+    let code = launch_editor(&tmp);
+    let after = std::fs::read_to_string(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+
+    if code != 0 {
+        eprintln!("wsp: editor exited {code} — nothing written");
+        return 1;
+    }
+    if after == before {
+        if !args.json() {
+            println!("unchanged");
+        }
+        return 0;
+    }
+
+    match one {
+        Some(sec) => t.set_section(sec, &after),
+        None => {
+            // Re-read the headings the editor came back with, so moving text
+            // between them does what it looks like it does.
+            let mut probe = Task::default();
+            probe.body = after.clone();
+            let ov = probe.section("Overview");
+            let de = probe.section("Details");
+            if ov.is_none() && de.is_none() {
+                // Both headings were deleted and something was typed anyway.
+                // Keeping it under Overview is a guess; discarding it is not a
+                // guess, it is losing the only thing the user actually wrote.
+                t.set_section("Overview", after.trim());
+            } else {
+                // Text above the first heading would otherwise fall out of the
+                // file entirely, so it joins the section it sits above.
+                let loose = probe.section("").unwrap_or_default();
+                let overview = match (loose.trim().is_empty(), ov) {
+                    (true, o) => o.unwrap_or_default(),
+                    (false, Some(o)) => format!("{}\n\n{}", loose.trim(), o),
+                    (false, None) => loose.trim().to_string(),
+                };
+                t.set_section("Overview", &overview);
+                t.set_section("Details", &de.unwrap_or_default());
+            }
         }
     }
+    t.touch();
+    if let Err(e) = store.save_task(&t) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("task-edited", json!({ "id": t.id, "section": one.unwrap_or("body") }));
+    store.git_commit(&format!("wsp: edit {} — {}", t.id, t.title));
+
+    if args.json() {
+        println!("{}", t.json());
+    } else {
+        println!("edited {}", t.id);
+    }
+    0
+}
+
+fn launch_editor(path: &std::path::Path) -> i32 {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    match std::process::Command::new(&editor).arg(path).status() {
+        Ok(s) => s.code().unwrap_or(0),
+        Err(e) => {
+            eprintln!("wsp: cannot launch {editor}: {e}");
+            127
+        }
+    }
+}
+
+fn edit_file(store: &Store, path: &std::path::Path, msg: &str) -> i32 {
+    let code = launch_editor(path);
+    if code == 0 {
+        store.git_commit(&format!("wsp: {msg}"));
+    }
+    code
 }
 
 pub fn archive(store: &Store, args: &Args) -> i32 {

@@ -106,8 +106,8 @@ churn, where killing and relaunching would blink the pane on every keypress.
 terminal. `↵` again on whatever is already open closes the pane, as does `esc`,
 so the same key both opens and closes and there is nothing to remember.
 
-For real editing, `E` pops the row's Markdown out into a **tab** of its own,
-full width, in `$EDITOR`. A tab rather than a split: a task's whole body —
+For real editing, `E` pops the row out into a **tab** of its own, full width,
+running `wsp edit` in `$EDITOR`. A tab rather than a split: a task's whole body —
 notes, acceptance criteria, the log — wants width, and a tab gives it without
 disturbing a layout you will come back to.
 
@@ -120,6 +120,7 @@ disturbing a layout you will come back to.
 | `s` `v` `d` `o` | task | start, review, done, reopen |
 | `b` | task | block, asking why |
 | `e` `n` | task | retitle, append a note |
+| `E` | task | edit its prose full-screen in a tab |
 | `m` | task | move — the tree becomes the picker |
 | `c` | task or agent | claim, either direction |
 | `O` | task, project | open a herdr workspace for it, and claim it |
@@ -179,6 +180,30 @@ layout, and flows that push scripted keys through the same reducer the live
 panel runs. No herdr, no store, no terminal — useful for arguing about the
 design before building it. The legend above is generated from the same glyph
 constants and `Style` values the rows draw with, so it cannot drift.
+
+## What a task file holds
+
+Frontmatter is a contract — `id`, `status`, `schema` — and every field in it has
+a command that sets it correctly. The body is yours, and carries three sections:
+
+| Section | For |
+|---|---|
+| `## Overview` | what the task is, written once, read to re-enter it |
+| `## Details` | working material — criteria, links, whatever the work needs |
+| `## Log` | dated, append-only; `wsp note` writes it, nothing edits it |
+
+```sh
+wsp edit <id>              # both sections, headings included
+wsp edit <id> --overview   # just that prose
+wsp edit <id> --details
+wsp edit <id> --raw        # the whole file, when the frontmatter is the problem
+```
+
+`wsp edit` never puts the frontmatter in front of you. A typo in `status:` is
+one keystroke from a task the tools can no longer read, and there is nothing to
+gain by allowing it — the part worth writing by hand is the prose. Sections come
+back in canonical order, headings you invented are kept, and if you delete both
+headings and type anyway your text is filed under Overview rather than dropped.
 
 ## Adopting what is already open
 

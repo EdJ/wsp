@@ -85,7 +85,16 @@ fn world() -> Snapshot {
         task("t-002", "Plan demo video strategy", Some("trance"), "doing"),
         // Doing, with an idle agent on it — the one combination that raises the
         // "needs you" arrow, because the work is live and the process is not.
-        task("t-003", "Retune the early reflections", Some("verb"), "doing"),
+        {
+            let mut t = task("t-003", "Retune the early reflections", Some("verb"), "doing");
+            t.body = "## Overview\nThe tail is right and the first 40 ms is not. Early reflections \
+are arriving too clean for the room the rest of the patch implies.\n\n\
+## Details\n- compare against the plate at 2.4s RT60\n\
+- the diffusion stage is suspect, not the tank\n\n\
+## Log\n- 2026-08-14 claimed by pane w2:p1\n"
+                .into();
+            t
+        },
         task("t-004", "Ship the release notes", Some("verb"), "review"),
         task("t-006", "Waiting on the tuning table decision", Some("verb"), "blocked"),
         task("t-005", "Design workspace management system", Some("tooling"), "doing"),
@@ -446,7 +455,7 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
         html: panel::to_html(&detail::frame(&ctx, &focus, W, H), W),
     };
     vec![
-        shot("Detail: a task", "↵ on a task opens it here rather than folding something. Inherited tags are resolved, and the log reads newest first — after the fact, the last line is the one that matters.", Focus::Task("t-003".into())),
+        shot("Detail: a task", "↵ on a task opens it here rather than folding something. Overview says what it is, Details carries the working material, and the log reads newest first — after the fact, the last line is the one that matters.", Focus::Task("t-003".into())),
         shot("Detail: a project", "↵ on a project: rolled-up work, what sits under it, and its own tasks in the panel's order.", Focus::Project("trance".into())),
         shot("Detail: nothing yet", "The pane before anything is opened. It is a reader — it waits rather than guessing.", Focus::Nothing),
     ]

@@ -26,7 +26,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
-    "json", "all", "force", "top", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
+    "json", "all", "force", "top", "raw", "overview", "details", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here",
 ];
 
