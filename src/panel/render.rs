@@ -294,14 +294,38 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     let body_rows = room - map_rows;
     let keys = hotkeys(&ui.rows);
 
-    let scroll = scroll_for(ui.sel, ui.rows.len(), body_rows);
-    for (i, row) in ui.rows.iter().enumerate().skip(scroll).take(body_rows) {
+    // The dock keeps its rows whatever the tree is doing. An agent with no
+    // work is the row you most need to see and the one the tree would push off
+    // the bottom first, since it sorts by work and that pane has none.
+    // One line of rule, so the dock reads as its own pane rather than as the
+    // tail of the tree. It is only worth its row if the rows it separates fit.
+    let dock_rows = if ui.dock == 0 {
+        0
+    } else {
+        (ui.dock + 1).min(body_rows.saturating_sub(MIN_TREE_ROWS))
+    };
+    let tree_len = ui.rows.len() - ui.dock;
+    let tree_rows = body_rows - dock_rows;
+
+    // Scroll on the tree's own length. A cursor down in the dock leaves the
+    // tree where it was rather than dragging it to the end.
+    let anchor = ui.sel.min(tree_len.saturating_sub(1));
+    let scroll = scroll_for(anchor, tree_len, tree_rows);
+    for (i, row) in ui.rows.iter().enumerate().take(tree_len).skip(scroll).take(tree_rows) {
         let mut l = render_row(row, w, keys[i]);
         l.selected = i == ui.sel;
         lines.push(l);
     }
-    while lines.len() < h.saturating_sub(footer_rows + map_rows) {
+    while lines.len() < h.saturating_sub(footer_rows + map_rows + dock_rows) {
         lines.push(Line::default());
+    }
+    if dock_rows > 0 {
+        lines.push(line(Style::Dim, "─".repeat(w)));
+        for (i, row) in ui.rows.iter().enumerate().skip(tree_len).take(dock_rows - 1) {
+            let mut l = render_row(row, w, keys[i]);
+            l.selected = i == ui.sel;
+            lines.push(l);
+        }
     }
     let hidden = map.len() - map_rows;
     lines.extend(map.into_iter().take(map_rows));

@@ -32,6 +32,9 @@ pub(super) const INBOX_KEY: &str = "(inbox)";
 
 pub(super) const NOPROJECT_KEY: &str = "(noproject)";
 
+/// The dock at the foot: agents holding no task.
+pub(super) const UNASSIGNED_KEY: &str = "(unassigned)";
+
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRef {
     pub(super) pane: String,
@@ -118,6 +121,8 @@ pub(crate) enum RowKind {
 
 pub(crate) struct Ui {
     pub(super) rows: Vec<Row>,
+    /// How many of the trailing rows are the unassigned dock rather than tree.
+    pub(super) dock: usize,
     pub(super) agents_total: usize,
     pub(super) needs: usize,
     pub(super) blocked: usize,
@@ -161,6 +166,7 @@ pub(super) fn target_of(row: &Row) -> Target {
         Row::More { key, .. } => Target::Overflow(key.clone()),
         Row::Agent { agent, .. } => Target::Pane(agent.pane.clone()),
         Row::Section { key, .. } if key == NOPROJECT_KEY => Target::Unattached,
+        Row::Section { key, .. } if key == UNASSIGNED_KEY => Target::Unattached,
         Row::Section { key, .. } if key == INBOX_KEY => Target::Inbox,
         Row::Section { .. } => Target::Nothing,
     }
@@ -445,6 +451,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     let mut live_by_project: std::collections::BTreeMap<String, usize> = Default::default();
     let mut loose_by_project: std::collections::BTreeMap<String, Vec<AgentRef>> = Default::default();
     let mut homeless: Vec<AgentRef> = Vec::new();
+    // An agent holding no task, wherever it is standing. These are the panes
+    // there is something to *do* about, and the tree is the wrong place for
+    // them: it is ordered by work, and an unassigned agent is precisely the one
+    // that has none. They go in a dock at the foot instead, where they cannot
+    // scroll out of sight.
+    let mut unassigned: Vec<AgentRef> = Vec::new();
 
     for a in panes.iter() {
         let bound = bound_task_of_pane(&a.pane_id);
@@ -466,14 +478,26 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                     *live_by_project.entry(id).or_insert(0) += 1;
                 }
                 if bound.is_none() {
-                    loose_by_project.entry(p.clone()).or_default().push(as_ref(a));
+                    if a.agent.is_empty() {
+                        loose_by_project.entry(p.clone()).or_default().push(as_ref(a));
+                    } else {
+                        unassigned.push(as_ref(a));
+                    }
                 }
             }
             // Resolves to nothing, or the workspace is deliberately pinned out
             // of the tree. Either way it belongs to no project.
             None => {
                 if bound.is_none() {
-                    homeless.push(as_ref(a));
+                    // A shell that resolves nowhere is still a fact about
+                    // nothing in particular, and stays in the tree's own
+                    // group. An agent is a person's worth of attention going
+                    // spare, and goes in the dock.
+                    if a.agent.is_empty() {
+                        homeless.push(as_ref(a));
+                    } else {
+                        unassigned.push(as_ref(a));
+                    }
                 }
             }
         }
@@ -616,8 +640,34 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         }
     }
 
+    // The dock. Last in the row list and pinned to the bottom of the frame, so
+    // it is reachable by the cursor — `c` has to be able to land on one of
+    // these — while never scrolling away like the tree above it.
+    let dock = if unassigned.is_empty() {
+        0
+    } else {
+        let folded = view.collapsed.contains(UNASSIGNED_KEY);
+        rows.push(Row::Section {
+            key: UNASSIGNED_KEY.to_string(),
+            label: "unassigned".into(),
+            count: unassigned.len(),
+            collapsed: folded,
+        });
+        if folded {
+            1
+        } else {
+            let n = unassigned.len();
+            for a in unassigned {
+                let title = a.where_.clone();
+                rows.push(Row::Agent { agent: a, title, depth: 1 });
+            }
+            n + 1
+        }
+    };
+
     Ui {
         rows,
+        dock,
         agents_total: panes.iter().filter(|p| !p.agent.is_empty()).count(),
         needs,
         blocked: tasks.iter().filter(|t| t.status() == Status::Blocked).count(),

@@ -366,7 +366,14 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .key(Key::Char('G'))
-            .scene("At the foot", "G to the last row. The cursor reports a pane to jump to rather than anything to edit — not every target is a thing you can change."),
+            .scene("At the foot", "G to the last row, which is in the dock. The cursor reports a pane to jump to rather than anything to edit — not every target is a thing you can change."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Agent)
+            .keys(&[Key::Char('G'), Key::Char('c')])
+            .scene("Handing work to an idle agent", "The dock holds every agent with no task, ruled off at the foot and pinned there — the tree above it scrolls and this does not. It is the one row you most need to see and the first the tree would push off the bottom, since the tree sorts by work and these panes have none. `c` on one turns the tree into the picker: choose what it takes."),
     );
 
     out.push(

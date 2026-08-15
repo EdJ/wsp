@@ -272,9 +272,27 @@ open, `▸` in flight, `■` blocked, `✓` when everything beneath it is finish
 Same numbers, one level down.
 
 The inbox sits at the top: unfiled work is what you triage before reading
-anything that already has a home. Loose agents sit at the foot, after the work.
-Both fold like a project and take the cursor like one, so a command can be
-aimed at them.
+anything that already has a home. A `no project` group sits at the foot for
+panes that resolved nowhere. Both fold like a project and take the cursor like
+one, so a command can be aimed at them.
+
+### The dock
+
+Under a rule at the very bottom sits **`unassigned`**: every agent holding no
+task, wherever it is standing. It is pinned — the tree scrolls above it and
+this does not — because it is the row you most need to see and the first the
+tree would push off the bottom, sorting as it does by work these panes have
+none of. `c` on one turns the tree into the picker and gives it something to
+do.
+
+Only agents. A shell with nobody driving it stays in the tree, under the
+project it is standing in or in `no project`: it is a fact about a place. An
+agent with no task is a person's worth of attention going spare, which is a
+fact about *you*.
+
+The dock takes the cursor like any other row, which is why its rows live at the
+end of the same list rather than being drawn separately — a block you can see
+and not select would show you an idle agent and give you no way to act on it.
 
 Colour carries six roles: **bold** is a project, plain is a claimed task, muted
 is an unclaimed one, dim is structure and finished work, accent is live work,
