@@ -537,6 +537,31 @@ it off them, and says so on the task. The tree hangs a pane under the task it
 is bound to and draws the first it finds, so the second was never visible —
 it was a state you could reach and not see.
 
+**But not off a *live* one, and not by accident.** Taking work from a pane that
+still has an agent in it is refused:
+
+```
+✗ t-260815-004  Sub-tasks: make the parent field real
+  held by claude in wP:p3 · working · 41m
+  wsp claim t-260815-004 --force   to take it anyway
+```
+
+It used to be silent. The binding was cleared, the other agent went on editing
+files for a task the store had given away, and the first anyone knew was two
+commits fighting over the same lines. A *dead* pane's binding is a different
+matter and is still taken without asking — that stale state is exactly what a
+re-claim is for.
+
+Claiming something already `done` is refused the same way, because it silently
+reopens it: the status goes back to `doing` and the task rejoins every open list
+on the machine. That is occasionally what you want, and never by accident — a
+bare `005` resolving to finished work is how the accident happens. This one was
+found by making it: the command was pointed at a completed task while testing
+the refusal above, and quietly undid somebody else's morning.
+
+Both refusals happen **before anything is written**, so a refused claim costs
+nothing — the agent has not yet let go of whatever it was holding.
+
 **The row moves; the cursor goes with it.** A claim re-sorts the tree under
 your hands — the pane row leaves one task and reappears under another, often
 several lines away. The panel holds the cursor on the row it was on rather than
@@ -602,6 +627,18 @@ fast builds are a feature here, because a session-start hook runs this binary.
   override when a directory is ambiguous.
 - **Tags are inherited.** A task in `trance` also matches `-t juce` and `-t dsp`
   from `vst` and `audio` above it.
+- **One writer at a time in `~/.local/state/wsp`.** Every state file is read,
+  changed in memory and written back whole, so `write_atomic` making each
+  *write* indivisible was never enough: two agents claiming at the same moment
+  both read the old map, both insert their key, and the second write drops the
+  first. Measured on this machine before the fix, thirty-two concurrent writers
+  left **two** records standing; after it, thirty-two. The window is a
+  millisecond wide, which is why it read as "herdr lost my claim" rather than as
+  a bug. A lock file around the whole read-change-write cycle closes it. It is
+  reentrant, so a claim can hold it across the several files it touches, and it
+  gives up after two seconds rather than hang — a lost update is recoverable,
+  a `wsp claim` that never returns is not. herdr calls stay outside it: a
+  socket round-trip is not something other agents should queue behind.
 - **Every escape sequence is consumed whole.** Reading a fixed two bytes after
   `ESC` matches the four arrows and leaves the tail of everything else in the
   buffer, where the next read hands it over as typing: page-up put a `~` in a

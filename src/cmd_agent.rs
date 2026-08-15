@@ -220,7 +220,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // environment describes the caller, not the target. Ask herdr what that
     // pane actually belongs to, or the claim records a workspace that nothing
     // can later resolve.
-    let target = herdr::panes().unwrap_or_default().into_iter().find(|p| p.pane_id == pane);
+    let panes_now = herdr::panes().unwrap_or_default();
+    let target = panes_now.iter().find(|p| p.pane_id == pane).cloned();
     let workspace = target
         .as_ref()
         .map(|p| p.workspace_id.clone())
@@ -232,6 +233,81 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         _ => std::env::current_dir().map(|c| util::contract(&c)).unwrap_or_default(),
     };
 
+    // The other direction: a task taken off another agent. Two panes bound to
+    // one task is not a state anything downstream can read — the tree hangs a
+    // pane under the task it is bound to and takes the first it finds, so the
+    // second would simply not be drawn.
+    let displaced: Vec<String> =
+        store.panes_for_task(&t.id).into_iter().filter(|p| p != &pane).collect();
+
+    // Claiming finished work reopens it, silently: the status goes back to
+    // `doing` and the task rejoins every open list on the machine. That is
+    // occasionally what you want — work comes back — but never by accident,
+    // and a bare suffix like `005` resolving to something already done is
+    // exactly how the accident happens. Found the hard way: this command was
+    // pointed at a completed task while testing the refusal below, and quietly
+    // undid somebody else's finished work.
+    if !t.status().is_open() && !args.has("force") {
+        let p = Paint::new();
+        eprintln!("{} {}  {}", p.yellow("✗"), p.bold(&t.id), t.title);
+        eprintln!("  {}", p.dim(&format!("already {} — claiming it would reopen it", t.status_raw)));
+        eprintln!("  {}", p.dim(&format!("wsp claim {} --force   to pick it back up", t.id)));
+        return 1;
+    }
+
+    // Taking work off a *live* agent is almost always a mistake, and it used
+    // to be silent: the binding was cleared, the other agent went on editing
+    // files for a task the store said was ours, and the first anyone knew was
+    // two commits fighting over the same lines. A dead pane's binding is
+    // another matter — that is exactly the stale state a re-claim is for.
+    //
+    // Refused before anything is written, so a refusal costs nothing: this
+    // agent has not yet let go of whatever it was holding.
+    let held_by: Vec<&herdr::Pane> = displaced
+        .iter()
+        .filter_map(|d| panes_now.iter().find(|p| &p.pane_id == d))
+        .filter(|p| !p.agent.is_empty())
+        .collect();
+    if !held_by.is_empty() && !args.has("force") {
+        let held = store
+            .claims()
+            .get(&t.id)
+            .and_then(|c| c.get("claimed_at"))
+            .and_then(|c| c.as_str())
+            .map(|c| util::duration_human(util::since(c)))
+            .unwrap_or_default();
+        if args.json() {
+            println!(
+                "{}",
+                json!({
+                    "error": "held",
+                    "task": t.id,
+                    "held_by": held_by.iter().map(|p| json!({
+                        "pane": p.pane_id, "agent": p.agent, "state": p.agent_status,
+                    })).collect::<Vec<_>>(),
+                    "held_for": held,
+                })
+            );
+        } else {
+            let p = Paint::new();
+            eprintln!("{} {}  {}", p.yellow("✗"), p.bold(&t.id), t.title);
+            for h in &held_by {
+                eprintln!(
+                    "  {}",
+                    p.dim(&format!(
+                        "held by {} in {} · {}{}",
+                        if h.agent.is_empty() { "a shell" } else { &h.agent },
+                        h.pane_id,
+                        h.agent_status,
+                        if held.is_empty() { String::new() } else { format!(" · {held}") }
+                    ))
+                );
+            }
+            eprintln!("  {}", p.dim(&format!("wsp claim {} --force   to take it anyway", t.id)));
+        }
+        return 1;
+    }
+
     // Whatever this agent was on, it is not on it after this. The claim moves
     // with the agent; the trace stays with the task.
     let left = leaving(store, &pane, &workspace, &t.id);
@@ -239,47 +315,52 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         hand_off(store, task, Some(&t.id), "handoff");
     }
 
-    // The other direction: a task taken off another agent. Two panes bound to
-    // one task is not a state anything downstream can read — the tree hangs a
-    // pane under the task it is bound to and takes the first it finds, so the
-    // second would simply not be drawn.
-    let displaced: Vec<String> =
-        store.panes_for_task(&t.id).into_iter().filter(|p| p != &pane).collect();
-    for other in &displaced {
-        store.clear_binding(other);
-    }
-
-    store.set_binding(
-        &pane,
-        json!({
-            "task_id": t.id,
-            "pane_id": pane,
-            "workspace_id": workspace,
-            "agent_session_id": session,
-            "cwd": cwd,
-            "started_at": util::now_iso(),
-        }),
-    );
-
-    // The durable half. A pane id is worthless the moment the pane dies, so
-    // record the workspace instead — by id, and by the label and cwd herdr
-    // keeps in its own session file, which survive the id being reissued.
     let ws_label = herdr::workspaces()
         .unwrap_or_default()
         .into_iter()
         .find(|w| w.id == workspace)
         .map(|w| w.label)
         .unwrap_or_default();
-    store.set_claim(
-        &t.id,
-        json!({
-            "workspace_id": workspace,
-            "workspace_label": ws_label,
-            "cwd": cwd,
-            "host": util::hostname(),
-            "claimed_at": util::now_iso(),
-        }),
-    );
+
+    // One lock around the state files a claim touches, so a claim
+    // arriving in the middle of this one cannot read a half-made state: a
+    // binding cleared and not yet replaced, or a claim recorded against a task
+    // whose binding has not landed. The task file and its git commit are
+    // outside it deliberately — a commit can take longer than any other agent
+    // should be made to wait, and `wsp reconcile` already rebuilds bindings
+    // from claims if the two ever part company.
+    store.locked(|| {
+        for other in &displaced {
+            store.clear_binding(other);
+        }
+        store.set_binding(
+            &pane,
+            json!({
+                "task_id": t.id,
+                "pane_id": pane,
+                "workspace_id": workspace,
+                "agent_session_id": session,
+                "cwd": cwd,
+                "started_at": util::now_iso(),
+            }),
+        );
+
+        // The durable half. A pane id is worthless the moment the pane dies,
+        // so record the workspace instead — by id, and by the label and cwd
+        // herdr keeps in its own session file, which survive the id being
+        // reissued. The label is looked up before the lock: asking herdr is a
+        // socket round-trip, and nothing else should wait on it.
+        store.set_claim(
+            &t.id,
+            json!({
+                "workspace_id": workspace,
+                "workspace_label": ws_label,
+                "cwd": cwd,
+                "host": util::hostname(),
+                "claimed_at": util::now_iso(),
+            }),
+        );
+    });
 
     // `hand_off` wrote to the tasks it released, and one of them may be this
     // one — a re-claim of work the same agent put down. Re-read rather than
@@ -974,6 +1055,19 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
             }
             seen.push(id.clone());
             walk = tasks.iter().find(|x| x.id == id).and_then(|x| x.parent.clone());
+        }
+    }
+
+    // One name, two pieces of work. Nothing downstream can tell them apart —
+    // `show` answers with the live one while the log, the claim and any
+    // `parent` pointing at it describe both.
+    let archived = store.archived_ids();
+    for t in &tasks {
+        if archived.contains(&t.id) {
+            problems.push(format!(
+                "task {} has the same id as an archived task — one of them needs renumbering",
+                t.id
+            ));
         }
     }
 
