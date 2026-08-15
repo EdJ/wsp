@@ -112,11 +112,23 @@ churn, where killing and relaunching would blink the pane on every keypress.
 terminal. `↵` again on whatever is already open closes the pane, as does `esc`,
 so the same key both opens and closes and there is nothing to remember.
 
-For real editing, `E` pops the row out into a **tab** of its own: the live
-detail view across the top, the editor beneath it, both full width. The context
-keeps updating while you type, so the status, the claim and the log stay in
-front of you instead of being the thing you gave up to edit. Quitting the
-editor closes the tab. A tab rather than a split: a task's whole body —
+For real editing, `E` pops the row out into a **tab** of its own:
+
+```
+┌─ context (live) ───────────────────────┐
+│ status · claim · log                   │
+├─ overview ──────────┬─ details ────────┤
+│ prose, no markup    │ prose, no markup │
+└─────────────────────┴──────────────────┘
+```
+
+The context is the same live view the sidebar opens, so status, claim and log
+keep updating while you type — that context was exactly what editing in a bare
+buffer cost. Each section gets its own editor on its own buffer, containing
+prose and nothing else: there is no `##` left to mangle. They are safe to run
+together because `wsp edit` re-reads the task and writes back only its own
+section. Quitting the second editor closes the tab; quitting the first leaves
+it standing, because closing then would take the other's work with it. A tab rather than a split: a task's whole body —
 notes, acceptance criteria, the log — wants width, and a tab gives it without
 disturbing a layout you will come back to.
 

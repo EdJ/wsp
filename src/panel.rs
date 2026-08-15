@@ -1388,27 +1388,15 @@ fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
 /// and a tab gives that without disturbing a layout you will come back to.
 fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
     let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
-    // A project has no `wsp edit` yet; fall back to its file, named here so the
-    // exception is visible rather than hidden in a path.
-    let (edit_cmd, view_id) = match argv.first().map(|s| s.as_str()) {
-        Some("edit-project-file") => {
-            let f = util::expand(&format!("~/wsp/projects/{}.md", argv[1]));
-            if !f.exists() {
-                return format!("no file for {}", argv[1]);
-            }
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-            (vec![editor, f.display().to_string()], argv[1].clone())
-        }
-        _ => {
-            let exe = std::env::current_exe()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "wsp".into());
-            (
-                std::iter::once(exe).chain(argv.iter().cloned()).collect::<Vec<_>>(),
-                argv.get(1).cloned().unwrap_or_default(),
-            )
-        }
-    };
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "wsp".into());
+
+    // A project has no section machinery yet, so it gets one editor on its
+    // file. Named here rather than hidden in a path, so the exception is
+    // visible until it can be closed.
+    let project_file = matches!(argv.first().map(|s| s.as_str()), Some("edit-project-file"));
+    let id = argv.get(1).cloned().unwrap_or_default();
 
     let Ok(r) = herdr::call(
         "tab.create",
@@ -1420,7 +1408,8 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
         .get("tab")
         .and_then(|t| t.get("tab_id"))
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     let Some(top) = r
         .get("root_pane")
         .and_then(|p| p.get("pane_id"))
@@ -1430,44 +1419,77 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
         return "tab reported no pane".into();
     };
 
-    // Context above, editor below. Split downward rather than sideways so both
-    // get the full width: prose wants it, and so do log lines.
-    let Ok(sp) = herdr::call(
-        "pane.split",
-        json!({ "direction": "down", "target_pane_id": top, "ratio": 0.38, "focus": true }),
-    ) else {
+    let split = |target: &str, dir: &str, ratio: f64| -> Option<String> {
+        herdr::call(
+            "pane.split",
+            json!({ "direction": dir, "target_pane_id": target, "ratio": ratio, "focus": false }),
+        )
+        .ok()?
+        .get("pane")?
+        .get("pane_id")?
+        .as_str()
+        .map(|s| s.to_string())
+    };
+    let run = |pane: &str, text: String| {
+        let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }));
+    };
+
+    // Context across the top, editors beneath. The context is the same live
+    // view the sidebar opens, so status, claim and log keep updating while you
+    // type — that context was exactly what editing in a bare buffer cost.
+    let Some(work) = split(&top, "down", 0.32) else {
         return "could not split the tab".into();
     };
-    let Some(bottom) = sp.get("pane").and_then(|p| p.get("pane_id")).and_then(|x| x.as_str()) else {
-        return "split reported no pane".into();
-    };
-
-    // The read-only half: the same live view the sidebar opens, so it keeps
-    // updating while you type — including the log, which is the context you
-    // were losing by editing in a bare buffer.
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
     let _ = herdr::call("pane.rename", json!({ "pane_id": top, "label": VIEW_LABEL }));
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({
-            "pane_id": top,
-            "text": format!("exec {} view {}\n", shell_quote(&exe), shell_quote(&view_id)),
-        }),
+    run(
+        &top,
+        format!("exec {} view {}\n", shell_quote(&exe), shell_quote(&id)),
     );
 
-    // The editor takes the tab down with it when it exits, so finishing an edit
-    // puts you back where you were instead of leaving a husk behind.
-    let text = edit_cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-    let after = match &tab {
-        Some(t) => format!("; herdr tab close {}", shell_quote(t)),
-        None => String::new(),
+    if project_file {
+        let f = util::expand(&format!("~/wsp/projects/{id}.md"));
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+        run(
+            &work,
+            format!(
+                "{} {}; herdr tab close {}\n",
+                editor,
+                shell_quote(&f.display().to_string()),
+                shell_quote(&tab)
+            ),
+        );
+        return format!("editing {label}");
+    }
+
+    // One editor per section, side by side. Each buffer is prose and nothing
+    // else — there is no markup left to mangle, which was the point. They are
+    // safe to run together because `wsp edit` re-reads the task and writes back
+    // only its own section.
+    let Some(right) = split(&work, "right", 0.5) else {
+        return "could not split the editors".into();
     };
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({ "pane_id": bottom, "text": format!("{text}{after}\n") }),
+
+    // Whichever editor is quit second takes the tab down. A one-byte marker per
+    // editor, because closing on the first would kill the other with its work
+    // still open — and leaving the tab means every edit strands a husk.
+    let mark = std::env::temp_dir().join(format!("wsp-edit-{}", tab.replace(':', "-")));
+    let m = shell_quote(&mark.display().to_string());
+    let done = format!(
+        "; printf x >> {m}; [ \"$(wc -c < {m} | tr -d ' ')\" -ge 2 ] && {{ rm -f {m}; herdr tab close {}; }}",
+        shell_quote(&tab)
     );
+    let _ = std::fs::remove_file(&mark);
+
+    for (pane, section) in [(&work, "--overview"), (&right, "--details")] {
+        run(
+            pane,
+            format!(
+                "{} edit {} {section}{done}\n",
+                shell_quote(&exe),
+                shell_quote(&id)
+            ),
+        );
+    }
     format!("editing {label}")
 }
 
