@@ -72,7 +72,7 @@ pub(crate) fn set_focus(store: &Store, workspace: &str, focus: &Focus) {
     );
 }
 
-fn get_focus(store: &Store, workspace: &str) -> Focus {
+pub(crate) fn get_focus(store: &Store, workspace: &str) -> Focus {
     read_all(store).get(workspace).map(Focus::from_json).unwrap_or(Focus::Nothing)
 }
 
@@ -404,33 +404,39 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     let _ = std::io::stdout().flush();
     panel::stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
+    // No event stream here: the view is a reader, and a second subscriber per
+    // workspace would double herdr's fan-out for a pane that can wait. Instead
+    // poll often and do nothing unless something moved — reading the target
+    // and stat-ing the store is cheap, re-reading every task file is not.
     let mut last = String::new();
+    let mut seen: Option<(Focus, u64)> = None;
     let mut quit = false;
+    let Ok(mut tty) = std::fs::File::open("/dev/tty") else { return 1 };
+
     while !quit {
-        let (w, h) = panel::term_size();
         let focus = pinned.clone().unwrap_or_else(|| get_focus(store, &ws));
-        let ctx = Ctx::live(store);
-        let painted = panel::to_ansi(&frame(&ctx, &focus, w, h), w, h);
-        if painted != last {
-            print!("{painted}");
-            let _ = std::io::stdout().flush();
-            last = painted;
+        let fp = store.fingerprint();
+        if seen.as_ref() != Some(&(focus.clone(), fp)) {
+            seen = Some((focus.clone(), fp));
+            let (w, h) = panel::term_size();
+            let ctx = Ctx::live(store);
+            let painted = panel::to_ansi(&frame(&ctx, &focus, w, h), w, h);
+            if painted != last {
+                print!("{painted}");
+                let _ = std::io::stdout().flush();
+                last = painted;
+            }
         }
 
-        // No event stream here: the view is a reader, and a second subscriber
-        // per workspace would double herdr's fan-out for a pane that can wait.
-        for _ in 0..8 {
-            let mut buf = [0u8; 1];
-            if let Ok(mut tty) = std::fs::File::open("/dev/tty") {
-                use std::io::Read;
-                if let Ok(1) = tty.read(&mut buf) {
-                    if buf[0] == b'q' || buf[0] == 3 {
-                        quit = true;
-                        break;
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(125));
+        use std::io::Read;
+        let mut buf = [0u8; 1];
+        match tty.read(&mut buf) {
+            // `min 0 time 1` gives a 100ms read timeout, so this doubles as
+            // the poll interval — no separate sleep, and a keypress is felt
+            // immediately rather than after the rest of a tick.
+            Ok(1) if buf[0] == b'q' || buf[0] == 3 => quit = true,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 

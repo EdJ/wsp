@@ -81,9 +81,10 @@ It must never go back to `layout.apply`: herdr rebuilds the whole tree from
 that call and every pane in it gets a fresh terminal, which takes down any
 agent running in the workspace.
 
-Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane,
-`1`-`9` jump straight to an agent, `A` shows finished tasks, `r` syncs, `?`
-lists the verbs, `q` quits.
+Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
+closes it again), `esc` closes it, `E` pops the row's file out into an editor
+tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `r` syncs,
+`?` lists the verbs, `q` quits.
 
 ## The detail pane
 
@@ -102,7 +103,13 @@ another, so reading a second thing does not move the pane you are reading. The
 target passes through a file the view polls: retargeting costs no process
 churn, where killing and relaunching would blink the pane on every keypress.
 `↵` on a pane row still jumps to that terminal — a pane's detail *is* the
-terminal.
+terminal. `↵` again on whatever is already open closes the pane, as does `esc`,
+so the same key both opens and closes and there is nothing to remember.
+
+For real editing, `E` pops the row's Markdown out into a **tab** of its own,
+full width, in `$EDITOR`. A tab rather than a split: a task's whole body —
+notes, acceptance criteria, the log — wants width, and a tab gives it without
+disturbing a layout you will come back to.
 
 ### Managing from the panel
 
@@ -219,6 +226,11 @@ fast builds are a feature here, because a session-start hook runs this binary.
 - **Status is work state, not process state.** herdr's `idle`/`working` describes
   the process; `doing`/`blocked`/`review` describes the work. `wsp wip` flags the
   gap between them — process-idle on a `doing` task means a human is the blocker.
+- **The focused panel refreshes at 250 ms; the rest at 30 s.** Both the store
+  stat and the two socket calls sit behind that gate, so twenty idle panels do
+  no work between refreshes while the one you are looking at feels immediate.
+  Rendering a frame costs 0.33 ms and herdr answers in 0.6–5.6 ms — the lag was
+  never compute, it was a five-second tick.
 - **Claims outlive panes; bindings do not.** A binding is keyed on a pane id,
   the most perishable thing herdr has. A claim names the workspace — id, label
   and cwd, all of which herdr persists — and is cleared only by `release`. A

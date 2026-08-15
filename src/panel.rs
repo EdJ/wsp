@@ -67,6 +67,8 @@ pub(crate) struct View {
     reveal: HashSet<String>,
     /// What the next keypress means.
     pub(crate) mode: Mode,
+    /// What the detail pane is currently showing, so `↵` can close it.
+    showing: Option<crate::detail::Focus>,
 }
 
 /// Management needs three shapes of input beyond a single key: a value to
@@ -1368,6 +1370,51 @@ fn spawn_events(tx: Sender<Msg>) {
 /// The label herdr carries on a detail pane, so we can find ours again.
 pub(crate) const VIEW_LABEL: &str = "wsp:view";
 
+/// Shut the workspace's detail pane, if it has one.
+fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
+    let Some(ws) = self_ws else { return false };
+    crate::detail::set_focus(store, ws, &crate::detail::Focus::Nothing);
+    let Ok(panes) = list_panes(ws) else { return false };
+    match panes.into_iter().find(|p| p.label == VIEW_LABEL) {
+        Some(p) => herdr::call("pane.close", json!({ "pane_id": p.id })).is_ok(),
+        None => false,
+    }
+}
+
+/// Open a file full-size in a tab of its own, in the user's editor.
+///
+/// A tab rather than a split: the store is Markdown and editing a task means
+/// its whole body — notes, acceptance criteria, the log — which wants width,
+/// and a tab gives that without disturbing a layout you will come back to.
+fn pop_out(path: &str, label: &str, self_ws: Option<&str>) -> String {
+    let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
+    let file = util::expand(path);
+    if !file.exists() {
+        return format!("no file at {path}");
+    }
+    let r = herdr::call(
+        "tab.create",
+        json!({ "workspace_id": ws, "label": label, "focus": true }),
+    );
+    let Ok(r) = r else { return "could not create a tab".into() };
+    let pane = r
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let Some(pane) = pane else { return "tab reported no pane".into() };
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let _ = herdr::call(
+        "pane.send_text",
+        json!({
+            "pane_id": pane,
+            "text": format!("exec {} {}\n", editor, shell_quote(&file.display().to_string())),
+        }),
+    );
+    format!("editing {label}")
+}
+
 /// Point the workspace's detail pane at something, making one if there is not
 /// one yet.
 ///
@@ -1459,7 +1506,7 @@ pub fn run(store: &Store) -> i32 {
     {
         let tx = tx.clone();
         std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(200));
             if tx.send(Msg::Tick).is_err() {
                 return;
             }
@@ -1490,6 +1537,10 @@ pub(crate) enum Effect {
     Open { label: String, cwd: Option<String>, project: Option<String>, task: Option<String> },
     /// Show this row in the detail pane, making one if there is not one yet.
     Inspect(crate::detail::Focus),
+    /// Shut the detail pane.
+    CloseView,
+    /// Open the row's file full-size, in an editor, in a tab of its own.
+    PopOut { path: String, label: String },
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
@@ -1673,7 +1724,8 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 
     match k {
         Key::Char('q') | Key::Interrupt => Effect::Quit,
-        Key::Esc => Effect::None,
+        // Esc is the universal "put that away".
+        Key::Esc => Effect::CloseView,
 
         Key::Down | Key::Char('j') => move_or_fold(Key::Down, ui, view),
         Key::Up | Key::Char('k') => move_or_fold(Key::Up, ui, view),
@@ -1697,8 +1749,11 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Some(a) => Effect::Focus(a.clone()),
                 None => Effect::None,
             },
-            Target::Task(id) => Effect::Inspect(crate::detail::Focus::Task(id.clone())),
-            Target::Project(p) => Effect::Inspect(crate::detail::Focus::Project(p.clone())),
+            // Pressing it again on the thing already open shuts the pane, so
+            // the same key both opens and closes and nothing has to be
+            // remembered.
+            Target::Task(id) => toggle(view, crate::detail::Focus::Task(id.clone())),
+            Target::Project(p) => toggle(view, crate::detail::Focus::Project(p.clone())),
             Target::Inbox | Target::Unattached | Target::Nothing => {
                 say(ui, "nothing to open there");
                 Effect::None
@@ -1725,7 +1780,7 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         }
         Key::Char('r') => Effect::Sync,
         Key::Char('?') => {
-            say(ui, "↵ inspect · ←→ fold · a add · s/v/d/o · b m c · O open · X remove");
+            say(ui, "↵ inspect/close · E edit · O workspace · a s d b m c X · ←→ fold");
             Effect::None
         }
 
@@ -1816,6 +1871,22 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
         },
 
+        // ---- pop out, full size, in an editor ----
+        Key::Char('E') => match &target {
+            Target::Task(id) => Effect::PopOut {
+                path: format!("~/wsp/tasks/{id}.md"),
+                label: id.clone(),
+            },
+            Target::Project(p) => Effect::PopOut {
+                path: format!("~/wsp/projects/{p}.md"),
+                label: p.clone(),
+            },
+            _ => {
+                say(ui, "nothing there to open");
+                Effect::None
+            }
+        },
+
         // ---- open a workspace for this row ----
         Key::Char('O') => match &target {
             Target::Task(id) => {
@@ -1878,6 +1949,15 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
     }
 }
 
+/// `↵` on what is already open means close it.
+fn toggle(view: &mut View, want: crate::detail::Focus) -> Effect {
+    if view.showing.as_ref() == Some(&want) {
+        Effect::CloseView
+    } else {
+        Effect::Inspect(want)
+    }
+}
+
 /// Status verbs all have the same shape: one key, a task, no input.
 fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
     match target {
@@ -1930,9 +2010,20 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
                 }
                 Effect::Inspect(focus) => {
                     let msg = inspect(store, self_ws, &focus);
-                    if !msg.is_empty() {
+                    if msg.is_empty() {
+                        view.showing = Some(focus);
+                    } else {
                         say(&mut ui, msg);
                     }
+                }
+                Effect::CloseView => {
+                    if close_view(store, self_ws) {
+                        say(&mut ui, "closed");
+                    }
+                    view.showing = None;
+                }
+                Effect::PopOut { path, label } => {
+                    say(&mut ui, pop_out(&path, &label, self_ws));
                 }
                 Effect::Open { label, cwd, project, task } => {
                     match open_workspace(&label, cwd.as_deref(), project.as_deref(), task.as_deref())
@@ -1977,27 +2068,33 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
             },
             Msg::Herdr(ws) => {
                 // An event naming our own workspace means we are probably about
-                // to be looked at: redraw now. Otherwise mark dirty and let the
-                // tick decide, so twenty-odd background panels stay cheap.
+                // to be looked at. Coalesce the burst that follows a split or a
+                // focus change, then mark dirty — the tick is 200ms away and
+                // will pick it up, so there is no reason to sleep here.
+                while rx.try_recv().is_ok() {}
                 let concerns_us = ws.is_some() && ws.as_deref() == self_ws;
+                dirty = true;
                 if concerns_us || ui.self_focused {
-                    std::thread::sleep(Duration::from_millis(250));
-                    while rx.try_recv().is_ok() {}
                     refetch = true;
-                } else {
-                    dirty = true;
+                    dirty = false;
                 }
             }
             Msg::Tick => {
+                // The one you are looking at should feel immediate; the twenty
+                // behind it should cost nothing. Both the fingerprint stat and
+                // the two socket calls sit behind this gate, so an idle
+                // background panel does no work at all between refreshes.
                 let interval = if ui.self_focused {
-                    Duration::from_secs(5)
+                    Duration::from_millis(250)
                 } else {
                     Duration::from_secs(30)
                 };
-                let store_changed = store.fingerprint() != last_fingerprint;
-                if (dirty || store_changed) && last_fetch.elapsed() >= interval {
-                    refetch = true;
-                    dirty = false;
+                if last_fetch.elapsed() >= interval {
+                    let store_changed = store.fingerprint() != last_fingerprint;
+                    if dirty || store_changed {
+                        refetch = true;
+                        dirty = false;
+                    }
                 }
             }
         }
@@ -2067,6 +2164,34 @@ fn list_panes(ws_id: &str) -> Result<Vec<PaneInfo>, String> {
         .collect())
 }
 
+/// The pane a panel should be split off: the widest one that is not ours.
+/// Width comes from herdr's layout, because "first in the list" is an
+/// arbitrary answer that happens to be right only when there is one pane.
+fn widest<'a>(ws_id: &str, panes: &'a [PaneInfo]) -> Option<&'a PaneInfo> {
+    let mine = |p: &PaneInfo| p.label == PANEL_LABEL || p.label == VIEW_LABEL;
+    let candidates: Vec<&PaneInfo> = panes.iter().filter(|p| !mine(p)).collect();
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
+    let widths: std::collections::BTreeMap<String, u64> = herdr::call(
+        "pane.layout",
+        json!({ "pane_id": candidates[0].id, "workspace_id": ws_id }),
+    )
+    .ok()
+    .and_then(|r| r.get("layout").and_then(|l| l.get("panes").cloned()))
+    .and_then(|p| p.as_array().cloned())
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|p| {
+        let id = p.get("pane_id")?.as_str()?.to_string();
+        let w = p.get("rect")?.get("width")?.as_u64()?;
+        Some((id, w))
+    })
+    .collect();
+
+    candidates.into_iter().max_by_key(|p| widths.get(&p.id).copied().unwrap_or(0))
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -2107,7 +2232,10 @@ pub fn install_one(store: &Store, ws_id: &str, ratio: f64) -> Result<bool, Strin
         save_panels(store, &panels);
         return Ok(false);
     }
-    let Some(target) = panes.first() else {
+    // Never split one of our own panes. A leftover view pane used to be a
+    // candidate, and splitting it gave the panel 22% of an already-narrow
+    // column — seven usable characters.
+    let Some(target) = widest(ws_id, &panes) else {
         return Ok(false);
     };
     let before: HashSet<&str> = panes.iter().map(|p| p.id.as_str()).collect();
@@ -2218,6 +2346,13 @@ pub fn uninstall(store: &Store, args: &crate::Args) -> i32 {
     for (ws, pane) in targets {
         if herdr::call("pane.close", json!({ "pane_id": pane })).is_ok() {
             removed += 1;
+        }
+        // The view pane is ours too. Leaving it behind orphans a pane nothing
+        // will reclaim, and the next install would try to split it.
+        if let Ok(ps) = list_panes(&ws) {
+            for v in ps.iter().filter(|p| p.label == VIEW_LABEL) {
+                let _ = herdr::call("pane.close", json!({ "pane_id": v.id }));
+            }
         }
         panels.remove(&ws);
     }
