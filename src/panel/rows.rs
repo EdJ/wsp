@@ -67,6 +67,7 @@ impl AgentRef {
     /// The terminal this stands for. The only field anything outside the panel
     /// has business with: a pane id is what a command names and what a test can
     /// check a click against.
+    #[cfg(test)]
     pub(crate) fn pane(&self) -> &str {
         &self.pane
     }

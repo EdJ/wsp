@@ -464,6 +464,15 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .to_pane("w4:p2")
+            .key(Key::Char('c'))
+            .up_to(panel::RowKind::More)
+            .key(Key::Enter)
+            .scene("Reaching past the cap", "Every project stops at six tasks and puts the rest behind `⋯`, so a hunt for work to hand over runs into one. `↵` inside a pick takes the row it lands on — and on a row it cannot take but can *open*, it opens it: the tail here, a folded project the same way. The pick is still running; the two tasks that were out of reach are now rows like any other."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_pane("w4:p2")
             .key(Key::Char('f'))
             .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command."),
     );
