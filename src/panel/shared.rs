@@ -50,6 +50,12 @@ pub(super) struct Shared {
     reveal: Vec<String>,
     show_done: bool,
     review_only: bool,
+    /// `w`, and here for the same reason `review_only` is: all three change
+    /// which rows exist rather than which of them is selected, and a panel
+    /// showing a different set of rows from the one you just left is a panel
+    /// you have to re-read. It was the one field of `View` this struct did not
+    /// carry — not by argument, it simply was not added when `w` was.
+    agents: bool,
     ids: bool,
     cursor: Cursor,
     /// Only ever set by a click, and cleared by the next keystroke. Shared
@@ -75,6 +81,7 @@ impl Shared {
             reveal: sorted(&view.reveal),
             show_done: view.show_done,
             review_only: view.review_only,
+            agents: view.agents,
             ids: view.ids,
             cursor: cursor.into(),
             scroll: view.scroll,
@@ -89,6 +96,7 @@ impl Shared {
         view.reveal = self.reveal.into_iter().collect();
         view.show_done = self.show_done;
         view.review_only = self.review_only;
+        view.agents = self.agents;
         view.ids = self.ids;
         view.scroll = self.scroll;
         self.cursor
@@ -101,6 +109,7 @@ impl Shared {
             "reveal": self.reveal,
             "show_done": self.show_done,
             "review_only": self.review_only,
+            "agents": self.agents,
             "ids": self.ids,
             "cursor": target_to_json(&self.cursor.target),
             "docked": self.cursor.docked,
@@ -122,6 +131,7 @@ impl Shared {
             reveal: list("reveal"),
             show_done: flag("show_done"),
             review_only: flag("review_only"),
+            agents: flag("agents"),
             ids: flag("ids"),
             cursor: Cursor {
                 target: v.get("cursor").map(target_from_json).unwrap_or(Target::Nothing),
@@ -233,6 +243,32 @@ mod tests {
         assert!(fresh.collapsed.contains("audio"));
         assert!(fresh.collapsed.contains("vst"));
         assert!(fresh.show_done);
+    }
+
+    /// `w` travels like `A` and `R` do. It was the one field of `View` that
+    /// `Shared` did not carry, so pressing it moved one panel and left the
+    /// other twenty-one on the tree — the reset this module exists to end,
+    /// applied to the view you reach for when you want to know who has stopped.
+    ///
+    /// The second half is what an older panel writes. During an install the
+    /// panels cross over one at a time, so a file with no `agents` key at all
+    /// has to read as "not the agents view" rather than take the reader down.
+    #[test]
+    fn the_agents_view_travels_between_panels() {
+        let mut v = View::default();
+        v.agents = true;
+        let shared = Shared::of(&v, Target::Pane("w1:p6".into()));
+
+        let mut fresh = View::default();
+        assert!(!fresh.agents);
+        Shared::from_json(&shared.to_json()).apply(&mut fresh);
+        assert!(fresh.agents, "w did not follow the panel you switched to");
+
+        let old = serde_json::json!({ "show_done": true });
+        let mut after = View::default();
+        after.agents = true;
+        Shared::from_json(&old).apply(&mut after);
+        assert!(!after.agents, "a file written before this field read as the agents view");
     }
 
     /// Sets are unordered, and the write is skipped by comparing text. If the
