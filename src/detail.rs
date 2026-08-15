@@ -193,7 +193,16 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
         Focus::Task(id) => task_frame(ctx, id, w, &mut out),
         Focus::Project(id) => project_frame(ctx, id, w, &mut out),
     }
-    out.truncate(h);
+
+    // A hint pinned to the bottom. `W` is worth naming here because it acts on
+    // panes other than this one, which is not a thing you would guess.
+    let footer = 2;
+    out.truncate(h.saturating_sub(footer));
+    while out.len() < h.saturating_sub(footer) {
+        out.push(Line::default());
+    }
+    out.push(line(Style::Dim, "─".repeat(w)));
+    out.push(line(Style::Dim, "q close · W save and close the editors"));
     out
 }
 
@@ -400,6 +409,69 @@ fn glyph_for(s: Status) -> &'static str {
     }
 }
 
+// ---- closing the editors --------------------------------------------------
+
+/// What to send an editor to make it save and quit.
+///
+/// Driving another program by keystroke is a guess, so the guess is written
+/// down where it can be corrected rather than buried. `vi` is the default
+/// because that is what an unset `$EDITOR` means.
+fn save_and_quit_keys(editor: &str) -> Option<&'static str> {
+    let name = editor
+        .rsplit('/')
+        .next()
+        .unwrap_or(editor)
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    match name {
+        // Esc first: in insert mode `:wq` would otherwise be typed into the
+        // text and then saved, which is the one outcome worse than not saving.
+        "" | "vi" | "vim" | "nvim" | "view" | "hx" | "helix" => Some("\x1b:wq\r"),
+        "nano" | "pico" => Some("\x0f\r\x18"),
+        "emacs" | "emacsclient" => Some("\x18\x13\x18\x03"),
+        "micro" => Some("\x13\x11"),
+        _ => None,
+    }
+}
+
+/// Tell every editor sharing this tab to save and quit.
+///
+/// The tab closes itself once the second one exits — that machinery already
+/// exists — so this only has to get them to leave.
+fn close_editors() -> String {
+    let env = herdr::Env::read();
+    let Some(me) = env.pane_id else {
+        return "no pane id — cannot find the editors".into();
+    };
+    let Ok(panes) = herdr::panes() else {
+        return "herdr is not answering".into();
+    };
+    let Some(mine) = panes.iter().find(|p| p.pane_id == me) else {
+        return "cannot place this pane".into();
+    };
+
+    let editor = std::env::var("EDITOR").unwrap_or_default();
+    let Some(keys) = save_and_quit_keys(&editor) else {
+        return format!("don't know how to save {editor} — quit it yourself");
+    };
+
+    let siblings: Vec<&herdr::Pane> = panes
+        .iter()
+        .filter(|p| p.tab_id == mine.tab_id && p.pane_id != me)
+        .collect();
+    if siblings.is_empty() {
+        return "nothing open beside this".into();
+    }
+    for p in &siblings {
+        let _ = herdr::call(
+            "pane.send_text",
+            json!({ "pane_id": p.pane_id, "text": keys }),
+        );
+    }
+    format!("saving {}", siblings.len())
+}
+
 // ---- the pane -----------------------------------------------------------
 
 pub fn run(store: &Store, args: &crate::Args) -> i32 {
@@ -458,6 +530,17 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             // the poll interval — no separate sleep, and a keypress is felt
             // immediately rather than after the rest of a tick.
             Ok(1) if buf[0] == b'q' || buf[0] == 3 => quit = true,
+            Ok(1) if buf[0] == b'W' => {
+                let msg = close_editors();
+                let (w, _) = panel::term_size();
+                let mut l = Line::default();
+                l.push(Style::Accent, util::truncate(&msg, w));
+                l.fit(w);
+                print!("\x1b[999;1H{}", panel::to_ansi(&[l], w, 1).trim_start_matches("\x1b[H\x1b[2J"));
+                let _ = std::io::stdout().flush();
+                // Force a repaint once they are gone.
+                seen = None;
+            }
             Ok(_) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }

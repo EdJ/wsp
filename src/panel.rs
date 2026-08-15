@@ -1480,11 +1480,15 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
     );
     let _ = std::fs::remove_file(&mark);
 
-    for (pane, section) in [(&work, "--overview"), (&right, "--details")] {
+    for (pane, section) in [(&work, "overview"), (&right, "details")] {
+        // Label the pane as well as the file: herdr shows one, the editor's
+        // status line shows the other, and between them there is no way to be
+        // looking at a buffer without knowing which half it is.
+        let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": section }));
         run(
             pane,
             format!(
-                "{} edit {} {section}{done}\n",
+                "{} edit {} --{section}{done}\n",
                 shell_quote(&exe),
                 shell_quote(&id)
             ),

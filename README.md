@@ -127,8 +127,23 @@ keep updating while you type — that context was exactly what editing in a bare
 buffer cost. Each section gets its own editor on its own buffer, containing
 prose and nothing else: there is no `##` left to mangle. They are safe to run
 together because `wsp edit` re-reads the task and writes back only its own
-section. Quitting the second editor closes the tab; quitting the first leaves
-it standing, because closing then would take the other's work with it. A tab rather than a split: a task's whole body —
+section. `W` in the context pane saves and closes both editors at once. It sends the
+save-and-quit for your `$EDITOR` — `Esc :wq` for the vi family, `^O ^X` for
+nano, and so on, with `vi` assumed when `$EDITOR` is unset. The `Esc` matters:
+without it, an editor sitting in insert mode would take `:wq` as text and save
+that. An editor it does not recognise is named rather than guessed at.
+
+Quitting the editors by hand works the same way: the second one to go takes the
+tab with it, and quitting the first leaves it standing because closing then
+would take the other's work.
+
+Each editor is labelled by its section, and its buffer is a file named
+`overview.md` or `details.md` — so the editor's own status line says which half
+you are in, without the editor having to cooperate.
+
+Closing the tab from herdr while an editor is open **loses that editor's
+changes**: `wsp edit` writes back only after the editor exits. If you had saved,
+the staged file survives under `$TMPDIR/wsp-<id>-<stamp>/`. A tab rather than a split: a task's whole body —
 notes, acceptance criteria, the log — wants width, and a tab gives it without
 disturbing a layout you will come back to.
 

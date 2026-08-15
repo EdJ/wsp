@@ -559,7 +559,15 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
         }
     };
 
-    let tmp = std::env::temp_dir().join(format!("wsp-{}-{}.md", t.id, util::epoch_nanos()));
+    // A directory per edit, so the file inside can be named for the section.
+    // Every terminal editor puts the filename in its status line, which makes
+    // that the one label that needs no cooperation from the editor at all.
+    let dir = std::env::temp_dir().join(format!("wsp-{}-{}", t.id, util::epoch_nanos()));
+    let _ = std::fs::create_dir_all(&dir);
+    let tmp = dir.join(format!(
+        "{}.md",
+        one.map(|s| s.to_lowercase()).unwrap_or_else(|| "body".into())
+    ));
     if let Err(e) = crate::store::write_atomic(&tmp, &before) {
         eprintln!("wsp: cannot stage the edit: {e}");
         return 1;
@@ -567,6 +575,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     let code = launch_editor(&tmp);
     let after = std::fs::read_to_string(&tmp).unwrap_or_default();
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir(&dir);
 
     if code != 0 {
         eprintln!("wsp: editor exited {code} — nothing written");
