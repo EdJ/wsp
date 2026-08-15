@@ -275,24 +275,42 @@ impl Store {
         Ok(name)
     }
 
-    /// Newest mtime across the store; the daemon polls this to notice
-    /// out-of-band edits without a filesystem-watch dependency.
+    /// Newest mtime and file count across the store; the daemon and the panel
+    /// poll this to notice out-of-band edits without a filesystem-watch
+    /// dependency.
+    ///
+    /// The count is here because an mtime cannot see a file leave: archiving a
+    /// task removes `tasks/x.md`, and the newest mtime left behind is the same
+    /// one as before. So both halves have to reach the answer, which is why
+    /// they are counted apart and mixed at the end. Folding the count into the
+    /// same accumulator — `max` with each mtime, then `+1` per file — let one
+    /// absorb the other: two files at `T` and one file at `T+1` both came out
+    /// `T+2`, and that is precisely the pair `wsp done` writes when it
+    /// archives one task and saves another a second later. Nothing compares
+    /// fingerprints for order, only for equality, so a collision is silent —
+    /// the panel keeps painting a task that is no longer there.
+    ///
+    /// Nanoseconds rather than seconds for the same reason: two writes to one
+    /// task inside a second are two changes, and a store that rewrites a file
+    /// the moment it claims it hits that window constantly. Filesystems that
+    /// only keep whole seconds degrade to the old resolution rather than break.
     pub fn fingerprint(&self) -> u64 {
         let mut newest = 0u64;
+        let mut files = 0u64;
         for dir in [self.projects_dir(), self.tasks_dir()] {
             let Ok(entries) = fs::read_dir(dir) else { continue };
             for e in entries.flatten() {
+                files += 1;
                 if let Ok(meta) = e.metadata() {
                     if let Ok(m) = meta.modified() {
                         if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
-                            newest = newest.max(d.as_secs());
+                            newest = newest.max(d.as_nanos() as u64);
                         }
                     }
                 }
-                newest = newest.wrapping_add(1); // count files too
             }
         }
-        newest
+        newest.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(files)
     }
 
     // ---- ephemeral state ------------------------------------------------
@@ -662,4 +680,72 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     }
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = Store { root: root.clone(), state: root.join("state") };
+        store.ensure_dirs().unwrap();
+        store
+    }
+
+    fn task_file(store: &Store, name: &str, at: SystemTime) {
+        let path = store.tasks_dir().join(name);
+        fs::write(&path, "x").unwrap();
+        let f = fs::File::options().write(true).open(&path).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(at)).unwrap();
+    }
+
+    /// The two halves of the fingerprint have to survive into the answer
+    /// separately, and this is the pair that proves it: two task files a
+    /// moment old, then one of them archived and the other written a second
+    /// later. The store is completely different and the old accumulator —
+    /// `max` with each mtime, `+1` per file, into the same u64 — called both
+    /// states `T+2`. The daemon and the panel only ever compare fingerprints
+    /// for equality, so a collision is not a near miss: the panel goes on
+    /// painting the task that is no longer there, and nothing moves it until
+    /// some unrelated write does.
+    #[test]
+    fn a_task_leaving_never_looks_like_a_task_being_touched() {
+        let store = scratch("fp-collision");
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+
+        task_file(&store, "a.md", t);
+        task_file(&store, "b.md", t);
+        let two_files = store.fingerprint();
+
+        fs::remove_file(store.tasks_dir().join("b.md")).unwrap();
+        task_file(&store, "a.md", t + Duration::from_secs(1));
+        let one_file_a_second_later = store.fingerprint();
+
+        assert_ne!(
+            two_files, one_file_a_second_later,
+            "archiving one task and writing another read as no change at all"
+        );
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// A file arriving is a change even when it is older than everything
+    /// already there — `wsp unarchive` puts back a task whose mtime is
+    /// whatever git wrote, and a store that has grown by one file may not
+    /// answer the same as the store that had not.
+    #[test]
+    fn a_file_arriving_moves_the_fingerprint_even_when_it_is_the_oldest() {
+        let store = scratch("fp-count");
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+
+        task_file(&store, "a.md", t);
+        let alone = store.fingerprint();
+
+        task_file(&store, "b.md", t - Duration::from_secs(3600));
+        assert_ne!(alone, store.fingerprint(), "an older file arriving was invisible");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
 }
