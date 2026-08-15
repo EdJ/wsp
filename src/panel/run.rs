@@ -156,14 +156,22 @@ pub fn run(store: &Store) -> i32 {
         });
     }
 
-    print!("\x1b[?1049h\x1b[?25l");
+    // `?1000h` reports button presses and releases; `?1006h` asks for them in
+    // SGR form, which is the only encoding with coordinates past column 223 —
+    // the older one packs them into single bytes and simply cannot say 240.
+    // Motion reporting (`?1002`/`?1003`) is deliberately not asked for: it
+    // floods the pane for a feature nobody wanted, and the terminal's own text
+    // selection is worth more than anything we would build on top of it.
+    print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
     let _ = std::io::stdout().flush();
     stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
     let outcome = event_loop(store, &rx, self_ws.as_deref());
 
     stty(&["sane"]);
-    print!("\x1b[?25h\x1b[?1049l");
+    // Off in the reverse order, and before the alternate screen goes: a pane
+    // left reporting mouse events into a shell prints gibberish on every click.
+    print!("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
 
     if let Outcome::Reload = outcome {
@@ -209,6 +217,23 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
 
         let mut refetch = false;
         match msg {
+            // Step one of mouse support, and the only question that matters:
+            // does a click on a pane you are not focused in reach the program
+            // running in it, or does herdr take it to move focus? Report what
+            // arrives and let a person click. Until that is answered, a click
+            // does nothing else — landing the cursor somewhere on the strength
+            // of coordinates nobody has checked is how you find out they were
+            // off by a header.
+            Msg::Key(k @ (Key::Click { .. } | Key::Wheel { .. })) => {
+                match k {
+                    Key::Click { x, y } => say(&mut ui, format!("click  col {x}  row {y}")),
+                    Key::Wheel { up } => {
+                        say(&mut ui, format!("wheel {}", if up { "up" } else { "down" }))
+                    }
+                    _ => {}
+                }
+                draw(&ui, &view, &mut last);
+            }
             Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
                 Effect::Quit => return Outcome::Quit,
                 Effect::None => {}

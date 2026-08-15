@@ -35,6 +35,12 @@ pub(crate) enum Key {
     Home,
     End,
     Char(char),
+    /// A press, in cells, 0-based from the top-left of the pane. The terminal
+    /// counts from 1; the correction happens here so nothing downstream has to
+    /// remember which convention it is holding.
+    Click { x: usize, y: usize },
+    /// The wheel, which reports as buttons 64 and 65 rather than as motion.
+    Wheel { up: bool },
     /// Ctrl-C, which raw mode delivers as a byte rather than a signal.
     Interrupt,
 }
@@ -226,8 +232,32 @@ fn ground(b: u8, out: &mut Vec<Key>) {
 /// unanswered returns `None`, which is a sequence consumed and dropped rather
 /// than one spilled into whatever is reading keys.
 fn key_of(seq: &Csi) -> Option<Key> {
-    // Private sequences are mouse reports and terminal replies. Parsed, so
-    // they cannot leak; not answered, because nothing has asked yet.
+    // An SGR mouse report: `ESC [ < button ; col ; row M` for a press, `m` for
+    // the release. This is what the private marker was being carried for.
+    //
+    // Only the press is answered. A release carries the same coordinates and
+    // answering both would do everything twice — and the release of a click
+    // that started somewhere else is not an event about this row at all.
+    if seq.private == Some(b'<') {
+        let b = seq.params.first().copied().unwrap_or(0);
+        let x = seq.params.get(1).copied().unwrap_or(1).saturating_sub(1) as usize;
+        let y = seq.params.get(2).copied().unwrap_or(1).saturating_sub(1) as usize;
+        if seq.final_byte != b'M' {
+            return None;
+        }
+        // Bit 6 marks the wheel; the low two bits then say which way. Modifier
+        // bits (4 shift, 8 alt, 16 ctrl) are masked off — the panel has nothing
+        // that a shift-click should mean, and letting them through would make
+        // a click with a stray modifier silently do nothing.
+        return match b & 0b1100_0011 {
+            64 => Some(Key::Wheel { up: true }),
+            65 => Some(Key::Wheel { up: false }),
+            0 => Some(Key::Click { x, y }),
+            _ => None,
+        };
+    }
+    // Every other private sequence is a terminal reply to something we never
+    // asked. Parsed so it cannot leak; not answered.
     if seq.private.is_some() {
         return None;
     }
@@ -315,12 +345,57 @@ mod tests {
     }
 
     #[test]
-    fn mouse_reports_leave_nothing() {
-        // SGR: press and release, which is what task 017 will read.
-        assert_eq!(then_typing(b"\x1b[<0;12;34M\x1b[<0;12;34m"), vec![Key::Char('x')]);
-        // X10, whose three bytes come after the final and here spell a
-        // sequence that would otherwise arrive as ` !"`.
+    fn a_press_is_a_click_and_a_release_is_nothing() {
+        // ESC [ < 0 ; 13 ; 4 M — button 0 down at column 13, row 4.
+        assert_eq!(keys(b"\x1b[<0;13;4M"), vec![Key::Click { x: 12, y: 3 }]);
+        // The release carries the same place and must not do it twice.
+        assert_eq!(keys(b"\x1b[<0;13;4m"), vec![]);
+    }
+
+    #[test]
+    fn the_wheel_reports_as_a_button() {
+        assert_eq!(keys(b"\x1b[<64;1;1M"), vec![Key::Wheel { up: true }]);
+        assert_eq!(keys(b"\x1b[<65;1;1M"), vec![Key::Wheel { up: false }]);
+    }
+
+    /// A click with a stray modifier held should still be a click on that row.
+    #[test]
+    fn modifier_bits_do_not_swallow_a_click() {
+        for b in [4u8, 8, 16, 28] {
+            let seq = format!("\x1b[<{};5;5M", b);
+            assert_eq!(
+                keys(seq.as_bytes()),
+                vec![Key::Click { x: 4, y: 4 }],
+                "button byte {b} should still read as button 0"
+            );
+        }
+    }
+
+    /// The right and middle buttons mean nothing here, and must not be read as
+    /// the left one.
+    #[test]
+    fn other_buttons_are_dropped() {
+        assert_eq!(then_typing(b"\x1b[<1;5;5M"), vec![Key::Char('x')]);
+        assert_eq!(then_typing(b"\x1b[<2;5;5M"), vec![Key::Char('x')]);
+    }
+
+    /// The X10 form still leaves nothing. Its three bytes sit *outside* the
+    /// grammar, after the final, so it is the one report that has to be
+    /// consumed by counting rather than by parsing — and it is not answered,
+    /// because no terminal sends it once SGR has been asked for.
+    #[test]
+    fn the_x10_report_is_still_eaten_whole() {
         assert_eq!(then_typing(b"\x1b[M \x21\x22"), vec![Key::Char('x')]);
+    }
+
+    /// SGR reports used to be dropped; now the press is a click. What must not
+    /// change is that nothing of the sequence survives into the text stream.
+    #[test]
+    fn an_sgr_report_leaves_no_tail_behind() {
+        assert_eq!(
+            then_typing(b"\x1b[<0;12;34M\x1b[<0;12;34m"),
+            vec![Key::Click { x: 11, y: 33 }, Key::Char('x')]
+        );
     }
 
     /// A terminal reply to a query nobody here made — colour, cursor position,

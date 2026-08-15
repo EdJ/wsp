@@ -212,6 +212,8 @@ fn key_name(k: Key) -> String {
         Key::End => "⇲".into(),
         Key::Backspace => "\u{232b}".into(),
         Key::Interrupt => "^C".into(),
+        Key::Click { x, y } => format!("click {x},{y}"),
+        Key::Wheel { up } => if up { "wheel ↑".into() } else { "wheel ↓".into() },
     }
 }
 
