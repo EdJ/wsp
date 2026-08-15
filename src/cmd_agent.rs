@@ -946,6 +946,118 @@ pub fn overlap(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The pane's content out of a `pane.read` reply.
+///
+/// It arrives wrapped — `{"type": "pane_read", "read": {…}}` — which the
+/// schema's own `PaneReadResult` does not say, and reading it flat returns an
+/// empty string rather than an error: the command worked, the pane looked
+/// blank, and nothing said why. So unwrap it if the wrapper is there and read
+/// it flat if it is not, and keep working whichever shape a later herdr sends.
+fn read_body(r: &serde_json::Value) -> &serde_json::Value {
+    r.get("read").unwrap_or(r)
+}
+
+/// `wsp peek [<target>]` — read what is actually on a pane.
+///
+/// Every interface bug on 2026-08-15 cost a round trip through a person's eyes:
+/// a key that did nothing because the binary was stale, a cursor scrolled off
+/// the pane, a closed column still showing a shell prompt. In each case the
+/// pane was displaying the answer and the agent that wrote the code could not
+/// see it, so the loop was guess, build, install, ask, wait.
+///
+/// herdr has been able to answer this all along — `pane.read` returns the
+/// characters on a pane. What was missing is a way to name the pane you mean.
+/// Nobody reaches for it under pressure if reaching for it starts with listing
+/// every pane on the machine and picking through the JSON.
+///
+/// So the target resolves the way everything else in wsp resolves: by what you
+/// call the thing, not by the id herdr filed it under.
+pub fn peek(store: &Store, args: &Args) -> i32 {
+    if !herdr::available() {
+        eprintln!("wsp: no herdr socket");
+        return 1;
+    }
+    let env = herdr::Env::read();
+    let here = args.get("workspace").or(env.workspace_id.clone());
+    let panes = herdr::panes().unwrap_or_default();
+    let mine = |label: &str| {
+        panes
+            .iter()
+            .find(|p| p.label == label && Some(&p.workspace_id) == here.as_ref())
+            .or_else(|| panes.iter().find(|p| p.label == label))
+            .map(|p| p.pane_id.clone())
+    };
+
+    let needle = args.rest.first().cloned().unwrap_or_default();
+    let (target, what) = match needle.as_str() {
+        // The common case, and the reason there is a default at all: "what
+        // does the sidebar look like right now".
+        "" | "panel" => (mine(crate::panel::PANEL_LABEL), "the panel".to_string()),
+        "view" | "detail" => (mine(crate::panel::VIEW_LABEL), "the view".to_string()),
+        "me" => (env.pane_id.clone(), "this pane".to_string()),
+        // A pane id, given as herdr writes them.
+        n if n.contains(':') && panes.iter().any(|p| p.pane_id == n) => {
+            (Some(n.to_string()), format!("pane {n}"))
+        }
+        // Otherwise a task: whichever pane holds it. This is how you look at
+        // what another agent is doing without knowing where it is sitting.
+        n => match store.find_task(n) {
+            Some(t) => {
+                let pane = store.panes_for_task(&t.id).into_iter().next();
+                (pane, format!("{} — {}", t.id, util::truncate(&t.title, 44)))
+            }
+            None => {
+                eprintln!("wsp: no pane, task or project matching `{n}`");
+                return 1;
+            }
+        },
+    };
+
+    let Some(pane) = target else {
+        // Name what is missing rather than what was asked for: "no view pane"
+        // is a fact you can act on, "nothing to peek at for view" is not.
+        let hint = match needle.as_str() {
+            "" | "panel" => "no panel in this workspace — `wsp panel install`",
+            "view" | "detail" => "no view pane open — `↵` on a row in the panel opens one",
+            _ => "nothing holds that — `wsp wip` says who holds what",
+        };
+        eprintln!("wsp: {hint}");
+        return 1;
+    };
+
+    // `visible` is what is on the pane now, which is what "what does it look
+    // like" means. `recent` reaches back through what has scrolled past, for
+    // when the question is what happened rather than what is showing.
+    let source = args.get("source").unwrap_or_else(|| "visible".into());
+    let mut params = json!({ "pane_id": pane, "source": source, "format": "text" });
+    if let Some(n) = args.get("lines").and_then(|l| l.parse::<u64>().ok()) {
+        params["lines"] = json!(n);
+    }
+    let Ok(r) = herdr::call("pane.read", params) else {
+        eprintln!("wsp: herdr would not read {pane}");
+        return 1;
+    };
+    let body = read_body(&r);
+    let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+
+    if args.json() {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "pane": pane, "what": what, "source": source, "text": text,
+            "truncated": body.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false),
+        })).unwrap_or_default());
+        return 0;
+    }
+
+    let p = Paint::new();
+    println!("{}", p.dim(&format!("{what}  ({pane})")));
+    if text.trim().is_empty() {
+        println!("{}", p.dim("(nothing on it)"));
+    } else {
+        println!("{}", text.trim_end());
+    }
+    0
+}
+
 pub fn sync_once(store: &Store, args: &Args) -> i32 {
     if !herdr::available() {
         eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
@@ -1278,4 +1390,25 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
     store.git_commit(&format!("wsp: adopt {made} workspace(s)"));
     println!("adopted {made} workspace(s)");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape that cost the first half hour of this command: a wrapped
+    /// payload read flat gives `""`, which looks exactly like a pane with
+    /// nothing on it. Both shapes have to work, and neither may be silent.
+    #[test]
+    fn a_pane_read_is_unwrapped_whichever_shape_it_arrives_in() {
+        let wrapped = json!({ "type": "pane_read", "read": { "text": "on the pane" } });
+        assert_eq!(read_body(&wrapped).get("text").unwrap(), "on the pane");
+
+        let flat = json!({ "text": "on the pane" });
+        assert_eq!(read_body(&flat).get("text").unwrap(), "on the pane");
+
+        // And an empty pane is still an empty pane, not a missing wrapper.
+        let empty = json!({ "type": "pane_read", "read": { "text": "" } });
+        assert_eq!(read_body(&empty).get("text").unwrap(), "");
+    }
 }

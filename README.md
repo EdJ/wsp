@@ -600,6 +600,40 @@ It never fails. An empty store, a herdr that is not answering, a pane belonging
 to no project: each of those is a shorter brief, not an error. A hook that
 errors on a fresh machine is a hook people delete.
 
+### Looking at a pane
+
+```sh
+wsp peek                 # the panel in this workspace
+wsp peek view            # the detail pane beside it
+wsp peek 042             # whichever pane holds that task
+wsp peek --lines 40 --source recent
+```
+
+What is actually on a pane, as text. Not a screenshot: a terminal's contents
+are already characters, and an image would need reading back out to answer
+questions the characters answer exactly.
+
+It exists because every interface bug on 2026-08-15 cost a round trip through
+somebody's eyes. A key that did nothing because the binary was stale. A cursor
+scrolled off the pane. A closed editor column still showing a shell prompt —
+which was the bug, sat on screen for an hour, while the agent that wrote the
+code read the code instead. The loop was guess, build for five minutes, install
+into twenty-two panes, ask, wait. `peek` closes it: after installing a change to
+anything a pane draws, look at the pane.
+
+herdr could always answer this — `pane.read` has been there all along. What was
+missing was a way to *name* the pane you mean. Nobody reaches for a capability
+under pressure if reaching for it starts with listing every pane on the machine
+and picking through the JSON, so the target resolves the way everything else in
+wsp resolves: by what you call the thing. No argument is the panel, because that
+is the question nine times in ten.
+
+Two things it does not do. It shows what is on the pane *now*, not what happened
+when a key was pressed — `herdr pane wait-output` is the tool for that, and it
+is a different one. And it cannot press the key: a person still makes the
+gesture, and what changes is that the agent can see the result rather than be
+told it.
+
 ### Who else is standing here
 
 ```sh
