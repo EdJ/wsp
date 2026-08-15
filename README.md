@@ -209,11 +209,12 @@ disturbing a layout you will come back to.
 | Key | On | Does |
 |---|---|---|
 | `a` | project, task, inbox | add a task in that scope |
+| | | the cursor lands on it, so `E` writes it up |
 | `P` | anywhere | new project, child of the selected one |
 | `s` `v` `d` `o` | task | start, review, done, reopen |
 | `b` | task | block, asking why |
 | `e` `n` | task | retitle, append a note |
-| `E` | task | edit its prose full-screen in a tab |
+| `E` | task, project | edit its prose full-screen in a tab |
 | `m` | task | move — the tree becomes the picker |
 | `c` | task or agent | claim, either direction — and how an agent moves on |
 | `O` | task, project | open a herdr workspace for it, and claim it |

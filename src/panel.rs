@@ -69,6 +69,9 @@ pub(crate) struct View {
     pub(crate) mode: Mode,
     /// What the detail pane is currently showing, so `↵` can close it.
     showing: Option<crate::detail::Focus>,
+    /// A row to select on the next rebuild — set when something is created, so
+    /// the cursor follows what you just made.
+    land_on: Option<String>,
     /// The key map, docked under the tree. A line in the footer could hold four
     /// of the twenty keys, which is worse than useless: it says there is a list
     /// and then shows you a fifth of it. It takes the rows it needs and no
@@ -162,7 +165,11 @@ fn open_workspace(
     if let Some(t) = task {
         env.insert("WSP_TASK".into(), json!(t));
     }
-    let mut params = json!({ "label": label, "env": env, "focus": true });
+    // The store first, then what this workspace is for — the latter wins if
+    // someone has both, which is right: it is more specific.
+    let mut merged = store_env();
+    merged.extend(env);
+    let mut params = json!({ "label": label, "env": merged, "focus": true });
     if let Some(c) = cwd {
         params["cwd"] = json!(util::expand(c).display().to_string());
     }
@@ -526,17 +533,39 @@ fn task_rows(
 /// Rebuild the rows from a snapshot, keeping the cursor where it was and
 /// carrying any pending message across. Shared with the storyboard so an
 /// offline flow lands on the same row a live one would.
-pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &View, self_ws: Option<&str>) {
+pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_ws: Option<&str>) {
     let sel = ui.sel;
+    let was = ui.selected_target();
     let msg = ui.message.take();
     *ui = collect(snap, view, self_ws);
-    ui.sel = sel.min(ui.rows.len().saturating_sub(1));
+    // The row, not the slot it was in. Claiming re-sorts the tree under the
+    // cursor — the pane row leaves one task and reappears under another, often
+    // several lines away — and holding the index would leave the eye on
+    // whatever slid into its place. Falls back to the index when the row is
+    // genuinely gone, which is the only case where there is nothing to follow.
+    ui.sel = match was {
+        Target::Nothing => sel,
+        want => ui.rows.iter().position(|r| target_of(r) == want).unwrap_or(sel),
+    };
+    ui.sel = ui.sel.min(ui.rows.len().saturating_sub(1));
     if !ui.rows.is_empty() && !ui.rows[ui.sel].selectable() {
         if let Some(next) = (ui.sel..ui.rows.len()).find(|i| ui.rows[*i].selectable()) {
             ui.sel = next;
         }
     }
     ui.message = msg;
+
+    // Something was just created: put the cursor on it. Done after the rebuild
+    // because until then the row does not exist.
+    if let Some(want) = view.land_on.take() {
+        if let Some(i) = ui.rows.iter().position(|r| match r {
+            Row::Task { id, .. } => *id == want,
+            Row::Project { id, .. } => *id == want,
+            _ => false,
+        }) {
+            ui.sel = i;
+        }
+    }
 }
 
 pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui {
@@ -1555,7 +1584,7 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
 
     let Ok(r) = herdr::call(
         "tab.create",
-        json!({ "workspace_id": ws, "label": label, "focus": true }),
+        json!({ "workspace_id": ws, "label": label, "focus": true, "env": store_env() }),
     ) else {
         return "could not create a tab".into();
     };
@@ -1685,17 +1714,38 @@ fn inspect(store: &Store, self_ws: Option<&str>, focus: &crate::detail::Focus) -
 /// Output is captured, never inherited: the panel owns an alternate screen in
 /// raw mode, and a subcommand printing into it would corrupt the frame. stdin
 /// is closed so nothing can sit waiting for input the panel will never send.
-fn run_wsp(argv: &[String]) -> Result<String, String> {
+/// What a command did: a line for the footer, and the id of whatever it made,
+/// when it made something.
+struct Made {
+    label: String,
+    id: Option<String>,
+}
+
+fn run_wsp(argv: &[String]) -> Result<Made, String> {
     let exe = std::env::current_exe().unwrap_or_else(|_| "wsp".into());
     let out = Command::new(exe)
         .args(argv)
+        .arg("--json")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
 
     match out {
-        Ok(o) if o.status.success() => Ok(argv.join(" ")),
+        // Ask for JSON so a caller can learn what was made. Nothing prints it;
+        // the panel owns the screen and stdout here is data, not output.
+        Ok(o) if o.status.success() => {
+            let made = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+                .and_then(|v| {
+                    v.get("id")
+                        .or_else(|| v.get("removed"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                });
+            Ok(Made { label: argv.join(" "), id: made })
+        }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             let first = err.lines().next().unwrap_or("failed").trim();
@@ -2306,13 +2356,16 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outco
                             // than relying on the env surviving a restart.
                             match &task {
                                 Some(t) => {
-                                    say(&mut ui, run_wsp(&[
+                                    let r = run_wsp(&[
                                         "claim".into(),
                                         t.clone(),
                                         "--pane".into(),
                                         pane.clone(),
-                                    ])
-                                    .unwrap_or_else(|e| e));
+                                    ]);
+                                    say(&mut ui, match r {
+                                        Ok(m) => m.label,
+                                        Err(e) => e,
+                                    });
                                 }
                                 None => say(&mut ui, format!("opened {label}")),
                             }
@@ -2323,7 +2376,20 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outco
                 }
                 Effect::Run { argv, escalate } => {
                     match (run_wsp(&argv), escalate) {
-                        (Ok(m), _) => say(&mut ui, m),
+                        (Ok(m), _) => {
+                            // Land the cursor on whatever was just created, so
+                            // `E` is the next key rather than a hunt. Quick
+                            // capture stays one line; writing it up is a
+                            // keystroke away rather than a mode you were forced
+                            // through.
+                            match (&m.id, argv.first().map(|s| s.as_str())) {
+                                (Some(id), Some("add")) | (Some(id), Some("project")) => {
+                                    view.land_on = Some(id.clone());
+                                    say(&mut ui, format!("{id} added · E to write it up"));
+                                }
+                                _ => say(&mut ui, m.label),
+                            }
+                        }
                         // Refused, and there is a stronger form of the same
                         // command: show what the CLI said and ask again.
                         (Err(e), Some(more)) => {
@@ -2377,7 +2443,7 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outco
         if refetch {
             last_fetch = Instant::now();
             last_fingerprint = store.fingerprint();
-            refetch_into(&mut ui, &Snapshot::live(store), &view, self_ws);
+            refetch_into(&mut ui, &Snapshot::live(store), &mut view, self_ws);
         }
         draw(&ui, &view, &mut last);
     }
@@ -2465,6 +2531,25 @@ fn widest<'a>(ws_id: &str, panes: &'a [PaneInfo]) -> Option<&'a PaneInfo> {
     .collect();
 
     candidates.into_iter().max_by_key(|p| widths.get(&p.id).copied().unwrap_or(0))
+}
+
+/// The store this panel is talking to, as environment for anything we spawn.
+///
+/// A tab or workspace herdr creates starts a fresh shell, which inherits
+/// nothing from us — so a panel pointed at a non-default store would open
+/// editors pointed at the default one. They would then fail to find the task
+/// and take the tab down with them, which looks exactly like the key not
+/// working.
+fn store_env() -> serde_json::Map<String, serde_json::Value> {
+    let mut env = serde_json::Map::new();
+    for key in ["WSP_HOME", "WSP_STATE", "WSP_NO_COMMIT"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                env.insert(key.to_string(), json!(v));
+            }
+        }
+    }
+    env
 }
 
 fn shell_quote(s: &str) -> String {
