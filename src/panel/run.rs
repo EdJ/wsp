@@ -113,6 +113,24 @@ pub(super) fn spawn_events(tx: Sender<Msg>) {
     });
 }
 
+/// Make this pane the focused one.
+///
+/// The mouse reaches an unfocused pane — that is what makes the panel worth
+/// pointing at — but it means scrolling or clicking here leaves the keyboard
+/// somewhere else, so the next `d` or `↵` goes to a pane you are not looking
+/// at. Touching the panel is a statement about where you are working.
+///
+/// The workspace first, then the pane: focusing a pane in a workspace that is
+/// not focused moves nothing you can see.
+fn focus_self(pane: Option<&str>, ws: Option<&str>) {
+    if let Some(ws) = ws {
+        let _ = herdr::call("workspace.focus", json!({ "workspace_id": ws }));
+    }
+    if let Some(p) = pane {
+        let _ = herdr::call("pane.focus", json!({ "pane_id": p }));
+    }
+}
+
 pub(super) fn focus(agent: &AgentRef) {
     let _ = herdr::call("workspace.focus", json!({ "workspace_id": agent.workspace }));
     let _ = herdr::call("pane.focus", json!({ "pane_id": agent.pane }));
@@ -195,6 +213,11 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
     let mut last = String::new();
     let mut dirty = false;
     let mut last_fetch = Instant::now();
+    // Who we are, for taking focus when the mouse says the reader is here.
+    let me = herdr::Env::read().pane_id;
+    // A scroll is a burst of events, and focus is a socket round-trip. Take it
+    // on the first of a burst and not on the ninety after it.
+    let mut took_focus = Instant::now() - Duration::from_secs(60);
     let mut last_fingerprint = store.fingerprint();
 
     let draw = |ui: &Ui, view: &View, last: &mut String| {
@@ -225,6 +248,13 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // Translated before the dispatch rather than inside it: only the loop
         // knows the pane's size, and `render::row_at` is the arithmetic that
         // drew the frame, so the row under the pointer is the row that acts.
+        if matches!(msg, Msg::Key(Key::Click { .. } | Key::Wheel { .. }))
+            && took_focus.elapsed() > Duration::from_millis(400)
+        {
+            took_focus = Instant::now();
+            focus_self(me.as_deref(), self_ws);
+        }
+
         if let Msg::Key(Key::Click { y, .. }) = msg {
             let (w, h) = term_size();
             match super::keys::click(&mut ui, &mut view, w, h, y) {
