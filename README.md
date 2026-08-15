@@ -208,7 +208,8 @@ disturbing a layout you will come back to.
 
 | Key | On | Does |
 |---|---|---|
-| `a` | project, task, inbox | add a task in that scope |
+| `a` | project, inbox | add a task in that scope |
+| `a` | task | add a **sub-task** of it |
 | | | the cursor lands on it, so `E` writes it up |
 | `P` | anywhere | new project, child of the selected one |
 | `s` `v` `d` `o` | task | start, review, done, reopen |
@@ -253,7 +254,12 @@ than borrowing the task's.
 
 `←` marks an idle agent on a task that is still `doing` — it has stopped and
 you are the blocker; the header carries the count. `⋯ n more` is the tail past
-the six-task cap.
+the six-task cap, which counts top-level work only: a sub-task is never hidden
+while its parent is on screen.
+
+A task with work under it carries the same right-hand counts a project does —
+open, `▸` in flight, `■` blocked, `✓` when everything beneath it is finished.
+Same numbers, one level down.
 
 The inbox sits at the top: unfiled work is what you triage before reading
 anything that already has a home. Loose agents sit at the foot, after the work.
@@ -330,6 +336,40 @@ ones already claimed and ones pinned `--top`.
 Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
 `$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
+
+## Sub-tasks
+
+```sh
+wsp add "Wire the daemon to the socket" --parent 005
+wsp done 005                 # refused while anything under it is open
+wsp done 005 --force         # …unless you say so
+```
+
+A task can sit under another. It is one field, `parent`, and it exists because
+work arrives at one size and gets done at another: you say *design the workspace
+management system*, and what actually happens is six things, each of which wants
+its own status, its own claim and its own log.
+
+That makes the sub-task the unit an agent can be given. Direction lands on the
+parent; the pieces beneath it are what gets claimed, worked and finished, and
+because a pane holds one current task the parent accumulates a legible trail of
+who did what and in what order.
+
+The rules are the few that keep the tree honest:
+
+- **A sub-task lives where its parent lives.** `--parent` takes the project
+  from the parent, and naming a different one is refused rather than filed —
+  one piece of work in two places in the tree is a piece of work you lose.
+- **A parent cannot be finished while its children are open.** The refusal
+  names the count; `--force` overrides it, and from the panel `d` turns the
+  refusal into the next question rather than swallowing it.
+- **A task cannot be its own parent.** `--parent` is resolved before the new id
+  is allocated, because id allocation reserves the file first — so `--parent
+  004` used to be able to match the very task being created. `doctor` reports
+  cycles as well as a missing parent, since a loop resolves at every step.
+- **Filtering never drops a child.** A task whose parent is not in the list is
+  drawn at the top level rather than hidden; a row indented under nothing is
+  just a row that looks broken.
 
 ## Moving between tasks
 

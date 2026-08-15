@@ -231,6 +231,11 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     out.push(field("status", t.status().as_str(), status_style(t.status())));
     out.push(field("priority", t.priority().as_str(), Style::Plain));
     out.push(field("project", t.project.as_deref().unwrap_or("(inbox)"), Style::Plain));
+    // What it is part of. A sub-task read on its own is missing the one thing
+    // that says why it exists.
+    if let Some(p) = t.parent.as_ref().and_then(|id| ctx.tasks.iter().find(|x| &x.id == id)) {
+        out.push(field("under", &format!("{}  {}", p.id, p.title), Style::Muted));
+    }
 
     // Own tags plus everything inherited from the project chain — the whole
     // point of inheritance is that it is invisible until something shows it.
@@ -279,6 +284,22 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
             out.push(field("pane", &format!("{} · {what} {}", p.pane_id, p.agent_status), Style::Plain));
         }
         None => out.push(field("pane", "", Style::Dim)),
+    }
+
+    // What is under it. The panel shows this as indentation and a count; here
+    // there is room to say which children, and what state each is in — which
+    // is the question you open a parent to ask.
+    let kids = resolve::children_of(&ctx.tasks, &t.id);
+    if !kids.is_empty() {
+        let under = resolve::counts_under(&ctx.tasks, &t.id);
+        out.push(Line::default());
+        out.push(heading(&format!("sub-tasks · {} of {} open", under.open, kids.len())));
+        for k in kids {
+            let mut l = Line::default();
+            l.push(Style::Dim, util::pad(k.status().as_str(), LABEL_W));
+            l.push(status_style(k.status()), util::truncate(&k.title, w.saturating_sub(LABEL_W)));
+            out.push(l);
+        }
     }
 
     // The prose, in the order it is written: what this is, then what the work

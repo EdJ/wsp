@@ -98,6 +98,19 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         task("t-004", "Ship the release notes", Some("verb"), "review"),
         task("t-006", "Waiting on the tuning table decision", Some("verb"), "blocked"),
         task("t-005", "Design workspace management system", Some("tooling"), "doing"),
+        // A decomposed task: what an agent given direction on t-005 would
+        // make for itself, and the case the tree has to render without the
+        // parent and its children coming apart.
+        {
+            let mut t = task("t-051", "Draft the store schema", Some("tooling"), "done");
+            t.parent = Some("t-005".into());
+            t
+        },
+        {
+            let mut t = task("t-052", "Wire the daemon to the socket", Some("tooling"), "doing");
+            t.parent = Some("t-005".into());
+            t
+        },
         task("t-020", "Buy new monitor stand", None, "todo"),
         task("t-021", "Renew domain for joltsite", None, "todo"),
         task("t-030", "Retired: old sidebar experiment", Some("verb"), "done"),
@@ -393,6 +406,14 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .down_to(panel::RowKind::Task)
+            .key(Key::Char('a'))
+            .type_in("Check the diffusion stage")
+            .scene("Adding under a task", "The same key on a task makes a sub-task of it — the footer says which. A sibling is one row away, on the project heading above; nothing else reaches beneath a task, and decomposing the work you are looking at is the commoner move."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Task)
             .key(Key::Char('b'))
             .type_in("waiting on the tuning table")
             .scene("Blocking, with a reason", "b asks why. `wsp block` requires a reason and so does the panel — a blocked task that does not say why is the one you cannot act on later."),
@@ -495,6 +516,7 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
     vec![
         shot("Detail: a task", "↵ on a task opens it here rather than folding something. Overview says what it is, Details carries the working material, and the log reads newest first — after the fact, the last line is the one that matters.", Focus::Task("t-003".into())),
         shot("Detail: after a handoff", "The task the Trance agent moved off. It is still doing — work underway with nobody on it is a true state, and usually means you are the blocker — but the claim has gone to the task the agent took up, and what is left is the trace: where it was worked, for how long, and what it was handed to.", Focus::Task("t-002".into())),
+        shot("Detail: a parent", "A task with work decomposed under it — what an agent given direction on this one would make for itself. The panel shows the shape as indentation and a count; there is room here to say which children and what state each is in, which is the question you open a parent to ask.", Focus::Task("t-005".into())),
         shot("Detail: a project", "↵ on a project: rolled-up work, what sits under it, and its own tasks in the panel's order.", Focus::Project("trance".into())),
         shot("Detail: nothing yet", "The pane before anything is opened. It is a reader — it waits rather than guessing.", Focus::Nothing),
     ]

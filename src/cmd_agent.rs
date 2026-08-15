@@ -834,6 +834,25 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
             if !tasks.iter().any(|x| &x.id == parent) {
                 problems.push(format!("task {} references unknown parent `{}`", t.id, parent));
             }
+            if parent == &t.id {
+                problems.push(format!("task {} is its own parent", t.id));
+            }
+        }
+        // A loop resolves at every step, so the "unknown parent" check above
+        // sees nothing wrong while the tree hangs a row beneath itself. The
+        // one-step case is already named above, and naming it twice reads as
+        // two faults.
+        let mut walk = t.parent.clone().filter(|p| p != &t.id);
+        let mut seen: Vec<String> = vec![t.id.clone()];
+        while let Some(id) = walk {
+            if seen.contains(&id) {
+                if id == t.id {
+                    problems.push(format!("task {} is in a parent cycle", t.id));
+                }
+                break;
+            }
+            seen.push(id.clone());
+            walk = tasks.iter().find(|x| x.id == id).and_then(|x| x.parent.clone());
         }
     }
 

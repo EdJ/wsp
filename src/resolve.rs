@@ -165,28 +165,115 @@ pub struct Counts {
     pub done: usize,
 }
 
+/// Fold one task into a tally. Shared by the project rollup and the sub-task
+/// rollup so the two can never disagree about what `open` means.
+fn tally(c: &mut Counts, t: &Task) {
+    match t.status() {
+        Status::Done => c.done += 1,
+        Status::Doing => {
+            c.doing += 1;
+            c.open += 1;
+        }
+        Status::Blocked => {
+            c.blocked += 1;
+            c.open += 1;
+        }
+        Status::Review => {
+            c.review += 1;
+            c.open += 1;
+        }
+        _ => c.open += 1,
+    }
+}
+
+/// The tasks directly beneath one, in id order.
+pub fn children_of<'a>(tasks: &'a [Task], id: &str) -> Vec<&'a Task> {
+    let mut kids: Vec<&Task> = tasks.iter().filter(|t| t.parent.as_deref() == Some(id)).collect();
+    kids.sort_by(|a, b| a.id.cmp(&b.id));
+    kids
+}
+
+/// Everything beneath a task, counted through the whole sub-tree.
+///
+/// Cycle-safe: `parent` is a plain string field and the store is edited by
+/// several agents at once, so a loop is a thing that can exist on disk. It is
+/// `doctor`'s job to report one, and nobody else's job to hang on it.
+pub fn counts_under(tasks: &[Task], id: &str) -> Counts {
+    let mut total = Counts::default();
+    let mut seen: Vec<&str> = vec![id];
+    let mut queue: Vec<&str> = vec![id];
+    while let Some(cur) = queue.pop() {
+        for kid in children_of(tasks, cur) {
+            if seen.contains(&kid.id.as_str()) {
+                continue;
+            }
+            seen.push(&kid.id);
+            queue.push(&kid.id);
+            tally(&mut total, kid);
+        }
+    }
+    total
+}
+
+/// Reading order: each task followed by its own children, with the depth to
+/// indent it by.
+///
+/// A task whose parent is not in `tasks` is a root here. Filtering — by
+/// project, by status, by tag — must never drop a child on the floor, and one
+/// indented under a parent that is not on screen is just a row that looks
+/// broken. Order within a level is the order it was given.
+pub fn nest(tasks: &[Task]) -> Vec<(Task, usize)> {
+    const MAX_DEPTH: usize = 6;
+    let present = |id: &str| tasks.iter().any(|t| t.id == id);
+    let mut out: Vec<(Task, usize)> = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+
+    fn walk(
+        tasks: &[Task],
+        parent: &str,
+        depth: usize,
+        out: &mut Vec<(Task, usize)>,
+        done: &mut Vec<String>,
+    ) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        for kid in tasks.iter().filter(|t| t.parent.as_deref() == Some(parent)) {
+            if done.contains(&kid.id) {
+                continue;
+            }
+            done.push(kid.id.clone());
+            out.push((kid.clone(), depth));
+            walk(tasks, &kid.id, depth + 1, out, done);
+        }
+    }
+
+    for t in tasks {
+        let rooted = match &t.parent {
+            None => true,
+            Some(p) => !present(p),
+        };
+        if rooted && !done.contains(&t.id) {
+            done.push(t.id.clone());
+            out.push((t.clone(), 0));
+            walk(tasks, &t.id, 1, &mut out, &mut done);
+        }
+    }
+    // Anything left is inside a cycle. Show it flat rather than not at all.
+    for t in tasks {
+        if !done.contains(&t.id) {
+            out.push((t.clone(), 0));
+        }
+    }
+    out
+}
+
 /// Per-project counts, rolled up so a parent includes its children.
 pub fn counts_by_project(index: &Index, tasks: &[Task]) -> BTreeMap<String, Counts> {
     let mut direct: BTreeMap<String, Counts> = BTreeMap::new();
     for t in tasks {
         let key = t.project.clone().unwrap_or_else(|| "".to_string());
-        let c = direct.entry(key).or_default();
-        match t.status() {
-            Status::Done => c.done += 1,
-            Status::Doing => {
-                c.doing += 1;
-                c.open += 1;
-            }
-            Status::Blocked => {
-                c.blocked += 1;
-                c.open += 1;
-            }
-            Status::Review => {
-                c.review += 1;
-                c.open += 1;
-            }
-            _ => c.open += 1,
-        }
+        tally(direct.entry(key).or_default(), t);
     }
 
     let mut rolled: BTreeMap<String, Counts> = BTreeMap::new();

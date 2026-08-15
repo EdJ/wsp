@@ -17,14 +17,46 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     }
 
     let index = Index::new(store.projects());
+
+    // Resolve the parent *before* an id exists. `alloc_task_id` reserves the
+    // file with O_EXCL, so afterwards `--parent 004` can match the task being
+    // created and make it its own parent — which resolves, so `doctor` sees
+    // nothing wrong, and the tree hangs a row beneath itself for ever.
+    let parent = match args.get("parent") {
+        Some(needle) => match store.find_task(&needle) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!("wsp: no such parent task `{needle}`");
+                return 1;
+            }
+        },
+        None => None,
+    };
+
+    // A sub-task belongs where its parent belongs. Filing it anywhere else
+    // splits a piece of work across two places in the tree, and the tree is
+    // the only thing that shows the two are related.
     let project = if args.has("inbox") {
         None
+    } else if let (Some(p), false) = (&parent, args.has("project")) {
+        p.project.clone()
     } else {
         match current_project(store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
     };
+    if let Some(p) = &parent {
+        if args.has("project") && p.project != project {
+            eprintln!(
+                "wsp: parent {} is in {}, not {}",
+                p.id,
+                p.project.clone().unwrap_or_else(|| "the inbox".into()),
+                project.clone().unwrap_or_else(|| "the inbox".into())
+            );
+            return 1;
+        }
+    }
 
     let id = match store.alloc_task_id() {
         Ok(id) => id,
@@ -59,15 +91,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     if project.is_none() {
         t.status_raw = "inbox".into();
     }
-    if let Some(parent) = args.get("parent") {
-        match store.find_task(&parent) {
-            Some(p) => t.parent = Some(p.id),
-            None => {
-                eprintln!("wsp: no such parent task `{parent}`");
-                return 1;
-            }
-        }
-    }
+    t.parent = parent.as_ref().map(|p| p.id.clone());
 
     if let Err(e) = store.save_task(&t) {
         eprintln!("wsp: write failed: {e}");
@@ -201,7 +225,20 @@ pub fn inbox(store: &Store, args: &Args) -> i32 {
 
 fn print_tasks(tasks: &[Task], p: &Paint, show_project: bool) {
     let idw = tasks.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
-    for t in tasks {
+    // Children under their parent, indented. The parent carries what is still
+    // open beneath it, because a one-line parent that says nothing about its
+    // children is a task you would tick off without looking.
+    for (t, depth) in crate::resolve::nest(tasks) {
+        let t = &t;
+        let indent = "  ".repeat(depth);
+        let under = crate::resolve::counts_under(tasks, &t.id);
+        let kids = if under.open > 0 {
+            p.dim(&format!("  ({} open)", under.open))
+        } else if under.done > 0 {
+            p.dim(&format!("  ({} done)", under.done))
+        } else {
+            String::new()
+        };
         let st = match t.status() {
             Status::Doing => p.cyan(&util::pad("doing", 8)),
             Status::Blocked => p.red(&util::pad("blocked", 8)),
@@ -219,11 +256,13 @@ fn print_tasks(tasks: &[Task], p: &Paint, show_project: bool) {
             String::new()
         };
         println!(
-            "  {} {} {} {}{}",
+            "  {} {} {} {}{}{}{}",
             p.dim(&util::pad(&t.id, idw)),
             st,
             prio,
-            util::truncate(&t.title, 62),
+            indent,
+            util::truncate(&t.title, 62usize.saturating_sub(indent.len())),
+            kids,
             project
         );
     }
@@ -267,6 +306,28 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     println!("{} {}", p.dim(&util::pad("created", 9)), t.created);
     println!("{} {}", p.dim(&util::pad("updated", 9)), t.updated);
+
+    // Where it sits in the work, both ways. A sub-task read on its own is
+    // missing the thing that says why it exists.
+    let all = store.tasks();
+    if let Some(parent) = t.parent.as_ref().and_then(|id| all.iter().find(|x| &x.id == id)) {
+        println!(
+            "{} {}  {}",
+            p.dim(&util::pad("under", 9)),
+            p.dim(&parent.id),
+            util::truncate(&parent.title, 56)
+        );
+    }
+    let kids = crate::resolve::children_of(&all, &t.id);
+    for (i, k) in kids.iter().enumerate() {
+        println!(
+            "{} {} {} {}",
+            p.dim(&util::pad(if i == 0 { "sub" } else { "" }, 9)),
+            p.dim(&k.id),
+            p.dim(&util::pad(k.status().as_str(), 8)),
+            util::truncate(&k.title, 56)
+        );
+    }
 
     for (pane, b) in store.bindings() {
         if b.get("task_id").and_then(|x| x.as_str()) == Some(t.id.as_str()) {
@@ -341,7 +402,19 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     // The claim, not just the binding. A finished task that keeps its claim
     // holds a workspace nothing will ever release: `adopt` goes on skipping it,
     // and after a restart `reconcile` binds an agent back to work that is over.
+    // Finishing a parent finishes a claim about its children too, and that
+    // claim is checkable. Refusing here is the same shape as `project rm`:
+    // the CLI says no, and from the panel that refusal becomes the next
+    // question rather than something a keystroke quietly overrode.
     if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
+        let open = crate::resolve::counts_under(&store.tasks(), &t.id).open;
+        if open > 0 && !args.has("force") {
+            eprintln!(
+                "wsp: {} has {open} open sub-task(s) — finish them, or `wsp done {} --force`",
+                t.id, t.id
+            );
+            return 1;
+        }
         for pane in store.panes_for_task(&t.id) {
             store.clear_binding(&pane);
         }

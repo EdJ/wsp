@@ -108,7 +108,7 @@ pub(crate) enum Mode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ask {
-    AddTask { project: Option<String> },
+    AddTask { project: Option<String>, parent: Option<String> },
     NewProject { parent: Option<String> },
     Block { task: String },
     Rename { task: String },
@@ -118,6 +118,7 @@ pub(crate) enum Ask {
 impl Ask {
     fn label(&self) -> &'static str {
         match self {
+            Ask::AddTask { parent: Some(_), .. } => "sub-task",
             Ask::AddTask { .. } => "task",
             Ask::NewProject { .. } => "project",
             Ask::Block { .. } => "why",
@@ -130,10 +131,26 @@ impl Ask {
     fn argv(&self, value: &str) -> Vec<String> {
         let v = value.trim().to_string();
         match self {
-            Ask::AddTask { project: Some(p) } => {
-                vec!["add".into(), v, "-p".into(), p.clone()]
+            Ask::AddTask { project, parent } => {
+                let mut argv = vec!["add".into(), v];
+                if let Some(p) = parent {
+                    argv.push("--parent".into());
+                    argv.push(p.clone());
+                }
+                match project {
+                    Some(p) => {
+                        argv.push("-p".into());
+                        argv.push(p.clone());
+                    }
+                    // `wsp add` with no project resolves one from the cwd, and
+                    // the panel's cwd is wherever it happens to be installed —
+                    // so the inbox has to be asked for, not left implied. A
+                    // sub-task needs neither: it goes where its parent is.
+                    None if parent.is_none() => argv.push("--inbox".into()),
+                    None => {}
+                }
+                argv
             }
-            Ask::AddTask { project: None } => vec!["add".into(), v],
             Ask::NewProject { parent: Some(p) } => {
                 vec!["project".into(), "add".into(), v, "--parent".into(), p.clone()]
             }
@@ -292,6 +309,10 @@ enum Row {
         /// Something is written in Overview or Details. Worth a mark: the
         /// whole point of writing it down is being reminded it is there.
         prose: bool,
+        /// Work beneath it, rolled up. A parent row that says nothing about
+        /// its children is one you would tick off without looking — and it is
+        /// the row a folded sub-tree has to speak for.
+        under: Counts,
     },
     /// `key` is the project the hidden tasks belong to, or `INBOX_KEY`.
     More { key: String, depth: usize, n: usize },
@@ -479,39 +500,55 @@ fn task_rows(
     rows: &mut Vec<Row>,
     needs: &mut usize,
 ) {
-    let mut mine: Vec<(&Task, Option<AgentRef>, bool)> = tasks
+    let mut mine: Vec<Task> = tasks
         .iter()
         .filter(|t| t.project.as_deref() == project)
         .filter(|t| view.show_done || t.status().is_open())
-        .map(|t| {
-            let a = agent_for_task(&t.id);
-            let needs_you =
-                a.as_ref().map(|a| a.state == "idle").unwrap_or(false) && t.status() == Status::Doing;
-            (t, a, needs_you)
-        })
+        .cloned()
         .collect();
-    mine.sort_by_key(|(t, a, n)| task_sort_key(t, a.is_some(), *n));
+    mine.sort_by_key(|t| {
+        let a = agent_for_task(&t.id);
+        let needs_you =
+            a.as_ref().map(|a| a.state == "idle").unwrap_or(false) && t.status() == Status::Doing;
+        task_sort_key(t, a.is_some(), needs_you)
+    });
 
+    // Sub-tasks follow their parent, indented. The cap counts top-level work
+    // only: hiding a child while its parent is on screen would make the parent
+    // lie about how much is under it, and the parent already carries the
+    // count that says so.
+    let nested = resolve::nest(&mine);
+    let tops = nested.iter().filter(|(_, d)| *d == 0).count();
     let key = project.unwrap_or(INBOX_KEY);
-    let shown = if view.expanded.contains(key) {
-        mine.len()
-    } else {
-        mine.len().min(MAX_TASKS_PER_PROJECT)
-    };
+    let cap = if view.expanded.contains(key) { tops } else { tops.min(MAX_TASKS_PER_PROJECT) };
 
-    for (t, a, needs_you) in mine.iter().take(shown) {
-        if *needs_you {
+    let mut seen_tops = 0;
+    for (t, sub) in &nested {
+        if *sub == 0 {
+            seen_tops += 1;
+            if seen_tops > cap {
+                break;
+            }
+        }
+        let a = agent_for_task(&t.id);
+        let needs_you =
+            a.as_ref().map(|a| a.state == "idle").unwrap_or(false) && t.status() == Status::Doing;
+        if needs_you {
             *needs += 1;
         }
         rows.push(Row::Task {
             id: t.id.clone(),
             project: t.project.clone(),
             title: t.title.clone(),
-            depth,
+            depth: depth + sub,
             status: t.status(),
             agent: a.clone(),
-            needs_you: *needs_you,
+            needs_you,
             prose: crate::model::has_prose(&t.body),
+            // Against every task, not the filtered set: a parent whose
+            // children are all done should say so rather than fall silent
+            // because `A` is off.
+            under: resolve::counts_under(tasks, &t.id),
         });
         // The pane working it hangs beneath, so the join is visible and the
         // task keeps its own status glyph instead of surrendering it to the
@@ -521,12 +558,12 @@ fn task_rows(
             rows.push(Row::Agent {
                 title: a.where_.clone(),
                 agent: a.clone(),
-                depth: depth + 1,
+                depth: depth + sub + 1,
             });
         }
     }
-    if mine.len() > shown {
-        rows.push(Row::More { key: key.to_string(), depth, n: mine.len() - shown });
+    if tops > cap {
+        rows.push(Row::More { key: key.to_string(), depth, n: tops - cap });
     }
 }
 
@@ -964,7 +1001,7 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Task { title, depth, status, agent, needs_you, prose, .. } => {
+        Row::Task { title, depth, status, agent, needs_you, prose, under, .. } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
@@ -979,10 +1016,27 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                 _ => l.push(Style::Dim, glyph::QUIET),
             }
             l.push(Style::Plain, " ");
+
+            // Work beneath it, in the same vocabulary a project row uses —
+            // the count is the same question asked one level down.
+            let mut right = Line::default();
+            if under.open > 0 {
+                right.push(Style::Dim, under.open.to_string());
+            }
+            if under.doing > 0 {
+                right.push(Style::Accent, format!(" {}{}", glyph::DOING, under.doing));
+            }
+            if under.blocked > 0 {
+                right.push(Style::Warn, format!(" {}{}", glyph::BLOCKED, under.blocked));
+            }
+            if under.open == 0 && under.done > 0 {
+                right.push(Style::Dim, format!(" {}", glyph::DONE));
+            }
             // Reserve the marker's column before truncating, or a long title
             // eats the very sign that there is more to read.
             let flag_w = if *needs_you { 2 } else { 0 } + if *prose { 2 } else { 0 };
-            let avail = w.saturating_sub(*depth + 5 + flag_w);
+            let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
+            let avail = w.saturating_sub(*depth + 5 + flag_w + count_w);
             let body = util::truncate(title, avail.max(4));
             let style = if *needs_you {
                 Style::Warn
@@ -1000,6 +1054,12 @@ fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             }
             if *needs_you {
                 l.push(Style::Warn, format!(" {}", glyph::NEEDS_YOU));
+            }
+            // Right-aligned, where a project row keeps the same numbers: they
+            // are read down the column, not along the row.
+            if !right.spans.is_empty() {
+                l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+                l.spans.extend(right.spans);
             }
         }
         Row::More { depth, n, .. } => {
@@ -2103,15 +2163,34 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         }
 
         // ---- create ----
-        Key::Char('a') => match scope(&target, ui) {
-            Some(project) => {
-                view.mode = Mode::Prompt { verb: Ask::AddTask { project }, buffer: String::new() };
+        // On a task the scope is *beneath* it. A sibling is one row away — the
+        // project heading above, or any task in it — but nothing else reaches
+        // a sub-task, and decomposing work you are looking at is the commoner
+        // move by far.
+        Key::Char('a') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Prompt {
+                    verb: Ask::AddTask {
+                        project: ui.project_of_task(id),
+                        parent: Some(id.clone()),
+                    },
+                    buffer: String::new(),
+                };
                 Effect::None
             }
-            None => {
-                say(ui, "nowhere to add that");
-                Effect::None
-            }
+            other => match scope(other, ui) {
+                Some(project) => {
+                    view.mode = Mode::Prompt {
+                        verb: Ask::AddTask { project, parent: None },
+                        buffer: String::new(),
+                    };
+                    Effect::None
+                }
+                None => {
+                    say(ui, "nowhere to add that");
+                    Effect::None
+                }
+            },
         },
         Key::Char('P') => {
             let parent = match &target {
@@ -2282,7 +2361,15 @@ fn toggle(view: &mut View, want: crate::detail::Focus) -> Effect {
 /// Status verbs all have the same shape: one key, a task, no input.
 fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
     match target {
-        Target::Task(id) => Effect::Run { argv: vec![verb.to_string(), id.clone()], escalate: None },
+        Target::Task(id) => Effect::Run {
+            argv: vec![verb.to_string(), id.clone()],
+            // `done` on a parent with open sub-tasks is refused by the CLI.
+            // Carry the stronger form so that refusal becomes the next
+            // question — the same shape `X` on a project already takes, and
+            // the reason the panel never has to know the rule itself.
+            escalate: (verb == "done")
+                .then(|| vec![verb.to_string(), id.clone(), "--force".into()]),
+        },
         _ => {
             say(ui, format!("{verb} needs a task"));
             Effect::None

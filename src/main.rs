@@ -224,11 +224,12 @@ fn help() {
 
 {tasks}
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]
+  wsp add "title" --parent <id>     a sub-task, filed where its parent is
   wsp ls [-p proj] [-t tag] [-s status] [--all]
   wsp inbox                         tasks with no project
   wsp show <id>                     full task, including notes
   wsp start|review|reopen <id>      move through the workflow
-  wsp done <id>                     complete
+  wsp done <id> [--force]           complete; --force over open sub-tasks
   wsp block <id> "reason"           park it, and say why
   wsp note <id> "text"              append to the log
   wsp mv <id> -p proj               reassign
