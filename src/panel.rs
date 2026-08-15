@@ -1162,7 +1162,7 @@ pub(crate) fn frame(ui: &Ui, mode: &Mode, w: usize, h: usize) -> Vec<Line> {
             Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
                 line(Style::Accent, util::truncate(m, w))
             }
-            _ => line(Style::Dim, "↵ inspect · ←→ fold · a s d · ? keys"),
+            _ => line(Style::Dim, "↵ open · E edit · a add · ? keys"),
         },
     });
 
@@ -1504,6 +1504,24 @@ fn focus(agent: &AgentRef) {
 
 // ---- main loop ----------------------------------------------------------
 
+/// Size and mtime of the binary we are running. Cheap enough to check on every
+/// tick, and enough to notice an `install` underneath us.
+pub(crate) fn exe_stamp() -> Option<(u64, u64)> {
+    let path = std::env::current_exe().ok()?;
+    let m = std::fs::metadata(path).ok()?;
+    let secs = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some((m.len(), secs))
+}
+
+/// Why the loop stopped.
+enum Outcome {
+    Quit,
+    /// The binary changed on disk. Twenty-two panes each holding a stale image
+    /// is a real cost while this is under active development — a key silently
+    /// doing what it used to do is worse than one that errors.
+    Reload,
+}
+
 pub fn run(store: &Store) -> i32 {
     if !herdr::available() {
         eprintln!("wsp: no herdr socket");
@@ -1528,12 +1546,24 @@ pub fn run(store: &Store) -> i32 {
     let _ = std::io::stdout().flush();
     stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
-    let code = event_loop(store, &rx, self_ws.as_deref());
+    let outcome = event_loop(store, &rx, self_ws.as_deref());
 
     stty(&["sane"]);
     print!("\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
-    code
+
+    if let Outcome::Reload = outcome {
+        // Replace this process rather than spawning beside it: the pane, its
+        // pty and its place in the layout all survive, and nothing has to
+        // reattach.
+        if let Ok(exe) = std::env::current_exe() {
+            use std::os::unix::process::CommandExt;
+            let err = Command::new(exe).arg("panel").exec();
+            eprintln!("wsp: could not reload: {err}");
+            return 1;
+        }
+    }
+    0
 }
 
 /// What a key asked for beyond changing the view.
@@ -1985,7 +2015,8 @@ fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
     }
 }
 
-fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
+fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outcome {
+    let started_as = exe_stamp();
     let mut view = View::default();
     let mut ui = collect(&Snapshot::live(store), &view, self_ws);
     let mut last = String::new();
@@ -2008,13 +2039,13 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
         let msg = match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(m) => m,
             Err(RecvTimeoutError::Timeout) => Msg::Tick,
-            Err(RecvTimeoutError::Disconnected) => return 0,
+            Err(RecvTimeoutError::Disconnected) => return Outcome::Quit,
         };
 
         let mut refetch = false;
         match msg {
             Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
-                Effect::Quit => return 0,
+                Effect::Quit => return Outcome::Quit,
                 Effect::None => {}
                 Effect::Refetch => refetch = true,
                 Effect::Focus(a) => focus(&a),
@@ -2106,6 +2137,9 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
                     Duration::from_secs(30)
                 };
                 if last_fetch.elapsed() >= interval {
+                    if started_as.is_some() && exe_stamp() != started_as {
+                        return Outcome::Reload;
+                    }
                     let store_changed = store.fingerprint() != last_fingerprint;
                     if dirty || store_changed {
                         refetch = true;

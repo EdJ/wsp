@@ -425,12 +425,18 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     // workspace would double herdr's fan-out for a pane that can wait. Instead
     // poll often and do nothing unless something moved — reading the target
     // and stat-ing the store is cheap, re-reading every task file is not.
+    let started_as = panel::exe_stamp();
     let mut last = String::new();
     let mut seen: Option<(Focus, u64)> = None;
     let mut quit = false;
+    let mut reload = false;
     let Ok(mut tty) = std::fs::File::open("/dev/tty") else { return 1 };
 
-    while !quit {
+    while !quit && !reload {
+        if started_as.is_some() && panel::exe_stamp() != started_as {
+            reload = true;
+            break;
+        }
         let focus = pinned.clone().unwrap_or_else(|| get_focus(store, &ws));
         let fp = store.fingerprint();
         if seen.as_ref() != Some(&(focus.clone(), fp)) {
@@ -460,5 +466,19 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     panel::stty(&["sane"]);
     print!("\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
+
+    if reload {
+        if let Ok(exe) = std::env::current_exe() {
+            use std::os::unix::process::CommandExt;
+            let mut c = std::process::Command::new(exe);
+            c.arg("view");
+            if let Some(id) = args.rest.first() {
+                c.arg(id);
+            }
+            let err = c.exec();
+            eprintln!("wsp: could not reload: {err}");
+            return 1;
+        }
+    }
     0
 }

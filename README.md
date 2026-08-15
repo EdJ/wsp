@@ -76,6 +76,12 @@ wsp panel install --all      # …or every one of them
 wsp panel uninstall
 ```
 
+Both the panel and the view watch their own binary and re-exec when it changes,
+so `install -m 755 target/release/wsp ~/.local/bin/wsp` reaches every open pane
+within a tick. `exec` rather than a respawn: the pane, its pty and its place in
+the layout all survive. Without it, twenty-two panes sit holding a stale image
+and a key silently does what it used to do — which is worse than one that errors.
+
 Install splits with `pane.split` and swaps the new pane into the narrow slot.
 It must never go back to `layout.apply`: herdr rebuilds the whole tree from
 that call and every pane in it gets a fresh terminal, which takes down any
