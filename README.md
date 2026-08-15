@@ -1291,6 +1291,12 @@ the one that is fine — and pronounce the loaded one healthy.
 `git read-tree HEAD`, with no `GIT_INDEX_FILE` set, puts it back. It writes the
 index and touches no file in the working tree.
 
+It is step 4 of `wsp commit-help` now, beside the commit that causes it: a
+private-index commit leaves `.git/index` holding the tree from before it, so
+*every* commit made the right way leaves the shared index a commit behind. The
+check found that thirty seconds after being installed, in its own commit. Doctor
+names the state; the step stops making it.
+
 ### Do not search a release binary for a string
 
 It cost an hour today, twice, in both directions. A short `&'static str` that
