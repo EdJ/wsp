@@ -922,8 +922,18 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                 l.push(Style::Dim, glyph::SHELL);
             }
             l.push(Style::Plain, " ");
+            // An agent line is live work, and accent is what live work looks
+            // like everywhere else in the tree — the counts on a project row,
+            // the ● on a working pane. Muted put a running agent in the same
+            // ink as an unclaimed task, which is the one row it is never
+            // telling you about.
+            //
+            // A shell is not live work: nobody is driving it. It stays muted,
+            // so the ▫/● distinction still separates "stopped" from "never
+            // started" in colour as well as in glyph.
             let avail = w.saturating_sub(*depth + 4).max(4);
-            l.push(Style::Muted, util::truncate(title, avail));
+            let ink = if agent.agent { Style::Accent } else { Style::Muted };
+            l.push(ink, util::truncate(title, avail));
         }
     }
     l
