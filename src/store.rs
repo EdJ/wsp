@@ -203,8 +203,11 @@ impl Store {
                 if path.extension().and_then(|x| x.to_str()) != Some("md") {
                     continue;
                 }
+                // `t-260815-001~2` is still that id's record, filed beside an
+                // earlier one. Reporting the name on disk would hide exactly
+                // the collision this is read to find.
                 if let Some(stem) = path.file_stem().and_then(|x| x.to_str()) {
-                    out.push(stem.to_string());
+                    out.push(stem.split('~').next().unwrap_or(stem).to_string());
                 }
             }
         }
@@ -240,13 +243,36 @@ impl Store {
         }
     }
 
-    pub fn archive_task(&self, t: &Task) -> std::io::Result<()> {
+    /// Retire a task to `archive/tasks/YYYY-MM/`, and return the name it took.
+    ///
+    /// Never overwrites. The archive is keyed by id, so an id handed out twice
+    /// filed the second task directly on top of the first — which is how four
+    /// tasks came to share one archived file, three of them recoverable only
+    /// from git. Ids are unique going forward, but an archive that can destroy
+    /// the record it exists to keep should not be one bug away from doing it,
+    /// so a name already taken gets a `~2` rather than a casualty.
+    pub fn archive_task(&self, t: &Task) -> std::io::Result<String> {
         let month = if t.updated.len() >= 7 { &t.updated[0..7] } else { "unknown" };
         let dir = self.archive_dir().join(month);
         fs::create_dir_all(&dir)?;
-        write_atomic(&dir.join(format!("{}.md", t.id)), &t.render())?;
+
+        let mut name = t.id.clone();
+        for n in 2..100 {
+            if !dir.join(format!("{name}.md")).exists() {
+                break;
+            }
+            name = format!("{}~{n}", t.id);
+        }
+        if dir.join(format!("{name}.md")).exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("archive already holds {} and 98 renamings of it", t.id),
+            ));
+        }
+
+        write_atomic(&dir.join(format!("{name}.md")), &t.render())?;
         let _ = fs::remove_file(self.task_path(&t.id));
-        Ok(())
+        Ok(name)
     }
 
     /// Newest mtime across the store; the daemon polls this to notice

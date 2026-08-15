@@ -625,6 +625,12 @@ fast builds are a feature here, because a session-start hook runs this binary.
 - **cwd is not identity.** Five workspaces share `~/git/Easter`. Resolution order
   is pin → binding → cwd → workspace label, so `wsp pin <project>` is the
   override when a directory is ambiguous.
+- **The archive never overwrites.** It files by id, so an id handed out twice
+  put the second task straight on top of the first: four tasks shared one
+  archived file here before anyone noticed the ids were being reused at all,
+  three of them recoverable only from git. A name already taken now gets a
+  `~2`, and `wsp rm` says so. Ids are unique going forward; an archive that can
+  destroy the record it exists to keep should not be one bug away from it.
 - **An id is never handed out twice.** `t-YYMMDD-NNN` is allocated past
   everything the day has already used, live *or* archived — not into the first
   free filename. Archiving moves a task out of `tasks/`, so the old probe gave

@@ -573,10 +573,13 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no task matching `{needle}`");
         return 1;
     };
-    if let Err(e) = store.archive_task(&t) {
-        eprintln!("wsp: archive failed: {e}");
-        return 1;
-    }
+    let filed = match store.archive_task(&t) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("wsp: archive failed: {e}");
+            return 1;
+        }
+    };
     // A retired task must not go on holding a pane or a workspace. Nothing is
     // recorded on the way out: `worked` is a trace kept on a task, and after
     // this there is no task to keep it on.
@@ -587,9 +590,13 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
     store.log_event("task-removed", json!({ "id": t.id, "project": t.project, "title": t.title }));
     store.git_commit(&format!("wsp: rm {} — {}", t.id, t.title));
     if args.json() {
-        println!("{}", json!({ "removed": t.id, "archived": true }));
-    } else {
+        println!("{}", json!({ "removed": t.id, "archived": true, "filed_as": filed }));
+    } else if filed == t.id {
         println!("removed {} (archived)", t.id);
+    } else {
+        // Say it rather than let it pass: the archive already held that id,
+        // which means two tasks have worn it.
+        println!("removed {} (archived as {filed} — that id was already in the archive)", t.id);
     }
     0
 }
