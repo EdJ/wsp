@@ -25,6 +25,7 @@ mod keys;
 mod render;
 mod rows;
 mod run;
+mod shared;
 mod verbs;
 
 pub(crate) use keys::{apply_key, Effect, View};

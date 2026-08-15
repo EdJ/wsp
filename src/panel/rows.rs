@@ -153,7 +153,7 @@ pub(crate) struct Ui {
 /// panel's. This is the seam the edit subcommands dispatch against: a command
 /// asks what the target is and refuses the ones it cannot act on, instead of
 /// every key having to re-read the row enum.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Target {
     /// A project id — `wsp add -p <id>`, `wsp project …`.
     Project(String),
@@ -168,6 +168,7 @@ pub(crate) enum Target {
     Pane(String),
     /// The overflow row, which only ever opens.
     Overflow(String),
+    #[default]
     Nothing,
 }
 

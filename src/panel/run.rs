@@ -18,7 +18,8 @@ use crate::store::Store;
 
 use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
-use super::rows::{collect, refetch_into, AgentRef, Snapshot, Ui};
+use super::rows::{collect, refetch_into, target_of, AgentRef, Snapshot, Target, Ui};
+use super::shared;
 use super::verbs::{close_view, inspect, open_workspace, pop_out, run_wsp, send_tell};
 
 
@@ -267,10 +268,52 @@ pub fn run(store: &Store) -> i32 {
     0
 }
 
+/// Take the shared view onto ours if it is not already ours, and answer with
+/// the row it wants the cursor on and the text we now agree with.
+///
+/// `agreed` is the last text this panel wrote or adopted. Equal means nobody
+/// else has touched it and there is nothing to take; `None` from the file means
+/// nothing has been written yet, which is a first run rather than an error.
+fn adopt(store: &Store, view: &mut View, agreed: &mut String) -> Target {
+    match shared::read(store) {
+        Some(text) if text != *agreed => {
+            let want = shared::parse(&text).apply(view);
+            *agreed = text;
+            want
+        }
+        _ => Target::Nothing,
+    }
+}
+
+/// Put the cursor on a row by what it *is*, never by where it was. Rows move
+/// under it constantly — the tree sorts by work — and an index carried across
+/// a rebuild lands on whatever slid into the slot.
+fn point_at(ui: &mut Ui, want: &Target) {
+    if *want == Target::Nothing {
+        return;
+    }
+    if let Some(i) = ui.rows.iter().position(|r| target_of(r) == *want) {
+        ui.sel = i;
+    }
+}
+
 pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outcome {
     let started_as = exe_stamp();
     let mut view = View::default();
+    // Open on what the last panel was showing rather than on a default tree.
+    // A panel installed in every workspace is one panel as far as anyone using
+    // it is concerned, and it should not lose the folds and the cursor every
+    // time herdr swaps which of them is on screen.
+    // What we last wrote or took. Held so a key that changes nothing durable —
+    // most of them — costs no write, and so a panel never adopts its own state
+    // back on top of itself.
+    let mut agreed = String::new();
+    let want = adopt(store, &mut view, &mut agreed);
     let mut ui = collect(&Snapshot::live(store), &view, self_ws);
+    point_at(&mut ui, &want);
+    if agreed.is_empty() {
+        agreed = shared::rendered(&shared::Shared::of(&view, ui.selected_target()));
+    }
     let mut last = String::new();
     let mut dirty = false;
     let mut last_fetch = Instant::now();
@@ -345,6 +388,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         }
 
         let mut refetch = false;
+        let is_key = matches!(msg, Msg::Key(_));
         match msg {
             Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
                 Effect::Quit => return Outcome::Quit,
@@ -510,7 +554,28 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         if refetch {
             last_fetch = Instant::now();
             last_fingerprint = store.fingerprint();
+            // Adopt before rebuilding, because the folds and the filters decide
+            // which rows there are to rebuild. A panel that has just been
+            // switched to refetches on the `workspace.focused` that named it,
+            // so this is the moment it catches up — no polling of its own.
+            //
+            // The panel being driven reads back what it just wrote, which is
+            // its own state and therefore a no-op. That is what makes "always
+            // adopt" safe: there is one keyboard, so there is one writer.
+            let want = adopt(store, &mut view, &mut agreed);
             refetch_into(&mut ui, &Snapshot::live(store), &mut view, self_ws);
+            point_at(&mut ui, &want);
+        }
+
+        // Only a key can change the durable half, so only a key is worth the
+        // comparison. A tick that serialised this five times a second in every
+        // pane on the machine would be pure heat.
+        if is_key {
+            let now = shared::rendered(&shared::Shared::of(&view, ui.selected_target()));
+            if now != agreed {
+                shared::write(store, &now);
+                agreed = now;
+            }
         }
         draw(&ui, &view, &mut last);
     }
@@ -562,6 +627,61 @@ mod tests {
             assert!(CHATTY.contains(&t), "{t} should be tick-gated");
             assert!(!SHAPE.contains(&t), "{t} is far too noisy to refetch on");
         }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wsp-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    /// The rule the ordering in the loop depends on. A panel writes the shared
+    /// view *after* it has rebuilt, so at the moment it rebuilds the file still
+    /// says where the cursor was before the key. Adopting there would drag the
+    /// cursor back off whatever was just created — `land_on` exists precisely to
+    /// put it there — so a panel only takes the file when someone else moved it.
+    #[test]
+    fn a_panel_does_not_adopt_its_own_state_back() {
+        let dir = scratch("own-state");
+        let store = Store { root: dir.clone(), state: dir.clone() };
+
+        let mut mine = View::default();
+        mine.collapsed.insert("audio".into());
+        let text = shared::rendered(&shared::Shared::of(&mine, Target::Task("t-1".into())));
+        shared::write(&store, &text);
+
+        let mut agreed = text.clone();
+        assert_eq!(
+            adopt(&store, &mut mine, &mut agreed),
+            Target::Nothing,
+            "a panel that already agrees has nothing to take",
+        );
+
+        let mut theirs = View::default();
+        let mut unseen = String::new();
+        assert_eq!(
+            adopt(&store, &mut theirs, &mut unseen),
+            Target::Task("t-1".into()),
+            "a panel that has not seen it takes it, cursor and all",
+        );
+        assert!(theirs.collapsed.contains("audio"));
+        assert_eq!(unseen, text, "and now agrees, so it will not take it twice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// First run. No file is the ordinary state of a machine that has never
+    /// opened the panel, and it must not blank the view it was given.
+    #[test]
+    fn nothing_shared_yet_leaves_the_view_alone() {
+        let dir = scratch("first-run");
+        let store = Store { root: dir.clone(), state: dir.clone() };
+        let mut view = View::default();
+        view.show_done = true;
+        let mut agreed = String::new();
+        assert_eq!(adopt(&store, &mut view, &mut agreed), Target::Nothing);
+        assert!(view.show_done, "a missing file is not an instruction to reset");
+        assert!(agreed.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Subscriptions are spelt with dots and the stream answers in underscores.
