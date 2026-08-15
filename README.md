@@ -905,6 +905,58 @@ the position that row was in, so the eye keeps the thing it was following.
 
 Every command takes `--json`.
 
+## Two agents in one tree
+
+Two agents worked this repository at once on 2026-08-15. Six times, one of them
+took or removed work belonging to the other. None of the six was carelessness,
+and each got past the defence built after the last one — which is the useful
+part, because the defences were individually correct and collectively assumed
+something that was not true: that a checkout belongs to whoever is looking at
+it.
+
+A shared checkout has four pieces of shared mutable state, and we found them in
+this order, each by being bitten:
+
+| Shared | How it bites |
+|---|---|
+| the working tree | your edit lands in their commit, or a `git stash` reverts their files under them |
+| `.git/index` | `git add` writes to one index for everybody; whoever commits takes it all |
+| `target/` | concurrent builds serialise on one lock, and neither build is attributable |
+| `~/.local/bin/wsp` | whoever installs last decides what every running pane is executing |
+
+### What each check catches, and what it does not
+
+This is the half worth writing down. Every incident happened inside the blind
+spot of the check we were relying on at the time.
+
+| Check | Catches | Blind to |
+|---|---|---|
+| Explicit paths (`git add <file>`) | staging a file you never meant to name | anything already staged in the shared index by someone else |
+| Reading `git diff --cached` | a hunk you did not write, if you read the **file list** and not just the hunks | nothing — but only if you actually read it; every swept hunk looked plausible in isolation |
+| Isolated build in a worktree | what you wrongly left *out*, and what you took in that only compiles against uncommitted work | whose commit it is; a coherent tree under the wrong author's message compiles perfectly |
+| A private `GIT_INDEX_FILE` | the other agent's staged work entering your commit | the working tree; two people still editing one file |
+| `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one — searching a release binary for string literals proves nothing, because LTO drops plain `&'static str` from live code |
+
+The procedure that follows from all of it is in `~/wsp/agents.md`, in the order
+you actually do it. The short version: commit through your own index, read the
+file list before the hunks, prove it in a worktree, and verify the artefact
+rather than the intention.
+
+### What none of it fixes
+
+Every rule above reduces the chance of taking someone's work; none removes it,
+because the tree itself is shared. `t-260815-022` — one working tree per agent —
+is the structural answer, and it is deliberately parked: it breaks
+`project_for_cwd`, costs a checkout and a build per agent, and isolates only the
+code, leaving the store, the index of record and the installed binary shared.
+The judgement was that the rules are cheaper until agents run unattended. The
+day nobody is reading the staged diff, that judgement changes.
+
+The other half is not a rule at all. Three of the six incidents cost nothing but
+the time spent not knowing what had happened, and all three were resolved by one
+agent telling the other what it had just done. `wsp overlap` exists to make that
+possible before the fact; saying it out loud is what makes it work.
+
 ## Source map
 
 | File | Responsibility |
