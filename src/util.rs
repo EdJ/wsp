@@ -282,6 +282,31 @@ impl Paint {
     }
 }
 
+/// Size and mtime of the binary we are running. Cheap enough to check on every
+/// tick, and enough to notice an `install` underneath us.
+///
+/// Lives here rather than beside the panel for the same reason `shell_quote`
+/// does: three unrelated long-lived processes now ask whether they have been
+/// replaced — the panel, the detail view and the daemon — and the daemon has
+/// no business importing the panel to find out.
+///
+/// Both halves are needed. A rebuild that changes nothing but a constant can
+/// come out the same length, and mtime is then the only thing that moved; two
+/// installs inside one second on a filesystem keeping whole seconds share an
+/// mtime, and size is then the only thing that moved. `None` means we could
+/// not read our own path, which is a reason not to reload rather than a
+/// reason to.
+pub fn exe_stamp() -> Option<(u64, u64)> {
+    stamp(&std::env::current_exe().ok()?)
+}
+
+/// [`exe_stamp`] against a path you name, which is the half that can be tested.
+pub fn stamp(path: &Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let secs = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some((m.len(), secs))
+}
+
 /// Wrap a string so a shell takes it as one literal argument.
 ///
 /// Single quotes, with an embedded quote spelled the only way `sh` allows:
@@ -291,4 +316,54 @@ impl Paint {
 /// quoting rule with two copies is a quoting rule with one bug.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::Duration;
+
+    fn write_at(path: &Path, body: &str, at: SystemTime) {
+        fs::write(path, body).unwrap();
+        let f = fs::File::options().write(true).open(path).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(at)).unwrap();
+    }
+
+    /// Both halves of the stamp earn their place, and each covers a case the
+    /// other misses. A rebuild that changes a constant can come out exactly as
+    /// long as the last one, and only the mtime moves; two installs inside one
+    /// second share an mtime on a filesystem keeping whole seconds, and only
+    /// the length moves. A stamp reduced to either half alone would let a
+    /// long-lived process go on executing a binary that is no longer on disk.
+    #[test]
+    fn a_replaced_binary_is_never_the_same_stamp() {
+        let dir = std::env::temp_dir().join(format!("wsp-stamp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wsp");
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+
+        write_at(&path, "aaaa", t);
+        let first = stamp(&path).unwrap();
+
+        // Same length, one second later: size alone would call this unchanged.
+        write_at(&path, "bbbb", t + Duration::from_secs(1));
+        let same_size = stamp(&path).unwrap();
+        assert_ne!(first, same_size, "a same-length rebuild read as the same binary");
+
+        // Same second, longer: mtime alone would call this unchanged.
+        write_at(&path, "bbbbb", t + Duration::from_secs(1));
+        let same_second = stamp(&path).unwrap();
+        assert_ne!(same_size, same_second, "a second install in the same second was invisible");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A path we cannot read is not a change. The callers reload on `!=`, so a
+    /// `None` treated as a value would make every unreadable moment — an
+    /// install mid-copy — look like a new binary worth exec'ing into.
+    #[test]
+    fn a_path_that_is_not_there_has_no_stamp() {
+        assert_eq!(stamp(Path::new("/nonexistent/wsp")), None);
+    }
 }

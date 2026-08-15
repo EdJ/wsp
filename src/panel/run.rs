@@ -15,13 +15,13 @@ use serde_json::json;
 use crate::herdr;
 use crate::input::Key;
 use crate::store::Store;
+use crate::util::exe_stamp;
 
 use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
 use super::shared;
 use super::verbs::{close_view, inspect, pop_out, run_wsp, send_tell};
-
 
 pub(super) enum Msg {
     Key(Key),
@@ -201,15 +201,6 @@ fn focus_self(pane: Option<&str>, ws: Option<&str>) {
 pub(super) fn focus(agent: &AgentRef) {
     let _ = herdr::call("workspace.focus", json!({ "workspace_id": agent.workspace }));
     let _ = herdr::call("pane.focus", json!({ "pane_id": agent.pane }));
-}
-
-/// Size and mtime of the binary we are running. Cheap enough to check on every
-/// tick, and enough to notice an `install` underneath us.
-pub(crate) fn exe_stamp() -> Option<(u64, u64)> {
-    let path = std::env::current_exe().ok()?;
-    let m = std::fs::metadata(path).ok()?;
-    let secs = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    Some((m.len(), secs))
 }
 
 /// Why the loop stopped.

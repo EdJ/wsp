@@ -42,7 +42,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     // workspace would double herdr's fan-out for a pane that can wait. Instead
     // poll often and do nothing unless something moved — reading the target
     // and stat-ing the store is cheap, re-reading every task file is not.
-    let started_as = panel::exe_stamp();
+    let started_as = crate::util::exe_stamp();
     let mut last = String::new();
     let mut seen: Option<(Focus, u64)> = None;
     let mut quit = false;
@@ -64,7 +64,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     let mut pressed: Vec<Key> = Vec::new();
 
     while !quit && !reload {
-        if started_as.is_some() && panel::exe_stamp() != started_as {
+        if started_as.is_some() && crate::util::exe_stamp() != started_as {
             reload = true;
             break;
         }

@@ -54,6 +54,6 @@ pub(crate) fn render_row_for_test(ui: &Ui, i: usize, w: usize) -> Line {
     rows::render_row(&ui.rows[i], w, keys[i])
 }
 pub(crate) use rows::{collect, refetch_into, RowKind, Snapshot, Target, Ui};
-pub(crate) use run::{exe_stamp, stty, term_size};
+pub(crate) use run::{stty, term_size};
 pub use install::{install, install_if_adopted, uninstall};
 pub use run::run;

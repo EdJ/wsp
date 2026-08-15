@@ -79,11 +79,22 @@ wsp panel install --all      # …or every one of them
 wsp panel uninstall
 ```
 
-Both the panel and the view watch their own binary and re-exec when it changes,
-so `install -m 755 target/release/wsp ~/.local/bin/wsp` reaches every open pane
-within a tick. `exec` rather than a respawn: the pane, its pty and its place in
-the layout all survive. Without it, twenty-two panes sit holding a stale image
-and a key silently does what it used to do — which is worse than one that errors.
+The panel, the view and the daemon all watch their own binary and re-exec when
+it changes, so `install -m 755 target/release/wsp ~/.local/bin/wsp` reaches
+every long-lived process within a tick. `exec` rather than a respawn: the pane,
+its pty and its place in the layout all survive. Without it, twenty-two panes
+sit holding a stale image and a key silently does what it used to do — which is
+worse than one that errors.
+
+The daemon was the last one to get this, and its absence was quieter than the
+panel's would have been. It has no screen to look wrong: it goes on answering
+and syncing, on whatever binary it happened to start with. The one running when
+this was written had been up for a day and had sat through two installs, so a
+store fix shipped that morning was live in every panel and absent from the
+process that polls the store hardest. It re-execs at the top of its loop, where
+no sync is in flight and no lock is held, and it carries `-v` across — a daemon
+that went quiet the first time it reloaded would look exactly like one that had
+died.
 
 Install splits with `pane.split` and swaps the new pane into the narrow slot.
 It must never go back to `layout.apply`: herdr rebuilds the whole tree from
@@ -1240,7 +1251,7 @@ this order, each by being bitten:
 | the working tree | your edit lands in their commit, or a `git stash` reverts their files under them |
 | `.git/index` | `git add` writes to one index for everybody; whoever commits takes it all |
 | `target/` | concurrent builds serialise on one lock, and neither build is attributable |
-| `~/.local/bin/wsp` | whoever installs last decides what every running pane is executing |
+| `~/.local/bin/wsp` | whoever installs last decides what every running pane *and the daemon* is executing |
 
 ### What each check catches, and what it does not
 

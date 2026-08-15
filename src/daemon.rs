@@ -35,6 +35,56 @@ const EVENTS: &[&str] = &[
     "worktree.opened",
 ];
 
+/// The stamp we are now running under, if it is not the one we started with.
+///
+/// `None` for `started_as` is a daemon that could not read its own path at
+/// startup, and `None` from a later reading is one that cannot read it now —
+/// mid-install, most likely. Neither is a reason to replace ourselves with
+/// something we cannot describe, so both answer "no change".
+///
+/// Takes the reading rather than doing it, so the decision can be tested
+/// without a filesystem — the reading itself is pinned in [`crate::util`].
+fn changed(started_as: Option<(u64, u64)>, now: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    match (started_as, now) {
+        (Some(was), Some(now)) if was != now => Some(now),
+        _ => None,
+    }
+}
+
+/// Replace this process with the binary now on disk. Returns only on failure.
+///
+/// `wsp panel` and `wsp view` have done this since the day they were written,
+/// and the daemon was the one long-lived process left out — so an
+/// `install -m 755 target/release/wsp ~/.local/bin/wsp` reached every pane on
+/// the machine and left the daemon executing whatever it was started with,
+/// indefinitely. The one running when this was written had been up for a day
+/// and had sat through two installs. Nothing said so: it answers, it syncs, it
+/// is simply doing it with old code, and the store fix you just shipped is
+/// live in the panels and absent from the process that polls hardest.
+///
+/// `exec` rather than spawn-and-exit, for the reason the panel does it: the
+/// process id, and so herdr's idea of what it started, survives. What does not
+/// survive is the event-reader thread and its socket — which costs nothing,
+/// because the new image resubscribes on the way up, and a dropped stream is
+/// the case that code already handles on every herdr restart. Nothing is owed
+/// to the sync either: this is called at the top of the loop, where the last
+/// one has finished and the next has not begun.
+fn reload(verbose: bool) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    let mut c = std::process::Command::new(exe);
+    c.arg("daemon");
+    // Carried across deliberately: a daemon that went quiet the first time it
+    // reloaded would look exactly like one that had died.
+    if verbose {
+        c.arg("-v");
+    }
+    c.exec()
+}
+
 pub fn run(store: &Store, verbose: bool) -> i32 {
     if !herdr::available() {
         eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
@@ -58,6 +108,10 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     let mut cache = Cache::default();
     let mut last_refresh = Instant::now();
     let mut last_fingerprint = store.fingerprint();
+    // What we are executing, so we can notice an `install` landing underneath
+    // us. See `reload` at the top of the loop for why the daemon needs this at
+    // all when herdr restarts it.
+    let mut started_as = crate::util::exe_stamp();
 
     // Before the first sync: herdr has just come back with its workspaces and
     // agent sessions restored, but pane ids are new and no binding survived.
@@ -96,6 +150,24 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             while rx.try_recv().is_ok() {}
         }
 
+        // Here, at the top, because it is the one point in the loop where
+        // nothing is half-done: no sync in flight, no store lock held, the
+        // debounce already drained. Everything below this line either finishes
+        // or is not started.
+        if let Some(stamp) = changed(started_as, crate::util::exe_stamp()) {
+            // `reload` returns only when it failed to replace us. An install is
+            // a copy, not a rename, so there is a window in which the file on
+            // disk is a half-written binary — and unlike a panel, of which
+            // there are twenty-two, this process is the only one there is.
+            // Staying on the old image is always better than not running.
+            let e = reload(verbose);
+            eprintln!("wsp daemon: could not reload: {e}");
+            // Adopt what we failed on, so a binary that is permanently
+            // unexecutable costs one line rather than one every tick, while the
+            // next install is still a change and still tried.
+            started_as = Some(stamp);
+        }
+
         let fingerprint = store.fingerprint();
         let store_changed = fingerprint != last_fingerprint;
         last_fingerprint = fingerprint;
@@ -125,5 +197,37 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reload gate, and the two readings that must not open it. A daemon
+    /// that could not read its own path at startup has nothing to compare
+    /// against, and one that cannot read it *now* is most likely looking at a
+    /// file mid-install — the moment when exec'ing it is worst. Both have to
+    /// answer "no change", because the caller's next move on any answer but
+    /// `None` is to replace this process with what it found.
+    #[test]
+    fn only_a_stamp_we_can_read_and_did_not_start_with_is_a_reload() {
+        let started = Some((100, 1_800_000_000));
+
+        assert_eq!(changed(started, None), None, "an unreadable binary read as a new one");
+        assert_eq!(changed(None, Some((100, 1))), None, "reloaded with nothing to compare against");
+        assert_eq!(changed(started, started), None, "the binary we started with read as new");
+        assert_eq!(changed(None, None), None, "reloaded knowing nothing at all");
+
+        assert_eq!(
+            changed(started, Some((100, 1_800_000_001))),
+            Some((100, 1_800_000_001)),
+            "a same-length reinstall was not noticed"
+        );
+        assert_eq!(
+            changed(started, Some((101, 1_800_000_000))),
+            Some((101, 1_800_000_000)),
+            "a reinstall inside the same second was not noticed"
+        );
     }
 }
