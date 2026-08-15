@@ -498,8 +498,9 @@ definition in `src/overlap.rs`, so there is no second answer to drift.
 ### Wiring it to Claude Code
 
 ```sh
-chmod +x ~/claude/wsp/claude/wsp-session.sh
-# then merge claude/settings.snippet.json into ~/.claude/settings.json by hand
+chmod +x ~/claude/wsp/claude-code/wsp-session.sh
+# then merge ~/claude/wsp/claude-code/settings.snippet.json
+# into ~/.claude/settings.json — by hand, two keys
 ```
 
 Two keys, and the snippet is a snippet rather than a file to copy over the top:

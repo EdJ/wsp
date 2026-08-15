@@ -8,7 +8,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh '/Users/edjames/claude/wsp/claude/wsp-session.sh' start",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' start",
             "timeout": 5
           }
         ]
