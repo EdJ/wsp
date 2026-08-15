@@ -3,6 +3,26 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The store we are talking to, as environment for anything we spawn.
+///
+/// A pane, tab or workspace herdr creates starts a fresh shell, which inherits
+/// nothing from us — so a panel pointed at a non-default store would open
+/// editors pointed at the default one. They would then fail to find the task
+/// and take the tab down with them, which looks exactly like the key not
+/// working. An agent spawned onto a task has the same problem and a longer
+/// fuse: it would sit in a tree reading the wrong backlog.
+pub fn store_env() -> serde_json::Map<String, serde_json::Value> {
+    let mut env = serde_json::Map::new();
+    for key in ["WSP_HOME", "WSP_STATE", "WSP_NO_COMMIT"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                env.insert(key.to_string(), serde_json::Value::String(v));
+            }
+        }
+    }
+    env
+}
+
 pub fn epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

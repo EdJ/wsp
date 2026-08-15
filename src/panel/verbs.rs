@@ -15,9 +15,8 @@ use serde_json::json;
 use crate::herdr;
 use crate::input::Key;
 use crate::store::Store;
-use crate::util;
 
-use super::install::{list_panes, store_env};
+use super::install::list_panes;
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, View};
 use super::rows::{hotkeys, AgentRef, Target, Ui};
@@ -77,52 +76,6 @@ impl Ask {
             Ask::Note { task } => vec!["note".into(), task.clone(), v],
         }
     }
-}
-
-/// Open a workspace for a piece of work, rooted where that work lives.
-///
-/// `WSP_PROJECT` and `WSP_TASK` go into the workspace environment, so every
-/// pane inside it knows what it is for without anyone having to infer it from
-/// a path. herdr does not persist env across a restart, which is why the
-/// durable answer is a claim rather than this — but for the life of the
-/// session it is exact, and exactness is what the cwd heuristic lacks.
-pub(super) fn open_workspace(
-    label: &str,
-    cwd: Option<&str>,
-    project: Option<&str>,
-    task: Option<&str>,
-) -> Result<(String, String), String> {
-    let mut env = serde_json::Map::new();
-    if let Some(p) = project {
-        env.insert("WSP_PROJECT".into(), json!(p));
-    }
-    if let Some(t) = task {
-        env.insert("WSP_TASK".into(), json!(t));
-    }
-    // The store first, then what this workspace is for — the latter wins if
-    // someone has both, which is right: it is more specific.
-    let mut merged = store_env();
-    merged.extend(env);
-    let mut params = json!({ "label": label, "env": merged, "focus": true });
-    if let Some(c) = cwd {
-        params["cwd"] = json!(util::expand(c).display().to_string());
-    }
-    let r = herdr::call("workspace.create", params).map_err(|e| e.to_string())?;
-    let ws = r
-        .get("workspace")
-        .and_then(|w| w.get("workspace_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "workspace.create returned no id".to_string())?;
-    // The pane it opened with — what `claim` needs to bind to, since claim
-    // speaks in panes and knows nothing about workspaces.
-    let pane = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "workspace.create returned no pane".to_string())?;
-    Ok((ws, pane))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,16 +205,13 @@ pub(super) fn tell_find_work(a: &AgentRef, project: &str) -> Tell {
     }
 }
 
-/// Tell an agent about a task it has just been handed.
-///
-/// `wsp brief` rather than the id alone: the brief is what a session gets on
-/// the way in, so an agent handed work mid-session lands in the same place it
-/// would have started from — its project, its claim, the decisions that bind it
-/// and who else is in the tree.
+/// Tell an agent about a task it has just been handed. The sentence itself is
+/// [`crate::cmd_spawn::claimed_text`], which is also what an agent `spawn` has
+/// just started hears — one work order, however it was handed over.
 pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
     Tell {
         pane: a.pane.clone(),
-        text: format!("You have been claimed onto {task}. Run `wsp brief`, then work it."),
+        text: crate::cmd_spawn::claimed_text(task),
         note: format!("{} → {task}", a.where_),
     }
 }
@@ -370,7 +320,7 @@ pub(super) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> St
 
     let Ok(r) = herdr::call(
         "tab.create",
-        json!({ "workspace_id": ws, "label": label, "focus": true, "env": store_env() }),
+        json!({ "workspace_id": ws, "label": label, "focus": true, "env": crate::util::store_env() }),
     ) else {
         return "could not create a tab".into();
     };
@@ -805,31 +755,15 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
         },
 
-        // ---- open a workspace for this row ----
-        Key::Char('O') => match &target {
-            Target::Task(id) => {
-                let project = ui.project_of_task(id);
-                match ui.task_title(id) {
-                    Some(title) => Effect::Open {
-                        label: title,
-                        cwd: project.as_deref().and_then(|p| ui.project_root(p)),
-                        project,
-                        task: Some(id.clone()),
-                    },
-                    None => Effect::None,
-                }
-            }
-            Target::Project(p) => Effect::Open {
-                label: p.clone(),
-                cwd: ui.project_root(p),
-                project: Some(p.clone()),
-                task: None,
-            },
-            _ => {
-                say(ui, "nothing there to open a workspace for");
-                Effect::None
-            }
-        },
+        // ---- open a workspace for this row, with or without somebody in it ----
+        //
+        // Two keys rather than one that asks, because they are two different
+        // decisions and only one of them is expensive: `O` is a place to work
+        // and `S` is a colleague, and the second costs a model and a context
+        // window. A y/n between the key and the thing would put the same
+        // question in front of the cheap one every time.
+        Key::Char('O') => spawn(&target, ui, false),
+        Key::Char('S') => spawn(&target, ui, true),
 
         // ---- destructive ----
         Key::Char('X') => match &target {
@@ -876,6 +810,36 @@ pub(super) fn toggle(view: &mut View, want: crate::detail::Focus) -> Effect {
     } else {
         Effect::Inspect(want)
     }
+}
+
+/// `O` and `S`: a workspace for the row under the cursor, and for `S` an agent
+/// started in it.
+///
+/// The row decides the argument and nothing else: `wsp spawn` resolves the
+/// title, the project and the root it should stand in, so the panel does not
+/// carry a second copy of any of that — which is how `O` came to open a
+/// workspace in the wrong tree for every task under `wsp/render`, a project
+/// whose root is its parent's.
+fn spawn(target: &Target, ui: &mut Ui, agent: bool) -> Effect {
+    let (mut argv, what) = match target {
+        Target::Task(id) => (vec!["spawn".to_string(), id.clone()], id.clone()),
+        Target::Project(p) => (
+            vec!["spawn".to_string(), "-p".to_string(), p.clone()],
+            p.clone(),
+        ),
+        _ => {
+            say(ui, "nothing there to open a workspace for");
+            return Effect::None;
+        }
+    };
+    if agent {
+        argv.push("--agent".into());
+    }
+    let note = match agent {
+        true => format!("starting an agent on {what}…"),
+        false => format!("opening {what}…"),
+    };
+    Effect::Spawn { argv, note }
 }
 
 /// Status verbs all have the same shape: one key, a task, no input.

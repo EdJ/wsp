@@ -20,13 +20,18 @@ use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
 use super::shared;
-use super::verbs::{close_view, inspect, open_workspace, pop_out, run_wsp, send_tell};
+use super::verbs::{close_view, inspect, pop_out, run_wsp, send_tell};
 
 
 pub(super) enum Msg {
     Key(Key),
     Herdr(HerdrEvent),
     Tick,
+    /// A line for the footer from something that took too long to do on the
+    /// loop. Only `S` and `O` produce these today: starting an agent means
+    /// waiting on `claude` to answer, and the sidebar must go on drawing while
+    /// it does.
+    Note(String),
 }
 
 /// A herdr event, reduced to what the loop decides with.
@@ -246,7 +251,7 @@ pub fn run(store: &Store) -> i32 {
     let _ = std::io::stdout().flush();
     stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
-    let outcome = event_loop(store, &rx, self_ws.as_deref());
+    let outcome = event_loop(store, &tx, &rx, self_ws.as_deref());
 
     stty(&["sane"]);
     // Off in the reverse order, and before the alternate screen goes: a pane
@@ -306,7 +311,12 @@ fn point_at(ui: &mut Ui, want: &Cursor) -> bool {
     }
 }
 
-pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> Outcome {
+pub(super) fn event_loop(
+    store: &Store,
+    tx: &Sender<Msg>,
+    rx: &Receiver<Msg>,
+    self_ws: Option<&str>,
+) -> Outcome {
     let started_as = exe_stamp();
     let mut view = View::default();
     // Open on what the last panel was showing rather than on a default tree.
@@ -447,32 +457,25 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                 Effect::PopOut { argv, label } => {
                     say(&mut ui, pop_out(&argv, &label, self_ws));
                 }
-                Effect::Open { label, cwd, project, task } => {
-                    match open_workspace(&label, cwd.as_deref(), project.as_deref(), task.as_deref())
-                    {
-                        Ok((_ws, pane)) => {
-                            // The workspace exists; the durable record of what
-                            // it is for is the claim, so make it now rather
-                            // than relying on the env surviving a restart.
-                            match &task {
-                                Some(t) => {
-                                    let r = run_wsp(&[
-                                        "claim".into(),
-                                        t.clone(),
-                                        "--pane".into(),
-                                        pane.clone(),
-                                    ]);
-                                    say(&mut ui, match r {
-                                        Ok(m) => m.label,
-                                        Err(e) => e,
-                                    });
-                                }
-                                None => say(&mut ui, format!("opened {label}")),
-                            }
-                        }
-                        Err(e) => say(&mut ui, e),
-                    }
-                    refetch = true;
+                // Off the loop, deliberately. `wsp spawn --agent` creates a
+                // workspace, claims into it, waits for an agent to boot and
+                // then tells it what it holds — seconds, not milliseconds, and
+                // every one of them a frame the panel would not have drawn.
+                // The footer says what is happening now and the thread says how
+                // it went; nothing else here waits on either.
+                Effect::Spawn { argv, note } => {
+                    say(&mut ui, note);
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        let line = match run_wsp(&argv) {
+                            Ok(_) => match argv.iter().any(|a| a == "--agent") {
+                                true => "agent working".to_string(),
+                                false => "workspace open".to_string(),
+                            },
+                            Err(e) => e,
+                        };
+                        let _ = tx.send(Msg::Note(line));
+                    });
                 }
                 Effect::Tell(t) => match send_tell(&t) {
                     Ok(()) => say(&mut ui, t.note),
@@ -556,6 +559,12 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                     refetch = true;
                     dirty = false;
                 }
+            }
+            // A spawn has landed. Refetch as well as say so: the workspace and
+            // its agent are new rows, and the claim moved a task under them.
+            Msg::Note(line) => {
+                say(&mut ui, line);
+                refetch = true;
             }
             Msg::Tick => {
                 // The one you are looking at should feel immediate; the twenty

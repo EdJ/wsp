@@ -97,25 +97,6 @@ pub(super) fn widest<'a>(ws_id: &str, panes: &'a [PaneInfo]) -> Option<&'a PaneI
     candidates.into_iter().max_by_key(|p| widths.get(&p.id).copied().unwrap_or(0))
 }
 
-/// The store this panel is talking to, as environment for anything we spawn.
-///
-/// A tab or workspace herdr creates starts a fresh shell, which inherits
-/// nothing from us — so a panel pointed at a non-default store would open
-/// editors pointed at the default one. They would then fail to find the task
-/// and take the tab down with them, which looks exactly like the key not
-/// working.
-pub(super) fn store_env() -> serde_json::Map<String, serde_json::Value> {
-    let mut env = serde_json::Map::new();
-    for key in ["WSP_HOME", "WSP_STATE", "WSP_NO_COMMIT"] {
-        if let Ok(v) = std::env::var(key) {
-            if !v.is_empty() {
-                env.insert(key.to_string(), json!(v));
-            }
-        }
-    }
-    env
-}
-
 /// `pane.split` starts the user's shell and takes no command, so the panel is
 /// `exec`d over it — which also means quitting the panel closes the pane
 /// instead of leaving a bare prompt behind.

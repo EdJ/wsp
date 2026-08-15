@@ -55,6 +55,7 @@ wsp tree                    # hierarchy with rolled-up counts
 wsp wip                     # every agent, its task, and who needs you
 wsp where                   # what project am I in, and why
 wsp overlap                 # who else is standing in this tree
+wsp spawn 003 --agent       # open a workspace on it and put an agent in it
 ```
 
 ## The panel
@@ -376,6 +377,7 @@ disturbing a layout you will come back to.
 | `f` | idle agent | send it to find its own work |
 | | | asks which project, and remembers, if it stands nowhere |
 | `O` | task, project | open a herdr workspace for it, and claim it |
+| `S` | task, project | the same, with an agent started in it and told |
 | `X` | task, project | remove, after a `y`/`n` |
 
 Nothing is reimplemented here: a key builds an argv and the panel runs its own
@@ -384,11 +386,16 @@ the same path a person at a shell takes. `wsp rename`, `wsp rm` and
 `wsp project rm` exist because the panel needed them — `edit` opens `$EDITOR`,
 which is no use to something already drawing on the screen.
 
-`O` creates the workspace rooted at the project's root, labelled after the
-work, with `WSP_PROJECT` and `WSP_TASK` in its environment — so every pane
-inside it knows what it is for instead of the cwd having to imply it. herdr
-does not persist env across a restart, which is why the durable record is the
-claim; the env is exact for the life of the session.
+`O` and `S` are both `wsp spawn` — see [Spawning](#spawning) for what it does
+and why it is a CLI verb rather than a key. Two keys rather than one that asks,
+because only one of them is expensive: `O` is a place to work and `S` is a
+colleague with a model and a context window behind it, and a `y`/`n` between the
+key and the thing would put that question in front of the cheap one every time.
+
+`S` is the one key that does not answer on the next frame. Starting an agent is
+seconds — a shell, a boot, a readiness handshake — so it runs off the event loop
+and the footer says `starting an agent on …` while it happens. The panel goes on
+drawing throughout; the outcome replaces the line when it lands.
 
 Typing, picking and confirming are modes, not widgets: navigation and folding
 keep working inside a pick, so you hunt for a destination by reading the tree.
@@ -1123,6 +1130,76 @@ the position that row was in, so the eye keeps the thing it was following.
 
 Every command takes `--json`.
 
+## Spawning
+
+Handing work to an agent that already exists is `c`. Getting one where there is
+nobody at all is `spawn`.
+
+```sh
+wsp spawn t-260815-033             # a workspace, rooted where the work lives
+wsp spawn t-260815-033 --agent     # …with an agent started in it and told
+wsp spawn -p wsp --agent           # a project, no task, nothing to tell it
+wsp spawn 033 --agent --kind codex # any agent kind herdr knows
+wsp spawn 033 --agent --no-focus   # do not drag the screen over to it
+```
+
+It is a CLI verb before it is a key. The gesture used to exist only as `O` in
+the panel, which meant a script could not do it and neither could an agent —
+and an agent that can open a workspace for the sub-task it just filed is the
+difference between decomposing work and doing all of it yourself. The panel's
+`O` and `S` run this; there is no second copy of it behind the keys.
+
+**Workspace, claim, agent, sentence, in that order.** The claim has to land
+before the agent starts, because a Claude Code session runs `wsp brief` from
+its `SessionStart` hook and reads the claim on the way in — started first, it
+would open knowing nothing, and the sentence would be the only thing it ever
+heard about the work. The sentence is the same one `c` types into an agent that
+was already running, defined once, so an agent's work order does not depend on
+which door it came through.
+
+The claim is the one that can refuse — work that is done, work that is blocked,
+work a live agent is holding — and each refusal is a reason not to put an agent
+here: a spawn onto a blocked task is exactly what that guard exists to stop. The
+workspace is left standing either way, because it is a terminal in the right
+tree, which is what you would have opened by hand.
+
+The workspace is rooted at the project's root, labelled after the work, and
+carries `WSP_PROJECT` and `WSP_TASK` in its environment — so every pane inside
+it knows what it is for instead of the cwd having to imply it. herdr does not
+persist env across a restart, which is why the durable record is the claim; the
+env is exact for the life of the session. A root is **inherited**: `wsp/render`
+and `wsp/data` are two halves of one checkout and neither has a `roots` of its
+own, and reading only a project's own roots put the agent wherever the caller
+happened to be standing.
+
+### What "started" means, and what it does not
+
+`agent.start` does not wait for the agent. It answers immediately with
+`launch_pending: true` — it has typed `claude` at the shell and nothing more —
+and the wait herdr's own CLI does afterwards is client-side. Three things about
+that window cost an afternoon between them, and all three are load-bearing:
+
+- **A brand-new workspace has no shell yet.** `agent.start` ten milliseconds
+  after `workspace.create` is refused with `agent_pane_busy`, "not an available
+  shell". So the launch retries while that is the refusal, and gives up on any
+  other.
+- **`idle` does not mean ready.** herdr reports `agent_status: idle` while the
+  agent is still starting, and `agent.prompt` refuses in that window with
+  `agent_not_ready`. Waiting for `idle` therefore returned in half a second,
+  every time, and the work order went into a pane still drawing its banner.
+  `interactive_ready` is the field that means what `idle` looks like it means.
+- **A shell that is not quite at a prompt eats what is typed at it.** The
+  observed failure was ` mclaude`, `command not found`, and a minute of waiting
+  for an agent that was never going to exist. So `ctrl-u` and one retype — but
+  only while herdr can see no agent in the pane at all, because typing `claude`
+  at a Claude Code that is merely still booting leaves the word in its input box
+  for somebody to find later.
+
+The sentence goes through `agent.prompt` rather than being typed into the pane,
+which is what `c` still does: `c` speaks to agents herdr did not start and may
+not consider ready, and pays for it with two writes and a sleep between them.
+Here the readiness is established, so there is nothing to guess at.
+
 ## Two agents in one tree
 
 Two agents worked this repository at once on 2026-08-15. Six times, one of them
@@ -1218,6 +1295,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
+| `src/cmd_spawn.rs` | a workspace on a task, and an agent started in it |
 | `src/cmd_*.rs` | the commands |
 
 The panel is split where the *work* splits rather than by layer: a row's data

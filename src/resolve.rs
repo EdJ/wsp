@@ -65,6 +65,30 @@ impl Index {
         out
     }
 
+    /// Where a project's work lives on disk: its own first root, or failing
+    /// that the nearest ancestor's.
+    ///
+    /// Inherited for the same reason tags are. The backlog is split into
+    /// `wsp/render` and `wsp/data`, and neither has a checkout of its own —
+    /// they are two halves of one tree, and saying so twice more would be two
+    /// more paths to keep true. Without the walk, opening a workspace for a
+    /// task in either landed it wherever the panel happened to be installed.
+    pub fn root_of(&self, id: &str) -> Option<String> {
+        let mut guard: HashSet<String> = HashSet::new();
+        let mut cur = Some(id.to_string());
+        while let Some(cid) = cur {
+            if !guard.insert(cid.clone()) {
+                break; // parent cycle; doctor reports it
+            }
+            let p = self.get(&cid)?;
+            if let Some(r) = p.roots.first() {
+                return Some(r.clone());
+            }
+            cur = p.parent.clone();
+        }
+        None
+    }
+
     pub fn ancestors(&self, id: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut guard: HashSet<String> = HashSet::new();

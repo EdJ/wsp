@@ -11,6 +11,7 @@ mod cmd_agent;
 mod cmd_brief;
 mod cmd_mandate;
 mod cmd_project;
+mod cmd_spawn;
 mod cmd_task;
 mod daemon;
 mod detail;
@@ -31,7 +32,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here",
+    "help", "version", "no-commit", "closed", "here", "agent", "no-focus",
 ];
 
 pub struct Args {
@@ -87,6 +88,27 @@ impl Args {
 
         let cmd = if positional.is_empty() { String::new() } else { positional.remove(0) };
         Args { cmd, rest: positional, flags }
+    }
+
+    /// A command line one command builds for another, instead of shelling out
+    /// to itself.
+    ///
+    /// `spawn` opens a workspace and then claims a task into the pane it made,
+    /// and a claim is thirty lines of guards — done work reopened, a block
+    /// walked past, work taken off a live agent — that must have exactly one
+    /// implementation. The panel already refuses to keep a second copy of them
+    /// and runs the CLI; inside the CLI the same rule means calling the same
+    /// function, which needs the arguments it reads.
+    pub fn synth(cmd: &str, rest: &[&str], flags: &[(&str, &str)]) -> Args {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in flags {
+            map.entry((*k).to_string()).or_default().push((*v).to_string());
+        }
+        Args {
+            cmd: cmd.to_string(),
+            rest: rest.iter().map(|s| (*s).to_string()).collect(),
+            flags: map,
+        }
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -219,6 +241,7 @@ fn main() {
         "brief" => cmd_brief::brief(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
+        "spawn" => cmd_spawn::spawn(&store, &args),
         "mandate" => cmd_mandate::mandate(&store, &args),
         "release" => cmd_agent::release(&store, &args),
         "pin" => cmd_agent::pin(&store, &args),
@@ -298,6 +321,9 @@ fn help() {
   wsp brief                         what this pane is for, and who else is working
   wsp commit-help                   how to commit in a tree somebody else is in
   wsp claim <id>                    bind this pane to a task, leaving the last
+  wsp spawn <id> [-p proj] [--agent [--kind claude]]
+                                    open a workspace on it, claim it there, and
+                                    start an agent in it; --no-focus to stay put
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project

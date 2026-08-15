@@ -38,9 +38,21 @@ fn connect(timeout: Option<Duration>) -> std::io::Result<UnixStream> {
     Ok(s)
 }
 
-/// One request, one reply.
+/// One request, one reply. Three seconds, which is generous for everything
+/// herdr answers out of its own state.
 pub fn call(method: &str, params: Value) -> std::io::Result<Value> {
-    let mut s = connect(Some(Duration::from_secs(3)))?;
+    call_for(method, params, Duration::from_secs(3))
+}
+
+/// The same, for the calls that wait on something outside herdr.
+///
+/// `agent.start` types `claude` at a shell and comes back when the agent
+/// answers, which is three seconds on this machine and up to thirty by its own
+/// documented default. Sent through [`call`] it read as a socket that had gone
+/// quiet: the agent started, the reply arrived after we had stopped listening,
+/// and the caller reported a failure that had not happened.
+pub fn call_for(method: &str, params: Value, timeout: Duration) -> std::io::Result<Value> {
+    let mut s = connect(Some(timeout))?;
     let req = json!({ "id": format!("wsp:{}", util::epoch_nanos()), "method": method, "params": params });
     s.write_all(format!("{req}\n").as_bytes())?;
     s.flush()?;

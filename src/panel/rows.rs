@@ -274,8 +274,6 @@ pub(crate) struct Ui {
     pub(super) review_only: bool,
     /// The agents are in place of the tree.
     pub(super) agents: bool,
-    /// project id -> its first root, for opening a workspace where the work is.
-    pub(super) roots: std::collections::BTreeMap<String, String>,
 }
 
 /// What the cursor is sitting on, in the store's own terms rather than the
@@ -435,19 +433,6 @@ impl Ui {
 
     pub(crate) fn selected_index(&self) -> usize {
         self.sel
-    }
-
-    pub(super) fn task_title(&self, task: &str) -> Option<String> {
-        self.rows.iter().find_map(|r| match r {
-            Row::Task { id, title, .. } if id == task => Some(title.clone()),
-            _ => None,
-        })
-    }
-
-    /// Where a project lives on disk, if it says. A project with no root has
-    /// nowhere to open, so the workspace lands wherever herdr defaults to.
-    pub(super) fn project_root(&self, project: &str) -> Option<String> {
-        self.roots.get(project).cloned()
     }
 
     /// The row for a pane, wherever in the tree it is drawn. A claim names a
@@ -1095,11 +1080,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         self_focused,
         show_done: view.show_done,
         review_only: view.review_only,
-        roots: snap
-            .projects
-            .iter()
-            .filter_map(|p| p.roots.first().map(|r| (p.id.clone(), r.clone())))
-            .collect(),
     }
 }
 

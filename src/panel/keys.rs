@@ -131,7 +131,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("d o", "done, reopen"),
                 ("b e n", "block, retitle, note"),
                 ("m c f", "move, claim, find work"),
-                ("O", "open a workspace"),
+                ("O S", "open a terminal, an agent"),
                 ("X", "remove, after y/n"),
             ],
         ),
@@ -165,9 +165,17 @@ pub(crate) enum Effect {
     Focus(AgentRef),
     Sync,
     Quit,
-    /// Open a herdr workspace for this row, then claim the task into it if
-    /// there is one.
-    Open { label: String, cwd: Option<String>, project: Option<String>, task: Option<String> },
+    /// `wsp spawn` for this row: a workspace, the claim, and an agent in it if
+    /// one was asked for.
+    ///
+    /// Argv rather than the pieces, for the same reason [`Effect::Run`] is
+    /// argv: the CLI is the one implementation and the panel is a caller of it.
+    /// Unlike `Run` it does not block the loop — starting an agent means
+    /// waiting for `claude` to answer, which is seconds, and a sidebar that
+    /// stops repainting while it happens reads as one that has crashed. So
+    /// `note` is what the footer says *now*, and what the command has to say
+    /// arrives later as a [`super::run::Msg::Note`].
+    Spawn { argv: Vec<String>, note: String },
     /// Show this row in the detail pane, making one if there is not one yet.
     Inspect(crate::detail::Focus),
     /// Shut the detail pane.
