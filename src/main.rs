@@ -109,6 +109,14 @@ impl Args {
     pub fn json(&self) -> bool {
         self.has("json")
     }
+    /// Every flag name given, for a command that would rather refuse one it
+    /// does not know than guess at what was meant. `edit` is the case that
+    /// forced this: it took an unrecognised `--<section>` for "no section
+    /// given", which is the combined-buffer path, and wrote the payload over
+    /// `Overview`. A typo cost prose and printed success.
+    pub fn flag_names(&self) -> Vec<&str> {
+        self.flags.keys().map(|s| s.as_str()).collect()
+    }
     /// Remaining positionals joined — titles, notes, reasons.
     pub fn text(&self, from: usize) -> String {
         self.rest.iter().skip(from).cloned().collect::<Vec<_>>().join(" ")
@@ -269,7 +277,7 @@ fn help() {
   wsp block <id> "reason"           park it, and say why
   wsp decide <task|proj> "…"      record what was settled, and why
   wsp note <id> "text"              append to the log
-  wsp edit <id> [--overview|--details]   prose, in $EDITOR
+  wsp edit <id> [--overview|--details|--decisions]  prose, in $EDITOR
   wsp edit <id> --overview --from F|-    …or from a file, or stdin
   wsp mv <id> -p proj               reassign, sub-tree and all
   wsp mv <id> --parent <id>|none    re-parent it, or detach it

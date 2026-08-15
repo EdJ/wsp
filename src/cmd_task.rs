@@ -831,7 +831,7 @@ pub struct Prose {
 
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp edit <id> [--overview | --details | --raw]");
+        eprintln!("usage: wsp edit <id> [--overview | --details | --decisions | --raw]");
         return 2;
     };
     let Some(t) = store.find_task(&needle) else {
@@ -903,19 +903,52 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         return edit_file(store, &item.path, &format!("edit {}", item.id));
     }
 
-    let one = if args.has("overview") {
-        Some("Overview")
-    } else if args.has("details") {
-        Some("Details")
-    } else {
-        None
-    };
+    // A flag this command does not know is a typo, and the cost of guessing is
+    // the prose that was already there: an unrecognised `--<section>` used to
+    // read as "no section given", take the combined-buffer path, and — because
+    // the payload carried no headings — land whole on `Overview`. Refusing is
+    // the only answer that cannot lose anything.
+    const KNOWN: [&str; 5] = ["raw", "from", "json", "no-commit", "help"];
+    let unknown: Vec<&str> = args
+        .flag_names()
+        .into_iter()
+        .filter(|f| {
+            !KNOWN.contains(f) && !crate::model::PROSE.iter().any(|s| s.to_lowercase() == *f)
+        })
+        .collect();
+    if let Some(f) = unknown.first() {
+        eprintln!(
+            "wsp: unknown flag `--{f}` — sections are {}",
+            crate::model::PROSE
+                .iter()
+                .map(|s| format!("--{}", s.to_lowercase()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return 2;
+    }
+
+    // Two sections at once has no meaning: each names a different buffer, and
+    // silently preferring the first would write one and drop the other.
+    let named: Vec<&str> = crate::model::PROSE
+        .iter()
+        .copied()
+        .filter(|s| args.has(&s.to_lowercase()))
+        .collect();
+    if named.len() > 1 {
+        eprintln!(
+            "wsp: {} name different sections — edit one at a time",
+            named.iter().map(|s| format!("--{}", s.to_lowercase())).collect::<Vec<_>>().join(" and ")
+        );
+        return 2;
+    }
+    let one = named.first().copied();
 
     let before = match one {
         Some(sec) => crate::model::section_of(&item.body, sec).unwrap_or_default(),
         None => {
             let mut b = String::new();
-            for sec in ["Overview", "Details"] {
+            for sec in crate::model::PROSE {
                 b.push_str(&format!("## {sec}\n"));
                 let text = crate::model::section_of(&item.body, sec).unwrap_or_default();
                 if !text.trim().is_empty() {
@@ -1001,22 +1034,45 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
     match one {
         Some(sec) => crate::model::set_section_in(&mut body, sec, &after),
         None => {
-            let ov = crate::model::section_of(&after, "Overview");
-            let de = crate::model::section_of(&after, "Details");
-            if ov.is_none() && de.is_none() {
-                // Both headings were deleted and something was typed anyway.
+            // Every editable section, not the two that happened to exist when
+            // this was written. A `## Decisions` block typed into the combined
+            // buffer used to be read by nobody and written back by nothing —
+            // the save reported success and the text was simply gone.
+            //
+            // Presence, not content, decides what gets written. A heading still
+            // on screen with nothing under it is someone clearing that section;
+            // a heading the buffer never carried is a section this edit was not
+            // about, and writing it back empty would delete prose nobody
+            // touched. Only `--from`/stdin can produce the second case, and it
+            // is the one an agent hits.
+            let loose = crate::model::section_of(&after, "").unwrap_or_default();
+            let present: Vec<&str> = crate::model::PROSE
+                .iter()
+                .copied()
+                .filter(|s| crate::model::has_section(&after, s))
+                .collect();
+            if present.is_empty() {
+                // Every heading was deleted and something was typed anyway.
                 // Keeping it under Overview is a guess; discarding it is not a
                 // guess, it is losing the only thing the user actually wrote.
                 crate::model::set_section_in(&mut body, "Overview", after.trim());
             } else {
-                let loose = crate::model::section_of(&after, "").unwrap_or_default();
-                let overview = match (loose.trim().is_empty(), ov) {
-                    (true, o) => o.unwrap_or_default(),
-                    (false, Some(o)) => format!("{}\n\n{}", loose.trim(), o),
-                    (false, None) => loose.trim().to_string(),
-                };
-                crate::model::set_section_in(&mut body, "Overview", &overview);
-                crate::model::set_section_in(&mut body, "Details", &de.unwrap_or_default());
+                for name in crate::model::PROSE {
+                    let mut text = crate::model::section_of(&after, name).unwrap_or_default();
+                    // Prose above the first heading belongs to Overview — that
+                    // is where someone who deleted the heading and kept typing
+                    // meant it to go, and it is the first section either way.
+                    if name == "Overview" && !loose.trim().is_empty() {
+                        text = if text.trim().is_empty() {
+                            loose.trim().to_string()
+                        } else {
+                            format!("{}\n\n{}", loose.trim(), text)
+                        };
+                    } else if !present.contains(&name) {
+                        continue;
+                    }
+                    crate::model::set_section_in(&mut body, name, &text);
+                }
             }
         }
     }

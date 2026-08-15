@@ -383,7 +383,7 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
 /// `wsp project set`, so there is nothing here an editor needs to reach.
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp project edit <id> [--overview | --details | --raw]");
+        eprintln!("usage: wsp project edit <id> [--overview | --details | --decisions | --raw]");
         return 2;
     };
     let index = Index::new(store.projects());

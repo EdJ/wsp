@@ -180,6 +180,18 @@ pub fn section_of(body: &str, name: &str) -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
+/// Whether a body carries a `## <name>` heading at all, empty or not.
+///
+/// [`section_of`] cannot answer this — it reports an empty section as absent,
+/// which is right for reading and wrong for writing an edit back. A heading the
+/// buffer still shows with nothing under it means *clear this*; a heading the
+/// buffer never carried means *this was not on screen, leave it alone*. Reading
+/// both as "absent" is how a combined-buffer save wipes the section it was not
+/// editing.
+pub fn has_section(body: &str, name: &str) -> bool {
+    split_sections(body).iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+}
+
 /// Replace a section, or add it if absent. Sections are rewritten in the
 /// canonical order and anything the schema does not know about is kept — the
 /// body is the user's, and losing a heading nobody anticipated would be a
@@ -232,8 +244,21 @@ pub fn set_section_in(body: &mut String, name: &str, text: &str) {
 /// `Log` does not — every task acquires one by being worked, so it would mark
 /// everything and therefore nothing.
 pub fn has_prose(body: &str) -> bool {
-    ["Overview", "Details", "Decisions"].iter().any(|s| section_of(body, s).is_some())
+    PROSE.iter().any(|s| section_of(body, s).is_some())
 }
+
+/// The sections a person writes: [`SECTIONS`] without `Log`.
+///
+/// The list exists so that "which sections can be edited" is answered in one
+/// place. It used to be answered in three, by three literals, and the third —
+/// `edit_prose`'s — was still naming two of them after `Decisions` shipped.
+/// `wsp edit --decisions` therefore fell through to the combined-buffer path
+/// and overwrote `Overview` while reporting success. A vocabulary that lives in
+/// one place cannot go stale in two others.
+///
+/// `Log` is not here. It is append-only, `wsp note` is how you add to it, and
+/// editing history in place is how history stops being evidence.
+pub const PROSE: [&str; 3] = ["Overview", "Details", "Decisions"];
 
 /// The headings a task or project body carries, in the order they are written.
 ///
@@ -472,5 +497,27 @@ mod tests {
     fn a_decision_alone_marks_a_row_as_written_on() {
         assert!(has_prose("## Decisions\n- 2026-08-15 settled\n"));
         assert!(!has_prose("## Log\n- 2026-08-15 claimed\n"));
+    }
+
+    /// The distinction a combined-buffer save turns on. `section_of` reports an
+    /// emptied section as absent, which is right for reading and would, on the
+    /// way back, delete a section that was never on screen.
+    #[test]
+    fn an_emptied_section_is_present_even_though_it_reads_as_absent() {
+        let b = "## Overview\nkept\n\n## Details\n\n";
+        assert_eq!(section_of(b, "Details"), None, "empty reads as absent");
+        assert!(has_section(b, "Details"), "…but the heading is still there");
+        assert!(!has_section(b, "Decisions"), "and one never written is not");
+    }
+
+    /// `Log` is append-only and belongs to `wsp note`, so it is not offered to
+    /// an editor. Everything else in the vocabulary is, and the two lists must
+    /// not drift — `edit_prose` naming its own pair is what let `--decisions`
+    /// fall through and overwrite `Overview`.
+    #[test]
+    fn the_editable_sections_are_the_body_minus_the_log() {
+        let editable: Vec<&str> = SECTIONS.iter().copied().filter(|s| *s != "Log").collect();
+        assert_eq!(PROSE.to_vec(), editable);
+        assert!(!PROSE.contains(&"Log"));
     }
 }

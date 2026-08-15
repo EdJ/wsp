@@ -345,11 +345,12 @@ task list in `wsp project show`, because it is a constraint on what may be
 picked up next and belongs in front of the list of things somebody might pick.
 
 ```sh
-wsp edit <id>                    # both sections, headings included
+wsp edit <id>                    # every prose section, headings included
 wsp edit <id> --overview         # just that prose
 wsp edit <id> --details
+wsp edit <id> --decisions
 wsp edit <id> --raw              # the whole file, when the frontmatter is wrong
-wsp project edit <id> [--overview|--details|--raw]
+wsp project edit <id> [--overview|--details|--decisions|--raw]
 
 wsp edit <id> --overview -       # …or from stdin, for something without hands
 wsp edit <id> --details --from notes.md
@@ -369,7 +370,7 @@ frontmatter, and the point of `--from` is that nobody is reading what goes
 past: a generated file landing on `status:` is not an edit, it is a task the
 tools can no longer read.
 
-Projects carry the same two sections and take the same editors — `roots`,
+Projects carry the same sections and take the same editors — `roots`,
 `tags`, `parent` and `status` all have `wsp project set`, so there is nothing
 in a project's frontmatter an editor needs to reach either. A row with anything
 written in it is marked `≡` in the tree, because the point of writing it down
@@ -383,8 +384,27 @@ with would silently undo whatever happened meanwhile.
 `wsp edit` never puts the frontmatter in front of you. A typo in `status:` is
 one keystroke from a task the tools can no longer read, and there is nothing to
 gain by allowing it — the part worth writing by hand is the prose. Sections come
-back in canonical order, headings you invented are kept, and if you delete both
-headings and type anyway your text is filed under Overview rather than dropped.
+back in canonical order, headings you invented are kept, and if you delete every
+heading and type anyway your text is filed under Overview rather than dropped.
+
+Which sections exist is answered once, by `model::PROSE` — `SECTIONS` without
+`Log`. It is one list because it was briefly three, and the third went stale:
+`edit_prose` still named `Overview` and `Details` after `## Decisions` shipped,
+so `wsp edit <id> --decisions` was not a section flag at all. It read as *no
+section given*, took the combined-buffer path, found no headings in the incoming
+text, and wrote the lot over `Overview` — reporting success. The flag a person
+reaches for first, the moment the section is documented, silently destroyed the
+prose it was aimed at.
+
+Two rules came out of that, and both are about refusing to guess:
+
+- **A flag `edit` does not know is refused**, rather than read as the absence of
+  a flag. Guessing is what cost the prose, and a typo should cost nothing.
+- **Presence decides what is written back, not content.** A heading still on
+  screen with nothing under it means *clear this section*. A heading the buffer
+  never carried means *this edit was not about that section* — leave what is
+  stored alone. Collapsing the two is how a save wipes a section nobody touched,
+  which is reachable from `--from` and stdin, which is to say from an agent.
 
 ## Adopting what is already open
 
