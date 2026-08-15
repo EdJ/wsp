@@ -422,19 +422,19 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     let tree_len = ui.rows.len() - ui.dock;
     let tree_rows = body_rows - dock_rows;
     let scroll = match view.scroll {
-        // A cursor down in the dock is not in the tree, and the tree owes it
-        // nothing: the dock is pinned and always drawn, so following a cursor
-        // into it would scroll the tree to its end to answer a question about
-        // a row that was on screen the whole time.
-        Some(s) if ui.sel >= tree_len => s.min(tree_len.saturating_sub(tree_rows)),
-        // Only the keyboard is owed lookahead. A click is owed the opposite —
-        // the row staying exactly where the pointer found it — and the wheel
-        // has just said where it wants the view, so neither may be answered by
-        // moving the tree under it.
-        Some(s) => {
-            let off = if view.keyed { LOOKAHEAD } else { 0 };
-            scroll_to(s, ui.sel, tree_len, tree_rows, off)
+        // The cursor pulls the view only when the cursor is what moved. A
+        // pointer has just said where it wants to be looking — and where the
+        // selection is has nothing to do with it: the wheel is entitled to
+        // carry the view clean off the selected row and leave it selected.
+        //
+        // A cursor down in the dock never pulls it either. The dock is pinned
+        // and always drawn, so following the cursor into it would scroll the
+        // tree to its end to answer a question about a row that was on screen
+        // the whole time.
+        Some(s) if !view.keyed || ui.sel >= tree_len => {
+            s.min(tree_len.saturating_sub(tree_rows))
         }
+        Some(s) => scroll_to(s, ui.sel, tree_len, tree_rows, LOOKAHEAD),
         None => scroll_for(ui.sel.min(tree_len.saturating_sub(1)), tree_len, tree_rows),
     };
     Geometry { head: HEAD, map_rows, focus_rows, dock_rows, tree_rows, tree_len, scroll }

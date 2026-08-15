@@ -686,6 +686,11 @@ pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_w
             _ => false,
         }) {
             ui.sel = i;
+            // And the view owes it a look. The tree is allowed to sit with the
+            // cursor off the pane — a wheel puts it there — but not when the
+            // cursor has just been moved onto something you made: you would
+            // type a name, press return, and watch nothing appear.
+            view.keyed = true;
         }
     }
 }

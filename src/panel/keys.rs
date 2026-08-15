@@ -72,14 +72,21 @@ pub(crate) struct View {
     /// [`super::render::scroll_to`]. Written by the frame that drew it, so a
     /// click reads the offset the pane in front of you is actually using.
     pub(super) scroll: Option<usize>,
-    /// The cursor moved under the keyboard rather than the pointer.
+    /// The cursor is what last moved, rather than the view.
     ///
-    /// The two want opposite things of the view when the selection lands near
-    /// an edge. A keyboard is aiming: it is owed rows beyond the cursor,
-    /// because a cursor on the last line shows you everything you have walked
-    /// past and nothing you are about to reach. A pointer is not: the row has
-    /// to stay exactly where it was clicked, or the second click of
-    /// select-then-activate lands on whatever slid into its place.
+    /// This is which of the two the other one follows. With it set the view
+    /// follows the cursor — kept on the pane, with rows beyond it, because a
+    /// cursor on the last line shows you everything you have walked past and
+    /// nothing you are about to reach. Cleared, the view is where the pointer
+    /// put it and the cursor is left wherever it was: on the pane if it
+    /// happens to be, off it if the wheel has gone past it, and selected
+    /// either way.
+    ///
+    /// The pointer needs both halves of that. A click needs the row it landed
+    /// on to stay exactly where it was, or the second click of
+    /// select-then-activate lands on whatever slid into its place; the wheel
+    /// needs the view to go where it said, rather than being hauled back to a
+    /// selection the reader is deliberately looking away from.
     pub(super) keyed: bool,
     /// What the next keypress means.
     pub(crate) mode: Mode,
@@ -420,8 +427,8 @@ pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 /// The reducer. Deliberately free of I/O — it moves the cursor, changes the
 /// mode, and reports what else it wants done, so the storyboard can drive the
 /// same transitions the terminal does and get the same frames out.
-/// The wheel moves the view, three rows at a time, and the cursor only if the
-/// view would leave it behind.
+/// The wheel moves the view, three rows at a time, and nothing else. The
+/// selection is left where it is, on the pane or off it.
 ///
 /// It used to be three of what `j` does, because the view had no position to
 /// move — the cursor was the scroll. That is why scrolling back up did nothing
@@ -435,27 +442,13 @@ pub(crate) fn wheel(ui: &mut Ui, view: &mut View, w: usize, h: usize, up: bool) 
     let last = g.tree_len.saturating_sub(g.tree_rows);
     let to = if up { g.scroll.saturating_sub(STEP) } else { (g.scroll + STEP).min(last) };
     view.scroll = Some(to);
-    // The pointer is not aiming, so the view owes the cursor no lookahead —
-    // only a place on the pane.
+    // The cursor stays where it is, even when the view leaves it behind. What
+    // is selected is a thing you decided, not a consequence of where you are
+    // looking: dragging it along means a scroll to check something quietly
+    // moves the row the next verb will act on, and you have no way of knowing
+    // it did. Off the pane is a state the panel is allowed to be in — the next
+    // keystroke is what brings the view back to it.
     view.keyed = false;
-    // A cursor in the dock is not in the tree and the tree does not carry it.
-    if ui.sel >= g.tree_len || g.tree_rows == 0 {
-        return;
-    }
-    let floor = to;
-    let ceil = (to + g.tree_rows - 1).min(g.tree_len - 1);
-    if ui.sel < floor || ui.sel > ceil {
-        let want = ui.sel.clamp(floor, ceil);
-        // A line under an agent cannot hold the cursor. Step off it inwards —
-        // away from the edge the cursor was just clamped to — or the cursor
-        // lands one row outside the pane and the next frame drags the view
-        // back to it, undoing part of the scroll that put it there.
-        ui.sel = if ui.rows[want].selectable() {
-            want
-        } else {
-            step(&ui.rows, want, want == floor)
-        };
-    }
 }
 
 /// What a click at screen row `y` amounts to.

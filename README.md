@@ -224,10 +224,15 @@ screen the whole time. The tree used to be drawn from the cursor alone, held in
 the middle of the pane, which meant every single row of travel scrolled
 everything on screen.
 
-The wheel moves the view rather than the cursor, three rows a notch, and drags
-the cursor only when the view would leave it behind. A click moves the cursor
-and never the view: a pointer is owed the row staying exactly where it was
-clicked, which is the one case that gets no lookahead.
+The wheel moves the view rather than the cursor, three rows a notch, and moves
+nothing else: it will carry the view clean off the selected row and leave it
+selected. What is selected is something you decided, and going to look at
+something else must not quietly change the row the next verb acts on. Nothing
+is highlighted on the pane while you are looking away — press a cursor key and
+the view comes back to it, and carries on from there.
+
+A click moves the cursor and never the view: a pointer is owed the row staying
+exactly where it was clicked, which is the one case that gets no lookahead.
 
 The verbs are listed first because a pane too short for the whole map cuts from
 the bottom, and movement is the half you can find by pressing an arrow and

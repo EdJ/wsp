@@ -1498,12 +1498,15 @@ mod tests {
         assert!(top(&ui, &view) < bottom, "a wheel up should move the view straight away");
     }
 
-    /// And the cursor is on the pane throughout, which is what makes the next
-    /// keystroke continue from where you are looking. The wheel moves the view
-    /// and drags the cursor only when the view would leave it behind, so most
-    /// notches do not move it at all.
+    /// Scrolling away from the selection leaves it selected. The wheel moves
+    /// the view and nothing else — what is selected is something you decided,
+    /// and a scroll to go and look at something else must not quietly change
+    /// the row the next verb acts on.
+    ///
+    /// It used to drag the cursor to the near edge to keep it on the pane,
+    /// which is the same silent substitution wearing a helpful face.
     #[test]
-    fn scrolling_keeps_the_cursor_on_the_pane() {
+    fn scrolling_past_the_selection_leaves_it_selected() {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
@@ -1511,14 +1514,30 @@ mod tests {
         let visible = |ui: &panel::Ui, view: &panel::View| {
             (0..H).any(|y| panel::row_at(ui, view, W, H, y) == Some(ui.selected_index()))
         };
+
+        // Somewhere with tree above and below it, so the wheel can leave it in
+        // either direction.
+        for _ in 0..6 {
+            panel::apply_key(Key::Down, &mut ui, &mut view);
+            panel::place(&ui, &mut view, W, H);
+        }
+        let chosen = ui.selected_index();
+        let target = ui.selected_target();
+
         for n in 0..12 {
             panel::wheel(&mut ui, &mut view, W, H, false);
-            assert!(visible(&ui, &view), "after {} scrolls down", n + 1);
+            assert_eq!(ui.selected_index(), chosen, "the wheel moved the cursor, notch {}", n + 1);
+            assert_eq!(ui.selected_target(), target);
         }
-        for n in 0..20 {
-            panel::wheel(&mut ui, &mut view, W, H, true);
-            assert!(visible(&ui, &view), "after {} scrolls up", n + 1);
-        }
+        assert!(!visible(&ui, &view), "twelve notches should have left the selection behind");
+
+        // And the next press of a cursor key brings the view back to it: the
+        // keyboard is where acting happens, so the tree returns to where the
+        // acting will be.
+        panel::apply_key(Key::Down, &mut ui, &mut view);
+        panel::place(&ui, &mut view, W, H);
+        assert!(visible(&ui, &view), "a cursor key should bring the view back to the cursor");
+        assert_eq!(ui.selected_index(), chosen + 1, "and it continues from where the cursor was");
     }
 
     /// What the focus dock is drawing, read off the frame the way you would
