@@ -97,6 +97,11 @@ pub(crate) enum Mode {
         /// your behalf that a refusal should be overridden — it puts the
         /// refusal on screen and asks again.
         escalate: Option<Vec<String>>,
+        /// Carried across the question, because a confirmed claim is still a
+        /// claim: the agent has to be told either way. Dropping it here left
+        /// the one case that most needs the sentence — work taken by force —
+        /// as the one case with nobody told about it.
+        then: Option<Tell>,
     },
 }
 
@@ -234,8 +239,9 @@ pub(super) fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effe
                 // hand: once this returns, the pane it named is just a string
                 // in an argv.
                 let then = pick_tell(&verb, &ui.selected_target(), ui);
+                let escalate = verb.escalate(&argv);
                 view.mode = Mode::Browse;
-                Effect::Run { argv, escalate: None, then }
+                Effect::Run { argv, escalate, then }
             }
             None => {
                 say(ui, "not a valid destination");
@@ -264,11 +270,12 @@ pub(super) fn confirm_key(
     view: &mut View,
     argv: Vec<String>,
     escalate: Option<Vec<String>>,
+    then: Option<Tell>,
 ) -> Effect {
     match k {
         Key::Char('y') | Key::Char('Y') => {
             view.mode = Mode::Browse;
-            Effect::Run { argv, escalate, then: None }
+            Effect::Run { argv, escalate, then }
         }
         Key::Char('n') | Key::Char('N') | Key::Esc | Key::Interrupt | Key::Enter => {
             view.mode = Mode::Browse;
@@ -378,13 +385,14 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 view.mode = Mode::Pick { verb: verb.clone() };
                 pick_key(k, ui, view, verb)
             }
-            Mode::Confirm { argv, question, escalate } => {
+            Mode::Confirm { argv, question, escalate, then } => {
                 view.mode = Mode::Confirm {
                     argv: argv.clone(),
                     question,
                     escalate: escalate.clone(),
+                    then: then.clone(),
                 };
-                confirm_key(k, ui, view, argv, escalate)
+                confirm_key(k, ui, view, argv, escalate, then)
             }
         }
     };

@@ -176,6 +176,29 @@ impl Pick {
             _ => None,
         }
     }
+
+    /// The stronger form of [`argv`](Pick::argv), for when the CLI refuses.
+    ///
+    /// Only the two claims have one. `claim` refuses on work that is done, on
+    /// work a live agent is holding, and on a blocked task — three rules the
+    /// panel would otherwise have to learn a copy of, since a `Target::Task`
+    /// carries no status for a pick to refuse on. Carrying `--force` here turns
+    /// each refusal into the next question instead, which is how `done` over
+    /// open sub-tasks and `project rm` already work.
+    ///
+    /// `mv` and `mandate` have nothing to refuse on, so there is nothing
+    /// stronger to offer and offering it anyway would be a y/n that never
+    /// appears.
+    pub(super) fn escalate(&self, argv: &[String]) -> Option<Vec<String>> {
+        match self {
+            Pick::PaneForTask { .. } | Pick::TaskForPane { .. } => {
+                let mut forced = argv.to_vec();
+                forced.push("--force".into());
+                Some(forced)
+            }
+            Pick::MoveTask { .. } | Pick::WorkForAgent { .. } => None,
+        }
+    }
 }
 
 
@@ -783,6 +806,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                     argv: vec!["rm".into(), id.clone()],
                     question: format!("retire {id}?"),
                     escalate: None,
+                    then: None,
                 };
                 Effect::None
             }
@@ -799,6 +823,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                         p.clone(),
                         "--force".into(),
                     ]),
+                    then: None,
                 };
                 Effect::None
             }

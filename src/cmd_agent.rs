@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use crate::herdr;
-use crate::model::Status;
+use crate::model::{Status, Task};
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::sync;
@@ -353,6 +353,26 @@ fn leaving(store: &Store, pane: &str, workspace: &str, taking: &str) -> Vec<Stri
     out
 }
 
+/// The question a `wsp block` left behind, if it can still be found.
+///
+/// `block` records it as a `blocked: …` line in the task's log and nowhere
+/// else, and until now nothing read it back. The refusal below is where it is
+/// worth the most: "someone owes you an answer" is only actionable if it says
+/// what was asked, and the alternative is making the reader open the task to
+/// find out why the command they just ran did nothing.
+///
+/// The last one wins — a task blocked twice is waiting on the second question.
+/// The date is stepped over rather than matched, because `Task::log` is what
+/// writes it; anything that is not `- <stamp> blocked: …` is somebody else's
+/// log line and is not treated as one.
+fn blocked_question(t: &Task) -> Option<String> {
+    t.section("Log")?.lines().rev().find_map(|l| {
+        let (_stamp, rest) = l.trim().strip_prefix("- ")?.split_once(' ')?;
+        let q = rest.strip_prefix("blocked:")?.trim();
+        (!q.is_empty()).then(|| q.to_string())
+    })
+}
+
 pub fn claim(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp claim <id>   (inside a herdr pane)");
@@ -408,6 +428,29 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         eprintln!("{} {}  {}", p.yellow("✗"), p.bold(&t.id), t.title);
         eprintln!("  {}", p.dim(&format!("already {} — claiming it would reopen it", t.status_raw)));
         eprintln!("  {}", p.dim(&format!("wsp claim {} --force   to pick it back up", t.id)));
+        return 1;
+    }
+
+    // `blocked` is open — `is_open` is `!Done` — so the guard above never
+    // covered it, and a claim on a blocked task ran to the end, where the
+    // status is set to `doing`. The status is the only structured record that a
+    // decision is owed: `block` writes its question to the log and nothing
+    // reads it back, so the block was cleared by the claim and what remained
+    // was one log line no list, count or panel row shows. The whole content of
+    // `block` is "stop, someone owes you an answer", and this is the command
+    // that was walking past it — twice over from the panel, which claims a task
+    // and then types "work it" into the agent's pane.
+    //
+    // Refused rather than warned about, for the same reason as the two guards
+    // around it: a line above the work still leaves the block gone.
+    if t.status() == Status::Blocked && !args.has("force") {
+        let p = Paint::new();
+        eprintln!("{} {}  {}", p.yellow("✗"), p.bold(&t.id), t.title);
+        match blocked_question(&t) {
+            Some(q) => eprintln!("  {}", p.dim(&format!("blocked, waiting on an answer: {q}"))),
+            None => eprintln!("  {}", p.dim("blocked — a decision is owed before it is worked")),
+        }
+        eprintln!("  {}", p.dim(&format!("wsp claim {} --force   to work it anyway", t.id)));
         return 1;
     }
 
@@ -1647,5 +1690,37 @@ mod tests {
         let long = "Agents should rename as they pick up new tasks, and say so";
         assert_eq!(task_label(long).unwrap().chars().count(), 44);
         assert!(task_label(long).unwrap().ends_with('…'));
+    }
+
+    /// The refusal says what is owed, and the log is the only place that has
+    /// ever recorded it. Anything that is not a `blocked:` line written by
+    /// `Task::log` is somebody else's note and must not be read as the
+    /// question — a claim that answers "blocked, waiting on an answer: claimed
+    /// by pane w0:p3" is worse than one that says nothing.
+    #[test]
+    fn the_refusal_finds_the_question_the_block_left_behind() {
+        let mut t = Task::new("Per-project id counters", "t-024");
+        t.log("claimed by pane w0:p3");
+        assert_eq!(blocked_question(&t), None);
+
+        t.log("blocked: wsp-014 or t-260815-014?");
+        assert_eq!(blocked_question(&t), Some("wsp-014 or t-260815-014?".into()));
+
+        // Blocked twice: the second question is the one still waiting.
+        t.log("blocked: and what happens to the ids already written?");
+        assert_eq!(
+            blocked_question(&t),
+            Some("and what happens to the ids already written?".into())
+        );
+
+        // A line that only mentions one is not one.
+        let mut mentions = Task::new("…", "t-025");
+        mentions.log("hand-off — t-024 is blocked: waiting on Ed");
+        assert_eq!(blocked_question(&mentions), None);
+
+        // And a block with no reason falls back rather than showing nothing.
+        let mut bare = Task::new("…", "t-026");
+        bare.log("blocked:");
+        assert_eq!(blocked_question(&bare), None);
     }
 }

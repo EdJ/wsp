@@ -438,6 +438,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                                 question: e,
                                 argv: more,
                                 escalate: None,
+                                then,
                             };
                         }
                         (Err(e), None) => say(&mut ui, e),

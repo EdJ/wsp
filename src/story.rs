@@ -1150,6 +1150,60 @@ mod tests {
         assert!(matches!(panel::apply_key(Key::Enter, &mut ui, &mut view), panel::Effect::None));
     }
 
+    /// A pick has no status to refuse on: a `Target::Task` is an id and
+    /// nothing else, so the tree offers blocked and finished work exactly as it
+    /// offers anything else. The CLI is the only half that can tell, and
+    /// carrying `--force` is what turns its refusal into the next question
+    /// instead of a message that scrolls out of the footer.
+    #[test]
+    fn a_claim_from_the_panel_carries_the_override_it_might_need() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Task("t-020".into()) {
+                break;
+            }
+        }
+        press(&mut ui, &mut view, 'c');
+        on_pane(&mut ui, "w4:p2");
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, escalate, .. } => {
+                assert_eq!(argv, vec!["claim", "t-020", "--pane", "w4:p2"]);
+                assert_eq!(
+                    escalate.expect("a refused claim is worth asking about"),
+                    vec!["claim", "t-020", "--pane", "w4:p2", "--force"]
+                );
+            }
+            _ => panic!("the pick should run a claim"),
+        }
+    }
+
+    /// And the picks that cannot be refused carry nothing. A mandate the CLI
+    /// always accepts would only ever escalate into a y/n nobody sees.
+    #[test]
+    fn a_pick_with_nothing_to_refuse_on_offers_no_override() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w6:p1");
+        press(&mut ui, &mut view, 'f');
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Project("verb".into()) {
+                break;
+            }
+        }
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, escalate, .. } => {
+                assert_eq!(argv, vec!["mandate", "verb", "-w", "w6"]);
+                assert!(escalate.is_none());
+            }
+            _ => panic!("the pick should set the mandate"),
+        }
+    }
+
     /// The claim still lands on a busy agent — it is only the typing that is
     /// withheld, because the store is safe to change and a pane in the middle
     /// of something is not.
