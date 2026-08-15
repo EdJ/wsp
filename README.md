@@ -54,6 +54,7 @@ wsp done 003
 wsp tree                    # hierarchy with rolled-up counts
 wsp wip                     # every agent, its task, and who needs you
 wsp where                   # what project am I in, and why
+wsp overlap                 # who else is standing in this tree
 ```
 
 ## The panel
@@ -89,8 +90,17 @@ agent running in the workspace.
 
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
 closes it again), `esc` closes it, `E` pops the row's file out into an editor
-tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `r` syncs,
-`?` opens the key map.
+tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `i` shows
+ids, `r` syncs, `?` opens the key map.
+
+`i` puts each task's id in front of its title — the thing you type at a shell
+beside the thing you read. Off by default: `t-260815-004` is thirteen columns of
+a pane that is thirty wide and eleven of them are identical on every row, so
+what shows is the suffix, which is exactly what `wsp start 004` resolves. When
+another *open* task shares that suffix the date is what separates them and the
+whole id appears instead; a finished task always shows in full, because a bare
+suffix resolves against open tasks only and an id you cannot type is worse than
+no id at all.
 
 `q` and `esc` both mean "put away what is in front of me": the key map first,
 then the detail pane. Neither quits the panel — it is installed furniture in
@@ -387,6 +397,46 @@ one piece of work.
 It never fails. An empty store, a herdr that is not answering, a pane belonging
 to no project: each of those is a shorter brief, not an error. A hook that
 errors on a fresh machine is a hook people delete.
+
+### Who else is standing here
+
+```sh
+wsp overlap          # who can reach the files under my hands
+wsp overlap --json
+```
+
+```
+2 in this tree  — they can reach the files you are editing
+    wP:p3    wsp brief: what an agent is handed at session start  same tree   7m
+    wW:p3    (◑ Evaluate infinite canvas performance on MacBook)  same tree
+
+20 idle shells in other trees · wsp wip
+```
+
+The question is *where a pane is standing*, not what it claimed. On 2026-08-15
+three agents worked this repo at once, none knew, and one swept another's
+uncommitted work into a commit — and the pane that did the damage held no claim
+for the first twenty minutes of its life. A report that needs a claim to fire
+would have been silent through exactly the window that cost us. A claim makes
+the answer better; it cannot be what triggers it.
+
+So panes are ranked by how close they are: the same tree (one directory inside
+the other), the same checkout (siblings under one project root), the same
+project reached another way, then everywhere else. Only the first two are a
+warning, because only they can overwrite a file you have open. herdr reports
+where a pane's *shell* started rather than where its agent is working, which is
+why containment counts and not just equality — an agent launched from `~/claude`
+is working in `~/claude/wsp` soon enough.
+
+A pane with no agent counts. A shell is a fact about the tree, and a person at
+one can clobber a file as thoroughly as an agent can. Our own panels and view
+panes do not: they are in every workspace by construction, and counting them
+would bury the row that matters.
+
+`wsp claim` says the same thing unprompted, since claiming is the moment an
+agent commits to a tree and the cheapest moment to learn it is not alone in one.
+`wsp brief` carries it into the session-start hook. All three read the one
+definition in `src/overlap.rs`, so there is no second answer to drift.
 
 ### The standing rules
 

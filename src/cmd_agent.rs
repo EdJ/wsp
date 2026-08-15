@@ -324,6 +324,35 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         for other in &displaced {
             println!("  {}", p.dim(&format!("taken from {other}")));
         }
+        // Claiming is the moment an agent commits to a tree, and the moment it
+        // is cheapest to be told it is not alone in one. On 2026-08-15 two
+        // agents worked this repo for twenty minutes without knowing, and this
+        // line is where the first of them would have found out.
+        let w = crate::overlap::World::live(store);
+        let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+        let near: Vec<_> = crate::overlap::standing_beside(&w, &pane, cwd.as_deref())
+            .into_iter()
+            .filter(|s| s.relation.is_near())
+            .collect();
+        if !near.is_empty() {
+            println!();
+            println!(
+                "  {}",
+                p.yellow(&format!(
+                    "{} else in this tree — commit with explicit paths",
+                    near.len()
+                ))
+            );
+            for s in near.iter().take(4) {
+                println!(
+                    "  {}",
+                    p.dim(&format!("{}  {}", util::pad(&s.pane, 7), util::truncate(&s.name(), 52)))
+                );
+            }
+            if near.len() > 4 {
+                println!("  {}", p.dim(&format!("{} more · wsp overlap", near.len() - 4)));
+            }
+        }
     }
     0
 }
@@ -708,6 +737,98 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     }
     if inbox > 0 {
         println!("\n{}  {}   {}", p.dim(&util::pad("INBOX", 8)), inbox, p.dim("wsp inbox"));
+    }
+    0
+}
+
+/// `wsp overlap` — who else is standing in this tree.
+///
+/// The near set first and by itself, because that is the answer to the question
+/// worth asking: who can reach the files under my hands. Everyone else follows
+/// under a rule, as context — they cannot clobber this checkout, but knowing
+/// the tree is busy is worth a line.
+pub fn overlap(store: &Store, args: &Args) -> i32 {
+    let w = crate::overlap::World::live(store);
+    let me = pane_id(args).unwrap_or_default();
+    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+    let all = crate::overlap::standing_beside(&w, &me, cwd.as_deref());
+    let (near, far): (Vec<_>, Vec<_>) = all.iter().partition(|s| s.relation.is_near());
+
+    if args.json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "pane": me,
+                "cwd": cwd,
+                "near": near.iter().map(|s| s.json()).collect::<Vec<_>>(),
+                "elsewhere": far.iter().map(|s| s.json()).collect::<Vec<_>>(),
+            }))
+            .unwrap_or_default()
+        );
+        return 0;
+    }
+
+    let p = Paint::new();
+    if all.is_empty() {
+        println!("{}", p.dim("nobody else is standing anywhere"));
+        return 0;
+    }
+
+    let row = |s: &crate::overlap::Standing, warn: bool| {
+        let who = util::truncate(&s.name(), 44);
+        let name = if warn { p.yellow(&util::pad(&who, 44)) } else { p.dim(&util::pad(&who, 44)) };
+        let held = match s.since {
+            Some(secs) => util::duration_human(secs),
+            None => String::new(),
+        };
+        println!(
+            "  {} {}  {}  {}  {}{}",
+            // A shell is marked rather than described: nobody is driving it,
+            // but a person at one can overwrite a file as thoroughly as an
+            // agent can, and the panel already means this by `▫`.
+            p.dim(if s.agent { " " } else { crate::panel::glyph::SHELL }),
+            p.dim(&util::pad(&s.pane, 7)),
+            name,
+            p.dim(&util::pad(s.relation.as_str(), 13)),
+            p.dim(&held),
+            if s.needs_you() { p.yellow("  ← needs you") } else { String::new() }
+        );
+    };
+
+    if near.is_empty() {
+        println!("{}", p.dim("nobody else is standing in this tree"));
+    } else {
+        println!(
+            "{}  {}",
+            p.yellow(&format!("{} in this tree", near.len())),
+            p.dim("— they can reach the files you are editing")
+        );
+        for s in &near {
+            row(s, true);
+        }
+    }
+
+    // Elsewhere is context, not a warning, and most of it is idle shells that
+    // have been sitting in a directory since Tuesday. Name the ones doing
+    // something; count the rest, because twenty rows of pane id would bury the
+    // two lines above that actually matter.
+    let (busy, quiet): (Vec<_>, Vec<_>) =
+        far.into_iter().partition(|s| s.agent || s.task.is_some());
+    if !busy.is_empty() {
+        println!("\n{}", p.dim(&format!("{} elsewhere", busy.len())));
+        for s in &busy {
+            row(s, false);
+        }
+    }
+    if !quiet.is_empty() {
+        println!(
+            "\n{}",
+            p.dim(&format!(
+                "{} idle {} in other trees · wsp wip",
+                quiet.len(),
+                if quiet.len() == 1 { "shell" } else { "shells" }
+            ))
+        );
     }
     0
 }

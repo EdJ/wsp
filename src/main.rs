@@ -17,6 +17,7 @@ mod fm;
 mod herdr;
 mod input;
 mod model;
+mod overlap;
 mod panel;
 mod resolve;
 mod story;
@@ -184,6 +185,7 @@ fn main() {
         "unpin" => cmd_agent::unpin(&store, &args),
         "where" => cmd_agent::where_am_i(&store, &args),
         "wip" | "status" => cmd_agent::wip(&store, &args),
+        "overlap" => cmd_agent::overlap(&store, &args),
         "sync" => cmd_agent::sync_once(&store, &args),
         "hook" => cmd_agent::hook(&store, &args),
         "doctor" => cmd_agent::doctor(&store, &args),
@@ -250,6 +252,7 @@ fn help() {
   wsp pin --top [-w ws]             pin it outside the tree entirely
   wsp where                         what project am I in, and why
   wsp wip                           everything in flight, with agents
+  wsp overlap                       who else is standing in this tree
 
 {plumbing}
   wsp panel                         the sidebar replacement (runs in a pane)
