@@ -292,7 +292,7 @@ fn help() {
   wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…
   wsp project ls|projects [--tag T] list projects
   wsp tree                          hierarchy with open counts
-  wsp project show <id>             brief, tags, roots, tasks, agents
+  wsp project show <id> [--decisions]  brief, tags, roots, tasks, agents
   wsp project set <id> k=v…         name/parent/status/brief/tags/roots
   wsp project rm <id> [--force]     remove; --force orphans what it held
 

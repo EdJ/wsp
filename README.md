@@ -589,6 +589,25 @@ reasoning that was live at the time, not a tidied conclusion. It sits above the
 task list in `wsp project show`, because it is a constraint on what may be
 picked up next and belongs in front of the list of things somebody might pick.
 
+Append-only and never trimmed is also the one output here that grows without
+bound, and it grows fastest on the projects people are actually working. `wsp`
+took eighteen decisions in a day, at which point `project show` was printing
+16KB — 3,437 of its 4,104 tokens were that block, three times the next most
+expensive command a session can run, and the brief was pointing every agent at
+it to read the four it had left out. So the block is an index by default: one
+line each, the first sentence, which is the rule — the argument for it comes
+after, and it is not what a reader scanning for *which* decision needs.
+
+```sh
+wsp project show wsp               # decisions abridged to the rule, ~600 tokens
+wsp project show wsp --decisions   # as written, reasoning and all
+```
+
+Abridging is never silent — the block says how many entries it cut and what to
+run — for the reason the rules cap has: prose that stops early reads exactly
+like prose that ends there, and here the missing half is the reasoning somebody
+is otherwise about to re-derive.
+
 `wsp edit --decisions` exists anyway, and the two are not in conflict once the
 rule is stated precisely. What append-only protects is that a decision cannot be
 **quietly** rewritten — not that the text is immutable, which no file on disk

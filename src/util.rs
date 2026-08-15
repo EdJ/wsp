@@ -221,6 +221,37 @@ pub fn truncate(s: &str, n: usize) -> String {
     out
 }
 
+/// The leading sentence, for prose that is read as an index rather than in
+/// full.
+///
+/// A decision is written the way a commit message is: the rule first, the
+/// argument after it. Measured across the eighteen on `wsp`, the first sentence
+/// averages 106 characters against 764 for the whole entry, and in every one of
+/// them it is the part that says what was settled — "Stage through a private
+/// index, not the shared one." is fifty characters of nine hundred and seventy.
+/// So a reader deciding whether *this* is the entry they wanted needs the first
+/// sentence and nothing else.
+///
+/// A sentence ends at `.`, `?` or `!` followed by a space. Not at end-of-string,
+/// because a body with no internal break is already one sentence and there is
+/// nothing to cut. Abbreviations and the like will occasionally end one early;
+/// the cost of that is a short line in an index, which is what this is for.
+pub fn first_sentence(s: &str) -> &str {
+    let b = s.as_bytes();
+    for i in 0..b.len() {
+        if !matches!(b[i], b'.' | b'?' | b'!') {
+            continue;
+        }
+        // The terminator has to be followed by a break, or `1.5s` and `e.g.`
+        // cut the line in half.
+        match b.get(i + 1) {
+            Some(c) if c.is_ascii_whitespace() => return s[..=i].trim_end(),
+            _ => {}
+        }
+    }
+    s.trim_end()
+}
+
 pub fn pad(s: &str, n: usize) -> String {
     let len = s.chars().count();
     if len >= n {
@@ -365,5 +396,41 @@ mod tests {
     #[test]
     fn a_path_that_is_not_there_has_no_stamp() {
         assert_eq!(stamp(Path::new("/nonexistent/wsp")), None);
+    }
+
+    /// The index line has to be the rule, not the first clause of the argument
+    /// for it. These are real entries out of `~/wsp/projects/wsp.md`.
+    #[test]
+    fn a_decision_cut_to_its_first_sentence_is_still_the_decision() {
+        assert_eq!(
+            first_sentence("Empty is not quiet. The panel's quiet-branch filter hides a project with no open tasks."),
+            "Empty is not quiet."
+        );
+        assert_eq!(
+            first_sentence("Stage through a private index, not the shared one. export GIT_INDEX_FILE=/tmp/x"),
+            "Stage through a private index, not the shared one."
+        );
+    }
+
+    /// A full stop is only a sentence end when something breaks after it.
+    /// Versions, abbreviations and file names are full of the character and
+    /// none of them end a sentence, so cutting at the first one seen would
+    /// leave `Build with cargo 1.` in an index.
+    #[test]
+    fn a_full_stop_inside_a_word_does_not_end_a_sentence() {
+        assert_eq!(
+            first_sentence("Pin cargo 1.84.0 in CI. Newer toolchains warn."),
+            "Pin cargo 1.84.0 in CI."
+        );
+        assert_eq!(first_sentence("Read src/util.rs first"), "Read src/util.rs first");
+    }
+
+    /// Prose with no internal break is already one sentence. Returning nothing,
+    /// or an ellipsis, would lose the whole entry rather than shorten it.
+    #[test]
+    fn prose_that_never_breaks_comes_back_whole() {
+        assert_eq!(first_sentence("one working tree per agent is not yet"), "one working tree per agent is not yet");
+        assert_eq!(first_sentence("A decision.  "), "A decision.");
+        assert_eq!(first_sentence(""), "");
     }
 }

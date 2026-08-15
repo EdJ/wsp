@@ -239,7 +239,7 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
 
 pub fn show(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp project show <id>");
+        eprintln!("usage: wsp project show <id> [--decisions]");
         return 2;
     };
     let index = Index::new(store.projects());
@@ -288,11 +288,43 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // Above the task list, not below the prose: a decision is a constraint on
     // what may be done next, so it has to be read before the list of things
     // somebody might pick up.
+    //
+    // One line each, because this is the only unbounded output wsp has. The
+    // block is append-only and nothing trims it — eighteen entries landed on
+    // `wsp` in a single day — and printed whole it was 3,437 of this command's
+    // 4,104 tokens, three times the next most expensive thing a session can
+    // run. The brief already caps its own view at four and then points here for
+    // the rest, which made the escape hatch the expensive command.
+    //
+    // The first sentence is the rule and the rest is the argument for it, so an
+    // index made of first sentences is a reader's whole question answered:
+    // which of these did I mean. `--decisions` prints the block as it was
+    // written, for when the answer is "that one, and I need to know why".
     let decided = crate::model::decisions(&proj.body);
+    let full = args.has("decisions");
     if !decided.is_empty() {
         println!("\n{}", p.dim("DECISIONS"));
+        let mut cut = 0;
         for (when, what) in &decided {
-            println!("  {}  {}", p.dim(&util::pad(when, 10)), what);
+            if full {
+                println!("  {}  {}", p.dim(&util::pad(when, 10)), what);
+                continue;
+            }
+            let lead = util::first_sentence(what);
+            if lead.len() < what.trim_end().len() {
+                cut += 1;
+            }
+            println!("  {}  {}", p.dim(&util::pad(when, 10)), util::truncate(lead, 96));
+        }
+        // Never trim quietly: an entry cut to its first sentence reads exactly
+        // like an entry that was only ever one, and the difference is the
+        // reasoning somebody is about to re-derive.
+        if cut > 0 {
+            println!(
+                "  {}  {}",
+                util::pad("", 10),
+                p.dim(&format!("{cut} of {} abridged · wsp project show {} --decisions", decided.len(), proj.id))
+            );
         }
     }
 
