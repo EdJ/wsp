@@ -1390,38 +1390,83 @@ fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
     let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
     // A project has no `wsp edit` yet; fall back to its file, named here so the
     // exception is visible rather than hidden in a path.
-    let cmd: Vec<String> = match argv.first().map(|s| s.as_str()) {
+    let (edit_cmd, view_id) = match argv.first().map(|s| s.as_str()) {
         Some("edit-project-file") => {
             let f = util::expand(&format!("~/wsp/projects/{}.md", argv[1]));
             if !f.exists() {
                 return format!("no file for {}", argv[1]);
             }
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-            vec![editor, f.display().to_string()]
+            (vec![editor, f.display().to_string()], argv[1].clone())
         }
         _ => {
             let exe = std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "wsp".into());
-            std::iter::once(exe).chain(argv.iter().cloned()).collect()
+            (
+                std::iter::once(exe).chain(argv.iter().cloned()).collect::<Vec<_>>(),
+                argv.get(1).cloned().unwrap_or_default(),
+            )
         }
     };
-    let r = herdr::call(
+
+    let Ok(r) = herdr::call(
         "tab.create",
         json!({ "workspace_id": ws, "label": label, "focus": true }),
-    );
-    let Ok(r) = r else { return "could not create a tab".into() };
-    let pane = r
+    ) else {
+        return "could not create a tab".into();
+    };
+    let tab = r
+        .get("tab")
+        .and_then(|t| t.get("tab_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let Some(top) = r
         .get("root_pane")
         .and_then(|p| p.get("pane_id"))
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
-    let Some(pane) = pane else { return "tab reported no pane".into() };
+        .map(|s| s.to_string())
+    else {
+        return "tab reported no pane".into();
+    };
 
-    let text = cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    // Context above, editor below. Split downward rather than sideways so both
+    // get the full width: prose wants it, and so do log lines.
+    let Ok(sp) = herdr::call(
+        "pane.split",
+        json!({ "direction": "down", "target_pane_id": top, "ratio": 0.38, "focus": true }),
+    ) else {
+        return "could not split the tab".into();
+    };
+    let Some(bottom) = sp.get("pane").and_then(|p| p.get("pane_id")).and_then(|x| x.as_str()) else {
+        return "split reported no pane".into();
+    };
+
+    // The read-only half: the same live view the sidebar opens, so it keeps
+    // updating while you type — including the log, which is the context you
+    // were losing by editing in a bare buffer.
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "wsp".into());
+    let _ = herdr::call("pane.rename", json!({ "pane_id": top, "label": VIEW_LABEL }));
     let _ = herdr::call(
         "pane.send_text",
-        json!({ "pane_id": pane, "text": format!("exec {text}\n") }),
+        json!({
+            "pane_id": top,
+            "text": format!("exec {} view {}\n", shell_quote(&exe), shell_quote(&view_id)),
+        }),
+    );
+
+    // The editor takes the tab down with it when it exits, so finishing an edit
+    // puts you back where you were instead of leaving a husk behind.
+    let text = edit_cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let after = match &tab {
+        Some(t) => format!("; herdr tab close {}", shell_quote(t)),
+        None => String::new(),
+    };
+    let _ = herdr::call(
+        "pane.send_text",
+        json!({ "pane_id": bottom, "text": format!("{text}{after}\n") }),
     );
     format!("editing {label}")
 }

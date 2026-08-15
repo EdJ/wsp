@@ -112,8 +112,11 @@ churn, where killing and relaunching would blink the pane on every keypress.
 terminal. `↵` again on whatever is already open closes the pane, as does `esc`,
 so the same key both opens and closes and there is nothing to remember.
 
-For real editing, `E` pops the row out into a **tab** of its own, full width,
-running `wsp edit` in `$EDITOR`. A tab rather than a split: a task's whole body —
+For real editing, `E` pops the row out into a **tab** of its own: the live
+detail view across the top, the editor beneath it, both full width. The context
+keeps updating while you type, so the status, the claim and the log stay in
+front of you instead of being the thing you gave up to edit. Quitting the
+editor closes the tab. A tab rather than a split: a task's whole body —
 notes, acceptance criteria, the log — wants width, and a tab gives it without
 disturbing a layout you will come back to.
 
@@ -204,6 +207,11 @@ wsp edit <id> --overview   # just that prose
 wsp edit <id> --details
 wsp edit <id> --raw        # the whole file, when the frontmatter is the problem
 ```
+
+`wsp edit` re-reads the task after the editor exits and carries across only the
+section you edited. An edit lasts as long as someone is typing and the file is
+shared — a note, a status change, a claim — so writing back the copy it opened
+with would silently undo whatever happened meanwhile.
 
 `wsp edit` never puts the frontmatter in front of you. A typo in `status:` is
 one keystroke from a task the tools can no longer read, and there is nothing to

@@ -522,7 +522,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp edit <id> [--overview | --details | --raw]");
         return 2;
     };
-    let Some(mut t) = store.find_task(&needle) else {
+    let Some(t) = store.find_task(&needle) else {
         eprintln!("wsp: no task matching `{needle}`");
         return 1;
     };
@@ -578,6 +578,16 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
         }
         return 0;
     }
+
+    // Re-read before writing. An edit session lasts as long as someone is
+    // typing, and the task is a shared file — a `wsp note`, a status change
+    // from the panel, a claim — so writing back the copy we opened with would
+    // silently undo whatever happened in between. Only the edited section is
+    // carried across.
+    let Some(mut t) = store.find_task(&t.id) else {
+        eprintln!("wsp: {} disappeared while you were editing — nothing written", t.id);
+        return 1;
+    };
 
     match one {
         Some(sec) => t.set_section(sec, &after),
