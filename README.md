@@ -563,6 +563,20 @@ Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
 `$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
 
+A claim also renames the workspace and the pane after the task. herdr has no
+name of its own for a workspace nobody named — it answers with the agent
+standing in it, or the folder leaf — so three agents in one tree all read as
+`claude`, which is the one thing about them you already knew. It renames over a
+name you typed, too, and prints what it overwrote:
+
+```
+▸ t-260815-041  Agents should rename as they pick up new tasks
+  bound to w0:p3
+  named w0 · was wsp
+```
+
+That last line is the undo: `herdr workspace rename w0 wsp`.
+
 ## What an agent is handed
 
 ```sh

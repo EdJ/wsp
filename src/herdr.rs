@@ -148,6 +148,23 @@ fn sget(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
+/// Give a workspace a name. This is the durable `custom_name` in herdr's
+/// session file, and it is what the sidebar draws.
+///
+/// A workspace nobody has named has no name to read back: `workspace.list`
+/// answers with the agent standing in it, or the folder leaf, so three agents
+/// in one tree all come back as `claude`. Setting it is the only way to tell
+/// them apart, and there is no way to ask which of the two you are looking at.
+pub fn rename_workspace(workspace_id: &str, label: &str) -> std::io::Result<()> {
+    call("workspace.rename", json!({ "workspace_id": workspace_id, "label": label })).map(|_| ())
+}
+
+/// Name a pane. Unlike a workspace this one reads back as itself — an unnamed
+/// pane has an empty `label`, which is how the panel finds its own.
+pub fn rename_pane(pane_id: &str, label: &str) -> std::io::Result<()> {
+    call("pane.rename", json!({ "pane_id": pane_id, "label": label })).map(|_| ())
+}
+
 /// Display-only metadata. Values are capped at 16 keys by the server, and the
 /// TTL cannot exceed 24h — hence the daemon's refresh loop.
 pub fn report_workspace_tokens(

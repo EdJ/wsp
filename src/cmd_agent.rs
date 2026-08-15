@@ -89,6 +89,52 @@ fn pane_id(args: &Args) -> Option<String> {
     args.get("pane").or_else(|| herdr::Env::read().pane_id)
 }
 
+/// The name a task lends the workspace and pane holding it, or `None` if it
+/// lends none.
+///
+/// Capped at the 44 characters `sync` already gives the `task` token. A herdr
+/// sidebar is 26 columns and draws its own ellipsis, so this is not about what
+/// fits — it is about not putting a paragraph on the wire as a name.
+///
+/// `wsp` and `wsp:view` are withheld. They are how the panel finds its own
+/// panes, and `install` adopts a stray pane labelled `wsp` as a panel it lost
+/// track of — a task called "wsp" would hand it an agent instead.
+fn task_label(title: &str) -> Option<String> {
+    let label = util::truncate(title.trim(), 44);
+    match label.as_str() {
+        "" | crate::panel::PANEL_LABEL | crate::panel::VIEW_LABEL => None,
+        _ => Some(label),
+    }
+}
+
+/// Put the task's name on the workspace and the pane that took it up. Returns
+/// the workspace's new label, if the workspace took it.
+///
+/// herdr has no name of its own for a workspace nobody named — `workspace.list`
+/// answers with the agent standing in it, or the folder leaf — so three agents
+/// in one tree all read as `claude`, which is the one thing about them you
+/// already knew. A claim is the moment wsp knows better.
+///
+/// It renames over a name typed by hand, by decision on t-260815-041, and the
+/// claim prints what it overwrote so `herdr workspace rename` can put it back.
+/// The cost is `resolve`'s last resort: a workspace whose project was inferred
+/// from a label like `Trance Video` loses that inference once the label is a
+/// task title. Only ever last resort — a pin, this binding, or the cwd all beat
+/// it, and a workspace that has just claimed has a binding by definition.
+fn name_after_task(pane: &str, workspace: &str, title: &str) -> Option<String> {
+    let label = task_label(title)?;
+    if !herdr::available() {
+        return None;
+    }
+    if !pane.is_empty() {
+        let _ = herdr::rename_pane(pane, &label);
+    }
+    if workspace.is_empty() {
+        return None;
+    }
+    herdr::rename_workspace(workspace, &label).ok().map(|_| label)
+}
+
 /// `Trance Video · 3h12m` — a claim as one line.
 ///
 /// Both this and `worked_line` join what they have and skip what they do not,
@@ -336,6 +382,12 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         .map(|w| w.label)
         .unwrap_or_default();
 
+    // Name the workspace and the pane after the work, before the claim is
+    // written: the claim records the label the workspace is to be *found* by
+    // when its id is gone, so it has to record the name it is about to have and
+    // not the one it is losing.
+    let named = name_after_task(&pane, &workspace, &t.title);
+
     // One lock around the state files a claim touches, so a claim
     // arriving in the middle of this one cannot read a half-made state: a
     // binding cleared and not yet replaced, or a claim recorded against a task
@@ -368,7 +420,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
             &t.id,
             json!({
                 "workspace_id": workspace,
-                "workspace_label": ws_label,
+                "workspace_label": named.clone().unwrap_or_else(|| ws_label.clone()),
                 "cwd": cwd,
                 "host": util::hostname(),
                 "claimed_at": util::now_iso(),
@@ -404,12 +456,27 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     if args.json() {
         println!(
             "{}",
-            json!({ "task": t.json(), "pane": pane, "from": left, "took_over": displaced })
+            json!({
+                "task": t.json(),
+                "pane": pane,
+                "from": left,
+                "took_over": displaced,
+                "named": named,
+                "was": ws_label,
+            })
         );
     } else {
         let p = Paint::new();
         println!("{} {}  {}", p.cyan("▸"), p.bold(&t.id), t.title);
         println!("  {}", p.dim(&format!("bound to {pane}")));
+        // A rename is not free to the person who typed the old name, so say
+        // what it was: that line is the whole of the undo.
+        match &named {
+            Some(l) if *l == ws_label => {}
+            Some(_) if ws_label.is_empty() => println!("  {}", p.dim(&format!("named {workspace}"))),
+            Some(_) => println!("  {}", p.dim(&format!("named {workspace} · was {ws_label}"))),
+            None => {}
+        }
         // Naming what was put down is the whole point of a migration being one
         // command: the agent moved, and you can see what it moved off.
         for prev in &left {
@@ -1410,5 +1477,24 @@ mod tests {
         // And an empty pane is still an empty pane, not a missing wrapper.
         let empty = json!({ "type": "pane_read", "read": { "text": "" } });
         assert_eq!(read_body(&empty).get("text").unwrap(), "");
+    }
+
+    /// The two names a task may not lend a pane. `install` treats any pane
+    /// labelled `wsp` as a panel it lost track of, so a task called "wsp"
+    /// renaming its own pane would get that agent adopted as furniture and
+    /// dropped from the tree — the panel filters its own panes out of it.
+    #[test]
+    fn a_task_never_lends_a_pane_the_panels_own_name() {
+        assert_eq!(task_label("wsp"), None);
+        assert_eq!(task_label("  wsp  "), None);
+        assert_eq!(task_label("wsp:view"), None);
+        assert_eq!(task_label(""), None);
+
+        // Anything else is itself, and a long one is cut to the width `sync`
+        // already uses for the same title.
+        assert_eq!(task_label("wsp panel"), Some("wsp panel".to_string()));
+        let long = "Agents should rename as they pick up new tasks, and say so";
+        assert_eq!(task_label(long).unwrap().chars().count(), 44);
+        assert!(task_label(long).unwrap().ends_with('…'));
     }
 }
