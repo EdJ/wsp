@@ -301,6 +301,53 @@ pub(crate) enum Target {
     Nothing,
 }
 
+/// Where the cursor is: what the row *is*, and which of the two lists it is in.
+///
+/// The identity alone is ambiguous, because the panel draws some rows twice on
+/// purpose. A pane appears under the task it claimed and again in the dock at
+/// the foot; the `agents` heading and the `no project` heading are both
+/// [`Target::Unattached`]. Keeping the cursor by identity across a rebuild —
+/// which is the whole point of keeping it by identity — then meant taking the
+/// first row that matched, and the first is always the one in the tree. So a
+/// cursor walked down into the dock was pulled straight back up to wherever
+/// that agent's work happens to sit: scrolling down jumped the view up, and
+/// went on doing it every quarter-second for as long as the cursor was there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Cursor {
+    pub(crate) target: Target,
+    /// In the pinned section at the foot rather than the tree above it.
+    pub(crate) docked: bool,
+}
+
+impl From<Target> for Cursor {
+    /// A row in the tree, which is where all but a handful of them are. The
+    /// dock is the exception and has to say so.
+    fn from(target: Target) -> Cursor {
+        Cursor { target, docked: false }
+    }
+}
+
+impl Cursor {
+    /// The row this names, looked for on the side of the dock it was last on.
+    /// Falls across to the other side rather than giving up: the dock empties
+    /// when the last agent goes, and a pane row that was in it can genuinely
+    /// reappear in the tree.
+    pub(super) fn find_in(&self, rows: &[Row], tree_len: usize) -> Option<usize> {
+        let hit = |from: usize, to: usize| {
+            rows.get(from..to)?
+                .iter()
+                .position(|r| target_of(r) == self.target)
+                .map(|i| i + from)
+        };
+        let n = rows.len();
+        if self.docked {
+            hit(tree_len, n).or_else(|| hit(0, tree_len))
+        } else {
+            hit(0, tree_len).or_else(|| hit(tree_len, n))
+        }
+    }
+}
+
 /// What a row stands for, in the store's own terms. Pulled out of
 /// `selected_target` because the cursor is kept on a row's identity across a
 /// refetch, which means asking this of rows other than the selected one.
@@ -339,6 +386,18 @@ impl Ui {
         self.dock
     }
 
+    /// Every row standing for the same thing, for a test that has to prove the
+    /// panel draws one of them twice on purpose.
+    #[cfg(test)]
+    pub(crate) fn rows_for_target(&self, want: &Target) -> Vec<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| target_of(r) == *want)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// The census the header strip is drawn from, for a test that has to check
     /// the strip against the agents it stands for.
     #[cfg(test)]
@@ -348,6 +407,18 @@ impl Ui {
 
     pub(crate) fn selected_target(&self) -> Target {
         self.rows.get(self.sel).map(target_of).unwrap_or(Target::Nothing)
+    }
+
+    /// Where the tree ends and the pinned dock begins.
+    pub(super) fn tree_len(&self) -> usize {
+        self.rows.len().saturating_sub(self.dock)
+    }
+
+    /// Where the cursor is, in full: the row's identity *and* which of the two
+    /// lists it is standing in. See [`Cursor`] for why the identity alone is
+    /// not enough.
+    pub(crate) fn cursor(&self) -> Cursor {
+        Cursor { target: self.selected_target(), docked: self.sel >= self.tree_len() }
     }
 
     pub(crate) fn selected_kind(&self) -> RowKind {
@@ -587,7 +658,7 @@ pub(super) fn task_rows(
 /// offline flow lands on the same row a live one would.
 pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_ws: Option<&str>) {
     let sel = ui.sel;
-    let was = ui.selected_target();
+    let was = ui.cursor();
     let msg = ui.message.take();
     *ui = collect(snap, view, self_ws);
     // The row, not the slot it was in. Claiming re-sorts the tree under the
@@ -595,9 +666,14 @@ pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_w
     // several lines away — and holding the index would leave the eye on
     // whatever slid into its place. Falls back to the index when the row is
     // genuinely gone, which is the only case where there is nothing to follow.
-    ui.sel = match was {
+    //
+    // Which side of the dock it was on is part of the row's identity here: a
+    // pane is drawn twice, and taking the first match took the tree copy every
+    // time. See [`Cursor`].
+    let tree_len = ui.tree_len();
+    ui.sel = match was.target {
         Target::Nothing => sel,
-        want => ui.rows.iter().position(|r| target_of(r) == want).unwrap_or(sel),
+        _ => was.find_in(&ui.rows, tree_len).unwrap_or(sel),
     };
     ui.sel = ui.sel.min(ui.rows.len().saturating_sub(1));
     if !ui.rows.is_empty() && !ui.rows[ui.sel].selectable() {

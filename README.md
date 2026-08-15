@@ -494,6 +494,15 @@ The dock takes the cursor like any other row, which is why its rows live at the
 end of the same list rather than being drawn separately — a block you can see
 and not select would show you an idle agent and give you no way to act on it.
 
+*Which* end of that list the cursor is on is part of where it is, and is kept
+with it. Every row survives a rebuild by what it *is* rather than by the slot
+it was in, because the tree re-sorts under the cursor constantly — but a pane
+is deliberately drawn twice, under the task it claimed and again down here, and
+the first row matching is always the one in the tree. Scrolling down off the end
+of the tree therefore used to land in the dock and be dragged straight back up
+to wherever that agent's work happened to sit, four times a second, for as long
+as the cursor stayed there.
+
 Colour carries six roles: **bold** is a project, plain is a claimed task, muted
 is an unclaimed one, dim is structure and finished work, accent is live work,
 and warn wants a decision.

@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use crate::store::Store;
 
 use super::keys::View;
-use super::rows::Target;
+use super::rows::{Cursor, Target};
 
 const FILE: &str = "panel-view.json";
 
@@ -51,7 +51,7 @@ pub(super) struct Shared {
     show_done: bool,
     review_only: bool,
     ids: bool,
-    cursor: Target,
+    cursor: Cursor,
     /// Only ever set by a click, and cleared by the next keystroke. Shared
     /// because the panel you arrive at should be looking at what the one you
     /// left was looking at, however it came to be looking there.
@@ -68,7 +68,7 @@ fn sorted(set: &HashSet<String>) -> Vec<String> {
 }
 
 impl Shared {
-    pub(super) fn of(view: &View, cursor: Target) -> Shared {
+    pub(super) fn of(view: &View, cursor: impl Into<Cursor>) -> Shared {
         Shared {
             collapsed: sorted(&view.collapsed),
             expanded: sorted(&view.expanded),
@@ -76,14 +76,14 @@ impl Shared {
             show_done: view.show_done,
             review_only: view.review_only,
             ids: view.ids,
-            cursor,
+            cursor: cursor.into(),
             scroll: view.scroll,
         }
     }
 
     /// Put this back onto a view. The cursor comes back separately because it
     /// cannot be applied until the rows exist.
-    pub(super) fn apply(self, view: &mut View) -> Target {
+    pub(super) fn apply(self, view: &mut View) -> Cursor {
         view.collapsed = self.collapsed.into_iter().collect();
         view.expanded = self.expanded.into_iter().collect();
         view.reveal = self.reveal.into_iter().collect();
@@ -102,7 +102,8 @@ impl Shared {
             "show_done": self.show_done,
             "review_only": self.review_only,
             "ids": self.ids,
-            "cursor": target_to_json(&self.cursor),
+            "cursor": target_to_json(&self.cursor.target),
+            "docked": self.cursor.docked,
             "scroll": self.scroll,
         })
     }
@@ -122,7 +123,10 @@ impl Shared {
             show_done: flag("show_done"),
             review_only: flag("review_only"),
             ids: flag("ids"),
-            cursor: v.get("cursor").map(target_from_json).unwrap_or(Target::Nothing),
+            cursor: Cursor {
+                target: v.get("cursor").map(target_from_json).unwrap_or(Target::Nothing),
+                docked: flag("docked"),
+            },
             scroll: v.get("scroll").and_then(|x| x.as_u64()).map(|n| n as usize),
         }
     }
@@ -197,7 +201,7 @@ pub(super) fn write(store: &Store, text: &str) {
 ///
 /// `agreed` is the last text this panel wrote or took, so a gesture that
 /// changes nothing durable — and most do not — costs no write at all.
-pub(super) fn share(store: &Store, view: &View, cursor: Target, agreed: &mut String) {
+pub(super) fn share(store: &Store, view: &View, cursor: impl Into<Cursor>, agreed: &mut String) {
     let now = rendered(&Shared::of(view, cursor));
     if now != *agreed {
         write(store, &now);
@@ -225,7 +229,7 @@ mod tests {
 
         let mut fresh = View::default();
         let cursor = back.apply(&mut fresh);
-        assert_eq!(cursor, Target::Task("t-260815-063".into()));
+        assert_eq!(cursor, Cursor::from(Target::Task("t-260815-063".into())));
         assert!(fresh.collapsed.contains("audio"));
         assert!(fresh.collapsed.contains("vst"));
         assert!(fresh.show_done);
@@ -304,7 +308,7 @@ mod tests {
         let mut theirs = View::default();
         let want = parse(&read(&store).unwrap()).apply(&mut theirs);
         assert_eq!(theirs.scroll, Some(12));
-        assert_eq!(want, Target::Task("t-4".into()));
+        assert_eq!(want, Cursor::from(Target::Task("t-4".into())));
 
         // Nothing changed, so nothing is written. A wheel against the end of
         // the tree is a burst of events that move nothing.
@@ -318,6 +322,24 @@ mod tests {
             "a gesture that changes nothing durable costs no write",
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Which side of the dock the cursor is on travels with it.
+    ///
+    /// A pane is drawn twice — under the task it claimed and again in the
+    /// section pinned at the foot — so a panel told only "this pane" puts its
+    /// cursor on the tree copy, which is the same jump that made scrolling
+    /// down unusable, arriving by workspace switch instead of by tick.
+    #[test]
+    fn the_side_of_the_dock_travels_with_the_cursor() {
+        for want in [
+            Cursor { target: Target::Pane("w1:p6".into()), docked: true },
+            Cursor::from(Target::Pane("w1:p6".into())),
+        ] {
+            let there = Shared::of(&View::default(), want.clone());
+            let back = Shared::from_json(&there.to_json());
+            assert_eq!(back.cursor, want, "the side did not survive the file");
+        }
     }
 
     /// Every arm, because a cursor that comes back as `Nothing` silently gives
@@ -341,7 +363,7 @@ mod tests {
     #[test]
     fn nothing_written_yet_is_not_a_failure() {
         let empty = Shared::from_json(&json!({}));
-        assert_eq!(empty.cursor, Target::Nothing);
+        assert_eq!(empty.cursor, Cursor::default());
         assert!(empty.collapsed.is_empty());
         assert!(!empty.show_done);
     }

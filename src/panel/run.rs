@@ -18,7 +18,7 @@ use crate::store::Store;
 
 use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
-use super::rows::{collect, refetch_into, target_of, AgentRef, Snapshot, Target, Ui};
+use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
 use super::shared;
 use super::verbs::{close_view, inspect, open_workspace, pop_out, run_wsp, send_tell};
 
@@ -274,14 +274,14 @@ pub fn run(store: &Store) -> i32 {
 /// `agreed` is the last text this panel wrote or adopted. Equal means nobody
 /// else has touched it and there is nothing to take; `None` from the file means
 /// nothing has been written yet, which is a first run rather than an error.
-fn adopt(store: &Store, view: &mut View, agreed: &mut String) -> Target {
+fn adopt(store: &Store, view: &mut View, agreed: &mut String) -> Cursor {
     match shared::read(store) {
         Some(text) if text != *agreed => {
             let want = shared::parse(&text).apply(view);
             *agreed = text;
             want
         }
-        _ => Target::Nothing,
+        _ => Cursor::default(),
     }
 }
 
@@ -293,11 +293,11 @@ fn adopt(store: &Store, view: &mut View, agreed: &mut String) -> Target {
 /// appear — a task under a project that was folded when the cursor arrived, or
 /// one past the per-project cap — so the caller holds the wish until it lands
 /// rather than dropping it on the first rebuild that could not honour it.
-fn point_at(ui: &mut Ui, want: &Target) -> bool {
-    if *want == Target::Nothing {
+fn point_at(ui: &mut Ui, want: &Cursor) -> bool {
+    if want.target == Target::Nothing {
         return true;
     }
-    match ui.rows.iter().position(|r| target_of(r) == *want) {
+    match want.find_in(&ui.rows, ui.tree_len()) {
         Some(i) => {
             ui.sel = i;
             true
@@ -323,10 +323,10 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
     let mut want = adopt(store, &mut view, &mut agreed);
     let mut ui = collect(&Snapshot::live(store), &view, self_ws);
     if point_at(&mut ui, &want) {
-        want = Target::Nothing;
+        want = Cursor::default();
     }
     if agreed.is_empty() {
-        agreed = shared::rendered(&shared::Shared::of(&view, ui.selected_target()));
+        agreed = shared::rendered(&shared::Shared::of(&view, ui.cursor()));
     }
     let mut last = String::new();
     let mut dirty = false;
@@ -393,7 +393,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                 // the same thing `w` does, so it presses it.
                 super::keys::Hit::Rest => msg = Msg::Key(Key::Char('w')),
                 super::keys::Hit::Select => {
-                    shared::share(store, &view, ui.selected_target(), &mut agreed);
+                    shared::share(store, &view, ui.cursor(), &mut agreed);
                     draw(&ui, &view, &mut last);
                     continue;
                 }
@@ -407,7 +407,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // centring every time a key moved the selection.
         if let Msg::Key(Key::Wheel { up }) = msg {
             super::keys::wheel(&mut ui, &mut view, up);
-            shared::share(store, &view, ui.selected_target(), &mut agreed);
+            shared::share(store, &view, ui.cursor(), &mut agreed);
             draw(&ui, &view, &mut last);
             continue;
         }
@@ -416,7 +416,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         let is_key = matches!(msg, Msg::Key(_));
         if is_key {
             // The person is driving. Whatever the file wanted, they want this.
-            want = Target::Nothing;
+            want = Cursor::default();
         }
         match msg {
             Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
@@ -592,12 +592,12 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
             // its own state and therefore a no-op. That is what makes "always
             // adopt" safe: there is one keyboard, so there is one writer.
             let taken = adopt(store, &mut view, &mut agreed);
-            if taken != Target::Nothing {
+            if taken.target != Target::Nothing {
                 want = taken;
             }
             refetch_into(&mut ui, &Snapshot::live(store), &mut view, self_ws);
             if point_at(&mut ui, &want) {
-                want = Target::Nothing;
+                want = Cursor::default();
             }
         }
 
@@ -606,7 +606,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // pane on the machine would be pure heat. The mouse shares from its own
         // branches above, which return before they reach here.
         if is_key {
-            shared::share(store, &view, ui.selected_target(), &mut agreed);
+            shared::share(store, &view, ui.cursor(), &mut agreed);
         }
         draw(&ui, &view, &mut last);
     }
@@ -684,7 +684,7 @@ mod tests {
         let mut agreed = text.clone();
         assert_eq!(
             adopt(&store, &mut mine, &mut agreed),
-            Target::Nothing,
+            Cursor::default(),
             "a panel that already agrees has nothing to take",
         );
 
@@ -692,7 +692,7 @@ mod tests {
         let mut unseen = String::new();
         assert_eq!(
             adopt(&store, &mut theirs, &mut unseen),
-            Target::Task("t-1".into()),
+            Cursor::from(Target::Task("t-1".into())),
             "a panel that has not seen it takes it, cursor and all",
         );
         assert!(theirs.collapsed.contains("audio"));
@@ -709,7 +709,7 @@ mod tests {
         let mut view = View::default();
         view.show_done = true;
         let mut agreed = String::new();
-        assert_eq!(adopt(&store, &mut view, &mut agreed), Target::Nothing);
+        assert_eq!(adopt(&store, &mut view, &mut agreed), Cursor::default());
         assert!(view.show_done, "a missing file is not an instruction to reset");
         assert!(agreed.is_empty());
         let _ = std::fs::remove_dir_all(&dir);

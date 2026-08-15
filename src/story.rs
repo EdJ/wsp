@@ -1200,6 +1200,52 @@ mod tests {
         assert_eq!(panel::row_at(&ui, &view, W, H, H - 3), None);
     }
 
+    /// Ed: "overscrolling resets the position to that of the last agent, when
+    /// scrolling down, making it very hard to use". This is why.
+    ///
+    /// The cursor is kept across a rebuild by what the row *is*, never by the
+    /// slot it was in — but the panel draws a pane twice on purpose, under the
+    /// task it claimed and again in the section pinned at the foot, and the
+    /// first row matching is always the one in the tree. So scrolling down off
+    /// the end of the tree put the cursor in the dock, and a quarter of a
+    /// second later the rebuild moved it up to wherever that agent's work
+    /// happened to sit. Scrolling down jumped the view up, and went on doing it
+    /// for as long as the cursor stayed there.
+    #[test]
+    fn a_cursor_in_the_dock_is_not_dragged_back_up_to_the_tree() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let tree = ui.rows_for_test() - ui.dock_for_test();
+
+        // Down until it is over the line. This is the overscroll: the tree has
+        // run out and the dock is what is under the cursor.
+        for _ in 0..ui.rows_for_test() {
+            if ui.selected_index() >= tree {
+                break;
+            }
+            panel::apply_key(Key::Down, &mut ui, &mut view);
+        }
+        assert!(ui.selected_index() >= tree, "the cursor walks off the tree into the dock");
+
+        // The fixture only tests anything if this pane is one of the ones drawn
+        // twice — otherwise there is nothing for the search to pick wrongly.
+        let target = ui.selected_target();
+        let drawn = ui.rows_for_target(&target);
+        assert!(
+            drawn.len() > 1 && drawn[0] < tree,
+            "this pane has to appear in the tree as well as the dock: {drawn:?}",
+        );
+
+        let was = ui.selected_index();
+        panel::refetch_into(&mut ui, &w, &mut view, Some("w0"));
+        assert_eq!(ui.selected_index(), was, "a rebuild left the cursor where it was");
+        assert!(
+            ui.selected_index() >= ui.rows_for_test() - ui.dock_for_test(),
+            "and left it in the dock rather than on the tree copy of the same pane",
+        );
+    }
+
     /// The tree scrolls once the cursor is past the middle, and a click has to
     /// go through the same offset the frame drew with — otherwise clicking
     /// works at the top of a list and acts on the wrong task further down.
