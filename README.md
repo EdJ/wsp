@@ -935,7 +935,26 @@ spot of the check we were relying on at the time.
 | Reading `git diff --cached` | a hunk you did not write, if you read the **file list** and not just the hunks | nothing — but only if you actually read it; every swept hunk looked plausible in isolation |
 | Isolated build in a worktree | what you wrongly left *out*, and what you took in that only compiles against uncommitted work | whose commit it is; a coherent tree under the wrong author's message compiles perfectly |
 | A private `GIT_INDEX_FILE` | the other agent's staged work entering your commit | the working tree; two people still editing one file |
-| `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one — searching a release binary for string literals proves nothing, because LTO drops plain `&'static str` from live code |
+| `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one |
+
+### Do not search a release binary for a string
+
+It cost an hour today, twice, in both directions. A short `&'static str` that
+goes through `.into()` is not stored as a literal at all under `opt-level = 2`
+with `lto` — the copy is inlined, so the bytes end up as immediate operands in
+the instruction stream, split on eight-byte boundaries. `no editors open` is
+absent from the binary; `no edito` and `rs open` are each present exactly once.
+The bytes are all there. They are simply not a contiguous run for anything to
+find.
+
+Format strings survive, because the formatting machinery needs a real address
+for them — which is what makes the method so convincing and so useless: some of
+what you look for is always there. The proof it seemed to offer was that a
+function had been optimised away, and the function in question was the `E` key,
+which had been opening edit tabs all afternoon.
+
+Use `cmp` against a clean isolated build, or run a command whose output only
+the new code can produce.
 
 The procedure that follows from all of it is in `~/wsp/agents.md`, in the order
 you actually do it. The short version: commit through your own index, read the
