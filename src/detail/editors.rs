@@ -296,11 +296,23 @@ pub(super) fn close_editors(force_these: &[String]) -> Closing {
 /// which is exactly why the one part that is a quoting problem should be
 /// checked by something.
 pub(crate) fn editor_loop(section: &str, cmd: &str, slot: &str) -> String {
+    // `exit` is load-bearing, and its absence is what made the whole feature
+    // look broken. The loop is sent to a pane running an *interactive shell*,
+    // so when it breaks the shell simply returns to its prompt: the editor is
+    // gone, the pane is not. A closed column stayed on screen showing the loop
+    // text and a `%`, the sibling count never reached zero, and so the tab
+    // never closed — which read as `W` and `q` being broken, when what they had
+    // asked for had already happened.
+    //
+    // The context pane never had this problem because it is started with
+    // `exec`, which replaces the shell outright. A loop cannot be `exec`ed, so
+    // it says `exit` instead and means the same thing: when this is over, there
+    // is nothing left in this pane, and herdr reaps it.
     format!(
         "s={section}; while :; do printf %s \"$s\" > {slot}; \
          {cmd} --\"$s\"; n=$(cat {slot} 2>/dev/null); \
          {{ [ -z \"$n\" ] || [ \"$n\" = \"$s\" ]; }} && break; s=\"$n\"; done; \
-         rm -f {slot}"
+         rm -f {slot}; exit"
     )
 }
 
@@ -390,6 +402,63 @@ pub(crate) fn edit_command(focus: &super::Focus) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The loop is sent to an interactive shell, so it has to end that shell
+    /// itself. Without this the pane survives its own editor: the column looks
+    /// closed, the sibling count never reaches zero, and the tab that was
+    /// supposed to close on the last editor never does.
+    #[test]
+    fn the_loop_leaves_nothing_running() {
+        let cmd = editor_loop("details", "/bin/true", "/tmp/slot");
+        assert!(cmd.trim_end().ends_with("exit"), "no exit: {cmd}");
+    }
+
+    /// And it terminates on its own when the editor quits without re-pointing:
+    /// runs the command once, sees the slot unchanged, and cleans up after
+    /// itself. Run for real under `sh`, because the thing being tested is a
+    /// shell fragment and reading one proves nothing.
+    #[test]
+    fn the_loop_ends_and_removes_its_slot() {
+        let slot = std::env::temp_dir().join(format!("wsp-test-slot-{}", std::process::id()));
+        let _ = std::fs::remove_file(&slot);
+        let cmd = editor_loop("details", "/bin/true", &slot.display().to_string());
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .expect("sh");
+        assert!(out.status.success(), "loop exited {:?}", out.status);
+        assert!(!slot.exists(), "the slot was left behind");
+    }
+
+    /// A re-point goes round again: the slot is changed while the editor is
+    /// "running", so the loop opens the new section instead of ending. Proven
+    /// with a stub that rewrites the slot on its first call only.
+    #[test]
+    fn a_changed_slot_sends_the_loop_round_again() {
+        let dir = std::env::temp_dir().join(format!("wsp-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (slot, log, stub) = (dir.join("slot"), dir.join("log"), dir.join("stub"));
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {l}\n[ -s {d}/once ] || {{ : > {d}/once; printf overview > {s}; }}\n",
+                l = log.display(), d = dir.display(), s = slot.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let cmd = editor_loop("details", &stub.display().to_string(), &slot.display().to_string());
+        let out = std::process::Command::new("/bin/sh").arg("-c").arg(&cmd).output().expect("sh");
+        assert!(out.status.success());
+        let ran = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(ran.contains("--details"), "never opened the section it started on: {ran}");
+        assert!(ran.contains("--overview"), "never followed the slot to the new section: {ran}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn secs(c: &Columns) -> Vec<&str> {
