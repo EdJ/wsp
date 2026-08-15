@@ -759,6 +759,7 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     rows.sort_by(|a, b| a.project.cmp(&b.project).then(a.pane.cmp(&b.pane)));
 
     let blocked: Vec<_> = tasks.iter().filter(|t| t.status() == Status::Blocked).collect();
+    let in_review: Vec<_> = tasks.iter().filter(|t| t.status() == Status::Review).collect();
     let inbox = tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count();
     let needs = rows.iter().filter(|r| r.needs_you).count();
 
@@ -773,6 +774,7 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
                 })).collect::<Vec<_>>(),
                 "needs_you": needs,
                 "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
+                "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
                 "inbox": inbox,
             }))
             .unwrap_or_default()
@@ -825,7 +827,23 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
             println!(
                 "  {}  {}  {}",
                 p.dim(&t.id),
-                t.project.clone().unwrap_or_else(|| "—".into()),
+                util::pad(&t.project.clone().unwrap_or_else(|| "—".into()), 8),
+                util::truncate(&t.title, 56)
+            );
+        }
+    }
+
+    // Work an agent has finished with. `review` is the agent's terminal verb —
+    // it stops there and says so, and only a person says `done` — so this is
+    // the list of things waiting on you rather than on anybody working.
+    if !in_review.is_empty() {
+        println!();
+        println!("{}  {}   {}", p.yellow(&util::pad("REVIEW", 8)), in_review.len(), p.dim("wsp done <id> · wsp reopen <id>"));
+        for t in &in_review {
+            println!(
+                "  {}  {}  {}",
+                p.dim(&t.id),
+                util::pad(&t.project.clone().unwrap_or_else(|| "—".into()), 8),
                 util::truncate(&t.title, 56)
             );
         }

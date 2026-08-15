@@ -340,6 +340,13 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     } else {
         foot.push(Style::Dim, "blocked 0");
     }
+    // Beside it, and only when there is one: an agent stops at `review`, so a
+    // count here is work finished and waiting on you. Zero is the resting
+    // state and saying so every time would train the eye to skip the line.
+    if ui.review > 0 {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Warn, format!("review {}", ui.review));
+    }
     if ui.show_done {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "+done");

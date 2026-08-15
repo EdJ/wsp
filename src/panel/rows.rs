@@ -126,6 +126,10 @@ pub(crate) struct Ui {
     pub(super) agents_total: usize,
     pub(super) needs: usize,
     pub(super) blocked: usize,
+    /// Tasks an agent has finished with and handed back. `review` is where an
+    /// agent's work ends; only a person says `done`, so this is a count of
+    /// things waiting on one.
+    pub(super) review: usize,
     pub(super) sel: usize,
     pub(super) message: Option<(String, Instant)>,
     pub(super) self_focused: bool,
@@ -671,6 +675,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         agents_total: panes.iter().filter(|p| !p.agent.is_empty()).count(),
         needs,
         blocked: tasks.iter().filter(|t| t.status() == Status::Blocked).count(),
+        review: tasks.iter().filter(|t| t.status() == Status::Review).count(),
         sel: 0,
         message: None,
         self_focused,

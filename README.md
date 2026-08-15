@@ -508,6 +508,42 @@ which is no use for behaviour that has to happen without being asked — so the
 few sentences that say when to reach for the CLI have to be in front of the
 agent before it does anything, and this is the file the hook puts there.
 
+### Where an agent stops
+
+```sh
+wsp review <id>      # an agent's last word on a piece of work
+wsp done <id>        # yours
+```
+
+`review` is the agent's terminal verb. It is not a request for a code review —
+it means *I have finished and it is yours now*, which is a different claim from
+`done` and the only one an agent is in a position to make. An agent that closes
+its own work has graded its own homework, and the one thing it cannot know is
+whether the thing you asked for is the thing it built.
+
+Nothing enforces this and nothing should: `wsp done` works from anywhere, and a
+rule that has to be policed by a permission is a rule nobody believes in. What
+makes it hold is that it is stated in `agents.md`, where every session reads it,
+and that stopping is *visible* — `wsp wip` grows a `REVIEW` block beside
+`BLOCKED`, and the panel footer counts it beside the blocked count. Work parked
+where you cannot see it is the failure this guards against, not disobedience.
+
+The seam for telling you is already there. Every status change fires
+`~/wsp/hooks/on-task-review` with the event JSON on stdin, so a notification is
+an executable file rather than a feature request:
+
+```sh
+#!/bin/sh
+# ~/wsp/hooks/on-task-review
+exec terminal-notifier -title "wsp: ready to review" -message "$(jq -r .data.title)"
+```
+
+The payload is `{kind, ts, data}`, so the task's fields are under `.data` —
+which is worth saying, because the obvious `jq -r .title` returns null and a
+notification with an empty body looks like a broken tool rather than a wrong
+path. Failures are ignored on purpose: a broken hook must not be able to stop a
+task being finished.
+
 ## Sub-tasks
 
 ```sh
