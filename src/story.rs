@@ -328,6 +328,22 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// The same hunt upwards, for the rows above wherever a verb left the
+    /// cursor — the dock is at the foot, and everything a pick is looking for
+    /// is above it.
+    fn up_to(&mut self, want: panel::RowKind) -> &mut Self {
+        loop {
+            if self.ui.selected_kind() == want {
+                return self;
+            }
+            let before = self.ui.selected_index();
+            self.key(Key::Up);
+            if self.ui.selected_index() == before {
+                return self;
+            }
+        }
+    }
+
     fn scene(&self, title: &str, caption: &str) -> Scene {
         Scene {
             title: title.to_string(),
@@ -417,6 +433,14 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .keys(&[Key::Char('G'), Key::Char('c')])
+            .up_to(panel::RowKind::More)
+            .key(Key::Enter)
+            .scene("Reaching past the cap", "Every project stops at six tasks and puts the rest behind `⋯`, so a hunt for work to hand over runs into one. `↵` inside a pick takes the row it lands on — and on a row it cannot take but can *open*, it opens it: the tail here, a folded project the same way. The pick is still running; the two tasks that were out of reach are now rows like any other."),
+    );
+
+    out.push(
+        Driver::new(&w)
             .keys(&[Key::Char('G'), Key::Up, Key::Char('f')])
             .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command."),
     );
@@ -448,6 +472,17 @@ fn scenes() -> Vec<Scene> {
             .scene(
                 "The agents, not the work",
                 "`w` puts every running agent in place of the tree, ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ■ stopped on a task parked with a question, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The project on the right is what the tree would have said by where it drew the row. Every key still means what it means — ↵ jumps to the terminal, `c` hands it a task, 1-9 are the same hotkeys.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .key(Key::Char('w'))
+            .down_to(panel::RowKind::Agent)
+            .key(Key::Char('c'))
+            .scene(
+                "Handing work over from the agents view",
+                "The agents view is where you notice an agent with nothing to do, and it is the one view with no work in it to give one. So `c` brings the tree back on its way into the pick — the same switch `R` and `w` already make on each other. The question in the footer is unchanged; what changed is that there is now something on screen that can answer it.",
             ),
     );
 
@@ -1190,6 +1225,142 @@ mod tests {
 
     fn press(ui: &mut panel::Ui, view: &mut panel::View, c: char) -> panel::Effect {
         panel::apply_key(Key::Char(c), ui, view)
+    }
+
+    /// A key and the rebuild the live loop does for it. `press` is enough while
+    /// a test only asks what a key returned; anything that asks which rows are
+    /// there afterwards has to go through this, because the folds decide the
+    /// rows and the reducer only says that they moved.
+    fn step(snap: &Snapshot, ui: &mut panel::Ui, view: &mut panel::View, k: Key) -> panel::Effect {
+        let e = panel::apply_key(k, ui, view);
+        if matches!(e, panel::Effect::Refetch) {
+            panel::refetch_into(ui, snap, view, Some("w0"));
+        }
+        e
+    }
+
+    fn has(ui: &panel::Ui, want: &panel::Target) -> bool {
+        let mut probe = ui.clone();
+        (0..ui.rows_for_test()).any(|i| {
+            probe.select_for_test(i);
+            probe.selected_target() == *want
+        })
+    }
+
+    /// Put the cursor on the first row of a kind, without counting presses: a
+    /// count rots the moment the fixture gains a task.
+    fn on_kind(ui: &mut panel::Ui, want: panel::RowKind) {
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_kind() == want {
+                return;
+            }
+        }
+        panic!("no {want:?} row");
+    }
+
+    /// Handing work to an agent is a hunt through the tree, and every project
+    /// in it stops at six tasks with the rest behind a `⋯`. Inside a pick `↵`
+    /// was the pick's own key and nothing else, so the one row whose entire
+    /// purpose is to be opened was the one row the pick refused — and any task
+    /// past the cap could not be handed to anybody.
+    #[test]
+    fn the_overflow_row_still_opens_while_a_pick_is_hunting() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w4:p2");
+        press(&mut ui, &mut view, 'c');
+
+        // Eight tasks in `wsp` against a cap of six: the last two are behind ⋯.
+        let past_the_cap = panel::Target::Task("t-108".into());
+        assert!(!has(&ui, &past_the_cap), "the tail starts folded away");
+
+        on_kind(&mut ui, panel::RowKind::More);
+        step(&w, &mut ui, &mut view, Key::Enter);
+        assert!(has(&ui, &past_the_cap), "↵ on ⋯ has to open the tail, mid-pick or not");
+
+        // And the pick is still live: opening a row is not choosing one.
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_target() == past_the_cap {
+                break;
+            }
+        }
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["claim", "t-108", "--pane", "w4:p2"]);
+            }
+            _ => panic!("the pick outlived the row it opened, and should claim"),
+        }
+    }
+
+    /// The same key on a folded project. A pick cannot take one — a pane takes
+    /// a task — and refusing there left the tree's own carets as the only way
+    /// in, which is a second thing to know at the moment you are hunting for a
+    /// row rather than reading a key map.
+    #[test]
+    fn a_folded_project_opens_under_a_pick_too() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_kind(&mut ui, panel::RowKind::Project);
+        step(&w, &mut ui, &mut view, Key::Left);
+        let under = panel::Target::Task("t-001".into());
+        assert!(!has(&ui, &under), "folded, so its work is away");
+
+        on_pane(&mut ui, "w4:p2");
+        press(&mut ui, &mut view, 'c');
+        on_kind(&mut ui, panel::RowKind::Project);
+        step(&w, &mut ui, &mut view, Key::Enter);
+        assert!(has(&ui, &under), "↵ opens it, because the pick is looking for what is inside");
+    }
+
+    /// `w` puts the agents in place of the tree, which is exactly where you
+    /// notice an agent with nothing to do — and it is the one view with no work
+    /// in it to hand over. Starting the pick there aimed it at a list of panes:
+    /// every row refused, and no key brought the tree back.
+    #[test]
+    fn picking_for_an_agent_brings_the_work_back_into_view() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        step(&w, &mut ui, &mut view, Key::Char('w'));
+        assert!(!has(&ui, &panel::Target::Task("t-020".into())), "the agents, not the work");
+
+        // `c`: which task does it take?
+        on_pane(&mut ui, "w4:p2");
+        step(&w, &mut ui, &mut view, Key::Char('c'));
+        assert!(has(&ui, &panel::Target::Task("t-020".into())), "a pick needs work to aim at");
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Task("t-020".into()) {
+                break;
+            }
+        }
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["claim", "t-020", "--pane", "w4:p2"]);
+            }
+            _ => panic!("the pick should claim the task it landed on"),
+        }
+    }
+
+    /// And `f` on an agent standing nowhere, which asks the same question one
+    /// level up: it lands on a project, and the agents view has no projects
+    /// either.
+    #[test]
+    fn sending_an_agent_looking_brings_the_projects_back_into_view() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        step(&w, &mut ui, &mut view, Key::Char('w'));
+        on_pane(&mut ui, "w6:p1");
+        step(&w, &mut ui, &mut view, Key::Char('f'));
+        assert!(
+            has(&ui, &panel::Target::Project("verb".into())),
+            "the pick asks which project, so the projects have to be there",
+        );
     }
 
     /// The dock's own verb: the panel works out what the pane is for and types

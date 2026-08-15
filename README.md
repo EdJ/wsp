@@ -372,6 +372,11 @@ claim; the env is exact for the life of the session.
 
 Typing, picking and confirming are modes, not widgets: navigation and folding
 keep working inside a pick, so you hunt for a destination by reading the tree.
+`↵` takes the row it lands on, and on a row the pick cannot take but *can*
+open — a folded project, a `⋯` tail — it opens it instead of refusing, because
+those are the rows standing between the hunt and what it is looking for. A pick
+started from the agents view puts the tree back first: `w` shows the panes and
+nothing else, and it is the one view with no work in it to point at.
 
 `c` and `f` are the two answers to one question, and the difference is who
 picks the work. Both end in the same place: a sentence typed into the agent's

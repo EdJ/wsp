@@ -249,6 +249,13 @@ pub(super) fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effe
                 view.mode = Mode::Browse;
                 Effect::Run { argv, escalate, then }
             }
+            // Not a destination, but not nothing either: a `⋯`, or a branch
+            // that is folded, is a row whose whole purpose is to be opened —
+            // and what it opens onto is what the pick is hunting for. Refusing
+            // there put the tail of every project past the six-task cap out of
+            // reach of a claim, because `↵` was the pick's own key and the tail
+            // has no other one.
+            None if opens(ui.rows.get(ui.sel)) => move_or_fold(Key::Right, ui, view),
             None => {
                 say(ui, "not a valid destination");
                 Effect::None
@@ -289,6 +296,18 @@ pub(super) fn confirm_key(
             Effect::None
         }
         _ => Effect::None,
+    }
+}
+
+/// Whether `→` on this row would show something that is not showing: the
+/// overflow row, or a branch that is folded. An open branch is deliberately not
+/// one — `↵` means open, and making it fold as well would give the pick's own
+/// key a second meaning that depends on state you are not looking at.
+fn opens(row: Option<&Row>) -> bool {
+    match row {
+        Some(Row::More { .. }) => true,
+        Some(Row::Project { collapsed, .. }) | Some(Row::Section { collapsed, .. }) => *collapsed,
+        _ => false,
     }
 }
 

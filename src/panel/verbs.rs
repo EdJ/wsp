@@ -202,6 +202,24 @@ impl Pick {
 }
 
 
+/// Start a pick, putting the tree back if it is not there.
+///
+/// The agents view holds the panes and nothing else, and it is exactly where
+/// you notice an agent with nothing to do — so it is where `c` and `f` get
+/// pressed. Both then ask you to point at work, and there was none on screen to
+/// point at: every row refused, and no key in the pick brings the tree back.
+///
+/// The same switch `R` and `w` already make on each other. A view is what you
+/// are looking at, and asking which task is a question about the tree.
+fn begin(view: &mut View, verb: Pick) -> Effect {
+    view.mode = Mode::Pick { verb };
+    if view.agents {
+        view.agents = false;
+        return Effect::Refetch;
+    }
+    Effect::None
+}
+
 /// A sentence to type into an agent's pane, and the line the footer shows for
 /// having typed it.
 ///
@@ -310,10 +328,10 @@ fn find_work(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
         return Effect::None;
     }
     let Some(project) = a.project.clone() else {
-        view.mode = Mode::Pick {
-            verb: Pick::WorkForAgent { pane: a.pane.clone(), workspace: a.workspace.clone() },
-        };
-        return Effect::None;
+        return begin(
+            view,
+            Pick::WorkForAgent { pane: a.pane.clone(), workspace: a.workspace.clone() },
+        );
     };
     let tell = tell_find_work(a, &project);
     say(ui, tell.note.clone());
@@ -739,24 +757,15 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 
         // ---- picked ----
         Key::Char('m') => match &target {
-            Target::Task(id) => {
-                view.mode = Mode::Pick { verb: Pick::MoveTask { task: id.clone() } };
-                Effect::None
-            }
+            Target::Task(id) => begin(view, Pick::MoveTask { task: id.clone() }),
             _ => {
                 say(ui, "only a task moves");
                 Effect::None
             }
         },
         Key::Char('c') => match &target {
-            Target::Task(id) => {
-                view.mode = Mode::Pick { verb: Pick::PaneForTask { task: id.clone() } };
-                Effect::None
-            }
-            Target::Pane(p) => {
-                view.mode = Mode::Pick { verb: Pick::TaskForPane { pane: p.clone() } };
-                Effect::None
-            }
+            Target::Task(id) => begin(view, Pick::PaneForTask { task: id.clone() }),
+            Target::Pane(p) => begin(view, Pick::TaskForPane { pane: p.clone() }),
             _ => {
                 say(ui, "claim joins a task to an agent");
                 Effect::None
