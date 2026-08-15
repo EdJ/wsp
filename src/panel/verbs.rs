@@ -17,7 +17,8 @@ use crate::input::Key;
 use crate::store::Store;
 use crate::util;
 
-use super::install::{list_panes, shell_quote, store_env};
+use super::install::{list_panes, store_env};
+use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, View};
 use super::rows::{hotkeys, Target, Ui};
 use super::{PANEL_LABEL, VIEW_LABEL};
@@ -201,12 +202,10 @@ pub(super) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> St
     ) else {
         return "could not create a tab".into();
     };
-    let tab = r
-        .get("tab")
-        .and_then(|t| t.get("tab_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    // The tab id is deliberately not kept. It was here to build the marker
+    // file's name and the `herdr tab close` the last editor ran; closing the
+    // tab is the context pane's job now, and it finds its own tab from its own
+    // pane. Nothing in this function needs to know which tab it made.
     let Some(top) = r
         .get("root_pane")
         .and_then(|p| p.get("pane_id"))
@@ -246,70 +245,33 @@ pub(super) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> St
     // One editor per section, side by side. Each buffer is prose and nothing
     // else — there is no markup left to mangle, which was the point. They are
     // safe to run together because `wsp edit` re-reads the task and writes back
-    // only its own section.
-    let Some(right) = split(&work, "right", 0.5) else {
-        return "could not split the editors".into();
-    };
+    // only its own section, and because no two columns ever hold the same one.
+    //
+    // Two columns to open with, not three: the third is a keystroke away and
+    // three editors on a laptop split is narrower than most prose wants. `3`
+    // in the context pane says otherwise.
+    let cols = crate::detail::Columns::new(2);
+    let sections = cols.sections();
+    let mut panes = vec![work];
+    for i in 1..sections.len() {
+        // The target keeps `ratio` and the new pane takes the rest, so peeling
+        // one column at a time off the right of what is left gives even widths:
+        // a third, then half of the remaining two thirds.
+        let ratio = 1.0 / (sections.len() - i + 1) as f64;
+        let Some(p) = panes.last().and_then(|last| split(last, "right", ratio)) else {
+            return "could not split the editors".into();
+        };
+        panes.push(p);
+    }
 
-    // Whichever editor is quit second takes the tab down. A one-byte marker per
-    // editor, because closing on the first would kill the other with its work
-    // still open — and leaving the tab means every edit strands a husk.
-    let mark = std::env::temp_dir().join(format!("wsp-edit-{}", tab.replace(':', "-")));
-    let m = shell_quote(&mark.display().to_string());
-    let done = format!(
-        "; printf x >> {m}; [ \"$(wc -c < {m} | tr -d ' ')\" -ge 2 ] && {{ rm -f {m}; herdr tab close {}; }}",
-        shell_quote(&tab)
-    );
-    let _ = std::fs::remove_file(&mark);
-
-    for (pane, section) in [(&work, "overview"), (&right, "details")] {
-        // Label the pane as well as the file: herdr shows one, the editor's
-        // status line shows the other, and between them there is no way to be
-        // looking at a buffer without knowing which half it is.
-        let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": section }));
-        let cmd = std::iter::once(shell_quote(&exe))
-            .chain(base.iter().map(|a| shell_quote(a)))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let slot = shell_quote(&crate::detail::slot_path(pane).display().to_string());
-        let _ = std::fs::remove_file(crate::detail::slot_path(pane));
-        run(pane, format!("{}\n", editor_loop(section, &cmd, &slot, &done)));
+    let cmd = std::iter::once(shell_quote(&exe))
+        .chain(base.iter().map(|a| shell_quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (pane, section) in panes.iter().zip(sections) {
+        crate::detail::start_editor(pane, section, &cmd);
     }
     format!("editing {label}")
-}
-
-/// The shell an editor pane runs: open a section, and open it again if the
-/// menu moved this pane while somebody was inside it.
-///
-/// A loop rather than one editor, so the top pane can re-point this one without
-/// closing anything. The pane writes the section it is opening into its slot,
-/// runs the editor, then reads the slot back. Unchanged means the person quit;
-/// changed means the menu moved it, and the next turn opens what it now says.
-///
-/// Three things this shape is carrying, none of them obvious:
-///
-/// - **The tab-closing marker is outside the loop.** It counts editors that
-///   *finished*, not editors that *exited*, and a swap is an exit. Counting
-///   those would take the tab down on the second swap.
-/// - **An empty read ends the loop.** The slot can go missing — a temp reaper,
-///   a forced close, a second `W` — and an empty section name would otherwise
-///   become `wsp edit <id> --`, which parses as no section at all and puts the
-///   whole body in front of someone who asked for one part of it.
-/// - **The slot is written at the top of each turn, not the bottom.** The menu
-///   writes it while the editor is running, so reading it after the editor
-///   exits is the only ordering that sees the change.
-///
-/// Built as a string here, and separately, so it can be handed to `sh -n`.
-/// Nothing else in this file can be tested without a terminal and a herdr,
-/// which is exactly why the one part that is a quoting problem should be.
-fn editor_loop(section: &str, cmd: &str, slot: &str, done: &str) -> String {
-    format!(
-        "s={section}; while :; do printf %s \"$s\" > {slot}; \
-         {cmd} --\"$s\"; n=$(cat {slot} 2>/dev/null); \
-         {{ [ -z \"$n\" ] || [ \"$n\" = \"$s\" ]; }} && break; s=\"$n\"; done; \
-         rm -f {slot}{done}"
-    )
 }
 
 /// Point the workspace's detail pane at something, making one if there is not
@@ -738,42 +700,3 @@ pub(super) fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The one thing in this file that is a quoting problem rather than a
-    /// terminal problem. `sh -n` parses without running, so a stray brace or an
-    /// unbalanced quote fails here rather than in a pane at the moment somebody
-    /// presses `E`.
-    #[test]
-    fn the_editor_loop_is_valid_shell() {
-        let done = "; printf x >> '/tmp/wsp-edit-w0-p3'";
-        let loop_ = editor_loop("overview", "'/usr/bin/wsp' 'edit' 't-1'", "'/tmp/s'", done);
-        let out = std::process::Command::new("sh")
-            .arg("-n")
-            .arg("-c")
-            .arg(&loop_)
-            .output()
-            .expect("sh");
-        assert!(
-            out.status.success(),
-            "sh -n rejected the loop: {}\n{loop_}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// A missing slot must end the loop, not feed it an empty section — that
-    /// becomes `wsp edit <id> --`, which parses as no section at all and opens
-    /// the whole body. The guard is easy to drop when editing the format
-    /// string, and nothing else would notice.
-    #[test]
-    fn an_empty_slot_ends_the_loop_rather_than_reopening_on_nothing() {
-        let l = editor_loop("overview", "true", "'/tmp/s'", "");
-        assert!(l.contains("[ -z \"$n\" ]"), "no empty-slot guard: {l}");
-        // The read has to come after the editor, or the swap is never seen.
-        let editor = l.find("--\"$s\"").expect("runs the editor");
-        let read = l.find("n=$(cat").expect("reads the slot back");
-        assert!(editor < read, "slot is read before the editor runs: {l}");
-    }
-}

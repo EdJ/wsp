@@ -11,6 +11,7 @@ use serde_json::json;
 
 use crate::herdr;
 use crate::store::Store;
+use crate::util::shell_quote;
 
 use super::{PANEL_LABEL, VIEW_LABEL};
 
@@ -113,10 +114,6 @@ pub(super) fn store_env() -> serde_json::Map<String, serde_json::Value> {
         }
     }
     env
-}
-
-pub(super) fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// `pane.split` starts the user's shell and takes no command, so the panel is

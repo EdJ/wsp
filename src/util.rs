@@ -261,3 +261,14 @@ impl Paint {
         self.wrap("36", s)
     }
 }
+
+/// Wrap a string so a shell takes it as one literal argument.
+///
+/// Single quotes, with an embedded quote spelled the only way `sh` allows:
+/// close, escape, reopen. Lives here rather than beside the panel because two
+/// unrelated places now build shell for a pane to run — the panel when it
+/// opens an edit tab, and the detail pane when the menu adds a column — and a
+/// quoting rule with two copies is a quoting rule with one bug.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}

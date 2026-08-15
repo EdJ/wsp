@@ -93,6 +93,13 @@ pub(crate) struct Ctx {
     pub worked: std::collections::BTreeMap<String, serde_json::Value>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub panes: Vec<herdr::Pane>,
+    /// The sections in the editor columns beside this pane, left to right.
+    ///
+    /// Cannot be derived from `panes`: a `herdr::Pane` carries no geometry, so
+    /// which label is the second column across takes a separate call. Filled
+    /// once per repaint by `live`, and left empty by a storyboard, where there
+    /// are no editors and the menu is rightly absent.
+    pub columns: Vec<String>,
 }
 
 impl Ctx {
@@ -104,6 +111,7 @@ impl Ctx {
             worked: store.worked(),
             bindings: store.bindings(),
             panes: herdr::panes().unwrap_or_default(),
+            columns: super::editors::editor_columns(),
         }
     }
 
@@ -138,37 +146,60 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
     // place its keys do anything. Offering three keys in a view with nothing
     // beside it would be advertising a menu whose every entry answers "no
     // editors open".
-    let open = open_sections(ctx);
-    let footer = if open.is_empty() { 2 } else { 3 };
+    let cols = &ctx.columns;
+    let footer = if cols.is_empty() { 2 } else { 3 };
     out.truncate(h.saturating_sub(footer));
     while out.len() < h.saturating_sub(footer) {
         out.push(Line::default());
     }
     out.push(line(Style::Dim, "─".repeat(w)));
-    if !open.is_empty() {
-        let mut menu = Line::default();
-        for (i, name) in crate::model::PROSE.iter().enumerate() {
-            if i > 0 {
-                menu.push(Style::Dim, " · ");
-            }
-            let showing = open.iter().any(|s| s.eq_ignore_ascii_case(name));
-            menu.push(Style::Dim, format!("{} ", section_key(name)));
-            // Lit for what is on screen, muted for what a key would bring in.
-            // The distinction is the whole point of drawing the menu: three
-            // sections and two panes means one is always somewhere else.
-            menu.push(
-                if showing { Style::Accent } else { Style::Muted },
-                name.to_lowercase(),
-            );
-        }
-        menu.fit(w);
-        out.push(menu);
+    if !cols.is_empty() {
+        out.push(menu_line(cols, w));
     }
     out.push(line(
         Style::Dim,
-        "h/l left or right · W save and close · q close, discarding",
+        if cols.is_empty() {
+            "h/l left or right · W save and close · q close, discarding"
+        } else {
+            "o/d/D then 1-3 places a section · 1/2/3 alone sets the columns · W save · q discard"
+        }
+        .to_string(),
     ));
     out
+}
+
+/// The menu: what is in each column, and what a key would bring in.
+///
+/// Two halves, because there are two questions. On the left, the columns as
+/// they are — numbered, because the number is what you type. On the right, the
+/// sections that are not on screen, so `D` has something to point at when
+/// decisions is nowhere. A section that is showing is never repeated on the
+/// right; the whole value of the line is telling those two states apart.
+fn menu_line(cols: &[String], w: usize) -> Line {
+    let mut menu = Line::default();
+    for (i, section) in cols.iter().enumerate() {
+        if i > 0 {
+            menu.push(Style::Dim, "  ");
+        }
+        menu.push(Style::Dim, format!("{} ", i + 1));
+        menu.push(Style::Accent, section.to_lowercase());
+    }
+    let elsewhere: Vec<&&str> = crate::model::PROSE
+        .iter()
+        .filter(|s| !cols.iter().any(|c| c.eq_ignore_ascii_case(s)))
+        .collect();
+    if !elsewhere.is_empty() {
+        menu.push(Style::Dim, "   ·   ");
+        for (i, section) in elsewhere.iter().enumerate() {
+            if i > 0 {
+                menu.push(Style::Dim, "  ");
+            }
+            menu.push(Style::Dim, format!("{} ", section_key(section)));
+            menu.push(Style::Muted, section.to_lowercase());
+        }
+    }
+    menu.fit(w);
+    menu
 }
 
 /// The key that brings a section in. Initials, not positions — `h`/`l` already
@@ -179,28 +210,6 @@ fn section_key(section: &str) -> char {
         "Details" => 'd',
         _ => 'D',
     }
-}
-
-/// The sections open in editor panes beside this one.
-///
-/// Read from the panes the context already carries rather than asked for
-/// again: the join is live, and a second round-trip to herdr on every repaint
-/// would cost more than the line it draws. A storyboard `Ctx` holds synthetic
-/// panes that share no tab with this process, so it finds none and the menu
-/// stays off — which is right, since a still frame has no editors either.
-fn open_sections(ctx: &Ctx) -> Vec<String> {
-    let Some(me) = herdr::Env::read().pane_id else {
-        return Vec::new();
-    };
-    let Some(tab) = ctx.panes.iter().find(|p| p.pane_id == me).map(|p| p.tab_id.clone()) else {
-        return Vec::new();
-    };
-    ctx.panes
-        .iter()
-        .filter(|p| p.tab_id == tab && p.pane_id != me)
-        .filter(|p| super::editors::is_section_label(&p.label))
-        .map(|p| p.label.clone())
-        .collect()
 }
 
 fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
@@ -448,3 +457,74 @@ fn glyph_for(s: Status) -> &'static str {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The spans that carry a section name, paired with whether they are lit.
+    /// Style is the whole message here — an accented name is a column you have,
+    /// a muted one is a key away — so a test that only read the text would pass
+    /// on a line that told the user the opposite of the truth.
+    fn named(l: &Line) -> Vec<(String, bool)> {
+        l.spans
+            .iter()
+            .filter(|s| crate::model::PROSE.iter().any(|p| p.eq_ignore_ascii_case(s.text.trim())))
+            .map(|s| (s.text.trim().to_string(), matches!(s.style, Style::Accent)))
+            .collect()
+    }
+
+    #[test]
+    fn the_menu_numbers_the_columns_it_has_and_dims_the_rest() {
+        let cols = vec!["overview".to_string(), "details".to_string()];
+        let l = menu_line(&cols, 120);
+        assert_eq!(
+            named(&l),
+            [
+                ("overview".to_string(), true),
+                ("details".to_string(), true),
+                ("decisions".to_string(), false),
+            ]
+        );
+        let text: String = l.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.starts_with("1 overview"), "columns are numbered: {text}");
+        assert!(text.contains("2 details"), "…in order: {text}");
+        assert!(text.contains("D decisions"), "and the absent one shows its key: {text}");
+    }
+
+    /// With every section on screen there is nothing left to offer, and the
+    /// line must not invent a fourth entry or leave a trailing separator
+    /// pointing at nothing.
+    #[test]
+    fn three_columns_leaves_nothing_on_the_right() {
+        let cols: Vec<String> =
+            crate::model::PROSE.iter().map(|s| s.to_lowercase()).collect();
+        let l = menu_line(&cols, 120);
+        assert!(named(&l).iter().all(|(_, lit)| *lit), "all three are columns");
+        let text: String = l.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(!text.contains("·"), "no separator with nothing after it: {text}");
+    }
+
+    /// A column order the user made with `d 1` has to survive into the menu, or
+    /// the numbers name the wrong panes and `d 2` moves something else.
+    #[test]
+    fn the_menu_follows_the_column_order_rather_than_the_canonical_one() {
+        let cols = vec!["decisions".to_string(), "overview".to_string()];
+        let text: String =
+            menu_line(&cols, 120).spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.starts_with("1 decisions"), "{text}");
+        assert!(text.contains("2 overview"), "{text}");
+        assert!(text.contains("d details"), "details is the one off screen: {text}");
+    }
+
+    /// A narrow pane must not wrap the menu into the frame above it: `fit`
+    /// pads and truncates, and the footer is one line by construction.
+    #[test]
+    fn the_menu_fits_a_narrow_pane() {
+        let cols: Vec<String> =
+            crate::model::PROSE.iter().map(|s| s.to_lowercase()).collect();
+        for w in [20usize, 40, 200] {
+            assert_eq!(menu_line(&cols, w).width(), w, "menu is exactly {w} wide");
+        }
+    }
+}

@@ -528,6 +528,8 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
         worked,
         bindings: w.bindings.clone(),
         panes: w.panes.clone(),
+        // A still frame has no edit tab, so no section menu.
+        columns: Vec::new(),
     };
     let shot = |title: &str, caption: &str, focus: Focus| Scene {
         title: title.to_string(),

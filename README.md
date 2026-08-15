@@ -151,7 +151,7 @@ For real editing, `E` pops the row out into a **tab** of its own:
 ```
 ┌─ context (live) ───────────────────────┐
 │ status · claim · log                   │
-│ o overview · d details · D decisions   │
+│ 1 overview  2 details   ·   D decisions│
 ├─ overview ──────────┬─ details ────────┤
 │ prose, no markup    │ prose, no markup │
 └─────────────────────┴──────────────────┘
@@ -166,47 +166,103 @@ section. The tab opens with the **context** focused, not an editor — so `W` an
 under your hands before you have committed to typing anything. From there `h`
 and `l`, or `←` and `→`, go to the pane on that side of the screen.
 
-#### Three sections, two panes
+#### Three sections, three columns
 
-The menu across the context pane says which sections are open — lit for what is
-on screen, muted for what a key would bring in. `o`, `d` and `D` each put one
-there.
+The menu across the context pane is the layout, written down. On the left, the
+columns you have, numbered — the number is what you type. On the right, after a
+separator, whatever is not on screen, with the key that would fetch it. A
+section is never in both halves; telling those two states apart is the whole
+value of the line.
 
-There are three prose sections and two panes, so a key has to mean something
-definite about which pane moves. The rule is one sentence: **the section you
-press lands on the right, and if it is already on the left the two trade
-places.** That reaches every arrangement, it never disturbs a pane already
-showing what you asked for, and the common case — swapping `details` out for
-`decisions` while you keep writing the overview — leaves the pane you are
-working in alone.
+```
+1 overview  2 details   ·   D decisions
+```
 
-The swap does not close anything. Each editor pane runs a loop around a *slot
-file* holding the section it is showing: it writes the section, runs the editor,
-and reads the slot back when the editor exits. Unchanged means you quit, and the
-loop ends. Changed means the menu re-pointed the pane while you were inside it,
-and the next turn opens what it now says. The menu writes every slot *before*
-asking any editor to leave, so a trade cannot come apart with one pane moved and
-one not.
+Two keys, and they compose:
 
-That indirection is doing more than it looks like. The tab-closing marker sits
-outside the loop, so it counts editors that **finished** rather than editors
-that **exited** — a swap is an exit, and counting those would take the tab down
-on the second swap. And an empty slot ends the loop rather than continuing it:
-the file can go missing, and an empty section name would otherwise become `wsp
-edit <id> --`, which parses as no section at all and puts the whole body in
-front of someone who asked for one part of it.
+| Press | Means |
+|---|---|
+| `1` `2` `3` | how many columns there are |
+| `o` `d` `D` then `1` `2` `3` | put that section in that column |
 
-By position, not by name: `o` for overview and `d` for details put the key for
-the *left* pane under the right hand, which is backwards every time you reach
-for it. `h` and `l` are left and right on the keyboard, in vim, and in herdr's
-own `prefix+h/l`. The side is resolved from herdr's actual geometry rather than
-from the layout this code happens to build, so it stays true if that changes.
+So `d 2` is details in column two, `D 3` is decisions in column three, and a
+bare `3` is all three sections at once. The digits mean two different things
+depending on what came before them, which is exactly why it is a chain rather
+than six keys: `2` on its own is a question about the layout, and `d 2` is a
+question about one column.
 
-Getting back, and moving around generally, is herdr's own: `prefix+h/j/k/l`
-focuses the pane left/down/up/right, where the prefix is whatever
-`[keys] prefix` says in `~/.config/herdr/config.toml`. There was no reason to
-reinvent that; `o` and `d` exist only because naming a pane you are looking
-straight at beats a two-step reach for it.
+A half-typed chain is not a trap. `d` then anything that is not a digit cancels
+and says so, and the key you actually pressed is then handled normally — so
+changing your mind mid-chain still saves, still scrolls, still quits.
+
+The rules are the few that keep the columns honest:
+
+- **No section is ever in two columns.** Two editors on one buffer means the
+  second to exit wins and the first person's typing is gone — `wsp edit` reads
+  and writes back a whole section. So placing a section that is already on
+  screen makes the two columns **trade** rather than overwriting the target.
+- **Asking for a column past the end grows to reach it.** `D 3` from a
+  two-column tab is unambiguous, and refusing it so you can press `3` first
+  would be pedantry.
+- **Shrinking drops from the right, growing appends what is missing.** `1` then
+  `3` gets you back something recognisable rather than the default: the column
+  you were writing in stays put, and only the ones you asked about move.
+
+Those rules live in `Columns`, apart from any pane, because everything else
+here needs a terminal and a herdr to exercise and that does not. A key press is
+a function from one `Columns` to the next; moving panes is the diff between
+them, applied **grow, then re-point, then shrink** — a section moving out of a
+column that is about to close has to reach its new home before the old one goes.
+
+#### Moving between the panes
+
+`h` and `l`, or `←` and `→`, focus the pane on that side of the screen — by
+position, not by name, because `h` and `l` mean left and right on the keyboard,
+in vim, and in herdr's own `prefix+h/l`. The side is resolved from herdr's
+actual geometry rather than from the layout this code happens to build, so it
+stays true if that changes.
+
+That same geometry is what orders the columns the menu numbers. herdr lists
+panes in creation order, which stops meaning "left to right" the first time a
+column is closed and another opened — which, with a menu that adds and removes
+them, is immediately. Reading the order back off the layout each time costs one
+call and cannot go stale; remembering it in the context pane would describe a
+column that somebody had since quit by hand.
+
+Moving around more generally is herdr's own: `prefix+h/j/k/l` focuses the pane
+left/down/up/right, where the prefix is whatever `[keys] prefix` says in
+`~/.config/herdr/config.toml`. There was no reason to reinvent that.
+
+#### How a column moves without closing
+
+Each editor pane runs a loop around a *slot file* holding the section it is
+showing: it writes the section, runs the editor, and reads the slot back when
+the editor exits. Unchanged means you quit, and the loop ends, and the shell
+exits, and herdr reaps the pane. Changed means the menu re-pointed the pane
+while you were inside it, and the next turn opens what it now says.
+
+That gives the context pane one gesture for two jobs. To **move** a section,
+write the slot and ask the editor to save and quit. To **close** a column, ask
+the editor to save and quit and leave the slot alone. Same keystrokes; the only
+difference is whether anything was written first.
+
+The slot is written at the *top* of each turn and read at the bottom, because
+the menu writes it while the editor is running — any other ordering never sees
+the change. And an empty read ends the loop rather than continuing it: the file
+can go missing, and an empty section name would become `wsp edit <id> --`,
+which parses as no section at all and puts the whole body in front of someone
+who asked for one part of it.
+
+**Nothing in the pane closes the tab.** It used to: a marker file counted
+editors that had finished, and the second one took the tab down. That hard-codes
+two panes into a shell fragment, and the moment the column count could change,
+going from three columns to two counted as an editor finishing and closed the
+tab underneath you. The context pane watches its editor siblings instead and
+closes the tab when the count reaches zero — which does not care how many
+columns there are. It arms only once editors have actually been seen, so a
+context pane that paints before they register does not close the tab on the way
+up, and it wants two consecutive empty readings, so a momentary gap in what
+herdr reports is not mistaken for the end.
 
 `W` in the context pane saves and closes every editor at once. It sends two
 things: an abort — `Ctrl-C` for the vi family, `Ctrl-G` for emacs — and then
@@ -868,8 +924,8 @@ Every command takes `--json`.
 | `src/panel/verbs.rs` | what the letters do |
 | `src/panel/run.rs` | the terminal, the event loop, the effects |
 | `src/panel/install.rs` | splitting the panel into a workspace, and back out |
-| `src/detail/render.rs` | a task or a project, in full, and the section menu |
-| `src/detail/editors.rs` | getting the editors a pop-out opened to go, and the slot they read |
+| `src/detail/render.rs` | a task or a project, in full, and the column menu |
+| `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
