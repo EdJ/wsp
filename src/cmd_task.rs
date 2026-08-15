@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use crate::cmd_agent::current_project;
+use crate::cmd_agent::{claim_line, current_project, worked_line};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
 use crate::store::Store;
@@ -274,29 +274,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         }
     }
     if let Some(c) = store.claims().get(&t.id) {
-        let get = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or("");
-        let held = util::since(get("claimed_at"));
-        println!(
-            "{} {}{}",
-            p.dim(&util::pad("claimed", 9)),
-            get("workspace_label"),
-            if held > 0 { format!(" · {}", util::duration_human(held)) } else { String::new() }
-        );
+        println!("{} {}", p.dim(&util::pad("claimed", 9)), claim_line(c));
     } else if let Some(w) = store.worked().get(&t.id) {
         // The last agent on it, once there is no current one — the trace a
         // migration leaves, so a task never loses every sign it was worked.
-        let get = |k: &str| w.get(k).and_then(|x| x.as_str()).unwrap_or("");
-        let spent = w.get("seconds").and_then(|x| x.as_i64()).unwrap_or(0);
-        println!(
-            "{} {} · {}{}",
-            p.dim(&util::pad("worked", 9)),
-            get("workspace_label"),
-            util::duration_human(spent),
-            match get("handed_to") {
-                "" => format!(" · {}", get("reason")),
-                next => format!(" · to {next}"),
-            }
-        );
+        println!("{} {}", p.dim(&util::pad("worked", 9)), worked_line(w));
     }
     if !t.body.trim().is_empty() {
         println!("\n{}", t.body.trim());
@@ -360,13 +342,7 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     // holds a workspace nothing will ever release: `adopt` goes on skipping it,
     // and after a restart `reconcile` binds an agent back to work that is over.
     if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
-        let panes: Vec<String> = store
-            .bindings()
-            .iter()
-            .filter(|(_, b)| b.get("task_id").and_then(|x| x.as_str()) == Some(t.id.as_str()))
-            .map(|(pane, _)| pane.clone())
-            .collect();
-        for pane in panes {
+        for pane in store.panes_for_task(&t.id) {
             store.clear_binding(&pane);
         }
         crate::cmd_agent::hand_off(store, &t.id, None, "done");
@@ -528,6 +504,13 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: archive failed: {e}");
         return 1;
     }
+    // A retired task must not go on holding a pane or a workspace. Nothing is
+    // recorded on the way out: `worked` is a trace kept on a task, and after
+    // this there is no task to keep it on.
+    for pane in store.panes_for_task(&t.id) {
+        store.clear_binding(&pane);
+    }
+    store.clear_claim(&t.id);
     store.log_event("task-removed", json!({ "id": t.id, "project": t.project, "title": t.title }));
     store.git_commit(&format!("wsp: rm {} — {}", t.id, t.title));
     if args.json() {

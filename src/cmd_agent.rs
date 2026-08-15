@@ -75,6 +75,48 @@ fn pane_id(args: &Args) -> Option<String> {
     args.get("pane").or_else(|| herdr::Env::read().pane_id)
 }
 
+/// `Trance Video · 3h12m` — a claim as one line.
+///
+/// Both this and `worked_line` join what they have and skip what they do not,
+/// because every part is optional: a claim made outside herdr has no label, and
+/// one made before the clock was recorded has no duration. Formatting them with
+/// fixed separators left `" · 3s · to t-260815-002"` hanging off nothing.
+pub fn claim_line(c: &serde_json::Value) -> String {
+    let get = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let mut parts: Vec<String> = Vec::new();
+    match (get("workspace_label"), get("workspace_id")) {
+        ("", "") => {}
+        ("", id) => parts.push(id.to_string()),
+        (label, "") => parts.push(label.to_string()),
+        (label, id) => parts.push(format!("{label} ({id})")),
+    }
+    let held = util::since(get("claimed_at"));
+    if held > 0 {
+        parts.push(util::duration_human(held));
+    }
+    parts.join(" · ")
+}
+
+/// `Trance Video · 3h12m · to t-260814-026` — the claim that ended.
+pub fn worked_line(w: &serde_json::Value) -> String {
+    let get = |k: &str| w.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let mut parts: Vec<String> = Vec::new();
+    match (get("workspace_label"), get("workspace_id")) {
+        ("", id) if !id.is_empty() => parts.push(id.to_string()),
+        (label, _) if !label.is_empty() => parts.push(label.to_string()),
+        _ => {}
+    }
+    let spent = w.get("seconds").and_then(|x| x.as_i64()).unwrap_or(0);
+    if spent > 0 {
+        parts.push(util::duration_human(spent));
+    }
+    match get("handed_to") {
+        "" => parts.push(get("reason").to_string()),
+        next => parts.push(format!("to {next}")),
+    }
+    parts.join(" · ")
+}
+
 /// End a claim and leave the trace behind.
 ///
 /// An agent works several tasks in sequence, so every way a claim can end —
@@ -162,7 +204,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp claim <id>   (inside a herdr pane)");
         return 2;
     };
-    let Some(mut t) = store.find_task(&needle) else {
+    let Some(t) = store.find_task(&needle) else {
         eprintln!("wsp: no task matching `{needle}`");
         return 1;
     };
@@ -201,14 +243,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // one task is not a state anything downstream can read — the tree hangs a
     // pane under the task it is bound to and takes the first it finds, so the
     // second would simply not be drawn.
-    let displaced: Vec<String> = store
-        .bindings()
-        .iter()
-        .filter(|(p, b)| {
-            *p != &pane && b.get("task_id").and_then(|x| x.as_str()) == Some(t.id.as_str())
-        })
-        .map(|(p, _)| p.clone())
-        .collect();
+    let displaced: Vec<String> =
+        store.panes_for_task(&t.id).into_iter().filter(|p| p != &pane).collect();
     for other in &displaced {
         store.clear_binding(other);
     }

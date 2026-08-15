@@ -261,33 +261,16 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     // facts and the panel only ever shows the second.
     out.push(Line::default());
     match ctx.claims.get(&t.id) {
-        Some(c) => {
-            let label = c.get("workspace_label").and_then(|x| x.as_str()).unwrap_or("");
-            let ws = c.get("workspace_id").and_then(|x| x.as_str()).unwrap_or("");
-            let held = c.get("claimed_at").and_then(|x| x.as_str()).map(util::since).unwrap_or(0);
-            let held = if held > 0 { format!(" · {}", util::duration_human(held)) } else { String::new() };
-            out.push(field("claimed", &format!("{label} ({ws}){held}"), Style::Accent));
-        }
-        None => out.push(field("claimed", "", Style::Dim)),
-    }
-    // The ghost: an agent works several tasks in sequence, and this is the one
-    // it walked away from. Only worth a line once the claim is gone — while
-    // one is live it is the previous shift, and the live fact wins the space.
-    if !ctx.claims.contains_key(&t.id) {
-        if let Some(wk) = ctx.worked.get(&t.id) {
-            let get = |k: &str| wk.get(k).and_then(|x| x.as_str()).unwrap_or("");
-            let label = get("workspace_label");
-            let label = if label.is_empty() { get("workspace_id") } else { label };
-            let spent = wk.get("seconds").and_then(|x| x.as_i64()).unwrap_or(0);
-            let mut s = label.to_string();
-            if spent > 0 {
-                s.push_str(&format!(" · {}", util::duration_human(spent)));
+        Some(c) => out.push(field("claimed", &crate::cmd_agent::claim_line(c), Style::Accent)),
+        None => {
+            out.push(field("claimed", "", Style::Dim));
+            // The ghost: an agent works several tasks in sequence, and this is
+            // the one it walked away from. Only once the claim is gone — while
+            // one is live this is the shift before it, and the live fact wins
+            // the line.
+            if let Some(w) = ctx.worked.get(&t.id) {
+                out.push(field("worked", &crate::cmd_agent::worked_line(w), Style::Muted));
             }
-            match get("handed_to") {
-                "" => s.push_str(&format!(" · {}", get("reason"))),
-                next => s.push_str(&format!(" · to {next}")),
-            }
-            out.push(field("worked", &s, Style::Muted));
         }
     }
     match ctx.pane_for(&t.id) {

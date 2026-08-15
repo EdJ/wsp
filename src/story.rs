@@ -238,7 +238,7 @@ impl<'a> Driver<'a> {
         // The reducer may ask for a refetch; offline that just means rebuilding
         // the rows from the same snapshot, exactly as the live loop does.
         if let panel::Effect::Refetch = panel::apply_key(k, &mut self.ui, &mut self.view) {
-            panel::refetch_into(&mut self.ui, self.snap, &self.view, Some("w0"));
+            panel::refetch_into(&mut self.ui, self.snap, &mut self.view, Some("w0"));
         }
         self
     }
@@ -426,6 +426,13 @@ fn scenes() -> Vec<Scene> {
             .scene("Claiming", "c from a task picks the agent that takes it. From an agent row it runs the other way — pick the task it moves to, which is how one agent hands itself from one piece of work to the next."),
     );
 
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Agent)
+            .key(Key::Char('c'))
+            .scene("Migrating an agent", "The same key from the pane row. Landing on a task moves the agent to it: the task being left keeps its status — work underway with nobody on it is a real state — and gives up its claim, keeping the record of who had it. The cursor is on the pane row, and the pane row is what the tree carries to wherever it lands."),
+    );
+
     out.extend(detail_scenes(&w));
     out
 }
@@ -450,10 +457,27 @@ impl TypeIn for Driver<'_> {
 /// Line/Style model, so a colour that drifts in one drifts visibly in both.
 fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
     use crate::detail::{self, Focus};
+    // Claims for the two tasks an agent is on, and — on the task the Trance
+    // agent left — the ghost it leaves behind. No `claimed_at`: a live claim
+    // prints how long it has been held, and a fixture that says "356d" is a
+    // fixture whose age is showing.
+    let mut claims = BTreeMap::new();
+    claims.insert("t-001".to_string(), json!({ "workspace_id": "w1", "workspace_label": "Trance Video" }));
+    claims.insert("t-003".to_string(), json!({ "workspace_id": "w2", "workspace_label": "Verb UI" }));
+    let mut worked = BTreeMap::new();
+    worked.insert(
+        "t-002".to_string(),
+        json!({
+            "workspace_id": "w1", "workspace_label": "Trance Video",
+            "seconds": 11_520, "handed_to": "t-001", "reason": "handoff",
+        }),
+    );
+
     let ctx = detail::Ctx {
         tasks: w.tasks.clone(),
         index: crate::resolve::Index::new(w.projects.clone()),
-        claims: Default::default(),
+        claims,
+        worked,
         bindings: w.bindings.clone(),
         panes: w.panes.clone(),
     };
@@ -470,6 +494,7 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
     };
     vec![
         shot("Detail: a task", "↵ on a task opens it here rather than folding something. Overview says what it is, Details carries the working material, and the log reads newest first — after the fact, the last line is the one that matters.", Focus::Task("t-003".into())),
+        shot("Detail: after a handoff", "The task the Trance agent moved off. It is still doing — work underway with nobody on it is a true state, and usually means you are the blocker — but the claim has gone to the task the agent took up, and what is left is the trace: where it was worked, for how long, and what it was handed to.", Focus::Task("t-002".into())),
         shot("Detail: a project", "↵ on a project: rolled-up work, what sits under it, and its own tasks in the panel's order.", Focus::Project("trance".into())),
         shot("Detail: nothing yet", "The pane before anything is opened. It is a reader — it waits rather than guessing.", Focus::Nothing),
     ]

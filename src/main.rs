@@ -237,7 +237,7 @@ fn help() {
   wsp archive [--all]               sweep done tasks older than 30d
 
 {agents}
-  wsp claim <id>                    bind this pane to a task
+  wsp claim <id>                    bind this pane to a task, leaving the last
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project
   wsp pin --top [-w ws]             pin it outside the tree entirely

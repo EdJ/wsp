@@ -237,6 +237,18 @@ impl Store {
         self.write_json("bindings.json", &Value::Object(b.into_iter().collect()));
     }
 
+    /// Every pane bound to a task. A list rather than an option because the
+    /// state file can hold two — briefly, while work is being taken off one
+    /// agent and given to another — and the callers that free a task have to
+    /// free all of them.
+    pub fn panes_for_task(&self, task: &str) -> Vec<String> {
+        self.bindings()
+            .iter()
+            .filter(|(_, b)| b.get("task_id").and_then(|x| x.as_str()) == Some(task))
+            .map(|(pane, _)| pane.clone())
+            .collect()
+    }
+
     pub fn clear_binding(&self, pane: &str) -> bool {
         let mut b = self.bindings();
         let removed = b.remove(pane).is_some();

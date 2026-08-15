@@ -37,7 +37,7 @@ are published by the daemon.
 | `~/wsp/tasks/<id>.md` | one task per file: `t-YYMMDD-NNN` |
 | `~/wsp/archive/tasks/YYYY-MM/` | swept `done` tasks |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
-| `~/.local/state/wsp/` | claims, bindings, pins, `events.jsonl` — machine-local, not in git |
+| `~/.local/state/wsp/` | claims, bindings, pins, `worked.json`, `events.jsonl` — machine-local, not in git |
 
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
@@ -215,7 +215,7 @@ disturbing a layout you will come back to.
 | `e` `n` | task | retitle, append a note |
 | `E` | task | edit its prose full-screen in a tab |
 | `m` | task | move — the tree becomes the picker |
-| `c` | task or agent | claim, either direction |
+| `c` | task or agent | claim, either direction — and how an agent moves on |
 | `O` | task, project | open a herdr workspace for it, and claim it |
 | `X` | task, project | remove, after a `y`/`n` |
 
@@ -330,6 +330,54 @@ Inside a herdr pane, `wsp claim <id>` binds the pane to a task (via
 `$HERDR_PANE_ID`), which is what makes `wsp wip` and the `$task` sidebar token
 work. `wsp release` unbinds; `pane.exited` does it automatically.
 
+## Moving between tasks
+
+One agent works several tasks in a sitting, so `claim` is also the verb for
+moving: claiming a second task hands off the first rather than quietly leaving
+it claimed. From the panel it is `c` — on an agent row, pick the task it moves
+to; on a task row, pick the agent that takes it.
+
+```
+▸ t-260814-026  Panel management: keys for tag, pin, priority
+  bound to w5:p1
+  left t-260814-025  Agent migration between tasks
+```
+
+**One pane, one current task.** Not a queue: the project's task list is already
+the plan, and every join wsp makes — `wip`, the `$task` token, which task a pane
+hangs under in the tree — needs one answer to *what is this agent doing now*,
+not a list and a rule for picking from it.
+
+**The task being left keeps its status and loses its claim.** `doing` with
+nobody on it is a real state — it is the work that is underway and waiting for
+you, which is exactly what `wsp wip` flags. What it must not keep is the claim,
+or `reconcile` puts the agent back on it after a restart and `adopt` goes on
+treating its workspace as spoken for. `done` releases the claim for the same
+reason: work that is finished should not still be holding a workspace.
+
+**What it keeps instead is the record.** A line in its own log — `handed off to
+t-260814-026 after 3h12m` — which is durable, readable and in git; and
+`worked.json`, which is the same fact structured, so `wsp show` and the detail
+pane can say where it was worked, for how long, and what it went to:
+
+```
+worked    panel work · 3h12m · to t-260814-026
+```
+
+That file sits with the claims, machine-local, because a workspace id and a cwd
+mean nothing on another host. Both halves of a claim now end the same way,
+whether it was migrated, released or finished.
+
+**Two panes never hold one task.** Claiming work that another agent has takes
+it off them, and says so on the task. The tree hangs a pane under the task it
+is bound to and draws the first it finds, so the second was never visible —
+it was a state you could reach and not see.
+
+**The row moves; the cursor goes with it.** A claim re-sorts the tree under
+your hands — the pane row leaves one task and reappears under another, often
+several lines away. The panel holds the cursor on the row it was on rather than
+the position that row was in, so the eye keeps the thing it was following.
+
 Every command takes `--json`.
 
 ## Source map
@@ -367,7 +415,9 @@ fast builds are a feature here, because a session-start hook runs this binary.
   pane exiting leaves the claim standing, and `wsp reconcile` rebuilds the
   bindings from claims against whatever is currently open. The daemon does it
   before its first sync, which is when herdr has just restored everything under
-  new pane ids.
+  new pane ids. One pane takes one claim there too: two claims naming the same
+  workspace used to land on the same pane, and since claims are walked in id
+  order the agent came back bound to the *older* task — the one it had left.
 - **cwd is not identity.** Five workspaces share `~/git/Easter`. Resolution order
   is pin → binding → cwd → workspace label, so `wsp pin <project>` is the
   override when a directory is ambiguous.
