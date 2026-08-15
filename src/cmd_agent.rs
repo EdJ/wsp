@@ -12,7 +12,7 @@ use crate::util::{self, Paint};
 use crate::Args;
 
 /// The project the caller is standing in. `-p` always wins; otherwise the
-/// precedence chain is pin > binding > cwd > workspace label.
+/// precedence chain is pin > binding > mandate > cwd > workspace label.
 pub fn current_project(
     store: &Store,
     args: &Args,
@@ -46,6 +46,14 @@ pub fn current_project(
 
     let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
 
+    // A mandate is a statement about what this workspace is *for*, so it beats
+    // the directory the shell happens to be sitting in — but not a pin, which
+    // is a statement about what the workspace *is*, and not a binding, which is
+    // the work actually in hand. Checked here rather than inside `resolve` so
+    // that the panel and `overlap` go on placing panes by where they stand:
+    // standing direction says nothing about which tree a pane is in.
+    let mandate = crate::cmd_mandate::current(store, env.workspace_id.as_deref());
+
     let r = resolve::resolve(
         index,
         &pins,
@@ -54,6 +62,12 @@ pub fn current_project(
         None,
         cwd.as_deref(),
     );
+    if matches!(r.source, "pin" | "binding") && r.project.is_some() {
+        return Ok(r.project);
+    }
+    if mandate.is_some() {
+        return Ok(mandate);
+    }
     if r.project.is_some() {
         return Ok(r.project);
     }

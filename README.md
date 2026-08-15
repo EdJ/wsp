@@ -37,7 +37,7 @@ are published by the daemon.
 | `~/wsp/tasks/<id>.md` | one task per file: `t-YYMMDD-NNN` |
 | `~/wsp/archive/tasks/YYYY-MM/` | swept `done` tasks |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
-| `~/.local/state/wsp/` | claims, bindings, pins, `worked.json`, `events.jsonl` — machine-local, not in git |
+| `~/.local/state/wsp/` | claims, bindings, pins, mandates, `worked.json`, `events.jsonl` — machine-local, not in git |
 
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
@@ -536,6 +536,48 @@ The rules are the few that keep the tree honest:
   drawn at the top level rather than hidden; a row indented under nothing is
   just a row that looks broken.
 
+## Standing direction
+
+```sh
+wsp mandate wsp          # work here without being asked again
+wsp mandate              # what is the standing direction?
+wsp mandate --clear      # give it back
+```
+
+A claim says what an agent is doing now. A mandate says what it is *for* —
+which is the question an agent has to answer for itself every time it finishes
+something. Without one, a session records faithfully what it was told and then
+stops. With one, `wsp brief` opens with it and names the task to take next:
+
+```
+mandate wsp   take work here without asking
+you    nothing claimed
+next   t-260815-009  review is the agent's terminal verb  wsp claim it
+```
+
+It lives beside the claims, keyed on the workspace and the host, and it
+survives a restart — direction you have to repeat every morning is not standing
+direction, it is a reminder. In the resolution chain it sits at **pin > binding
+> mandate > cwd > label**: a pin says what a workspace *is* and a binding is the
+work actually in hand, but a mandate beats the directory a shell happens to be
+sitting in. It is deliberately not consulted when the panel places a pane in the
+tree — where a pane is standing is a fact about the pane, and standing direction
+says nothing about it.
+
+Scope is the project and everything under it, and containment reads **both
+ways** along the chain: a mandate on `data` while standing in `wsp` is in scope,
+because `data` declares no roots of its own and so can only be worked from
+inside its parent's. Reading it one way round would have called that out of
+scope and passed every test anyone would think to write, since the obvious test
+is a mandate on a project that has a root.
+
+The limits are the design rather than a caveat. Work still finishes at
+`review`, never at `done`; anything needing a decision is still `wsp block`ed
+with the question rather than guessed at; and the mandate ends — on `--clear`,
+or when the backlog runs dry, which the brief says in as many words. A mandate
+with no end is standing permission, which is not what "go work on project x"
+means.
+
 ## Moving between tasks
 
 One agent works several tasks in a sitting, so `claim` is also the verb for
@@ -634,6 +676,7 @@ Every command takes `--json`.
 | `src/detail/editors.rs` | getting the editors a pop-out opened to go |
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
+| `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_*.rs` | the commands |
 
 The panel is split where the *work* splits rather than by layer: a row's data

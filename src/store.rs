@@ -154,8 +154,6 @@ impl Store {
         write_atomic(&self.task_path(&t.id), &t.render())
     }
 
-    /// Allocate `t-YYMMDD-NNN`, reserving the file with O_EXCL so two agents
-    /// adding a task in the same second cannot collide.
     /// The highest number ever handed out under a day's prefix, live *or*
     /// archived.
     ///
@@ -215,6 +213,8 @@ impl Store {
         out
     }
 
+    /// Allocate `t-YYMMDD-NNN`, reserving the file with O_EXCL so two agents
+    /// adding a task in the same second cannot collide.
     pub fn alloc_task_id(&self) -> std::io::Result<String> {
         fs::create_dir_all(self.tasks_dir())?;
         let stamp = util::today_stamp();
@@ -452,6 +452,34 @@ impl Store {
             Value::Object(m) => m.into_iter().collect(),
             _ => BTreeMap::new(),
         }
+    }
+
+    // ---- mandates ---------------------------------------------------------
+    //
+    // A claim says what an agent is doing now. A mandate says what it is *for*
+    // — the question it has to answer for itself every time it finishes
+    // something, and the one thing standing between "record what you were told"
+    // and "pick up the next piece". Keyed on the workspace, like a pin, because
+    // that is the unit a person points at a piece of work.
+
+    /// workspace id -> mandate record
+    pub fn mandates(&self) -> BTreeMap<String, Value> {
+        match self.read_json("mandates.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_mandate(&self, workspace: &str, value: Value) {
+        self.update_json("mandates.json", |m| {
+            m.insert(workspace.to_string(), value);
+        });
+    }
+
+    pub fn clear_mandate(&self, workspace: &str) -> bool {
+        let mut removed = false;
+        self.update_json("mandates.json", |m| removed = m.remove(workspace).is_some());
+        removed
     }
 
     pub fn set_claim(&self, task: &str, value: Value) {

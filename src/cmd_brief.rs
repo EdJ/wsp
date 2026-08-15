@@ -14,6 +14,7 @@
 use serde_json::json;
 
 use crate::cmd_agent::current_project;
+use crate::cmd_mandate;
 use crate::herdr;
 use crate::model::Task;
 use crate::overlap;
@@ -62,6 +63,8 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     };
     let about = project.as_deref().and_then(|p| index.get(p)).map(|p| p.brief.clone()).unwrap_or_default();
 
+    let mandate = cmd_mandate::current(store, env.workspace_id.as_deref());
+
     // What this pane is on. The binding is the live answer; the claim is the
     // durable one and outlives a restart, so a session that comes back before
     // the daemon has reconciled still knows what it was doing.
@@ -82,11 +85,15 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
         .and_then(|id| tasks.iter().find(|t| t.id == id));
 
     // The backlog for this project, minus whatever is already in hand.
+    let scope: Option<Vec<String>> = project.as_deref().map(|p| index.subtree(p));
     let mut open: Vec<&Task> = tasks
         .iter()
         .filter(|t| t.status().is_open())
-        .filter(|t| match &project {
-            Some(p) => t.project.as_deref() == Some(p.as_str()),
+        // The subtree, as `ls` and `next` scope it. Exact-project was a third
+        // answer to one question: under a mandate on `wsp` the brief would
+        // list nothing from `data` while `next` handed you a task out of it.
+        .filter(|t| match &scope {
+            Some(ids) => t.project.as_ref().map(|p| ids.contains(p)).unwrap_or(false),
             None => t.project.is_none(),
         })
         .filter(|t| Some(t.id.as_str()) != mine.map(|m| m.id.as_str()))
@@ -142,6 +149,7 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
                 "brief": about,
                 "pane": env.pane_id,
                 "workspace": env.workspace_id,
+                "mandate": mandate,
                 "task": mine.map(|t| t.json()),
                 "open": open.iter().map(|t| t.json()).collect::<Vec<_>>(),
                 "here": near.iter().map(|s| s.json()).collect::<Vec<_>>(),
@@ -171,6 +179,14 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
         None => row("where", p.dim("no project resolved for this pane").to_string()),
     }
 
+    // Standing direction, before anything about the work itself. An agent
+    // under a mandate is allowed to pick up the next piece without being asked
+    // again, and behaviour that has to happen unprompted cannot wait for the
+    // agent to go looking for permission.
+    if let Some(m) = &mandate {
+        row("mandate", format!("{}  {}", p.bold(m), p.dim("take work here without asking")));
+    }
+
     // What you are on. `—` rather than silence: an agent with no task is a
     // thing worth noticing, since claiming one is the first move.
     match mine {
@@ -191,6 +207,22 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
             let under = resolve::counts_under(&tasks, &t.id);
             if under.open > 0 {
                 row("", p.dim(&format!("{} sub-task(s) open beneath it", under.open)));
+            }
+        }
+        None if mandate.is_some() => {
+            row("you", p.dim("nothing claimed").to_string());
+            // The loop, spelled out on the one line where it is actionable.
+            match open.first() {
+                Some(t) => row(
+                    "next",
+                    format!(
+                        "{}  {}  {}",
+                        p.bold(&t.id),
+                        util::truncate(&t.title, 44),
+                        p.dim("wsp claim it")
+                    ),
+                ),
+                None => row("next", p.dim("nothing actionable here — the mandate is done").to_string()),
             }
         }
         None => row("you", p.dim("nothing claimed — wsp claim <id>, or wsp add \"…\" first").to_string()),

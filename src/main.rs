@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 mod cmd_agent;
 mod cmd_brief;
+mod cmd_mandate;
 mod cmd_project;
 mod cmd_task;
 mod daemon;
@@ -209,6 +210,7 @@ fn main() {
 
         "brief" => cmd_brief::brief(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
+        "mandate" => cmd_mandate::mandate(&store, &args),
         "release" => cmd_agent::release(&store, &args),
         "pin" => cmd_agent::pin(&store, &args),
         "unpin" => cmd_agent::unpin(&store, &args),
@@ -277,6 +279,7 @@ fn help() {
 {agents}
   wsp brief                         what this pane is for, and who else is working
   wsp claim <id>                    bind this pane to a task, leaving the last
+  wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project
   wsp pin --top [-w ws]             pin it outside the tree entirely
