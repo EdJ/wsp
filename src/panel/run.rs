@@ -272,8 +272,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // cursor and the view follows. A separate offset would fight that
         // centring every time a key moved the selection.
         if let Msg::Key(Key::Wheel { up }) = msg {
-            let (w, h) = term_size();
-            super::keys::wheel(&mut ui, &mut view, w, h, up);
+            super::keys::wheel(&mut ui, &mut view, up);
             draw(&ui, &view, &mut last);
             continue;
         }

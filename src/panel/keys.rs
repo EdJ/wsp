@@ -305,27 +305,16 @@ pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 /// The reducer. Deliberately free of I/O — it moves the cursor, changes the
 /// mode, and reports what else it wants done, so the storyboard can drive the
 /// same transitions the terminal does and get the same frames out.
-/// Scroll the tree, carrying the cursor along rather than leaving it behind.
+/// The wheel moves the selection, three rows at a time.
 ///
-/// A pure scrollbar moves the view and not the selection, which reads as the
-/// selected row wandering off the screen — and then the first keystroke drags
-/// the view back to it, which is a jump nobody asked for. So the cursor is
-/// pushed along by the edge it meets: it stays where it is while it is still
-/// on screen, and is carried once the scroll would leave it behind.
-///
-/// A cursor sitting in the dock is left alone. The dock does not scroll, so
-/// there is no edge to push it against, and moving it into the tree would
-/// answer a scroll by changing what a verb is aimed at.
-pub(crate) fn wheel(ui: &mut Ui, view: &mut View, w: usize, h: usize, up: bool) {
-    const STEP: usize = 3;
-    let g = super::render::geometry(ui, view, w, h);
-    let most = g.tree_len.saturating_sub(g.tree_rows);
-    let to = if up { g.scroll.saturating_sub(STEP) } else { (g.scroll + STEP).min(most) };
-    view.scroll = Some(to);
-
-    if ui.sel < g.tree_len && g.tree_rows > 0 {
-        let last = to + g.tree_rows - 1;
-        ui.sel = ui.sel.clamp(to.min(g.tree_len - 1), last.min(g.tree_len - 1));
+/// Deliberately the same thing `j`/`k` do, three times over — not a scroll
+/// offset of its own. The tree scrolls by holding the cursor near the middle
+/// of the pane, and that centring *is* the scrolling: move the cursor and the
+/// view follows. An offset the pointer owned separately made the highlight
+/// wander off the pane, which is a different feature nobody asked for.
+pub(crate) fn wheel(ui: &mut Ui, view: &mut View, up: bool) {
+    for _ in 0..3 {
+        let _ = apply_key(if up { Key::Up } else { Key::Down }, ui, view);
     }
 }
 

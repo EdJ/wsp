@@ -881,10 +881,25 @@ mod tests {
         }
     }
 
-    /// Ed: "we don't scroll the actual selected item anymore — that's a
-    /// little weird". A pure scrollbar leaves the cursor behind, so the
-    /// highlight wanders off the pane and the next keystroke drags the view
-    /// back to it. The cursor is carried by the edge it meets instead.
+    /// The wheel moves the selection, the way `j`/`k` do — the tree scrolls by
+    /// holding the cursor near the middle, so moving the cursor *is* the
+    /// scroll. A view offset of its own left the highlight behind, which is
+    /// not what the panel has ever done.
+    #[test]
+    fn the_wheel_moves_the_selection() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let start = ui.selected_index();
+        panel::wheel(&mut ui, &mut view, false);
+        assert!(ui.selected_index() > start, "down should move the cursor down");
+        let mid = ui.selected_index();
+        panel::wheel(&mut ui, &mut view, true);
+        assert!(ui.selected_index() < mid, "up should move it back");
+    }
+
+    /// And the cursor is on the pane throughout, which is what makes the next
+    /// keystroke continue from where you are looking.
     #[test]
     fn scrolling_keeps_the_cursor_on_the_pane() {
         let w = world();
@@ -893,30 +908,14 @@ mod tests {
         let visible = |ui: &panel::Ui, view: &panel::View| {
             (0..H).any(|y| panel::row_at(ui, view, W, H, y) == Some(ui.selected_index()))
         };
-        assert!(visible(&ui, &view), "before touching anything");
         for n in 0..12 {
-            panel::wheel(&mut ui, &mut view, W, H, false);
+            panel::wheel(&mut ui, &mut view, false);
             assert!(visible(&ui, &view), "after {} scrolls down", n + 1);
         }
         for n in 0..20 {
-            panel::wheel(&mut ui, &mut view, W, H, true);
+            panel::wheel(&mut ui, &mut view, true);
             assert!(visible(&ui, &view), "after {} scrolls up", n + 1);
         }
-    }
-
-    /// It carries the cursor, it does not drag it: a row still on screen after
-    /// the scroll keeps the selection where it was.
-    #[test]
-    fn scrolling_moves_the_cursor_only_when_it_must() {
-        let w = world();
-        let mut view = panel::View::default();
-        let mut ui = ui_of(&w, &view);
-        for _ in 0..10 {
-            panel::apply_key(Key::Down, &mut ui, &mut view);
-        }
-        let was = ui.selected_index();
-        panel::wheel(&mut ui, &mut view, W, H, false);
-        assert_eq!(ui.selected_index(), was, "one step should not have reached the cursor");
     }
 
     #[test]
