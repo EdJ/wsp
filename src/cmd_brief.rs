@@ -15,7 +15,8 @@ use serde_json::json;
 
 use crate::cmd_agent::current_project;
 use crate::herdr;
-use crate::model::{Status, Task};
+use crate::model::Task;
+use crate::overlap;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -41,24 +42,11 @@ fn rules(store: &Store) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-struct Other {
-    pane: String,
-    where_: String,
-    project: String,
-    task: Option<Task>,
-    /// The terminal title, for a pane with no claim — the only thing herdr
-    /// knows about what it is doing.
-    title: String,
-    state: String,
-    needs_you: bool,
-}
-
 pub fn brief(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
     let tasks = store.tasks();
     let bindings = store.bindings();
     let claims = store.claims();
-    let pins = store.pins();
     let env = herdr::Env::read();
 
     let project = current_project(store, args, &index).unwrap_or(None);
@@ -120,60 +108,29 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     });
     let shown = open.len().min(MAX_TASKS);
 
-    // Everyone else. Panes rather than agents, because a shell standing in a
-    // tree is the fact that produced this whole line of work — but our own
-    // furniture is not somebody, and neither is this pane.
-    //
-    // PROVISIONAL: this whole block comes out when `overlap::standing_beside`
-    // lands (t-260815-011). It answers "who else is working"; the question
-    // that matters more is "who else is standing where I am", which needs the
-    // root resolution being written next door. One definition, not two.
-    let panes = if herdr::available() { herdr::panes().unwrap_or_default() } else { Vec::new() };
-    let workspaces = if herdr::available() { herdr::workspaces().unwrap_or_default() } else { Vec::new() };
-    let label_of = |ws: &str| -> String {
-        workspaces.iter().find(|w| w.id == ws).map(|w| w.label.clone()).unwrap_or_default()
-    };
+    // Everyone else, nearest first. `standing_beside` is the one definition
+    // of that reckoning — `wsp overlap` and `wsp claim` read the same vector —
+    // so the brief's only job is deciding what a briefing shows of it.
+    let world = overlap::World::live(store);
+    let here = std::env::current_dir().ok().map(|c| util::contract(&c));
+    let all = overlap::standing_beside(
+        &world,
+        env.pane_id.as_deref().unwrap_or_default(),
+        here.as_deref(),
+    );
 
-    let mut others: Vec<Other> = Vec::new();
-    for p in &panes {
-        if Some(&p.pane_id) == env.pane_id.as_ref() {
-            continue;
-        }
-        if p.label == crate::panel::PANEL_LABEL || p.label == crate::panel::VIEW_LABEL {
-            continue;
-        }
-        if p.agent.is_empty() {
-            continue;
-        }
-        let task = bindings
-            .get(&p.pane_id)
-            .and_then(|b| b.get("task_id"))
-            .and_then(|t| t.as_str())
-            .and_then(|id| tasks.iter().find(|t| t.id == id))
-            .cloned();
-        let label = label_of(&p.workspace_id);
-        let r = resolve::resolve(
-            &index,
-            &pins,
-            task.as_ref().and_then(|t| t.project.clone()),
-            Some(&p.workspace_id),
-            Some(&label),
-            Some(&p.cwd),
-        );
-        let idle = p.agent_status == "idle";
-        others.push(Other {
-            pane: p.pane_id.clone(),
-            where_: if label.is_empty() { p.cwd.clone() } else { label },
-            project: r.project.unwrap_or_default(),
-            needs_you: idle && task.as_ref().map(|t| t.status() == Status::Doing).unwrap_or(false),
-            task,
-            title: p.title.clone(),
-            state: p.agent_status.clone(),
-        });
-    }
-    // Whoever wants a decision first, then whoever is working, then the rest.
-    others.sort_by_key(|o| (u8::from(!o.needs_you), u8::from(o.state != "working"), o.pane.clone()));
-    let others_shown = others.len().min(MAX_OTHERS);
+    // Two questions, and only the first is a warning. Panes that can reach the
+    // files under your hands go at the top and get the colour; everyone else
+    // is context.
+    let (near, far): (Vec<&overlap::Standing>, Vec<&overlap::Standing>) =
+        all.iter().partition(|s| s.relation.is_near());
+
+    // Of twenty-two panes here, twenty are shells that have been sitting in a
+    // directory since Tuesday. Naming them would push the two that matter off
+    // the bottom, so the far set names whoever is holding something and counts
+    // the rest in one line.
+    let (far_named, far_quiet): (Vec<&&overlap::Standing>, Vec<&&overlap::Standing>) =
+        far.iter().partition(|s| s.agent || s.task.is_some());
 
     if args.json() {
         println!(
@@ -187,11 +144,8 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
                 "workspace": env.workspace_id,
                 "task": mine.map(|t| t.json()),
                 "open": open.iter().map(|t| t.json()).collect::<Vec<_>>(),
-                "others": others.iter().map(|o| json!({
-                    "pane": o.pane, "where": o.where_, "project": o.project,
-                    "task": o.task.as_ref().map(|t| t.json()), "title": o.title,
-                    "state": o.state, "needs_you": o.needs_you,
-                })).collect::<Vec<_>>(),
+                "here": near.iter().map(|s| s.json()).collect::<Vec<_>>(),
+                "others": far.iter().map(|s| s.json()).collect::<Vec<_>>(),
                 "rules": rules(store),
             }))
             .unwrap_or_default()
@@ -264,21 +218,47 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
         }
     }
 
-    if others_shown > 0 {
-        for (i, o) in others.iter().take(others_shown).enumerate() {
-            let what = match &o.task {
-                Some(t) => format!("{}  {}", p.dim(&t.id), util::truncate(&t.title, 40)),
-                None => p.dim(&format!("unclaimed · {}", util::truncate(&o.title, 40))),
-            };
-            let flag = if o.needs_you { p.yellow("  ← wants a decision") } else { String::new() };
-            row(
-                if i == 0 { "others" } else { "" },
-                format!("{}  {}{}", p.dim(&util::pad(&util::truncate(&o.where_, 14), 14)), what, flag),
-            );
-        }
-        if others.len() > others_shown {
-            row("", p.dim(&format!("{} more · wsp wip", others.len() - others_shown)));
-        }
+    // Who can reach the files you are about to edit. First, and in the colour
+    // that means a decision, because this is the line that would have caught
+    // two agents in one checkout this morning.
+    for (i, o) in near.iter().enumerate() {
+        let held = match o.since {
+            Some(secs) if secs > 0 => format!(" · {}", util::duration_human(secs)),
+            _ => String::new(),
+        };
+        row(
+            if i == 0 { "here" } else { "" },
+            format!(
+                "{}  {}{}",
+                p.yellow(&util::pad(&util::truncate(&o.workspace, 12), 12)),
+                util::truncate(&o.name(), 40),
+                p.dim(&format!("  {}{held}", o.relation.as_str()))
+            ),
+        );
+    }
+
+    let far_shown = far_named.len().min(MAX_OTHERS);
+    for (i, o) in far_named.iter().take(far_shown).enumerate() {
+        let flag = if o.needs_you() { p.yellow("  ← wants a decision") } else { String::new() };
+        row(
+            if i == 0 { "others" } else { "" },
+            format!(
+                "{}  {}{}",
+                p.dim(&util::pad(&util::truncate(&o.workspace, 12), 12)),
+                p.dim(&util::truncate(&o.name(), 40)),
+                flag
+            ),
+        );
+    }
+    // The quiet ones get a number, not names. A shell that has been standing
+    // in a directory since Tuesday is worth knowing the count of and nothing
+    // more.
+    let hidden = far_named.len() - far_shown + far_quiet.len();
+    if hidden > 0 {
+        row(
+            if far_shown == 0 { "others" } else { "" },
+            p.dim(&format!("{hidden} more · wsp overlap")).to_string(),
+        );
     }
 
     if let Some(text) = rules(store) {

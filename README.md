@@ -378,8 +378,9 @@ under  t-260815-003  Claude Code lifecycle: agents that keep the store themselve
 open   t-260814-023  blocked   Storyboard: scripted input through the reducer…
        t-260815-003  todo    ! Claude Code lifecycle…                   (8 open)
        4 more · wsp ls
-others wsp             t-260815-011  Overlap: tell an agent who else is standing…
-       vst             unclaimed · ◑ Evaluate infinite canvas performance…
+here   wsp           Atomic claim, and refuse to take a task…   same tree · 26s
+       vst           (Evaluate infinite canvas performance …)  same tree
+others 20 more · wsp overlap
 ```
 
 Every line of it is answerable already — `where` for the project, `ls` for the
@@ -387,6 +388,14 @@ backlog, `wip` for the other agents. One command exists because a session-start
 hook can afford exactly one call, and because what it prints is a *briefing*
 rather than a report: the few facts an agent cannot work correctly without, in
 the order it needs them, short enough that nobody turns it off to save context.
+
+`here` is the line that would have caught two agents editing one checkout this
+morning. It comes from the same `standing_beside` reckoning `wsp overlap` and
+`wsp claim` use, split at `Relation::is_near()`: panes that can reach the files
+under your hands get named and coloured, everyone else is context. The far set
+names whoever is holding something and counts the rest — twenty of twenty-two
+panes here are shells that have sat in a directory since Tuesday, and naming
+them would push the two that matter off the bottom.
 
 `under` is there because direction lands on a parent and the work happens a
 sub-task at a time, so the piece in hand is rarely the reason it is being done.
