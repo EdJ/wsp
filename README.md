@@ -625,6 +625,14 @@ fast builds are a feature here, because a session-start hook runs this binary.
 - **cwd is not identity.** Five workspaces share `~/git/Easter`. Resolution order
   is pin → binding → cwd → workspace label, so `wsp pin <project>` is the
   override when a directory is ambiguous.
+- **An id is never handed out twice.** `t-YYMMDD-NNN` is allocated past
+  everything the day has already used, live *or* archived — not into the first
+  free filename. Archiving moves a task out of `tasks/`, so the old probe gave
+  the next task the name of the one just retired: two pieces of work answering
+  to one id, with the log, the claim, the ghost and any `parent` pointing at it
+  describing both. `O_EXCL` still settles two agents adding in the same second;
+  what changed is where the count starts. `wsp doctor` reports a live id the
+  archive also holds, and names the claim or worked record left keyed on it.
 - **Tags are inherited.** A task in `trance` also matches `-t juce` and `-t dsp`
   from `vst` and `audio` above it.
 - **One writer at a time in `~/.local/state/wsp`.** Every state file is read,

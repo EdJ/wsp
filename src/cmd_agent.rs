@@ -1062,11 +1062,30 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // `show` answers with the live one while the log, the claim and any
     // `parent` pointing at it describe both.
     let archived = store.archived_ids();
+    let claims = store.claims();
+    let worked = store.worked();
     for t in &tasks {
-        if archived.contains(&t.id) {
+        if !archived.contains(&t.id) {
+            continue;
+        }
+        problems.push(format!(
+            "task {} has the same id as an archived task — one of them needs renumbering",
+            t.id
+        ));
+        // The blast radius, spelled out. Everything keyed on an id inherits
+        // whatever else wore it: a claim made by the archived task now names
+        // the live one, and nothing in the record says which it meant.
+        let mut carried: Vec<&str> = Vec::new();
+        if claims.contains_key(&t.id) {
+            carried.push("a claim");
+        }
+        if worked.contains_key(&t.id) {
+            carried.push("a worked record");
+        }
+        if !carried.is_empty() {
             problems.push(format!(
-                "task {} has the same id as an archived task — one of them needs renumbering",
-                t.id
+                "  …and {} still keyed on it, which may belong to either",
+                carried.join(" and ")
             ));
         }
     }
