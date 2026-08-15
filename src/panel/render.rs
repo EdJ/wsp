@@ -190,23 +190,26 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
                 mark(&[(Style::Dim, g::NOTES)], "written on", "something is in this row's Overview or Details — E opens it"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
+                mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "agents"), (Style::Plain, " "), (Style::Dim, "7")], "the section", "pinned at the foot: five agents, in the strip's order, with the count of all of them"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
                 mark(&[(Style::Accent, "+done")], "showing done", "A is on, so finished work is included"),
             ],
         ),
         (
-            "In the header, and in the agents view",
+            "In the header, and among the agents",
             "herdr says working or idle and nothing more. What an idle agent is \
              waiting for comes from the task in its hands, which is the half \
              the store knows — so the same two states from herdr become four \
-             different answers here. One mark per agent, what wants you first.",
+             different answers here. One mark per agent, what wants you first, \
+             what is free next: there is nothing to do about an agent that is \
+             working. Each mark is clickable and goes to that terminal.",
             vec![
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "stopped, holding work that is still live — you are the blocker"),
                 mark(&[(Style::Warn, g::BLOCKED)], "blocked", "stopped, on a task parked with a question written on it"),
                 mark(&[(Style::Accent, g::WORKING)], "working", "running"),
                 mark(&[(Style::Muted, g::IDLE)], "spare", "stopped, holding nothing — a person's worth of attention going spare"),
                 mark(&[(Style::Dim, g::QUIET)], "quiet", "herdr says neither, usually an agent that has not spoken since it started"),
-                mark(&[(Style::Dim, g::MORE), (Style::Plain, " "), (Style::Dim, "11")], "too many to draw", "the strip is clipped, never the count beside it"),
+                mark(&[(Style::Dim, g::MORE), (Style::Plain, " "), (Style::Dim, "11")], "too many to draw", "the strip is clipped, never the count beside it — click the ⋯ for the rest"),
             ],
         ),
         (
@@ -370,21 +373,72 @@ pub(super) fn header(ui: &Ui, w: usize) -> Line {
         return l;
     }
 
-    let right = line(Style::Dim, ui.census.len().to_string());
-    // One column of gap either side of the strip, and the total's own width.
-    let room = w.saturating_sub(l.width() + right.width() + 1);
-    let (shown, clipped) =
-        if ui.census.len() > room { (room.saturating_sub(1), true) } else { (ui.census.len(), false) };
-    for state in ui.census.iter().take(shown) {
+    let s = strip(ui, w);
+    for (state, _) in ui.census.iter().take(s.shown) {
         let (st, mark) = state.mark();
         l.push(st, mark);
     }
-    if clipped {
+    if s.clipped {
         l.push(Style::Dim, glyph::MORE);
     }
+    let right = line(Style::Dim, ui.census.len().to_string());
     l.pad(w.saturating_sub(l.width() + right.width()).max(1));
     l.spans.extend(right.spans);
     l
+}
+
+/// Where the strip's marks are, in columns.
+///
+/// Extracted from [`header`] for the same reason [`geometry`] is extracted from
+/// [`frame`]: a click has to be turned back into an agent by the arithmetic
+/// that drew it. Two copies would agree until the header gained a word, and
+/// then clicking `←` would focus the pane beside the one you pointed at.
+pub(super) struct Strip {
+    /// Column the first mark is drawn at.
+    pub at: usize,
+    pub shown: usize,
+    /// The rest did not fit and a `⋯` stands for them.
+    pub clipped: bool,
+}
+
+pub(super) fn strip(ui: &Ui, w: usize) -> Strip {
+    // "wsp" and its space, and on the right the total with a column of gap.
+    let at = 4;
+    let total = ui.census.len();
+    let room = w.saturating_sub(at + total.to_string().chars().count() + 1);
+    if total > room {
+        Strip { at, shown: room.saturating_sub(1), clipped: true }
+    } else {
+        Strip { at, shown: total, clipped: false }
+    }
+}
+
+/// What a click on the top line landed on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StripHit {
+    /// The nth agent of the census — the one that mark stands for.
+    Agent(usize),
+    /// The `⋯`: everything the strip could not draw.
+    Rest,
+}
+
+/// The mark under column `x` of the top line, if it is a mark.
+pub(crate) fn strip_at(ui: &Ui, w: usize, x: usize) -> Option<StripHit> {
+    if ui.census.is_empty() {
+        return None;
+    }
+    let s = strip(ui, w);
+    if x < s.at {
+        return None;
+    }
+    let i = x - s.at;
+    if i < s.shown {
+        return Some(StripHit::Agent(i));
+    }
+    if s.clipped && i == s.shown {
+        return Some(StripHit::Rest);
+    }
+    None
 }
 
 /// this into something you can look at.
@@ -403,7 +457,7 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     // of its own and costs the tree nothing but its own height.
     let map = if view.help { help_lines(w) } else { Vec::new() };
     let map_rows = g.map_rows;
-    let keys = hotkeys(&ui.rows);
+    let keys = hotkeys(ui);
 
     // The dock keeps its rows whatever the tree is doing. An agent with no
     // work is the row you most need to see and the one the tree would push off

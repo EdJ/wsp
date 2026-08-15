@@ -63,8 +63,9 @@ wsp overlap                 # who else is standing in this tree
 lists workspaces and hangs agents beneath them; this inverts that — the spine is
 the project tree, tasks hang off projects, and panes hang off whichever they
 belong to: the task they claimed, or failing that the project they are standing
-in. Tasks belonging to no project get an `inbox` heading at the top; panes
-belonging to no project get a `no project` group at the foot.
+in. Tasks belonging to no project get an `inbox` heading at the top; shells
+belonging to no project get a `no project` group at the foot, and the agents get
+a section of their own, pinned under a rule at the very bottom.
 
 Panes come from `pane.list`, not `agent.list`. Most panes are a shell nobody is
 driving, and a shell sitting in a project is a fact about that project — the
@@ -110,22 +111,41 @@ have to get up. The store holds the other half, so the two become four:
 | `○` | spare — stopped and holding nothing at all |
 | `·` | herdr says neither, usually a pane that has not spoken since it started |
 
-What wants you sorts first, in both places. The strip is drawn from every agent
-on the machine whatever the tree is filtered to — a header that went quiet under
-`R` is one you learn to distrust — and the total stays on the right, because a
-narrow pane clips the strip and a clipped strip must not be the only thing
-saying how many there are.
+What wants you sorts first and what is free comes next, in both places: there
+is nothing to do about an agent that is working, and sorting the busy ones above
+the spare one is how the row you were looking for falls off the end of the five
+the panel keeps on screen. The strip is drawn from every agent on the machine
+whatever the tree is filtered to — a header that went quiet under `R` is one you
+learn to distrust — and the total stays on the right, because a narrow pane
+clips the strip and a clipped strip must not be the only thing saying how many
+there are.
 
-`w` puts those agents in place of the tree, ordered the same way, with the
-project each one's work belongs to on the right — in the tree that is said by
-which branch the row is drawn under, and a flat list has no branch to say it
-with. It is deliberately not a filter over the tree: the tree is ordered by what
-has to be done, and an agent with nothing to do has no work to be filed under.
-Every row is a pane, so `↵`, `c`, `f` and `1`-`9` all go on meaning what they
-mean — which is the point, since you open it to find who is free and end up
-already standing on the row that hands them something. Shells are left out: a
-pane with nobody in it is a fact about a place, and this is a list of people.
-`w` and `R` each put the other away.
+**Each mark is clickable** and goes straight to that terminal — one click, not
+the select-then-activate a row gets: a mark is a single column with nothing to
+read on the way, and the `←` you are reaching for is the one you have already
+decided to answer. Clicking the `⋯` of a clipped strip opens the agents view,
+which is what the rest of them are.
+
+Beneath the tree, under a rule of its own, the first five agents are pinned in
+that same order: who has stopped and who is free is the question you ask between
+reading anything else, and it should not be a keystroke away. The heading counts
+them all, so a sixth is never silently absent; `→` on its `⋯` opens the tail in
+place, and the digits `1`-`9` start here rather than in the tree, because a
+digit you can always see is worth more than one in row order. A pane drawn twice
+— under its task and again in the section — spends only one of the nine.
+
+`w` gives the same agents the whole pane and three lines each: what it is
+waiting for in words, which terminal it is, how long it has held what it holds,
+where it is pointed if that is not where it stands, and the task itself. Only
+the first line takes the cursor; the two beneath it are that line said at
+length, and a click on either lands on the agent they belong to. It is
+deliberately not a filter over the tree: the tree is ordered by what has to be
+done, and an agent with nothing to do has no work to be filed under. Every row
+is a pane, so `↵`, `c`, `f` and `1`-`9` all go on meaning what they mean — which
+is the point, since you open it to find who is free and end up already standing
+on the row that hands them something. Shells are left out of both: a pane with
+nobody in it is a fact about a place, and this is a list of people. `w` and `R`
+each put the other away.
 
 `i` puts each task's id in front of its title — the thing you type at a shell
 beside the thing you read. Off by default: `t-260815-004` is thirteen columns of

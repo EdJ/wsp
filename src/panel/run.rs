@@ -379,10 +379,19 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
             focus_self(me.as_deref(), self_ws);
         }
 
-        if let Msg::Key(Key::Click { y, .. }) = msg {
+        if let Msg::Key(Key::Click { x, y }) = msg {
             let (w, h) = term_size();
-            match super::keys::click(&mut ui, &mut view, w, h, y) {
+            match super::keys::click(&mut ui, &mut view, w, h, x, y) {
                 super::keys::Hit::Activate => msg = Msg::Key(Key::Enter),
+                // A mark in the strip is an agent, and going there is the whole
+                // of what it means.
+                super::keys::Hit::Focus(a) => {
+                    focus(&a);
+                    continue;
+                }
+                // The `⋯`: the agents the strip could not draw. It stands for
+                // the same thing `w` does, so it presses it.
+                super::keys::Hit::Rest => msg = Msg::Key(Key::Char('w')),
                 super::keys::Hit::Select => {
                     draw(&ui, &view, &mut last);
                     continue;

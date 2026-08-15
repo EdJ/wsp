@@ -32,10 +32,16 @@ pub(super) const INBOX_KEY: &str = "(inbox)";
 
 pub(super) const NOPROJECT_KEY: &str = "(noproject)";
 
-/// The dock at the foot: agents holding no task.
-pub(super) const UNASSIGNED_KEY: &str = "(unassigned)";
+/// The section pinned at the foot: the agents, whatever they are doing.
+pub(super) const AGENTS_KEY: &str = "(agents)";
 
-#[derive(Debug, Clone)]
+/// How many agents the foot keeps on screen before the rest need `w`. Five is
+/// what a pane can spare beside a tree and still be a tree — the strip in the
+/// header carries the census in full, and this carries the top of it in the
+/// form you can aim a verb at.
+pub(super) const MAX_AGENTS_DOCKED: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentRef {
     pub(super) pane: String,
     pub(super) workspace: String,
@@ -57,6 +63,15 @@ pub(crate) struct AgentRef {
     pub(super) project: Option<String>,
 }
 
+impl AgentRef {
+    /// The terminal this stands for. The only field anything outside the panel
+    /// has business with: a pane id is what a command names and what a test can
+    /// check a click against.
+    pub(crate) fn pane(&self) -> &str {
+        &self.pane
+    }
+}
+
 /// What an agent is waiting for, as far as anything here can tell.
 ///
 /// herdr reports two states, working and idle, and `idle` is an answer to a
@@ -68,16 +83,22 @@ pub(crate) struct AgentRef {
 /// waiting for work. Same two states from herdr, three different answers.
 ///
 /// Declaration order is the order they are drawn in and sorted by: what wants
-/// you first, what is running after it, what is spare last.
+/// an answer, then what is free, then what is busy, then what has not said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum AgentState {
     /// Stopped, on a task that is still `doing`. You are what it is waiting for.
     Asking,
     /// Stopped, on a task it has parked with a question written on it.
     Blocked,
-    Working,
     /// Stopped, holding nothing. A person's worth of attention going spare.
+    ///
+    /// Above `Working` deliberately. Both the strip and the list are read for
+    /// what to do next, and there is nothing to do about an agent that is
+    /// working — where a dozen busy panes sorted first, the one going spare
+    /// fell off the end of the five the panel keeps on screen, which is the
+    /// row the whole section exists to show.
     Spare,
+    Working,
     /// herdr says neither working nor idle, so nothing here is going to pretend
     /// to know. Mostly a pane whose agent has not spoken since it started.
     Quiet,
@@ -97,13 +118,17 @@ impl AgentState {
 
 /// What an agent row carries when it is standing on its own, in the agents
 /// view, rather than nested under the task or project that explains it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Census {
     pub(super) state: AgentState,
     /// Where its work lives: the project of the task it holds, else the one it
     /// is standing in or pointed at. The tree says this by where it draws the
     /// row; a flat list has to say it in words.
     pub(super) project: Option<String>,
+    /// The task in its hands, as the panel would draw it anywhere else.
+    pub(super) task: Option<(Status, String)>,
+    /// How long it has held that task, if the claim says when it took it.
+    pub(super) held: Option<String>,
 }
 
 /// Read the two halves together: what herdr says the pane is doing, and what
@@ -171,13 +196,30 @@ pub(super) enum Row {
     /// it is `None` and the row draws as it always has, under the thing that
     /// explains it.
     Agent { agent: AgentRef, title: String, depth: usize, census: Option<Census> },
+    /// A line that belongs to the row above it. The cursor never lands on one
+    /// and no digit addresses one: it is the second and third line of one
+    /// agent, in the view that has the room to spend three lines on one.
+    ///
+    /// A row rather than extra lines inside one, because the frame maps screen
+    /// rows to row indices one for one — a row that drew two lines would put
+    /// every click below it on the wrong thing.
+    Detail(Detail),
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum Detail {
+    /// What it is waiting for, which terminal it is, and how long it has been
+    /// holding what it holds.
+    Standing { state: AgentState, pane: String, held: Option<String>, direction: Option<String> },
+    /// The task in its hands, drawn the way the tree draws a task.
+    Holding { status: Status, title: String },
 }
 
 impl Row {
     /// Every row takes the cursor. A heading you cannot select is a heading you
     /// cannot fold or add to, and both are things the groups need.
     pub(super) fn selectable(&self) -> bool {
-        true
+        !matches!(self, Row::Detail(_))
     }
     /// The pane this row *is*. A task that has one is not it — the pane sits
     /// on its own row directly beneath, and letting both answer meant two
@@ -200,6 +242,9 @@ pub(crate) enum RowKind {
     More,
     Section,
     Agent,
+    /// A line under an agent in the agents view. Never selected, so a driver
+    /// that hunts for one has gone wrong.
+    Detail,
     Nothing,
 }
 
@@ -212,7 +257,10 @@ pub(crate) struct Ui {
     /// agent on the machine is in here whichever view is up — the strip is the
     /// census, and a census that only counted what the tree happened to be
     /// showing would go quiet exactly when a filter was on.
-    pub(super) census: Vec<AgentState>,
+    ///
+    /// The pane comes with the state because a mark in the strip is clickable:
+    /// it is the one row-less thing on the panel that leads somewhere.
+    pub(super) census: Vec<(AgentState, AgentRef)>,
     pub(super) blocked: usize,
     /// Tasks an agent has finished with and handed back. `review` is where an
     /// agent's work ends; only a person says `done`, so this is a count of
@@ -262,9 +310,10 @@ pub(super) fn target_of(row: &Row) -> Target {
         Row::More { key, .. } => Target::Overflow(key.clone()),
         Row::Agent { agent, .. } => Target::Pane(agent.pane.clone()),
         Row::Section { key, .. } if key == NOPROJECT_KEY => Target::Unattached,
-        Row::Section { key, .. } if key == UNASSIGNED_KEY => Target::Unattached,
+        Row::Section { key, .. } if key == AGENTS_KEY => Target::Unattached,
         Row::Section { key, .. } if key == INBOX_KEY => Target::Inbox,
         Row::Section { .. } => Target::Nothing,
+        Row::Detail(_) => Target::Nothing,
     }
 }
 
@@ -283,6 +332,19 @@ impl Ui {
         self.rows.len()
     }
 
+    /// How many of those are the pinned section at the foot.
+    #[cfg(test)]
+    pub(crate) fn dock_for_test(&self) -> usize {
+        self.dock
+    }
+
+    /// The census the header strip is drawn from, for a test that has to check
+    /// the strip against the agents it stands for.
+    #[cfg(test)]
+    pub(crate) fn census_for_test(&self) -> Vec<(AgentState, AgentRef)> {
+        self.census.clone()
+    }
+
     pub(crate) fn selected_target(&self) -> Target {
         self.rows.get(self.sel).map(target_of).unwrap_or(Target::Nothing)
     }
@@ -294,6 +356,7 @@ impl Ui {
             Some(Row::More { .. }) => RowKind::More,
             Some(Row::Section { .. }) => RowKind::Section,
             Some(Row::Agent { .. }) => RowKind::Agent,
+            Some(Row::Detail(_)) => RowKind::Detail,
             None => RowKind::Nothing,
         }
     }
@@ -348,6 +411,10 @@ pub struct Snapshot {
     /// has a project it is *for*, and that is the one the panel sends it to
     /// look in.
     pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
+    /// task id -> claim record. Read for one field, `claimed_at`: how long a
+    /// pane has been holding what it holds is the difference between an agent
+    /// working and an agent stuck, and it is the one fact herdr cannot supply.
+    pub claims: std::collections::BTreeMap<String, serde_json::Value>,
     pub workspaces: Vec<herdr::Workspace>,
     pub panes: Vec<herdr::Pane>,
 }
@@ -363,6 +430,7 @@ impl Snapshot {
             bindings: store.bindings(),
             pins: store.pins(),
             mandates: store.mandates(),
+            claims: store.claims(),
             workspaces: herdr::workspaces().unwrap_or_default(),
             panes: herdr::panes().unwrap_or_default(),
         }
@@ -610,12 +678,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     let mut live_by_project: std::collections::BTreeMap<String, usize> = Default::default();
     let mut loose_by_project: std::collections::BTreeMap<String, Vec<AgentRef>> = Default::default();
     let mut homeless: Vec<AgentRef> = Vec::new();
-    // An agent holding no task, wherever it is standing. These are the panes
-    // there is something to *do* about, and the tree is the wrong place for
-    // them: it is ordered by work, and an unassigned agent is precisely the one
-    // that has none. They go in a dock at the foot instead, where they cannot
-    // scroll out of sight.
-    let mut unassigned: Vec<AgentRef> = Vec::new();
     // Every running agent, with what it is waiting for and where its work is.
     // Gathered in this same pass because resolving a pane's project is the
     // expensive half of this function and it runs four times a second — and
@@ -646,17 +708,24 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         // Shells are not in the census. A pane with nobody in it is a fact
         // about a place, and the agents view is a list of people.
         if !a.agent.is_empty() {
-            let holds = bound
-                .as_ref()
-                .and_then(|id| tasks.iter().find(|t| &t.id == id))
-                .map(|t| t.status());
+            let holds = bound.as_ref().and_then(|id| tasks.iter().find(|t| &t.id == id));
             census.push((
                 Census {
-                    state: agent_state(&a.agent_status, holds),
+                    state: agent_state(&a.agent_status, holds.map(|t| t.status())),
                     // Where it stands, before where it is aimed: a pane holding
                     // a task is placed by that task's project, and only one
                     // with no work of its own is described by its direction.
                     project: r.project.clone().or_else(|| direction.clone()),
+                    task: holds.map(|t| (t.status(), t.title.clone())),
+                    // From the claim rather than the binding: a binding is
+                    // remade whenever a pane is, and would reset the clock on
+                    // work nobody had put down.
+                    held: holds
+                        .and_then(|t| snap.claims.get(&t.id))
+                        .and_then(|c| c.get("claimed_at"))
+                        .and_then(|c| c.as_str())
+                        .filter(|c| !c.is_empty())
+                        .map(|c| util::duration_human(util::since(c))),
                 },
                 as_ref(a, direction.clone()),
             ));
@@ -666,27 +735,21 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 for id in std::iter::once(p.clone()).chain(index.ancestors(p)) {
                     *live_by_project.entry(id).or_insert(0) += 1;
                 }
-                if bound.is_none() {
-                    if a.agent.is_empty() {
-                        loose_by_project.entry(p.clone()).or_default().push(as_ref(a, direction));
-                    } else {
-                        unassigned.push(as_ref(a, direction));
-                    }
+                // Shells only. An agent is in the census, and the census is
+                // pinned at the foot where it cannot scroll away — putting it
+                // in the tree as well would be the same pane twice in one
+                // glance, which is one pane too many to count.
+                if bound.is_none() && a.agent.is_empty() {
+                    loose_by_project.entry(p.clone()).or_default().push(as_ref(a, direction));
                 }
             }
             // Resolves to nothing, or the workspace is deliberately pinned out
             // of the tree. Either way it belongs to no project.
             None => {
-                if bound.is_none() {
-                    // A shell that resolves nowhere is still a fact about
-                    // nothing in particular, and stays in the tree's own
-                    // group. An agent is a person's worth of attention going
-                    // spare, and goes in the dock.
-                    if a.agent.is_empty() {
-                        homeless.push(as_ref(a, direction));
-                    } else {
-                        unassigned.push(as_ref(a, direction));
-                    }
+                // A shell that resolves nowhere is still a fact about nothing
+                // in particular, and keeps the tree's own group for it.
+                if bound.is_none() && a.agent.is_empty() {
+                    homeless.push(as_ref(a, direction));
                 }
             }
         }
@@ -854,58 +917,87 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         }
     }
 
-    // The dock. Last in the row list and pinned to the bottom of the frame, so
-    // it is reachable by the cursor — `c` has to be able to land on one of
-    // these — while never scrolling away like the tree above it.
-    let dock = if unassigned.is_empty() || view.review_only {
-        0
-    } else {
-        let folded = view.collapsed.contains(UNASSIGNED_KEY);
-        rows.push(Row::Section {
-            key: UNASSIGNED_KEY.to_string(),
-            label: "unassigned".into(),
-            count: unassigned.len(),
-            collapsed: folded,
-        });
-        if folded {
-            1
-        } else {
-            let n = unassigned.len();
-            for a in unassigned {
-                let title = a.where_.clone();
-                rows.push(Row::Agent { agent: a, title, depth: 1, census: None });
-            }
-            n + 1
-        }
-    };
-
     census.sort_by(|(a, ar), (b, br)| a.state.cmp(&b.state).then(ar.where_.cmp(&br.where_)));
 
-    // The agents in place of the tree. Built after it rather than instead of
-    // it: every count in the header and the footer is a fact about the work,
-    // and a view that swapped those out for facts about the panes would go
-    // quiet on the blocked task you turned it on to chase down.
+    // The agents, either way round.
+    //
+    // Pinned at the foot the panel keeps the first few on screen whatever the
+    // tree is doing — who has stopped and who is free is the question you ask
+    // between reading anything else, and the answer must not be a keystroke
+    // away. `w` gives the same list the whole pane and three lines each: the
+    // difference is how much room there is to say it in, not what is being
+    // said.
     let (rows, dock) = if view.agents {
-        let list = census
-            .iter()
-            .map(|(c, a)| Row::Agent {
+        let mut list: Vec<Row> = Vec::new();
+        for (c, a) in census.iter() {
+            list.push(Row::Agent {
                 title: a.where_.clone(),
                 agent: a.clone(),
                 depth: 0,
                 census: Some(c.clone()),
-            })
-            .collect();
-        // No dock: an agent with no work is a row in this list like any other,
-        // and pinning some of them to the foot would sort the list twice.
+            });
+            list.push(Row::Detail(Detail::Standing {
+                state: c.state,
+                pane: a.pane.clone(),
+                held: c.held.clone(),
+                // Only when it differs from where the row already says it is:
+                // a mandate that agrees with the cwd is not news.
+                direction: a.project.clone().filter(|d| Some(d) != c.project.as_ref()),
+            }));
+            if let Some((status, title)) = &c.task {
+                list.push(Row::Detail(Detail::Holding {
+                    status: *status,
+                    title: title.clone(),
+                }));
+            }
+        }
+        // No dock: every agent is already here, and pinning five of them to the
+        // foot would be the same list twice.
         (list, 0)
+    } else if census.is_empty() || view.review_only {
+        // Under the review filter the panel is answering one question, and this
+        // is not it — the strip in the header still carries the census, so
+        // nothing is hidden, only set aside.
+        (rows, 0)
     } else {
-        (rows, dock)
+        let mut rows = rows;
+        let folded = view.collapsed.contains(AGENTS_KEY);
+        rows.push(Row::Section {
+            key: AGENTS_KEY.to_string(),
+            label: "agents".into(),
+            count: census.len(),
+            collapsed: folded,
+        });
+        if folded {
+            (rows, 1)
+        } else {
+            // The cap is the point of the section: five rows of who, beside a
+            // tree that is still a tree. The heading counts them all, so a
+            // sixth agent is never silently absent, and `⋯` opens the rest in
+            // place for anyone who would rather not leave the tree at all.
+            let more = view.expanded.contains(AGENTS_KEY);
+            let shown = if more { census.len() } else { census.len().min(MAX_AGENTS_DOCKED) };
+            for (c, a) in census.iter().take(shown) {
+                rows.push(Row::Agent {
+                    title: a.where_.clone(),
+                    agent: a.clone(),
+                    depth: 1,
+                    census: Some(c.clone()),
+                });
+            }
+            let hidden = census.len() - shown;
+            if hidden > 0 {
+                rows.push(Row::More { key: AGENTS_KEY.to_string(), depth: 1, n: hidden });
+            }
+            let dock = shown + usize::from(hidden > 0) + 1;
+            (rows, dock)
+        }
     };
 
     Ui {
         rows,
         dock,
-        census: census.into_iter().map(|(c, _)| c.state).collect(),
+        census: census.into_iter().map(|(c, a)| (c.state, a)).collect(),
         agents: view.agents,
         blocked: tasks.iter().filter(|t| t.status() == Status::Blocked).count(),
         review: tasks.iter().filter(|t| t.status() == Status::Review).count(),
@@ -982,13 +1074,8 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             }
             l.pad(*depth);
             l.push(Style::Plain, " ");
-            match status {
-                Status::Blocked => l.push(Style::Warn, glyph::BLOCKED),
-                Status::Review => l.push(Style::Muted, glyph::REVIEW),
-                Status::Done => l.push(Style::Dim, glyph::DONE),
-                Status::Doing => l.push(Style::Accent, glyph::DOING),
-                _ => l.push(Style::Dim, glyph::QUIET),
-            }
+            let (st, g) = status_mark(*status);
+            l.push(st, g);
             l.push(Style::Plain, " ");
 
             // Work beneath it, in the same vocabulary a project row uses —
@@ -1116,21 +1203,81 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             let ink = if agent.agent { Style::Accent } else { Style::Muted };
             l.push(ink, util::truncate(title, avail));
         }
+        // Indented under the name it belongs to and drawn dim throughout: this
+        // is the row above, said at length, and it must not compete with the
+        // rows the cursor can actually land on.
+        Row::Detail(Detail::Standing { state, pane, held, direction }) => {
+            l.pad(4);
+            let (st, _) = state.mark();
+            l.push(st, word(*state));
+            l.push(Style::Dim, format!(" · {pane}"));
+            if let Some(d) = direction {
+                l.push(Style::Dim, format!(" · for {d}"));
+            }
+            if let Some(h) = held {
+                let right = line(Style::Dim, h.clone());
+                l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+                l.spans.extend(right.spans);
+            }
+        }
+        Row::Detail(Detail::Holding { status, title }) => {
+            l.pad(4);
+            let (st, g) = status_mark(*status);
+            l.push(st, g);
+            l.push(Style::Plain, " ");
+            l.push(Style::Muted, util::truncate(title, w.saturating_sub(7).max(4)));
+        }
     }
     l
 }
 
+/// What an agent is waiting for, in the fewest words that are true. Beside the
+/// mark rather than instead of it: the glyph is what you read in the strip, and
+/// the word is what tells you the glyph's name the first time you meet it.
+pub(super) fn word(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Asking => "wants you",
+        AgentState::Blocked => "blocked",
+        AgentState::Spare => "spare",
+        AgentState::Working => "working",
+        AgentState::Quiet => "no word yet",
+    }
+}
+
+/// A task's own status, in the first column, exactly as a task row draws it.
+pub(super) fn status_mark(status: Status) -> (Style, &'static str) {
+    match status {
+        Status::Blocked => (Style::Warn, glyph::BLOCKED),
+        Status::Review => (Style::Muted, glyph::REVIEW),
+        Status::Done => (Style::Dim, glyph::DONE),
+        Status::Doing => (Style::Accent, glyph::DOING),
+        _ => (Style::Dim, glyph::QUIET),
+    }
+}
+
 /// Digits 1-9 address rows that lead somewhere: a terminal.
-pub(super) fn hotkeys(rows: &[Row]) -> Vec<Option<u8>> {
-    let mut out = Vec::with_capacity(rows.len());
+///
+/// The pinned agents at the foot are numbered first, because they are the rows
+/// that are always on screen — a digit you can see is worth more than a digit
+/// in the order the rows happen to be built in. And one terminal takes one
+/// digit: a pane can be drawn twice, under its task and again in the section,
+/// and spending two of the nine on one pane would leave the ninth agent with
+/// none.
+pub(super) fn hotkeys(ui: &Ui) -> Vec<Option<u8>> {
+    let rows = &ui.rows;
+    let mut out = vec![None; rows.len()];
     let mut n: u8 = 0;
-    for r in rows {
-        if r.agent().is_some() && n < 9 {
-            n += 1;
-            out.push(Some(n));
-        } else {
-            out.push(None);
+    let mut taken: Vec<&str> = Vec::new();
+    let tree = rows.len() - ui.dock;
+    let order = (tree..rows.len()).chain(0..tree);
+    for i in order {
+        let Some(a) = rows[i].agent() else { continue };
+        if taken.contains(&a.pane.as_str()) || n >= 9 {
+            continue;
         }
+        n += 1;
+        taken.push(&a.pane);
+        out[i] = Some(n);
     }
     out
 }

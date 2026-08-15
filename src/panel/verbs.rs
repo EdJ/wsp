@@ -584,7 +584,12 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::None
         }
         Key::Char('G') | Key::End => {
+            // The last row that takes the cursor, which in the agents view is
+            // not the last line: an agent's detail lines follow it.
             ui.sel = n.saturating_sub(1);
+            if !ui.rows.is_empty() && !ui.rows[ui.sel].selectable() {
+                ui.sel = super::keys::step(&ui.rows, ui.sel, false);
+            }
             Effect::None
         }
 
@@ -610,7 +615,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 
         Key::Char(d @ '1'..='9') => {
             let want = d as u8 - b'0';
-            match hotkeys(&ui.rows)
+            match hotkeys(ui)
                 .iter()
                 .position(|k| *k == Some(want))
                 .and_then(|i| ui.rows[i].agent())

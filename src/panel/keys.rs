@@ -311,18 +311,42 @@ fn opens(row: Option<&Row>) -> bool {
     }
 }
 
+/// The next row the cursor is allowed to sit on, in the direction of travel.
+///
+/// Most rows take the cursor; the lines under an agent in the agents view do
+/// not, because they are the row above said at length and selecting one would
+/// mean the same pane three times over. Stepping over them here is what keeps
+/// `j` meaning "the next thing I can act on" rather than "the next line".
+pub(super) fn step(rows: &[Row], from: usize, down: bool) -> usize {
+    let mut i = from;
+    loop {
+        let next = if down {
+            if i + 1 >= rows.len() {
+                return from;
+            }
+            i + 1
+        } else {
+            if i == 0 {
+                return from;
+            }
+            i - 1
+        };
+        if rows[next].selectable() {
+            return next;
+        }
+        i = next;
+    }
+}
+
 /// Cursor movement and folding, shared by browse and pick.
 pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
-    let n = ui.rows.len();
     match k {
         Key::Down => {
-            if ui.sel + 1 < n {
-                ui.sel += 1;
-            }
+            ui.sel = step(&ui.rows, ui.sel, true);
             Effect::None
         }
         Key::Up => {
-            ui.sel = ui.sel.saturating_sub(1);
+            ui.sel = step(&ui.rows, ui.sel, false);
             Effect::None
         }
         Key::Left | Key::Right => match ui.rows.get(ui.sel) {
@@ -371,6 +395,15 @@ pub(crate) enum Hit {
     Select,
     /// A click on the row already under the cursor: what `↵` means.
     Activate,
+    /// A mark in the header strip. It is not a row and there is nothing to
+    /// select — the mark *is* the agent, so pointing at it goes there. One
+    /// click rather than the select-then-activate a row gets: the strip is a
+    /// line of single columns, there is nothing to read on the way, and the ←
+    /// you are reaching for is the one you have already decided to answer.
+    Focus(AgentRef),
+    /// The `⋯` at the end of a clipped strip: the rest of the agents, which is
+    /// what the agents view is.
+    Rest,
 }
 
 /// Decide what a click does, and move the cursor if that is what it does.
@@ -379,10 +412,31 @@ pub(crate) enum Hit {
 /// the loop's job is to read the pane's size and act on the answer, and the
 /// interesting half — select, then activate, without the tree moving — is
 /// policy that a fixture can drive.
-pub(crate) fn click(ui: &mut Ui, view: &mut View, w: usize, h: usize, y: usize) -> Hit {
+pub(crate) fn click(ui: &mut Ui, view: &mut View, w: usize, h: usize, x: usize, y: usize) -> Hit {
+    // The top line is the strip, and a mark on it is an agent.
+    if y == 0 {
+        return match super::render::strip_at(ui, w, x) {
+            Some(super::render::StripHit::Agent(i)) => {
+                Hit::Focus(ui.census[i].1.clone())
+            }
+            Some(super::render::StripHit::Rest) => Hit::Rest,
+            None => Hit::Nothing,
+        };
+    }
     let at = super::render::geometry(ui, view, w, h).scroll;
     match super::render::row_at(ui, view, w, h, y) {
         None => Hit::Nothing,
+        // A line under an agent belongs to that agent: the click lands on the
+        // row it is written beneath, which is the row it is about.
+        Some(i) if !ui.rows[i].selectable() => {
+            let owner = step(&ui.rows, i, false);
+            if !ui.rows[owner].selectable() {
+                return Hit::Nothing;
+            }
+            view.scroll = Some(at);
+            ui.sel = owner;
+            Hit::Select
+        }
         Some(i) if i == ui.sel => Hit::Activate,
         Some(i) => {
             // Pin the view before moving the cursor. Selecting normally

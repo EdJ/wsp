@@ -50,7 +50,7 @@ pub(crate) use render::to_html_spans as spans_of;
 /// a click maps to is the row that was painted there.
 #[cfg(test)]
 pub(crate) fn render_row_for_test(ui: &Ui, i: usize, w: usize) -> Line {
-    let keys = rows::hotkeys(&ui.rows);
+    let keys = rows::hotkeys(ui);
     rows::render_row(&ui.rows[i], w, keys[i])
 }
 pub(crate) use rows::{collect, refetch_into, RowKind, Snapshot, Target, Ui};

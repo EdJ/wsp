@@ -196,6 +196,11 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         bindings,
         pins: BTreeMap::new(),
         mandates,
+        // No `claimed_at` anywhere: a live claim prints how long it has been
+        // held, and a fixture that says `356d` is a fixture whose age is
+        // showing. The panel draws the duration when there is one and says
+        // nothing when there is not, which is what these frames show.
+        claims: BTreeMap::new(),
         workspaces,
         panes: agents,
     }
@@ -312,6 +317,25 @@ impl<'a> Driver<'a> {
         self.down_to(want)
     }
 
+    /// Press `Down` until the cursor is on a particular pane's row. A scene
+    /// that means a *specific* agent — the spare one, the one standing nowhere
+    /// — has to say which: what a count of presses lands on changes the moment
+    /// the fixture gains a pane, and the caption underneath would go on
+    /// describing the row that used to be there.
+    fn to_pane(&mut self, pane: &str) -> &mut Self {
+        let want = panel::Target::Pane(pane.to_string());
+        loop {
+            if self.ui.selected_target() == want {
+                return self;
+            }
+            let before = self.ui.selected_index();
+            self.key(Key::Down);
+            if self.ui.selected_index() == before {
+                panic!("no row for pane {pane}");
+            }
+        }
+    }
+
     /// Press `Down` until the cursor sits on a row of `want`. Bounded by the
     /// cursor going nowhere, so a `want` that is not present terminates rather
     /// than spins.
@@ -415,42 +439,41 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .down_to_next(panel::RowKind::Section)
-            .scene("The other group", "Loose agents sit at the foot, after the work. Nothing can be added here — herdr owns agents — so the useful verb on this row is claim."),
+            .scene("The other group", "Shells that resolve nowhere sit at the foot, after the work — a pane with nobody in it is a fact about a place, so it stays in the tree, where places are. Nothing can be added here; herdr owns panes."),
     );
 
     out.push(
         Driver::new(&w)
-            .key(Key::Char('G'))
-            .scene("At the foot", "G to the last row, which is in the dock. The cursor reports a pane to jump to rather than anything to edit — not every target is a thing you can change."),
+            .to_pane("w2:p1")
+            .scene("The agents, always on", "Under a rule of its own at the foot: the agents, five of them, in the order the strip is drawn in — what wants you, what is free, what is busy. Pinned, so the tree above scrolls and this does not, because who has stopped is the question you ask between reading anything else and it must not be a keystroke away. The heading counts them all, so the sixth is never silently absent, and 1-9 start here rather than in the tree: a digit you can always see is worth more than one in row order."),
     );
 
     out.push(
         Driver::new(&w)
-            .down_to(panel::RowKind::Agent)
-            .keys(&[Key::Char('G'), Key::Char('c')])
-            .scene("Handing work to an idle agent", "The dock holds every agent with no task, ruled off at the foot and pinned there — the tree above it scrolls and this does not. It is the one row you most need to see and the first the tree would push off the bottom, since the tree sorts by work and these panes have none. `c` on one turns the tree into the picker: choose what it takes."),
+            .keys(&[Key::Char('G'), Key::Right])
+            .scene("Opening the rest in place", "G to the last row, which is the section's own `⋯`, and `→` opens the tail where it stands — the same gesture as a project past the six-task cap. For anyone who would rather not leave the tree at all; `w` is the other door, and it gives the same agents three lines each instead of one."),
     );
 
     out.push(
         Driver::new(&w)
-            .keys(&[Key::Char('G'), Key::Char('c')])
-            .up_to(panel::RowKind::More)
-            .key(Key::Enter)
-            .scene("Reaching past the cap", "Every project stops at six tasks and puts the rest behind `⋯`, so a hunt for work to hand over runs into one. `↵` inside a pick takes the row it lands on — and on a row it cannot take but can *open*, it opens it: the tail here, a folded project the same way. The pick is still running; the two tasks that were out of reach are now rows like any other."),
+            .to_pane("w4:p2")
+            .key(Key::Char('c'))
+            .scene("Handing work to an idle agent", "`○` is an agent that has stopped holding nothing — a person's worth of attention going spare, and the row the section exists to keep on screen: it sorts above the busy ones for exactly that reason, since there is nothing to do about an agent that is working. `c` on it turns the tree into the picker: choose what it takes."),
     );
 
     out.push(
         Driver::new(&w)
-            .keys(&[Key::Char('G'), Key::Up, Key::Char('f')])
+            .to_pane("w4:p2")
+            .key(Key::Char('f'))
             .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command."),
     );
 
     out.push(
         Driver::new(&w)
-            .keys(&[Key::Char('G'), Key::Char('f')])
+            .to_pane("w6:p1")
+            .key(Key::Char('f'))
             .scene("Asking where it works", "The commonest pane of all: an idle agent standing in no project, because herdr reports where a pane's *shell* started and that is one directory above every checkout. `f` asks rather than refusing — and the answer is written down as a mandate, so the next `f` on that pane goes straight out. Picking a project for an idle agent *is* standing direction; there was never anything else it could mean."),
     );
-
     out.push(
         Driver::new(&w)
             .key(Key::Char('A'))
@@ -929,11 +952,27 @@ mod tests {
 
         let running =
             w.panes.iter().filter(|p| !p.agent.is_empty() && p.label != panel::PANEL_LABEL).count();
-        assert_eq!(ui.rows_for_test(), running, "one row per running agent, and no more");
+        let mut kinds = Vec::new();
         for i in 0..ui.rows_for_test() {
             ui.select_for_test(i);
-            assert_eq!(ui.selected_kind(), panel::RowKind::Agent, "row {i}");
-            assert!(matches!(ui.selected_target(), panel::Target::Pane(_)), "row {i}");
+            kinds.push(ui.selected_kind());
+        }
+        assert_eq!(
+            kinds.iter().filter(|k| **k == panel::RowKind::Agent).count(),
+            running,
+            "one agent row per running agent, and no more"
+        );
+        // Everything else in the view is one of those agents' own lines.
+        assert!(kinds.iter().all(|k| matches!(k, panel::RowKind::Agent | panel::RowKind::Detail)));
+
+        // And the cursor only ever lands on the agents: the lines beneath one
+        // are the row above said at length, and stopping on them would be the
+        // same pane three times over.
+        let (mut ui, mut view) = showing(&w, &[Key::Char('w')]);
+        for _ in 0..ui.rows_for_test() {
+            assert_eq!(ui.selected_kind(), panel::RowKind::Agent, "at row {}", ui.selected_index());
+            assert!(matches!(ui.selected_target(), panel::Target::Pane(_)));
+            panel::apply_key(Key::Down, &mut ui, &mut view);
         }
 
         // And back again. `w` is a view, not a door.
@@ -983,8 +1022,8 @@ mod tests {
                 .collect()
         };
         // One mark per agent, ordered as the list is: wants you, blocked,
-        // working, spare, quiet.
-        let want = "←■●●○○·";
+        // spare, working, quiet.
+        let want = "←■○○●●·";
 
         let (ui, view) = showing(&w, &[]);
         assert_eq!(marks(&ui, &view), want, "at rest");
@@ -997,6 +1036,129 @@ mod tests {
         // drawing a bare zero.
         let (ui, view) = showing(&quiet_world(), &[]);
         assert!(panel::frame(&ui, &view, W, H)[0].text().contains("no agents"));
+    }
+
+    /// The lines under an agent are that agent said at length, so a click on
+    /// one lands on the row they belong to rather than on nothing. Doing
+    /// nothing would be defensible for a rule or a blank; here the pointer is
+    /// on the agent's own words.
+    #[test]
+    fn clicking_an_agents_own_lines_selects_the_agent() {
+        let w = world();
+        let (mut ui, mut view) = showing(&w, &[Key::Char('w')]);
+        // The first agent's second line, two screen rows under the header.
+        let head = 2;
+        let detail = head + 1;
+        assert_eq!(panel::row_at(&ui, &view, W, H, detail), Some(1), "the line under the first");
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 2, detail), panel::Hit::Select);
+        assert_eq!(ui.selected_index(), 0, "the agent it belongs to");
+        assert_eq!(ui.selected_kind(), panel::RowKind::Agent);
+    }
+
+    /// The strip is a row of single columns, and each one is an agent. Nothing
+    /// else on the panel is clickable without being a row, so the arithmetic
+    /// that draws it has to be the arithmetic that reads the click — otherwise
+    /// pointing at the `←` focuses the pane beside the one you meant.
+    #[test]
+    fn clicking_a_mark_in_the_strip_goes_to_that_agent() {
+        let w = world();
+        let (mut ui, mut view) = showing(&w, &[]);
+
+        // Column by column, against the census the strip was drawn from.
+        for (i, (_, agent)) in ui.census_for_test().into_iter().enumerate() {
+            let hit = panel::click(&mut ui, &mut view, W, H, 4 + i, 0);
+            match hit {
+                panel::Hit::Focus(a) => assert_eq!(a.pane(), agent.pane(), "mark {i}"),
+                other => panic!("mark {i} should go to a terminal, got {other:?}"),
+            }
+        }
+        // The name is not a mark, and neither is the gap before the total.
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, 0), panel::Hit::Nothing);
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, W - 1, 0), panel::Hit::Nothing);
+        // And clicking one does not move the cursor: there is no row to move to.
+        assert_eq!(ui.selected_index(), 0);
+    }
+
+    /// A strip too long for the pane ends in `⋯`, and the rest of the agents is
+    /// exactly what the agents view is — so the mark that stands for them opens
+    /// it rather than doing nothing.
+    #[test]
+    fn clicking_the_rest_of_a_clipped_strip_opens_the_agents() {
+        let w = world();
+        let (mut ui, mut view) = showing(&w, &[]);
+        // Narrow enough that seven marks cannot fit beside the name and total.
+        let narrow = 10;
+        let clipped = panel::frame(&ui, &view, narrow, H)[0].text();
+        assert!(clipped.contains(panel::glyph::MORE), "{clipped}");
+        let at = clipped.chars().position(|c| c.to_string() == panel::glyph::MORE).unwrap();
+        assert_eq!(panel::click(&mut ui, &mut view, narrow, H, at, 0), panel::Hit::Rest);
+    }
+
+    /// The section keeps a few on screen and says how many there are, so the
+    /// ones it cannot fit are never silently absent.
+    #[test]
+    fn the_section_keeps_five_and_counts_them_all() {
+        let w = world();
+        let (mut ui, mut view) = showing(&w, &[]);
+        let census = ui.census_for_test().len();
+        assert!(census > 5, "the fixture has to outrun the cap to test it");
+
+        let docked = ui.dock_for_test();
+        let mut agents = 0;
+        for i in ui.rows_for_test() - docked..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_kind() == panel::RowKind::Agent {
+                agents += 1;
+            }
+        }
+        assert_eq!(agents, 5, "five agents pinned, and a `⋯` for the rest");
+        // The heading counts every one of them, whatever it could draw.
+        let head = panel::render_row_for_test(&ui, ui.rows_for_test() - docked, W);
+        assert!(head.text().contains("agents") && head.text().contains(&census.to_string()));
+
+        // `→` on the `⋯` opens the tail in place, exactly as a project's does.
+        panel::apply_key(Key::Char('G'), &mut ui, &mut view);
+        if let panel::Effect::Refetch = panel::apply_key(Key::Right, &mut ui, &mut view) {
+            panel::refetch_into(&mut ui, &w, &mut view, Some("w0"));
+        }
+        let docked = ui.dock_for_test();
+        let mut agents = 0;
+        for i in ui.rows_for_test() - docked..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_kind() == panel::RowKind::Agent {
+                agents += 1;
+            }
+        }
+        assert_eq!(agents, census, "all of them, once asked");
+    }
+
+    /// A digit is an address for a terminal. The pinned rows take them first
+    /// because they are the rows that are always on screen — and a pane drawn
+    /// twice, under its task and again in the section, must not spend two.
+    #[test]
+    fn one_terminal_takes_one_digit_and_the_pinned_ones_go_first() {
+        let w = world();
+        let (mut ui, _view) = showing(&w, &[]);
+        // Which row carries which digit, read off the drawn lines.
+        let mut seen: Vec<(u8, usize, String)> = Vec::new();
+        for i in 0..ui.rows_for_test() {
+            let line = panel::render_row_for_test(&ui, i, W).text();
+            let Some(d) = line.chars().next().and_then(|c| c.to_digit(10)) else { continue };
+            ui.select_for_test(i);
+            let panel::Target::Pane(p) = ui.selected_target() else { continue };
+            seen.push((d as u8, i, p));
+        }
+        let panes: Vec<&String> = seen.iter().map(|(_, _, p)| p).collect();
+        let mut uniq = panes.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(panes.len(), uniq.len(), "a terminal took two digits: {seen:?}");
+
+        // 1 is in the section at the foot, not on the first agent in the tree
+        // — and the tree row for that same pane carries no digit of its own.
+        let tree = ui.rows_for_test() - ui.dock_for_test();
+        let (_, at, _) = seen.iter().find(|(d, _, _)| *d == 1).expect("no 1");
+        assert!(*at >= tree, "the first digit belongs to the pinned section");
     }
 
     /// Two switches, one state. A filter left on under a view that does not use
@@ -1115,7 +1277,7 @@ mod tests {
                 continue;
             }
             let (mut after_ui, mut after_view) = (ui.clone(), view.clone());
-            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, y), panel::Hit::Select);
+            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, 0, y), panel::Hit::Select);
             assert_eq!(
                 panel::row_at(&after_ui, &after_view, W, H, y),
                 Some(i),
@@ -1123,7 +1285,7 @@ mod tests {
             );
             // And the row it selected is the row that was clicked, so the
             // second click activates rather than selecting something else.
-            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, y), panel::Hit::Activate);
+            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, 0, y), panel::Hit::Activate);
         }
     }
 
@@ -1225,6 +1387,23 @@ mod tests {
 
     fn press(ui: &mut panel::Ui, view: &mut panel::View, c: char) -> panel::Effect {
         panel::apply_key(Key::Char(c), ui, view)
+    }
+
+    /// Open the agents section past the five it keeps on screen, the way `→` on
+    /// its `⋯` does. A test that wants the sixth agent has to ask for it exactly
+    /// as a person would — and the last overflow row in the tree is the
+    /// section's, since it is the last thing in the list.
+    fn show_all_agents(snap: &Snapshot, ui: &mut panel::Ui, view: &mut panel::View) {
+        let mut probe = ui.clone();
+        let more = (0..ui.rows_for_test())
+            .filter(|i| {
+                probe.select_for_test(*i);
+                probe.selected_kind() == panel::RowKind::More
+            })
+            .next_back()
+            .expect("the agents section has no overflow row");
+        ui.select_for_test(more);
+        step(snap, ui, view, Key::Right);
     }
 
     /// A key and the rebuild the live loop does for it. `press` is enough while
@@ -1411,6 +1590,7 @@ mod tests {
         on_pane(&mut ui, "w5:p1"); // a shell standing in ~/claude/wsp
         assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
 
+        show_all_agents(&w, &mut ui, &mut view);
         on_pane(&mut ui, "w3:p1"); // an agent working, holding no task
         assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
 
@@ -1568,6 +1748,10 @@ mod tests {
             }
         }
         press(&mut ui, &mut view, 'c');
+        // Past the section's cap, so the pick has to open it — which is the
+        // other half of the same rule: every agent is reachable from inside a
+        // pick, or some of them can never be handed anything.
+        show_all_agents(&w, &mut ui, &mut view);
         on_pane(&mut ui, "w3:p1");
         match panel::apply_key(Key::Enter, &mut ui, &mut view) {
             panel::Effect::Run { argv, then, .. } => {
