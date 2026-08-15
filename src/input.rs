@@ -31,6 +31,10 @@ pub(crate) enum Key {
     Enter,
     Esc,
     Backspace,
+    /// Ctrl-U: the line, gone. Every other terminal that hands you a line to
+    /// edit has it, and a prompt that opens holding sixty characters needs
+    /// one key that means "not those" — sixty backspaces is not an edit.
+    KillLine,
     /// The far ends of the list, for anyone who does not think in `g`/`G`.
     Home,
     End,
@@ -218,6 +222,7 @@ fn ground(b: u8, out: &mut Vec<Key>) {
         3 => Key::Interrupt,
         b'\r' | b'\n' => Key::Enter,
         0x7f | 0x08 => Key::Backspace,
+        0x15 => Key::KillLine,
         c if c.is_ascii_graphic() || c == b' ' => Key::Char(c as char),
         _ => return,
     };

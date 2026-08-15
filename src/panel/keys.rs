@@ -227,6 +227,11 @@ pub(super) fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut bu
             view.mode = Mode::Prompt { verb, buffer };
             Effect::None
         }
+        Key::KillLine => {
+            buffer.clear();
+            view.mode = Mode::Prompt { verb, buffer };
+            Effect::None
+        }
         Key::Esc | Key::Interrupt => {
             view.mode = Mode::Browse;
             say(ui, "cancelled");
@@ -237,6 +242,17 @@ pub(super) fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut bu
                 view.mode = Mode::Browse;
                 say(ui, "nothing typed");
                 return Effect::None;
+            }
+            // A prompt that opens holding a value can be left alone and sent
+            // by the same key that sends a change. Running it would write the
+            // title it already has: a log line, an event and a commit that
+            // record a person pressing `↵` and nothing else.
+            if let Ask::Rename { from, .. } = &verb {
+                if buffer.trim() == from.trim() {
+                    view.mode = Mode::Browse;
+                    say(ui, "unchanged");
+                    return Effect::None;
+                }
             }
             let argv = verb.argv(&buffer);
             if let Ask::NewProject { .. } = &verb {

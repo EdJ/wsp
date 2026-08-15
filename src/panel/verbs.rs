@@ -27,7 +27,10 @@ pub(crate) enum Ask {
     AddTask { project: Option<String>, parent: Option<String> },
     NewProject { parent: Option<String> },
     Block { task: String },
-    Rename { task: String },
+    /// `from` is the title the prompt opened with. Carried so pressing `↵` on
+    /// an untouched line can be nothing rather than a rename to the same
+    /// words — which is a log entry, an event and a commit saying nothing.
+    Rename { task: String, from: String },
     Note { task: String },
 }
 
@@ -72,7 +75,7 @@ impl Ask {
             }
             Ask::NewProject { parent: None } => vec!["project".into(), "add".into(), v],
             Ask::Block { task } => vec!["block".into(), task.clone(), v],
-            Ask::Rename { task } => vec!["rename".into(), task.clone(), v],
+            Ask::Rename { task, .. } => vec!["rename".into(), task.clone(), v],
             Ask::Note { task } => vec!["note".into(), task.clone(), v],
         }
     }
@@ -696,10 +699,18 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Effect::None
             }
         },
+        // Retitling is nearly always a correction — a word swapped, a clause
+        // added — and an empty line makes you retype the sixty characters you
+        // meant to keep, from a title the row was too narrow to show you in
+        // the first place. So the prompt opens holding the whole of it, caret
+        // at the end. `ctrl-u` is there for the rarer case of starting over.
         Key::Char('e') => match &target {
             Target::Task(id) => {
-                view.mode =
-                    Mode::Prompt { verb: Ask::Rename { task: id.clone() }, buffer: String::new() };
+                let from = ui.title_of_task(id).unwrap_or_default();
+                view.mode = Mode::Prompt {
+                    verb: Ask::Rename { task: id.clone(), from: from.clone() },
+                    buffer: from,
+                };
                 Effect::None
             }
             _ => {

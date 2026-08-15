@@ -262,6 +262,7 @@ fn key_name(k: Key) -> String {
         Key::Home => "⇱".into(),
         Key::End => "⇲".into(),
         Key::Backspace => "\u{232b}".into(),
+        Key::KillLine => "^U".into(),
         Key::Interrupt => "^C".into(),
         Key::Click { x, y } => format!("click {x},{y}"),
         Key::Wheel { up } => if up { "wheel ↑".into() } else { "wheel ↓".into() },
@@ -619,6 +620,13 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('b'))
             .type_in("waiting on the tuning table")
             .scene("Blocking, with a reason", "b asks why. `wsp block` requires a reason and so does the panel — a blocked task that does not say why is the one you cannot act on later."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_task("t-002")
+            .key(Key::Char('e'))
+            .scene("Retitling", "e opens the field holding the whole title, caret at the end — a retitle is nearly always a correction, and an empty field means retyping the sixty characters you meant to keep, from a row too narrow to have shown them to you. The line scrolls to its end, `^U` clears it, and ↵ on an untouched title does nothing rather than writing the title it already has."),
     );
 
     out.push(
@@ -2040,5 +2048,69 @@ mod tests {
             ui.rows_for_target(&panel::Target::Project("trance".into())).is_empty(),
             "finished work is quiet, not empty"
         );
+    }
+
+    /// Put the cursor on a task without counting presses, for a test that is
+    /// about a particular title rather than about a particular row.
+    fn on_task(ui: &mut panel::Ui, id: &str) {
+        let want = panel::Target::Task(id.to_string());
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_target() == want {
+                return;
+            }
+        }
+        panic!("no row for task {id}");
+    }
+
+    /// A retitle is nearly always a correction — a word swapped, a clause
+    /// added — and the prompt used to open empty, so keeping fifty-nine of
+    /// sixty characters meant retyping all sixty. From a row that was too
+    /// narrow to show you the title in the first place.
+    #[test]
+    fn retitling_opens_holding_the_title_it_is_changing() {
+        let w = world();
+        let title = w.tasks.iter().find(|t| t.id == "t-002").expect("t-002").title.clone();
+
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_task(&mut ui, "t-002");
+        panel::apply_key(Key::Char('e'), &mut ui, &mut view);
+
+        // The title outruns the pane by a long way, so what is on screen is
+        // its tail — the end being where the caret is, and where typing goes.
+        let shown = panel::frame(&ui, &view, W, H)[H - 1].text();
+        let tail: String = title.chars().skip(title.chars().count() - 12).collect();
+        assert!(shown.contains(&tail), "the prompt should hold the title: {shown}");
+
+        // Sent back untouched it is not a rename at all. The value is already
+        // in the buffer, so `↵` would otherwise write the title the task has —
+        // a log line, an event and a commit recording a keystroke.
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::None => {}
+            _ => panic!("an unchanged title should not run a rename"),
+        }
+
+        // Changed by one character, and it runs — carrying the whole title,
+        // not the character that was typed.
+        on_task(&mut ui, "t-002");
+        panel::apply_key(Key::Char('e'), &mut ui, &mut view);
+        panel::apply_key(Key::Char('!'), &mut ui, &mut view);
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv[0], "rename");
+                assert_eq!(argv[1], "t-002");
+                assert_eq!(argv[2], format!("{title}!"));
+            }
+            _ => panic!("a changed title should run a rename"),
+        }
+
+        // And `ctrl-u` is the way out of a value you did not want: one key,
+        // against sixty backspaces.
+        on_task(&mut ui, "t-002");
+        panel::apply_key(Key::Char('e'), &mut ui, &mut view);
+        panel::apply_key(Key::KillLine, &mut ui, &mut view);
+        let shown = panel::frame(&ui, &view, W, H)[H - 1].text();
+        assert!(!shown.contains(&tail), "ctrl-u should clear the line: {shown}");
     }
 }

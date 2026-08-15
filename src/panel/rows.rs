@@ -451,6 +451,15 @@ impl Ui {
         })
     }
 
+    /// What a task is called, in full. The row carries the whole title and
+    /// cuts it only at draw time, so retitling can start from what is
+    /// already there without going back to the store for it.
+    pub(super) fn title_of_task(&self, task: &str) -> Option<String> {
+        self.rows.iter().find_map(|r| match r {
+            Row::Task { id, title, .. } if id == task => Some(title.clone()),
+            _ => None,
+        })
+    }
 }
 
 /// Everything `collect` reads, gathered into one value.
