@@ -41,6 +41,11 @@ pub(crate) struct View {
     /// and handed back. Every key goes on meaning what it means; the only
     /// thing that changes is which rows are there to aim them at.
     pub(super) review_only: bool,
+    /// Put the agents in place of the tree: every pane running an agent, in one
+    /// list, ordered by what it is waiting for. The tree answers what the work
+    /// is; this answers who is on it and which of them has stopped — the
+    /// question herdr's own sidebar exists for, asked without leaving the panel.
+    pub(super) agents: bool,
     /// Put each task's id in front of its title. Off by default: the tree is
     /// for reading, and thirteen characters of id on every row is most of a
     /// narrow pane. On when you are about to type one at a shell.
@@ -137,6 +142,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("E", "edit in a tab"),
                 ("A i r", "show done, ids, sync"),
                 ("R", "only what needs review"),
+                ("w", "the agents, not the work"),
                 ("q", "quit"),
             ],
         ),

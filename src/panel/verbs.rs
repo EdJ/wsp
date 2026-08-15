@@ -615,11 +615,29 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             view.review_only = !view.review_only;
             if view.review_only {
                 view.show_done = false;
+                // `R` is a question about work, and the agents view has no work
+                // in it to narrow. Asking it there means the tree, so go back.
+                view.agents = false;
             }
             say(
                 ui,
                 if view.review_only { "review only" } else { "the whole tree" },
             );
+            Effect::Refetch
+        }
+        // The agents, in place of the work. Not a filter over the tree: the
+        // tree is ordered by what has to be done and this is ordered by who has
+        // stopped, and no arrangement of one row set answers both.
+        Key::Char('w') => {
+            view.agents = !view.agents;
+            if view.agents {
+                // The two are one switch from either side. A filter left on
+                // under a view that does not use it is a footer saying `review
+                // only` over a list of panes, and a tree that comes back
+                // narrowed when you turn the view off.
+                view.review_only = false;
+            }
+            say(ui, if view.agents { "the agents" } else { "the work" });
             Effect::Refetch
         }
         // The tree names work by title, which is what you read it for. The id

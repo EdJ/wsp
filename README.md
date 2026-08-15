@@ -91,7 +91,41 @@ agent running in the workspace.
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
 closes it again), `esc` closes it, `E` pops the row's file out into an editor
 tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `R` narrows
-to what needs reviewing, `i` shows ids, `r` syncs, `?` opens the key map.
+to what needs reviewing, `w` shows the agents instead of the work, `i` shows
+ids, `r` syncs, `?` opens the key map.
+
+### The strip, and the agents view
+
+The top line carries one mark per running agent, and the same marks are the
+first column of the agents view `w` opens. herdr reports two states — working,
+or idle — and `idle` is an answer to a question nobody asked: an agent that has
+stopped is waiting for *something*, and which something decides whether you
+have to get up. The store holds the other half, so the two become four:
+
+| Mark | What it is waiting for |
+|---|---|
+| `←` | stopped, holding a task that is still live — you are the blocker |
+| `■` | stopped, on a task parked with a question written on it |
+| `●` | running |
+| `○` | spare — stopped and holding nothing at all |
+| `·` | herdr says neither, usually a pane that has not spoken since it started |
+
+What wants you sorts first, in both places. The strip is drawn from every agent
+on the machine whatever the tree is filtered to — a header that went quiet under
+`R` is one you learn to distrust — and the total stays on the right, because a
+narrow pane clips the strip and a clipped strip must not be the only thing
+saying how many there are.
+
+`w` puts those agents in place of the tree, ordered the same way, with the
+project each one's work belongs to on the right — in the tree that is said by
+which branch the row is drawn under, and a flat list has no branch to say it
+with. It is deliberately not a filter over the tree: the tree is ordered by what
+has to be done, and an agent with nothing to do has no work to be filed under.
+Every row is a pane, so `↵`, `c`, `f` and `1`-`9` all go on meaning what they
+mean — which is the point, since you open it to find who is free and end up
+already standing on the row that hands them something. Shells are left out: a
+pane with nobody in it is a fact about a place, and this is a list of people.
+`w` and `R` each put the other away.
 
 `i` puts each task's id in front of its title — the thing you type at a shell
 beside the thing you read. Off by default: `t-260815-004` is thirteen columns of

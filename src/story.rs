@@ -155,6 +155,19 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // in no project by that measure — which is why `f` has to be able to
         // ask rather than refuse.
         agent("w6:p1", "w6", "idle", ""),
+        // Stopped on a task it has parked with a question on it. herdr calls
+        // this idle exactly as it calls the one above idle, and they are not
+        // the same thing at all: this one is waiting on an answer that is
+        // written down, and that one is waiting for anything to do.
+        agent("w3:p2", "w3", "idle", "waiting on the tuning table"),
+        // An agent herdr has no state for yet — a pane that has started and
+        // not said anything since. Common for a few seconds, and worth its own
+        // mark rather than being rounded down to idle.
+        {
+            let mut a = agent("w5:p2", "w5", "", "just started");
+            a.cwd = "~/claude/wsp".into();
+            a
+        },
         // Shells: no agent, placed purely by where they are standing.
         shell("w4:p1", "w4", "~/claude/trance"),
         shell("w5:p1", "w5", "~/claude/wsp"),
@@ -169,6 +182,9 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
     let mut bindings = BTreeMap::new();
     bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
     bindings.insert("w2:p1".to_string(), json!({ "task_id": "t-003" }));
+    // Holding the blocked task, which is what makes its idleness mean
+    // something different from anybody else's.
+    bindings.insert("w3:p2".to_string(), json!({ "task_id": "t-006" }));
 
     // Empty on purpose. Standing direction is what `f` writes when it has to
     // ask, so a world that starts with one would hide the question.
@@ -423,6 +439,24 @@ fn scenes() -> Vec<Scene> {
             .scene(
                 "Only what needs review",
                 "`R` narrows the tree to work an agent has finished with and handed back — `review` is where an agent stops, and only a person says `done`. The project rows stay so each one is placed, and every key goes on meaning what it means: `d` closes it, `o` sends it back, `↵` opens it in the detail pane. Nothing else changes, which is why this is a filter and not a second pane. The footer says the filter is on, because one left up silently reads as an empty backlog.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .key(Key::Char('w'))
+            .scene(
+                "The agents, not the work",
+                "`w` puts every running agent in place of the tree, ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ■ stopped on a task parked with a question, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The project on the right is what the tree would have said by where it drew the row. Every key still means what it means — ↵ jumps to the terminal, `c` hands it a task, 1-9 are the same hotkeys.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .keys(&[Key::Char('w'), Key::Char('c')])
+            .scene(
+                "Handing work over from the census",
+                "`c` on a row in the agents view is `c` on a pane row anywhere else: the tree comes back as the picker and the agent takes whatever you land on. Which is the point of putting the agents in one list — you go looking for who is free, and you are already standing on the row that hands them something.",
             ),
     );
 
@@ -836,6 +870,119 @@ mod tests {
         assert_eq!(panel::row_at(&ui, &view, W, H, 3), Some(1));
     }
 
+    /// Drive the panel the way a person would and hand back what it is
+    /// showing: the reducer, then the rebuild the live loop does for it.
+    fn showing(snap: &Snapshot, keys: &[Key]) -> (panel::Ui, panel::View) {
+        let mut view = panel::View::default();
+        let mut ui = ui_of(snap, &view);
+        for k in keys {
+            if let panel::Effect::Refetch = panel::apply_key(*k, &mut ui, &mut view) {
+                panel::refetch_into(&mut ui, snap, &mut view, Some("w0"));
+            }
+        }
+        (ui, view)
+    }
+
+    /// Every row of the agents view leads to a terminal, which is what makes
+    /// `↵`, `c` and the 1-9 hotkeys go on working inside it. A list of agents
+    /// with a project heading in it would put the cursor somewhere none of the
+    /// three verbs mean anything.
+    #[test]
+    fn the_agents_view_is_every_agent_and_nothing_else() {
+        let w = world();
+        let (mut ui, _view) = showing(&w, &[Key::Char('w')]);
+
+        let running =
+            w.panes.iter().filter(|p| !p.agent.is_empty() && p.label != panel::PANEL_LABEL).count();
+        assert_eq!(ui.rows_for_test(), running, "one row per running agent, and no more");
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            assert_eq!(ui.selected_kind(), panel::RowKind::Agent, "row {i}");
+            assert!(matches!(ui.selected_target(), panel::Target::Pane(_)), "row {i}");
+        }
+
+        // And back again. `w` is a view, not a door.
+        let (ui, _) = showing(&w, &[Key::Char('w'), Key::Char('w')]);
+        assert_eq!(ui.rows_for_test(), ui_of(&w, &panel::View::default()).rows_for_test());
+    }
+
+    /// herdr says `idle` for four of the panes in the fixture and means four
+    /// different things by it. Which one comes from the task in the agent's
+    /// hands, which is the half of the answer the store is holding.
+    #[test]
+    fn what_an_idle_agent_is_waiting_for_comes_from_what_it_holds() {
+        let w = world();
+        let (ui, _view) = showing(&w, &[Key::Char('w')]);
+        let lines: Vec<String> =
+            (0..ui.rows_for_test()).map(|i| panel::render_row_for_test(&ui, i, W).text()).collect();
+        let row = |name: &str| -> String {
+            lines.iter().find(|l| l.contains(name)).unwrap_or_else(|| panic!("no row for {name}")).clone()
+        };
+
+        // Idle, holding a task that is still doing: you are the blocker.
+        assert!(row("Verb UI").contains(panel::glyph::NEEDS_YOU));
+        // Idle, holding a task parked with a question on it — waiting on an
+        // answer that is at least written down.
+        assert!(row("waiting on the tuning").contains(panel::glyph::BLOCKED));
+        // Idle, holding nothing at all: a person's worth of attention going spare.
+        assert!(row("spare hands").contains(panel::glyph::IDLE));
+        // No state from herdr yet, and nothing here pretends otherwise.
+        assert!(row("just started").contains(panel::glyph::QUIET));
+        assert!(row("Trance Video").contains(panel::glyph::WORKING));
+
+        // What wants you is at the top, because that is what the list is read
+        // for. Sorted by state, so the first row is never a working agent.
+        assert!(lines[0].contains(panel::glyph::NEEDS_YOU), "{}", lines[0]);
+    }
+
+    /// The strip is the census, not a summary of whatever the tree is showing.
+    /// A header that went quiet under a filter is one you learn to distrust.
+    #[test]
+    fn the_header_strip_is_the_same_whatever_the_view() {
+        let w = world();
+        let marks = |ui: &panel::Ui, view: &panel::View| -> String {
+            panel::frame(ui, view, W, H)[0]
+                .text()
+                .chars()
+                .filter(|c| "←■●○·".contains(*c))
+                .collect()
+        };
+        // One mark per agent, ordered as the list is: wants you, blocked,
+        // working, spare, quiet.
+        let want = "←■●●○○·";
+
+        let (ui, view) = showing(&w, &[]);
+        assert_eq!(marks(&ui, &view), want, "at rest");
+        let (ui, view) = showing(&w, &[Key::Char('R')]);
+        assert_eq!(marks(&ui, &view), want, "under the review filter");
+        let (ui, view) = showing(&w, &[Key::Char('w')]);
+        assert_eq!(marks(&ui, &view), want, "in the agents view");
+
+        // Nobody running: the strip has nothing to say and says that instead of
+        // drawing a bare zero.
+        let (ui, view) = showing(&quiet_world(), &[]);
+        assert!(panel::frame(&ui, &view, W, H)[0].text().contains("no agents"));
+    }
+
+    /// Two switches, one state. A filter left on under a view that does not use
+    /// it is a footer saying `review only` over a list of panes.
+    #[test]
+    fn the_agents_view_and_the_review_filter_each_put_the_other_away() {
+        let w = world();
+        let foot = |ui: &panel::Ui, view: &panel::View| panel::frame(ui, view, W, H)[H - 2].text();
+
+        let (ui, view) = showing(&w, &[Key::Char('R')]);
+        assert!(foot(&ui, &view).contains("review only"));
+
+        let (ui, view) = showing(&w, &[Key::Char('R'), Key::Char('w')]);
+        let f = foot(&ui, &view);
+        assert!(f.contains("agents") && !f.contains("review only"), "{f}");
+
+        let (ui, view) = showing(&w, &[Key::Char('w'), Key::Char('R')]);
+        let f = foot(&ui, &view);
+        assert!(f.contains("review only") && !f.contains("agents"), "{f}");
+    }
+
     #[test]
     fn furniture_is_not_a_row() {
         let w = quiet_world();
@@ -924,6 +1071,14 @@ mod tests {
         }
         for y in [2usize, 3, 6, 9] {
             let Some(i) = panel::row_at(&ui, &view, W, H, y) else { continue };
+            // Whichever of these the cursor happens to be parked on is a click
+            // that activates, and this is a test about the other kind. Asked
+            // rather than assumed: which screen row the cursor lands on after
+            // fourteen presses is a fact about the fixture, and the fixture
+            // gains a pane whenever the panel gains a case worth drawing.
+            if i == ui.selected_index() {
+                continue;
+            }
             let (mut after_ui, mut after_view) = (ui.clone(), view.clone());
             assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, y), panel::Hit::Select);
             assert_eq!(

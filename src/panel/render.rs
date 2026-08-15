@@ -184,7 +184,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
             "Rows and markers that are not about a single task.",
             vec![
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "an idle agent on a task that is still doing — it has stopped and you are the blocker"),
-                mark(&[(Style::Warn, "1 "), (Style::Warn, g::NEEDS_YOU)], "how many", "the same count, in the header"),
+                mark(&[(Style::Warn, g::NEEDS_YOU), (Style::Accent, g::WORKING), (Style::Muted, g::IDLE)], "the strip", "the same question in the header, once per agent — see below"),
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Muted, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in"),
                 mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
@@ -192,6 +192,21 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
                 mark(&[(Style::Accent, "+done")], "showing done", "A is on, so finished work is included"),
+            ],
+        ),
+        (
+            "In the header, and in the agents view",
+            "herdr says working or idle and nothing more. What an idle agent is \
+             waiting for comes from the task in its hands, which is the half \
+             the store knows — so the same two states from herdr become four \
+             different answers here. One mark per agent, what wants you first.",
+            vec![
+                mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "stopped, holding work that is still live — you are the blocker"),
+                mark(&[(Style::Warn, g::BLOCKED)], "blocked", "stopped, on a task parked with a question written on it"),
+                mark(&[(Style::Accent, g::WORKING)], "working", "running"),
+                mark(&[(Style::Muted, g::IDLE)], "spare", "stopped, holding nothing — a person's worth of attention going spare"),
+                mark(&[(Style::Dim, g::QUIET)], "quiet", "herdr says neither, usually an agent that has not spoken since it started"),
+                mark(&[(Style::Dim, g::MORE), (Style::Plain, " "), (Style::Dim, "11")], "too many to draw", "the strip is clipped, never the count beside it"),
             ],
         ),
         (
@@ -334,24 +349,50 @@ pub(crate) fn row_at(ui: &Ui, view: &View, w: usize, h: usize, y: usize) -> Opti
     None
 }
 
+/// The top line: the name, then one mark per running agent.
+///
+/// A count said there were eleven agents, which is a number you can do nothing
+/// with. The strip says the same eleven and which of them have stopped, in the
+/// same glyphs and the same colours the rows use — the ones that want you are
+/// first and in warn, so the line is read left to right and the answer is at
+/// the near end. It is drawn from the whole census whatever the tree is
+/// filtered to: a header that went quiet under `R` would be a header you learn
+/// to distrust.
+///
+/// The total stays on the right, because a narrow pane truncates the strip and
+/// a truncated strip must not be the only thing saying how many there are.
+pub(super) fn header(ui: &Ui, w: usize) -> Line {
+    let mut l = Line::default();
+    l.push(Style::Bold, "wsp");
+    l.push(Style::Plain, " ");
+    if ui.census.is_empty() {
+        l.push(Style::Dim, "· no agents");
+        return l;
+    }
+
+    let right = line(Style::Dim, ui.census.len().to_string());
+    // One column of gap either side of the strip, and the total's own width.
+    let room = w.saturating_sub(l.width() + right.width() + 1);
+    let (shown, clipped) =
+        if ui.census.len() > room { (room.saturating_sub(1), true) } else { (ui.census.len(), false) };
+    for state in ui.census.iter().take(shown) {
+        let (st, mark) = state.mark();
+        l.push(st, mark);
+    }
+    if clipped {
+        l.push(Style::Dim, glyph::MORE);
+    }
+    l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+    l.spans.extend(right.spans);
+    l
+}
+
 /// this into something you can look at.
 pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     let mode = &view.mode;
     let mut lines: Vec<Line> = Vec::new();
 
-    let mut head = Line::default();
-    head.push(Style::Bold, "wsp");
-    head.push(Style::Plain, " ");
-    head.push(Style::Dim, "·");
-    head.push(Style::Plain, format!(" {} ", ui.agents_total));
-    head.push(Style::Dim, "agents ·");
-    head.push(Style::Plain, " ");
-    if ui.needs > 0 {
-        head.push(Style::Warn, format!("{} {}", ui.needs, glyph::NEEDS_YOU));
-    } else {
-        head.push(Style::Dim, "·");
-    }
-    lines.push(head);
+    lines.push(header(ui, w));
     lines.push(line(Style::Dim, "─".repeat(w)));
 
     let footer_rows = 3;
@@ -381,6 +422,11 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
         lines.push(Line::default());
         lines.push(line(Style::Dim, "  nothing waiting on you"));
         lines.push(line(Style::Dim, "  R for the whole tree"));
+    }
+    if tree_len == 0 && ui.agents {
+        lines.push(Line::default());
+        lines.push(line(Style::Dim, "  nobody is running"));
+        lines.push(line(Style::Dim, "  w for the work"));
     }
 
     let scroll = g.scroll;
@@ -431,6 +477,13 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     if ui.review_only {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "review only");
+    }
+    // Same reason as the filter: the agents view answers a different question
+    // from the one the panel is normally asking, and a panel you have stopped
+    // reading is one that has to say when it is not showing you the work.
+    if ui.agents {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Accent, "agents");
     }
     lines.push(foot);
 

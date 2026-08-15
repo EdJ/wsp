@@ -57,6 +57,75 @@ pub(crate) struct AgentRef {
     pub(super) project: Option<String>,
 }
 
+/// What an agent is waiting for, as far as anything here can tell.
+///
+/// herdr reports two states, working and idle, and `idle` is an answer to a
+/// question nobody asked: an agent that has stopped is waiting for *something*,
+/// and which something decides whether you have to get up. The store holds the
+/// other half of it. A pane still holding a task that is `doing` has stopped
+/// part-way through and is waiting on you; one holding a task at `blocked` is
+/// waiting on a decision that is at least written down; one holding nothing is
+/// waiting for work. Same two states from herdr, three different answers.
+///
+/// Declaration order is the order they are drawn in and sorted by: what wants
+/// you first, what is running after it, what is spare last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AgentState {
+    /// Stopped, on a task that is still `doing`. You are what it is waiting for.
+    Asking,
+    /// Stopped, on a task it has parked with a question written on it.
+    Blocked,
+    Working,
+    /// Stopped, holding nothing. A person's worth of attention going spare.
+    Spare,
+    /// herdr says neither working nor idle, so nothing here is going to pretend
+    /// to know. Mostly a pane whose agent has not spoken since it started.
+    Quiet,
+}
+
+impl AgentState {
+    pub(super) fn mark(self) -> (Style, &'static str) {
+        match self {
+            AgentState::Asking => (Style::Warn, glyph::NEEDS_YOU),
+            AgentState::Blocked => (Style::Warn, glyph::BLOCKED),
+            AgentState::Working => (Style::Accent, glyph::WORKING),
+            AgentState::Spare => (Style::Muted, glyph::IDLE),
+            AgentState::Quiet => (Style::Dim, glyph::QUIET),
+        }
+    }
+}
+
+/// What an agent row carries when it is standing on its own, in the agents
+/// view, rather than nested under the task or project that explains it.
+#[derive(Debug, Clone)]
+pub(super) struct Census {
+    pub(super) state: AgentState,
+    /// Where its work lives: the project of the task it holds, else the one it
+    /// is standing in or pointed at. The tree says this by where it draws the
+    /// row; a flat list has to say it in words.
+    pub(super) project: Option<String>,
+}
+
+/// Read the two halves together: what herdr says the pane is doing, and what
+/// the store says it is holding while it does it.
+pub(super) fn agent_state(herdr_state: &str, holds: Option<Status>) -> AgentState {
+    match herdr_state {
+        "working" => AgentState::Working,
+        "idle" => match holds {
+            Some(Status::Blocked) => AgentState::Blocked,
+            // A claim left on finished work is not work: the agent is free
+            // whatever the binding still says.
+            Some(Status::Done) | None => AgentState::Spare,
+            // Everything else is a task in its hands with the hands stopped —
+            // `doing` most of the time, `todo` for the moment between a claim
+            // landing and the agent starting, `review` when it has handed the
+            // work back and is standing there waiting to be told what next.
+            Some(_) => AgentState::Asking,
+        },
+        _ => AgentState::Quiet,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum Row {
     Project {
@@ -96,7 +165,12 @@ pub(super) enum Row {
     /// A group that is not a project: the inbox, loose agents. `key` names it
     /// so it can be folded and so a command can be aimed at it.
     Section { key: String, label: String, count: usize, collapsed: bool },
-    Agent { agent: AgentRef, title: String, depth: usize },
+    /// `census` is set only in the agents view, where the row stands on its
+    /// own: there it has to say what the pane is waiting for and where it
+    /// belongs, because there is no branch above it doing either. In the tree
+    /// it is `None` and the row draws as it always has, under the thing that
+    /// explains it.
+    Agent { agent: AgentRef, title: String, depth: usize, census: Option<Census> },
 }
 
 impl Row {
@@ -134,8 +208,11 @@ pub(crate) struct Ui {
     pub(super) rows: Vec<Row>,
     /// How many of the trailing rows are the unassigned dock rather than tree.
     pub(super) dock: usize,
-    pub(super) agents_total: usize,
-    pub(super) needs: usize,
+    /// One entry per running agent, sorted, for the strip in the header. Every
+    /// agent on the machine is in here whichever view is up — the strip is the
+    /// census, and a census that only counted what the tree happened to be
+    /// showing would go quiet exactly when a filter was on.
+    pub(super) census: Vec<AgentState>,
     pub(super) blocked: usize,
     /// Tasks an agent has finished with and handed back. `review` is where an
     /// agent's work ends; only a person says `done`, so this is a count of
@@ -146,6 +223,8 @@ pub(crate) struct Ui {
     pub(super) self_focused: bool,
     pub(super) show_done: bool,
     pub(super) review_only: bool,
+    /// The agents are in place of the tree.
+    pub(super) agents: bool,
     /// project id -> its first root, for opening a workspace where the work is.
     pub(super) roots: std::collections::BTreeMap<String, String>,
 }
@@ -195,6 +274,13 @@ impl Ui {
     #[cfg(test)]
     pub(crate) fn select_for_test(&mut self, i: usize) {
         self.sel = i;
+    }
+
+    /// How many rows there are, for a test that has to speak for all of them
+    /// rather than for the one under the cursor.
+    #[cfg(test)]
+    pub(crate) fn rows_for_test(&self) -> usize {
+        self.rows.len()
     }
 
     pub(crate) fn selected_target(&self) -> Target {
@@ -354,7 +440,6 @@ pub(super) fn task_rows(
     view: &View,
     agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
     rows: &mut Vec<Row>,
-    needs: &mut usize,
 ) {
     let mut mine: Vec<Task> = tasks
         .iter()
@@ -395,9 +480,6 @@ pub(super) fn task_rows(
         let a = agent_for_task(&t.id);
         let needs_you =
             a.as_ref().map(|a| a.state == "idle").unwrap_or(false) && t.status() == Status::Doing;
-        if needs_you {
-            *needs += 1;
-        }
         rows.push(Row::Task {
             id: t.id.clone(),
             project: t.project.clone(),
@@ -422,6 +504,7 @@ pub(super) fn task_rows(
                 title: a.where_.clone(),
                 agent: a.clone(),
                 depth: depth + sub + 1,
+                census: None,
             });
         }
     }
@@ -533,6 +616,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // that has none. They go in a dock at the foot instead, where they cannot
     // scroll out of sight.
     let mut unassigned: Vec<AgentRef> = Vec::new();
+    // Every running agent, with what it is waiting for and where its work is.
+    // Gathered in this same pass because resolving a pane's project is the
+    // expensive half of this function and it runs four times a second — and
+    // because the two answers must not be worked out twice and disagree.
+    let mut census: Vec<(Census, AgentRef)> = Vec::new();
 
     for a in panes.iter() {
         let bound = bound_task_of_pane(&a.pane_id);
@@ -555,6 +643,24 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         let direction = crate::cmd_mandate::from_map(&snap.mandates, &a.workspace_id)
             .filter(|p| index.get(p).is_some())
             .or_else(|| r.project.clone());
+        // Shells are not in the census. A pane with nobody in it is a fact
+        // about a place, and the agents view is a list of people.
+        if !a.agent.is_empty() {
+            let holds = bound
+                .as_ref()
+                .and_then(|id| tasks.iter().find(|t| &t.id == id))
+                .map(|t| t.status());
+            census.push((
+                Census {
+                    state: agent_state(&a.agent_status, holds),
+                    // Where it stands, before where it is aimed: a pane holding
+                    // a task is placed by that task's project, and only one
+                    // with no work of its own is described by its direction.
+                    project: r.project.clone().or_else(|| direction.clone()),
+                },
+                as_ref(a, direction.clone()),
+            ));
+        }
         match &r.project {
             Some(p) => {
                 for id in std::iter::once(p.clone()).chain(index.ancestors(p)) {
@@ -604,7 +710,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     };
 
     let mut rows: Vec<Row> = Vec::new();
-    let mut needs = 0;
 
     // Unparented tasks, first. They are the only work with nowhere to belong,
     // so they are what you triage before reading anything that already has a
@@ -628,7 +733,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             collapsed: folded,
         });
         if !folded {
-            task_rows(&tasks, None, 1, view, &agent_for_task, &mut rows, &mut needs);
+            task_rows(&tasks, None, 1, view, &agent_for_task, &mut rows);
         }
     }
 
@@ -645,7 +750,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         loose: &std::collections::BTreeMap<String, Vec<AgentRef>>,
         interesting: &dyn Fn(&str) -> bool,
         agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
-        needs: &mut usize,
     ) {
         for p in index.children(parent) {
             if !interesting(&p.id) {
@@ -678,11 +782,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             }
 
             // This project's own tasks, attention first.
-            task_rows(tasks, Some(&p.id), depth + 1, view, agent_for_task, rows, needs);
+            task_rows(tasks, Some(&p.id), depth + 1, view, agent_for_task, rows);
 
             walk(
                 index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, loose, interesting,
-                agent_for_task, needs,
+                agent_for_task,
             );
 
             // Then the panes that resolve here but are working on nothing
@@ -704,6 +808,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                         title: a.where_.clone(),
                         agent: a.clone(),
                         depth: depth + 1,
+                        census: None,
                     });
                 }
                 if ps.len() > shown {
@@ -725,7 +830,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         &loose_by_project,
         &interesting,
         &agent_for_task,
-        &mut needs,
     );
 
     // Panes belonging to no project. Some are there because nothing resolved;
@@ -745,7 +849,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         if !folded {
             for a in homeless {
                 let title = a.where_.clone();
-                rows.push(Row::Agent { agent: a, title, depth: 1 });
+                rows.push(Row::Agent { agent: a, title, depth: 1, census: None });
             }
         }
     }
@@ -769,17 +873,40 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             let n = unassigned.len();
             for a in unassigned {
                 let title = a.where_.clone();
-                rows.push(Row::Agent { agent: a, title, depth: 1 });
+                rows.push(Row::Agent { agent: a, title, depth: 1, census: None });
             }
             n + 1
         }
     };
 
+    census.sort_by(|(a, ar), (b, br)| a.state.cmp(&b.state).then(ar.where_.cmp(&br.where_)));
+
+    // The agents in place of the tree. Built after it rather than instead of
+    // it: every count in the header and the footer is a fact about the work,
+    // and a view that swapped those out for facts about the panes would go
+    // quiet on the blocked task you turned it on to chase down.
+    let (rows, dock) = if view.agents {
+        let list = census
+            .iter()
+            .map(|(c, a)| Row::Agent {
+                title: a.where_.clone(),
+                agent: a.clone(),
+                depth: 0,
+                census: Some(c.clone()),
+            })
+            .collect();
+        // No dock: an agent with no work is a row in this list like any other,
+        // and pinning some of them to the foot would sort the list twice.
+        (list, 0)
+    } else {
+        (rows, dock)
+    };
+
     Ui {
         rows,
         dock,
-        agents_total: panes.iter().filter(|p| !p.agent.is_empty()).count(),
-        needs,
+        census: census.into_iter().map(|(c, _)| c.state).collect(),
+        agents: view.agents,
         blocked: tasks.iter().filter(|t| t.status() == Status::Blocked).count(),
         review: tasks.iter().filter(|t| t.status() == Status::Review).count(),
         sel: 0,
@@ -933,13 +1060,40 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Agent { agent, title, depth } => {
+        Row::Agent { agent, title, depth, census } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
             }
             l.pad(*depth);
             l.push(Style::Plain, " ");
+            // Standing on its own, in the agents view: the glyph says what it
+            // is waiting for rather than only whether it is running, and the
+            // project it belongs to goes on the right — in the tree that is
+            // said by which branch the row is drawn under, and here there is
+            // no branch to say it.
+            if let Some(c) = census {
+                let (st, dot) = c.state.mark();
+                l.push(st, dot);
+                l.push(Style::Plain, " ");
+                let mut right = Line::default();
+                if let Some(p) = &c.project {
+                    right.push(Style::Dim, util::truncate(p, 12));
+                }
+                let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
+                let avail = w.saturating_sub(*depth + 4 + count_w).max(4);
+                let ink = match c.state {
+                    AgentState::Asking | AgentState::Blocked => Style::Warn,
+                    AgentState::Working => Style::Accent,
+                    _ => Style::Muted,
+                };
+                l.push(ink, util::truncate(title, avail));
+                if !right.spans.is_empty() {
+                    l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+                    l.spans.extend(right.spans);
+                }
+                return l;
+            }
             if agent.agent {
                 let (st, dot) = state_dot(&agent.state);
                 l.push(st, dot);
