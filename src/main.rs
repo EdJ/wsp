@@ -233,9 +233,12 @@ fn main() {
         "view" => detail::run(&store, &args),
         "say" => cmd_agent::say(&store, &args),
         "reconcile" => {
-            let r = cmd_agent::reconcile(&store);
+            let r = cmd_agent::reconcile(&store, args.has("reap"));
             println!("reconciled {} binding(s) from claims", r.bound);
             println!("named {} pane(s) after the task they hold", r.named);
+            if args.has("reap") {
+                println!("ended {} claim(s) whose workspace is gone", r.reaped);
+            }
             0
         }
         "daemon" => daemon::run(&store, args.has("verbose")),
@@ -310,7 +313,8 @@ fn help() {
   wsp hook <event>                  herdr event-hook entrypoint
   wsp doctor                        integrity check
   wsp say "…" [--clear]             say where you have got to, on your pane
-  wsp reconcile                     rebuild bindings from claims, and rename
+  wsp reconcile [--reap]            rebuild bindings from claims, and rename;
+                                    --reap ends claims whose workspace is gone
   wsp adopt [--yes]                 turn live workspaces into tasks
 
 Ids accept a bare suffix (003) or a unique title substring.

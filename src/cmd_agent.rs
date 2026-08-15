@@ -681,10 +681,20 @@ pub struct Reconciled {
     pub bound: usize,
     /// Workspaces and panes given the name of the task they hold.
     pub named: usize,
+    /// Claims dropped because the workspace holding them is gone.
+    pub reaped: usize,
 }
 
 /// Returns what it put right.
-pub fn reconcile(store: &Store) -> Reconciled {
+///
+/// `reap` additionally ends every claim whose workspace herdr no longer knows —
+/// the other half of retiring a set of workspaces, because a claim naming one
+/// that has been closed goes on saying work is being done in it, and herdr
+/// hands ids out again. Asked for rather than automatic: a claim outliving its
+/// *pane* is an accident of process lifetime and must stand, and a daemon
+/// starting before herdr has finished restoring a session would otherwise read
+/// a half-built world as a mass closure.
+pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
     let mut out = Reconciled::default();
     let claims = store.claims();
     if claims.is_empty() {
@@ -693,6 +703,27 @@ pub fn reconcile(store: &Store) -> Reconciled {
     let Ok(panes) = herdr::panes() else { return out };
     let workspaces = herdr::workspaces().unwrap_or_default();
     let host = util::hostname();
+
+    // Nothing at all is a herdr that is not answering properly, not a machine
+    // with no workspaces on it: there is one open to have asked from.
+    if reap && !workspaces.is_empty() {
+        for (task_id, c) in &claims {
+            let get = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            if !get("host").is_empty() && get("host") != host {
+                continue;
+            }
+            let alive = workspaces.iter().any(|w| {
+                w.id == get("workspace_id")
+                    || (!get("workspace_label").is_empty() && w.label == get("workspace_label"))
+            });
+            if alive {
+                continue;
+            }
+            hand_off(store, task_id, None, "workspace closed");
+            out.reaped += 1;
+        }
+    }
+    let claims = if out.reaped > 0 { store.claims() } else { claims };
 
     let bindings = store.bindings();
     let already: Vec<String> = bindings

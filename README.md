@@ -1223,7 +1223,13 @@ fast builds are a feature here, because a session-start hook runs this binary.
   the most perishable thing herdr has. A claim names the workspace — id, label
   and cwd, all of which herdr persists — and is cleared only by `release`. A
   pane exiting leaves the claim standing, and `wsp reconcile` rebuilds the
-  bindings from claims against whatever is currently open. The daemon does it
+  bindings from claims against whatever is currently open. A *workspace* being
+  closed is a decision rather than an accident, and `wsp reconcile --reap` is
+  what ends the claims it leaves behind — asked for, never automatic, because a
+  daemon starting while herdr is still restoring a session would read a
+  half-built world as a mass closure. Herdr hands workspace ids out again, so a
+  claim naming a closed one is not merely stale: it is waiting to attach itself
+  to whatever takes the id next. The daemon does it
   before its first sync, which is when herdr has just restored everything under
   new pane ids. One pane takes one claim there too: two claims naming the same
   workspace used to land on the same pane, and since claims are walked in id

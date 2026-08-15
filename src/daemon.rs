@@ -62,7 +62,9 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // Before the first sync: herdr has just come back with its workspaces and
     // agent sessions restored, but pane ids are new and no binding survived.
     // Claims did, so rebuild from those.
-    let r = crate::cmd_agent::reconcile(store);
+    // Never reaping: a session being restored is a world that is briefly
+    // missing workspaces, and this runs at exactly that moment.
+    let r = crate::cmd_agent::reconcile(store, false);
     let live: Vec<String> = store.tasks().into_iter().map(|t| t.id).collect();
     let dropped = store.reap_claims(&live) + store.reap_worked(&live);
     if verbose && (r.bound > 0 || r.named > 0 || dropped > 0) {
