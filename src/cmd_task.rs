@@ -511,29 +511,173 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// `mv` reassigns a task's project, its place in the sub-task tree, or both.
+///
+/// The one rule the whole command exists to keep is the one `add --parent`
+/// already keeps: a sub-task lives where its parent lives. Re-parenting is the
+/// obvious back door around it, so here the project *follows* the parent —
+/// naming a different one is refused, exactly as it is on `add` — and the move
+/// carries the sub-tree, because otherwise the invariant survives at the task
+/// that moved and breaks one level below it.
 pub fn mv(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
-    let target = match args.get("project") {
-        Some(p) if p == "none" || p == "inbox" => None,
+    let tasks = store.tasks();
+
+    if !args.has("project") && !args.has("parent") {
+        eprintln!("usage: wsp mv <id> -p <project> | --parent <id> | --parent none");
+        return 2;
+    }
+
+    // Resolve the task before anything is written: the sub-tree carry below
+    // touches several files, and none of them should be touched at all if the
+    // id the user typed does not name a task.
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp mv <id> -p <project> | --parent <id> | --parent none");
+        return 2;
+    };
+    let Some(subject) = store.find_task(&needle) else {
+        eprintln!("wsp: no task matching `{needle}`");
+        return 1;
+    };
+
+    // `--parent` unset, `--parent none` and `--parent <id>` are three different
+    // instructions, so the absent case has to stay distinguishable from the
+    // detaching one.
+    let new_parent: Option<Option<Task>> = match args.get("parent") {
+        None => None,
+        Some(p) if p == "none" || p == "root" || p == "top" => Some(None),
+        Some(needle) => match store.find_task(&needle) {
+            Some(p) => Some(Some(p)),
+            None => {
+                eprintln!("wsp: no such parent task `{needle}`");
+                return 1;
+            }
+        },
+    };
+
+    // A cycle resolves at every step, so nothing downstream notices one: the
+    // tree hangs a row beneath itself and `nest` draws the loop flat for ever.
+    // `add` cannot reach this because a task being created has no children;
+    // re-parenting is the only verb that can, which makes the check this
+    // command's own to make.
+    if let Some(Some(p)) = &new_parent {
+        if p.id == subject.id {
+            eprintln!("wsp: {} cannot be its own parent", subject.id);
+            return 1;
+        }
+        if crate::resolve::descendants_of(&tasks, &subject.id).contains(&p.id) {
+            eprintln!("wsp: {} is beneath {} — that would make a cycle", p.id, subject.id);
+            return 1;
+        }
+    }
+
+    let named_project = match args.get("project") {
+        Some(p) if p == "none" || p == "inbox" => Some(None),
         Some(p) => match index.find(&p) {
-            Some(found) => Some(found.id.clone()),
+            Some(found) => Some(Some(found.id.clone())),
             None => {
                 eprintln!("wsp: no such project `{p}`");
                 return 1;
             }
         },
-        None => {
-            eprintln!("usage: wsp mv <id> -p <project>");
-            return 2;
-        }
+        None => None,
     };
-    mutate(store, args, "moved", |t| {
+
+    // Where the task lands. A parent decides it; `-p` may only agree.
+    let target: Option<String> = match (&new_parent, &named_project) {
+        (Some(Some(p)), Some(named)) => {
+            if &p.project != named {
+                eprintln!(
+                    "wsp: parent {} is in {}, not {}",
+                    p.id,
+                    p.project.clone().unwrap_or_else(|| "the inbox".into()),
+                    named.clone().unwrap_or_else(|| "the inbox".into())
+                );
+                return 1;
+            }
+            p.project.clone()
+        }
+        (Some(Some(p)), None) => p.project.clone(),
+        (_, Some(named)) => named.clone(),
+        (_, None) => subject.project.clone(),
+    };
+
+    // Moving a task out from under a parent it is still attached to is the same
+    // violation seen from the other side. Refuse it, and name the way out
+    // rather than leaving the user to guess that `--parent none` exists.
+    if new_parent.is_none() {
+        if let Some(pid) = &subject.parent {
+            if let Some(p) = tasks.iter().find(|t| &t.id == pid) {
+                if p.project != target {
+                    eprintln!(
+                        "wsp: {} sits under {} in {} — move the parent, or detach it with `--parent none`",
+                        subject.id,
+                        p.id,
+                        p.project.clone().unwrap_or_else(|| "the inbox".into())
+                    );
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // The sub-tree comes too. These land before `mutate` writes the task
+    // itself, so the single commit it makes on its way out holds the whole
+    // move — a sub-tree left in the old project by a half-applied move is
+    // exactly the state the invariant exists to prevent.
+    let mut carried = 0usize;
+    if target != subject.project {
+        for id in crate::resolve::descendants_of(&tasks, &subject.id) {
+            let Some(mut kid) = tasks.iter().find(|t| t.id == id).cloned() else { continue };
+            if kid.project == target {
+                continue;
+            }
+            kid.project = target.clone();
+            if kid.project.is_some() && kid.status() == Status::Inbox {
+                kid.set_status(Status::Todo);
+            }
+            kid.log(&format!(
+                "carried to {} with {}",
+                target.clone().unwrap_or_else(|| "the inbox".into()),
+                subject.id
+            ));
+            kid.touch();
+            if let Err(e) = store.save_task(&kid) {
+                eprintln!("wsp: write failed for {}: {e}", kid.id);
+                return 1;
+            }
+            carried += 1;
+        }
+    }
+
+    let verb = if new_parent.is_some() { "re-parented" } else { "moved" };
+    mutate(store, args, verb, |t| {
+        let was_project = t.project.clone();
         t.project = target.clone();
+        if let Some(p) = &new_parent {
+            t.parent = p.as_ref().map(|p| p.id.clone());
+        }
         if t.project.is_some() && t.status() == Status::Inbox {
             t.set_status(Status::Todo);
         }
-        t.log(&format!("moved to {}", target.clone().unwrap_or_else(|| "inbox".into())));
+        match &new_parent {
+            Some(Some(p)) => t.log(&format!("moved under {} in {}", p.id, label(&target))),
+            Some(None) => t.log(&format!("detached to the top level of {}", label(&target))),
+            None => t.log(&format!("moved to {}", label(&target))),
+        }
+        if carried > 0 {
+            t.log(&format!(
+                "{carried} sub-task{} carried from {}",
+                if carried == 1 { "" } else { "s" },
+                label(&was_project)
+            ));
+        }
     })
+}
+
+/// A project id, or the name we give the absence of one in prose.
+fn label(project: &Option<String>) -> String {
+    project.clone().unwrap_or_else(|| "the inbox".into())
 }
 
 pub fn tag(store: &Store, args: &Args) -> i32 {

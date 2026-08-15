@@ -597,6 +597,8 @@ task being finished.
 
 ```sh
 wsp add "Wire the daemon to the socket" --parent 005
+wsp mv 007 --parent 005      # …or file it under 005 after the fact
+wsp mv 007 --parent none     # back out to the top level
 wsp done 005                 # refused while anything under it is open
 wsp done 005 --force         # …unless you say so
 ```
@@ -623,9 +625,46 @@ The rules are the few that keep the tree honest:
   is allocated, because id allocation reserves the file first — so `--parent
   004` used to be able to match the very task being created. `doctor` reports
   cycles as well as a missing parent, since a loop resolves at every step.
+- **A task cannot be moved beneath its own descendant.** `add` cannot reach
+  this, because a task being created has no children yet; `mv --parent` is the
+  only verb that can, so the check is its own to make. The refusal names both
+  ids. A cycle is worth refusing rather than reporting because it resolves at
+  every step: nothing downstream notices, `nest` draws the loop flat, and the
+  tree quietly hangs a row beneath itself.
 - **Filtering never drops a child.** A task whose parent is not in the list is
   drawn at the top level rather than hidden; a row indented under nothing is
   just a row that looks broken.
+
+Re-parenting arrived after sub-tasks did, which is why the tree was fixed at
+creation for a while: the only way to regroup a backlog was to file the pieces
+again under new ids, or to reach into `~/wsp` and edit the frontmatter — the one
+thing the standing rules tell an agent not to do.
+
+`mv` is where it landed, because "which project is this in" and "what is this
+under" are the same question asked at two scales, and answering them with two
+verbs is how they drift apart. The command keeps the first rule above by making
+the project *follow* the parent:
+
+```sh
+wsp mv 007 --parent 005      # 007 lands in 005's project, whatever it was
+wsp mv 007 --parent 005 -p x # refused unless x is already 005's project
+wsp mv 007 -p x              # refused while 007 sits under a parent elsewhere
+```
+
+The last of those names `--parent none` in its refusal, because detaching is
+usually what was meant, and a rule that does not say what to do instead is just
+a wall.
+
+**The move carries the sub-tree.** Re-parenting a task across projects takes
+everything beneath it along, and each carried task says so in its own log. This
+is the part that is easy to leave out and hard to notice missing: without it the
+invariant survives exactly at the task that moved and breaks one level below it,
+where nothing is looking. The carried writes land before the move itself, so the
+single commit `mv` makes holds the whole thing — a sub-tree stranded in the old
+project by a half-applied move is precisely the state the rule exists to
+prevent. `counts_under` and the carry walk the tree through one shared function
+for the same reason `tally` is shared: two walks are two chances to disagree
+about what "beneath" means.
 
 ## Standing direction
 
@@ -752,7 +791,7 @@ Every command takes `--json`.
 | `src/store.rs` | atomic writes, `O_EXCL` id allocation, git, state, hooks |
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, status/priority vocabulary |
-| `src/resolve.rs` | project resolution, tag inheritance, count rollup |
+| `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh |

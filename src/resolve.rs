@@ -193,23 +193,38 @@ pub fn children_of<'a>(tasks: &'a [Task], id: &str) -> Vec<&'a Task> {
     kids
 }
 
-/// Everything beneath a task, counted through the whole sub-tree.
+/// Every task beneath one, through the whole sub-tree. Excludes the task
+/// itself.
 ///
 /// Cycle-safe: `parent` is a plain string field and the store is edited by
 /// several agents at once, so a loop is a thing that can exist on disk. It is
 /// `doctor`'s job to report one, and nobody else's job to hang on it.
-pub fn counts_under(tasks: &[Task], id: &str) -> Counts {
-    let mut total = Counts::default();
-    let mut seen: Vec<&str> = vec![id];
-    let mut queue: Vec<&str> = vec![id];
+pub fn descendants_of(tasks: &[Task], id: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = vec![id.to_string()];
+    let mut queue: Vec<String> = vec![id.to_string()];
     while let Some(cur) = queue.pop() {
-        for kid in children_of(tasks, cur) {
-            if seen.contains(&kid.id.as_str()) {
+        for kid in children_of(tasks, &cur) {
+            if seen.contains(&kid.id) {
                 continue;
             }
-            seen.push(&kid.id);
-            queue.push(&kid.id);
-            tally(&mut total, kid);
+            seen.push(kid.id.clone());
+            queue.push(kid.id.clone());
+            out.push(kid.id.clone());
+        }
+    }
+    out
+}
+
+/// Everything beneath a task, counted through the whole sub-tree.
+///
+/// Walks by way of `descendants_of` so that what `done` refuses over and what
+/// re-parenting carries can never disagree about what "beneath" means.
+pub fn counts_under(tasks: &[Task], id: &str) -> Counts {
+    let mut total = Counts::default();
+    for kid in descendants_of(tasks, id) {
+        if let Some(t) = tasks.iter().find(|t| t.id == kid) {
+            tally(&mut total, t);
         }
     }
     total

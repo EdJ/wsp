@@ -271,7 +271,8 @@ fn help() {
   wsp note <id> "text"              append to the log
   wsp edit <id> [--overview|--details]   prose, in $EDITOR
   wsp edit <id> --overview --from F|-    …or from a file, or stdin
-  wsp mv <id> -p proj               reassign
+  wsp mv <id> -p proj               reassign, sub-tree and all
+  wsp mv <id> --parent <id>|none    re-parent it, or detach it
   wsp tag <id> +dsp -ui             adjust tags
   wsp next [-p proj]                highest-priority actionable task
   wsp archive [--all]               sweep done tasks older than 30d
