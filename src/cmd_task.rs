@@ -241,6 +241,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     if args.json() {
         let mut v = t.json();
         v["body"] = json!(t.body);
+        // Who has it and who had it. An agent reading this back is usually
+        // asking exactly that, and the alternative is reading two state files
+        // it has no business knowing the names of.
+        v["claim"] = store.claims().get(&t.id).cloned().unwrap_or(json!(null));
+        v["worked"] = store.worked().get(&t.id).cloned().unwrap_or(json!(null));
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }
@@ -267,6 +272,31 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         if b.get("task_id").and_then(|x| x.as_str()) == Some(t.id.as_str()) {
             println!("{} {}", p.dim(&util::pad("agent", 9)), pane);
         }
+    }
+    if let Some(c) = store.claims().get(&t.id) {
+        let get = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let held = util::since(get("claimed_at"));
+        println!(
+            "{} {}{}",
+            p.dim(&util::pad("claimed", 9)),
+            get("workspace_label"),
+            if held > 0 { format!(" · {}", util::duration_human(held)) } else { String::new() }
+        );
+    } else if let Some(w) = store.worked().get(&t.id) {
+        // The last agent on it, once there is no current one — the trace a
+        // migration leaves, so a task never loses every sign it was worked.
+        let get = |k: &str| w.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let spent = w.get("seconds").and_then(|x| x.as_i64()).unwrap_or(0);
+        println!(
+            "{} {} · {}{}",
+            p.dim(&util::pad("worked", 9)),
+            get("workspace_label"),
+            util::duration_human(spent),
+            match get("handed_to") {
+                "" => format!(" · {}", get("reason")),
+                next => format!(" · to {next}"),
+            }
+        );
     }
     if !t.body.trim().is_empty() {
         println!("\n{}", t.body.trim());
@@ -322,27 +352,29 @@ pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
 }
 
 pub fn done(store: &Store, args: &Args) -> i32 {
-    let code = mutate(store, args, "done", |t| {
+    // Let go of the work before finishing it: the log then reads in the order
+    // it happened — the claim ended, then the task did — and the whole thing
+    // lands in the one commit `mutate` makes on its way out.
+    //
+    // The claim, not just the binding. A finished task that keeps its claim
+    // holds a workspace nothing will ever release: `adopt` goes on skipping it,
+    // and after a restart `reconcile` binds an agent back to work that is over.
+    if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
+        let panes: Vec<String> = store
+            .bindings()
+            .iter()
+            .filter(|(_, b)| b.get("task_id").and_then(|x| x.as_str()) == Some(t.id.as_str()))
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        for pane in panes {
+            store.clear_binding(&pane);
+        }
+        crate::cmd_agent::hand_off(store, &t.id, None, "done");
+    }
+    mutate(store, args, "done", |t| {
         t.set_status(Status::Done);
         t.log("→ done");
-    });
-    if code == 0 {
-        // Free any pane still holding it.
-        if let Some(needle) = args.rest.first() {
-            if let Some(t) = store.find_task(needle) {
-                let panes: Vec<String> = store
-                    .bindings()
-                    .iter()
-                    .filter(|(_, b)| b.get("task_id").and_then(|x| x.as_str()) == Some(t.id.as_str()))
-                    .map(|(pane, _)| pane.clone())
-                    .collect();
-                for pane in panes {
-                    store.clear_binding(&pane);
-                }
-            }
-        }
-    }
-    code
+    })
 }
 
 pub fn block(store: &Store, args: &Args) -> i32 {

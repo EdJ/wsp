@@ -359,18 +359,24 @@ pub(crate) enum Target {
     Nothing,
 }
 
+/// What a row stands for, in the store's own terms. Pulled out of
+/// `selected_target` because the cursor is kept on a row's identity across a
+/// refetch, which means asking this of rows other than the selected one.
+fn target_of(row: &Row) -> Target {
+    match row {
+        Row::Project { id, .. } => Target::Project(id.clone()),
+        Row::Task { id, .. } => Target::Task(id.clone()),
+        Row::More { key, .. } => Target::Overflow(key.clone()),
+        Row::Agent { agent, .. } => Target::Pane(agent.pane.clone()),
+        Row::Section { key, .. } if key == NOPROJECT_KEY => Target::Unattached,
+        Row::Section { key, .. } if key == INBOX_KEY => Target::Inbox,
+        Row::Section { .. } => Target::Nothing,
+    }
+}
+
 impl Ui {
     pub(crate) fn selected_target(&self) -> Target {
-        match self.rows.get(self.sel) {
-            Some(Row::Project { id, .. }) => Target::Project(id.clone()),
-            Some(Row::Task { id, .. }) => Target::Task(id.clone()),
-            Some(Row::More { key, .. }) => Target::Overflow(key.clone()),
-            Some(Row::Agent { agent, .. }) => Target::Pane(agent.pane.clone()),
-            Some(Row::Section { key, .. }) if key == NOPROJECT_KEY => Target::Unattached,
-            Some(Row::Section { key, .. }) if key == INBOX_KEY => Target::Inbox,
-            Some(Row::Section { .. }) => Target::Nothing,
-            None => Target::Nothing,
-        }
+        self.rows.get(self.sel).map(target_of).unwrap_or(Target::Nothing)
     }
 
     pub(crate) fn selected_kind(&self) -> RowKind {
@@ -1969,14 +1975,22 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
     };
 
     match k {
-        Key::Char('q') | Key::Interrupt => Effect::Quit,
-        // Esc is the universal "put that away", and the map is what is in front
-        // of you: it goes first, the detail pane once it is gone.
-        Key::Esc if view.help => {
+        // `q` and Esc both mean "put away what is in front of me", and the
+        // panel itself is never that. It is installed furniture in every
+        // workspace, so quitting it by a stray keystroke costs a reinstall and
+        // buys nothing — `ctrl-c` still does it, and `wsp panel uninstall` is
+        // the deliberate way. The map goes first, then the detail pane.
+        Key::Char('q') | Key::Esc if view.help => {
             view.help = false;
             Effect::None
         }
+        Key::Char('q') | Key::Esc if view.showing.is_some() => Effect::CloseView,
+        Key::Char('q') => {
+            say(ui, "nothing to close · ctrl-c quits the panel");
+            Effect::None
+        }
         Key::Esc => Effect::CloseView,
+        Key::Interrupt => Effect::Quit,
 
         Key::Down | Key::Char('j') => move_or_fold(Key::Down, ui, view),
         Key::Up | Key::Char('k') => move_or_fold(Key::Up, ui, view),

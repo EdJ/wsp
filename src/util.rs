@@ -56,6 +56,17 @@ pub fn today_stamp() -> String {
     format!("{:02}{:02}{:02}", y % 100, m, d)
 }
 
+/// The inverse of `civil_from_days`: (year, month, day) -> days since epoch.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Days between an ISO date (or timestamp) and today. Returns 0 on parse failure.
 pub fn age_days(iso: &str) -> i64 {
     if iso.len() < 10 {
@@ -64,15 +75,45 @@ pub fn age_days(iso: &str) -> i64 {
     let y: i64 = iso[0..4].parse().unwrap_or(0);
     let m: i64 = iso[5..7].parse().unwrap_or(1);
     let d: i64 = iso[8..10].parse().unwrap_or(1);
-    // days_from_civil
-    let yy = if m <= 2 { y - 1 } else { y };
-    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
-    let yoe = yy - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let then = era * 146_097 + doe - 719_468;
-    epoch_secs().div_euclid(86_400) - then
+    epoch_secs().div_euclid(86_400) - days_from_civil(y, m, d)
+}
+
+/// Seconds since the epoch for `2026-08-14T16:22:51Z`; a bare date is midnight.
+/// 0 when the stamp cannot be read, which every caller treats as "no time
+/// recorded" rather than 1970 — a record written before this existed has no
+/// start, and inventing one would date it to the epoch.
+pub fn epoch_of(iso: &str) -> i64 {
+    if iso.len() < 10 {
+        return 0;
+    }
+    let n = |a: usize, b: usize| -> i64 { iso.get(a..b).and_then(|s| s.parse().ok()).unwrap_or(0) };
+    let days = days_from_civil(n(0, 4), n(5, 7).max(1), n(8, 10).max(1));
+    let (hh, mm, ss) = if iso.len() >= 19 { (n(11, 13), n(14, 16), n(17, 19)) } else { (0, 0, 0) };
+    days * 86_400 + hh * 3600 + mm * 60 + ss
+}
+
+/// How long ago a stamp was, in seconds. Never negative: a stamp from the
+/// future is two clocks disagreeing, not a duration to display as one.
+pub fn since(iso: &str) -> i64 {
+    match epoch_of(iso) {
+        0 => 0,
+        then => (epoch_secs() - then).max(0),
+    }
+}
+
+/// Two units at most. This goes in a log line and a one-line field, and nobody
+/// reads `3h 12m 07s` off either.
+pub fn duration_human(secs: i64) -> String {
+    let s = secs.max(0);
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
+    match (d, h, m) {
+        (0, 0, 0) => format!("{s}s"),
+        (0, 0, m) => format!("{m}m"),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h{m}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d{h}h"),
+    }
 }
 
 /// This machine's name. Claims are machine-local — a workspace on the laptop

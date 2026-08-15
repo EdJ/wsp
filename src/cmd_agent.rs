@@ -75,6 +75,88 @@ fn pane_id(args: &Args) -> Option<String> {
     args.get("pane").or_else(|| herdr::Env::read().pane_id)
 }
 
+/// End a claim and leave the trace behind.
+///
+/// An agent works several tasks in sequence, so every way a claim can end —
+/// handed to the next task, released by hand, finished — has to answer what
+/// becomes of the one being left. It keeps its status, because `doing` with
+/// nobody on it is a true and useful state: it is the work that is underway
+/// and waiting for you. What it loses is the claim, and what it gains is the
+/// record of who had it and for how long.
+///
+/// Does nothing when there was no claim: `done` on a task nobody ever picked
+/// up must not write a line saying it was released.
+pub fn hand_off(store: &Store, task_id: &str, to: Option<&str>, reason: &str) {
+    let Some(claim) = store.claims().get(task_id).cloned() else {
+        return;
+    };
+    let get = |k: &str| claim.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let from = get("claimed_at");
+    let secs = util::since(&from);
+
+    store.set_worked(
+        task_id,
+        json!({
+            "workspace_id": get("workspace_id"),
+            "workspace_label": get("workspace_label"),
+            "cwd": get("cwd"),
+            "host": get("host"),
+            "from": from,
+            "to": util::now_iso(),
+            "seconds": secs,
+            "handed_to": to,
+            "reason": reason,
+        }),
+    );
+    store.clear_claim(task_id);
+
+    if let Some(mut t) = store.task(task_id) {
+        let spent = if secs > 0 { format!(" after {}", util::duration_human(secs)) } else { String::new() };
+        match to {
+            Some(next) => t.log(&format!("handed off to {next}{spent}")),
+            None => t.log(&format!("released{spent}")),
+        }
+        t.touch();
+        let _ = store.save_task(&t);
+    }
+    store.log_event(
+        if to.is_some() { "task-handoff" } else { "task-released" },
+        json!({ "id": task_id, "to": to, "reason": reason, "seconds": secs }),
+    );
+}
+
+/// Every task this pane, or the workspace it sits in, is about to stop working.
+///
+/// Two lists rather than one, because a claim outlives the pane that made it:
+/// after a herdr restart the binding is gone and only the claim says the
+/// workspace was on that task, so migrating there without looking would leave
+/// the old claim standing and `reconcile` would bind the agent straight back
+/// to the task it had left.
+fn leaving(store: &Store, pane: &str, workspace: &str, taking: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(prev) = store
+        .bindings()
+        .get(pane)
+        .and_then(|b| b.get("task_id"))
+        .and_then(|x| x.as_str())
+    {
+        if prev != taking {
+            out.push(prev.to_string());
+        }
+    }
+    if !workspace.is_empty() {
+        for (task, c) in store.claims() {
+            if task == taking || out.contains(&task) {
+                continue;
+            }
+            if c.get("workspace_id").and_then(|x| x.as_str()) == Some(workspace) {
+                out.push(task);
+            }
+        }
+    }
+    out
+}
+
 pub fn claim(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp claim <id>   (inside a herdr pane)");
@@ -108,6 +190,29 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         _ => std::env::current_dir().map(|c| util::contract(&c)).unwrap_or_default(),
     };
 
+    // Whatever this agent was on, it is not on it after this. The claim moves
+    // with the agent; the trace stays with the task.
+    let left = leaving(store, &pane, &workspace, &t.id);
+    for task in &left {
+        hand_off(store, task, Some(&t.id), "handoff");
+    }
+
+    // The other direction: a task taken off another agent. Two panes bound to
+    // one task is not a state anything downstream can read — the tree hangs a
+    // pane under the task it is bound to and takes the first it finds, so the
+    // second would simply not be drawn.
+    let displaced: Vec<String> = store
+        .bindings()
+        .iter()
+        .filter(|(p, b)| {
+            *p != &pane && b.get("task_id").and_then(|x| x.as_str()) == Some(t.id.as_str())
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    for other in &displaced {
+        store.clear_binding(other);
+    }
+
     store.set_binding(
         &pane,
         json!({
@@ -140,12 +245,25 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         }),
     );
 
+    // `hand_off` wrote to the tasks it released, and one of them may be this
+    // one — a re-claim of work the same agent put down. Re-read rather than
+    // saving the copy taken before all that.
+    let mut t = store.task(&t.id).unwrap_or(t);
     if t.status() != Status::Doing {
         t.set_status(Status::Doing);
     }
-    t.log(&format!("claimed by pane {pane}"));
+    for other in &displaced {
+        t.log(&format!("taken over from pane {other}"));
+    }
+    match left.first() {
+        Some(prev) => t.log(&format!("claimed by pane {pane}, taken up from {prev}")),
+        None => t.log(&format!("claimed by pane {pane}")),
+    }
     let _ = store.save_task(&t);
-    store.log_event("task-claimed", json!({ "id": t.id, "pane": pane }));
+    store.log_event(
+        "task-claimed",
+        json!({ "id": t.id, "pane": pane, "from": left, "took_over": displaced }),
+    );
     store.git_commit(&format!("wsp: claim {} — {}", t.id, t.title));
 
     // Reflect it in the sidebar immediately rather than waiting for the daemon.
@@ -153,11 +271,23 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     let _ = sync::sync(store, &mut cache, true);
 
     if args.json() {
-        println!("{}", json!({ "task": t.json(), "pane": pane }));
+        println!(
+            "{}",
+            json!({ "task": t.json(), "pane": pane, "from": left, "took_over": displaced })
+        );
     } else {
         let p = Paint::new();
         println!("{} {}  {}", p.cyan("▸"), p.bold(&t.id), t.title);
         println!("  {}", p.dim(&format!("bound to {pane}")));
+        // Naming what was put down is the whole point of a migration being one
+        // command: the agent moved, and you can see what it moved off.
+        for prev in &left {
+            let title = store.task(prev).map(|x| x.title).unwrap_or_default();
+            println!("  {}", p.dim(&format!("left {prev}  {}", util::truncate(&title, 48))));
+        }
+        for other in &displaced {
+            println!("  {}", p.dim(&format!("taken from {other}")));
+        }
     }
     0
 }
@@ -186,6 +316,12 @@ pub fn reconcile(store: &Store) -> usize {
         .values()
         .filter_map(|b| b.get("task_id").and_then(|t| t.as_str()).map(|s| s.to_string()))
         .collect();
+
+    // A pane holds one task, here as everywhere else. Two claims naming the
+    // same workspace used to pick the same pane and the second quietly
+    // overwrote the first — and claims are walked in id order, so an agent came
+    // back from a restart bound to the *older* task, the one it had left.
+    let mut taken: Vec<String> = bindings.keys().cloned().collect();
 
     let mut fixed = 0;
     for (task_id, c) in &claims {
@@ -220,7 +356,8 @@ pub fn reconcile(store: &Store) -> usize {
             .filter(|p| p.workspace_id == ws && p.label != crate::panel::PANEL_LABEL)
             .collect();
         candidates.sort_by_key(|p| u8::from(p.agent.is_empty()));
-        let Some(pane) = candidates.first() else { continue };
+        let Some(pane) = candidates.iter().find(|p| !taken.contains(&p.pane_id)) else { continue };
+        taken.push(pane.pane_id.clone());
 
         store.set_binding(
             &pane.pane_id,
@@ -254,9 +391,9 @@ pub fn release(store: &Store, args: &Args) -> i32 {
         if let Some(task_id) = had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
             // Releasing is a decision, so it clears the durable claim too —
             // unlike a pane exiting, which is only ever an accident of process
-            // lifetime and must leave the intent standing.
-            store.clear_claim(task_id);
-            store.log_event("task-released", json!({ "id": task_id, "pane": pane }));
+            // lifetime and must leave the intent standing. It ends the same way
+            // a migration does, and leaves the same record behind.
+            hand_off(store, task_id, None, "release");
         }
         let mut cache = sync::Cache::default();
         let _ = sync::sync(store, &mut cache, true);

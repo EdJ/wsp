@@ -58,9 +58,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // agent sessions restored, but pane ids are new and no binding survived.
     // Claims did, so rebuild from those.
     let rebound = crate::cmd_agent::reconcile(store);
-    let dropped = store.reap_claims(
-        &store.tasks().into_iter().map(|t| t.id).collect::<Vec<_>>(),
-    );
+    let live: Vec<String> = store.tasks().into_iter().map(|t| t.id).collect();
+    let dropped = store.reap_claims(&live) + store.reap_worked(&live);
     if verbose && (rebound > 0 || dropped > 0) {
         eprintln!("wsp daemon: reconciled {rebound} binding(s), dropped {dropped} stale claim(s)");
     }

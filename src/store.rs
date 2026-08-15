@@ -298,6 +298,47 @@ impl Store {
         dropped
     }
 
+    // ---- worked -----------------------------------------------------------
+    //
+    // What is left when a claim ends. An agent commonly works several tasks in
+    // sequence, and the task it walked away from used to lose every trace of
+    // it the moment the next claim overwrote the binding.
+    //
+    // Machine-local for the same reason claims are: it names a workspace, a
+    // cwd and a host, none of which mean anything on another machine. The half
+    // that belongs in git is the sentence in the task's own log, which `claim`,
+    // `release` and `done` all write.
+
+    /// task id -> the claim that ended, and how long it ran
+    pub fn worked(&self) -> BTreeMap<String, Value> {
+        match self.read_json("worked.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_worked(&self, task: &str, value: Value) {
+        let mut w = self.worked();
+        w.insert(task.to_string(), value);
+        self.write_json("worked.json", &Value::Object(w.into_iter().collect()));
+    }
+
+    /// One record per task, so this only grows with tasks — but a removed task
+    /// would keep its ghost for ever without this.
+    pub fn reap_worked(&self, live_tasks: &[String]) -> usize {
+        let w = self.worked();
+        let keep: BTreeMap<String, Value> = w
+            .iter()
+            .filter(|(task, _)| live_tasks.iter().any(|t| t == *task))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let dropped = w.len() - keep.len();
+        if dropped > 0 {
+            self.write_json("worked.json", &Value::Object(keep.into_iter().collect()));
+        }
+        dropped
+    }
+
     pub fn reap_bindings(&self, live_panes: &[String]) -> usize {
         let b = self.bindings();
         let keep: BTreeMap<String, Value> = b

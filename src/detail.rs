@@ -155,6 +155,7 @@ pub(crate) struct Ctx {
     pub tasks: Vec<Task>,
     pub index: Index,
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
+    pub worked: std::collections::BTreeMap<String, serde_json::Value>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub panes: Vec<herdr::Pane>,
 }
@@ -165,6 +166,7 @@ impl Ctx {
             tasks: store.tasks(),
             index: Index::new(store.projects()),
             claims: store.claims(),
+            worked: store.worked(),
             bindings: store.bindings(),
             panes: herdr::panes().unwrap_or_default(),
         }
@@ -262,9 +264,31 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         Some(c) => {
             let label = c.get("workspace_label").and_then(|x| x.as_str()).unwrap_or("");
             let ws = c.get("workspace_id").and_then(|x| x.as_str()).unwrap_or("");
-            out.push(field("claimed", &format!("{label} ({ws})"), Style::Accent));
+            let held = c.get("claimed_at").and_then(|x| x.as_str()).map(util::since).unwrap_or(0);
+            let held = if held > 0 { format!(" · {}", util::duration_human(held)) } else { String::new() };
+            out.push(field("claimed", &format!("{label} ({ws}){held}"), Style::Accent));
         }
         None => out.push(field("claimed", "", Style::Dim)),
+    }
+    // The ghost: an agent works several tasks in sequence, and this is the one
+    // it walked away from. Only worth a line once the claim is gone — while
+    // one is live it is the previous shift, and the live fact wins the space.
+    if !ctx.claims.contains_key(&t.id) {
+        if let Some(wk) = ctx.worked.get(&t.id) {
+            let get = |k: &str| wk.get(k).and_then(|x| x.as_str()).unwrap_or("");
+            let label = get("workspace_label");
+            let label = if label.is_empty() { get("workspace_id") } else { label };
+            let spent = wk.get("seconds").and_then(|x| x.as_i64()).unwrap_or(0);
+            let mut s = label.to_string();
+            if spent > 0 {
+                s.push_str(&format!(" · {}", util::duration_human(spent)));
+            }
+            match get("handed_to") {
+                "" => s.push_str(&format!(" · {}", get("reason"))),
+                next => s.push_str(&format!(" · to {next}")),
+            }
+            out.push(field("worked", &s, Style::Muted));
+        }
     }
     match ctx.pane_for(&t.id) {
         Some(p) => {
