@@ -378,6 +378,7 @@ disturbing a layout you will come back to.
 | `a` | project, inbox | add a task in that scope |
 | `a` | task | add a **sub-task** of it |
 | | | the cursor lands on it, so `E` writes it up |
+| | | …and the panel takes the keyboard, because that sentence names a key |
 | `P` | anywhere | new project, child of the selected one |
 | `s` `v` `d` `o` | task | start, review, done, reopen |
 | `b` | task | block, asking why |

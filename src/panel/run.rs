@@ -484,6 +484,24 @@ pub(super) fn event_loop(
                                 (Some(id), Some("add")) | (Some(id), Some("project")) => {
                                     view.land_on = Some(id.clone());
                                     say(&mut ui, format!("{id} added · E to write it up"));
+                                    // …and take the keyboard, because that
+                                    // sentence names a key. herdr's focus moves
+                                    // on its own — a `workspace.focused` for
+                                    // every sidebar hover, an agent coming back
+                                    // in another workspace — so the pane that
+                                    // ran this is not reliably the pane the
+                                    // next keystroke reaches, and the `E` the
+                                    // footer just asked for lands in whatever
+                                    // terminal does hold it. Which is somebody
+                                    // else's agent, taking `E` as a prompt.
+                                    //
+                                    // The same rule as the click: acting here
+                                    // is a statement about where you are
+                                    // working. `took_focus` moves with it so a
+                                    // click landing straight after does not ask
+                                    // herdr twice.
+                                    took_focus = Instant::now();
+                                    focus_self(me.as_deref(), self_ws);
                                 }
                                 _ => say(&mut ui, m.label),
                             }
