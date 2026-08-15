@@ -7,9 +7,16 @@
 //! into is already showing what the one you left was showing.
 //!
 //! Deliberately not everything. `mode` is a half-typed title, `showing` is
-//! which detail pane *this* workspace has open, `land_on` is a one-shot, and
-//! `scroll` is where a pointer was over this pane. Carrying any of those across
-//! would be worse than the reset it is fixing.
+//! which detail pane *this* workspace has open, and `land_on` is a one-shot.
+//! Carrying any of those across would be worse than the reset it is fixing.
+//!
+//! `scroll` *is* carried, which it was not at first and should have been. The
+//! tree normally has no scroll offset of its own — it holds the cursor near the
+//! middle and the window follows, so sharing the cursor shares where the tree
+//! sits. A click is the exception: it pins the row under the pointer, and a
+//! pinned view that did not travel left the panel you switched to showing the
+//! same rows from a different place, which reads as exactly the reset this was
+//! supposed to end.
 //!
 //! It lives in the state directory rather than the store proper, which is what
 //! keeps it out of `Store::fingerprint` — that walks `projects/` and `tasks/`
@@ -37,6 +44,10 @@ pub(super) struct Shared {
     review_only: bool,
     ids: bool,
     cursor: Target,
+    /// Only ever set by a click, and cleared by the next keystroke. Shared
+    /// because the panel you arrive at should be looking at what the one you
+    /// left was looking at, however it came to be looking there.
+    scroll: Option<usize>,
 }
 
 /// Sets are written sorted. The file is compared against the last one written
@@ -58,6 +69,7 @@ impl Shared {
             review_only: view.review_only,
             ids: view.ids,
             cursor,
+            scroll: view.scroll,
         }
     }
 
@@ -70,6 +82,7 @@ impl Shared {
         view.show_done = self.show_done;
         view.review_only = self.review_only;
         view.ids = self.ids;
+        view.scroll = self.scroll;
         self.cursor
     }
 
@@ -82,6 +95,7 @@ impl Shared {
             "review_only": self.review_only,
             "ids": self.ids,
             "cursor": target_to_json(&self.cursor),
+            "scroll": self.scroll,
         })
     }
 
@@ -101,6 +115,7 @@ impl Shared {
             review_only: flag("review_only"),
             ids: flag("ids"),
             cursor: v.get("cursor").map(target_from_json).unwrap_or(Target::Nothing),
+            scroll: v.get("scroll").and_then(|x| x.as_u64()).map(|n| n as usize),
         }
     }
 }
@@ -197,6 +212,27 @@ mod tests {
         let a = Shared::of(&view_with(&["audio", "vst", "meta"], false), Target::Inbox);
         let b = Shared::of(&view_with(&["vst", "meta", "audio"], false), Target::Inbox);
         assert_eq!(rendered(&a), rendered(&b));
+    }
+
+    /// A click pins the row under the pointer, and that pin is the one part of
+    /// where the tree sits that the cursor does not imply. Left behind, the
+    /// panel you switch to shows the same rows from a different place.
+    #[test]
+    fn a_pinned_view_travels_with_the_rest() {
+        let mut v = View::default();
+        v.scroll = Some(12);
+        let back = Shared::from_json(&Shared::of(&v, Target::Inbox).to_json());
+        let mut fresh = View::default();
+        back.apply(&mut fresh);
+        assert_eq!(fresh.scroll, Some(12));
+
+        // And an unpinned view must come back unpinned rather than as zero,
+        // which would be a pin at the top of the tree.
+        let loose = Shared::from_json(&Shared::of(&View::default(), Target::Inbox).to_json());
+        let mut other = View::default();
+        other.scroll = Some(9);
+        loose.apply(&mut other);
+        assert_eq!(other.scroll, None);
     }
 
     /// Every arm, because a cursor that comes back as `Nothing` silently gives

@@ -288,12 +288,21 @@ fn adopt(store: &Store, view: &mut View, agreed: &mut String) -> Target {
 /// Put the cursor on a row by what it *is*, never by where it was. Rows move
 /// under it constantly — the tree sorts by work — and an index carried across
 /// a rebuild lands on whatever slid into the slot.
-fn point_at(ui: &mut Ui, want: &Target) {
+///
+/// Answers whether it found the row. A row can be absent for a while and then
+/// appear — a task under a project that was folded when the cursor arrived, or
+/// one past the per-project cap — so the caller holds the wish until it lands
+/// rather than dropping it on the first rebuild that could not honour it.
+fn point_at(ui: &mut Ui, want: &Target) -> bool {
     if *want == Target::Nothing {
-        return;
+        return true;
     }
-    if let Some(i) = ui.rows.iter().position(|r| target_of(r) == *want) {
-        ui.sel = i;
+    match ui.rows.iter().position(|r| target_of(r) == *want) {
+        Some(i) => {
+            ui.sel = i;
+            true
+        }
+        None => false,
     }
 }
 
@@ -308,9 +317,14 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
     // most of them — costs no write, and so a panel never adopts its own state
     // back on top of itself.
     let mut agreed = String::new();
-    let want = adopt(store, &mut view, &mut agreed);
+    // A row the shared view wants the cursor on, held until it exists. Cleared
+    // by any key, because a person moving the cursor outranks a wish taken off
+    // disk before they did.
+    let mut want = adopt(store, &mut view, &mut agreed);
     let mut ui = collect(&Snapshot::live(store), &view, self_ws);
-    point_at(&mut ui, &want);
+    if point_at(&mut ui, &want) {
+        want = Target::Nothing;
+    }
     if agreed.is_empty() {
         agreed = shared::rendered(&shared::Shared::of(&view, ui.selected_target()));
     }
@@ -389,6 +403,10 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
 
         let mut refetch = false;
         let is_key = matches!(msg, Msg::Key(_));
+        if is_key {
+            // The person is driving. Whatever the file wanted, they want this.
+            want = Target::Nothing;
+        }
         match msg {
             Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
                 Effect::Quit => return Outcome::Quit,
@@ -562,9 +580,14 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
             // The panel being driven reads back what it just wrote, which is
             // its own state and therefore a no-op. That is what makes "always
             // adopt" safe: there is one keyboard, so there is one writer.
-            let want = adopt(store, &mut view, &mut agreed);
+            let taken = adopt(store, &mut view, &mut agreed);
+            if taken != Target::Nothing {
+                want = taken;
+            }
             refetch_into(&mut ui, &Snapshot::live(store), &mut view, self_ws);
-            point_at(&mut ui, &want);
+            if point_at(&mut ui, &want) {
+                want = Target::Nothing;
+            }
         }
 
         // Only a key can change the durable half, so only a key is worth the
