@@ -18,6 +18,14 @@
 //! same rows from a different place, which reads as exactly the reset this was
 //! supposed to end.
 //!
+//! Carrying a field is only half of it: something has to write. The mouse was
+//! the half that did not, for longer than the field was missing — the wheel and
+//! a click are each answered in a branch of the event loop that returns as soon
+//! as it has redrawn, and the loop's own write is at the far end of the body
+//! they never reach. So the keyboard travelled and the pointer did not, which
+//! from a chair looks exactly like scroll being the one thing not shared.
+//! [`super::run::share`] is where both now go.
+//!
 //! It lives in the state directory rather than the store proper, which is what
 //! keeps it out of `Store::fingerprint` — that walks `projects/` and `tasks/`
 //! only. A file inside the fingerprint would give every panel on the machine a
@@ -178,6 +186,25 @@ pub(super) fn write(store: &Store, text: &str) {
     let _ = crate::store::write_atomic(&store.state.join(FILE), text);
 }
 
+/// Hand this view to every other panel, if it is not already what they have.
+///
+/// Call this from the paths where *this pane's* person did something, and from
+/// nowhere else — a key, a wheel, a click. A panel that shared on every draw
+/// would write on ticks and on rebuilds too, including the rebuild where it is
+/// still holding a cursor the file asked for and the rows cannot yet honour:
+/// it would answer that wish by overwriting it with its own. Input is what
+/// makes this pane the one that wins.
+///
+/// `agreed` is the last text this panel wrote or took, so a gesture that
+/// changes nothing durable — and most do not — costs no write at all.
+pub(super) fn share(store: &Store, view: &View, cursor: Target, agreed: &mut String) {
+    let now = rendered(&Shared::of(view, cursor));
+    if now != *agreed {
+        write(store, &now);
+        *agreed = now;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +260,64 @@ mod tests {
         other.scroll = Some(9);
         loose.apply(&mut other);
         assert_eq!(other.scroll, None);
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wsp-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    /// What the mouse does is durable, so the mouse has to write.
+    ///
+    /// The wheel moves the cursor and a click pins the view, and for a while
+    /// neither reached the file: both are answered in a branch of the event
+    /// loop that redraws and returns, and the loop's own write is at the far
+    /// end of a body they never get to. The keyboard travelled and the pointer
+    /// did not, which from a chair looks exactly like the scroll being the one
+    /// thing not shared.
+    #[test]
+    fn a_gesture_that_changes_the_view_reaches_the_file() {
+        let dir = scratch("share");
+        let store = Store { root: dir.clone(), state: dir.clone() };
+        let mut view = View::default();
+        let mut agreed = String::new();
+
+        share(&store, &view, Target::Task("t-1".into()), &mut agreed);
+        let first = read(&store).expect("the first share writes");
+        assert_eq!(first, agreed);
+
+        // A wheel is three of what `j` does: the cursor lands somewhere else,
+        // and where the cursor is *is* where the tree sits.
+        share(&store, &view, Target::Task("t-4".into()), &mut agreed);
+        assert_ne!(read(&store).as_deref(), Some(first.as_str()), "a moved cursor is a new view");
+
+        // A click pins the row under the pointer, which the cursor does not
+        // imply — the one part of where the tree sits that has to travel on
+        // its own.
+        let pinned = agreed.clone();
+        view.scroll = Some(12);
+        share(&store, &view, Target::Task("t-4".into()), &mut agreed);
+        assert_ne!(read(&store).as_deref(), Some(pinned.as_str()), "a pin is part of the view");
+
+        // And it arrives: the panel you switch to is looking where you left it.
+        let mut theirs = View::default();
+        let want = parse(&read(&store).unwrap()).apply(&mut theirs);
+        assert_eq!(theirs.scroll, Some(12));
+        assert_eq!(want, Target::Task("t-4".into()));
+
+        // Nothing changed, so nothing is written. A wheel against the end of
+        // the tree is a burst of events that move nothing.
+        let settled = agreed.clone();
+        let before = std::fs::metadata(store.state.join(FILE)).unwrap();
+        share(&store, &view, Target::Task("t-4".into()), &mut agreed);
+        assert_eq!(agreed, settled);
+        assert_eq!(
+            std::fs::metadata(store.state.join(FILE)).unwrap().modified().unwrap(),
+            before.modified().unwrap(),
+            "a gesture that changes nothing durable costs no write",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every arm, because a cursor that comes back as `Nothing` silently gives

@@ -393,6 +393,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
                 // the same thing `w` does, so it presses it.
                 super::keys::Hit::Rest => msg = Msg::Key(Key::Char('w')),
                 super::keys::Hit::Select => {
+                    shared::share(store, &view, ui.selected_target(), &mut agreed);
                     draw(&ui, &view, &mut last);
                     continue;
                 }
@@ -406,6 +407,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // centring every time a key moved the selection.
         if let Msg::Key(Key::Wheel { up }) = msg {
             super::keys::wheel(&mut ui, &mut view, up);
+            shared::share(store, &view, ui.selected_target(), &mut agreed);
             draw(&ui, &view, &mut last);
             continue;
         }
@@ -599,15 +601,12 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
             }
         }
 
-        // Only a key can change the durable half, so only a key is worth the
+        // Only input can change the durable half, so only input is worth the
         // comparison. A tick that serialised this five times a second in every
-        // pane on the machine would be pure heat.
+        // pane on the machine would be pure heat. The mouse shares from its own
+        // branches above, which return before they reach here.
         if is_key {
-            let now = shared::rendered(&shared::Shared::of(&view, ui.selected_target()));
-            if now != agreed {
-                shared::write(store, &now);
-                agreed = now;
-            }
+            shared::share(store, &view, ui.selected_target(), &mut agreed);
         }
         draw(&ui, &view, &mut last);
     }
