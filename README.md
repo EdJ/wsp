@@ -151,6 +151,7 @@ For real editing, `E` pops the row out into a **tab** of its own:
 ```
 ┌─ context (live) ───────────────────────┐
 │ status · claim · log                   │
+│ o overview · d details · D decisions   │
 ├─ overview ──────────┬─ details ────────┤
 │ prose, no markup    │ prose, no markup │
 └─────────────────────┴──────────────────┘
@@ -165,6 +166,36 @@ section. The tab opens with the **context** focused, not an editor — so `W` an
 under your hands before you have committed to typing anything. From there `h`
 and `l`, or `←` and `→`, go to the pane on that side of the screen.
 
+#### Three sections, two panes
+
+The menu across the context pane says which sections are open — lit for what is
+on screen, muted for what a key would bring in. `o`, `d` and `D` each put one
+there.
+
+There are three prose sections and two panes, so a key has to mean something
+definite about which pane moves. The rule is one sentence: **the section you
+press lands on the right, and if it is already on the left the two trade
+places.** That reaches every arrangement, it never disturbs a pane already
+showing what you asked for, and the common case — swapping `details` out for
+`decisions` while you keep writing the overview — leaves the pane you are
+working in alone.
+
+The swap does not close anything. Each editor pane runs a loop around a *slot
+file* holding the section it is showing: it writes the section, runs the editor,
+and reads the slot back when the editor exits. Unchanged means you quit, and the
+loop ends. Changed means the menu re-pointed the pane while you were inside it,
+and the next turn opens what it now says. The menu writes every slot *before*
+asking any editor to leave, so a trade cannot come apart with one pane moved and
+one not.
+
+That indirection is doing more than it looks like. The tab-closing marker sits
+outside the loop, so it counts editors that **finished** rather than editors
+that **exited** — a swap is an exit, and counting those would take the tab down
+on the second swap. And an empty slot ends the loop rather than continuing it:
+the file can go missing, and an empty section name would otherwise become `wsp
+edit <id> --`, which parses as no section at all and puts the whole body in
+front of someone who asked for one part of it.
+
 By position, not by name: `o` for overview and `d` for details put the key for
 the *left* pane under the right hand, which is backwards every time you reach
 for it. `h` and `l` are left and right on the keyboard, in vim, and in herdr's
@@ -177,7 +208,7 @@ focuses the pane left/down/up/right, where the prefix is whatever
 reinvent that; `o` and `d` exist only because naming a pane you are looking
 straight at beats a two-step reach for it.
 
-`W` in the context pane saves and closes both editors at once. It sends two
+`W` in the context pane saves and closes every editor at once. It sends two
 things: an abort — `Ctrl-C` for the vi family, `Ctrl-G` for emacs — and then
 the save-and-quit, `:wqa` or `^O ^X` or whatever that editor wants. `vi` is
 assumed when `$EDITOR` is unset, and an editor it does not recognise is named
@@ -205,8 +236,12 @@ tab with it, and quitting the first leaves it standing because closing then
 would take the other's work.
 
 Each editor is labelled by its section, and its buffer is a file named
-`overview.md` or `details.md` — so the editor's own status line says which half
-you are in, without the editor having to cooperate.
+`overview.md`, `details.md` or `decisions.md` — so the editor's own status line
+says which section you are in, without the editor having to cooperate. The label
+is also how `W` and `q` know which panes are editors, and the test is the
+section vocabulary rather than a pair of names: a pane holding `decisions` is as
+much an editor as one holding `overview`, and naming them literally is how `q`
+would have walked past one and closed the tab around it.
 
 Closing the tab from herdr while an editor is open **loses that editor's
 changes**: `wsp edit` writes back only after the editor exits. If you had saved,
@@ -343,6 +378,17 @@ so, which is the honest record — what a reader three months on needs is the
 reasoning that was live at the time, not a tidied conclusion. It sits above the
 task list in `wsp project show`, because it is a constraint on what may be
 picked up next and belongs in front of the list of things somebody might pick.
+
+`wsp edit --decisions` exists anyway, and the two are not in conflict once the
+rule is stated precisely. What append-only protects is that a decision cannot be
+**quietly** rewritten — not that the text is immutable, which no file on disk
+has ever been. A typo is worth fixing. A change nobody can see afterwards is
+not. So the edit is allowed and it leaves a mark: editing the section by hand
+appends `decisions edited by hand` to the log, and `wsp decide` does not, which
+is how you tell the two apart a month later. Without that the section would have
+been reachable from `E` and from the CLI with nothing recording that anyone had
+been there — which is the failure the rule was written against, arriving by a
+door the rule did not mention.
 
 ```sh
 wsp edit <id>                    # every prose section, headings included
@@ -822,8 +868,8 @@ Every command takes `--json`.
 | `src/panel/verbs.rs` | what the letters do |
 | `src/panel/run.rs` | the terminal, the event loop, the effects |
 | `src/panel/install.rs` | splitting the panel into a workspace, and back out |
-| `src/detail/render.rs` | a task or a project, in full |
-| `src/detail/editors.rs` | getting the editors a pop-out opened to go |
+| `src/detail/render.rs` | a task or a project, in full, and the section menu |
+| `src/detail/editors.rs` | getting the editors a pop-out opened to go, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |

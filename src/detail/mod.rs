@@ -18,6 +18,7 @@ mod editors;
 mod render;
 mod run;
 
+pub(crate) use editors::slot_path;
 pub(crate) use render::{frame, Ctx};
 pub use run::run;
 

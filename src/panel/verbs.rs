@@ -271,9 +271,45 @@ pub(super) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> St
             .chain(base.iter().map(|a| shell_quote(a)))
             .collect::<Vec<_>>()
             .join(" ");
-        run(pane, format!("{cmd} --{section}{done}\n"));
+
+        let slot = shell_quote(&crate::detail::slot_path(pane).display().to_string());
+        let _ = std::fs::remove_file(crate::detail::slot_path(pane));
+        run(pane, format!("{}\n", editor_loop(section, &cmd, &slot, &done)));
     }
     format!("editing {label}")
+}
+
+/// The shell an editor pane runs: open a section, and open it again if the
+/// menu moved this pane while somebody was inside it.
+///
+/// A loop rather than one editor, so the top pane can re-point this one without
+/// closing anything. The pane writes the section it is opening into its slot,
+/// runs the editor, then reads the slot back. Unchanged means the person quit;
+/// changed means the menu moved it, and the next turn opens what it now says.
+///
+/// Three things this shape is carrying, none of them obvious:
+///
+/// - **The tab-closing marker is outside the loop.** It counts editors that
+///   *finished*, not editors that *exited*, and a swap is an exit. Counting
+///   those would take the tab down on the second swap.
+/// - **An empty read ends the loop.** The slot can go missing — a temp reaper,
+///   a forced close, a second `W` — and an empty section name would otherwise
+///   become `wsp edit <id> --`, which parses as no section at all and puts the
+///   whole body in front of someone who asked for one part of it.
+/// - **The slot is written at the top of each turn, not the bottom.** The menu
+///   writes it while the editor is running, so reading it after the editor
+///   exits is the only ordering that sees the change.
+///
+/// Built as a string here, and separately, so it can be handed to `sh -n`.
+/// Nothing else in this file can be tested without a terminal and a herdr,
+/// which is exactly why the one part that is a quoting problem should be.
+fn editor_loop(section: &str, cmd: &str, slot: &str, done: &str) -> String {
+    format!(
+        "s={section}; while :; do printf %s \"$s\" > {slot}; \
+         {cmd} --\"$s\"; n=$(cat {slot} 2>/dev/null); \
+         {{ [ -z \"$n\" ] || [ \"$n\" = \"$s\" ]; }} && break; s=\"$n\"; done; \
+         rm -f {slot}{done}"
+    )
 }
 
 /// Point the workspace's detail pane at something, making one if there is not
@@ -699,5 +735,45 @@ pub(super) fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
             say(ui, format!("{verb} needs a task"));
             Effect::None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one thing in this file that is a quoting problem rather than a
+    /// terminal problem. `sh -n` parses without running, so a stray brace or an
+    /// unbalanced quote fails here rather than in a pane at the moment somebody
+    /// presses `E`.
+    #[test]
+    fn the_editor_loop_is_valid_shell() {
+        let done = "; printf x >> '/tmp/wsp-edit-w0-p3'";
+        let loop_ = editor_loop("overview", "'/usr/bin/wsp' 'edit' 't-1'", "'/tmp/s'", done);
+        let out = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&loop_)
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "sh -n rejected the loop: {}\n{loop_}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A missing slot must end the loop, not feed it an empty section — that
+    /// becomes `wsp edit <id> --`, which parses as no section at all and opens
+    /// the whole body. The guard is easy to drop when editing the format
+    /// string, and nothing else would notice.
+    #[test]
+    fn an_empty_slot_ends_the_loop_rather_than_reopening_on_nothing() {
+        let l = editor_loop("overview", "true", "'/tmp/s'", "");
+        assert!(l.contains("[ -z \"$n\" ]"), "no empty-slot guard: {l}");
+        // The read has to come after the editor, or the swap is never seen.
+        let editor = l.find("--\"$s\"").expect("runs the editor");
+        let read = l.find("n=$(cat").expect("reads the slot back");
+        assert!(editor < read, "slot is read before the editor runs: {l}");
     }
 }

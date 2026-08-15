@@ -24,7 +24,7 @@ use crate::herdr;
 ///
 /// The quit is `wqa`, not `wq`: someone who has split inside their editor
 /// would otherwise close one window and leave the pane sitting there.
-fn save_and_quit_keys(editor: &str, force: bool) -> Option<(&'static str, String)> {
+pub(super) fn save_and_quit_keys(editor: &str, force: bool) -> Option<(&'static str, String)> {
     let name = editor
         .rsplit('/')
         .next()
@@ -69,11 +69,31 @@ pub(super) fn discard_and_quit_keys(editor: &str) -> Option<(&'static str, &'sta
 /// there. A view opened from the sidebar shares its tab with the panel and
 /// whatever you were working in — closing *that* tab would take the sidebar
 /// and your work pane with it, which is emphatically not what `q` means.
+///
+/// The test is the section vocabulary rather than two names, so a pane holding
+/// `decisions` is as much an editor as one holding `overview`. Naming them
+/// literally is what left the menu's third section out of every check that
+/// matters — `q` would have walked past it and closed the tab around it.
 pub(super) fn edit_tab_siblings(me: &str) -> Vec<herdr::Pane> {
-    siblings_of(me)
-        .into_iter()
-        .filter(|p| p.label == "overview" || p.label == "details")
-        .collect()
+    siblings_of(me).into_iter().filter(|p| is_section_label(&p.label)).collect()
+}
+
+/// Whether a pane label names an editable section.
+pub(crate) fn is_section_label(label: &str) -> bool {
+    crate::model::PROSE.iter().any(|s| s.eq_ignore_ascii_case(label))
+}
+
+/// Where an editor pane is told which section to open next.
+///
+/// One file per pane, holding a section name. The pane's shell loop writes the
+/// section it is about to open and reads the file again when the editor exits:
+/// unchanged means the person really quit, changed means the menu re-pointed
+/// the pane while they were in it. That indirection is what lets the top pane
+/// swap a section in without knowing anything about `$EDITOR` beyond how to
+/// ask it to leave — and it is why a swap does not trip the tab-closing
+/// marker, which only sees a loop that ran out.
+pub(crate) fn slot_path(pane_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("wsp-slot-{}", pane_id.replace(':', "-")))
 }
 
 /// The outcome of asking the editors to leave.

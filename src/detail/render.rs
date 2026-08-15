@@ -133,17 +133,74 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
 
     // A hint pinned to the bottom. `W` is worth naming here because it acts on
     // panes other than this one, which is not a thing you would guess.
-    let footer = 2;
+    //
+    // The section menu appears only in an edit tab, because that is the only
+    // place its keys do anything. Offering three keys in a view with nothing
+    // beside it would be advertising a menu whose every entry answers "no
+    // editors open".
+    let open = open_sections(ctx);
+    let footer = if open.is_empty() { 2 } else { 3 };
     out.truncate(h.saturating_sub(footer));
     while out.len() < h.saturating_sub(footer) {
         out.push(Line::default());
     }
     out.push(line(Style::Dim, "─".repeat(w)));
+    if !open.is_empty() {
+        let mut menu = Line::default();
+        for (i, name) in crate::model::PROSE.iter().enumerate() {
+            if i > 0 {
+                menu.push(Style::Dim, " · ");
+            }
+            let showing = open.iter().any(|s| s.eq_ignore_ascii_case(name));
+            menu.push(Style::Dim, format!("{} ", section_key(name)));
+            // Lit for what is on screen, muted for what a key would bring in.
+            // The distinction is the whole point of drawing the menu: three
+            // sections and two panes means one is always somewhere else.
+            menu.push(
+                if showing { Style::Accent } else { Style::Muted },
+                name.to_lowercase(),
+            );
+        }
+        menu.fit(w);
+        out.push(menu);
+    }
     out.push(line(
         Style::Dim,
         "h/l left or right · W save and close · q close, discarding",
     ));
     out
+}
+
+/// The key that brings a section in. Initials, not positions — `h`/`l` already
+/// mean left and right in this pane, and one footer cannot teach both.
+fn section_key(section: &str) -> char {
+    match section {
+        "Overview" => 'o',
+        "Details" => 'd',
+        _ => 'D',
+    }
+}
+
+/// The sections open in editor panes beside this one.
+///
+/// Read from the panes the context already carries rather than asked for
+/// again: the join is live, and a second round-trip to herdr on every repaint
+/// would cost more than the line it draws. A storyboard `Ctx` holds synthetic
+/// panes that share no tab with this process, so it finds none and the menu
+/// stays off — which is right, since a still frame has no editors either.
+fn open_sections(ctx: &Ctx) -> Vec<String> {
+    let Some(me) = herdr::Env::read().pane_id else {
+        return Vec::new();
+    };
+    let Some(tab) = ctx.panes.iter().find(|p| p.pane_id == me).map(|p| p.tab_id.clone()) else {
+        return Vec::new();
+    };
+    ctx.panes
+        .iter()
+        .filter(|p| p.tab_id == tab && p.pane_id != me)
+        .filter(|p| super::editors::is_section_label(&p.label))
+        .map(|p| p.label.clone())
+        .collect()
 }
 
 fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {

@@ -140,6 +140,28 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
                         let _ = std::io::stdout().flush();
                     }
                 }
+                // The menu. One key per section, and the letters are the
+                // sections' own initials rather than positions — `h`/`l` took
+                // the positional meaning already, and a key that means "left"
+                // in one row of the footer and "overview" in the next is a
+                // footer nobody reads twice. `D` is shifted because `d` is
+                // spoken for and details is the one you reach for more often.
+                Key::Char('o') | Key::Char('d') | Key::Char('D') => {
+                    let want = match k {
+                        Key::Char('o') => "overview",
+                        Key::Char('d') => "details",
+                        _ => "decisions",
+                    };
+                    let msg = show_section(want);
+                    if !msg.is_empty() {
+                        let (w, _) = panel::term_size();
+                        let mut l = Line::default();
+                        l.push(Style::Accent, util::truncate(&msg, w));
+                        l.fit(w);
+                        print!("\x1b[999;1H{}", panel::to_ansi(&[l], w, 1).trim_start_matches("\x1b[H\x1b[2J"));
+                        let _ = std::io::stdout().flush();
+                    }
+                }
                 Key::Char('W') => {
                     let outcome = close_editors(&stuck);
                     let msg = match outcome {
@@ -186,6 +208,109 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
         }
     }
     0
+}
+
+/// Put a section into the editor panes, and say what happened.
+///
+/// Two panes, three sections, so a key has to mean something definite about
+/// which pane moves. The rule is one sentence: **the section you press lands on
+/// the right, and if it is already on the left the two trade places.** That
+/// reaches every arrangement, it never disturbs a pane that is already showing
+/// what you asked for, and the common case — swapping `details` out for
+/// `decisions` while you keep writing the overview — leaves the pane you are
+/// working in alone.
+///
+/// The swap goes through the slot file and the editor's own save-and-quit, not
+/// through closing the pane. Closing it would lose the shell that owns the
+/// tab-closing marker, and re-splitting would move every pane on screen while
+/// somebody is typing in one of them.
+fn show_section(want: &str) -> String {
+    let Some(me) = herdr::Env::read().pane_id else {
+        return "no pane id".into();
+    };
+    let editors = edit_tab_siblings(&me);
+    if editors.is_empty() {
+        return "no editors open — this is a view, not an edit".into();
+    }
+
+    // Left and right by where they actually are, not by the order herdr lists
+    // them. `focus_by_position` learned the same lesson: the layout is the
+    // authority on which pane is on the left, and the order panes were created
+    // in stops being that the first time one is closed.
+    //
+    // The layout is fetched once and sorted against, not asked for inside the
+    // comparator — a round-trip per comparison is a socket call in a sort.
+    let xs = pane_xs(&me);
+    let mut ordered: Vec<&herdr::Pane> = editors.iter().collect();
+    ordered.sort_by_key(|p| xs.get(&p.pane_id).copied().unwrap_or(0));
+    let (Some(left), Some(right)) = (ordered.first(), ordered.last()) else {
+        return "could not place the editors".into();
+    };
+    if left.pane_id == right.pane_id {
+        return "only one editor open".into();
+    }
+
+    if right.label.eq_ignore_ascii_case(want) {
+        return format!("{want} is already there");
+    }
+    // Already on the left: trade, so the pane that was on the right is not
+    // simply overwritten with a section that is on screen twice.
+    let pairs: Vec<(&herdr::Pane, String)> = if left.label.eq_ignore_ascii_case(want) {
+        vec![(left, right.label.clone()), (right, want.to_string())]
+    } else {
+        vec![(right, want.to_string())]
+    };
+
+    // Write every slot before asking any editor to leave. An editor that exits
+    // between the two steps would re-open on the section it already had, and
+    // the trade would come apart with one pane moved and one not.
+    for (pane, section) in &pairs {
+        let _ = std::fs::write(super::slot_path(&pane.pane_id), section);
+    }
+
+    let ed = std::env::var("EDITOR").unwrap_or_default();
+    let Some((abort, commit)) = super::editors::save_and_quit_keys(&ed, false) else {
+        for (pane, _) in &pairs {
+            let _ = std::fs::remove_file(super::slot_path(&pane.pane_id));
+        }
+        return format!("don't know how to save {ed} — quit it yourself");
+    };
+    let send = |pane: &str, text: &str| {
+        let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }));
+    };
+    // Two sends, for the reason `close_editors` documents: vim throws away
+    // pending type-ahead when it takes an interrupt, so the command in the
+    // same write as the Ctrl-C is eaten.
+    for (pane, _) in &pairs {
+        send(&pane.pane_id, abort);
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    for (pane, _) in &pairs {
+        send(&pane.pane_id, &commit);
+    }
+    for (pane, section) in &pairs {
+        let _ = herdr::call(
+            "pane.rename",
+            json!({ "pane_id": pane.pane_id, "label": section }),
+        );
+    }
+    format!("{want} →")
+}
+
+/// Every pane's x in this tab, for ordering siblings left to right.
+fn pane_xs(me: &str) -> std::collections::BTreeMap<String, i64> {
+    herdr::call("pane.layout", json!({ "pane_id": me }))
+        .ok()
+        .and_then(|r| r.get("layout").and_then(|l| l.get("panes").cloned()))
+        .and_then(|p| p.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| {
+            let id = p.get("pane_id")?.as_str()?.to_string();
+            let x = p.get("rect")?.get("x")?.as_i64()?;
+            Some((id, x))
+        })
+        .collect()
 }
 
 /// Focus the leftmost or rightmost pane below this one.

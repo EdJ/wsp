@@ -1031,6 +1031,8 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         },
     };
 
+    let decisions_before = crate::model::section_of(&body, "Decisions").unwrap_or_default();
+
     match one {
         Some(sec) => crate::model::set_section_in(&mut body, sec, &after),
         None => {
@@ -1075,6 +1077,17 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
                 }
             }
         }
+    }
+
+    // `wsp decide` is how a decision is written and there is no `wsp undecide`,
+    // so an editor that can reach `## Decisions` needs an answer to the rule it
+    // appears to break. The rule is that a decision cannot be *quietly*
+    // rewritten — not that the text is immutable, which no file on disk ever
+    // is. A typo is worth fixing; a change nobody can see afterwards is not.
+    // So the edit is allowed and it leaves a mark: the log says the section was
+    // edited by hand, which is exactly what the record was protecting.
+    if crate::model::section_of(&body, "Decisions").unwrap_or_default() != decisions_before {
+        crate::model::append_dated(&mut body, "Log", "decisions edited by hand");
     }
 
     let saved = match item.what {
