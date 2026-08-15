@@ -19,7 +19,25 @@
 //! nothing waiting return empty after ~100ms, and [`Keys::idle`] is that
 //! silence — an `ESC` with nothing behind it was the key.
 
-use crate::panel::Key;
+/// A key as typed, not as interpreted. `j` used to arrive already meaning
+/// "down", which is unanswerable once a prompt needs a literal `j` — so the
+/// meaning is decided by the reducer, which knows the mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Key {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Esc,
+    Backspace,
+    /// The far ends of the list, for anyone who does not think in `g`/`G`.
+    Home,
+    End,
+    Char(char),
+    /// Ctrl-C, which raw mode delivers as a byte rather than a signal.
+    Interrupt,
+}
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;

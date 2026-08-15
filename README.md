@@ -434,9 +434,22 @@ Every command takes `--json`.
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh |
 | `src/input.rs` | terminal bytes → keys: the escape-sequence parser |
-| `src/panel.rs` | the in-pane sidebar: project tree, tasks, panes |
-| `src/detail.rs` | the detail pane: one task or project, in full |
+| `src/panel/rows.rs` | what is in the tree, and how each row draws |
+| `src/panel/render.rs` | `Line`/`Style`, the frame, and the ansi + html backends |
+| `src/panel/keys.rs` | modes, movement, and the map |
+| `src/panel/verbs.rs` | what the letters do |
+| `src/panel/run.rs` | the terminal, the event loop, the effects |
+| `src/panel/install.rs` | splitting the panel into a workspace, and back out |
+| `src/detail/render.rs` | a task or a project, in full |
+| `src/detail/editors.rs` | getting the editors a pop-out opened to go |
+| `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_*.rs` | the commands |
+
+The panel is split where the *work* splits rather than by layer: a row's data
+and its drawing sit together in `rows.rs`, because a field added to a row is
+read where it is written and drawn a hundred lines below, and separating them
+would put one change in two files every time. What `render.rs` keeps is the
+surface a row is drawn onto, which nothing about a row needs to know.
 
 Dependencies: `serde_json`. That is the whole list, and it should stay that way —
 fast builds are a feature here, because a session-start hook runs this binary.

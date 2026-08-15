@@ -14,7 +14,8 @@ use serde_json::json;
 
 use crate::herdr;
 use crate::model::{Project, Task};
-use crate::panel::{self, Key, Snapshot};
+use crate::input::Key;
+use crate::panel::{self, Snapshot};
 
 // ---- fixture building ---------------------------------------------------
 

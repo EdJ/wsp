@@ -1,0 +1,681 @@
+//! What the letters do.
+//!
+//! The change half of the panel: [`Ask`] and [`Pick`] are the questions a verb
+//! stops to ask, and the rest is what happens when it has its answer — a `wsp`
+//! subcommand run against the row under the cursor, a workspace opened, an
+//! editor popped out into a tab of its own.
+//!
+//! A verb is added here and nowhere else: its key, its prompt, its entry in
+//! the map, and the command it becomes.
+
+use std::process::{Command, Stdio};
+
+use serde_json::json;
+
+use crate::herdr;
+use crate::input::Key;
+use crate::store::Store;
+use crate::util;
+
+use super::install::{list_panes, shell_quote, store_env};
+use super::keys::{move_or_fold, say, Effect, Mode, View};
+use super::rows::{hotkeys, Target, Ui};
+use super::{PANEL_LABEL, VIEW_LABEL};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Ask {
+    AddTask { project: Option<String>, parent: Option<String> },
+    NewProject { parent: Option<String> },
+    Block { task: String },
+    Rename { task: String },
+    Note { task: String },
+}
+
+impl Ask {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Ask::AddTask { parent: Some(_), .. } => "sub-task",
+            Ask::AddTask { .. } => "task",
+            Ask::NewProject { .. } => "project",
+            Ask::Block { .. } => "why",
+            Ask::Rename { .. } => "title",
+            Ask::Note { .. } => "note",
+        }
+    }
+
+    /// The command this becomes once a value is typed.
+    pub(super) fn argv(&self, value: &str) -> Vec<String> {
+        let v = value.trim().to_string();
+        match self {
+            Ask::AddTask { project, parent } => {
+                let mut argv = vec!["add".into(), v];
+                if let Some(p) = parent {
+                    argv.push("--parent".into());
+                    argv.push(p.clone());
+                }
+                match project {
+                    Some(p) => {
+                        argv.push("-p".into());
+                        argv.push(p.clone());
+                    }
+                    // `wsp add` with no project resolves one from the cwd, and
+                    // the panel's cwd is wherever it happens to be installed —
+                    // so the inbox has to be asked for, not left implied. A
+                    // sub-task needs neither: it goes where its parent is.
+                    None if parent.is_none() => argv.push("--inbox".into()),
+                    None => {}
+                }
+                argv
+            }
+            Ask::NewProject { parent: Some(p) } => {
+                vec!["project".into(), "add".into(), v, "--parent".into(), p.clone()]
+            }
+            Ask::NewProject { parent: None } => vec!["project".into(), "add".into(), v],
+            Ask::Block { task } => vec!["block".into(), task.clone(), v],
+            Ask::Rename { task } => vec!["rename".into(), task.clone(), v],
+            Ask::Note { task } => vec!["note".into(), task.clone(), v],
+        }
+    }
+}
+
+/// Open a workspace for a piece of work, rooted where that work lives.
+///
+/// `WSP_PROJECT` and `WSP_TASK` go into the workspace environment, so every
+/// pane inside it knows what it is for without anyone having to infer it from
+/// a path. herdr does not persist env across a restart, which is why the
+/// durable answer is a claim rather than this — but for the life of the
+/// session it is exact, and exactness is what the cwd heuristic lacks.
+pub(super) fn open_workspace(
+    label: &str,
+    cwd: Option<&str>,
+    project: Option<&str>,
+    task: Option<&str>,
+) -> Result<(String, String), String> {
+    let mut env = serde_json::Map::new();
+    if let Some(p) = project {
+        env.insert("WSP_PROJECT".into(), json!(p));
+    }
+    if let Some(t) = task {
+        env.insert("WSP_TASK".into(), json!(t));
+    }
+    // The store first, then what this workspace is for — the latter wins if
+    // someone has both, which is right: it is more specific.
+    let mut merged = store_env();
+    merged.extend(env);
+    let mut params = json!({ "label": label, "env": merged, "focus": true });
+    if let Some(c) = cwd {
+        params["cwd"] = json!(util::expand(c).display().to_string());
+    }
+    let r = herdr::call("workspace.create", params).map_err(|e| e.to_string())?;
+    let ws = r
+        .get("workspace")
+        .and_then(|w| w.get("workspace_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "workspace.create returned no id".to_string())?;
+    // The pane it opened with — what `claim` needs to bind to, since claim
+    // speaks in panes and knows nothing about workspaces.
+    let pane = r
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "workspace.create returned no pane".to_string())?;
+    Ok((ws, pane))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pick {
+    /// Move a task: land on a project, or on the inbox to unfile it.
+    MoveTask { task: String },
+    /// Bind a pane to the task the cursor started on.
+    PaneForTask { task: String },
+    /// Point an agent at different work — this is task 025's migration.
+    TaskForPane { pane: String },
+}
+
+impl Pick {
+    pub(super) fn hint(&self) -> &'static str {
+        match self {
+            Pick::MoveTask { .. } => "move to which project?",
+            Pick::PaneForTask { .. } => "which agent takes it?",
+            Pick::TaskForPane { .. } => "which task does it take?",
+        }
+    }
+
+    /// `None` when the cursor is somewhere this pick cannot accept.
+    pub(super) fn argv(&self, at: &Target) -> Option<Vec<String>> {
+        match (self, at) {
+            (Pick::MoveTask { task }, Target::Project(p)) => {
+                Some(vec!["mv".into(), task.clone(), "-p".into(), p.clone()])
+            }
+            // Unfiling. `mv` already understands `inbox` as "no project".
+            (Pick::MoveTask { task }, Target::Inbox) => {
+                Some(vec!["mv".into(), task.clone(), "-p".into(), "inbox".into()])
+            }
+            (Pick::PaneForTask { task }, Target::Pane(pane)) => {
+                Some(vec!["claim".into(), task.clone(), "--pane".into(), pane.clone()])
+            }
+            (Pick::TaskForPane { pane }, Target::Task(task)) => {
+                Some(vec!["claim".into(), task.clone(), "--pane".into(), pane.clone()])
+            }
+            _ => None,
+        }
+    }
+}
+
+
+/// Shut the workspace's detail pane, if it has one.
+pub(super) fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
+    let Some(ws) = self_ws else { return false };
+    crate::detail::set_focus(store, ws, &crate::detail::Focus::Nothing);
+    let Ok(panes) = list_panes(ws) else { return false };
+    match panes.into_iter().find(|p| p.label == VIEW_LABEL) {
+        Some(p) => herdr::call("pane.close", json!({ "pane_id": p.id })).is_ok(),
+        None => false,
+    }
+}
+
+/// Open a file full-size in a tab of its own, in the user's editor.
+///
+/// A tab rather than a split: the store is Markdown and editing a task means
+/// its whole body — notes, acceptance criteria, the log — which wants width,
+/// and a tab gives that without disturbing a layout you will come back to.
+pub(super) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
+    let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "wsp".into());
+
+    // A project has no section machinery yet, so it gets one editor on its
+    // file. Named here rather than hidden in a path, so the exception is
+    // visible until it can be closed.
+    // `wsp edit <id>` for a task, `wsp project edit <id>` for a project. The
+    // section flags append to either, so both get the same two editors.
+    let id = argv.last().cloned().unwrap_or_default();
+    let base: Vec<String> = argv.to_vec();
+
+    let Ok(r) = herdr::call(
+        "tab.create",
+        json!({ "workspace_id": ws, "label": label, "focus": true, "env": store_env() }),
+    ) else {
+        return "could not create a tab".into();
+    };
+    let tab = r
+        .get("tab")
+        .and_then(|t| t.get("tab_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let Some(top) = r
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+    else {
+        return "tab reported no pane".into();
+    };
+
+    let split = |target: &str, dir: &str, ratio: f64| -> Option<String> {
+        herdr::call(
+            "pane.split",
+            json!({ "direction": dir, "target_pane_id": target, "ratio": ratio, "focus": false }),
+        )
+        .ok()?
+        .get("pane")?
+        .get("pane_id")?
+        .as_str()
+        .map(|s| s.to_string())
+    };
+    let run = |pane: &str, text: String| {
+        let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }));
+    };
+
+    // Context across the top, editors beneath. The context is the same live
+    // view the sidebar opens, so status, claim and log keep updating while you
+    // type — that context was exactly what editing in a bare buffer cost.
+    let Some(work) = split(&top, "down", 0.32) else {
+        return "could not split the tab".into();
+    };
+    let _ = herdr::call("pane.rename", json!({ "pane_id": top, "label": VIEW_LABEL }));
+    run(
+        &top,
+        format!("exec {} view {}\n", shell_quote(&exe), shell_quote(&id)),
+    );
+
+    // One editor per section, side by side. Each buffer is prose and nothing
+    // else — there is no markup left to mangle, which was the point. They are
+    // safe to run together because `wsp edit` re-reads the task and writes back
+    // only its own section.
+    let Some(right) = split(&work, "right", 0.5) else {
+        return "could not split the editors".into();
+    };
+
+    // Whichever editor is quit second takes the tab down. A one-byte marker per
+    // editor, because closing on the first would kill the other with its work
+    // still open — and leaving the tab means every edit strands a husk.
+    let mark = std::env::temp_dir().join(format!("wsp-edit-{}", tab.replace(':', "-")));
+    let m = shell_quote(&mark.display().to_string());
+    let done = format!(
+        "; printf x >> {m}; [ \"$(wc -c < {m} | tr -d ' ')\" -ge 2 ] && {{ rm -f {m}; herdr tab close {}; }}",
+        shell_quote(&tab)
+    );
+    let _ = std::fs::remove_file(&mark);
+
+    for (pane, section) in [(&work, "overview"), (&right, "details")] {
+        // Label the pane as well as the file: herdr shows one, the editor's
+        // status line shows the other, and between them there is no way to be
+        // looking at a buffer without knowing which half it is.
+        let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": section }));
+        let cmd = std::iter::once(shell_quote(&exe))
+            .chain(base.iter().map(|a| shell_quote(a)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        run(pane, format!("{cmd} --{section}{done}\n"));
+    }
+    format!("editing {label}")
+}
+
+/// Point the workspace's detail pane at something, making one if there is not
+/// one yet.
+///
+/// One pane per workspace, reused: opening a second thing retargets the pane
+/// you are already reading rather than stacking another beside it. The target
+/// goes through a file the view polls, so retargeting costs no process churn —
+/// the alternative, killing and relaunching, would blink the pane on every
+/// press of a key whose whole job is to be cheap.
+pub(super) fn inspect(store: &Store, self_ws: Option<&str>, focus: &crate::detail::Focus) -> String {
+    let Some(ws) = self_ws else {
+        return "no workspace to open a view in".into();
+    };
+    crate::detail::set_focus(store, ws, focus);
+
+    let existing = list_panes(ws).ok().and_then(|ps| {
+        ps.into_iter().find(|p| p.label == VIEW_LABEL).map(|p| p.id)
+    });
+    if existing.is_some() {
+        return String::new();
+    }
+
+    // Split downward off our own pane, so the detail shares the sidebar's
+    // column and the working pane beside it is never touched.
+    let Some(me) = list_panes(ws)
+        .ok()
+        .and_then(|ps| ps.into_iter().find(|p| p.label == PANEL_LABEL).map(|p| p.id))
+    else {
+        return "cannot find the panel pane".into();
+    };
+    let res = herdr::call(
+        "pane.split",
+        json!({ "direction": "down", "target_pane_id": me, "ratio": 0.45, "focus": false }),
+    );
+    let Ok(r) = res else { return "could not split a view pane".into() };
+    let Some(pane) = r.get("pane").and_then(|p| p.get("pane_id")).and_then(|x| x.as_str()) else {
+        return "split reported no pane".into();
+    };
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "wsp".into());
+    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": VIEW_LABEL }));
+    let _ = herdr::call(
+        "pane.send_text",
+        json!({ "pane_id": pane, "text": format!("exec {} view\n", shell_quote(&exe)) }),
+    );
+    String::new()
+}
+
+/// Run this binary against the store and report in a few words.
+///
+/// Output is captured, never inherited: the panel owns an alternate screen in
+/// raw mode, and a subcommand printing into it would corrupt the frame. stdin
+/// is closed so nothing can sit waiting for input the panel will never send.
+/// What a command did: a line for the footer, and the id of whatever it made,
+/// when it made something.
+pub(super) struct Made {
+    pub(super) label: String,
+    pub(super) id: Option<String>,
+}
+
+pub(super) fn run_wsp(argv: &[String]) -> Result<Made, String> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "wsp".into());
+    let out = Command::new(exe)
+        .args(argv)
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match out {
+        // Ask for JSON so a caller can learn what was made. Nothing prints it;
+        // the panel owns the screen and stdout here is data, not output.
+        Ok(o) if o.status.success() => {
+            let made = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+                .and_then(|v| {
+                    v.get("id")
+                        .or_else(|| v.get("removed"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                });
+            Ok(Made { label: argv.join(" "), id: made })
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let first = err.lines().next().unwrap_or("failed").trim();
+            Err(first.strip_prefix("wsp: ").unwrap_or(first).to_string())
+        }
+        Err(e) => Err(format!("cannot run wsp: {e}")),
+    }
+}
+
+/// Reading the key map. Everything that is not scrolling or closing is
+/// swallowed: the map is open precisely because you are not sure what a key
+/// does, which is the worst possible moment for one of them to fire.
+pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
+    let n = ui.rows.len();
+    let target = ui.selected_target();
+
+    // Which project a new task should land in, read from wherever the cursor
+    // is: a project takes it directly, a task hands over its own project, and
+    // the inbox means deliberately none.
+    let scope = |t: &Target, ui: &Ui| -> Option<Option<String>> {
+        match t {
+            Target::Project(p) => Some(Some(p.clone())),
+            Target::Inbox => Some(None),
+            Target::Task(id) => Some(ui.project_of_task(id)),
+            _ => None,
+        }
+    };
+
+    match k {
+        // `q` and Esc both mean "put away what is in front of me", and the
+        // panel itself is never that. It is installed furniture in every
+        // workspace, so quitting it by a stray keystroke costs a reinstall and
+        // buys nothing — `ctrl-c` still does it, and `wsp panel uninstall` is
+        // the deliberate way. The map goes first, then the detail pane.
+        Key::Char('q') | Key::Esc if view.help => {
+            view.help = false;
+            Effect::None
+        }
+        Key::Char('q') | Key::Esc if view.showing.is_some() => Effect::CloseView,
+        Key::Char('q') => {
+            say(ui, "nothing to close · ctrl-c quits the panel");
+            Effect::None
+        }
+        Key::Esc => Effect::CloseView,
+        Key::Interrupt => Effect::Quit,
+
+        Key::Down | Key::Char('j') => move_or_fold(Key::Down, ui, view),
+        Key::Up | Key::Char('k') => move_or_fold(Key::Up, ui, view),
+        Key::Left | Key::Char('h') => move_or_fold(Key::Left, ui, view),
+        Key::Right | Key::Char('l') => move_or_fold(Key::Right, ui, view),
+        Key::Char('g') | Key::Home => {
+            ui.sel = 0;
+            Effect::None
+        }
+        Key::Char('G') | Key::End => {
+            ui.sel = n.saturating_sub(1);
+            Effect::None
+        }
+
+        Key::Enter => match &target {
+            // An overflow row has nothing to look at; opening it is the only
+            // thing it does.
+            Target::Overflow(_) => move_or_fold(Key::Right, ui, view),
+            // A pane's detail *is* the terminal. Going there beats describing it.
+            Target::Pane(_) => match ui.rows.get(ui.sel).and_then(|r| r.agent()) {
+                Some(a) => Effect::Focus(a.clone()),
+                None => Effect::None,
+            },
+            // Pressing it again on the thing already open shuts the pane, so
+            // the same key both opens and closes and nothing has to be
+            // remembered.
+            Target::Task(id) => toggle(view, crate::detail::Focus::Task(id.clone())),
+            Target::Project(p) => toggle(view, crate::detail::Focus::Project(p.clone())),
+            Target::Inbox | Target::Unattached | Target::Nothing => {
+                say(ui, "nothing to open there");
+                Effect::None
+            }
+        },
+
+        Key::Char(d @ '1'..='9') => {
+            let want = d as u8 - b'0';
+            match hotkeys(&ui.rows)
+                .iter()
+                .position(|k| *k == Some(want))
+                .and_then(|i| ui.rows[i].agent())
+            {
+                Some(a) => Effect::Focus(a.clone()),
+                None => Effect::None,
+            }
+        }
+
+        // ---- view ----
+        Key::Char('A') => {
+            view.show_done = !view.show_done;
+            say(ui, if view.show_done { "showing done" } else { "hiding done" });
+            Effect::Refetch
+        }
+        Key::Char('r') => Effect::Sync,
+        // Nothing else changes while it is up: the tree keeps the cursor, and
+        // every key on the map still does what the map says it does — which is
+        // the only way to read one and act on it in the same breath.
+        Key::Char('?') => {
+            view.help = !view.help;
+            Effect::None
+        }
+
+        // ---- create ----
+        // On a task the scope is *beneath* it. A sibling is one row away — the
+        // project heading above, or any task in it — but nothing else reaches
+        // a sub-task, and decomposing work you are looking at is the commoner
+        // move by far.
+        Key::Char('a') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Prompt {
+                    verb: Ask::AddTask {
+                        project: ui.project_of_task(id),
+                        parent: Some(id.clone()),
+                    },
+                    buffer: String::new(),
+                };
+                Effect::None
+            }
+            other => match scope(other, ui) {
+                Some(project) => {
+                    view.mode = Mode::Prompt {
+                        verb: Ask::AddTask { project, parent: None },
+                        buffer: String::new(),
+                    };
+                    Effect::None
+                }
+                None => {
+                    say(ui, "nowhere to add that");
+                    Effect::None
+                }
+            },
+        },
+        Key::Char('P') => {
+            let parent = match &target {
+                Target::Project(p) => Some(p.clone()),
+                _ => None,
+            };
+            view.mode = Mode::Prompt { verb: Ask::NewProject { parent }, buffer: String::new() };
+            Effect::None
+        }
+
+        // ---- status, one key each ----
+        Key::Char('s') => task_verb(&target, ui, "start"),
+        Key::Char('v') => task_verb(&target, ui, "review"),
+        Key::Char('d') => task_verb(&target, ui, "done"),
+        Key::Char('o') => task_verb(&target, ui, "reopen"),
+
+        // ---- typed ----
+        Key::Char('b') => match &target {
+            Target::Task(id) => {
+                view.mode =
+                    Mode::Prompt { verb: Ask::Block { task: id.clone() }, buffer: String::new() };
+                Effect::None
+            }
+            _ => {
+                say(ui, "only a task can be blocked");
+                Effect::None
+            }
+        },
+        Key::Char('e') => match &target {
+            Target::Task(id) => {
+                view.mode =
+                    Mode::Prompt { verb: Ask::Rename { task: id.clone() }, buffer: String::new() };
+                Effect::None
+            }
+            _ => {
+                say(ui, "only a task can be retitled here");
+                Effect::None
+            }
+        },
+        Key::Char('n') => match &target {
+            Target::Task(id) => {
+                view.mode =
+                    Mode::Prompt { verb: Ask::Note { task: id.clone() }, buffer: String::new() };
+                Effect::None
+            }
+            _ => {
+                say(ui, "notes go on a task");
+                Effect::None
+            }
+        },
+
+        // ---- picked ----
+        Key::Char('m') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Pick { verb: Pick::MoveTask { task: id.clone() } };
+                Effect::None
+            }
+            _ => {
+                say(ui, "only a task moves");
+                Effect::None
+            }
+        },
+        Key::Char('c') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Pick { verb: Pick::PaneForTask { task: id.clone() } };
+                Effect::None
+            }
+            Target::Pane(p) => {
+                view.mode = Mode::Pick { verb: Pick::TaskForPane { pane: p.clone() } };
+                Effect::None
+            }
+            _ => {
+                say(ui, "claim joins a task to an agent");
+                Effect::None
+            }
+        },
+
+        // ---- pop out, full size, in an editor ----
+        Key::Char('E') => match &target {
+            // `wsp edit`, not the file: it opens the prose and keeps the
+            // frontmatter out of reach, which is the difference between a typo
+            // and a task the tools can no longer read.
+            Target::Task(id) => Effect::PopOut {
+                argv: vec!["edit".into(), id.clone()],
+                label: id.clone(),
+            },
+            Target::Project(p) => Effect::PopOut {
+                argv: vec!["project".into(), "edit".into(), p.clone()],
+                label: p.clone(),
+            },
+            _ => {
+                say(ui, "nothing there to open");
+                Effect::None
+            }
+        },
+
+        // ---- open a workspace for this row ----
+        Key::Char('O') => match &target {
+            Target::Task(id) => {
+                let project = ui.project_of_task(id);
+                match ui.task_title(id) {
+                    Some(title) => Effect::Open {
+                        label: title,
+                        cwd: project.as_deref().and_then(|p| ui.project_root(p)),
+                        project,
+                        task: Some(id.clone()),
+                    },
+                    None => Effect::None,
+                }
+            }
+            Target::Project(p) => Effect::Open {
+                label: p.clone(),
+                cwd: ui.project_root(p),
+                project: Some(p.clone()),
+                task: None,
+            },
+            _ => {
+                say(ui, "nothing there to open a workspace for");
+                Effect::None
+            }
+        },
+
+        // ---- destructive ----
+        Key::Char('X') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Confirm {
+                    argv: vec!["rm".into(), id.clone()],
+                    question: format!("retire {id}?"),
+                    escalate: None,
+                };
+                Effect::None
+            }
+            Target::Project(p) => {
+                // Deliberately without --force. If the project still holds
+                // work the CLI refuses, and that refusal becomes the next
+                // question rather than something the panel quietly overrode.
+                view.mode = Mode::Confirm {
+                    argv: vec!["project".into(), "rm".into(), p.clone()],
+                    question: format!("remove {p}?"),
+                    escalate: Some(vec![
+                        "project".into(),
+                        "rm".into(),
+                        p.clone(),
+                        "--force".into(),
+                    ]),
+                };
+                Effect::None
+            }
+            _ => {
+                say(ui, "nothing there to remove");
+                Effect::None
+            }
+        },
+
+        _ => Effect::None,
+    }
+}
+
+/// `↵` on what is already open means close it.
+pub(super) fn toggle(view: &mut View, want: crate::detail::Focus) -> Effect {
+    if view.showing.as_ref() == Some(&want) {
+        Effect::CloseView
+    } else {
+        Effect::Inspect(want)
+    }
+}
+
+/// Status verbs all have the same shape: one key, a task, no input.
+pub(super) fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
+    match target {
+        Target::Task(id) => Effect::Run {
+            argv: vec![verb.to_string(), id.clone()],
+            // `done` on a parent with open sub-tasks is refused by the CLI.
+            // Carry the stronger form so that refusal becomes the next
+            // question — the same shape `X` on a project already takes, and
+            // the reason the panel never has to know the rule itself.
+            escalate: (verb == "done")
+                .then(|| vec![verb.to_string(), id.clone(), "--force".into()]),
+        },
+        _ => {
+            say(ui, format!("{verb} needs a task"));
+            Effect::None
+        }
+    }
+}
