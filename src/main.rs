@@ -192,6 +192,7 @@ fn main() {
         "ls" | "list" => cmd_task::list(&store, &args),
         "inbox" => cmd_task::inbox(&store, &args),
         "show" | "cat" => cmd_task::show(&store, &args),
+        "decide" => cmd_task::decide(&store, &args),
         "note" => cmd_task::note(&store, &args),
         "start" | "doing" => cmd_task::set_status(&store, &args, model::Status::Doing),
         "done" | "close" => cmd_task::done(&store, &args),
@@ -264,6 +265,7 @@ fn help() {
   wsp start|review|reopen <id>      move through the workflow
   wsp done <id> [--force]           complete; --force over open sub-tasks
   wsp block <id> "reason"           park it, and say why
+  wsp decide <task|proj> "…"      record what was settled, and why
   wsp note <id> "text"              append to the log
   wsp edit <id> [--overview|--details]   prose, in $EDITOR
   wsp edit <id> --overview --from F|-    …or from a file, or stdin

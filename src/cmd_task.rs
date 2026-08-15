@@ -341,8 +341,20 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         // migration leaves, so a task never loses every sign it was worked.
         println!("{} {}", p.dim(&util::pad("worked", 9)), worked_line(w));
     }
-    if !t.body.trim().is_empty() {
-        println!("\n{}", t.body.trim());
+    // Decisions first and in their own block: on a task they are what was
+    // settled about this work, and burying them mid-body between Details and
+    // the log is how a reader misses the one line that would have stopped them.
+    let decided = crate::model::decisions(&t.body);
+    if !decided.is_empty() {
+        println!("\n{}", p.dim("DECISIONS"));
+        for (when, what) in &decided {
+            println!("  {}  {}", p.dim(&util::pad(when, 10)), what);
+        }
+    }
+    let mut rest = t.body.clone();
+    crate::model::set_section_in(&mut rest, "Decisions", "");
+    if !rest.trim().is_empty() {
+        println!("\n{}", rest.trim());
     }
     0
 }
@@ -445,6 +457,58 @@ pub fn note(store: &Store, args: &Args) -> i32 {
         return 2;
     }
     mutate(store, args, "note", |t| t.log(text.trim()))
+}
+
+/// `wsp decide <id> "…"` — record what was settled, on a task or a project.
+///
+/// Takes either, because the two are the same act at different heights: a
+/// decision about *this piece of work* belongs on the task, and one that binds
+/// everything under a heading belongs on the project, where the agent who has
+/// not read this task will still meet it. Resolving a task first and falling
+/// back to a project keeps one verb for both — `wsp decide wsp "…"` and
+/// `wsp decide 022 "…"` are the same sentence about different scopes.
+///
+/// Append-only by construction: there is no `wsp undecide`. A decision that
+/// turns out wrong is superseded by a later one saying so, which is the honest
+/// record — the reasoning that was live at the time is what a reader three
+/// months on needs, not a tidied conclusion.
+pub fn decide(store: &Store, args: &Args) -> i32 {
+    let text = args.text(1);
+    if text.trim().is_empty() {
+        eprintln!("usage: wsp decide <task|project> \"what was settled, and why\"");
+        return 2;
+    }
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp decide <task|project> \"what was settled, and why\"");
+        return 2;
+    };
+
+    if store.find_task(&needle).is_some() {
+        return mutate(store, args, "decided", |t| {
+            crate::model::append_dated(&mut t.body, "Decisions", text.trim())
+        });
+    }
+
+    let index = Index::new(store.projects());
+    let Some(mut p) = index.find(&needle).cloned() else {
+        eprintln!("wsp: no task or project matching `{needle}`");
+        return 1;
+    };
+    crate::model::append_dated(&mut p.body, "Decisions", text.trim());
+    if let Err(e) = store.save_project(&p) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("project-decided", json!({ "id": p.id, "text": text.trim() }));
+    store.git_commit(&format!("wsp: decide {} — {}", p.id, util::truncate(text.trim(), 60)));
+
+    if args.json() {
+        println!("{}", json!({ "project": p.id, "decisions": crate::model::decisions(&p.body).len() }));
+    } else {
+        let paint = Paint::new();
+        println!("{} {}  {}", paint.cyan("◆"), paint.bold(&p.id), util::truncate(text.trim(), 60));
+    }
+    0
 }
 
 pub fn mv(store: &Store, args: &Args) -> i32 {

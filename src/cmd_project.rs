@@ -283,6 +283,17 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         println!("{}  {}", p.dim(util::pad("children", 8).as_str()), names.join(" "));
     }
 
+    // Above the task list, not below the prose: a decision is a constraint on
+    // what may be done next, so it has to be read before the list of things
+    // somebody might pick up.
+    let decided = crate::model::decisions(&proj.body);
+    if !decided.is_empty() {
+        println!("\n{}", p.dim("DECISIONS"));
+        for (when, what) in &decided {
+            println!("  {}  {}", p.dim(&util::pad(when, 10)), what);
+        }
+    }
+
     if !mine.is_empty() {
         println!("\n{}", p.dim("OPEN TASKS"));
         for t in &mine {
@@ -294,8 +305,12 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             );
         }
     }
-    if !proj.body.trim().is_empty() {
-        println!("\n{}", proj.body.trim());
+    // The rest of the prose, with the decisions taken out — they are above,
+    // and printing them twice would teach the reader to skip one of them.
+    let mut rest = proj.body.clone();
+    crate::model::set_section_in(&mut rest, "Decisions", "");
+    if !rest.trim().is_empty() {
+        println!("\n{}", rest.trim());
     }
     0
 }

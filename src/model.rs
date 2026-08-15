@@ -223,18 +223,71 @@ pub fn set_section_in(body: &mut String, name: &str, text: &str) {
     *body = out;
 }
 
-/// True when either prose section carries anything — what the tree uses to
-/// mark a row as having something written on it.
+/// True when any written section carries anything — what the tree uses to mark
+/// a row as having something worth reading on it.
+///
+/// `Decisions` counts. A row whose only prose is a decision is precisely the
+/// row you want the mark on: somebody settled something here, and the next
+/// person to pick it up needs to know before they start rather than after.
+/// `Log` does not — every task acquires one by being worked, so it would mark
+/// everything and therefore nothing.
 pub fn has_prose(body: &str) -> bool {
-    section_of(body, "Overview").is_some() || section_of(body, "Details").is_some()
+    ["Overview", "Details", "Decisions"].iter().any(|s| section_of(body, s).is_some())
 }
 
-/// The headings a task body carries, in the order they are written.
+/// The headings a task or project body carries, in the order they are written.
 ///
-/// `Overview` is what the task is — written once, read to re-enter it later.
+/// `Overview` is what the thing is — written once, read to re-enter it later.
 /// `Details` is working material: criteria, links, whatever the work needs.
+/// `Decisions` is what was settled and now binds: dated, append-only, and not
+/// to be edited, because a decision that can be quietly rewritten is not a
+/// record of anything.
 /// `Log` is the dated, append-only trail and is never edited by hand.
-pub const SECTIONS: [&str; 3] = ["Overview", "Details", "Log"];
+///
+/// `Decisions` sits before `Log` deliberately. The log is where a thing has
+/// been; a decision is a constraint on where it can go, which is worth reading
+/// before the history rather than after it — and it keeps `Log` last, which is
+/// what lets [`Task::log`] go on appending to the end of the body.
+pub const SECTIONS: [&str; 4] = ["Overview", "Details", "Decisions", "Log"];
+
+/// Append a dated line under `## <section>`, adding the section if it is not
+/// there. Written through [`set_section_in`], so the body comes back in
+/// canonical order however out of order it was.
+pub fn append_dated(body: &mut String, section: &str, line: &str) {
+    let mut text = section_of(body, section).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("- {} {}\n", util::today_ymd(), line));
+    set_section_in(body, section, &text);
+}
+
+/// The `## Decisions` entries, oldest first, as `(date, text)`.
+///
+/// Split here rather than in the renderers: every one of them wants to dim the
+/// date, or truncate the text to a width, or both, and a caller handed a whole
+/// line would have to take it apart again to do either. Same bargain as
+/// `worked_line` — the record goes in, the sentence comes out where it is
+/// shown.
+///
+/// A line with no leading date is not dropped. It comes back with an empty
+/// date, because a decision somebody wrote by hand is still a decision and
+/// losing it to a formatting rule would be the worst thing this could do.
+pub fn decisions(body: &str) -> Vec<(String, String)> {
+    let ymd = |s: &str| {
+        s.len() == 10 && s.chars().all(|c| c.is_ascii_digit() || c == '-')
+    };
+    section_of(body, "Decisions")
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .map(|l| match l.split_once(' ') {
+            Some((d, rest)) if ymd(d) => (d.to_string(), rest.trim().to_string()),
+            _ => (String::new(), l),
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Task {
@@ -361,4 +414,63 @@ impl Task {
 
 fn fm_key_refs() -> &'static str {
     "refs"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decision_lands_in_its_own_section_before_the_log() {
+        let mut b = String::from("## Overview\nwhat this is\n\n## Log\n- 2026-08-14 claimed\n");
+        append_dated(&mut b, "Decisions", "we are not doing worktrees yet");
+        let heads: Vec<&str> = b.lines().filter(|l| l.starts_with("## ")).collect();
+        assert_eq!(heads, ["## Overview", "## Decisions", "## Log"], "canonical order");
+        // Log stays last, which is what lets Task::log go on appending to the end.
+        assert!(b.trim_end().ends_with("- 2026-08-14 claimed"));
+    }
+
+    #[test]
+    fn decisions_come_back_as_date_and_text() {
+        let mut b = String::new();
+        append_dated(&mut b, "Decisions", "render and data are separate sub-projects");
+        let got = decisions(&b);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.len(), 10, "a yyyy-mm-dd date");
+        assert_eq!(got[0].1, "render and data are separate sub-projects");
+    }
+
+    #[test]
+    fn they_accumulate_oldest_first() {
+        let mut b = String::new();
+        append_dated(&mut b, "Decisions", "first");
+        append_dated(&mut b, "Decisions", "second");
+        let texts: Vec<String> = decisions(&b).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(texts, ["first", "second"]);
+    }
+
+    /// Somebody will write one by hand. Losing it to a formatting rule would be
+    /// the worst thing this code could do.
+    #[test]
+    fn an_undated_line_is_kept_rather_than_dropped() {
+        let b = String::from("## Decisions\n- no date on this one\nnor a bullet here\n");
+        let got = decisions(&b);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], (String::new(), "no date on this one".to_string()));
+        assert_eq!(got[1], (String::new(), "nor a bullet here".to_string()));
+    }
+
+    #[test]
+    fn no_decisions_is_an_empty_list_not_an_empty_entry() {
+        assert!(decisions("## Overview\nsomething\n").is_empty());
+        assert!(decisions("").is_empty());
+    }
+
+    /// The mark in the tree means "something is written here". A decision is
+    /// exactly that; a log is not, since every task grows one by being worked.
+    #[test]
+    fn a_decision_alone_marks_a_row_as_written_on() {
+        assert!(has_prose("## Decisions\n- 2026-08-15 settled\n"));
+        assert!(!has_prose("## Log\n- 2026-08-15 claimed\n"));
+    }
 }

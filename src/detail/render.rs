@@ -240,7 +240,7 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     // The prose, in the order it is written: what this is, then what the work
     // needs. Both are optional and an empty one draws nothing rather than an
     // empty heading.
-    for name in ["Overview", "Details"] {
+    for name in ["Overview", "Details", "Decisions"] {
         if let Some(text) = t.section(name) {
             out.push(Line::default());
             out.push(heading(&name.to_lowercase()));
@@ -312,7 +312,7 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
 
     // A project's prose, same as a task's — it is the same machinery now, and
     // a project is the natural home for "what is this and why".
-    for name in ["Overview", "Details"] {
+    for name in ["Overview", "Details", "Decisions"] {
         if let Some(text) = p.section(name) {
             out.push(Line::default());
             out.push(heading(&name.to_lowercase()));

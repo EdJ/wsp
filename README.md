@@ -312,13 +312,37 @@ constants and `Style` values the rows draw with, so it cannot drift.
 ## What a task or project file holds
 
 Frontmatter is a contract — `id`, `status`, `schema` — and every field in it has
-a command that sets it correctly. The body is yours, and carries three sections:
+a command that sets it correctly. The body is yours, and carries four sections:
 
 | Section | For |
 |---|---|
 | `## Overview` | what the task is, written once, read to re-enter it |
 | `## Details` | working material — criteria, links, whatever the work needs |
+| `## Decisions` | what was settled and now binds; `wsp decide` writes it |
 | `## Log` | dated, append-only; `wsp note` writes it, nothing edits it |
+
+```sh
+wsp decide 022 "parked rather than dropped — the mechanism is right, the moment is not"
+wsp decide wsp "the backlog is split into render and data, and here is what that means"
+```
+
+A decision is not a task and not a note. A task is work that completes; a
+decision never does, so filing one as a task leaves it open in every list for
+ever. A note lives on one task, where a decision that binds a whole project
+cannot be found by the agent who needs it — which is the agent about to do the
+thing the decision rules out. So `wsp decide` takes either a task or a project:
+the same sentence, at the height it applies.
+
+It is not a file beside the code, either. `ARCHITECTURE.md` and its kind stay in
+the repo, because they describe the implementation and travel with it. A
+decision is about the *work*, and work lives in the store.
+
+Dated and append-only, like the log, and for the same reason: there is no `wsp
+undecide`. A decision that turns out wrong is superseded by a later one saying
+so, which is the honest record — what a reader three months on needs is the
+reasoning that was live at the time, not a tidied conclusion. It sits above the
+task list in `wsp project show`, because it is a constraint on what may be
+picked up next and belongs in front of the list of things somebody might pick.
 
 ```sh
 wsp edit <id>                    # both sections, headings included
