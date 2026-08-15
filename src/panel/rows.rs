@@ -767,10 +767,22 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             .as_ref()
             .and_then(|id| tasks.iter().find(|t| &t.id == id))
             .and_then(|t| t.project.clone());
+        // The claim is per workspace and the binding per pane, so a
+        // workspace with three shells in it places all three by the task it
+        // holds — which is the whole of what `adopt` wrote down and nothing
+        // was reading.
         let r = resolve::resolve(
             &index,
             pins,
-            bound_project,
+            resolve::Held {
+                binding: bound_project,
+                claim: resolve::claimed_project(
+                    &snap.claims,
+                    &tasks,
+                    Some(&a.workspace_id),
+                    Some(&ws_label(&a.workspace_id)),
+                ),
+            },
             Some(&a.workspace_id),
             Some(&ws_label(&a.workspace_id)),
             Some(&a.cwd),

@@ -88,12 +88,23 @@ pub fn current_project(
     let r = resolve::resolve(
         index,
         &pins,
-        bound_project,
+        resolve::Held {
+            binding: bound_project,
+            claim: resolve::claimed_project(
+                &store.claims(),
+                &store.tasks(),
+                env.workspace_id.as_deref(),
+                None,
+            ),
+        },
         env.workspace_id.as_deref(),
         None,
         cwd.as_deref(),
     );
-    if matches!(r.source, "pin" | "binding") && r.project.is_some() {
+    // A claim is work in hand, like a binding, so it stands with the binding
+    // above the mandate: what this workspace is *doing* beats what it is *for*
+    // for as long as it is holding it.
+    if matches!(r.source, "pin" | "binding" | "claim") && r.project.is_some() {
         return Ok(r.project);
     }
     if mandate.is_some() {
@@ -914,7 +925,15 @@ pub fn where_am_i(store: &Store, args: &Args) -> i32 {
     let r = resolve::resolve(
         &index,
         &pins,
-        bound_task.as_ref().and_then(|t| t.project.clone()),
+        resolve::Held {
+            binding: bound_task.as_ref().and_then(|t| t.project.clone()),
+            claim: resolve::claimed_project(
+                &store.claims(),
+                &store.tasks(),
+                env.workspace_id.as_deref(),
+                label.as_deref(),
+            ),
+        },
         env.workspace_id.as_deref(),
         label.as_deref(),
         cwd.as_deref(),
@@ -969,6 +988,7 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
     let tasks = store.tasks();
     let bindings = store.bindings();
+    let claims = store.claims();
     let pins = store.pins();
 
     let agents = if herdr::available() { herdr::agents().unwrap_or_default() } else { Vec::new() };
@@ -996,7 +1016,15 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
         let r = resolve::resolve(
             &index,
             &pins,
-            bound.and_then(|t| t.project.clone()),
+            resolve::Held {
+                binding: bound.and_then(|t| t.project.clone()),
+                claim: resolve::claimed_project(
+                    &claims,
+                    &tasks,
+                    Some(&a.workspace_id),
+                    label.as_deref(),
+                ),
+            },
             Some(&a.workspace_id),
             label.as_deref(),
             Some(&a.cwd),
@@ -1589,7 +1617,14 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
             .project_for_label(&w.label)
             .or_else(|| index.project_for_cwd(&pane.cwd))
             .or_else(|| {
-                resolve::resolve(&index, &pins, None, Some(&w.id), Some(&w.label), Some(&pane.cwd))
+                resolve::resolve(
+                    &index,
+                    &pins,
+                    resolve::Held::default(),
+                    Some(&w.id),
+                    Some(&w.label),
+                    Some(&pane.cwd),
+                )
                     .project
             });
         plan.push((w.id.clone(), w.label.clone(), project, pane.pane_id.clone()));

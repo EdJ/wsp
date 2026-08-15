@@ -321,10 +321,67 @@ pub struct Resolution {
 /// which only means nothing has been decided.
 pub const TOP_LEVEL: &str = "(top)";
 
+/// The work in hand, in the two places it is written down.
+///
+/// A binding says which task a *pane* is working. A claim says which task a
+/// *workspace* is working: the same fact one level up, and the only thing that
+/// tells ten shells sharing one folder apart. They travel together because
+/// resolution reads them together, and as one value rather than two arguments
+/// of the same type, which are a swap waiting to happen at a call site.
+#[derive(Default, Clone)]
+pub struct Held {
+    pub binding: Option<String>,
+    pub claim: Option<String>,
+}
+
+
+/// The project of the task this workspace holds, if it holds one.
+///
+/// Matched on the workspace id first and its label second — the label is what
+/// survives a workspace being rebuilt under a new id, which is the same
+/// fallback `reconcile` uses to find a claim's pane again. A claim made on
+/// another machine says nothing about this one, and a claim on work that is
+/// finished is not work in hand: both are passed over. Of what is left, the
+/// most recent claim wins, because a workspace that has moved on from one task
+/// to the next is doing the second.
+pub fn claimed_project(
+    claims: &BTreeMap<String, serde_json::Value>,
+    tasks: &[Task],
+    workspace_id: Option<&str>,
+    workspace_label: Option<&str>,
+) -> Option<String> {
+    let host = util::hostname();
+    let mut best: Option<(&str, String)> = None;
+    for (task_id, c) in claims {
+        let get = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        if !get("host").is_empty() && get("host") != host {
+            continue;
+        }
+        let names_it = match (workspace_id, workspace_label) {
+            (Some(id), _) if !id.is_empty() && get("workspace_id") == id => true,
+            (_, Some(l)) if !l.is_empty() && get("workspace_label") == l => true,
+            _ => false,
+        };
+        if !names_it {
+            continue;
+        }
+        let Some(t) = tasks.iter().find(|t| &t.id == task_id) else { continue };
+        if !t.status().is_open() {
+            continue;
+        }
+        let Some(project) = t.project.clone() else { continue };
+        let at = get("claimed_at");
+        if best.as_ref().map(|(seen, _)| at > *seen).unwrap_or(true) {
+            best = Some((get("claimed_at"), project));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 pub fn resolve(
     index: &Index,
     pins: &BTreeMap<String, String>,
-    binding_project: Option<String>,
+    held: Held,
     workspace_id: Option<&str>,
     workspace_label: Option<&str>,
     cwd: Option<&str>,
@@ -339,9 +396,18 @@ pub fn resolve(
             }
         }
     }
-    if let Some(p) = binding_project {
+    if let Some(p) = held.binding {
         if index.get(&p).is_some() {
             return Resolution { project: Some(p), source: "binding" };
+        }
+    }
+    // Above the directory, deliberately. A shell started in the folder ten
+    // workspaces share is standing there in the shallowest sense — the claim is
+    // what somebody said this workspace is doing, and it is the reason the
+    // folder is not the answer.
+    if let Some(p) = held.claim {
+        if index.get(&p).is_some() {
+            return Resolution { project: Some(p), source: "claim" };
         }
     }
     if let Some(c) = cwd {
@@ -355,4 +421,154 @@ pub fn resolve(
         }
     }
     Resolution { project: None, source: "none" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The world this exists for: eleven workspaces whose shells all started in
+    /// one folder, each holding a claim on work in a different project.
+    fn index() -> Index {
+        let mut vst = Project::new("vst");
+        vst.roots = vec!["/home/ed/claude/vst".into()];
+        let mut trance = Project::new("trance");
+        trance.parent = Some("vst".into());
+        trance.roots = vec!["/home/ed/claude/trance".into()];
+        Index::new(vec![vst, trance])
+    }
+
+    fn task(id: &str, project: &str, status: &str) -> Task {
+        let mut t = Task::new("Trance Video", id);
+        t.project = Some(project.into());
+        t.status_raw = status.into();
+        t
+    }
+
+    fn claim(ws: &str, label: &str, at: &str) -> serde_json::Value {
+        json!({
+            "workspace_id": ws,
+            "workspace_label": label,
+            "claimed_at": at,
+            "host": util::hostname(),
+        })
+    }
+
+    fn claims(pairs: &[(&str, serde_json::Value)]) -> BTreeMap<String, serde_json::Value> {
+        pairs.iter().map(|(t, c)| ((*t).to_string(), c.clone())).collect()
+    }
+
+    fn held(cl: &BTreeMap<String, serde_json::Value>, tasks: &[Task], ws: &str, label: &str) -> Held {
+        Held { binding: None, claim: claimed_project(cl, tasks, Some(ws), Some(label)) }
+    }
+
+    /// A shell in the folder ten workspaces share is standing there in the
+    /// shallowest sense. What the workspace is holding is what it is doing.
+    #[test]
+    fn a_claim_places_a_pane_the_directory_cannot() {
+        let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
+        let tasks = vec![task("t-1", "trance", "doing")];
+        let r = resolve(
+            &index(),
+            &BTreeMap::new(),
+            held(&cl, &tasks, "w7", "Trance Video"),
+            Some("w7"),
+            Some("Trance Video"),
+            Some("/home/ed/claude/vst"),
+        );
+        assert_eq!(r.project.as_deref(), Some("trance"));
+        assert_eq!(r.source, "claim");
+
+        // And with nothing claimed it is the folder again, unchanged.
+        let r = resolve(
+            &index(),
+            &BTreeMap::new(),
+            Held::default(),
+            Some("w7"),
+            Some("Trance Video"),
+            Some("/home/ed/claude/vst"),
+        );
+        assert_eq!(r.project.as_deref(), Some("vst"));
+        assert_eq!(r.source, "cwd");
+    }
+
+    /// A pane working something of its own is not doing what the workspace
+    /// around it is doing. The narrower fact wins, as it always has.
+    #[test]
+    fn a_panes_own_binding_beats_the_workspaces_claim() {
+        let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
+        let tasks = vec![task("t-1", "trance", "doing")];
+        let mut h = held(&cl, &tasks, "w7", "Trance Video");
+        h.binding = Some("vst".into());
+        let r = resolve(&index(), &BTreeMap::new(), h, Some("w7"), Some("Trance Video"), None);
+        assert_eq!(r.project.as_deref(), Some("vst"));
+        assert_eq!(r.source, "binding");
+    }
+
+    /// A pin is a statement about what a workspace *is*, and it outranks every
+    /// statement about what it is doing.
+    #[test]
+    fn a_pin_still_beats_a_claim() {
+        let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
+        let tasks = vec![task("t-1", "trance", "doing")];
+        let pins: BTreeMap<String, String> = [("w7".to_string(), "vst".to_string())].into();
+        let r = resolve(
+            &index(),
+            &pins,
+            held(&cl, &tasks, "w7", "Trance Video"),
+            Some("w7"),
+            Some("Trance Video"),
+            None,
+        );
+        assert_eq!(r.project.as_deref(), Some("vst"));
+        assert_eq!(r.source, "pin");
+    }
+
+    /// Finished work is not work in hand. A claim nobody released would
+    /// otherwise go on placing a workspace for as long as the file survived.
+    #[test]
+    fn a_claim_on_finished_work_places_nothing() {
+        let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
+        let tasks = vec![task("t-1", "trance", "done")];
+        assert_eq!(claimed_project(&cl, &tasks, Some("w7"), Some("Trance Video")), None);
+    }
+
+    /// Claims are machine-local — a workspace id on the laptop means nothing
+    /// here — and the store is shared between both.
+    #[test]
+    fn a_claim_from_another_machine_is_not_this_machines_business() {
+        let mut c = claim("w7", "Trance Video", "2026-08-14T10:00:00Z");
+        c["host"] = json!("somebody-elses-mac");
+        let cl = claims(&[("t-1", c)]);
+        let tasks = vec![task("t-1", "trance", "doing")];
+        assert_eq!(claimed_project(&cl, &tasks, Some("w7"), Some("Trance Video")), None);
+    }
+
+    /// A workspace rebuilt under a new id keeps its label, which is why
+    /// `reconcile` looks it up both ways and why this does too.
+    #[test]
+    fn a_claim_is_found_again_by_label_when_the_id_has_changed() {
+        let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
+        let tasks = vec![task("t-1", "trance", "doing")];
+        assert_eq!(
+            claimed_project(&cl, &tasks, Some("w22"), Some("Trance Video")).as_deref(),
+            Some("trance")
+        );
+    }
+
+    /// Two claims on one workspace is a workspace that moved from one task to
+    /// the next and left the first behind. It is doing the second.
+    #[test]
+    fn the_most_recent_of_two_claims_is_the_one_being_worked() {
+        let cl = claims(&[
+            ("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z")),
+            ("t-2", claim("w7", "Trance Video", "2026-08-15T09:00:00Z")),
+        ]);
+        let tasks = vec![task("t-1", "vst", "doing"), task("t-2", "trance", "doing")];
+        assert_eq!(
+            claimed_project(&cl, &tasks, Some("w7"), Some("Trance Video")).as_deref(),
+            Some("trance")
+        );
+    }
 }

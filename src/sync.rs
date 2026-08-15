@@ -50,6 +50,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
     let counts = resolve::counts_by_project(&index, &tasks);
     let pins = store.pins();
     let bindings = store.bindings();
+    let claims = store.claims();
 
     let workspaces = herdr::workspaces()?;
     let agents = herdr::agents()?;
@@ -92,7 +93,10 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         let r = resolve::resolve(
             &index,
             &pins,
-            bound_project,
+            resolve::Held {
+                binding: bound_project,
+                claim: resolve::claimed_project(&claims, &tasks, Some(&ws.id), Some(&ws.label)),
+            },
             Some(&ws.id),
             Some(&ws.label),
             cwd.as_deref(),

@@ -1008,11 +1008,11 @@ next   t-260815-009  review is the agent's terminal verb  wsp claim it
 It lives beside the claims, keyed on the workspace and the host, and it
 survives a restart — direction you have to repeat every morning is not standing
 direction, it is a reminder. In the resolution chain it sits at **pin > binding
-> mandate > cwd > label**: a pin says what a workspace *is* and a binding is the
-work actually in hand, but a mandate beats the directory a shell happens to be
-sitting in. It is deliberately not consulted when the panel places a pane in the
-tree — where a pane is standing is a fact about the pane, and standing direction
-says nothing about it.
+> claim > mandate > cwd > label**: a pin says what a workspace *is*, and a
+binding and a claim are the work actually in hand, but a mandate beats the
+directory a shell happens to be sitting in. It is deliberately not consulted
+when the panel places a pane in the tree — where a pane is standing is a fact
+about the pane, and standing direction says nothing about it.
 
 Scope is the project and everything under it, and containment reads **both
 ways** along the chain: a mandate on `data` while standing in `wsp` is in scope,
@@ -1228,9 +1228,17 @@ fast builds are a feature here, because a session-start hook runs this binary.
   new pane ids. One pane takes one claim there too: two claims naming the same
   workspace used to land on the same pane, and since claims are walked in id
   order the agent came back bound to the *older* task — the one it had left.
-- **cwd is not identity.** Five workspaces share `~/git/Easter`. Resolution order
-  is pin → binding → cwd → workspace label, so `wsp pin <project>` is the
-  override when a directory is ambiguous.
+- **cwd is not identity.** Five workspaces share `~/git/Easter` and eleven share
+  `~/claude/vst`. Resolution order is pin → binding → claim → cwd → workspace
+  label, so `wsp pin <project>` is the override when a directory is ambiguous.
+  The claim step is what usually answers first: a binding says which task a
+  *pane* holds and a claim says which task a *workspace* holds, and every pane
+  in a claimed workspace is placed by it. Without that step, twelve of the
+  twenty-one panes here piled under `vst` and the projects their workspaces were
+  named after — `trance`, `ein`, `verb`, `jolt` — showed no panes at all, while
+  the store had said where each of them belonged since the day `adopt` captured
+  them. A claim from another host, or on work that is finished, is not work in
+  hand and places nothing; of what is left the most recent wins.
 - **The archive never overwrites.** It files by id, so an id handed out twice
   put the second task straight on top of the first: four tasks shared one
   archived file here before anyone noticed the ids were being reused at all,

@@ -228,7 +228,15 @@ pub(crate) fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<
         resolve::resolve(
             &w.index,
             &w.pins,
-            task_of(&p.pane_id).and_then(|t| t.project.clone()),
+            resolve::Held {
+                binding: task_of(&p.pane_id).and_then(|t| t.project.clone()),
+                claim: resolve::claimed_project(
+                    &w.claims,
+                    &w.tasks,
+                    Some(&p.workspace_id),
+                    Some(&label_of(&p.workspace_id)),
+                ),
+            },
             Some(&p.workspace_id),
             Some(&label_of(&p.workspace_id)),
             Some(&p.cwd),
