@@ -439,6 +439,12 @@ names whoever is holding something and counts the rest — twenty of twenty-two
 panes here are shells that have sat in a directory since Tuesday, and naming
 them would push the two that matter off the bottom.
 
+`decided` carries what is already settled, and sits above the backlog rather
+than below it: a decision is a constraint on what may be picked up, so it
+belongs in front of the list of things to pick. It reads the whole project
+chain — a decision made on `wsp` binds work taken in `data`, exactly as a tag
+does and for the same reason, because the work is inside it.
+
 `under` is there because direction lands on a parent and the work happens a
 sub-task at a time, so the piece in hand is rarely the reason it is being done.
 A sub-task whose parent is also on the `open` list is left out of it — the

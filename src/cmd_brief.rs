@@ -31,6 +31,10 @@ const MAX_TASKS: usize = 6;
 const MAX_OTHERS: usize = 6;
 /// The standing rules, if the store carries any.
 const MAX_RULES: usize = 40;
+/// Decisions binding this project. Few, and the most recent — a decision is
+/// read to know what is already settled, and the settled thing that matters is
+/// rarely the oldest.
+const MAX_DECISIONS: usize = 4;
 
 /// The protocol an agent works to, kept in the store rather than in this
 /// binary. It is the user's to write, versioned with the tasks it talks about,
@@ -115,6 +119,13 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     });
     let shown = open.len().min(MAX_TASKS);
 
+    let decided: Vec<(String, String)> = path
+        .iter()
+        .filter_map(|id| index.get(id))
+        .flat_map(|proj| crate::model::decisions(&proj.body))
+        .collect();
+    let dropped = decided.len().saturating_sub(MAX_DECISIONS);
+
     // Everyone else, nearest first. `standing_beside` is the one definition
     // of that reckoning — `wsp overlap` and `wsp claim` read the same vector —
     // so the brief's only job is deciding what a briefing shows of it.
@@ -151,6 +162,7 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
                 "workspace": env.workspace_id,
                 "mandate": mandate,
                 "task": mine.map(|t| t.json()),
+                "decisions": decided.iter().map(|(w, t)| json!({ "date": w, "text": t })).collect::<Vec<_>>(),
                 "open": open.iter().map(|t| t.json()).collect::<Vec<_>>(),
                 "here": near.iter().map(|s| s.json()).collect::<Vec<_>>(),
                 "others": far.iter().map(|s| s.json()).collect::<Vec<_>>(),
@@ -226,6 +238,25 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
             }
         }
         None => row("you", p.dim("nothing claimed — wsp claim <id>, or wsp add \"…\" first").to_string()),
+    }
+
+    // What is already settled, before the list of things to pick up. A decision
+    // is a constraint on what may be taken, so it belongs in front of the
+    // backlog rather than after it — claude-92's argument for `project show`,
+    // and it applies here for the same reason.
+    //
+    // The whole chain, not just this project: a decision made on `wsp` binds
+    // what is picked up in `data`, exactly as a tag does, and for the same
+    // reason — the work is inside it.
+    for (i, (when, what)) in decided.iter().skip(dropped).enumerate() {
+        row(
+            if i == 0 { "decided" } else { "" },
+            format!("{} {}", p.dim(when), util::truncate(what, 56)),
+        );
+    }
+    if dropped > 0 {
+        let leaf = project.as_deref().unwrap_or("");
+        row("", p.dim(&format!("{dropped} earlier · wsp project show {leaf}")).to_string());
     }
 
     if shown > 0 {
