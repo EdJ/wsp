@@ -495,6 +495,39 @@ agent commits to a tree and the cheapest moment to learn it is not alone in one.
 `wsp brief` carries it into the session-start hook. All three read the one
 definition in `src/overlap.rs`, so there is no second answer to drift.
 
+### Wiring it to Claude Code
+
+```sh
+chmod +x ~/claude/wsp/claude/wsp-session.sh
+# then merge claude/settings.snippet.json into ~/.claude/settings.json by hand
+```
+
+Two keys, and the snippet is a snippet rather than a file to copy over the top:
+`settings.json` already holds your model, your theme, your plugins and herdr's
+own `SessionStart` entry, and replacing it would take those with it. The wsp
+hook goes *beside* herdr's in the same array — herdr's own file says in its
+header that it is overwritten on every update, and it is right to say so.
+
+`SessionStart` runs `wsp brief` and a session's context opens with it. That is
+the whole integration: 38 ms, once per session, and an agent starts knowing its
+project, the task it holds, what is already settled, what to take next and who
+else is standing in the tree. A subagent is skipped — it shares its parent's
+pane and therefore its parent's claim, and needs neither.
+
+**`SessionEnd` is deliberately not wired.** A claim outlives the pane that made
+it, which is the design; and `/clear` ends a session without ending the work.
+Releasing there would drop a claim mid-task every time you cleared the screen,
+and would take away the one signal `wsp wip` exists to give — a task underway
+with nobody on it.
+
+The **permissions** half matters as much as the hook. Create, claim, note,
+decide and move through the workflow are pre-allowed, because a store an agent
+has to ask permission to write is a store that stays empty. `done`, `rm`, `mv`,
+`project rm` and `archive` are denied outright: finishing work and retiring it
+are yours, and a deny rule states that better than a paragraph does — an agent
+that finishes to `review` because the rule says so is one prompt away from
+finishing to `done` when the rule is forgotten.
+
 ### The standing rules
 
 `~/wsp/agents.md`, if it exists, is printed at the end. The protocol an agent

@@ -1,0 +1,51 @@
+{
+  "_comment": "Merge these two keys into ~/.claude/settings.json by hand. This is a snippet, not a file to copy over the top: settings.json already holds your model, theme, plugins and herdr's own SessionStart entry, and replacing it would take those with it. The hooks array takes a second entry beside herdr's; it is not a replacement for it.",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude/wsp-session.sh' start",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+
+  "permissions": {
+    "allow": [
+      "Bash(wsp brief:*)",
+      "Bash(wsp ls:*)",
+      "Bash(wsp show:*)",
+      "Bash(wsp tree:*)",
+      "Bash(wsp wip:*)",
+      "Bash(wsp where:*)",
+      "Bash(wsp next:*)",
+      "Bash(wsp overlap:*)",
+      "Bash(wsp inbox:*)",
+      "Bash(wsp mandate:*)",
+      "Bash(wsp add:*)",
+      "Bash(wsp claim:*)",
+      "Bash(wsp release:*)",
+      "Bash(wsp note:*)",
+      "Bash(wsp decide:*)",
+      "Bash(wsp edit:*)",
+      "Bash(wsp start:*)",
+      "Bash(wsp block:*)",
+      "Bash(wsp review:*)",
+      "Bash(wsp reopen:*)",
+      "Bash(wsp tag:*)"
+    ],
+    "deny": [
+      "Bash(wsp done:*)",
+      "Bash(wsp rm:*)",
+      "Bash(wsp mv:*)",
+      "Bash(wsp project rm:*)",
+      "Bash(wsp archive:*)"
+    ]
+  }
+}
