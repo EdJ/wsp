@@ -1225,16 +1225,26 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // Blocked work, named. Under `--terse` the count alone: `wip` is asked
+    // repeatedly through a session to see who is free, and the answer to that
+    // moves every few minutes while this list does not — a task is blocked
+    // because it is waiting on a person, which is the slowest thing here.
+    // Still a line, because a count going up is the reason you would go and
+    // read it.
     if !blocked.is_empty() {
         println!();
-        println!("{}  {}", p.red(&util::pad("BLOCKED", 8)), blocked.len());
-        for t in &blocked {
-            println!(
-                "  {}  {}  {}",
-                p.dim(&t.id),
-                util::pad(&t.project.clone().unwrap_or_else(|| "—".into()), 8),
-                util::truncate(&t.title, 56)
-            );
+        if args.terse() {
+            println!("{}  {}   {}", p.red(&util::pad("BLOCKED", 8)), blocked.len(), p.dim("wsp ls -s blocked"));
+        } else {
+            println!("{}  {}", p.red(&util::pad("BLOCKED", 8)), blocked.len());
+            for t in &blocked {
+                println!(
+                    "  {}  {}  {}",
+                    p.dim(&t.id),
+                    util::pad(&t.project.clone().unwrap_or_else(|| "—".into()), 8),
+                    util::truncate(&t.title, 56)
+                );
+            }
         }
     }
 

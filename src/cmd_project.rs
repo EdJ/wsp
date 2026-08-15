@@ -341,6 +341,14 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     // The rest of the prose, with the decisions taken out — they are above,
     // and printing them twice would teach the reader to skip one of them.
+    //
+    // Not a `--terse` block, though it was written as one first. Measured
+    // across five projects it saved 266 bytes on `wsp` and nothing at all on
+    // `strata`, `strata-prototype`, `tooling` or `meta`, none of which carry an
+    // Overview or Details — so the flag would have done nothing on four out of
+    // five things you point it at, which is how a flag stops being believed.
+    // What was expensive here was the decisions block, and abridging it took
+    // 4,104 tokens to 1,058 for every caller rather than the ones who ask.
     let mut rest = proj.body.clone();
     crate::model::set_section_in(&mut rest, "Decisions", "");
     if !rest.trim().is_empty() {

@@ -409,11 +409,30 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
         );
     }
 
-    if let Some(text) = rules(store) {
-        println!();
-        for line in text.lines() {
-            println!("{}", p.dim(line));
+    // The rules, last and in full — unless the caller says it has them.
+    //
+    // This is the block `--terse` exists for. It is the same text in every
+    // session on the machine and 59% of a brief in a claimed pane even after
+    // two cuts, and the hook that delivers it has already run by the time
+    // anybody can type `wsp brief` — so every later brief in that session pays
+    // for text sitting a few thousand tokens up its own context. There were 35
+    // of those across the sessions this was measured on.
+    //
+    // Named rather than dropped. A brief that quietly stops before the rules
+    // reads like a store with no rules in it, which is the failure MAX_RULES is
+    // written against, arriving by a different door.
+    match rules(store) {
+        Some(_) if args.terse() => {
+            println!();
+            println!("{}", p.dim("(rules omitted — wsp brief, without --terse)"));
         }
+        Some(text) => {
+            println!();
+            for line in text.lines() {
+                println!("{}", p.dim(line));
+            }
+        }
+        None => {}
     }
     0
 }

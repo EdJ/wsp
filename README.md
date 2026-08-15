@@ -1194,6 +1194,50 @@ the position that row was in, so the eye keeps the thing it was following.
 
 Every command takes `--json`.
 
+### Saying less
+
+Almost everything an agent knows about the work, it read out of this tool, and
+that reading is charged to its context. 988 `wsp` calls across 221 sessions on
+this machine came to roughly 202,600 tokens of output.
+
+Most of that is content and stays. An `ls` row is twenty-one tokens of id,
+status, priority and title with nothing in it to remove; `show` is the task's
+own prose, which is the work in hand and the one place you want all of it;
+`where`, `doctor`, `overlap` and `next` are already under 500 bytes. Three
+things were not content, and each was dealt with where it was:
+
+| | |
+|---|---|
+| `project show` | the decisions block, printed whole. 4,104 → 1,058 tokens, for every caller |
+| `agents.md` | fifty lines of commit ritual (66058d9), then the case for each remaining rule. 434 → 305 tokens, in every session on the machine |
+| the figma plugin | 3,545 tokens of system prompt in a Rust TUI that cannot reach any of it (ee9ae79) |
+
+What is left is a block you have already read, printed again because the
+command that carries it does not know that. `--terse` — or `WSP_TERSE=1`, set
+once, for a whole session — leaves those out:
+
+```sh
+wsp brief --terse    # everything but the rules      613 → 319 tokens
+wsp wip --terse      # the blocked count, not the list  259 → 140 tokens
+```
+
+Two commands, because those are the two that get re-read. The session hook
+delivers the rules once and then every later `wsp brief` in that session pays
+about three hundred tokens for text a few thousand tokens up its own context —
+thirty-five of those in the sessions measured. `wip` is asked repeatedly to see
+who is free, and the blocked list is the slowest-moving thing in it, because a
+task is blocked on a person.
+
+Neither block goes quietly: each leaves a line saying it is gone and what to
+run. Prose that stops early reads exactly like prose that ends there, which is
+the failure the rules cap is written against.
+
+`project show` was tried as a third and dropped. Its `--terse` saved 266 bytes
+on `wsp` and nothing at all on four other projects, none of which carry an
+Overview or Details — a flag that does nothing on four things out of five is a
+flag nobody believes. Its expensive half was the decisions block, and that is
+fixed for everybody rather than for whoever remembers to ask.
+
 ## Spawning
 
 Handing work to an agent that already exists is `c`. Getting one where there is

@@ -31,8 +31,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
-    "json", "all", "force", "top", "raw", "overview", "details", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here", "agent", "no-focus",
+    "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
+    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "terse",
 ];
 
 pub struct Args {
@@ -130,6 +130,34 @@ impl Args {
     }
     pub fn json(&self) -> bool {
         self.has("json")
+    }
+    /// Leave out what the caller already has.
+    ///
+    /// Not a second rendering of everything and deliberately not a width dial:
+    /// measured over 988 `wsp` calls in 221 sessions, what costs context is a
+    /// handful of blocks that get re-read rather than the width of a row.
+    /// `ls` and `show` are untouched — an `ls` row is 21 tokens of id, status
+    /// and title with nothing to remove, and `show` is the task's own prose,
+    /// which is the work in hand.
+    ///
+    /// Two commands honour it, and they are the two that get re-read: the rules
+    /// in `brief` and the blocked list in `wip`. Both roughly halve, both are
+    /// one command away in full, and both say the block is gone rather than
+    /// going quietly. `project show` was the third candidate and is not one —
+    /// see the note there.
+    ///
+    /// `WSP_TERSE` because the caller who wants this is an agent that decided
+    /// once, at the top of a session, and should not have to remember a flag on
+    /// every call after that. `0`, `false` and empty are off, so a variable
+    /// exported by something else does not silently trim anybody's output.
+    pub fn terse(&self) -> bool {
+        if self.has("terse") {
+            return true;
+        }
+        match std::env::var("WSP_TERSE") {
+            Ok(v) => !matches!(v.trim(), "" | "0" | "false" | "no"),
+            Err(_) => false,
+        }
     }
     /// Every flag name given, for a command that would rather refuse one it
     /// does not know than guess at what was meant. `edit` is the case that
@@ -349,7 +377,9 @@ fn help() {
   wsp adopt [--yes]                 turn live workspaces into tasks
 
 Ids accept a bare suffix (003) or a unique title substring.
-Every command takes --json. Set WSP_HOME to relocate the store."#,
+Every command takes --json. Set WSP_HOME to relocate the store.
+--terse, or WSP_TERSE=1 for a whole session, leaves out what you already have:
+the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
         name = h("wsp"),
         projects = h("PROJECTS"),
         tasks = h("TASKS"),
@@ -428,5 +458,30 @@ mod tests {
         let missing: Vec<&Vec<String>> =
             arms.iter().filter(|names| !names.iter().any(|n| named(n))).collect();
         assert!(missing.is_empty(), "verbs the help never mentions: {missing:?}");
+    }
+
+    /// The flag is the whole point and the variable is how a session sets it
+    /// once, so both have to reach the same answer. `synth` is the path the
+    /// panel and `spawn` build arguments on, and it carries no environment,
+    /// which is why `terse()` reads the variable itself rather than being
+    /// resolved at parse time.
+    #[test]
+    fn terse_is_the_flag_or_the_variable() {
+        // Serialised by being one test: these mutate the process environment.
+        std::env::remove_var("WSP_TERSE");
+        assert!(!super::Args::synth("brief", &[], &[]).terse());
+        assert!(super::Args::synth("brief", &[], &[("terse", "true")]).terse());
+
+        std::env::set_var("WSP_TERSE", "1");
+        assert!(super::Args::synth("brief", &[], &[]).terse());
+
+        // A variable somebody else exported must not trim anyone's output.
+        for off in ["0", "false", "no", "", "  "] {
+            std::env::set_var("WSP_TERSE", off);
+            assert!(!super::Args::synth("brief", &[], &[]).terse(), "WSP_TERSE={off:?} turned it on");
+        }
+        // …but the flag still wins over an explicit off.
+        assert!(super::Args::synth("brief", &[], &[("terse", "true")]).terse());
+        std::env::remove_var("WSP_TERSE");
     }
 }
