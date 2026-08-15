@@ -809,6 +809,94 @@ mod tests {
         assert!(sel_y.is_some(), "the selected row is on screen and clickable");
     }
 
+    /// The invariant that matters, and the one the other tests here do not
+    /// check: what `row_at` says is at screen row `y` must be what `frame`
+    /// actually *drew* at `y`. Comparing the mapping against its own
+    /// arithmetic proves only that it is self-consistent.
+    fn assert_mapping_matches_frame(ui: &panel::Ui, view: &panel::View, at: &str) {
+        let drawn = panel::frame(ui, view, W, H);
+        for y in 0..H {
+            let Some(i) = panel::row_at(ui, view, W, H, y) else { continue };
+            let want = panel::spans_of(&panel::render_row_for_test(ui, i, W));
+            let got = panel::spans_of(&drawn[y]);
+            assert_eq!(got, want, "{at}: screen row {y} maps to tree row {i}, which is not what is drawn there");
+        }
+    }
+
+    /// The fixture's own size is one configuration out of many. A click that
+    /// aligns in a 26-row pane and not in a 40-row one is the same bug either
+    /// way, and only the shape of the pane decides which you happen to have.
+    #[test]
+    fn the_mapping_matches_the_frame_at_every_size() {
+        let w = world();
+        for h in [10usize, 14, 20, 26, 33, 40, 60] {
+            for help in [false, true] {
+                let mut view = panel::View::default();
+                view.set_help_for_test(help);
+                let mut ui = ui_of(&w, &view);
+                for n in 0..26 {
+                    let drawn = panel::frame(&ui, &view, W, h);
+                    for y in 0..h {
+                        let Some(i) = panel::row_at(&ui, &view, W, h, y) else { continue };
+                        let want = panel::spans_of(&panel::render_row_for_test(&ui, i, W));
+                        let got = panel::spans_of(&drawn[y]);
+                        assert_eq!(
+                            got, want,
+                            "h={h} help={help} after {n} down: screen row {y} maps to tree row {i}, not what is drawn"
+                        );
+                    }
+                    panel::apply_key(Key::Down, &mut ui, &mut view);
+                }
+            }
+        }
+    }
+
+    /// Ed: "when we scroll they no longer align as expected". This is why.
+    /// Selecting recentres the tree, so the row you clicked slides out from
+    /// under the pointer — and the second click of select-then-activate lands
+    /// on whatever moved into its place.
+    #[test]
+    fn clicking_a_row_leaves_it_where_it_was() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        // Scroll into the middle of a list long enough to move.
+        for _ in 0..14 {
+            panel::apply_key(Key::Down, &mut ui, &mut view);
+        }
+        for y in [2usize, 3, 6, 9] {
+            let Some(i) = panel::row_at(&ui, &view, W, H, y) else { continue };
+            let (mut after_ui, mut after_view) = (ui.clone(), view.clone());
+            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, y), panel::Hit::Select);
+            assert_eq!(
+                panel::row_at(&after_ui, &after_view, W, H, y),
+                Some(i),
+                "clicking screen row {y} moved tree row {i} out from under the pointer"
+            );
+            // And the row it selected is the row that was clicked, so the
+            // second click activates rather than selecting something else.
+            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, y), panel::Hit::Activate);
+        }
+    }
+
+    #[test]
+    fn the_mapping_matches_the_frame_at_rest() {
+        let w = world();
+        let view = panel::View::default();
+        assert_mapping_matches_frame(&ui_of(&w, &view), &view, "at rest");
+    }
+
+    #[test]
+    fn the_mapping_matches_the_frame_after_scrolling() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        for n in 0..24 {
+            panel::apply_key(Key::Down, &mut ui, &mut view);
+            assert_mapping_matches_frame(&ui, &view, &format!("after {} down", n + 1));
+        }
+    }
+
     /// Every row the frame draws must be reachable by clicking it, and no two
     /// screen rows may claim the same one.
     #[test]

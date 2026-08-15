@@ -119,6 +119,7 @@ pub(crate) enum RowKind {
     Nothing,
 }
 
+#[derive(Clone)]
 pub(crate) struct Ui {
     pub(super) rows: Vec<Row>,
     /// How many of the trailing rows are the unassigned dock rather than tree.
@@ -178,6 +179,13 @@ pub(super) fn target_of(row: &Row) -> Target {
 }
 
 impl Ui {
+    /// Move the cursor without going through a key, so a test can ask what a
+    /// click would leave behind.
+    #[cfg(test)]
+    pub(crate) fn select_for_test(&mut self, i: usize) {
+        self.sel = i;
+    }
+
     pub(crate) fn selected_target(&self) -> Target {
         self.rows.get(self.sel).map(target_of).unwrap_or(Target::Nothing)
     }

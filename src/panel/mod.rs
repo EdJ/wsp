@@ -28,12 +28,26 @@ mod run;
 mod verbs;
 
 pub(crate) use keys::{apply_key, Effect, View};
+// The live path reaches these through `super::keys`; only the storyboard's
+// tests need them from outside.
+#[cfg(test)]
+pub(crate) use keys::{click, Hit};
 pub(crate) use render::{frame, glyph, legend, line, to_ansi, to_html, to_html_spans, Line, Style};
 // The live click mapping reaches `row_at` through `super::render` inside this
 // module; only the storyboard's tests need it from outside, so it is exported
 // for them alone rather than widening the surface for everyone.
 #[cfg(test)]
 pub(crate) use render::row_at;
+#[cfg(test)]
+pub(crate) use render::to_html_spans as spans_of;
+
+/// Draw one row exactly as the frame would, so a test can ask whether the row
+/// a click maps to is the row that was painted there.
+#[cfg(test)]
+pub(crate) fn render_row_for_test(ui: &Ui, i: usize, w: usize) -> Line {
+    let keys = rows::hotkeys(&ui.rows);
+    rows::render_row(&ui.rows[i], w, keys[i])
+}
 pub(crate) use rows::{collect, refetch_into, RowKind, Snapshot, Target, Ui};
 pub(crate) use run::{exe_stamp, stty, term_size};
 pub use install::{install, install_if_adopted, uninstall};

@@ -227,15 +227,13 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // drew the frame, so the row under the pointer is the row that acts.
         if let Msg::Key(Key::Click { y, .. }) = msg {
             let (w, h) = term_size();
-            match super::render::row_at(&ui, &view, w, h, y) {
-                Some(i) if i == ui.sel => msg = Msg::Key(Key::Enter),
-                Some(i) => {
-                    ui.sel = i;
+            match super::keys::click(&mut ui, &mut view, w, h, y) {
+                super::keys::Hit::Activate => msg = Msg::Key(Key::Enter),
+                super::keys::Hit::Select => {
                     draw(&ui, &view, &mut last);
                     continue;
                 }
-                // Furniture: the title, a rule, the blank tail, the footer.
-                None => continue,
+                super::keys::Hit::Nothing => continue,
             }
         }
 
@@ -244,9 +242,9 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // cursor and the view follows. A separate offset would fight that
         // centring every time a key moved the selection.
         if let Msg::Key(Key::Wheel { up }) = msg {
-            for _ in 0..3 {
-                let _ = apply_key(if up { Key::Up } else { Key::Down }, &mut ui, &mut view);
-            }
+            let (w, h) = term_size();
+            let at = super::render::geometry(&ui, &view, w, h).scroll;
+            view.scroll = Some(if up { at.saturating_sub(3) } else { at + 3 });
             draw(&ui, &view, &mut last);
             continue;
         }

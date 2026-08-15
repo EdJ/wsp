@@ -298,14 +298,13 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     let tree_len = ui.rows.len() - ui.dock;
     let tree_rows = body_rows - dock_rows;
     let anchor = ui.sel.min(tree_len.saturating_sub(1));
-    Geometry {
-        head: HEAD,
-        map_rows,
-        dock_rows,
-        tree_rows,
-        tree_len,
-        scroll: scroll_for(anchor, tree_len, tree_rows),
-    }
+    let scroll = match view.scroll {
+        // Clamped rather than trusted: the tree changes under a pointer that
+        // is not moving, and an offset past the end would draw a blank pane.
+        Some(s) => s.min(tree_len.saturating_sub(tree_rows)),
+        None => scroll_for(anchor, tree_len, tree_rows),
+    };
+    Geometry { head: HEAD, map_rows, dock_rows, tree_rows, tree_len, scroll }
 }
 
 /// The row a click at pane row `y` landed on, if it landed on one.

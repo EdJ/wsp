@@ -20,7 +20,16 @@ use super::verbs::{browse_key, Ask, Pick};
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
 /// event loop and handed to `collect`, which is otherwise a pure function of
 /// the store plus herdr.
-#[derive(Default)]
+impl View {
+    /// The key map changes how many rows the tree gets, which changes where a
+    /// click lands. Test-only, so a sweep can check both.
+    #[cfg(test)]
+    pub(crate) fn set_help_for_test(&mut self, on: bool) {
+        self.help = on;
+    }
+}
+
+#[derive(Default, Clone)]
 pub(crate) struct View {
     /// Projects whose children and tasks are hidden.
     pub(super) collapsed: HashSet<String>,
@@ -41,6 +50,15 @@ pub(crate) struct View {
     /// swallow it the instant it was made — you would type a name, press
     /// return, and watch nothing appear.
     pub(super) reveal: HashSet<String>,
+    /// A scroll offset the *pointer* set, if it has. The tree normally scrolls
+    /// by holding the cursor near the middle, which is right for a keyboard
+    /// and wrong for a mouse: selecting a row would recentre the tree and
+    /// slide that row out from under the pointer, so the second click of
+    /// select-then-activate landed on whatever moved into its place.
+    ///
+    /// So the pointer drives the view directly and the keyboard goes on
+    /// centring — any keystroke clears this and hands the view back.
+    pub(super) scroll: Option<usize>,
     /// What the next keypress means.
     pub(crate) mode: Mode,
     /// What the detail pane is currently showing, so `↵` can close it.
@@ -287,25 +305,70 @@ pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 /// The reducer. Deliberately free of I/O — it moves the cursor, changes the
 /// mode, and reports what else it wants done, so the storyboard can drive the
 /// same transitions the terminal does and get the same frames out.
-pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
-    // Taken rather than borrowed: every branch may replace it.
-    match std::mem::take(&mut view.mode) {
-        Mode::Browse => browse_key(k, ui, view),
-        Mode::Prompt { verb, buffer } => {
-            view.mode = Mode::Prompt { verb: verb.clone(), buffer: buffer.clone() };
-            prompt_key(k, ui, view, verb, buffer)
-        }
-        Mode::Pick { verb } => {
-            view.mode = Mode::Pick { verb: verb.clone() };
-            pick_key(k, ui, view, verb)
-        }
-        Mode::Confirm { argv, question, escalate } => {
-            view.mode = Mode::Confirm {
-                argv: argv.clone(),
-                question,
-                escalate: escalate.clone(),
-            };
-            confirm_key(k, ui, view, argv, escalate)
+/// What a click at screen row `y` amounts to.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Hit {
+    /// Furniture — the title, a rule, the blank tail, the footer.
+    Nothing,
+    /// The cursor moved to that row, and the view was pinned so the row stays
+    /// under the pointer.
+    Select,
+    /// A click on the row already under the cursor: what `↵` means.
+    Activate,
+}
+
+/// Decide what a click does, and move the cursor if that is what it does.
+///
+/// Here rather than in the event loop so it can be tested without a terminal:
+/// the loop's job is to read the pane's size and act on the answer, and the
+/// interesting half — select, then activate, without the tree moving — is
+/// policy that a fixture can drive.
+pub(crate) fn click(ui: &mut Ui, view: &mut View, w: usize, h: usize, y: usize) -> Hit {
+    let at = super::render::geometry(ui, view, w, h).scroll;
+    match super::render::row_at(ui, view, w, h, y) {
+        None => Hit::Nothing,
+        Some(i) if i == ui.sel => Hit::Activate,
+        Some(i) => {
+            // Pin the view before moving the cursor. Selecting normally
+            // recentres the tree, which would slide the row out from under the
+            // pointer that chose it — and the second click of
+            // select-then-activate would land on whatever replaced it.
+            view.scroll = Some(at);
+            ui.sel = i;
+            Hit::Select
         }
     }
+}
+
+pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
+    let sel_before = ui.sel;
+    let effect = {
+        // Taken rather than borrowed: every branch may replace it.
+        match std::mem::take(&mut view.mode) {
+            Mode::Browse => browse_key(k, ui, view),
+            Mode::Prompt { verb, buffer } => {
+                view.mode = Mode::Prompt { verb: verb.clone(), buffer: buffer.clone() };
+                prompt_key(k, ui, view, verb, buffer)
+            }
+            Mode::Pick { verb } => {
+                view.mode = Mode::Pick { verb: verb.clone() };
+                pick_key(k, ui, view, verb)
+            }
+            Mode::Confirm { argv, question, escalate } => {
+                view.mode = Mode::Confirm {
+                    argv: argv.clone(),
+                    question,
+                    escalate: escalate.clone(),
+                };
+                confirm_key(k, ui, view, argv, escalate)
+            }
+        }
+    };
+    // The keyboard gives the view back to the cursor, but only once the cursor
+    // has actually moved: a verb, or the `↵` a click turns into, must not
+    // jerk the tree out from under the pointer that asked for it.
+    if ui.sel != sel_before {
+        view.scroll = None;
+    }
+    effect
 }
