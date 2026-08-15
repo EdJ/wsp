@@ -309,6 +309,14 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
 
     // Scroll on the tree's own length. A cursor down in the dock leaves the
     // tree where it was rather than dragging it to the end.
+    // A filter that matches nothing draws an empty tree, which looks exactly
+    // like a broken panel. Say which it is.
+    if tree_len == 0 && ui.review_only {
+        lines.push(Line::default());
+        lines.push(line(Style::Dim, "  nothing waiting on you"));
+        lines.push(line(Style::Dim, "  R for the whole tree"));
+    }
+
     let anchor = ui.sel.min(tree_len.saturating_sub(1));
     let scroll = scroll_for(anchor, tree_len, tree_rows);
     for (i, row) in ui.rows.iter().enumerate().take(tree_len).skip(scroll).take(tree_rows) {
@@ -343,13 +351,21 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     // Beside it, and only when there is one: an agent stops at `review`, so a
     // count here is work finished and waiting on you. Zero is the resting
     // state and saying so every time would train the eye to skip the line.
-    if ui.review > 0 {
+    // Not while the filter is up: there the count is the tree itself, and
+    // `review 1  review only` is the footer saying one thing twice.
+    if ui.review > 0 && !ui.review_only {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Warn, format!("review {}", ui.review));
     }
     if ui.show_done {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "+done");
+    }
+    // A filter left on silently reads as an empty backlog, and the panel is
+    // furniture you stop looking at. So it says so, every frame it is up.
+    if ui.review_only {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Accent, "review only");
     }
     lines.push(foot);
 

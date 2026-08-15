@@ -384,6 +384,15 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .key(Key::Char('R'))
+            .scene(
+                "Only what needs review",
+                "`R` narrows the tree to work an agent has finished with and handed back — `review` is where an agent stops, and only a person says `done`. The project rows stay so each one is placed, and every key goes on meaning what it means: `d` closes it, `o` sends it back, `↵` opens it in the detail pane. Nothing else changes, which is why this is a filter and not a second pane. The footer says the filter is on, because one left up silently reads as an empty backlog.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
             .key(Key::Char('i'))
             .scene("Showing ids", "i puts the id in front of each title — the thing you type at a shell, next to the thing you read. Off by default because thirteen characters of `t-260815-004` on every row is most of a narrow pane, and only the last three of them differ. The suffix is what `wsp start 004` resolves, so the suffix is what shows, unless another open task shares it and the date is what separates them."),
     );

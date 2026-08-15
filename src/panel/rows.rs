@@ -134,6 +134,7 @@ pub(crate) struct Ui {
     pub(super) message: Option<(String, Instant)>,
     pub(super) self_focused: bool,
     pub(super) show_done: bool,
+    pub(super) review_only: bool,
     /// project id -> its first root, for opening a workspace where the work is.
     pub(super) roots: std::collections::BTreeMap<String, String>,
 }
@@ -302,7 +303,13 @@ pub(super) fn task_rows(
     let mut mine: Vec<Task> = tasks
         .iter()
         .filter(|t| t.project.as_deref() == project)
-        .filter(|t| view.show_done || t.status().is_open())
+        .filter(|t| {
+            if view.review_only {
+                t.status() == Status::Review
+            } else {
+                view.show_done || t.status().is_open()
+            }
+        })
         .cloned()
         .collect();
     mine.sort_by_key(|t| {
@@ -512,6 +519,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // broken on exactly the projects it exists to reveal.
     let interesting = |id: &str| -> bool {
         let c = counts.get(id).copied().unwrap_or_default();
+        // Under the review filter a branch earns its row only by holding
+        // something at review. A project row with nothing beneath it is the
+        // whole tree pretending the filter did nothing.
+        if view.review_only {
+            return c.review > 0;
+        }
         c.open > 0
             || live_by_project.contains_key(id)
             || (view.show_done && c.done > 0)
@@ -526,9 +539,14 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // home — and putting them last meant scrolling past every project to find
     // the one list that needs a decision.
     let inbox_open = tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count();
-    let inbox_any = tasks
-        .iter()
-        .any(|t| t.project.is_none() && (view.show_done || t.status().is_open()));
+    let inbox_any = tasks.iter().any(|t| {
+        t.project.is_none()
+            && if view.review_only {
+                t.status() == Status::Review
+            } else {
+                view.show_done || t.status().is_open()
+            }
+    });
     if inbox_any {
         let folded = view.collapsed.contains(INBOX_KEY);
         rows.push(Row::Section {
@@ -565,9 +583,22 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             rows.push(Row::Project {
                 id: p.id.clone(),
                 depth,
-                counts: counts.get(&p.id).copied().unwrap_or_default(),
+                // Under the review filter the right-hand column counts what
+                // is *shown*. A project reading `5 ▸3 ■1` beside one visible
+                // row is the tree describing a tree that is not there.
+                counts: {
+                    let c = counts.get(&p.id).copied().unwrap_or_default();
+                    if view.review_only {
+                        crate::resolve::Counts { open: c.review, ..Default::default() }
+                    } else {
+                        c
+                    }
+                },
                 collapsed: is_collapsed,
-                live: live.get(&p.id).copied().unwrap_or(0),
+                // Zero under the filter for the same reason as the counts:
+                // three agents at work is true and is not what this view is
+                // answering. One question at a time.
+                live: if view.review_only { 0 } else { live.get(&p.id).copied().unwrap_or(0) },
                 prose: crate::model::has_prose(&p.body),
             });
             if is_collapsed {
@@ -628,7 +659,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // Panes belonging to no project. Some are there because nothing resolved;
     // some because the workspace is deliberately pinned out of the tree — the
     // orchestrator's own home, and whatever else you opened that is not work.
-    if !homeless.is_empty() {
+    // Both pane groups go under the review filter. Neither is work waiting on
+    // you — they are terminals — and leaving them is the filter answering a
+    // question nobody asked while hiding half the answer to the one they did.
+    if !homeless.is_empty() && !view.review_only {
         let folded = view.collapsed.contains(NOPROJECT_KEY);
         rows.push(Row::Section {
             key: NOPROJECT_KEY.to_string(),
@@ -647,7 +681,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // The dock. Last in the row list and pinned to the bottom of the frame, so
     // it is reachable by the cursor — `c` has to be able to land on one of
     // these — while never scrolling away like the tree above it.
-    let dock = if unassigned.is_empty() {
+    let dock = if unassigned.is_empty() || view.review_only {
         0
     } else {
         let folded = view.collapsed.contains(UNASSIGNED_KEY);
@@ -680,6 +714,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         message: None,
         self_focused,
         show_done: view.show_done,
+        review_only: view.review_only,
         roots: snap
             .projects
             .iter()

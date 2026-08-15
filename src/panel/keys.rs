@@ -28,6 +28,10 @@ pub(crate) struct View {
     pub(super) expanded: HashSet<String>,
     /// Include `done` tasks, and the projects that hold only those.
     pub(super) show_done: bool,
+    /// Narrow the tree to work at `review` — what an agent has finished with
+    /// and handed back. Every key goes on meaning what it means; the only
+    /// thing that changes is which rows are there to aim them at.
+    pub(super) review_only: bool,
     /// Put each task's id in front of its title. Off by default: the tree is
     /// for reading, and thirteen characters of id on every row is most of a
     /// narrow pane. On when you are about to type one at a shell.
@@ -109,6 +113,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("↵ esc", "open it, close it"),
                 ("E", "edit in a tab"),
                 ("A i r", "show done, ids, sync"),
+                ("R", "only what needs review"),
                 ("q", "quit"),
             ],
         ),

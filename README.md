@@ -90,8 +90,8 @@ agent running in the workspace.
 
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
 closes it again), `esc` closes it, `E` pops the row's file out into an editor
-tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `i` shows
-ids, `r` syncs, `?` opens the key map.
+tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `R` narrows
+to what needs reviewing, `i` shows ids, `r` syncs, `?` opens the key map.
 
 `i` puts each task's id in front of its title — the thing you type at a shell
 beside the thing you read. Off by default: `t-260815-004` is thirteen columns of
@@ -561,6 +561,21 @@ makes it hold is that it is stated in `agents.md`, where every session reads it,
 and that stopping is *visible* — `wsp wip` grows a `REVIEW` block beside
 `BLOCKED`, and the panel footer counts it beside the blocked count. Work parked
 where you cannot see it is the failure this guards against, not disobedience.
+
+`R` in the panel narrows the tree to exactly that work, and is the answer to
+reviewing several things in a sitting. It is a filter rather than a second
+pane: the panel already has the cursor, the verbs and the detail pane, so `d`
+closes a task, `o` sends it back, `↵` opens it — every key goes on meaning what
+it means, and the only thing that changed is which rows are there to aim them
+at. Project rows stay so each item is placed, and their right-hand counts
+follow the filter, because a project reading `5 ▸3 ■1` beside one visible row
+is the tree describing a tree that is not there. The pane groups go, since a
+terminal is not work waiting on you. The footer says the filter is up, because
+one left on silently reads as an empty backlog — and `R` again is the whole
+tree.
+
+(`r` was taken: it syncs. Uppercase is what the panel already means by a
+view-level key — `A`, `E`, `O`, `X` — and lowercase stays the verbs.)
 
 The seam for telling you is already there. Every status change fires
 `~/wsp/hooks/on-task-review` with the event JSON on stdin, so a notification is

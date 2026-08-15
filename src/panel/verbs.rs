@@ -456,6 +456,20 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             say(ui, if view.show_done { "showing done" } else { "hiding done" });
             Effect::Refetch
         }
+        // The review filter and `A` are opposites — one narrows to work that is
+        // finished-and-handed-back, the other widens to work that is finished
+        // and gone — so leaving both on shows nothing and reads as a bug.
+        Key::Char('R') => {
+            view.review_only = !view.review_only;
+            if view.review_only {
+                view.show_done = false;
+            }
+            say(
+                ui,
+                if view.review_only { "review only" } else { "the whole tree" },
+            );
+            Effect::Refetch
+        }
         // The tree names work by title, which is what you read it for. The id
         // is what you type at a shell, and there was no way to get from one to
         // the other without opening the row.
