@@ -273,8 +273,7 @@ pub(super) fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str
         // centring every time a key moved the selection.
         if let Msg::Key(Key::Wheel { up }) = msg {
             let (w, h) = term_size();
-            let at = super::render::geometry(&ui, &view, w, h).scroll;
-            view.scroll = Some(if up { at.saturating_sub(3) } else { at + 3 });
+            super::keys::wheel(&mut ui, &mut view, w, h, up);
             draw(&ui, &view, &mut last);
             continue;
         }
