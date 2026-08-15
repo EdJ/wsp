@@ -178,6 +178,20 @@ whole id appears instead; a finished task always shows in full, because a bare
 suffix resolves against open tasks only and an id you cannot type is worse than
 no id at all.
 
+`F` docks the selected row's title under the tree, in full and wrapped, and
+follows the cursor. A row is one line wide and a title is not: titles here run
+to a median of sixty-four characters against the twenty-five a thirty-four
+column row can draw, so the tree names most work by its opening clause. Reading
+the rest meant `↵`, which opens a second pane and takes the cursor out of the
+tree — a lot of ceremony for one sentence. With this up, scrolling *is* the
+reading: every row you pass says what it is.
+
+It keeps three lines whatever is selected, so the rows above do not step up and
+down as the cursor moves between a short title and a long one, and grows to six
+when the title needs them — a panel that cut the title would fail on exactly
+the rows it exists for. Like the key map, it takes those rows out of the tree's
+and gives them back when you press `F` again.
+
 `q` and `esc` both mean "put away what is in front of me": the key map first,
 then the detail pane. Neither quits the panel — it is installed furniture in
 every workspace, so losing one to a stray keystroke costs a reinstall and buys

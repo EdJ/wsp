@@ -13,48 +13,6 @@ use crate::util;
 
 use super::Focus;
 
-/// Break `text` to `w` columns on word boundaries, falling back to a hard cut
-/// for a single word longer than the pane is wide.
-fn wrap(text: &str, w: usize) -> Vec<String> {
-    let w = w.max(8);
-    let mut out: Vec<String> = Vec::new();
-    for para in text.split('\n') {
-        if para.trim().is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut cur = String::new();
-        for word in para.split_whitespace() {
-            if word.chars().count() > w {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-                let mut rest: Vec<char> = word.chars().collect();
-                while rest.len() > w {
-                    out.push(rest[..w].iter().collect());
-                    rest = rest[w..].to_vec();
-                }
-                cur = rest.into_iter().collect();
-                continue;
-            }
-            let need = if cur.is_empty() { word.chars().count() } else { cur.chars().count() + 1 + word.chars().count() };
-            if need > w {
-                out.push(std::mem::take(&mut cur));
-                cur = word.to_string();
-            } else {
-                if !cur.is_empty() {
-                    cur.push(' ');
-                }
-                cur.push_str(word);
-            }
-        }
-        if !cur.is_empty() {
-            out.push(cur);
-        }
-    }
-    out
-}
-
 const LABEL_W: usize = 9;
 
 /// `label   value` — the shape every field in this view takes.
@@ -131,7 +89,7 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
             out.push(line(Style::Bold, "wsp"));
             out.push(line(Style::Dim, "─".repeat(w)));
             out.push(Line::default());
-            for l in wrap("Nothing open. Press ↵ on a row in the panel.", w) {
+            for l in util::wrap("Nothing open. Press ↵ on a row in the panel.", w) {
                 out.push(line(Style::Muted, l));
             }
         }
@@ -224,7 +182,7 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     out.push(head);
     out.push(line(Style::Dim, "─".repeat(w)));
 
-    for l in wrap(&t.title, w) {
+    for l in util::wrap(&t.title, w) {
         out.push(line(Style::Plain, l));
     }
     out.push(Line::default());
@@ -310,7 +268,7 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         if let Some(text) = t.section(name) {
             out.push(Line::default());
             out.push(heading(&name.to_lowercase()));
-            for l in wrap(&text, w) {
+            for l in util::wrap(&text, w) {
                 if l.trim().is_empty() {
                     out.push(Line::default());
                 } else {
@@ -333,7 +291,7 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         for entry in log.iter().rev() {
             let text = entry.trim_start().trim_start_matches("- ");
             let mut first = true;
-            for l in wrap(text, w.saturating_sub(2)) {
+            for l in util::wrap(text, w.saturating_sub(2)) {
                 let mut ln = Line::default();
                 ln.push(Style::Dim, if first { "· " } else { "  " });
                 ln.push(Style::Muted, l);
@@ -357,7 +315,7 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     out.push(line(Style::Dim, "─".repeat(w)));
 
     if p.name != p.id {
-        for l in wrap(&p.name, w) {
+        for l in util::wrap(&p.name, w) {
             out.push(line(Style::Plain, l));
         }
         out.push(Line::default());
@@ -371,7 +329,7 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     }
     if !p.brief.is_empty() {
         out.push(Line::default());
-        for l in wrap(&p.brief, w) {
+        for l in util::wrap(&p.brief, w) {
             out.push(line(Style::Muted, l));
         }
     }
@@ -382,7 +340,7 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         if let Some(text) = p.section(name) {
             out.push(Line::default());
             out.push(heading(&name.to_lowercase()));
-            for l in wrap(&text, w) {
+            for l in util::wrap(&text, w) {
                 if l.trim().is_empty() {
                     out.push(Line::default());
                 } else {

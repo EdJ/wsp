@@ -27,6 +27,13 @@ impl View {
     pub(crate) fn set_help_for_test(&mut self, on: bool) {
         self.help = on;
     }
+
+    /// The focus dock does the same, and worse: its height depends on the row
+    /// the cursor is on, so it changes while a sweep is pressing `j`.
+    #[cfg(test)]
+    pub(crate) fn set_focus_for_test(&mut self, on: bool) {
+        self.focus = on;
+    }
 }
 
 #[derive(Default, Clone)]
@@ -77,6 +84,12 @@ pub(crate) struct View {
     /// more, because you read it to press one of the keys in it — and the row
     /// you would press it on has to still be there, and still be selected.
     pub(super) help: bool,
+    /// The selected row's title in full, docked above the footer. A row is one
+    /// line wide and a title is not, so the tree names most work by its first
+    /// twenty-five characters; reading the rest meant `↵`, which opens another
+    /// pane and takes the cursor out of the tree. This reads it where you are
+    /// and follows the cursor, so it is scrolling rather than looking things up.
+    pub(super) focus: bool,
 }
 
 /// Management needs three shapes of input beyond a single key: a value to
@@ -139,6 +152,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
             "look",
             vec![
                 ("↵ esc", "open it, close it"),
+                ("F", "the title in full, docked"),
                 ("E", "edit in a tab"),
                 ("A i r", "show done, ids, sync"),
                 ("R", "only what needs review"),

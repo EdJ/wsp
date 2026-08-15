@@ -53,6 +53,12 @@ pub(crate) fn render_row_for_test(ui: &Ui, i: usize, w: usize) -> Line {
     let keys = rows::hotkeys(ui);
     rows::render_row(&ui.rows[i], w, keys[i])
 }
+/// A row's own words, unabridged — what the focus dock is drawing when the
+/// cursor is on that row, so a test can ask whether the two agree.
+#[cfg(test)]
+pub(crate) fn full_text_for_test(ui: &Ui, i: usize) -> String {
+    rows::full_text(&ui.rows[i])
+}
 pub(crate) use rows::{collect, refetch_into, RowKind, Snapshot, Target, Ui};
 pub(crate) use run::{stty, term_size};
 pub use install::{install, install_if_adopted, uninstall};

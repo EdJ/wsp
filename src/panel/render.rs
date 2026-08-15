@@ -257,6 +257,53 @@ pub(super) fn help_lines(w: usize) -> Vec<Line> {
     out
 }
 
+/// Lines the focus dock keeps whatever is selected, and the most it will grow
+/// to when the title needs them.
+///
+/// Fixed height is what a dock under a moving cursor wants: a panel that shrank
+/// to fit every short title would take a row off the tree and give it back on
+/// every keypress, and the rows you are reading would step up and down while
+/// you scrolled past them. But three lines is ninety-odd columns, and a tenth
+/// of the titles here run past that — a focus panel that cuts the title is a
+/// panel that fails on exactly the rows it exists for. So: three lines always,
+/// six when the title needs them, and only the longest tenth ever moves it.
+pub(super) const FOCUS_MIN: usize = 3;
+
+pub(super) const FOCUS_MAX: usize = 6;
+
+/// The selected row's own words, wrapped to the pane.
+///
+/// Padded out to [`FOCUS_MIN`] rather than returned short, so the caller draws
+/// the same number of rows it reserved.
+pub(super) fn focus_lines(ui: &Ui, w: usize) -> Vec<Line> {
+    let text = ui.rows.get(ui.sel).map(super::rows::full_text).unwrap_or_default();
+    let room = w.saturating_sub(2);
+    let wrapped = util::wrap(&text, room);
+    let over = wrapped.len() > FOCUS_MAX;
+    let mut kept: Vec<String> = wrapped.into_iter().take(FOCUS_MAX).collect();
+    // Six lines is a title of about two hundred characters and there is one of
+    // those. Say so rather than stop mid-word: a panel whose whole job is the
+    // full title has to admit the once it is not showing you one.
+    if over {
+        if let Some(last) = kept.last_mut() {
+            *last = util::truncate(&format!("{last} …"), room);
+        }
+    }
+    let mut out: Vec<Line> = kept
+        .into_iter()
+        .map(|s| {
+            let mut l = Line::default();
+            l.push(Style::Plain, " ");
+            l.push(Style::Plain, s);
+            l
+        })
+        .collect();
+    while out.len() < FOCUS_MIN {
+        out.push(Line::default());
+    }
+    out
+}
+
 /// Rows the tree keeps whatever the map wants. A cursor with no neighbours
 /// above or below it is not a tree you can aim with, and aiming is the whole
 /// reason the map is open.
@@ -292,6 +339,8 @@ pub(super) struct Geometry {
     /// Rows above the tree: the title and its rule.
     pub head: usize,
     pub map_rows: usize,
+    /// The focus dock and the rule above it, or zero when it is off.
+    pub focus_rows: usize,
     pub dock_rows: usize,
     pub tree_rows: usize,
     pub tree_len: usize,
@@ -307,7 +356,19 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     } else {
         0
     };
-    let body_rows = room - map_rows;
+    // Before the map's rows are taken as well, or a short pane with both up
+    // would hand the same rows out twice.
+    let focus_rows = if view.focus {
+        // Its own rule included, and never that rule on its own: one line of
+        // furniture with nothing under it says the title is missing.
+        match (focus_lines(ui, w).len() + 1).min(room.saturating_sub(map_rows + MIN_TREE_ROWS)) {
+            n if n < 2 => 0,
+            n => n,
+        }
+    } else {
+        0
+    };
+    let body_rows = room - map_rows - focus_rows;
     let dock_rows = if ui.dock == 0 {
         0
     } else {
@@ -322,7 +383,7 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
         Some(s) => s.min(tree_len.saturating_sub(tree_rows)),
         None => scroll_for(anchor, tree_len, tree_rows),
     };
-    Geometry { head: HEAD, map_rows, dock_rows, tree_rows, tree_len, scroll }
+    Geometry { head: HEAD, map_rows, focus_rows, dock_rows, tree_rows, tree_len, scroll }
 }
 
 /// The row a click at pane row `y` landed on, if it landed on one.
@@ -341,7 +402,7 @@ pub(crate) fn row_at(ui: &Ui, view: &View, w: usize, h: usize, y: usize) -> Opti
     // The dock sits at the bottom whatever the tree is doing, under a rule of
     // its own. `dock_rows` counts that rule, so its rows are one fewer.
     if g.dock_rows > 1 {
-        let first = h.saturating_sub(3 + g.map_rows + g.dock_rows) + 1;
+        let first = h.saturating_sub(3 + g.focus_rows + g.map_rows + g.dock_rows) + 1;
         if y >= first && y < first + g.dock_rows - 1 {
             let i = g.tree_len + (y - first);
             if i < ui.rows.len() {
@@ -489,7 +550,7 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
         l.selected = i == ui.sel;
         lines.push(l);
     }
-    while lines.len() < h.saturating_sub(footer_rows + map_rows + dock_rows) {
+    while lines.len() < h.saturating_sub(footer_rows + g.focus_rows + map_rows + dock_rows) {
         lines.push(Line::default());
     }
     if dock_rows > 0 {
@@ -502,6 +563,14 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
     }
     let hidden = map.len() - map_rows;
     lines.extend(map.into_iter().take(map_rows));
+
+    // Last before the footer, so it sits where the eye already goes for what
+    // the panel is saying about right now — and so the tree above it is one
+    // unbroken run whatever else is up.
+    if g.focus_rows > 1 {
+        lines.push(line(Style::Dim, "─".repeat(w)));
+        lines.extend(focus_lines(ui, w).into_iter().take(g.focus_rows - 1));
+    }
 
     lines.push(line(Style::Dim, "─".repeat(w)));
 
@@ -547,9 +616,17 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
         Mode::Prompt { verb, buffer } => {
             let mut l = Line::default();
             l.push(Style::Accent, format!("{}> ", verb.label()));
+            // A prompt that opens holding a value needs to say how to be rid
+            // of it — backspacing a title away is not an edit anyone makes
+            // twice. Only while there is something to clear, and only when
+            // the pane is wide enough that the hint is not eating the value.
+            const CLEAR: &str = "  ^U";
+            let hint = !buffer.is_empty() && w > l.width() + CLEAR.chars().count() + 12;
             // Show the tail once the value outruns the pane, so the caret is
             // always the thing you can see.
-            let room = w.saturating_sub(l.width() + 1);
+            let room = w
+                .saturating_sub(l.width() + 1)
+                .saturating_sub(if hint { CLEAR.chars().count() } else { 0 });
             let shown: String = if buffer.chars().count() > room {
                 buffer.chars().skip(buffer.chars().count() - room).collect()
             } else {
@@ -557,6 +634,9 @@ pub(crate) fn frame(ui: &Ui, view: &View, w: usize, h: usize) -> Vec<Line> {
             };
             l.push(Style::Plain, shown);
             l.push(Style::Accent, "▌");
+            if hint {
+                l.push(Style::Dim, CLEAR);
+            }
             l
         }
         Mode::Confirm { question, .. } => {

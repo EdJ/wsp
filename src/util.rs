@@ -221,6 +221,52 @@ pub fn truncate(s: &str, n: usize) -> String {
     out
 }
 
+/// Break `text` to `w` columns on word boundaries, falling back to a hard cut
+/// for a single word longer than the pane is wide.
+///
+/// Here rather than in the detail pane it was written for: the panel's focus
+/// dock breaks the same titles to the same rule, and two copies of a wrap would
+/// agree until one of them learned about a hyphen.
+pub fn wrap(text: &str, w: usize) -> Vec<String> {
+    let w = w.max(8);
+    let mut out: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        if para.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in para.split_whitespace() {
+            if word.chars().count() > w {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                let mut rest: Vec<char> = word.chars().collect();
+                while rest.len() > w {
+                    out.push(rest[..w].iter().collect());
+                    rest = rest[w..].to_vec();
+                }
+                cur = rest.into_iter().collect();
+                continue;
+            }
+            let need = if cur.is_empty() { word.chars().count() } else { cur.chars().count() + 1 + word.chars().count() };
+            if need > w {
+                out.push(std::mem::take(&mut cur));
+                cur = word.to_string();
+            } else {
+                if !cur.is_empty() {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
 /// The leading sentence, for prose that is read as an index rather than in
 /// full.
 ///

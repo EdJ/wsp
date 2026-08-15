@@ -1309,6 +1309,32 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
     l
 }
 
+/// What the row says, with nothing cut.
+///
+/// [`render_row`] fits a row to the pane, which for a task means about
+/// twenty-five characters of a title that averages sixty-four. This is the same
+/// text before that happens, for the focus dock — beside `render_row` so the
+/// two cannot come to disagree about which field a row is named by.
+pub(super) fn full_text(row: &Row) -> String {
+    match row {
+        Row::Project { id, .. } => id.clone(),
+        Row::Task { title, .. } => title.clone(),
+        Row::More { n, .. } => format!("{n} more"),
+        Row::Section { label, .. } => label.clone(),
+        Row::Agent { agent, title, .. } => {
+            // The title is the pane's name, which is what the row draws. What
+            // it does not draw, and what a name alone will not tell you, is
+            // which terminal it is.
+            format!("{title} · {}", agent.pane)
+        }
+        // Never selected, so never asked for. Answering with the line's own
+        // words rather than nothing, in case a future row kind takes the
+        // cursor here.
+        Row::Detail(Detail::Standing { state, pane, .. }) => format!("{} · {pane}", word(*state)),
+        Row::Detail(Detail::Holding { title, .. }) => title.clone(),
+    }
+}
+
 /// What an agent is waiting for, in the fewest words that are true. Beside the
 /// mark rather than instead of it: the glyph is what you read in the strip, and
 /// the word is what tells you the glyph's name the first time you meet it.

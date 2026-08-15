@@ -622,6 +622,15 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::Refetch
         }
         Key::Char('r') => Effect::Sync,
+        // A row is one line wide and a title is not. `↵` has always been the
+        // way to read the rest, and it opens a second pane and takes the cursor
+        // out of the tree — which is a lot to do to read a sentence. This keeps
+        // the rest of it under the tree while you go on scrolling.
+        Key::Char('F') => {
+            view.focus = !view.focus;
+            say(ui, if view.focus { "titles in full" } else { "titles as they fit" });
+            Effect::None
+        }
         // Nothing else changes while it is up: the tree keeps the cursor, and
         // every key on the map still does what the map says it does — which is
         // the only way to read one and act on it in the same breath.

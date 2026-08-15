@@ -83,7 +83,16 @@ fn world() -> Snapshot {
 
     let mut tasks = vec![
         task("t-001", "Apply reverb fixes from the tuning table", Some("trance"), "doing"),
-        task("t-002", "Plan demo video strategy", Some("trance"), "doing"),
+        // Long on purpose, and not unusually so: the titles in the real store
+        // run to a median of sixty-four characters and a tenth of them past a
+        // hundred, against the twenty-five a row can draw. A fixture where
+        // every title fits is a fixture that cannot show what F is for.
+        task(
+            "t-002",
+            "Plan the demo video: what it shows, in what order, and which of the three patches is worth the first thirty seconds",
+            Some("trance"),
+            "doing",
+        ),
         // Doing, with an idle agent on it — the one combination that raises the
         // "needs you" arrow, because the work is live and the process is not.
         {
@@ -317,6 +326,23 @@ impl<'a> Driver<'a> {
         self.down_to(want)
     }
 
+    /// The same hunt for a named task. A scene about what a row *says* has to
+    /// name the row it means, for the reason `to_pane` does: a count of presses
+    /// describes the fixture it was written against and nothing else.
+    fn to_task(&mut self, id: &str) -> &mut Self {
+        let want = panel::Target::Task(id.to_string());
+        loop {
+            if self.ui.selected_target() == want {
+                return self;
+            }
+            let before = self.ui.selected_index();
+            self.key(Key::Down);
+            if self.ui.selected_index() == before {
+                panic!("no row for task {id}");
+            }
+        }
+    }
+
     /// Press `Down` until the cursor is on a particular pane's row. A scene
     /// that means a *specific* agent — the spare one, the one standing nowhere
     /// — has to say which: what a count of presses lands on changes the moment
@@ -531,6 +557,21 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .key(Key::Char('i'))
             .scene("Showing ids", "i puts the id in front of each title — the thing you type at a shell, next to the thing you read. Off by default because thirteen characters of `t-260815-004` on every row is most of a narrow pane, and only the last three of them differ. The suffix is what `wsp start 004` resolves, so the suffix is what shows, unless another open task shares it and the date is what separates them."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_task("t-002")
+            .key(Key::Char('F'))
+            .scene("The title in full", "F docks the selected row's title under the tree, wrapped, where the row itself has room for a quarter of it. Reading the rest used to mean ↵, which opens a second pane and takes the cursor out of the tree — a lot of ceremony for one sentence. Three lines whatever is selected, so the tree does not step up and down as the cursor passes between a short title and a long one; six when the title needs them, because a focus panel that cut the title would fail on exactly the rows it exists for."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_task("t-002")
+            .key(Key::Char('F'))
+            .keys(&[Key::Down; 3])
+            .scene("Reading down the tree", "It follows the cursor, so scrolling is how you read: every row on the way past says what it is in full, without opening anything. Short titles leave the rest of the dock blank rather than closing it up — the height is what keeps the rows above from moving while you scroll."),
     );
 
     out.push(
@@ -1288,21 +1329,27 @@ mod tests {
         let w = world();
         for h in [10usize, 14, 20, 26, 33, 40, 60] {
             for help in [false, true] {
-                let mut view = panel::View::default();
-                view.set_help_for_test(help);
-                let mut ui = ui_of(&w, &view);
-                for n in 0..26 {
-                    let drawn = panel::frame(&ui, &view, W, h);
-                    for y in 0..h {
-                        let Some(i) = panel::row_at(&ui, &view, W, h, y) else { continue };
-                        let want = panel::spans_of(&panel::render_row_for_test(&ui, i, W));
-                        let got = panel::spans_of(&drawn[y]);
-                        assert_eq!(
-                            got, want,
-                            "h={h} help={help} after {n} down: screen row {y} maps to tree row {i}, not what is drawn"
-                        );
+                // The focus dock is the harder of the two: the map is a fixed
+                // block, and this one is as tall as whatever the cursor is on,
+                // so it changes height under the very keypress being swept.
+                for focus in [false, true] {
+                    let mut view = panel::View::default();
+                    view.set_help_for_test(help);
+                    view.set_focus_for_test(focus);
+                    let mut ui = ui_of(&w, &view);
+                    for n in 0..26 {
+                        let drawn = panel::frame(&ui, &view, W, h);
+                        for y in 0..h {
+                            let Some(i) = panel::row_at(&ui, &view, W, h, y) else { continue };
+                            let want = panel::spans_of(&panel::render_row_for_test(&ui, i, W));
+                            let got = panel::spans_of(&drawn[y]);
+                            assert_eq!(
+                                got, want,
+                                "h={h} help={help} focus={focus} after {n} down: screen row {y} maps to tree row {i}, not what is drawn"
+                            );
+                        }
+                        panel::apply_key(Key::Down, &mut ui, &mut view);
                     }
-                    panel::apply_key(Key::Down, &mut ui, &mut view);
                 }
             }
         }
@@ -1379,6 +1426,96 @@ mod tests {
             panel::wheel(&mut ui, &mut view, true);
             assert!(visible(&ui, &view), "after {} scrolls up", n + 1);
         }
+    }
+
+    /// What the focus dock is drawing, read off the frame the way you would
+    /// read it off the pane: the lines between the last two rules.
+    fn dock_text(frame: &[panel::Line], w: usize) -> String {
+        let rule = "─".repeat(w);
+        let rules: Vec<usize> =
+            frame.iter().enumerate().filter(|(_, l)| l.text() == rule).map(|(i, _)| i).collect();
+        assert!(rules.len() >= 2, "no focus dock: only {} rules", rules.len());
+        let (top, bottom) = (rules[rules.len() - 2], rules[rules.len() - 1]);
+        frame[top + 1..bottom]
+            .iter()
+            .map(|l| l.text())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The whole point: the sentence the row had to cut is on the pane.
+    #[test]
+    fn the_focus_dock_holds_the_title_the_row_cut() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.to_task("t-002").key(Key::Char('F'));
+        let title = "Plan the demo video: what it shows, in what order, and which of the three \
+                     patches is worth the first thirty seconds";
+
+        let drawn = panel::frame(&d.ui, &d.view, W, H);
+        assert_eq!(dock_text(&drawn, W), title);
+
+        // And the row it came from cannot say it, which is why the dock exists.
+        let row = panel::render_row_for_test(&d.ui, d.ui.selected_index(), W).text();
+        assert!(row.contains('…'), "the row is not truncated: {row}");
+    }
+
+    /// It follows the cursor — that is the difference between this and opening
+    /// the task. Whatever the cursor lands on, the dock is saying it.
+    #[test]
+    fn the_focus_dock_follows_the_cursor() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.key(Key::Char('F'));
+        for n in 0..20 {
+            d.key(Key::Down);
+            let drawn = panel::frame(&d.ui, &d.view, W, H);
+            let want = panel::full_text_for_test(&d.ui, d.ui.selected_index());
+            assert!(
+                dock_text(&drawn, W).starts_with(&want),
+                "after {} down the dock says something else",
+                n + 1
+            );
+        }
+    }
+
+    /// Three lines whatever is selected, six when the title needs them. The
+    /// floor is what keeps the tree still while the cursor moves: a dock that
+    /// shrank to fit every short title would hand the tree a row back and take
+    /// it away again on every keypress.
+    #[test]
+    fn the_focus_dock_keeps_its_floor_and_grows_only_for_a_long_title() {
+        let w = world();
+        let rows_of = |id: &str| {
+            let mut d = Driver::new(&w);
+            d.to_task(id).key(Key::Char('F'));
+            let drawn = panel::frame(&d.ui, &d.view, W, H);
+            let rule = "─".repeat(W);
+            let rules: Vec<usize> =
+                drawn.iter().enumerate().filter(|(_, l)| l.text() == rule).map(|(i, _)| i).collect();
+            rules[rules.len() - 1] - rules[rules.len() - 2] - 1
+        };
+        assert_eq!(rows_of("t-020"), 3, "a four-word title still gets three lines");
+        assert_eq!(rows_of("t-002"), 4, "a title that needs four lines gets four");
+    }
+
+    /// It costs the tree exactly what it takes, and gives it back when it goes.
+    #[test]
+    fn the_focus_dock_takes_its_rows_from_the_tree() {
+        let w = world();
+        let on_screen = |d: &Driver| {
+            (0..H).filter(|y| panel::row_at(&d.ui, &d.view, W, H, *y).is_some()).count()
+        };
+        let mut d = Driver::new(&w);
+        d.to_task("t-002");
+        let before = on_screen(&d);
+        d.key(Key::Char('F'));
+        assert_eq!(on_screen(&d), before - 5, "a four-line dock and its rule");
+        d.key(Key::Char('F'));
+        assert_eq!(on_screen(&d), before, "F again gives the rows back");
     }
 
     #[test]
