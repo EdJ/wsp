@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn a_gesture_that_changes_the_view_reaches_the_file() {
         let dir = scratch("share");
-        let store = Store { root: dir.clone(), state: dir.clone() };
+        let store = Store::at(dir.clone(), dir.clone());
         let mut view = View::default();
         let mut agreed = String::new();
 

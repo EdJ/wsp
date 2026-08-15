@@ -798,6 +798,10 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
             hand_off(store, task_id, None, "workspace closed");
             out.reaped += 1;
         }
+        // Same reason as `release`: the log lines are written here, so the
+        // commit that carries them is this one. Nothing is written when
+        // nothing was reaped, and `git_commit` is a no-op on that.
+        store.git_commit(&format!("wsp: release {} task(s) whose workspace closed", out.reaped));
     }
     let claims = if out.reaped > 0 { store.claims() } else { claims };
 
@@ -933,6 +937,11 @@ pub fn release(store: &Store, args: &Args) -> i32 {
             // lifetime and must leave the intent standing. It ends the same way
             // a migration does, and leaves the same record behind.
             hand_off(store, task_id, None, "release");
+            // `hand_off` writes the release into the task's log, and until
+            // commits were scoped to what a command wrote, that line waited
+            // for some later command to sweep it up — under that command's
+            // message. It belongs to this one.
+            store.git_commit(&format!("wsp: release {task_id}"));
         }
         let mut cache = sync::Cache::default();
         let _ = sync::sync(store, &mut cache, true);
@@ -1597,6 +1606,31 @@ fn tree_index_loss(root: &std::path::Path) -> Option<u64> {
     Some(index_loss(&staged, &disk))
 }
 
+/// What is sitting in the store that no command wrote.
+///
+/// Every `wsp` command commits the files it writes, so whatever is left is a
+/// hand edit — `agents.md` is the usual one, a hook script the other. That
+/// used to be invisible because the next command along swept it into its own
+/// commit; now it waits, correctly, for the person who made it, and the only
+/// thing missing is anybody being told.
+fn store_uncommitted(root: &std::path::Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .env_remove("GIT_INDEX_FILE")
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.get(3..).map(|p| p.trim().to_string()))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 pub fn doctor(store: &Store, args: &Args) -> i32 {
     let mut problems: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -1608,6 +1642,19 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     }
     if !store.root.join(".git").exists() {
         notes.push("store is not a git repo (history disabled)".into());
+    } else {
+        let loose = store_uncommitted(&store.root);
+        if !loose.is_empty() {
+            let named: Vec<&str> = loose.iter().take(3).map(|s| s.as_str()).collect();
+            let rest = match loose.len() > named.len() {
+                true => format!(" and {} more", loose.len() - named.len()),
+                false => String::new(),
+            };
+            notes.push(format!(
+                "uncommitted in the store: {}{rest} — wsp commits what it writes, so these are yours to commit",
+                named.join(", ")
+            ));
+        }
     }
 
     let index = Index::new(store.projects());

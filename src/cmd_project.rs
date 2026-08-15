@@ -26,7 +26,9 @@ pub fn init(store: &Store, args: &Args) -> i32 {
     let hooks = store.root.join("hooks");
     let _ = std::fs::create_dir_all(&hooks);
 
-    store.git_commit("wsp: init store");
+    // The whole store, and the one command entitled to it: what `init` is
+    // about is the store itself, not a file in it.
+    store.git_commit_all("wsp: init store");
 
     if args.json() {
         println!("{}", json!({ "root": util::contract(&store.root), "state": util::contract(&store.state) }));
@@ -367,6 +369,9 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {}: {e}", path.display());
         return 1;
     }
+    // Removed here rather than through the store, so the commit has to be told
+    // about it — the tasks and children rewritten above said so themselves.
+    store.wrote(path);
     store.log_event("project-removed", json!({ "id": p.id, "parent": p.parent }));
     store.git_commit(&format!("wsp: project rm {}", p.id));
 

@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn a_panel_does_not_adopt_its_own_state_back() {
         let dir = scratch("own-state");
-        let store = Store { root: dir.clone(), state: dir.clone() };
+        let store = Store::at(dir.clone(), dir.clone());
 
         let mut mine = View::default();
         mine.collapsed.insert("audio".into());
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn nothing_shared_yet_leaves_the_view_alone() {
         let dir = scratch("first-run");
-        let store = Store { root: dir.clone(), state: dir.clone() };
+        let store = Store::at(dir.clone(), dir.clone());
         let mut view = View::default();
         view.show_done = true;
         let mut agreed = String::new();

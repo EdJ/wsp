@@ -42,6 +42,16 @@ are published by the daemon.
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
 
+Every command commits the files it wrote, and only those — `wsp note` commits
+one task, an archive sweep commits the set it moved, `wsp init` is the one
+command whose subject is the whole store. It used to be `git add -A`, which
+meant whoever ran a command next took everything every other agent had written
+and landed it under their own message. Two things follow. A file you edit in
+the store by hand — `agents.md`, a hook — is never committed by wsp, so commit
+it yourself; `wsp doctor` names what is sitting there uncommitted. And a
+command that fails to commit says so on stderr rather than leaving it for the
+next one to sweep up, because now nothing will.
+
 ## Everyday use
 
 ```sh
@@ -1253,6 +1263,7 @@ this order, each by being bitten:
 | `.git/index` | `git add` writes to one index for everybody; whoever commits takes it all |
 | `target/` | concurrent builds serialise on one lock, and neither build is attributable |
 | `~/.local/bin/wsp` | whoever installs last decides what every running pane *and the daemon* is executing |
+| `~/wsp` (the store) | the same defect as the index, inside the tool: every command committed the whole store, so one agent's `wsp done` carried another's hand-written rule under a message about a task. Fixed in `git_commit` — commands commit the paths they wrote |
 
 ### What each check catches, and what it does not
 

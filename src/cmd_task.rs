@@ -1197,6 +1197,9 @@ fn launch_editor(path: &std::path::Path) -> i32 {
 fn edit_file(store: &Store, path: &std::path::Path, msg: &str) -> i32 {
     let code = launch_editor(path);
     if code == 0 {
+        // `--raw` hands the file straight to an editor, so nothing in the
+        // store wrote it and nothing else would name it in the commit.
+        store.wrote(path);
         store.git_commit(&format!("wsp: {msg}"));
     }
     code

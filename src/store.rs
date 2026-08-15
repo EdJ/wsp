@@ -4,8 +4,9 @@
 //! git commits stay in one place — that is the whole reason agents are told to
 //! use the CLI rather than editing files.
 
-use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,9 @@ thread_local! {
 pub struct Store {
     pub root: PathBuf,
     pub state: PathBuf,
+    /// Files this process has written to the store, waiting for the commit
+    /// that names them. See `git_commit`.
+    written: RefCell<BTreeSet<PathBuf>>,
 }
 
 impl Store {
@@ -38,7 +42,11 @@ impl Store {
             Some(v) => PathBuf::from(v),
             None => util::home().join(".local/state/wsp"),
         };
-        Store { root, state }
+        Store::at(root, state)
+    }
+
+    pub fn at(root: PathBuf, state: PathBuf) -> Store {
+        Store { root, state, written: RefCell::new(BTreeSet::new()) }
     }
 
     pub fn projects_dir(&self) -> PathBuf {
@@ -91,7 +99,10 @@ impl Store {
 
     pub fn save_project(&self, p: &Project) -> std::io::Result<()> {
         fs::create_dir_all(self.projects_dir())?;
-        write_atomic(&self.projects_dir().join(format!("{}.md", p.id)), &p.render())
+        let path = self.projects_dir().join(format!("{}.md", p.id));
+        write_atomic(&path, &p.render())?;
+        self.wrote(path);
+        Ok(())
     }
 
     // ---- tasks ----------------------------------------------------------
@@ -151,7 +162,10 @@ impl Store {
 
     pub fn save_task(&self, t: &Task) -> std::io::Result<()> {
         fs::create_dir_all(self.tasks_dir())?;
-        write_atomic(&self.task_path(&t.id), &t.render())
+        let path = self.task_path(&t.id);
+        write_atomic(&path, &t.render())?;
+        self.wrote(path);
+        Ok(())
     }
 
     /// The highest number ever handed out under a day's prefix, live *or*
@@ -270,8 +284,13 @@ impl Store {
             ));
         }
 
-        write_atomic(&dir.join(format!("{name}.md")), &t.render())?;
+        let filed = dir.join(format!("{name}.md"));
+        write_atomic(&filed, &t.render())?;
         let _ = fs::remove_file(self.task_path(&t.id));
+        // Both halves of the move. A commit holding the arrival without the
+        // departure is a store with the task in two places.
+        self.wrote(filed);
+        self.wrote(self.task_path(&t.id));
         Ok(name)
     }
 
@@ -629,23 +648,135 @@ impl Store {
     }
 
     // ---- git ------------------------------------------------------------
+    //
+    // A commit here says one command did one thing, and it is the only record
+    // of who did what in a store several agents write to at once. `add -A`
+    // could not keep that promise: it committed the whole store, so whoever
+    // ran a command next took everything anybody else had written and landed
+    // it under their own message. Nothing was ever lost that way — what went
+    // was the attribution, and the ability to revert one change without the
+    // other.
+    //
+    // So the store remembers what it wrote and commits exactly that. The
+    // record is kept here rather than threaded through the callers because
+    // the set is assembled by helpers several layers down — a claim hands
+    // other tasks off, `project rm` rewrites every task it orphans, an
+    // archive sweep moves as many files as it finds — and a caller that
+    // forgot one would silently leave it uncommitted, which is the same
+    // invisible failure in a new place.
 
+    /// Note a file written to the store, for the commit at the end of the
+    /// command. Callers that write a store file without going through the
+    /// save/archive methods — `init`'s README, `project rm`'s deletion, an
+    /// editor let loose on a task — have to say so themselves.
+    pub fn wrote(&self, path: impl Into<PathBuf>) {
+        self.written.borrow_mut().insert(path.into());
+    }
+
+    /// Commit the files this command wrote, and nothing else.
+    ///
+    /// A no-op when it wrote nothing, so a command that only sometimes touches
+    /// the store can call it unconditionally.
     pub fn git_commit(&self, msg: &str) {
+        let paths: Vec<PathBuf> = std::mem::take(&mut *self.written.borrow_mut())
+            .into_iter()
+            // Relative to the root, because that is where git is being run and
+            // a root reached through a symlink does not match its own absolute
+            // paths as a pathspec.
+            .map(|p| p.strip_prefix(&self.root).unwrap_or(&p).to_path_buf())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.commit(msg, &paths);
+    }
+
+    /// `wsp init`, whose subject is the store itself rather than anything in
+    /// it. The one command that legitimately wants everything.
+    pub fn git_commit_all(&self, msg: &str) {
+        self.written.borrow_mut().clear();
+        self.commit(msg, &[PathBuf::from(".")]);
+    }
+
+    fn commit(&self, msg: &str, paths: &[PathBuf]) {
         if std::env::var_os("WSP_NO_COMMIT").is_some() || !self.root.join(".git").exists() {
             return;
         }
-        use std::process::{Command, Stdio};
-        let run = |args: &[&str]| {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&self.root)
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        };
-        run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", msg]);
+        let spec: Vec<&OsStr> = paths.iter().map(|p| p.as_os_str()).collect();
+
+        // The `add` is not optional: a pathspec is matched against what git
+        // already knows, so a task that has just been created matches nothing
+        // until it is in the index.
+        //
+        // The `--` on the commit matters as much. A commit with paths takes
+        // its content from the *working tree* and bypasses the index, so a
+        // concurrent `add -A` in another agent's process cannot widen this
+        // commit in the moment between the two calls — and whatever that agent
+        // had staged is still staged afterwards, untouched.
+        let mut add: Vec<&OsStr> = vec![OsStr::new("add"), OsStr::new("--")];
+        add.extend(&spec);
+        self.git(&add);
+
+        // No HEAD is a store git has just been initialised in, where there is
+        // nothing to diff against and the first commit takes what is staged.
+        let born = self
+            .git(&[OsStr::new("rev-parse"), OsStr::new("--verify"), OsStr::new("-q"), OsStr::new("HEAD")])
+            .is_some();
+
+        let mut cmd: Vec<&OsStr> = vec![OsStr::new("commit"), OsStr::new("-q"), OsStr::new("-m"), OsStr::new(msg)];
+        if born {
+            // Nothing to say. A `mutate` that changed no bytes, or a file
+            // written back exactly as it was found — an empty commit is noise
+            // and `git commit` would fail on it anyway.
+            let mut diff: Vec<&OsStr> = vec![
+                OsStr::new("diff"),
+                OsStr::new("--cached"),
+                OsStr::new("--quiet"),
+                OsStr::new("HEAD"),
+                OsStr::new("--"),
+            ];
+            diff.extend(&spec);
+            if self.git(&diff).is_some() {
+                return;
+            }
+            cmd.push(OsStr::new("--"));
+            cmd.extend(&spec);
+        }
+
+        // `git commit` takes a lock, and with several agents writing a few
+        // times a minute two of them land together often enough to matter.
+        // Under `add -A` a commit lost that way was swept up by the next one;
+        // now it would sit uncommitted until something else happened to touch
+        // the same file, so it is worth waiting out — and worth saying so if
+        // waiting does not help. Silence here is what let the original defect
+        // run for a day.
+        for wait in [20, 80, 200] {
+            if self.git(&cmd).is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(wait));
+        }
+        eprintln!(
+            "wsp: could not commit {} — the change is on disk; `git -C {} status`",
+            paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "),
+            util::contract(&self.root)
+        );
+    }
+
+    /// `Some` when git said yes. Output is captured rather than inherited so a
+    /// commit never prints over whatever the command is saying.
+    fn git(&self, args: &[&OsStr]) -> Option<std::process::Output> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            // The commit procedure has agents working through a private index.
+            // A wsp command run from inside one would otherwise stage into it
+            // and be committed later, by hand, as part of somebody's patch.
+            .env_remove("GIT_INDEX_FILE")
+            .args(args)
+            .output()
+            .ok()?;
+        out.status.success().then_some(out)
     }
 
     pub fn git_init(&self) {
@@ -690,9 +821,135 @@ mod tests {
     fn scratch(tag: &str) -> Store {
         let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let store = Store { root: root.clone(), state: root.join("state") };
+        let store = Store::at(root.clone(), root.join("state"));
         store.ensure_dirs().unwrap();
         store
+    }
+
+    /// A scratch store that is a git repo with one commit behind it, so the
+    /// commits under test have a HEAD to be measured against.
+    fn git_scratch(tag: &str) -> Store {
+        assert!(
+            std::env::var_os("WSP_NO_COMMIT").is_none(),
+            "these tests are about the commit — unset WSP_NO_COMMIT to run them"
+        );
+        let store = scratch(tag);
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "wsp@test"],
+            &["config", "user.name", "wsp test"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            git(&store, args);
+        }
+        // The store's own doc, which is nobody's command's output and is the
+        // file the original defect kept sweeping into other people's commits.
+        fs::write(store.root.join("agents.md"), "the rules\n").unwrap();
+        git(&store, &["add", "-A"]);
+        git(&store, &["commit", "-q", "-m", "store"]);
+        store
+    }
+
+    fn git(store: &Store, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&store.root)
+            .args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// `--no-renames` because archiving a task is exactly the move git reads
+    /// as a rename, and a rename is listed by its destination alone — which
+    /// would hide the half of the commit these tests exist to check.
+    fn head_files(store: &Store) -> Vec<String> {
+        git(store, &["show", "--name-only", "--no-renames", "--format=", "HEAD"])
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    fn head_message(store: &Store) -> String {
+        git(store, &["log", "-1", "--format=%s"]).trim().to_string()
+    }
+
+    /// The defect this replaced `add -A` for: with several agents live, the
+    /// commit a command makes must hold the files that command wrote and no
+    /// others. Anything else and the record of who did what is whoever ran a
+    /// command next — which is how a hand-written rule in `agents.md` came to
+    /// be committed by another agent's `wsp done`, under a message about a
+    /// task, as a change its author never made.
+    #[test]
+    fn a_commit_carries_only_the_files_the_command_wrote() {
+        let store = git_scratch("commit-scope");
+
+        // Somebody else, mid-edit, in the store this command is about to
+        // write to.
+        fs::write(store.root.join("agents.md"), "the rules, amended\n").unwrap();
+
+        let t = Task::new("something", "t-260815-001");
+        store.save_task(&t).unwrap();
+        store.git_commit("wsp: add t-260815-001 — something");
+
+        assert_eq!(head_files(&store), vec!["tasks/t-260815-001.md".to_string()]);
+        assert_eq!(head_message(&store), "wsp: add t-260815-001 — something");
+        assert!(
+            git(&store, &["status", "--porcelain"]).contains("agents.md"),
+            "their edit was taken into this commit rather than left for them"
+        );
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// A task leaving is two files — the one that arrives in the archive and
+    /// the one that goes from `tasks/` — and a commit holding one without the
+    /// other is a store with the task in both places or neither.
+    #[test]
+    fn archiving_commits_the_departure_with_the_arrival() {
+        let store = git_scratch("commit-archive");
+
+        let t = Task::new("finished", "t-260815-002");
+        store.save_task(&t).unwrap();
+        store.git_commit("wsp: add t-260815-002 — finished");
+
+        store.archive_task(&t).unwrap();
+        store.git_commit("wsp: rm t-260815-002 — finished");
+
+        let files = head_files(&store);
+        assert!(
+            files.contains(&"tasks/t-260815-002.md".to_string()),
+            "the task file left the store without leaving the commit: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.starts_with("archive/tasks/")),
+            "the archived copy is not in the commit that retired it: {files:?}"
+        );
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// `release` and `reconcile` commit whether or not they wrote anything,
+    /// because whether they did depends on what was bound at the time. An
+    /// empty commit for every one of those would bury the log the store keeps
+    /// exists to be read.
+    #[test]
+    fn a_command_that_wrote_nothing_commits_nothing() {
+        let store = git_scratch("commit-empty");
+        store.git_commit("wsp: release nothing at all");
+        assert_eq!(head_message(&store), "store");
+
+        // And neither does one that wrote a file back exactly as it found it.
+        let t = Task::new("unchanged", "t-260815-003");
+        store.save_task(&t).unwrap();
+        store.git_commit("wsp: add t-260815-003 — unchanged");
+        store.save_task(&t).unwrap();
+        store.git_commit("wsp: note t-260815-003 — unchanged");
+        assert_eq!(head_message(&store), "wsp: add t-260815-003 — unchanged");
+
+        let _ = fs::remove_dir_all(&store.root);
     }
 
     fn task_file(store: &Store, name: &str, at: SystemTime) {
