@@ -40,8 +40,9 @@ pub(crate) struct AgentRef {
     pub(super) pane: String,
     pub(super) workspace: String,
     pub(super) state: String,
-    /// What to call it: the agent's terminal title if there is one, otherwise
-    /// the workspace label.
+    /// What to call it — see [`pane_name`]. The pane's own label first, which
+    /// `claim` and `wsp say` keep current, then its terminal title, then the
+    /// workspace it stands in.
     pub(super) where_: String,
     /// Whether an agent is running here, or it is just a shell.
     pub(super) agent: bool,
@@ -282,6 +283,30 @@ impl Snapshot {
     }
 }
 
+/// What to call a pane's row: its label, else its terminal title, else the
+/// workspace it stands in.
+///
+/// The label comes first because it is the only one of the three that is kept
+/// up to date. `claim` writes the task into it and `wsp say` writes whatever
+/// the agent is doing right now, so on a task's own row the line beneath reads
+/// as progress — the task above, the state of it below.
+///
+/// The terminal title is what an agent called itself when it started and never
+/// revises: a pane three tasks later still announced its opening prompt, which
+/// is worse than useless, because it is a specific and confident answer to the
+/// question and it is wrong. It stays as the fallback for panes wsp has never
+/// named, where it is the best thing on offer — and the workspace label behind
+/// that, for a shell, which has no title of its own but is still worth naming
+/// by where it stands.
+pub(crate) fn pane_name(label: &str, title: &str, workspace: &str) -> String {
+    [label, title, workspace]
+        .into_iter()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, u8, u8, String) {
     (
         u8::from(!needs_you),
@@ -474,6 +499,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             .map(|s| s.to_string())
     };
     // `project` is what the pane would take *work* from, which the caller has
+    // (see `pane_name` above for how a pane row is named)
     // usually just resolved for its own reasons — passed in rather than worked
     // out again here, because resolution canonicalises every project root and
     // this runs four times a second against every pane on the machine.
@@ -481,7 +507,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         pane: a.pane_id.clone(),
         workspace: a.workspace_id.clone(),
         state: a.agent_status.clone(),
-        where_: if a.title.is_empty() { ws_label(&a.workspace_id) } else { a.title.clone() },
+        where_: pane_name(&a.label, &a.title, &ws_label(&a.workspace_id)),
         agent: !a.agent.is_empty(),
         task: bound_task_of_pane(&a.pane_id),
         project,

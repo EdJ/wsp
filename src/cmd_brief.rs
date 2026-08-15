@@ -30,7 +30,13 @@ const MAX_TASKS: usize = 6;
 /// briefing and starts being `wip`.
 const MAX_OTHERS: usize = 6;
 /// The standing rules, if the store carries any.
-const MAX_RULES: usize = 40;
+///
+/// Was 40, which was under half of what `agents.md` had grown to — and the cut
+/// fell in the middle of the commit procedure, so every agent was briefed on
+/// staging into its own index and none on committing with it, building it, or
+/// looking at the pane afterwards. A cap on the rules is right; a cap that
+/// silently keeps the first half of a numbered list is not.
+const MAX_RULES: usize = 120;
 /// Decisions binding this project. Few, and the most recent — a decision is
 /// read to know what is already settled, and the settled thing that matters is
 /// rarely the oldest.
@@ -41,10 +47,25 @@ const MAX_DECISIONS: usize = 4;
 /// and readable by anything that can read a file — none of which is true of a
 /// string compiled in here.
 fn rules(store: &Store) -> Option<String> {
-    let text = std::fs::read_to_string(store.root.join("agents.md")).ok()?;
+    let path = store.root.join("agents.md");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let total = text.lines().count();
     let kept: Vec<&str> = text.lines().take(MAX_RULES).collect();
-    let out = kept.join("\n").trim_end().to_string();
-    (!out.is_empty()).then_some(out)
+    let mut out = kept.join("\n").trim_end().to_string();
+    if out.is_empty() {
+        return None;
+    }
+    // Never drop rules quietly. A rule an agent has not been given is a rule it
+    // will not follow, and a briefing that ends mid-procedure reads exactly
+    // like a procedure that ends there.
+    if total > MAX_RULES {
+        out.push_str(&format!(
+            "\n\n({} more lines — read the rest: cat {})",
+            total - MAX_RULES,
+            util::contract(&path)
+        ));
+    }
+    Some(out)
 }
 
 pub fn brief(store: &Store, args: &Args) -> i32 {

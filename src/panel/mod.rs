@@ -33,6 +33,10 @@ pub(crate) use keys::{apply_key, Effect, View};
 // tests need them from outside.
 #[cfg(test)]
 pub(crate) use keys::{click, wheel, Hit};
+// Same bargain: `rows` builds the tree for this module, and the storyboard
+// tests the naming rule directly rather than through six fabricated panes.
+#[cfg(test)]
+pub(crate) use rows::pane_name;
 pub(crate) use render::{frame, glyph, legend, line, to_ansi, to_html, to_html_spans, Line, Style};
 // The live click mapping reaches `row_at` through `super::render` inside this
 // module; only the storyboard's tests need it from outside, so it is exported

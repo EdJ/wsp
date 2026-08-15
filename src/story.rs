@@ -802,6 +802,29 @@ mod tests {
         panel::collect(snap, view, Some("w0"))
     }
 
+    /// The label wins because it is the only one of the three anybody keeps
+    /// current. An agent's terminal title is its opening prompt frozen, so a
+    /// pane three tasks on still answered with the first thing it was asked —
+    /// confidently, and wrongly, which is the failure a blank would not be.
+    #[test]
+    fn a_pane_is_named_by_the_name_somebody_is_still_maintaining() {
+        use crate::panel::pane_name;
+
+        // `claim` and `wsp say` both write the label, so it answers first.
+        assert_eq!(pane_name("reading the claim guard", "◑ Pick up wsp 041", "wsp"), "reading the claim guard");
+
+        // Never named by wsp: the title is the best thing left.
+        assert_eq!(pane_name("", "◑ Pick up wsp 041", "wsp"), "◑ Pick up wsp 041");
+
+        // A shell has neither, and where it stands still says something.
+        assert_eq!(pane_name("", "", "Trance Video"), "Trance Video");
+        assert_eq!(pane_name("", "", ""), "");
+
+        // Whitespace is not a name. A label of spaces used to win outright and
+        // draw an agent row with nothing on it at all.
+        assert_eq!(pane_name("   ", "◑ Pick up wsp 041", "wsp"), "◑ Pick up wsp 041");
+    }
+
     #[test]
     fn the_first_tree_row_sits_under_the_title_and_its_rule() {
         let w = world();

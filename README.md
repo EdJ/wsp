@@ -613,6 +613,17 @@ now*. Putting both on the workspace would lose the name of the work every time
 somebody started a build. A claim resets the pane to the task title, so there
 is always a way home.
 
+The panel names a pane row by that label first, then its terminal title, then
+the workspace. The label is the only one of the three anybody maintains: an
+agent's terminal title is its opening prompt frozen, so a pane three tasks on
+still announced the first thing it was asked — which is worse than a blank,
+being a specific and confident answer that is wrong. So an agent row under a
+task now reads as progress: the task above, `wsp say` beneath it.
+
+The standing rules an agent is briefed with live in `~/wsp/agents.md`, not in
+this binary — the user's to write, versioned with the tasks they talk about.
+`wsp brief` prints them.
+
 ## What an agent is handed
 
 ```sh
