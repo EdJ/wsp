@@ -11,6 +11,7 @@ mod cmd_agent;
 mod cmd_project;
 mod cmd_task;
 mod daemon;
+mod detail;
 mod fm;
 mod herdr;
 mod model;
@@ -184,6 +185,7 @@ fn main() {
         "hook" => cmd_agent::hook(&store, &args),
         "doctor" => cmd_agent::doctor(&store, &args),
         "adopt" => cmd_agent::adopt(&store, &args),
+        "view" => detail::run(&store, &args),
         "reconcile" => {
             let n = cmd_agent::reconcile(&store);
             println!("reconciled {n} binding(s) from claims");
@@ -244,6 +246,7 @@ fn help() {
 
 {plumbing}
   wsp panel                         the sidebar replacement (runs in a pane)
+  wsp view [<id>]                   detail pane; follows the panel unless given an id
   wsp panel install [--all]         split it into a workspace, or all of them
   wsp panel uninstall [-w ws]       take it back out
   wsp sync [--force]                push tokens to herdr once

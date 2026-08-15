@@ -81,9 +81,28 @@ It must never go back to `layout.apply`: herdr rebuilds the whole tree from
 that call and every pane in it gets a fresh terminal, which takes down any
 agent running in the workspace.
 
-Keys: `j`/`k` move, `←`/`→` fold, `↵` folds or opens a `⋯ n more` row or jumps
-to a task's agent, `1`-`9` jump straight to an agent, `A` shows finished tasks,
-`r` syncs, `?` lists the verbs, `q` quits.
+Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane,
+`1`-`9` jump straight to an agent, `A` shows finished tasks, `r` syncs, `?`
+lists the verbs, `q` quits.
+
+## The detail pane
+
+`↵` on a task or a project opens it in a second pane, split beneath the panel.
+The panel answers *what is there*; this answers *what is this* — a task's
+resolved tags, its claim, the pane working it and its log newest-first; a
+project's rolled-up work, what sits under it and its own tasks.
+
+```sh
+wsp view            # follows whatever the panel last opened
+wsp view <id>       # pinned to one thing
+```
+
+There is one view pane per workspace and `↵` retargets it rather than stacking
+another, so reading a second thing does not move the pane you are reading. The
+target passes through a file the view polls: retargeting costs no process
+churn, where killing and relaunching would blink the pane on every keypress.
+`↵` on a pane row still jumps to that terminal — a pane's detail *is* the
+terminal.
 
 ### Managing from the panel
 
@@ -188,7 +207,8 @@ Every command takes `--json`.
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh |
-| `src/panel.rs` | the in-pane sidebar: project tree, tasks, agents |
+| `src/panel.rs` | the in-pane sidebar: project tree, tasks, panes |
+| `src/detail.rs` | the detail pane: one task or project, in full |
 | `src/cmd_*.rs` | the commands |
 
 Dependencies: `serde_json`. That is the whole list, and it should stay that way —

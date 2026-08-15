@@ -403,6 +403,7 @@ fn scenes() -> Vec<Scene> {
             .scene("Claiming", "c from a task picks the agent that takes it. From an agent row it runs the other way — pick the task it moves to, which is how one agent hands itself from one piece of work to the next."),
     );
 
+    out.extend(detail_scenes(&w));
     out
 }
 
@@ -420,6 +421,35 @@ impl TypeIn for Driver<'_> {
         }
         self
     }
+}
+
+/// The detail pane, rendered from the same fixture. It shares the panel's
+/// Line/Style model, so a colour that drifts in one drifts visibly in both.
+fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
+    use crate::detail::{self, Focus};
+    let ctx = detail::Ctx {
+        tasks: w.tasks.clone(),
+        index: crate::resolve::Index::new(w.projects.clone()),
+        claims: Default::default(),
+        bindings: w.bindings.clone(),
+        panes: w.panes.clone(),
+    };
+    let shot = |title: &str, caption: &str, focus: Focus| Scene {
+        title: title.to_string(),
+        caption: caption.to_string(),
+        gesture: "↵".into(),
+        target: match &focus {
+            Focus::Task(id) => format!("task {id}"),
+            Focus::Project(p) => format!("project {p}"),
+            Focus::Nothing => "nothing".into(),
+        },
+        html: panel::to_html(&detail::frame(&ctx, &focus, W, H), W),
+    };
+    vec![
+        shot("Detail: a task", "↵ on a task opens it here rather than folding something. Inherited tags are resolved, and the log reads newest first — after the fact, the last line is the one that matters.", Focus::Task("t-003".into())),
+        shot("Detail: a project", "↵ on a project: rolled-up work, what sits under it, and its own tasks in the panel's order.", Focus::Project("trance".into())),
+        shot("Detail: nothing yet", "The pane before anything is opened. It is a reader — it waits rather than guessing.", Focus::Nothing),
+    ]
 }
 
 // ---- page ---------------------------------------------------------------

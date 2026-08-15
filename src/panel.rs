@@ -526,7 +526,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // someone opened, agent or not — a shell sitting in a project is a fact
     // about that project whether or not an agent ever attaches to it.
     let panes: Vec<&herdr::Pane> =
-        snap.panes.iter().filter(|p| p.label != PANEL_LABEL).collect();
+        snap.panes.iter().filter(|p| p.label != PANEL_LABEL && p.label != VIEW_LABEL).collect();
     let self_focused = self_ws
         .and_then(|id| workspaces.iter().find(|w| w.id == id))
         .map(|w| w.focused)
@@ -782,23 +782,23 @@ pub struct Line {
 }
 
 impl Line {
-    fn push(&mut self, style: Style, text: impl Into<String>) {
+    pub(crate) fn push(&mut self, style: Style, text: impl Into<String>) {
         let text = text.into();
         if !text.is_empty() {
             self.spans.push(Span { text, style });
         }
     }
 
-    fn width(&self) -> usize {
+    pub(crate) fn width(&self) -> usize {
         self.spans.iter().map(|s| s.text.chars().count()).sum()
     }
 
-    fn pad(&mut self, n: usize) {
+    pub(crate) fn pad(&mut self, n: usize) {
         self.push(Style::Plain, " ".repeat(n));
     }
 
     /// Pad or clip to exactly `w` columns.
-    fn fit(&mut self, w: usize) {
+    pub(crate) fn fit(&mut self, w: usize) {
         let have = self.width();
         if have < w {
             self.pad(w - have);
@@ -830,7 +830,7 @@ impl Line {
     }
 }
 
-fn line(style: Style, text: impl Into<String>) -> Line {
+pub(crate) fn line(style: Style, text: impl Into<String>) -> Line {
     let mut l = Line::default();
     l.push(style, text);
     l
@@ -1160,7 +1160,7 @@ pub(crate) fn frame(ui: &Ui, mode: &Mode, w: usize, h: usize) -> Vec<Line> {
             Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
                 line(Style::Accent, util::truncate(m, w))
             }
-            _ => line(Style::Dim, "a s d b m c X · ↵ open · A done · ? keys"),
+            _ => line(Style::Dim, "↵ inspect · ←→ fold · a s d · ? keys"),
         },
     });
 
@@ -1258,7 +1258,7 @@ pub(crate) fn to_html(frame: &[Line], w: usize) -> String {
 
 // ---- terminal -----------------------------------------------------------
 
-fn stty(args: &[&str]) {
+pub(crate) fn stty(args: &[&str]) {
     if let Ok(tty) = File::open("/dev/tty") {
         let _ = Command::new("stty")
             .args(args)
@@ -1269,7 +1269,7 @@ fn stty(args: &[&str]) {
     }
 }
 
-fn term_size() -> (usize, usize) {
+pub(crate) fn term_size() -> (usize, usize) {
     if let Ok(tty) = File::open("/dev/tty") {
         if let Ok(out) = Command::new("stty").arg("size").stdin(Stdio::from(tty)).output() {
             let s = String::from_utf8_lossy(&out.stdout);
@@ -1365,6 +1365,55 @@ fn spawn_events(tx: Sender<Msg>) {
     });
 }
 
+/// The label herdr carries on a detail pane, so we can find ours again.
+pub(crate) const VIEW_LABEL: &str = "wsp:view";
+
+/// Point the workspace's detail pane at something, making one if there is not
+/// one yet.
+///
+/// One pane per workspace, reused: opening a second thing retargets the pane
+/// you are already reading rather than stacking another beside it. The target
+/// goes through a file the view polls, so retargeting costs no process churn —
+/// the alternative, killing and relaunching, would blink the pane on every
+/// press of a key whose whole job is to be cheap.
+fn inspect(store: &Store, self_ws: Option<&str>, focus: &crate::detail::Focus) -> String {
+    let Some(ws) = self_ws else {
+        return "no workspace to open a view in".into();
+    };
+    crate::detail::set_focus(store, ws, focus);
+
+    let existing = list_panes(ws).ok().and_then(|ps| {
+        ps.into_iter().find(|p| p.label == VIEW_LABEL).map(|p| p.id)
+    });
+    if existing.is_some() {
+        return String::new();
+    }
+
+    // Split downward off our own pane, so the detail shares the sidebar's
+    // column and the working pane beside it is never touched.
+    let Some(me) = list_panes(ws)
+        .ok()
+        .and_then(|ps| ps.into_iter().find(|p| p.label == PANEL_LABEL).map(|p| p.id))
+    else {
+        return "cannot find the panel pane".into();
+    };
+    let res = herdr::call(
+        "pane.split",
+        json!({ "direction": "down", "target_pane_id": me, "ratio": 0.45, "focus": false }),
+    );
+    let Ok(r) = res else { return "could not split a view pane".into() };
+    let Some(pane) = r.get("pane").and_then(|p| p.get("pane_id")).and_then(|x| x.as_str()) else {
+        return "split reported no pane".into();
+    };
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "wsp".into());
+    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": VIEW_LABEL }));
+    let _ = herdr::call(
+        "pane.send_text",
+        json!({ "pane_id": pane, "text": format!("exec {} view\n", shell_quote(&exe)) }),
+    );
+    String::new()
+}
+
 /// Run this binary against the store and report in a few words.
 ///
 /// Output is captured, never inherited: the panel owns an alternate screen in
@@ -1439,6 +1488,8 @@ pub(crate) enum Effect {
     /// Open a herdr workspace for this row, then claim the task into it if
     /// there is one.
     Open { label: String, cwd: Option<String>, project: Option<String>, task: Option<String> },
+    /// Show this row in the detail pane, making one if there is not one yet.
+    Inspect(crate::detail::Focus),
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
@@ -1637,28 +1688,21 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::None
         }
 
-        Key::Enter => match ui.rows.get(ui.sel) {
-            Some(Row::Project { .. }) | Some(Row::Section { .. }) | Some(Row::More { .. }) => {
-                let fold = matches!(ui.rows.get(ui.sel), Some(Row::More { .. }));
-                if fold {
-                    move_or_fold(Key::Right, ui, view)
-                } else {
-                    let collapsed = matches!(
-                        ui.rows.get(ui.sel),
-                        Some(Row::Project { collapsed: true, .. })
-                            | Some(Row::Section { collapsed: true, .. })
-                    );
-                    move_or_fold(if collapsed { Key::Right } else { Key::Left }, ui, view)
-                }
-            }
-            Some(row) => match row.agent() {
+        Key::Enter => match &target {
+            // An overflow row has nothing to look at; opening it is the only
+            // thing it does.
+            Target::Overflow(_) => move_or_fold(Key::Right, ui, view),
+            // A pane's detail *is* the terminal. Going there beats describing it.
+            Target::Pane(_) => match ui.rows.get(ui.sel).and_then(|r| r.agent()) {
                 Some(a) => Effect::Focus(a.clone()),
-                None => {
-                    say(ui, "no agent on that task");
-                    Effect::None
-                }
+                None => Effect::None,
             },
-            None => Effect::None,
+            Target::Task(id) => Effect::Inspect(crate::detail::Focus::Task(id.clone())),
+            Target::Project(p) => Effect::Inspect(crate::detail::Focus::Project(p.clone())),
+            Target::Inbox | Target::Unattached | Target::Nothing => {
+                say(ui, "nothing to open there");
+                Effect::None
+            }
         },
 
         Key::Char(d @ '1'..='9') => {
@@ -1681,7 +1725,7 @@ fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         }
         Key::Char('r') => Effect::Sync,
         Key::Char('?') => {
-            say(ui, "a add · s/v/d/o status · b block · m move · c claim · O open · X remove");
+            say(ui, "↵ inspect · ←→ fold · a add · s/v/d/o · b m c · O open · X remove");
             Effect::None
         }
 
@@ -1883,6 +1927,12 @@ fn event_loop(store: &Store, rx: &Receiver<Msg>, self_ws: Option<&str>) -> i32 {
                     let _ = crate::sync::sync(store, &mut cache, true);
                     ui.message = Some(("synced".into(), Instant::now()));
                     refetch = true;
+                }
+                Effect::Inspect(focus) => {
+                    let msg = inspect(store, self_ws, &focus);
+                    if !msg.is_empty() {
+                        say(&mut ui, msg);
+                    }
                 }
                 Effect::Open { label, cwd, project, task } => {
                     match open_workspace(&label, cwd.as_deref(), project.as_deref(), task.as_deref())
