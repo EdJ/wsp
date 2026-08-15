@@ -137,7 +137,16 @@ pub(super) struct Census {
 pub(super) fn agent_state(herdr_state: &str, holds: Option<Status>) -> AgentState {
     match herdr_state {
         "working" => AgentState::Working,
-        "idle" => match holds {
+        // `done` is a third value herdr sends and nothing here knew about. It
+        // is a turn ending rather than an agent leaving: 120s of the event
+        // stream held three `working -> done` and three `done -> idle`, and
+        // forty one-second samples of `pane.list` never caught a pane in it at
+        // all. So it means what `idle` means, and mapping it to `Quiet` —
+        // "herdr says neither working nor idle, so nothing here will pretend to
+        // know" — would draw the one moment we know most about as the one we
+        // know nothing about. Which the panel is now far likelier to sample,
+        // since a status change is what it refetches on.
+        "idle" | "done" => match holds {
             Some(Status::Blocked) => AgentState::Blocked,
             // A claim left on finished work is not work: the agent is free
             // whatever the binding still says.

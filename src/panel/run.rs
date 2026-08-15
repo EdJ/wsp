@@ -4,13 +4,14 @@
 //! stream, the tick, and the loop that turns an [`Effect`] into something that
 //! actually happens.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::herdr;
 use crate::input::Key;
@@ -114,6 +115,14 @@ pub(super) fn spawn_input(tx: Sender<Msg>) {
 /// again when the agent goes away. `pane.agent_status_changed` is not here and
 /// cannot be: it is per-pane and its request requires a `pane_id`, so asking
 /// for it globally refuses the whole list — see the note in [`crate::herdr`].
+///
+/// An agent *finishing* belongs in this list too and is not in it, because
+/// there is no event that means it. It is recovered instead: see
+/// [`status_changed`], which promotes the one `pane.updated` in a hundred that
+/// carries a status the pane did not have before. An agent appearing was
+/// immediate on every panel on the machine while an agent stopping waited up to
+/// thirty seconds on all but the focused one — and "who has stopped, and who is
+/// free" is the question the census exists to answer.
 const SHAPE: &[&str] = &[
     "workspace.created",
     "workspace.closed",
@@ -133,7 +142,10 @@ const SHAPE: &[&str] = &[
 ///
 /// `pane.updated` is the only global carrier of an agent going idle or working,
 /// which is what the "wants you" arrow is drawn from, so it has to be here even
-/// though it is the noisiest thing herdr sends.
+/// though it is the noisiest thing herdr sends. Chatty is what it is on
+/// average, not what it always is: the one in a hundred of them that carries a
+/// status the pane did not have before is promoted to structural by
+/// [`status_changed`], and the other ninety-nine go on being coalesced.
 const CHATTY: &[&str] = &["workspace.focused", "workspace.renamed", "pane.updated"];
 
 /// Subscriptions herdr scopes to a single pane. Its request struct for these
@@ -151,10 +163,45 @@ fn is(types: &[&str], event: &str) -> bool {
     types.iter().any(|t| t.replace('.', "_") == event)
 }
 
+/// Did this event say an agent started or stopped, as against saying anything
+/// else at all?
+///
+/// `pane.updated` is the only global carrier of an agent's status and also the
+/// noisiest thing herdr sends: it fires on every spinner frame in a terminal
+/// title and every token count, ten a second with four agents running, and
+/// carries the whole pane each time. The status itself changes a few times a
+/// minute. `seen` is the only thing that can tell those apart — the event does
+/// not say what it was before, so a reducer that keeps no history has to treat
+/// a stop and a spinner frame identically, which is why an agent finishing sat
+/// on the 30s cadence while an agent appearing did not.
+///
+/// A pane met for the first time is recorded and is not a change. Every pane on
+/// the machine arriving at once is what the first second of a subscription
+/// looks like, and it is not news about any of them.
+fn status_changed(seen: &mut HashMap<String, String>, d: &Value) -> bool {
+    let Some(pane) = d.get("pane") else { return false };
+    let Some(id) = pane.get("pane_id").and_then(|x| x.as_str()) else { return false };
+    // A pane with no agent in it has no status to change. herdr sends the field
+    // as an empty string rather than leaving it out.
+    let status = pane.get("agent_status").and_then(|x| x.as_str()).unwrap_or_default();
+    if status.is_empty() {
+        return false;
+    }
+    match seen.insert(id.to_string(), status.to_string()) {
+        Some(before) => before != status,
+        None => false,
+    }
+}
+
 pub(super) fn spawn_events(tx: Sender<Msg>) {
     std::thread::spawn(move || loop {
         let tx2 = tx.clone();
         let types: Vec<&str> = SHAPE.iter().chain(CHATTY).copied().collect();
+        // Per subscription rather than per panel: a dropped stream is a gap we
+        // cannot describe, so the map starts empty and the first event about
+        // each pane teaches it rather than firing. The background tick covers
+        // whatever changed while nobody was listening.
+        let mut seen: HashMap<String, String> = HashMap::new();
         let res = herdr::subscribe(&types, move |e, d| {
             // `pane.created` and `pane.updated` carry the pane as an object and
             // the workspace id inside it; the rest put it at the top level.
@@ -165,9 +212,14 @@ pub(super) fn spawn_events(tx: Sender<Msg>) {
                 .or_else(|| d.get("pane").and_then(|p| p.get("workspace_id")))
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string());
+            // First, and not behind the `||`: every event carrying a pane
+            // teaches the map, including the structural ones. A `pane.created`
+            // that did not would leave the pane's opening status unrecorded,
+            // and the next `pane.updated` would read as a change.
+            let changed = status_changed(&mut seen, d);
             let ev = HerdrEvent {
                 workspace: ws,
-                shape: is(SHAPE, e),
+                shape: changed || is(SHAPE, e),
                 focus: e == "workspace_focused",
             };
             tx2.send(Msg::Herdr(ev)).is_ok()
@@ -679,6 +731,54 @@ mod tests {
             assert!(CHATTY.contains(&t), "{t} should be tick-gated");
             assert!(!SHAPE.contains(&t), "{t} is far too noisy to refetch on");
         }
+    }
+
+    /// The whole of the asymmetry, in one function. An agent stopping has no
+    /// event of its own that reaches every panel, so it arrives inside the
+    /// noisiest one there is — and the only thing separating it from a spinner
+    /// frame is what the pane's status was a moment ago.
+    ///
+    /// Measured against the live server with four agents running: 120s of
+    /// `pane.updated` is 335 events carrying 18 status transitions. Promoting
+    /// eighteen a couple of minutes is the handful a minute `SHAPE` is costed
+    /// for; promoting all 335 is the continuous socket traffic across every
+    /// panel on the machine that `CHATTY` exists to avoid.
+    #[test]
+    fn only_a_status_that_actually_changed_is_worth_a_refetch() {
+        let pane = |id: &str, status: &str| {
+            json!({ "pane": { "pane_id": id, "agent_status": status } })
+        };
+        let mut seen = HashMap::new();
+
+        // Meeting a pane teaches without firing: the first second of a
+        // subscription is every pane on the machine arriving at once.
+        assert!(!status_changed(&mut seen, &pane("w1:p6", "working")));
+        // And the spinner frames behind it say nothing new.
+        for _ in 0..10 {
+            assert!(!status_changed(&mut seen, &pane("w1:p6", "working")));
+        }
+
+        // Stopping is the one that must not wait.
+        assert!(status_changed(&mut seen, &pane("w1:p6", "idle")));
+        assert!(!status_changed(&mut seen, &pane("w1:p6", "idle")), "and only once");
+        // Starting again is the same fact from the other side: an arrow that
+        // says an agent wants you must come down as promptly as it went up.
+        assert!(status_changed(&mut seen, &pane("w1:p6", "working")));
+
+        // Panes are tracked apart. One agent working through another's stop
+        // used to be the same event as far as the reducer could tell.
+        assert!(!status_changed(&mut seen, &pane("w0:p3", "idle")));
+        assert!(status_changed(&mut seen, &pane("w0:p3", "working")));
+        assert!(!status_changed(&mut seen, &pane("w1:p6", "working")));
+
+        // A pane with no agent in it has no status to change. herdr sends the
+        // field empty rather than leaving it out, and an empty string is not a
+        // transition into anything.
+        assert!(!status_changed(&mut seen, &pane("w2:p1", "")));
+        assert!(!status_changed(&mut seen, &pane("w2:p1", "")));
+        // Nor is an event that carries no pane at all — `workspace.focused`
+        // goes through the same reducer.
+        assert!(!status_changed(&mut seen, &json!({ "workspace_id": "w1" })));
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
