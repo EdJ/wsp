@@ -155,7 +155,35 @@ pub fn call(method: &str, params: Value) -> std::io::Result<Value> {
 /// and the caller reported a failure that had not happened.
 pub fn call_for(method: &str, params: Value, timeout: Duration) -> std::io::Result<Value> {
     let (machine, params) = route(params)?;
-    let mut s = connect_to(&socket_for(machine.as_deref()), Some(timeout)).map_err(|e| {
+    send(machine.as_deref(), method, params, timeout)
+}
+
+/// A call to a machine you name, for the methods that carry no id to route on.
+///
+/// `workspace.list`, `pane.list`, `agent.list` and `workspace.create` ask a
+/// server about itself, so there is nothing in the params to read a machine
+/// off. Everything else should go through [`call`] and let the id decide —
+/// naming the machine at a call site that already carries one is how the two
+/// answers get to disagree.
+///
+/// `None` is this machine, so a caller fanning out over "here and mb2" writes
+/// one loop rather than a special case.
+pub fn call_on(
+    machine: Option<&str>,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> std::io::Result<Value> {
+    send(machine, method, params, timeout)
+}
+
+fn send(
+    machine: Option<&str>,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> std::io::Result<Value> {
+    let mut s = connect_to(&socket_for(machine), Some(timeout)).map_err(|e| {
         // Named, because the bare errno is the wrong diagnosis. "No such file
         // or directory" on a path nobody typed reads as a broken install; what
         // it actually means is that the daemon is not holding a tunnel to that

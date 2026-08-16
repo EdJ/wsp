@@ -498,6 +498,20 @@ pub struct Machine {
     pub name: String,
     /// A `Host` alias, not a hostname. See the struct docs.
     pub ssh: String,
+    /// Where the far machine's herdr socket is, as an absolute path *on that
+    /// machine*. What `ssh -L <here>:<there>` forwards.
+    ///
+    /// Written down rather than discovered, because `ssh -L` does not expand
+    /// `~` on the remote side and asking the far machine for its `$HOME` would
+    /// put a blocking round trip — to a machine that may be down — inside the
+    /// daemon's tick.
+    ///
+    /// Defaulted to this machine's own herdr socket path, which is right while
+    /// paths mirror and is exactly the assumption the design says it is making:
+    /// the executor is a Mac now and a Linux box later, and the Linux box is
+    /// what makes you type this field. The machines file is where host-specific
+    /// paths were always going to hang.
+    pub herdr_sock: String,
     /// `darwin` | `linux`, and whatever comes next. Free text: nothing branches
     /// on it yet, and a machine you cannot describe is still a machine.
     pub os: String,
@@ -537,11 +551,23 @@ pub fn valid_machine_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// This machine's herdr socket, as the default for a machine's own.
+///
+/// The mirrored-path assumption, in the one place it is made. It is right for
+/// a Mac driving a Mac with the same username — which is what exists — and
+/// wrong for the Linux box, which is why the field is writable and why being
+/// wrong shows up as a tunnel that will not come up rather than as anything
+/// subtler.
+fn mirrored_herdr_sock() -> String {
+    crate::herdr::socket_path().to_string_lossy().into_owned()
+}
+
 impl Machine {
     pub fn new(name: &str, ssh: &str) -> Machine {
         Machine {
             name: name.to_string(),
             ssh: ssh.to_string(),
+            herdr_sock: mirrored_herdr_sock(),
             status: "active".into(),
             added: util::now_iso(),
             ..Default::default()
@@ -557,6 +583,7 @@ impl Machine {
             // twice.
             ssh: doc.opt("ssh").unwrap_or_else(|| name.clone()),
             name,
+            herdr_sock: doc.opt("herdr_sock").unwrap_or_else(mirrored_herdr_sock),
             os: doc.str("os"),
             arch: doc.str("arch"),
             status: doc.opt("status").unwrap_or_else(|| "active".into()),
@@ -569,6 +596,7 @@ impl Machine {
         let mut d = Doc::default();
         d.set_str("name", &self.name);
         d.set_str("ssh", &self.ssh);
+        d.set_str("herdr_sock", &self.herdr_sock);
         d.set_str("os", &self.os);
         d.set_str("arch", &self.arch);
         d.set_str("status", &self.status);

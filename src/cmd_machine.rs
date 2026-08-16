@@ -119,6 +119,9 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     // Said now rather than discovered later: everything about reaching the
     // machine lives outside wsp, so the next step is not a wsp command.
     println!("  {}", p.dim(&format!("needs: a `Host {}` block in ~/.ssh/config, and herdr server running there", m.ssh)));
+    // The mirrored-path assumption, said out loud at the moment it is made
+    // rather than discovered as a tunnel that will not come up.
+    println!("  {}", p.dim(&format!("forwards {} — wsp machine set {} herdr_sock=… if that is not where it is", m.herdr_sock, m.name)));
     0
 }
 
@@ -189,6 +192,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     println!("{}  {}{}", p.bold(&m.name), state, if note.is_empty() { String::new() } else { format!("  {}", p.dim(&note)) });
     println!();
     println!("ssh       {}", m.ssh);
+    println!("herdr     {}", m.herdr_sock);
     let box_line = [m.os.as_str(), m.arch.as_str()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
     if !box_line.is_empty() {
         println!("box       {box_line}");
@@ -203,7 +207,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             println!("socket    {}", util::contract(std::path::Path::new(&l.socket)));
         }
         if !l.herdr_version.is_empty() {
-            println!("herdr     {}", l.herdr_version);
+            println!("version   {}", l.herdr_version);
         }
         if !l.error.is_empty() {
             println!("error     {}", p.red(&l.error));
@@ -220,7 +224,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
 pub fn set(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp machine set <name> ssh=… os=… arch=… status=active|retired");
+        eprintln!("usage: wsp machine set <name> ssh=… herdr_sock=… os=… arch=… status=active|retired");
         return 2;
     };
     let Some(mut m) = find(store, &needle) else {
@@ -236,6 +240,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
         };
         match k {
             "ssh" => m.ssh = v.to_string(),
+            "herdr_sock" => m.herdr_sock = v.to_string(),
             "os" => m.os = v.to_string(),
             "arch" => m.arch = v.to_string(),
             "status" => match v {
@@ -246,7 +251,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                 }
             },
             other => {
-                eprintln!("wsp: machines have no `{other}` — ssh, os, arch, status");
+                eprintln!("wsp: machines have no `{other}` — ssh, herdr_sock, os, arch, status");
                 return 2;
             }
         }
@@ -428,6 +433,7 @@ fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
         "ssh": m.ssh,
         "os": m.os,
         "arch": m.arch,
+        "herdr_sock": m.herdr_sock,
         "status": m.status,
         "added": m.added,
         "live": live.map(|l| l.to_value()),

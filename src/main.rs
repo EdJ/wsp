@@ -27,6 +27,7 @@ mod resolve;
 mod story;
 mod store;
 mod sync;
+mod tunnel;
 mod util;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -374,7 +375,7 @@ fn help() {
                                     a Host alias from ~/.ssh/config, not an address
   wsp machine ls|machines           what exists, and whether it is answering
   wsp machine show <name>           ssh target, tunnel, last seen, why not
-  wsp machine set <name> k=v…       ssh/os/arch/status
+  wsp machine set <name> k=v…       ssh/herdr_sock/os/arch/status
   wsp machine rm <name> [--force]   retire it; --force removes the record
 
 {plumbing}

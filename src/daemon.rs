@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::herdr;
 use crate::store::Store;
 use crate::sync::{self, Cache};
+use crate::tunnel::Supervisor;
 
 const DEBOUNCE: Duration = Duration::from_millis(400);
 const TICK: Duration = Duration::from_secs(20);
@@ -106,6 +107,9 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     });
 
     let mut cache = Cache::default();
+    // Every executor's herdr socket, held open on this machine. Inert until
+    // somebody runs `wsp machine add`; see `crate::tunnel`.
+    let mut tunnels = Supervisor::new();
     let mut last_refresh = Instant::now();
     let mut last_fingerprint = store.fingerprint();
     // What we are executing, so we can notice an `install` landing underneath
@@ -155,6 +159,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // debounce already drained. Everything below this line either finishes
         // or is not started.
         if let Some(stamp) = changed(started_as, crate::util::exe_stamp()) {
+            // The tunnels first, and before the `exec`. An `ssh -L` we leave
+            // behind goes on holding the socket it bound, and the daemon that
+            // comes up in our place cannot bind it — the machine would read as
+            // permanently broken for a reason nothing on screen could explain.
+            // Safe if the exec then fails: the next tick starts them again.
+            tunnels.shutdown();
             // `reload` returns only when it failed to replace us. An install is
             // a copy, not a rename, so there is a window in which the file on
             // disk is a half-written binary — and unlike a panel, of which
@@ -166,6 +176,25 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             // unexecutable costs one line rather than one every tick, while the
             // next install is still a change and still tried.
             started_as = Some(stamp);
+        }
+
+        // Every tick, not only when something woke us: a machine going away is
+        // not an event herdr has any way to tell us about, and a tunnel that
+        // fell over five minutes ago must not wait for a sidebar hover to be
+        // noticed.
+        let moved = tunnels.tick(store);
+        if verbose && !moved.is_empty() {
+            for name in &moved {
+                match store.machine_live(name) {
+                    Some(l) if l.reachable => eprintln!("wsp daemon: {name} up"),
+                    Some(l) => eprintln!(
+                        "wsp daemon: {name} {} — {}",
+                        l.tunnel,
+                        if l.error.is_empty() { "no answer yet" } else { &l.error }
+                    ),
+                    None => eprintln!("wsp daemon: {name} gone"),
+                }
+            }
         }
 
         let fingerprint = store.fingerprint();
