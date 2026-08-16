@@ -296,6 +296,12 @@ take a column back down with it. The rest of the frame is unchanged: the strip,
 the dock, the focus line and the footer each span the pane, one row to a line,
 because they are lists of five rather than trees.
 
+`↵` while zoomed puts you back in the sidebar with the detail pane open, and
+that is herdr rather than the panel: splitting a pane into a zoomed workspace
+ends the zoom, which is the right answer — the row you asked to read is opening
+in a second pane, and a zoom is the one state where a second pane cannot be
+seen. `Z` again when you have read it.
+
 A pane that big is also a pane with no shortage, so the six-task cap comes off:
 a project shows all its tasks rather than six and a `⋯ 4 more`. That is the one
 thing about a fullscreen panel that is not simply the same panel bigger — which
