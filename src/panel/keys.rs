@@ -52,8 +52,8 @@ pub(crate) struct View {
     pub(super) collapsed: HashSet<String>,
     /// Projects (or the inbox) showing past `MAX_TASKS_PER_PROJECT`.
     pub(super) expanded: HashSet<String>,
-    /// The pane is a page rather than a sidebar — wide enough that the tree is
-    /// drawn in columns, which is what `Z` makes it.
+    /// The pane is a page rather than a sidebar — wide enough to be read rather
+    /// than glanced at, which is what `Z` makes it.
     ///
     /// A fact about this pane and not about the work, so it is never shared: two
     /// panels open on the same tree, one zoomed and one not, are looking at the
@@ -901,9 +901,7 @@ pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 pub(crate) fn wheel(ui: &mut Ui, view: &mut View, w: usize, h: usize, up: bool) {
     const STEP: usize = 3;
     let g = super::render::geometry(ui, view, w, h);
-    // Every column of the tree, not one of them: what the last screen holds is
-    // what the view may be scrolled to the end of.
-    let last = g.tree_len.saturating_sub(g.body());
+    let last = g.tree_len.saturating_sub(g.tree_rows);
     let to = if up { g.scroll.saturating_sub(STEP) } else { (g.scroll + STEP).min(last) };
     view.scroll = Some(to);
     // The cursor stays where it is, even when the view leaves it behind. What
@@ -990,7 +988,7 @@ pub(crate) fn click(
         };
     }
     let at = super::render::geometry(ui, view, w, h).scroll;
-    match super::render::row_at(ui, view, w, h, x, y) {
+    match super::render::row_at(ui, view, w, h, y) {
         None => Hit::Nothing,
         // A line under an agent belongs to that agent: the click lands on the
         // row it is written beneath, which is the row it is about. A group

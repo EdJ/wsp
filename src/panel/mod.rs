@@ -63,20 +63,11 @@ pub(crate) use render::{
 // for them alone rather than widening the surface for everyone.
 #[cfg(test)]
 pub(crate) use render::row_at;
-// The rule for how many columns of tree a pane is worth, checked directly
-// rather than through a frame: it is a decision about when the panel stops
-// being a sidebar, and reading it back off a rendered page would prove it at
-// one size and leave the boundaries untested.
-#[cfg(test)]
-pub(crate) use render::columns;
 #[cfg(test)]
 pub(crate) use render::to_html_spans as spans_of;
 
 /// Draw one row exactly as the frame would, so a test can ask whether the row
 /// a click maps to is the row that was painted there.
-///
-/// `w` is the column it is drawn in rather than the pane: in a wide pane the
-/// tree is several columns of rows, and a cell of it is what a click lands on.
 #[cfg(test)]
 pub(crate) fn render_row_for_test(ui: &Ui, i: usize, w: usize) -> Line {
     render::cell(ui, i, w, &rows::hotkeys(ui))

@@ -280,33 +280,25 @@ close afterwards; this is one call and a repaint. The footer says `fullscreen ·
 Z back`, because a key that changes the shape of the screen has to say how to
 undo itself.
 
-What the room is spent on is the tree, in columns — down one, then into the
-next, the way a newspaper sets a story, so reading order is what it was and `j`
-walks off the foot of one column onto the top of the one beside it. A column is
-at least 48 wide, which is where a row stops being an abbreviation: the
-sidebar's 34 leaves about twenty-five characters of a title that averages
-sixty-four, and 48 leaves about forty. Below that a second column would buy rows
-by taking the words off them, so a sidebar and an ordinary eighty-column
-terminal stay a single list.
+Nothing is laid out differently. The tree stays one row to a line and every one
+of those rows is the width of the pane, so the title that was twenty-five
+characters and an ellipsis is a sentence, and there are as many rows as the
+workspace is tall. That is the whole of what more room is for — the panel was
+already the right shape, it was only ever thirty-four columns of it.
 
-Columns arrive when the pane can hold them **and** there is tree to put in them.
-Four columns for a tree that fills one and a half would be three columns of
-white space beside a list you were still scrolling, so folding a branch away can
-take a column back down with it. The rest of the frame is unchanged: the strip,
-the dock, the focus line and the footer each span the pane, one row to a line,
-because they are lists of five rather than trees.
+The one thing that does change is which rows there are: the six-task cap comes
+off, so a project shows all its tasks rather than six and a `⋯ 4 more`. Six was
+what one project could spend of a column that had to hold thirty projects, and a
+pane this size has no such shortage. It follows the width rather than the key —
+a pane is a page at 96 columns, which is about where a row stops abbreviating —
+so dragging the split wider by hand gets the same tree, and herdr's own zoom
+keybinding works as well as `Z` does.
 
 `↵` while zoomed puts you back in the sidebar with the detail pane open, and
 that is herdr rather than the panel: splitting a pane into a zoomed workspace
 ends the zoom, which is the right answer — the row you asked to read is opening
 in a second pane, and a zoom is the one state where a second pane cannot be
 seen. `Z` again when you have read it.
-
-A pane that big is also a pane with no shortage, so the six-task cap comes off:
-a project shows all its tasks rather than six and a `⋯ 4 more`. That is the one
-thing about a fullscreen panel that is not simply the same panel bigger — which
-is why it follows the width rather than the key. Drag the split wider by hand
-and you get the same tree; herdr's own zoom keybinding works as well as `Z`.
 
 ## The detail pane
 

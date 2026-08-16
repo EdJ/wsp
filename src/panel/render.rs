@@ -54,15 +54,6 @@ pub enum Style {
 pub struct Span {
     pub text: String,
     pub style: Style,
-    /// Drawn inverse, on its own account.
-    ///
-    /// A selected row used to be a selected *line*, which it is right up until
-    /// the tree is drawn in more than one column — then one line holds a row
-    /// from each column and at most one of them is the one under the cursor.
-    /// So the mark moved onto the run of text it is actually about, and the
-    /// line-level flag stayed for the docks and the picker, which are one row
-    /// to a line and always will be.
-    pub selected: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,15 +67,7 @@ impl Line {
     pub(crate) fn push(&mut self, style: Style, text: impl Into<String>) {
         let text = text.into();
         if !text.is_empty() {
-            self.spans.push(Span { text, style, selected: false });
-        }
-    }
-
-    /// Mark every span of this line as the selected row, so it draws inverse
-    /// wherever on a line it has been laid.
-    pub(crate) fn select(&mut self) {
-        for s in &mut self.spans {
-            s.selected = true;
+            self.spans.push(Span { text, style });
         }
     }
 
@@ -114,11 +97,7 @@ impl Line {
                 left -= n;
                 out.push(s);
             } else {
-                out.push(Span {
-                    text: s.text.chars().take(left).collect(),
-                    style: s.style,
-                    selected: s.selected,
-                });
+                out.push(Span { text: s.text.chars().take(left).collect(), style: s.style });
                 break;
             }
         }
@@ -629,59 +608,23 @@ pub(super) fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
     sel.saturating_sub(body / 2).min(n - body)
 }
 
-/// The narrowest column of tree worth drawing.
+/// Where a sidebar ends and a page begins.
 ///
-/// Forty-eight is where a row stops being an abbreviation. The sidebar's
-/// thirty-four leaves about twenty-five characters of a title that averages
-/// sixty-four; this leaves about forty. Below it a second column buys rows by
-/// taking away the words on them, which is the wrong trade — the pane was made
-/// bigger precisely so it could say more.
-pub(super) const COL_MIN: usize = 48;
-
-/// A space, a rule, a space, between one column of tree and the next. The rule
-/// is what stops the counts down the right of one column reading as marks down
-/// the left of the next.
-pub(super) const GUTTER: usize = 3;
-
-/// How many columns of tree the *pane* could hold, before asking whether there
-/// is tree enough to fill them. The last column needs no gutter after it, so
-/// `w + GUTTER` is the width being divided into whole slots.
-fn cols_by_width(w: usize) -> usize {
-    (w + GUTTER) / (COL_MIN + GUTTER)
-}
+/// A title in this store averages sixty-four characters, and a row spends about
+/// thirty more on depth, marks, an id and the counts down the right — so
+/// ninety-six is roughly the width at which the tree stops abbreviating and
+/// starts saying what the work is. Below it the panel is a sidebar however it
+/// got there; at or above it, it is being read rather than glanced at.
+pub(super) const PAGE_MIN: usize = 96;
 
 /// Is this pane a page rather than a sidebar?
 ///
-/// One question with two answers hanging off it, and they are the same
-/// judgement: a page draws the tree in columns, and a page shows a project's
-/// tasks all of them rather than six and a count. Asked of the width alone —
-/// how many rows there are cannot come into it, because the cap decides how
-/// many rows there are, and a rule that read them back would chase itself.
+/// Asked of the width alone, and it decides one thing: whether a project shows
+/// all its tasks or six and a count of the rest. How many rows there are cannot
+/// come into it, because the cap is what decides how many rows there are, and a
+/// rule that read them back would chase itself.
 pub(crate) fn is_page(w: usize) -> bool {
-    cols_by_width(w) > 1
-}
-
-/// How many columns the tree is drawn in, and how wide each of them is.
-///
-/// Two limits, and the smaller wins. The pane is one: a column narrower than
-/// [`COL_MIN`] is a column of truncation, so a sidebar and an ordinary
-/// eighty-column terminal both stay a single list. The tree is the other —
-/// there is no sense drawing four columns for a tree that fills one and a half,
-/// and a panel that did would leave three columns of white space beside a list
-/// you were still scrolling.
-///
-/// So columns arrive when the pane is big enough to hold them *and* there is
-/// tree to put in them. `Z` is what makes the first true, and it is also why
-/// folding a branch away can take a column back down with it.
-pub(crate) fn columns(w: usize, tree_len: usize, tree_rows: usize) -> (usize, usize) {
-    let fits = cols_by_width(w);
-    let needed = match tree_rows {
-        0 => 1,
-        n => tree_len.div_ceil(n),
-    };
-    let cols = fits.min(needed).max(1);
-    let col_w = ((w + GUTTER) / cols).saturating_sub(GUTTER).max(1);
-    (cols, col_w)
+    w >= PAGE_MIN
 }
 
 /// The whole panel as styled lines. No escapes, no terminal — a backend turns
@@ -701,37 +644,9 @@ pub(crate) struct Geometry {
     /// The focus dock and the rule above it, or zero when it is off.
     pub focus_rows: usize,
     pub dock_rows: usize,
-    /// Rows in *one* column of the tree.
     pub tree_rows: usize,
-    /// How many of those columns there are, and how wide one is. One and the
-    /// pane's own width in a sidebar; see [`columns`].
-    pub tree_cols: usize,
-    pub col_w: usize,
     pub tree_len: usize,
     pub scroll: usize,
-}
-
-impl Geometry {
-    /// How many rows of tree are on the pane at once — every column of them.
-    /// What the scroll is clamped against, and what a page of travel is worth.
-    pub(crate) fn body(&self) -> usize {
-        self.tree_rows * self.tree_cols
-    }
-
-    /// The pane column that column `col` of the tree begins at.
-    pub(crate) fn col_x(&self, col: usize) -> usize {
-        col * (self.col_w + GUTTER)
-    }
-
-    /// The column a click at pane column `x` landed in, or `None` for the rule
-    /// between two of them and the space past the last.
-    fn column_at(&self, x: usize) -> Option<usize> {
-        let col = x / (self.col_w + GUTTER);
-        // How far into that column the pointer landed: past its last cell is
-        // the rule beside it, and the gutter is furniture like the rules above
-        // and below the tree — a click on furniture is not a click on a row.
-        (col < self.tree_cols && x - self.col_x(col) < self.col_w).then_some(col)
-    }
 }
 
 /// Work out the geometry and leave the view holding the offset it was drawn
@@ -796,10 +711,6 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     };
     let tree_len = ui.rows.len() - ui.dock;
     let tree_rows = body_rows - dock_rows;
-    // Every question below this line is about how much tree is on the pane, and
-    // in a wide one that is several columns of it rather than one.
-    let (tree_cols, col_w) = columns(w, tree_len, tree_rows);
-    let body = tree_rows * tree_cols;
     let scroll = match view.scroll {
         // The cursor pulls the view only when the cursor is what moved. A
         // pointer has just said where it wants to be looking — and where the
@@ -810,57 +721,37 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
         // and always drawn, so following the cursor into it would scroll the
         // tree to its end to answer a question about a row that was on screen
         // the whole time.
-        Some(s) if !view.keyed || ui.sel >= tree_len => s.min(tree_len.saturating_sub(body)),
-        Some(s) => scroll_to(s, ui.sel, tree_len, body, LOOKAHEAD),
-        None => scroll_for(ui.sel.min(tree_len.saturating_sub(1)), tree_len, body),
+        Some(s) if !view.keyed || ui.sel >= tree_len => {
+            s.min(tree_len.saturating_sub(tree_rows))
+        }
+        Some(s) => scroll_to(s, ui.sel, tree_len, tree_rows, LOOKAHEAD),
+        None => scroll_for(ui.sel.min(tree_len.saturating_sub(1)), tree_len, tree_rows),
     };
-    Geometry {
-        head: HEAD,
-        map_rows,
-        tags_rows,
-        focus_rows,
-        dock_rows,
-        tree_rows,
-        tree_cols,
-        col_w,
-        tree_len,
-        scroll,
-    }
+    Geometry { head: HEAD, map_rows, tags_rows, focus_rows, dock_rows, tree_rows, tree_len, scroll }
 }
 
-/// One row of the tree as the frame paints it: drawn to the width of the column
-/// it lands in, padded out to fill it, and marked when it is the row under the
-/// cursor.
+/// One row as the frame paints it: drawn to the pane's width and marked when it
+/// is the row under the cursor.
 ///
 /// The single place a row becomes a line, so the storyboard's mapping sweep can
-/// ask for the cell the frame drew rather than for a restatement of it — and so
-/// that a selected row draws the same whether it is alone on its line or one of
-/// four laid side by side.
+/// ask for the line the frame drew rather than for a restatement of it.
 pub(crate) fn cell(ui: &Ui, i: usize, w: usize, keys: &[Option<u8>]) -> Line {
     let mut l = render_row(&ui.rows[i], w, keys.get(i).copied().flatten());
-    l.fit(w);
-    if i == ui.sel {
-        l.select();
-    }
+    l.selected = i == ui.sel;
     l
 }
 
-/// The row a click at pane cell `x`,`y` landed on, if it landed on one.
+/// The row a click at pane row `y` landed on, if it landed on one.
 ///
 /// `None` for the title, the rule, the blank tail, the key map and the footer:
 /// a click on furniture is not a click on a row, and moving the cursor because
-/// somebody clicked a horizontal line is worse than doing nothing. `x` is part
-/// of the question wherever the tree is drawn in columns — the same screen row
-/// then holds one row per column, and the space between them is furniture too.
-pub(crate) fn row_at(ui: &Ui, view: &View, w: usize, h: usize, x: usize, y: usize) -> Option<usize> {
+/// somebody clicked a horizontal line is worse than doing nothing.
+pub(crate) fn row_at(ui: &Ui, view: &View, w: usize, h: usize, y: usize) -> Option<usize> {
     let g = geometry(ui, view, w, h);
 
-    if y >= g.head && y < g.head + g.tree_rows {
-        let col = g.column_at(x)?;
-        let i = g.scroll + col * g.tree_rows + (y - g.head);
-        // Past the end of the tree: the tail of the last column, and every
-        // column beyond it, is blank.
-        return (i < g.tree_len).then_some(i);
+    let drawn = g.tree_rows.min(g.tree_len.saturating_sub(g.scroll));
+    if y >= g.head && y < g.head + drawn {
+        return Some(g.scroll + (y - g.head));
     }
 
     // The dock sits at the bottom whatever the tree is doing, under a rule of
@@ -1016,29 +907,12 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         lines.push(line(Style::Dim, "  w for the work"));
     }
 
-    // The tree, down one column and then into the next. One column is the
-    // sidebar exactly as it was; the arithmetic is the same either way, and it
-    // is the same arithmetic [`row_at`] maps a click back through.
-    //
-    // Only the screen rows that have something on them: a column fills before
-    // the one beside it starts, so the row that runs out is the last one drawn,
-    // and the blank tail below it belongs to the padding loop underneath.
+    // The tree: one row to a line, every line the width of the pane. A wide
+    // pane is a wide row — which is the whole of what a fullscreen panel is,
+    // and why there is no second layout here for [`row_at`] to disagree with.
     let scroll = g.scroll;
-    for r in 0..g.tree_rows.min(tree_len.saturating_sub(scroll)) {
-        let mut l = Line::default();
-        for c in 0..g.tree_cols {
-            let i = scroll + c * g.tree_rows + r;
-            if i >= tree_len {
-                break;
-            }
-            if c > 0 {
-                l.push(Style::Plain, " ");
-                l.push(Style::Dim, "│");
-                l.push(Style::Plain, " ");
-            }
-            l.spans.extend(cell(ui, i, g.col_w, &keys).spans);
-        }
-        lines.push(l);
+    for i in scroll..tree_len.min(scroll + g.tree_rows) {
+        lines.push(cell(ui, i, w, &keys));
     }
     while lines.len()
         < h.saturating_sub(footer_rows + g.focus_rows + g.tags_rows + map_rows + dock_rows)
@@ -1276,7 +1150,7 @@ pub(crate) fn to_ansi(frame: &[Line], w: usize, h: usize) -> String {
         let mut l = l.clone();
         l.fit(w);
         for s in &l.spans {
-            if l.selected || s.selected {
+            if l.selected {
                 out.push_str(INV);
             }
             out.push_str(ansi_of(s.style));
@@ -1318,14 +1192,11 @@ pub(super) fn esc_html(s: &str) -> String {
 pub(crate) fn to_html_spans(l: &Line) -> String {
     let mut out = String::new();
     for s in &l.spans {
-        let cell = format!("<span class=\"{}\">{}</span>", class_of(s.style), esc_html(&s.text));
-        // The same nesting a selected *line* gets from [`to_html`], so one
-        // rule in the stylesheet covers both: `.sel` paints the ground and the
-        // styles inside it take the ink.
-        out.push_str(&match s.selected {
-            true => format!("<span class=\"sel\">{cell}</span>"),
-            false => cell,
-        });
+        out.push_str(&format!(
+            "<span class=\"{}\">{}</span>",
+            class_of(s.style),
+            esc_html(&s.text)
+        ));
     }
     out
 }

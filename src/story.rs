@@ -601,7 +601,7 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::at(&w, 120, 30).scene(
             "Fullscreen",
-            "Z gives the panel the whole workspace — herdr zooms the pane it is already running in, so the process, the folds and the cursor are the ones from the sidebar. The room goes on the tree: columns, filled down one and then into the next, so reading order is unchanged and j walks off the foot of one onto the top of the next. A column is at least 48 wide, which is where a title stops being an abbreviation, and there are only ever as many as there is tree to fill — fold a branch away and a column goes with it. The cap goes too: a project shows all its tasks rather than six and a ⋯, because the six were an economy a pane this size does not need. Everything that is not the tree — the strip, the dock, the footer — is one row to a line, because a list of five in columns is a list of five with white space in it.",
+            "Z gives the panel the whole workspace — herdr zooms the pane it is already running in, so the process, the folds and the cursor are the ones from the sidebar. Nothing is laid out differently: the tree is the same one row to a line, and every one of those rows is now as wide as the pane, so a title that was twenty-five characters and an ellipsis is a sentence. The one thing that does change is which rows there are — the six-task cap comes off, because six was what a project could spend of a column that had to hold thirty projects, and a pane this size has no such shortage.",
         ),
     );
 
@@ -1211,10 +1211,10 @@ mod tests {
         let w = world();
         let view = panel::View::default();
         let ui = ui_of(&w, &view);
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, 0), None, "the title");
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, 1), None, "the rule under it");
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, 2), Some(0), "the first row");
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, 3), Some(1));
+        assert_eq!(panel::row_at(&ui, &view, W, H, 0), None, "the title");
+        assert_eq!(panel::row_at(&ui, &view, W, H, 1), None, "the rule under it");
+        assert_eq!(panel::row_at(&ui, &view, W, H, 2), Some(0), "the first row");
+        assert_eq!(panel::row_at(&ui, &view, W, H, 3), Some(1));
     }
 
     /// The keyboard is in this pane, which is the state every click below is
@@ -1613,7 +1613,7 @@ mod tests {
     /// top — every row above it is free to change height or arrive.
     fn screen_row(ui: &panel::Ui, view: &panel::View, row: usize) -> usize {
         (0..H)
-            .find(|&y| panel::row_at(ui, view, W, H, 0, y) == Some(row))
+            .find(|&y| panel::row_at(ui, view, W, H, y) == Some(row))
             .unwrap_or_else(|| panic!("row {row} is not on the pane"))
     }
 
@@ -1681,7 +1681,7 @@ mod tests {
         let (mut ui, mut view) = showing(&w, &[Key::Char('w')]);
         let on = ui.selected_index();
         let y = (0..H)
-            .find(|&y| panel::row_at(&ui, &view, W, H, 0, y) == Some(on))
+            .find(|&y| panel::row_at(&ui, &view, W, H, y) == Some(on))
             .expect("the selected row is on the pane");
 
         // With the keyboard here it is `↵` on that agent, which goes to its
@@ -1704,7 +1704,7 @@ mod tests {
         let sel = ui.selected_index();
         assert_eq!(panel::click(&mut ui, &mut view, W, H, 4, 0, nobody), panel::Hit::Keyboard);
         let other = (0..H)
-            .find(|&y| matches!(panel::row_at(&ui, &view, W, H, 0, y), Some(i) if i != sel))
+            .find(|&y| matches!(panel::row_at(&ui, &view, W, H, y), Some(i) if i != sel))
             .expect("a row the cursor is not on");
         assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, other, nobody), panel::Hit::Keyboard);
         assert_eq!(ui.selected_index(), sel, "nothing under the pointer was read at all");
@@ -1859,9 +1859,9 @@ mod tests {
         let view = panel::View::default();
         let ui = ui_of(&w, &view);
         // Far below anything drawn: the blank tail, the rules and the footer.
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, H - 1), None);
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, H - 2), None);
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, H - 3), None);
+        assert_eq!(panel::row_at(&ui, &view, W, H, H - 1), None);
+        assert_eq!(panel::row_at(&ui, &view, W, H, H - 2), None);
+        assert_eq!(panel::row_at(&ui, &view, W, H, H - 3), None);
     }
 
     /// Ed: "overscrolling resets the position to that of the last agent, when
@@ -1922,12 +1922,12 @@ mod tests {
             panel::apply_key(Key::Down, &mut ui, &mut view);
             panel::place(&ui, &mut view, W, H);
         }
-        let first = panel::row_at(&ui, &view, W, H, 0, 2).expect("a row at the top");
+        let first = panel::row_at(&ui, &view, W, H, 2).expect("a row at the top");
         assert!(first > 0, "the tree has scrolled, so the top row is not row 0");
         // Whatever is at the top, the row below it is the next one along.
-        assert_eq!(panel::row_at(&ui, &view, W, H, 0, 3), Some(first + 1));
+        assert_eq!(panel::row_at(&ui, &view, W, H, 3), Some(first + 1));
         // And the selected row is where the cursor actually is.
-        let sel_y = (2..H).find(|y| panel::row_at(&ui, &view, W, H, 0, *y) == Some(ui.selected_index()));
+        let sel_y = (2..H).find(|y| panel::row_at(&ui, &view, W, H, *y) == Some(ui.selected_index()));
         assert!(sel_y.is_some(), "the selected row is on screen and clickable");
     }
 
@@ -1938,7 +1938,7 @@ mod tests {
     fn assert_mapping_matches_frame(ui: &panel::Ui, view: &mut panel::View, at: &str) {
         let drawn = panel::frame(ui, view, W, H);
         for y in 0..H {
-            let Some(i) = panel::row_at(ui, view, W, H, 0, y) else { continue };
+            let Some(i) = panel::row_at(ui, view, W, H, y) else { continue };
             let want = panel::spans_of(&panel::render_row_for_test(ui, i, W));
             let got = panel::spans_of(&drawn[y]);
             assert_eq!(got, want, "{at}: screen row {y} maps to tree row {i}, which is not what is drawn there");
@@ -1964,7 +1964,7 @@ mod tests {
                     for n in 0..26 {
                         let drawn = panel::frame(&ui, &mut view, W, h);
                         for y in 0..h {
-                            let Some(i) = panel::row_at(&ui, &view, W, h, 0, y) else { continue };
+                            let Some(i) = panel::row_at(&ui, &view, W, h, y) else { continue };
                             let want = panel::spans_of(&panel::render_row_for_test(&ui, i, W));
                             let got = panel::spans_of(&drawn[y]);
                             assert_eq!(
@@ -1979,99 +1979,51 @@ mod tests {
         }
     }
 
-    /// When the panel stops being a list and becomes a page.
+    /// A page shows the branch whole; a sidebar shows six of it and says so.
     ///
-    /// Both halves of the rule matter and they fail differently. Without the
-    /// width test a sidebar would split into two columns of seventeen and every
-    /// title would be an abbreviation of an abbreviation; without the tree test
-    /// a zoomed pane holding a dozen rows would draw them four across with three
-    /// columns of white space beside them.
+    /// The cap is an economy: six tasks is what one project may spend of a
+    /// column that has to hold thirty projects, and the `⋯` is how the tail
+    /// stays reachable. A pane wide enough to be read rather than glanced at has
+    /// no such shortage, so the whole branch is there — which is what `Z` is
+    /// pressed for, and it follows the width rather than the key, so dragging a
+    /// split wider gets the same tree.
     #[test]
-    fn columns_arrive_when_there_is_pane_for_them_and_tree_to_fill_them() {
-        // The sidebar, whatever it is holding.
-        assert_eq!(panel::columns(34, 200, 20), (1, 34));
-        // And an ordinary eighty-column terminal, which is a pane rather than a
-        // screen: two columns of thirty-eight would be worse at every row.
-        assert_eq!(panel::columns(80, 200, 20), (1, 80));
-
-        // Zoomed, with a tree that fills it: three columns, and the rules
-        // between them account for the pane exactly.
-        let (cols, cw) = panel::columns(153, 200, 45);
-        assert_eq!((cols, cw), (3, 49));
-        assert_eq!(cols * cw + (cols - 1) * 3, 153, "the columns and their gutters are the pane");
-
-        // The same pane, with only as much tree as it takes to fill one column
-        // and then two. Folding a branch away takes a column down with it.
-        assert_eq!(panel::columns(153, 30, 45).0, 1);
-        assert_eq!(panel::columns(153, 60, 45).0, 2);
-
-        // A pane with no rows in it at all still answers with a column to draw
-        // into — the tree is empty under `R` with nothing at review, and the
-        // frame still has a sentence to put there.
-        assert_eq!(panel::columns(153, 0, 0).0, 1);
-    }
-
-    /// The same invariant in a pane wide enough for the tree to be drawn in
-    /// columns, where a screen row holds one tree row per column and `x` is
-    /// half of the question.
-    ///
-    /// Text rather than spans, because what is being compared is a *slice* of a
-    /// line — the columns one cell occupies, cut back out of the row it was laid
-    /// into. Getting this wrong is the mouse acting on a row two columns away
-    /// from the one under the pointer, which is worse than a click that misses.
-    ///
-    /// The narrow sizes are in the list on purpose: the same arithmetic draws
-    /// the sidebar, and a change that only ever gets exercised at 153 columns is
-    /// one nobody runs.
-    #[test]
-    fn the_mapping_matches_the_frame_in_columns() {
+    fn a_page_shows_the_branch_whole_and_a_sidebar_shows_six() {
         let world = world();
-        let slice = |l: &panel::Line, from: usize, w: usize| -> String {
-            l.text().chars().skip(from).take(w).collect()
-        };
-        for (w, h) in [(34usize, 26usize), (80, 24), (100, 24), (120, 30), (153, 50), (200, 40)] {
-            for focus in [false, true] {
-                let mut view = panel::View::default();
-                view.set_focus_for_test(focus);
-                let mut ui = ui_of(&world, &view);
-                for n in 0..26 {
-                    let g = panel::place(&ui, &mut view, w, h);
-                    let drawn = panel::frame(&ui, &mut view, w, h);
-                    for col in 0..g.tree_cols {
-                        let x = g.col_x(col);
-                        // The rule between two columns is furniture, like the
-                        // rules above and below the tree. Only over the tree:
-                        // the dock beneath it is one row to a line and spans
-                        // the pane, so there is no gutter there to click on.
-                        if col > 0 {
-                            for y in g.head..g.head + g.tree_rows {
-                                assert_eq!(
-                                    panel::row_at(&ui, &view, w, h, x - 1, y),
-                                    None,
-                                    "{w}x{h} after {n} down: the gutter before column {col} is not a row",
-                                );
-                            }
-                        }
-                        for y in 0..h {
-                            let Some(i) = panel::row_at(&ui, &view, w, h, x, y) else { continue };
-                            let Some(line) = drawn.get(y) else {
-                                panic!("{w}x{h}: row {y} maps to {i} and was never drawn")
-                            };
-                            // The dock is one row to a line at the pane's own
-                            // width, whatever the tree above it is doing.
-                            let (from, cw) =
-                                if i < g.tree_len { (x, g.col_w) } else { (0, w) };
-                            assert_eq!(
-                                slice(line, from, cw),
-                                panel::render_row_for_test(&ui, i, cw).text(),
-                                "{w}x{h} focus={focus} after {n} down: the cell at {x},{y} maps to row {i}, which is not what is drawn there",
-                            );
-                        }
-                    }
-                    panel::apply_key(Key::Down, &mut ui, &mut view);
+        let tasks_of = |w: usize| -> (Vec<String>, usize) {
+            let mut view = panel::View::default();
+            view.fit_to_pane(w);
+            let mut ui = ui_of(&world, &view);
+            let mut ids = Vec::new();
+            for i in 0..ui.rows_for_test() {
+                ui.select_for_test(i);
+                if let panel::Target::Task(id) = ui.selected_target() {
+                    ids.push(id);
                 }
             }
-        }
+            let more =
+                kinds(&mut ui).into_iter().filter(|k| *k == panel::RowKind::More).count();
+            (ids, more)
+        };
+
+        // The fixture's `wsp` project holds eight, which is what the overflow
+        // row exists for.
+        let (sidebar, sidebar_more) = tasks_of(W);
+        let (page, page_more) = tasks_of(120);
+        let panel_work = |ids: &[String]| ids.iter().filter(|id| id.starts_with("t-1")).count();
+
+        assert_eq!(panel_work(&sidebar), 6, "a sidebar spends six rows on one project");
+        assert_eq!(panel_work(&page), 8, "a page shows the branch whole");
+        assert!(page.len() > sidebar.len(), "and the tree is longer for it");
+
+        // One `⋯` fewer, not none: the other belongs to the agents dock, which
+        // keeps five rows however wide the pane is — it is a pinned list of who
+        // has stopped, and a page is not a reason to grow it.
+        assert_eq!(
+            sidebar_more,
+            page_more + 1,
+            "the ⋯ the page loses is the project's tail, and the one it keeps is the dock's",
+        );
     }
 
     /// Ed: "when we scroll they no longer align as expected". This is why.
@@ -2097,7 +2049,7 @@ mod tests {
         // that would move is the one at the edge, and which screen row that is
         // depends on how tall the dock happens to be today.
         for y in 0..H {
-            let Some(i) = panel::row_at(&ui, &view, W, H, 0, y) else { continue };
+            let Some(i) = panel::row_at(&ui, &view, W, H, y) else { continue };
             // Whichever of these the cursor happens to be parked on is a click
             // that activates, and this is a test about the other kind. Asked
             // rather than assumed: which screen row the cursor lands on after
@@ -2112,7 +2064,7 @@ mod tests {
             };
             assert_eq!(at(&mut after_ui, &mut after_view), panel::Hit::Select);
             assert_eq!(
-                panel::row_at(&after_ui, &after_view, W, H, 0, y),
+                panel::row_at(&after_ui, &after_view, W, H, y),
                 Some(i),
                 "clicking screen row {y} moved tree row {i} out from under the pointer"
             );
@@ -2136,7 +2088,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         panel::place(&ui, &mut view, W, H);
-        let top = |ui: &panel::Ui, view: &panel::View| panel::row_at(ui, view, W, H, 0, 2);
+        let top = |ui: &panel::Ui, view: &panel::View| panel::row_at(ui, view, W, H, 2);
         let mut down = |ui: &mut panel::Ui, view: &mut panel::View| {
             panel::apply_key(Key::Down, ui, view);
             panel::place(ui, view, W, H);
@@ -2184,7 +2136,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         panel::place(&ui, &mut view, W, H);
-        let top = |ui: &panel::Ui, view: &panel::View| panel::row_at(ui, view, W, H, 0, 2);
+        let top = |ui: &panel::Ui, view: &panel::View| panel::row_at(ui, view, W, H, 2);
 
         // Down to the end, and well past it: the wheel against the last screen
         // is a burst of events that move nothing.
@@ -2214,7 +2166,7 @@ mod tests {
         let mut ui = ui_of(&w, &view);
         panel::place(&ui, &mut view, W, H);
         let visible = |ui: &panel::Ui, view: &panel::View| {
-            (0..H).any(|y| panel::row_at(ui, view, W, H, 0, y) == Some(ui.selected_index()))
+            (0..H).any(|y| panel::row_at(ui, view, W, H, y) == Some(ui.selected_index()))
         };
 
         // Somewhere with tree above and below it, so the wheel can leave it in
@@ -2321,7 +2273,7 @@ mod tests {
     fn the_focus_dock_takes_its_rows_from_the_tree() {
         let w = world();
         let on_screen = |d: &Driver| {
-            (0..H).filter(|y| panel::row_at(&d.ui, &d.view, W, H, 0, *y).is_some()).count()
+            (0..H).filter(|y| panel::row_at(&d.ui, &d.view, W, H, *y).is_some()).count()
         };
         let mut d = Driver::new(&w);
         d.to_task("t-002");
@@ -2358,7 +2310,7 @@ mod tests {
         let w = world();
         let view = panel::View::default();
         let ui = ui_of(&w, &view);
-        let seen: Vec<usize> = (0..H).filter_map(|y| panel::row_at(&ui, &view, W, H, 0, y)).collect();
+        let seen: Vec<usize> = (0..H).filter_map(|y| panel::row_at(&ui, &view, W, H, y)).collect();
         let mut sorted = seen.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -2371,8 +2323,8 @@ mod tests {
         assert!(jumps <= 1, "the mapping has more than one gap: {seen:?}");
 
         // And every row that can be clicked can be selected by clicking it.
-        for (n, y) in (0..H).filter(|y| panel::row_at(&ui, &view, W, H, 0, *y).is_some()).enumerate() {
-            assert_eq!(panel::row_at(&ui, &view, W, H, 0, y), Some(seen[n]));
+        for (n, y) in (0..H).filter(|y| panel::row_at(&ui, &view, W, H, *y).is_some()).enumerate() {
+            assert_eq!(panel::row_at(&ui, &view, W, H, y), Some(seen[n]));
         }
     }
 
