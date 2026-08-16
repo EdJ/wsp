@@ -1496,83 +1496,154 @@ pub fn unpin(store: &Store, args: &Args) -> i32 {
     0
 }
 
-pub fn where_am_i(store: &Store, args: &Args) -> i32 {
-    let index = Index::new(store.projects());
-    let env = herdr::Env::read();
-    let pins = store.pins();
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+/// Everything `wsp where` reads, gathered into one value.
+///
+/// The subject here is the resolution chain — pin > binding > mandate > cwd >
+/// workspace label — and the chain is already pure in [`resolve::resolve`].
+/// What was not pure is *gathering the five things it compares*, which took a
+/// pane with the right environment, a store with the right pins, and a herdr
+/// answering with the right label. So the one question worth asking of this
+/// command — which link won, and what it beat — had no test.
+pub(crate) struct Whereabouts {
+    pub index: Index,
+    pub pins: std::collections::BTreeMap<String, String>,
+    pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
+    pub claims: std::collections::BTreeMap<String, serde_json::Value>,
+    pub tasks: Vec<Task>,
+    /// For the label of the workspace this pane stands in, which is both a
+    /// link in the chain and how a claim is matched to a workspace.
+    pub workspaces: Vec<herdr::Workspace>,
+    /// This pane and its workspace, as herdr's environment names them.
+    pub pane: Option<String>,
+    pub workspace: Option<String>,
+    /// The process's own directory rather than the pane's: herdr reports the
+    /// shell's cwd, which is stale the moment anyone `cd`s.
+    pub cwd: Option<String>,
+}
 
-    let binding = env.pane_id.as_ref().and_then(|p| store.bindings().get(p).cloned());
-    let bound_task = binding
+impl Whereabouts {
+    pub(crate) fn live(store: &Store) -> Whereabouts {
+        let env = herdr::Env::read();
+        Whereabouts {
+            index: Index::new(store.projects()),
+            pins: store.pins(),
+            bindings: store.bindings(),
+            claims: store.claims(),
+            tasks: store.tasks(),
+            workspaces: match (&env.workspace_id, herdr::available()) {
+                (Some(_), true) => herdr::workspaces().unwrap_or_default(),
+                _ => Vec::new(),
+            },
+            pane: env.pane_id,
+            workspace: env.workspace_id,
+            cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        }
+    }
+}
+
+/// Where this pane sits, once every link has been compared.
+pub(crate) struct Located {
+    pub project: Option<String>,
+    pub source: &'static str,
+    pub tags: Vec<String>,
+    /// What cwd alone would have said. Worth carrying, because a claimed pane
+    /// keeps its project after you `cd` somewhere else, and the two disagreeing
+    /// is the state a person is trying to understand when they ask.
+    pub by_cwd: Option<String>,
+    pub label: Option<String>,
+    pub task: Option<Task>,
+}
+
+fn locate(w: &Whereabouts) -> Located {
+    let task = w
+        .pane
         .as_ref()
+        .and_then(|p| w.bindings.get(p))
         .and_then(|b| b.get("task_id"))
         .and_then(|t| t.as_str())
-        .and_then(|id| store.task(id));
+        .and_then(|id| w.tasks.iter().find(|t| t.id == id).cloned());
 
-    let label = match (&env.workspace_id, herdr::available()) {
-        (Some(ws), true) => herdr::workspaces()
-            .ok()
-            .and_then(|list| list.into_iter().find(|w| &w.id == ws).map(|w| w.label)),
-        _ => None,
-    };
+    let label = w
+        .workspace
+        .as_ref()
+        .and_then(|ws| w.workspaces.iter().find(|x| &x.id == ws).map(|x| x.label.clone()));
 
     let r = resolve::resolve(
-        &index,
-        &pins,
+        &w.index,
+        &w.pins,
         resolve::Held {
-            binding: bound_task.as_ref().and_then(|t| t.project.clone()),
+            binding: task.as_ref().and_then(|t| t.project.clone()),
             claim: resolve::claimed_project(
-                &store.claims(),
-                &store.tasks(),
-                env.workspace_id.as_deref(),
+                &w.claims,
+                &w.tasks,
+                w.workspace.as_deref(),
                 label.as_deref(),
             ),
         },
-        env.workspace_id.as_deref(),
+        w.workspace.as_deref(),
         label.as_deref(),
-        cwd.as_deref(),
+        w.cwd.as_deref(),
     );
 
-    let tags = r.project.as_ref().map(|p| index.effective_tags(p)).unwrap_or_default();
-    // What cwd alone would have said — worth showing, because a claimed pane
-    // keeps its project even after you cd somewhere else.
-    let by_cwd = cwd.as_deref().and_then(|c| index.project_for_cwd(c));
-
-    if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "project": r.project,
-                "source": r.source,
-                "tags": tags,
-                "by_cwd": by_cwd,
-                "workspace_id": env.workspace_id,
-                "workspace_label": label,
-                "pane_id": env.pane_id,
-                "cwd": cwd,
-                "task": bound_task.as_ref().map(|t| t.json()),
-            }))
-            .unwrap_or_default()
-        );
-        return 0;
+    Located {
+        tags: r.project.as_ref().map(|p| w.index.effective_tags(p)).unwrap_or_default(),
+        by_cwd: w.cwd.as_deref().and_then(|c| w.index.project_for_cwd(c)),
+        project: r.project,
+        source: r.source,
+        label,
+        task,
     }
+}
 
-    let p = Paint::new();
-    match &r.project {
+fn where_json(w: &Whereabouts, at: &Located) -> serde_json::Value {
+    json!({
+        "project": at.project,
+        "source": at.source,
+        "tags": at.tags,
+        "by_cwd": at.by_cwd,
+        "workspace_id": w.workspace,
+        "workspace_label": at.label,
+        "pane_id": w.pane,
+        "cwd": w.cwd,
+        "task": at.task.as_ref().map(|t| t.json()),
+    })
+}
+
+fn where_lines(at: &Located, p: &Paint) -> Vec<String> {
+    let mut out = Vec::new();
+    match &at.project {
         Some(proj) => {
-            println!("{}  {}", p.bold(proj), p.dim(&format!("via {}", r.source)));
-            if !tags.is_empty() {
-                println!("{}", p.dim(&tags.join(" ")));
+            out.push(format!("{}  {}", p.bold(proj), p.dim(&format!("via {}", at.source))));
+            if !at.tags.is_empty() {
+                out.push(p.dim(&at.tags.join(" ")));
             }
         }
-        None => println!("{}", p.dim("no project resolved for this pane")),
+        None => out.push(p.dim("no project resolved for this pane")),
     }
-    if let Some(t) = &bound_task {
-        println!("\n{} {}  {}", p.cyan("▸"), p.bold(&t.id), t.title);
+    if let Some(t) = &at.task {
+        out.push(String::new());
+        out.push(format!("{} {}  {}", p.cyan("▸"), p.bold(&t.id), t.title));
     }
-    if let Some(c) = &by_cwd {
-        if Some(c) != r.project.as_ref() {
-            println!("\n{}", p.dim(&format!("cwd alone would say {c} — `wsp release` to follow the directory instead")));
+    // Only when they disagree: saying "cwd would also say wsp" is a line that
+    // never means anything.
+    if let Some(c) = &at.by_cwd {
+        if Some(c) != at.project.as_ref() {
+            out.push(String::new());
+            out.push(p.dim(&format!("cwd alone would say {c} — `wsp release` to follow the directory instead")));
+        }
+    }
+    out
+}
+
+pub fn where_am_i(store: &Store, args: &Args) -> i32 {
+    let w = Whereabouts::live(store);
+    let at = locate(&w);
+    match args.json() {
+        true => println!("{}", serde_json::to_string_pretty(&where_json(&w, &at)).unwrap_or_default()),
+        false => {
+            for l in where_lines(&at, &Paint::new()) {
+                println!("{l}");
+            }
         }
     }
     0
@@ -2999,4 +3070,120 @@ mod tests {
             .collect();
         assert_eq!(waiting, ["w2:p1"]);
     }
+
+    // ---- where, offline ----------------------------------------------------
+
+    fn where_index() -> Index {
+        let mut wsp = crate::model::Project::new("wsp");
+        wsp.roots = vec!["/home/ed/claude/wsp".into()];
+        wsp.tags = vec!["rust".into()];
+        let mut strata = crate::model::Project::new("strata");
+        strata.roots = vec!["/home/ed/claude/strata".into()];
+        Index::new(vec![wsp, strata])
+    }
+
+    /// A pane in wsp's tree, bound to a task filed under strata — which is the
+    /// state worth asking about, because the two links disagree.
+    fn standing() -> Whereabouts {
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
+        let mut t = Task::new("a task filed somewhere else", "t-001");
+        t.project = Some("strata".into());
+        t.status_raw = "doing".into();
+
+        Whereabouts {
+            index: where_index(),
+            pins: std::collections::BTreeMap::new(),
+            bindings,
+            claims: std::collections::BTreeMap::new(),
+            tasks: vec![t],
+            workspaces: vec![herdr::Workspace {
+                id: "w1".into(),
+                label: "strata/001 · a task filed somewhere else".into(),
+                ..Default::default()
+            }],
+            pane: Some("w1:p1".into()),
+            workspace: Some("w1".into()),
+            cwd: Some("/home/ed/claude/wsp".into()),
+        }
+    }
+
+    /// The whole point of the command: which link won, and what it beat. A
+    /// binding outranks the directory, so a pane that claimed strata work keeps
+    /// saying strata after you cd into the wsp tree — and the command says so
+    /// out loud rather than leaving you to wonder.
+    #[test]
+    fn where_says_which_link_won_and_what_it_beat() {
+        let w = standing();
+        let at = locate(&w);
+        assert_eq!(at.project.as_deref(), Some("strata"));
+        assert_eq!(at.source, "binding");
+        assert_eq!(at.by_cwd.as_deref(), Some("wsp"), "and what the directory alone would have said");
+
+        let text = where_lines(&at, &Paint::new()).join("\n");
+        assert!(text.contains("strata  via binding"), "{text}");
+        assert!(text.contains("cwd alone would say wsp"), "the disagreement is the answer:\n{text}");
+        assert!(text.contains("wsp release"), "…and what to do about it:\n{text}");
+        assert!(text.contains("a task filed somewhere else"), "the task it is holding:\n{text}");
+    }
+
+    /// When the two links agree there is nothing to say, and saying "cwd would
+    /// also say wsp" is a line that never means anything.
+    #[test]
+    fn a_pane_standing_where_its_work_lives_gets_no_second_opinion() {
+        let mut w = standing();
+        w.tasks[0].project = Some("wsp".into());
+        let at = locate(&w);
+        assert_eq!(at.project.as_deref(), Some("wsp"));
+
+        let text = where_lines(&at, &Paint::new()).join("\n");
+        assert!(!text.contains("cwd alone"), "nothing disagrees:\n{text}");
+        assert!(text.contains("rust"), "the project's tags are what a pane inherits:\n{text}");
+    }
+
+    /// A pin is the top of the chain and beats everything under it, which is
+    /// what makes it worth having: it is the one link a person sets by hand.
+    #[test]
+    fn a_pin_beats_the_binding_and_the_directory_both() {
+        let mut w = standing();
+        w.pins.insert("w1".to_string(), "wsp".to_string());
+        let at = locate(&w);
+        assert_eq!((at.project.as_deref(), at.source), (Some("wsp"), "pin"));
+    }
+
+    /// herdr silent costs the chain one link — the workspace label — and the
+    /// rest of it answers as it did. A pane with nothing else to go on falls
+    /// through to the directory rather than to nothing.
+    #[test]
+    fn no_herdr_costs_the_chain_its_label_and_no_more() {
+        let mut w = standing();
+        w.workspaces.clear();
+        w.bindings.clear();
+        let at = locate(&w);
+        assert_eq!((at.project.as_deref(), at.source), (Some("wsp"), "cwd"));
+        assert!(at.label.is_none());
+        assert!(at.task.is_none(), "no binding, so nothing in hand");
+
+        // And with not even a directory it says so, rather than guessing.
+        w.cwd = None;
+        let at = locate(&w);
+        assert_eq!(at.project, None);
+        assert_eq!(at.source, "none");
+        assert!(where_lines(&at, &Paint::new()).join("\n").contains("no project resolved"));
+    }
+
+    /// The json is the same reckoning as the text, and carries the two ids a
+    /// caller needs to act on it.
+    #[test]
+    fn where_json_carries_the_pane_it_answered_for() {
+        let w = standing();
+        let v = where_json(&w, &locate(&w));
+        assert_eq!(v["project"], json!("strata"));
+        assert_eq!(v["source"], json!("binding"));
+        assert_eq!(v["by_cwd"], json!("wsp"));
+        assert_eq!(v["pane_id"], json!("w1:p1"));
+        assert_eq!(v["workspace_id"], json!("w1"));
+        assert_eq!(v["task"]["id"], json!("t-001"));
+    }
+
 }
