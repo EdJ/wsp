@@ -2061,18 +2061,61 @@ is a step that gets abandoned when something more interesting happens — `git
 worktree list` held four stale trees on the day this was written, and an
 abandoned herdr session is a worse version of the same thing, because it is a
 process. `--run` stops and deletes it whatever the command exited with; `ls`
-shows both halves of a half-torn-down one, a directory whose session is gone and
-a session whose directory is; and asking for a sandbox that already exists
+shows all three states a half-torn-down one can be in — a directory whose
+session is gone, a session whose directory is, and a **process** whose session
+and directory are both gone; and asking for a sandbox that already exists
 replaces it rather than quietly handing back whatever state the last run left.
 
 The herdr it brings up is empty, and manufacturing twenty-two workspaces is not
 something this can do. `--seed` copies the store — projects and tasks, so `ls`,
 `tree`, `show` and the panel have something to draw — and deliberately not the
 machine state, because a claim names a workspace id that exists in nobody's
-herdr but the live one. The one mitigating fact about plugins, which are global
-rather than per-session: a *headless* session loads none at all, verified twice,
-so a sandbox is clean while it stays headless. Attaching a TUI to one is the
-untested case.
+herdr but the live one.
+
+#### A sandbox's herdr starts the plugins, and they are global
+
+This was got wrong first, and the way it was got wrong is worth more than the
+fix. `plugins.json` is one file for the whole machine, not one per session, and
+`edjames.wsp` has a `[[startup]]` entry that runs `wsp daemon`. A headless
+session server **does** load it. The first live run left a daemon holding that
+session's socket and — having been told nothing else — `~/wsp` and
+`~/.local/state/wsp`: a process the sandbox created, writing to the live store,
+outliving the sandbox, reparented to launchd. Compose that with a `sync` that
+reaps every binding when herdr answers with nothing, and running a sandbox ends
+every claim on the machine.
+
+Three things follow, and they are not alternatives:
+
+- **The server is started inside the sandbox**, with `WSP_HOME`, `WSP_STATE`,
+  `WSP_BIN` and the shim `PATH` already in its environment, because a server
+  hands its own environment to every plugin it starts. A process that inherits
+  the socket but not the store is the worst of both.
+- **Teardown reaps what the session started**, not just the session. `herdr
+  session stop` ends the server; its children are reparented and carry on. The
+  environment is the only handle — a plugin's daemon has the same command line
+  as the real one — so `HERDR_SESSION=<name>` is what is matched, ancestors of
+  the process doing the reaping excluded.
+- **The daemon refuses a store it was not told about while pointed at a socket
+  that is not this machine's**, for the case where the first two are right and
+  something starts one anyway. Both halves must be named: `WSP_HOME` alone
+  leaves state at `~/.local/state/wsp`, which is where bindings and claims
+  actually live. The socket is what decides and `HERDR_SESSION` deliberately
+  does not, though it is what the message leads with: the socket path is a fact
+  wsp can observe for itself, while the session name is herdr's own vocabulary —
+  it calls the main session `default`, and a server that one day exported that
+  to its startup plugins would have this refuse the real daemon on every
+  restart. Given two signals for one question, prefer the one that survives the
+  backend changing.
+
+And the measurement error, because the same reasoning was load-bearing
+elsewhere. Two probes had "verified" that a headless session loads no plugins.
+Both had pointed `WSP_HOME` at an empty scratch directory to make themselves
+safe — so the plugin ran, `wsp daemon` found no store, exited 2, and left
+nothing behind. What was then checked was the scratch state directory (empty)
+and the server log (no line containing "plugin" — it never prints one either
+way). Neither could have shown the process, because `pgrep` was never run. The
+redirect that made the probe safe is what suppressed the evidence, and the
+absence of an effect was read as the absence of a cause.
 
 ### What none of it fixes
 

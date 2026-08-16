@@ -143,7 +143,84 @@ fn watch_machines(
     }
 }
 
+/// Why this daemon must not run: it is pointed at a herdr that is not the
+/// machine's, and at a store nobody named.
+///
+/// The third defence in t-260816-076, and the one that holds when the other two
+/// are got right and something starts a daemon anyway. A herdr session server
+/// starts every enabled plugin's `[[startup]]` command — `plugins.json` is
+/// global, not per session — with its own environment. So a sandbox whose
+/// server was started carelessly gets a daemon holding *its* socket and the
+/// *live* store, and the first thing a daemon does is sync: `herdr::panes()`
+/// answers with nothing, and `reap_bindings` takes every binding in the real
+/// store with it. One line of environment between a test instance and everyone
+/// else's claims.
+///
+/// The rule is narrow on purpose. A daemon on the default socket is the
+/// ordinary one and is never refused, whatever its store. Only a daemon that is
+/// somewhere else has to say which store it is for — and it has to say *both*
+/// halves, because `WSP_HOME` alone leaves state at `~/.local/state/wsp`, which
+/// is where bindings and claims actually live (t-260815-111).
+///
+/// # The socket decides, and `HERDR_SESSION` deliberately does not
+///
+/// There are two signals for "this is not the machine's herdr" and only one of
+/// them is ours. The socket path is a fact wsp can observe: this is where I am
+/// pointed, that is where the default is, they differ. `HERDR_SESSION` is
+/// herdr's own vocabulary — herdr calls the main session `default`, and if a
+/// server ever exported `HERDR_SESSION=default` to its `[[startup]]` plugins,
+/// a predicate that read it would refuse the *real* daemon on every herdr
+/// restart, and nobody would notice until claims stopped syncing. It does not
+/// today: neither the live daemon nor any live pane carries the variable, while
+/// a `--session` pane does.
+///
+/// So it stays in the message, where `herdr session `wsp-w1`` beats a path for
+/// telling you what you are looking at, and out of the predicate. The general
+/// rule, which is the argument of t-260816-060: given two signals for the same
+/// question, prefer the one that survives the backend changing. Anything that
+/// is herdr's naming convention rather than an observable fact is something
+/// herdr can change without telling us, and something a different backend would
+/// not have at all — so the next person reading this should not re-add the
+/// session check as an obvious improvement.
+fn misdirected(
+    session: Option<&str>,
+    socket: Option<&str>,
+    home: Option<&str>,
+    state: Option<&str>,
+) -> Option<String> {
+    let default_socket = crate::util::home().join(".config/herdr/herdr.sock");
+    let elsewhere = socket
+        .map(|s| !s.trim().is_empty() && std::path::Path::new(s) != default_socket)
+        .unwrap_or(false);
+    if !elsewhere {
+        return None;
+    }
+    let told = |v: Option<&str>| v.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if told(home) && told(state) {
+        return None;
+    }
+    let which = match session {
+        Some(s) if !s.trim().is_empty() => format!("herdr session `{}`", s.trim()),
+        _ => format!("the herdr at {}", socket.unwrap_or("")),
+    };
+    Some(format!(
+        "refusing to run against {}: it is not this machine's herdr, and no WSP_HOME/WSP_STATE says which store it is for.\n\
+         wsp: a daemon on another herdr and the live store reaps every binding in it on its first sync.\n\
+         wsp: set both, or start the session with `wsp sandbox`, which does.",
+        which
+    ))
+}
+
 pub fn run(store: &Store, verbose: bool) -> i32 {
+    if let Some(why) = misdirected(
+        std::env::var("HERDR_SESSION").ok().as_deref(),
+        std::env::var("HERDR_SOCKET_PATH").ok().as_deref(),
+        std::env::var("WSP_HOME").ok().as_deref(),
+        std::env::var("WSP_STATE").ok().as_deref(),
+    ) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
     if !herdr::available() {
         eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
         return 1;
@@ -296,6 +373,75 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard that would have stopped t-260816-076 on its own.
+    ///
+    /// A `wsp daemon` was started by a sandbox's herdr from the global
+    /// `plugins.json`, holding that session's socket and — because nobody told
+    /// it otherwise — the live store. Its first sync asks an empty herdr for
+    /// panes and reaps every binding in the real store against the answer.
+    ///
+    /// Both halves of the store have to be named, not just `WSP_HOME`: state is
+    /// where bindings and claims live, and a scratch store with live state is
+    /// the same accident wearing a different hat (t-260815-111).
+    #[test]
+    fn a_daemon_on_somebody_elses_herdr_must_be_told_which_store() {
+        // Built from this machine's home rather than a literal: the rule is
+        // "not the default socket", and a test that had to set `HOME` to say so
+        // would be a test no other test could run beside.
+        let home = crate::util::home();
+        let sock = home.join(".config/herdr/sessions/wsp-w1/herdr.sock").display().to_string();
+        let default = home.join(".config/herdr/herdr.sock").display().to_string();
+        let (sock, default) = (sock.as_str(), default.as_str());
+
+        // Exactly what was found running: a session socket and no store.
+        assert!(
+            misdirected(Some("wsp-w1"), Some(sock), None, None).is_some(),
+            "the daemon that reaps the live store would have started"
+        );
+        // Half-told is not told: state is where bindings and claims are.
+        assert!(misdirected(Some("wsp-w1"), Some(sock), Some("/tmp/s/wsp"), None).is_some());
+        assert!(misdirected(Some("wsp-w1"), Some(sock), None, Some("/tmp/s/state")).is_some());
+        // A sandbox that says which instance it is, is what this is for.
+        assert!(
+            misdirected(Some("wsp-w1"), Some(sock), Some("/tmp/s/wsp"), Some("/tmp/s/state"))
+                .is_none(),
+            "a properly made sandbox was refused its own daemon"
+        );
+
+        // The ordinary daemon is never refused, whatever its store — this
+        // machine's herdr is the one case where the default store is right.
+        assert!(misdirected(None, None, None, None).is_none());
+        assert!(misdirected(None, Some(default), None, None).is_none());
+        assert!(misdirected(Some(""), Some(""), None, None).is_none());
+        // …including a deliberate non-default store on the real socket, which
+        // is `WSP_HOME=… wsp daemon` and nobody's accident.
+        assert!(misdirected(None, Some(default), Some("/tmp/s/wsp"), None).is_none());
+
+        // A socket somewhere else with no session name is the same danger: the
+        // socket is what decides, and it is the half wsp can observe for itself.
+        assert!(misdirected(None, Some("/tmp/somewhere/herdr.sock"), None, None).is_some());
+
+        // …and a session name on the *default* socket is not, however it is
+        // spelled. herdr calls the main session `default`, so a server that one
+        // day exported `HERDR_SESSION` to its startup plugins would otherwise
+        // have this refuse the real daemon on every restart — a naming
+        // convention we do not own deciding whether the machine syncs.
+        for named in ["default", "wsp-w1", "anything at all"] {
+            assert!(
+                misdirected(Some(named), Some(default), None, None).is_none(),
+                "HERDR_SESSION={named} on this machine's own socket refused the ordinary daemon"
+            );
+            assert!(misdirected(Some(named), None, None, None).is_none());
+        }
+        // The name is still what the message leads with, because it is better
+        // diagnostics than a path.
+        assert!(
+            misdirected(Some("wsp-w1"), Some(sock), None, None)
+                .is_some_and(|m| m.contains("herdr session `wsp-w1`")),
+            "the refusal stopped saying which session it was about"
+        );
+    }
 
     /// The reload gate, and the two readings that must not open it. A daemon
     /// that could not read its own path at startup has nothing to compare

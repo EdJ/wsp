@@ -47,6 +47,22 @@
 //! nobody's herdr but the live one. When what you need is this machine's actual
 //! workspaces and agents, no sandbox reproduces it; that residue is
 //! t-260816-057.
+//!
+//! # It is not empty of *processes*
+//!
+//! `plugins.json` is one file for the whole machine and a headless session
+//! server loads it — which was got wrong first, on two probes that had pointed
+//! `WSP_HOME` at an empty directory to be safe, so the plugin's `wsp daemon`
+//! found no store, exited, and left nothing to find. The redirect that made the
+//! probe safe is what suppressed the evidence.
+//!
+//! So a sandbox is a set of processes as well as a socket and two directories,
+//! and all three of the places it can leak are handled here: the server is
+//! started *inside* the sandbox so its children get the sandbox's store
+//! ([`Sandbox::store_env`]), teardown reaps what it started ([`stop_session`]),
+//! and `ls` counts processes so a stray with no session and no directory is
+//! still on the list. The daemon's own refusal is the fourth, in
+//! [`crate::daemon`]. See t-260816-076.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -102,15 +118,31 @@ impl Sandbox {
         }
     }
 
-    /// The environment a command runs in here.
-    fn env(&self) -> Vec<(String, String)> {
+    /// Which instance this is, without saying where its herdr is.
+    ///
+    /// Split out because the herdr *server* has to be started with these and
+    /// cannot be told the socket: it has not chosen one yet. That is not a
+    /// detail. A session server hands its own environment to every plugin it
+    /// starts, and the `[[startup]]` entry in the global `plugins.json` is `wsp
+    /// daemon` — so a server started without these gives its daemon the socket
+    /// of the sandbox and the store of the *live* instance, which is precisely
+    /// the pair that makes `sync` reap every binding in the real store. See
+    /// t-260816-076, and t-260816-058 for the reaping half.
+    fn store_env(&self) -> Vec<(String, String)> {
         vec![
-            ("HERDR_SOCKET_PATH".into(), self.socket.display().to_string()),
             ("WSP_HOME".into(), self.home.display().to_string()),
             ("WSP_STATE".into(), self.state.display().to_string()),
             ("WSP_BIN".into(), self.bin.display().to_string()),
             ("PATH".into(), path_with(&self.shim, std::env::var("PATH").ok().as_deref())),
         ]
+    }
+
+    /// The environment a command runs in here: the instance, and where to
+    /// reach it.
+    fn env(&self) -> Vec<(String, String)> {
+        let mut env = self.store_env();
+        env.insert(0, ("HERDR_SOCKET_PATH".into(), self.socket.display().to_string()));
+        env
     }
 }
 
@@ -229,14 +261,31 @@ fn session(name: &str) -> Option<(bool, PathBuf)> {
 /// The socket file appearing is not the same as herdr being ready to speak, and
 /// the difference is a race that only shows up on a busy machine — so this
 /// connects, which is the only question worth asking.
-fn start_session(name: &str) -> Result<PathBuf, String> {
-    Command::new(herdr_bin())
-        .args(["--session", name, "server"])
+///
+/// The server is started **inside the sandbox**, not beside it. It was not, and
+/// the first live run left a `wsp daemon` on the real store: a headless session
+/// server does load plugins, it starts them with its own environment, and the
+/// environment it had was the caller's. Everything a sandbox knows about itself
+/// has to be in place before the server exists, because the server is what
+/// starts the processes.
+fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
+    let name = &sb.name;
+    let mut c = Command::new(herdr_bin());
+    c.args(["--session", name, "server"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot start herdr: {e}"))?;
+        .stderr(Stdio::null());
+    for k in forget_keys() {
+        c.env_remove(k);
+    }
+    // Not in `forget_keys` — it is how a *child* is told where the sandbox is,
+    // and we do not know that yet. What we do know is that the caller's is
+    // wrong, and the server sets its own for everything it starts.
+    c.env_remove("HERDR_SOCKET_PATH");
+    for (k, v) in sb.store_env() {
+        c.env(k, v);
+    }
+    c.spawn().map_err(|e| format!("cannot start herdr: {e}"))?;
 
     let deadline = Instant::now() + READY;
     loop {
@@ -258,14 +307,177 @@ fn start_session(name: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Stop it and delete it, in that order, because `delete` refuses a session
-/// that is running. Both are best-effort: what this is usually clearing up is a
-/// half-torn-down sandbox, where one of the two has already happened.
-fn stop_session(name: &str) -> bool {
+/// Every process this machine is running, as `(pid, ppid, the rest of the
+/// line)` — where "the rest" includes the environment.
+///
+/// `ps -E` is how a process's environment is readable without a dependency or a
+/// `/proc`, and the environment is the only place a plugin's child says which
+/// herdr started it: its command line is `wsp daemon`, identical to the live
+/// one's. `ppid` comes back in the same call so the ancestors of this process
+/// can be ruled out of anything we are about to kill — a shell whose command
+/// line happens to mention the session is not a child of it.
+fn processes() -> Vec<(u32, u32, String)> {
+    let Ok(out) = Command::new("ps").args(["-A", "-E", "-o", "pid=,ppid=,command="]).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(ps_line).collect()
+}
+
+/// One line of that, as `(pid, ppid, the rest)`.
+///
+/// Its own function because it is the part that was wrong, and wrong silently:
+/// `ps` right-aligns the numeric columns, so a `splitn` on whitespace found an
+/// empty second field, failed to parse it and dropped **every** line. The
+/// teardown then reaped nothing and said nothing, which is precisely the shape
+/// of the defect it was written to fix.
+fn ps_line(line: &str) -> Option<(u32, u32, String)> {
+    let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+    let (ppid, rest) = rest.trim_start().split_once(char::is_whitespace)?;
+    Some((pid.parse().ok()?, ppid.parse().ok()?, rest.trim_start().to_string()))
+}
+
+/// What the session started and still has running.
+///
+/// A herdr session server starts the `[[startup]]` command of every enabled
+/// plugin — globally configured, not per session — and puts `HERDR_SESSION` in
+/// their environment. That name is the only thing that distinguishes a
+/// sandbox's daemon from the live one, so it is what this matches on, with a
+/// boundary so `wsp-w1` does not reap `wsp-w12`.
+///
+/// This process and its ancestors are never in the answer. The shell that typed
+/// `wsp sandbox rm` can have the session name on its own command line, and `ps
+/// -E` puts the command and the environment in one field.
+fn session_children(name: &str) -> Vec<u32> {
+    let all = processes();
+    children_of(&all, name)
+}
+
+/// This process and everything above it, so nothing we are standing on can end
+/// up in a list of things to kill.
+fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
+    let mut out: Vec<u32> = vec![std::process::id()];
+    // Bounded by the list itself, so a cycle cannot spin.
+    for _ in 0..all.len() {
+        let Some(&(_, ppid, _)) = out.last().and_then(|p| all.iter().find(|(pid, _, _)| pid == p))
+        else {
+            break;
+        };
+        if ppid == 0 || out.contains(&ppid) {
+            break;
+        }
+        out.push(ppid);
+    }
+    out
+}
+
+/// `HERDR_SESSION=<name>` in a process's environment, with a boundary after it
+/// so `wsp-w1` does not match `wsp-w12`.
+fn holds_session(rest: &str, name: &str) -> bool {
+    let needle = format!("HERDR_SESSION={name}");
+    rest.match_indices(&needle)
+        .any(|(i, _)| matches!(rest.as_bytes().get(i + needle.len()), None | Some(b' ') | Some(b'\t')))
+}
+
+fn children_of(all: &[(u32, u32, String)], name: &str) -> Vec<u32> {
+    let mine = ancestors(all);
+    all.iter()
+        .filter(|(pid, _, _)| !mine.contains(pid))
+        .filter(|(_, _, rest)| holds_session(rest, name))
+        .map(|(pid, _, _)| *pid)
+        .collect()
+}
+
+/// Every sandbox some process still says it belongs to.
+///
+/// The third place a sandbox can be, after the session list and the state
+/// directory — and the one `ls` was blind to. It said "no sandboxes" with a
+/// stray daemon up, because it asked herdr what sessions existed and a session
+/// is not the only thing a sandbox creates.
+fn sessions_with_processes() -> Vec<(String, usize)> {
+    let all = processes();
+    let mine = ancestors(&all);
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for (pid, _, rest) in &all {
+        if mine.contains(pid) {
+            continue;
+        }
+        for (i, _) in rest.match_indices("HERDR_SESSION=") {
+            let name: String = rest[i + "HERDR_SESSION=".len()..]
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .collect();
+            if !name.starts_with(PREFIX) {
+                continue;
+            }
+            match out.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, n)) => *n += 1,
+                None => out.push((name, 1)),
+            }
+        }
+    }
+    out
+}
+
+/// Said out loud rather than counted silently: a teardown that killed something
+/// is a fact about what the sandbox was running, and the whole reason this
+/// exists is that "torn down" was printed once while a daemon carried on.
+fn reaped_note(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => " — 1 process it started reaped".to_string(),
+        n => format!(" — {n} processes it started reaped"),
+    }
+}
+
+fn kill(pids: &[u32], signal: &str) {
+    if pids.is_empty() {
+        return;
+    }
+    let mut c = Command::new("kill");
+    c.arg(signal);
+    for p in pids {
+        c.arg(p.to_string());
+    }
+    let _ = c.stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
+/// Stop it, reap what it started, and delete it. Best-effort throughout: what
+/// this is usually clearing up is a half-torn-down sandbox, where some of it
+/// has already happened.
+///
+/// The reaping is the part `herdr session stop` does not do and cannot be
+/// expected to: it ends the server, and the server's children are reparented to
+/// `launchd` and carry on. One did — a `wsp daemon` holding the socket of a
+/// session that no longer existed and, because it had not been told otherwise,
+/// the live store. So the sandbox reaps what it started, on the only handle
+/// there is, and does it *after* the stop so that nothing is restarted behind
+/// us.
+///
+/// Returns whether there was a session, and how many processes it left.
+fn stop_session(name: &str) -> (bool, usize) {
     let existed = session(name).is_some();
     let _ = herdr(&["session", "stop", name]);
+
+    let children = session_children(name);
+    kill(&children, "-TERM");
+    if !children.is_empty() {
+        // A daemon in the middle of a sync has a store lock and a socket read
+        // to finish. Long enough to let it, short enough that a teardown is
+        // still something you wait for.
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            if session_children(name).is_empty() {
+                break;
+            }
+        }
+        kill(&session_children(name), "-KILL");
+    }
+
     let _ = herdr(&["session", "delete", name]);
-    existed
+    (existed, children.len())
 }
 
 /// Copy a tree, leaving `.git` out of it.
@@ -365,7 +577,8 @@ fn up(store: &Store, args: &Args) -> i32 {
     // asking for one is a clean one. Whatever is there under this name — a
     // session left running, a directory left behind by a torn-down session —
     // goes first, and says so rather than being quietly reused.
-    let replaced = stop_session(&name) || sb.dir.exists();
+    let (had_session, reaped) = stop_session(&name);
+    let replaced = had_session || reaped > 0 || sb.dir.exists();
     let _ = std::fs::remove_dir_all(&sb.dir);
 
     let seed = args.has("seed").then_some(store);
@@ -375,13 +588,14 @@ fn up(store: &Store, args: &Args) -> i32 {
     }
 
     let started = Instant::now();
-    match start_session(&name) {
+    match start_session(&sb) {
         Ok(sock) => sb.socket = sock,
         Err(e) => {
             eprintln!("wsp: {e}");
             // A session that did not answer in twenty seconds may still be
             // coming up, and a half-started one nobody knows about is the leak
-            // this command exists not to leave.
+            // this command exists not to leave — including whatever its plugins
+            // got as far as starting.
             stop_session(&name);
             let _ = std::fs::remove_dir_all(&sb.dir);
             return 1;
@@ -393,10 +607,10 @@ fn up(store: &Store, args: &Args) -> i32 {
     if let Some(cmd) = args.get("run") {
         let code = run_in(&sb, &cmd, args, up_secs);
         if !args.has("keep") {
-            stop_session(&sb.name);
+            let (_, reaped) = stop_session(&sb.name);
             let _ = std::fs::remove_dir_all(&sb.dir);
             if !json_out {
-                println!("{}", p.dim(&format!("sandbox {} torn down", sb.name)));
+                println!("{}", p.dim(&format!("sandbox {} torn down{}", sb.name, reaped_note(reaped))));
             }
         } else if !json_out {
             println!("{}", p.dim(&format!("sandbox {} kept — wsp sandbox rm {}", sb.name, sb.name)));
@@ -552,9 +766,11 @@ fn ls(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let root = store.state.join("sandbox");
 
-    // Both halves, because either can outlive the other: a directory whose
-    // session was stopped, and a session whose directory was removed. Both are
-    // leaks, and a list that showed only one kind would hide the other.
+    // All three halves, because any of them can outlive the others: a directory
+    // whose session was stopped, a session whose directory was removed, and a
+    // process whose session and directory are both gone. That last one is why
+    // this list exists to be read at all — it said "no sandboxes" with a stray
+    // daemon on the live store.
     let mut names: Vec<String> = std::fs::read_dir(&root)
         .map(|d| {
             d.flatten()
@@ -564,8 +780,14 @@ fn ls(store: &Store, args: &Args) -> i32 {
         })
         .unwrap_or_default();
     let live = sessions();
-    for (name, _, _) in &live {
-        if name.starts_with(PREFIX) && !names.contains(name) {
+    let running = sessions_with_processes();
+    for name in live
+        .iter()
+        .map(|(n, _, _)| n)
+        .chain(running.iter().map(|(n, _)| n))
+        .filter(|n| n.starts_with(PREFIX))
+    {
+        if !names.contains(name) {
             names.push(name.clone());
         }
     }
@@ -581,6 +803,7 @@ fn ls(store: &Store, args: &Args) -> i32 {
                 "socket": s.map(|(_, _, sock)| sock.display().to_string()).unwrap_or_default(),
                 "dir": util::contract(&root.join(n)),
                 "orphan": !root.join(n).is_dir(),
+                "processes": running.iter().find(|(m, _)| m == n).map(|(_, c)| *c).unwrap_or(0),
             })
         })
         .collect();
@@ -602,7 +825,14 @@ fn ls(store: &Store, args: &Args) -> i32 {
         } else {
             p.dim("herdr stopped")
         };
-        println!("{:<24} {:<16} {}", name, state, p.dim(r["dir"].as_str().unwrap_or("")));
+        // The process count is loud when the session is gone, because that is
+        // the state nothing else on this line would tell you about.
+        let procs = match (r["processes"].as_u64().unwrap_or(0), r["running"].as_bool()) {
+            (0, _) => String::new(),
+            (n, Some(true)) => p.dim(&format!("{n} process(es)")),
+            (n, _) => p.red(&format!("{n} process(es), no session")),
+        };
+        println!("{:<24} {:<16} {:<22} {}", name, state, procs, p.dim(r["dir"].as_str().unwrap_or("")));
     }
     println!("{}", p.dim("wsp sandbox rm <name> — or --all"));
     0
@@ -621,8 +851,16 @@ fn rm(store: &Store, args: &Args) -> i32 {
         names = std::fs::read_dir(&root)
             .map(|d| d.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
             .unwrap_or_default();
-        for (n, _, _) in sessions() {
-            if n.starts_with(PREFIX) && !names.contains(&n) {
+        // Sessions and processes as well as directories — `--all` has to reach
+        // a stray whose session and directory are both already gone, since that
+        // is the only state in which it is still doing damage.
+        for n in sessions()
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .chain(sessions_with_processes().into_iter().map(|(n, _)| n))
+            .filter(|n| n.starts_with(PREFIX))
+        {
+            if !names.contains(&n) {
                 names.push(n);
             }
         }
@@ -632,14 +870,14 @@ fn rm(store: &Store, args: &Args) -> i32 {
     names.sort();
     names.dedup();
 
-    let mut removed: Vec<String> = Vec::new();
+    let mut removed: Vec<Value> = Vec::new();
     for name in &names {
         let dir = root.join(name);
-        let had_session = stop_session(name);
+        let (had_session, reaped) = stop_session(name);
         let had_dir = dir.exists();
         let _ = std::fs::remove_dir_all(&dir);
-        if had_session || had_dir {
-            removed.push(name.clone());
+        if had_session || had_dir || reaped > 0 {
+            removed.push(json!({ "name": name, "processes": reaped }));
         }
     }
 
@@ -650,8 +888,9 @@ fn rm(store: &Store, args: &Args) -> i32 {
     if removed.is_empty() {
         println!("{}", p.dim(&format!("no sandbox called {}", names.join(", "))));
     } else {
-        for name in &removed {
-            println!("removed {name}");
+        for r in &removed {
+            let n = r["processes"].as_u64().unwrap_or(0) as usize;
+            println!("removed {}{}", r["name"].as_str().unwrap_or(""), reaped_note(n));
         }
     }
     0
@@ -769,6 +1008,91 @@ mod tests {
         let socket = envs.iter().find(|(k, _)| k == "HERDR_SOCKET_PATH").and_then(|(_, v)| v.clone());
         assert_eq!(socket, Some(sb.socket.display().to_string()), "the child was pointed at the wrong herdr");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The defect in t-260816-076, at the line it turned on.
+    ///
+    /// The herdr *server* is what starts plugins, and it starts them with its
+    /// own environment. Started without the store, its `wsp daemon` came up on
+    /// the sandbox's socket and the *live* store — the one pair of facts that
+    /// makes `sync` reap every binding in the real store. So the store has to be
+    /// in the server's environment, before the server exists, and the caller's
+    /// socket must not be: it is the live one, and we have no sandbox socket to
+    /// give yet.
+    #[test]
+    fn the_herdr_a_sandbox_starts_is_told_which_store_it_is_for() {
+        let dir = scratch("server-env");
+        let sb = sandbox_at(&dir, "wsp-w1");
+        let env: std::collections::HashMap<String, String> = sb.store_env().into_iter().collect();
+
+        for key in ["WSP_HOME", "WSP_STATE"] {
+            let v = env.get(key).unwrap_or_else(|| panic!("{key} is not in the server's environment"));
+            assert!(
+                v.starts_with(&sb.dir.display().to_string()),
+                "{key}={v} points outside the sandbox — this is the live-store daemon"
+            );
+        }
+        assert!(
+            !env.contains_key("HERDR_SOCKET_PATH"),
+            "the server was handed a socket, and the only one we have here is the live one"
+        );
+        // …and a command run *in* the sandbox does get one, or it would talk to
+        // whatever herdr the caller was standing in.
+        let mut sb = sb;
+        sb.socket = sb.dir.join("herdr.sock");
+        let full: std::collections::HashMap<String, String> = sb.env().into_iter().collect();
+        assert_eq!(full.get("HERDR_SOCKET_PATH"), Some(&sb.socket.display().to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `herdr session stop` ends the server, not what it started: the daemon it
+    /// left was reparented to launchd and went on holding the live store. The
+    /// environment is the only handle — the command line is `wsp daemon`, the
+    /// same as the real one's — so the match has to be exact at the end of the
+    /// name, and it must never include a process we are standing on.
+    /// `ps` right-aligns its numeric columns, and the first version of this
+    /// split on every run of whitespace — so the second field came back empty,
+    /// the parse failed, and every line was dropped. A teardown that reaps
+    /// nothing looks exactly like a teardown with nothing to reap: it printed
+    /// "torn down" over a live daemon, which is the defect verbatim. Pinned
+    /// against real output rather than a tidy invention.
+    #[test]
+    fn a_padded_ps_line_is_still_a_process() {
+        assert_eq!(
+            ps_line("  1628     1 /Users/e/wsp daemon HERDR_SESSION=wsp-w24"),
+            Some((1628, 1, "/Users/e/wsp daemon HERDR_SESSION=wsp-w24".to_string()))
+        );
+        assert_eq!(
+            ps_line("22121 38749 /Users/e/.local/bin/wsp daemon -v"),
+            Some((22121, 38749, "/Users/e/.local/bin/wsp daemon -v".to_string()))
+        );
+        assert_eq!(ps_line("  PID  PPID COMMAND"), None, "a header parsed as a process");
+        assert_eq!(ps_line(""), None);
+    }
+
+    #[test]
+    fn teardown_reaps_by_session_and_never_reaps_itself() {
+        assert!(holds_session("wsp daemon HERDR_SESSION=wsp-w1", "wsp-w1"));
+        assert!(holds_session("HERDR_SESSION=wsp-w1 WSP_HOME=/x", "wsp-w1"));
+        assert!(!holds_session("HERDR_SESSION=wsp-w12 WSP_HOME=/x", "wsp-w1"), "reaped a neighbour");
+        assert!(!holds_session("HERDR_SESSION=wsp-w1x", "wsp-w1"), "reaped a neighbour");
+        assert!(!holds_session("wsp daemon", "wsp-w1"));
+
+        // A shell with the session name on its own command line is the caller,
+        // and killing the process that asked for the teardown would be its own
+        // kind of leak. Ancestors are excluded by pid, not by guesswork.
+        let me = std::process::id();
+        let all = vec![
+            (1u32, 0u32, "launchd".to_string()),
+            (me, 900, format!("wsp sandbox rm HERDR_SESSION=wsp-w1")),
+            (900, 1, "zsh -c HERDR_SESSION=wsp-w1 wsp sandbox rm".to_string()),
+            (901, 1, "wsp daemon HERDR_SESSION=wsp-w1".to_string()),
+        ];
+        assert_eq!(
+            children_of(&all, "wsp-w1"),
+            vec![901],
+            "the teardown was about to kill itself or the shell that asked for it"
+        );
     }
 
     /// A sandbox with no store is a `wsp` that exits 2 on every command, so
