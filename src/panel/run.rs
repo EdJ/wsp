@@ -22,7 +22,7 @@ use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
 use super::shared;
-use super::verbs::{close_view, inspect, open_board, pop_out, run_wsp, send_tell, Tell};
+use super::verbs::{close_view, inspect, open_board, pop_out, run_wsp, send_tell, zoom, Tell};
 
 pub(super) enum Msg {
     Key(Key),
@@ -479,6 +479,12 @@ pub(super) fn event_loop(
     // off the frame: it decides what a click means, and a click is the one
     // gesture that arrives in a pane nobody is working in.
     let mut keyboard = holds_keyboard(&snap, me.as_deref());
+    // What shape of thing this pane is, before the rows are built from it: a
+    // page shows a project's tasks all of them and a sidebar shows six. See
+    // [`View::wide`], and the tick below, which is where a pane that changes
+    // shape under a running panel is noticed.
+    let mut drawn_size = term_size();
+    view.fit_to_pane(drawn_size.0);
     let mut ui = collect(&snap, &view, self_ws);
     if point_at(&mut ui, &want) {
         want = Cursor::default();
@@ -510,7 +516,11 @@ pub(super) fn event_loop(
     // `&mut` on the view because the frame is where the tree's scroll offset
     // is decided, and the view keeps it: the click handler two branches below
     // has to read the offset the pane in front of the reader is drawn with.
-    let draw = |ui: &Ui, view: &mut View, last: &mut String| {
+    // Answers the size it drew at, which is the only place the pane is measured:
+    // `term_size` shells out to `stty`, so asking a second time to find out
+    // whether the pane has changed shape would double that for every panel on
+    // the machine, five times a second.
+    let draw = |ui: &Ui, view: &mut View, last: &mut String| -> (usize, usize) {
         let (w, h) = term_size();
         let painted = to_ansi(&frame(ui, view, w, h), w, h);
         if painted != *last {
@@ -518,8 +528,9 @@ pub(super) fn event_loop(
             let _ = std::io::stdout().flush();
             *last = painted;
         }
+        (w, h)
     };
-    draw(&ui, &mut view, &mut last);
+    drawn_size = draw(&ui, &mut view, &mut last);
 
     loop {
         let mut msg = match carry.pop_front() {
@@ -572,7 +583,7 @@ pub(super) fn event_loop(
                 super::keys::Hit::Rest => msg = Msg::Key(Key::Char('w')),
                 super::keys::Hit::Select => {
                     shared::share(store, &view, ui.cursor(), &mut agreed);
-                    draw(&ui, &mut view, &mut last);
+                    drawn_size = draw(&ui, &mut view, &mut last);
                     continue;
                 }
                 // The pane was not the one being worked in, and now it is. That
@@ -595,7 +606,7 @@ pub(super) fn event_loop(
             let (w, h) = term_size();
             super::keys::wheel(&mut ui, &mut view, w, h, up);
             shared::share(store, &view, ui.cursor(), &mut agreed);
-            draw(&ui, &mut view, &mut last);
+            drawn_size = draw(&ui, &mut view, &mut last);
             continue;
         }
 
@@ -644,6 +655,13 @@ pub(super) fn event_loop(
                 }
                 Effect::Board { argv, label } => {
                     say(&mut ui, open_board(&argv, &label, self_ws));
+                }
+                // herdr resizes the pty under us, so there is nothing to redraw
+                // here: `draw` measures the pane every time it runs, and the
+                // tick behind this keystroke is 200ms away at worst.
+                Effect::Zoom => {
+                    let m = zoom(me.as_deref());
+                    say(&mut ui, m);
                 }
                 // Off the loop, deliberately. `wsp spawn --agent` creates a
                 // workspace, claims into it, waits for an agent to boot and
@@ -778,6 +796,21 @@ pub(super) fn event_loop(
                 refetch = true;
             }
             Msg::Tick => {
+                // The pane has changed shape since the rows were built — `Z`,
+                // a split dragged wider, a window resized. Almost all of that
+                // the frame answers by itself, because it is drawn to whatever
+                // it measures; this is the part it cannot, because a page and a
+                // sidebar do not have the same rows in them. See [`View::wide`].
+                //
+                // Read off the last frame rather than measured here: `term_size`
+                // shells out, and this arm runs five times a second in every
+                // panel on the machine.
+                let was = view.wide;
+                view.fit_to_pane(drawn_size.0);
+                if view.wide != was {
+                    refetch = true;
+                    dirty = false;
+                }
                 // A hand raised outranks the cadence.
                 //
                 // Everything else the background gate defers is *news about
@@ -887,7 +920,7 @@ pub(super) fn event_loop(
         if is_key {
             shared::share(store, &view, ui.cursor(), &mut agreed);
         }
-        draw(&ui, &mut view, &mut last);
+        drawn_size = draw(&ui, &mut view, &mut last);
     }
 }
 

@@ -21,6 +21,16 @@ use super::verbs::{browse_key, pick_tell, Ask, Pick, Tell};
 /// event loop and handed to `collect`, which is otherwise a pure function of
 /// the store plus herdr.
 impl View {
+    /// Take the shape of the pane this panel is drawn in.
+    ///
+    /// Which rows exist depends on it — see [`View::wide`] — so it is taken
+    /// before the rows are built rather than at the moment they are drawn, and
+    /// it is one function so that the live loop and the storyboard cannot come
+    /// to different views of what counts as a page.
+    pub(crate) fn fit_to_pane(&mut self, w: usize) {
+        self.wide = super::render::is_page(w);
+    }
+
     /// The key map changes how many rows the tree gets, which changes where a
     /// click lands. Test-only, so a sweep can check both.
     #[cfg(test)]
@@ -42,6 +52,16 @@ pub(crate) struct View {
     pub(super) collapsed: HashSet<String>,
     /// Projects (or the inbox) showing past `MAX_TASKS_PER_PROJECT`.
     pub(super) expanded: HashSet<String>,
+    /// The pane is a page rather than a sidebar — wide enough that the tree is
+    /// drawn in columns, which is what `Z` makes it.
+    ///
+    /// A fact about this pane and not about the work, so it is never shared: two
+    /// panels open on the same tree, one zoomed and one not, are looking at the
+    /// same folds through different windows. The loop sets it from the terminal
+    /// before the rows are built, because it is the rows that change — a page
+    /// shows a project's tasks all of them, where a sidebar shows six and a
+    /// count of the rest.
+    pub(super) wide: bool,
     /// Include `done` tasks, and the projects that hold only those.
     pub(super) show_done: bool,
     /// Narrow the tree to work at `review` — what an agent has finished with
@@ -456,6 +476,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
             vec![
                 ("↵ esc", "open it, close it"),
                 ("F", "the title in full, docked"),
+                ("Z", "fullscreen, and back"),
                 ("E", "edit in a tab"),
                 ("K", "the board, in a tab"),
                 ("A i r", "show done, ids, sync"),
@@ -506,6 +527,14 @@ pub(crate) enum Effect {
     /// pane taking the whole tab: four columns of readable title is ninety
     /// columns, and this pane is thirty-four.
     Board { argv: Vec<String>, label: String },
+    /// The panel over the whole workspace, and back again.
+    ///
+    /// Nothing is opened and nothing is launched: herdr zooms the pane this
+    /// panel is already running in, the pty resizes under it, and the next frame
+    /// is drawn to whatever it is now — which is why a fullscreen panel is the
+    /// same folds, the same cursor and the same process rather than a second
+    /// surface to keep in step with this one.
+    Zoom,
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
@@ -872,7 +901,9 @@ pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 pub(crate) fn wheel(ui: &mut Ui, view: &mut View, w: usize, h: usize, up: bool) {
     const STEP: usize = 3;
     let g = super::render::geometry(ui, view, w, h);
-    let last = g.tree_len.saturating_sub(g.tree_rows);
+    // Every column of the tree, not one of them: what the last screen holds is
+    // what the view may be scrolled to the end of.
+    let last = g.tree_len.saturating_sub(g.body());
     let to = if up { g.scroll.saturating_sub(STEP) } else { (g.scroll + STEP).min(last) };
     view.scroll = Some(to);
     // The cursor stays where it is, even when the view leaves it behind. What
@@ -959,7 +990,7 @@ pub(crate) fn click(
         };
     }
     let at = super::render::geometry(ui, view, w, h).scroll;
-    match super::render::row_at(ui, view, w, h, y) {
+    match super::render::row_at(ui, view, w, h, x, y) {
         None => Hit::Nothing,
         // A line under an agent belongs to that agent: the click lands on the
         // row it is written beneath, which is the row it is about. A group

@@ -113,11 +113,12 @@ that call and every pane in it gets a fresh terminal, which takes down any
 agent running in the workspace.
 
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
-closes it again), `esc` closes it, `E` pops the row's file out into an editor
-tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `R` narrows
-to what needs reviewing, `w` shows the agents instead of the work, `W` puts the
-tree back with the cursor on the task an agent is holding, `i` shows ids, `x`
-lowers a flag an agent has raised, `r` syncs, `?` opens the key map.
+closes it again), `esc` closes it, `Z` gives the panel the whole workspace and
+`Z` gives it back, `E` pops the row's file out into an editor tab, `1`-`9` jump
+straight to an agent, `A` shows finished tasks, `R` narrows to what needs
+reviewing, `w` shows the agents instead of the work, `W` puts the tree back with
+the cursor on the task an agent is holding, `i` shows ids, `x` lowers a flag an
+agent has raised, `r` syncs, `?` opens the key map.
 
 ### The strip, and the agents view
 
@@ -267,6 +268,39 @@ you can scroll it is worse at the one thing the panel is for.
 The verbs are listed first because a pane too short for the whole map cuts from
 the bottom, and movement is the half you can find by pressing an arrow and
 watching. The footer says how many lines it could not fit.
+
+### Fullscreen
+
+`Z` gives the panel the whole workspace, and `Z` gives it back. There is no
+fullscreen *version* of it: herdr zooms the pane the panel is already running
+in, the pty resizes underneath, and the next frame is drawn to whatever the pane
+now measures — same process, same folds, same cursor on the same row. A second
+pane running a second copy would be two panels to keep in step and a tab to
+close afterwards; this is one call and a repaint. The footer says `fullscreen ·
+Z back`, because a key that changes the shape of the screen has to say how to
+undo itself.
+
+What the room is spent on is the tree, in columns — down one, then into the
+next, the way a newspaper sets a story, so reading order is what it was and `j`
+walks off the foot of one column onto the top of the one beside it. A column is
+at least 48 wide, which is where a row stops being an abbreviation: the
+sidebar's 34 leaves about twenty-five characters of a title that averages
+sixty-four, and 48 leaves about forty. Below that a second column would buy rows
+by taking the words off them, so a sidebar and an ordinary eighty-column
+terminal stay a single list.
+
+Columns arrive when the pane can hold them **and** there is tree to put in them.
+Four columns for a tree that fills one and a half would be three columns of
+white space beside a list you were still scrolling, so folding a branch away can
+take a column back down with it. The rest of the frame is unchanged: the strip,
+the dock, the focus line and the footer each span the pane, one row to a line,
+because they are lists of five rather than trees.
+
+A pane that big is also a pane with no shortage, so the six-task cap comes off:
+a project shows all its tasks rather than six and a `⋯ 4 more`. That is the one
+thing about a fullscreen panel that is not simply the same panel bigger — which
+is why it follows the width rather than the key. Drag the split wider by hand
+and you get the same tree; herdr's own zoom keybinding works as well as `Z`.
 
 ## The detail pane
 

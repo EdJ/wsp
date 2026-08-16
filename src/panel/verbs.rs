@@ -659,6 +659,33 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
     }
 }
 
+/// Fullscreen, and back: herdr zooms the pane this panel is running in.
+///
+/// The whole of what `Z` does. There is no fullscreen *version* of the panel to
+/// build — the frame is drawn to whatever the pane measures, so a pane made
+/// larger is a panel showing more, with the folds, the cursor and the process
+/// all untouched. A second pane running a second copy would be two panels to
+/// keep in step and a tab to close; this is a call and a repaint.
+///
+/// A workspace with nothing beside the panel has nothing to zoom over, and
+/// herdr says so rather than failing — `single_pane` is the reason it gives, and
+/// it is worth passing on, because pressing this and seeing no change otherwise
+/// reads as a key that did not work.
+pub(super) fn zoom(me: Option<&str>) -> String {
+    let Some(pane) = me else { return "no pane to zoom — this panel is not in herdr".into() };
+    let r = match herdr::call("pane.zoom", json!({ "pane_id": pane, "mode": "toggle" })) {
+        Ok(r) => r,
+        Err(e) => return format!("could not zoom: {e}"),
+    };
+    let z = r.get("zoom");
+    let zoomed = z.and_then(|z| z.get("zoomed")).and_then(|x| x.as_bool()).unwrap_or(false);
+    match z.and_then(|z| z.get("reason")).and_then(|x| x.as_str()) {
+        Some("single_pane") => "nothing to zoom over — the panel is the only pane".into(),
+        _ if zoomed => "fullscreen · Z back".into(),
+        _ => "back in the sidebar".into(),
+    }
+}
+
 /// Open a board full-size in a tab of its own.
 ///
 /// The plain half of [`pop_out`]: a tab, its root pane, and the command in it.
@@ -1069,6 +1096,12 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             say(ui, if view.focus { "titles in full" } else { "titles as they fit" });
             Effect::None
         }
+        // The sidebar over the whole workspace. It is a key rather than a
+        // second surface because the panel is already the thing you want to
+        // look at — what is wrong with it at thirty-four columns is the
+        // thirty-four columns, and the pane herdr gives back is the same panel
+        // with the cursor still on the row you pressed it from.
+        Key::Char('Z') => Effect::Zoom,
         // Nothing else changes while it is up: the tree keeps the cursor, and
         // every key on the map still does what the map says it does — which is
         // the only way to read one and act on it in the same breath.

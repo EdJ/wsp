@@ -997,7 +997,14 @@ pub(super) fn task_rows(
     let nested = resolve::nest(&mine);
     let tops = nested.iter().filter(|(_, d)| *d == 0).count();
     let key = project.unwrap_or(INBOX_KEY);
-    let cap = if view.expanded.contains(key) { tops } else { tops.min(MAX_TASKS_PER_PROJECT) };
+    // The cap is a sidebar's economy: six tasks is what one project may spend of
+    // a column that has to hold thirty projects. A pane wide enough to draw the
+    // tree in columns has no such shortage — it was made big to be read whole —
+    // so there the branch is all of itself, and `⋯` never comes up.
+    let cap = match view.expanded.contains(key) || view.wide {
+        true => tops,
+        false => tops.min(MAX_TASKS_PER_PROJECT),
+    };
 
     let mut seen_tops = 0;
     for (t, sub) in &nested {
