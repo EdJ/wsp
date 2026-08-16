@@ -582,6 +582,36 @@ fn unassign(target: &Target, ui: &mut Ui) -> Effect {
     }
 }
 
+/// `W`: leave the agents view standing on the work.
+///
+/// Aimed at an agent wherever one is drawn — the list under `w`, the section at
+/// the foot, the row beneath a claimed task — so the gesture is the same one
+/// everywhere: point at somebody, ask what they are on, and be put there.
+///
+/// It only asks for the row. Which of the tree's folds and filters are covering
+/// that task is not something the reducer can see — it has the rows in front of
+/// it and no store behind them — and it is not something this has to know:
+/// `land_on` is answered against the rebuilt tree, where the task, the project
+/// chain and the filters all are. See [`super::rows::refetch_into`].
+fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
+    let Some(a) = ui.rows.get(ui.sel).and_then(|r| r.agent()).cloned() else {
+        say(ui, "W finds an agent's work — aim at an agent");
+        return Effect::None;
+    };
+    let Some(task) = a.task.clone() else {
+        // Nothing to be shown, and the tree would be the wrong place to look
+        // for it anyway: an agent holding no task is one you give work to, not
+        // one you follow. `f` and `c` are the keys for that, and saying so is
+        // more use than saying no.
+        say(ui, format!("{} holds nothing · f or c gives it some", a.where_));
+        return Effect::None;
+    };
+    view.agents = false;
+    view.land_on = Some(task);
+    say(ui, format!("{} · in the tree", a.where_));
+    Effect::Refetch
+}
+
 /// Shut the workspace's detail pane, if it has one.
 pub(super) fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
     let Some(ws) = self_ws else { return false };
@@ -907,6 +937,12 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             say(ui, if view.agents { "the agents" } else { "the work" });
             Effect::Refetch
         }
+        // And the way back, standing on the work rather than at the top of the
+        // tree. `w` answers "who has stopped"; the next question is always "on
+        // what", and until now the only way to ask it was `w` again and then
+        // hunting for the title by eye — in a tree that had no idea which of
+        // its rows you meant, and might not be drawing it at all.
+        Key::Char('W') => show_in_tree(ui, view),
         // The tree names work by title, which is what you read it for. The id
         // is what you type at a shell, and there was no way to get from one to
         // the other without opening the row.

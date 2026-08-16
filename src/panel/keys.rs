@@ -434,6 +434,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("A i r", "show done, ids, sync"),
                 ("R", "only what needs review"),
                 ("w", "the agents, not the work"),
+                ("W", "its task, in the tree"),
                 ("q", "quit"),
             ],
         ),

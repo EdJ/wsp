@@ -815,17 +815,60 @@ pub(super) fn task_rows(
 pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_ws: Option<&str>) {
     let sel = ui.sel;
     let was = ui.cursor();
+    rebuild(ui, snap, view, self_ws, &was, sel);
+
+    // Something was just created, or a row elsewhere has asked to be shown
+    // here: put the cursor on it. Done after the rebuild because until then the
+    // row does not exist.
+    if let Some(want) = view.land_on.take() {
+        // And when it still does not, the tree is holding it out of sight
+        // rather than not having it. A panel that answers "go to this task"
+        // by leaving the cursor where it was is one you stop pressing, so
+        // loosen whatever is covering the row and build again — see
+        // [`hiding`] for what the three are and why they are tried in this
+        // order. Each rebuild happens only in the case that would otherwise
+        // have failed, and the loop stops the moment the row is there.
+        for loosen in hiding() {
+            if row_for(&ui.rows, &want).is_some() {
+                break;
+            }
+            if loosen(view, snap, &want) {
+                rebuild(ui, snap, view, self_ws, &was, sel);
+            }
+        }
+        if let Some(i) = row_for(&ui.rows, &want) {
+            ui.sel = i;
+            // And the view owes it a look. The tree is allowed to sit with the
+            // cursor off the pane — a wheel puts it there — but not when the
+            // cursor has just been moved onto something you made: you would
+            // type a name, press return, and watch nothing appear.
+            view.keyed = true;
+        }
+    }
+}
+
+/// The rows again, with the cursor kept on the row it was on rather than the
+/// slot that row was in.
+///
+/// Claiming re-sorts the tree under the cursor — the pane row leaves one task
+/// and reappears under another, often several lines away — and holding the
+/// index would leave the eye on whatever slid into its place. Falls back to the
+/// index when the row is genuinely gone, which is the only case where there is
+/// nothing to follow.
+///
+/// Which side of the dock it was on is part of the row's identity here: a pane
+/// is drawn twice, and taking the first match took the tree copy every time.
+/// See [`Cursor`].
+fn rebuild(
+    ui: &mut Ui,
+    snap: &Snapshot,
+    view: &View,
+    self_ws: Option<&str>,
+    was: &Cursor,
+    sel: usize,
+) {
     let msg = ui.message.take();
     *ui = collect(snap, view, self_ws);
-    // The row, not the slot it was in. Claiming re-sorts the tree under the
-    // cursor — the pane row leaves one task and reappears under another, often
-    // several lines away — and holding the index would leave the eye on
-    // whatever slid into its place. Falls back to the index when the row is
-    // genuinely gone, which is the only case where there is nothing to follow.
-    //
-    // Which side of the dock it was on is part of the row's identity here: a
-    // pane is drawn twice, and taking the first match took the tree copy every
-    // time. See [`Cursor`].
     let tree_len = ui.tree_len();
     ui.sel = match was.target {
         Target::Nothing => sel,
@@ -838,23 +881,74 @@ pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_w
         }
     }
     ui.message = msg;
+}
 
-    // Something was just created: put the cursor on it. Done after the rebuild
-    // because until then the row does not exist.
-    if let Some(want) = view.land_on.take() {
-        if let Some(i) = ui.rows.iter().position(|r| match r {
-            Row::Task { id, .. } => *id == want,
-            Row::Project { id, .. } => *id == want,
-            _ => false,
-        }) {
-            ui.sel = i;
-            // And the view owes it a look. The tree is allowed to sit with the
-            // cursor off the pane — a wheel puts it there — but not when the
-            // cursor has just been moved onto something you made: you would
-            // type a name, press return, and watch nothing appear.
-            view.keyed = true;
-        }
+/// Where a task or a project is drawn, if it is drawn at all.
+fn row_for(rows: &[Row], want: &str) -> Option<usize> {
+    rows.iter().position(|r| match r {
+        Row::Task { id, .. } => id == want,
+        Row::Project { id, .. } => id == want,
+        _ => false,
+    })
+}
+
+/// The three things that keep a task off the tree, each with the one change
+/// that undoes it, cheapest first.
+///
+/// Every one of them is a decision the reader made — a branch folded, a long
+/// list left at its first few, finished work put away — so they are tried in
+/// order and stopped at the first that works, rather than swept aside together.
+/// Folding is first because it hides the most and costs the least to undo; the
+/// filters are last because turning one off changes what the whole tree is
+/// showing, and that is a price paid only when nothing else will do.
+///
+/// Each returns whether it actually changed anything, so a rebuild happens only
+/// when there is something new to build.
+fn hiding() -> [fn(&mut View, &Snapshot, &str) -> bool; 3] {
+    [unfold, uncap, unfilter]
+}
+
+/// The project the task is filed in, and every project above it, opened.
+fn unfold(view: &mut View, snap: &Snapshot, task: &str) -> bool {
+    let Some(t) = snap.tasks.iter().find(|t| t.id == task) else {
+        return false;
+    };
+    let Some(p) = t.project.clone() else {
+        return view.collapsed.remove(INBOX_KEY);
+    };
+    let index = Index::new(snap.projects.clone());
+    std::iter::once(p.clone())
+        .chain(index.ancestors(&p))
+        .fold(false, |moved, id| view.collapsed.remove(&id) || moved)
+}
+
+/// The cap off the list it is in, so a task sitting seventh in its project is
+/// drawn rather than rolled into the `n more` row.
+fn uncap(view: &mut View, snap: &Snapshot, task: &str) -> bool {
+    let Some(t) = snap.tasks.iter().find(|t| t.id == task) else {
+        return false;
+    };
+    view.expanded.insert(t.project.clone().unwrap_or_else(|| INBOX_KEY.to_string()))
+}
+
+/// The filters that would leave it out: `A` for work that is finished, `R` for
+/// work that is not at review. Both say so in the footer, which is what makes
+/// them safe to turn off from here — the tree changing under you is explained
+/// on the line beneath it.
+fn unfilter(view: &mut View, snap: &Snapshot, task: &str) -> bool {
+    let Some(t) = snap.tasks.iter().find(|t| t.id == task) else {
+        return false;
+    };
+    let mut moved = false;
+    if view.review_only && t.status() != Status::Review {
+        view.review_only = false;
+        moved = true;
     }
+    if !view.show_done && !t.status().is_open() {
+        view.show_done = true;
+        moved = true;
+    }
+    moved
 }
 
 pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui {

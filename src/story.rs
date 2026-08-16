@@ -613,6 +613,17 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .key(Key::Char('w'))
+            .to_pane("w2:p1")
+            .key(Key::Char('W'))
+            .scene(
+                "From the agent back to its work",
+                "`w` answers who has stopped; the next question is always what they stopped *on*. `W` is that question: the tree comes back with the cursor already on the task the agent is holding, rather than at the top with the title to find by eye. It works on an agent row wherever one is drawn — this list, the section at the foot, the line under a claimed task — and it uncovers the task if the tree was holding it out of sight: the projects above it unfold, the cap comes off the list it is in, and a filter that would leave the task out goes off, in that order, stopping at the first that is enough. Each of those is a decision you made, so only the ones in the way are undone. An agent holding nothing is told so rather than moved — that is a pane to give work to, which is `f` or `c`.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
             .key(Key::Char('i'))
             .scene("Showing ids", "i puts the id in front of each title — the thing you type at a shell, next to the thing you read. Off by default because thirteen characters of `t-260815-004` on every row is most of a narrow pane, and only the last three of them differ. The suffix is what `wsp start 004` resolves, so the suffix is what shows, unless another open task shares it and the date is what separates them."),
     );
@@ -1149,6 +1160,95 @@ mod tests {
         // And back again. `w` is a view, not a door.
         let (ui, _) = showing(&w, &[Key::Char('w'), Key::Char('w')]);
         assert_eq!(ui.rows_for_test(), ui_of(&w, &panel::View::default()).rows_for_test());
+    }
+
+    /// Which rows the tree is made of, so a test can ask whether it is a tree
+    /// at all — the agents view is agents and their own lines, and nothing else.
+    fn kinds(ui: &mut panel::Ui) -> Vec<panel::RowKind> {
+        let at = ui.selected_index();
+        let mut out = Vec::new();
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            out.push(ui.selected_kind());
+        }
+        ui.select_for_test(at);
+        out
+    }
+
+    /// `w` answers who has stopped. The next question is always what they
+    /// stopped *on*, and `W` is that question: the tree comes back with the
+    /// cursor already standing on the work, rather than at the top with the
+    /// title to find by eye.
+    #[test]
+    fn shift_w_puts_the_cursor_on_the_work_the_agent_is_holding() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.key(Key::Char('w')).to_pane("w2:p1").key(Key::Char('W'));
+
+        assert_eq!(d.ui.selected_target(), panel::Target::Task("t-003".into()));
+        // And it is the tree that came back, not the list with a cursor moved
+        // inside it: `W` is the way out of the agents view.
+        assert!(kinds(&mut d.ui).contains(&panel::RowKind::Project));
+
+        // An agent holding nothing has nowhere to be shown, and the tree is
+        // the wrong place to go looking anyway. The view stays where it is.
+        let mut d = Driver::new(&w);
+        d.key(Key::Char('w')).to_pane("w4:p2").key(Key::Char('W'));
+        assert_eq!(d.ui.selected_target(), panel::Target::Pane("w4:p2".into()));
+        assert!(!kinds(&mut d.ui).contains(&panel::RowKind::Project));
+    }
+
+    /// And it shows the work wherever the tree had put it away. Three things
+    /// hide a task — a folded project above it, the cap on a long list, a
+    /// filter that leaves it out — and a jump that worked on none of them would
+    /// be a key you could not trust to have done anything at all.
+    #[test]
+    fn shift_w_uncovers_the_task_whatever_the_tree_was_hiding_it_behind() {
+        // Folded away, two projects above it.
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.to_project("audio").key(Key::Char('h'));
+        assert!(!drawn_tasks(&mut d).contains(&"t-001".to_string()), "the fold already shows it");
+        d.key(Key::Char('w')).to_pane("w1:p1").key(Key::Char('W'));
+        assert_eq!(d.ui.selected_target(), panel::Target::Task("t-001".into()));
+
+        // Past the cap on its project's list. A claimed task sorts to the top
+        // of its own project, so the case that reaches the cap is a claimed
+        // *sub*-task: the cap counts top-level work, and a child goes wherever
+        // its parent went — here, into the `2 more` row at the foot of `wsp`.
+        let mut w = world();
+        let mut sub = task("t-109", "Panel work item 8, first half", Some("wsp"), "todo");
+        sub.parent = Some("t-108".into());
+        w.tasks.push(sub);
+        w.bindings.insert("w5:p2".to_string(), json!({ "task_id": "t-109" }));
+        let mut d = Driver::new(&w);
+        assert!(!drawn_tasks(&mut d).contains(&"t-109".to_string()), "the cap already shows it");
+        d.key(Key::Char('w')).to_pane("w5:p2").key(Key::Char('W'));
+        assert_eq!(d.ui.selected_target(), panel::Target::Task("t-109".into()));
+
+        // Finished, and the tree is not showing finished work. The filter goes
+        // off, which the footer says in the same breath — `+done` is there to
+        // be read the moment the tree changes shape.
+        let mut w = world();
+        w.bindings.insert("w5:p2".to_string(), json!({ "task_id": "t-030" }));
+        let mut d = Driver::new(&w);
+        d.key(Key::Char('w')).to_pane("w5:p2").key(Key::Char('W'));
+        assert_eq!(d.ui.selected_target(), panel::Target::Task("t-030".into()));
+        assert!(panel::frame(&d.ui, &mut d.view, W, H).iter().any(|l| l.text().contains("+done")));
+    }
+
+    /// Every task the tree is currently drawing, by id.
+    fn drawn_tasks(d: &mut Driver) -> Vec<String> {
+        let at = d.ui.selected_index();
+        let mut out = Vec::new();
+        for i in 0..d.ui.rows_for_test() {
+            d.ui.select_for_test(i);
+            if let panel::Target::Task(id) = d.ui.selected_target() {
+                out.push(id);
+            }
+        }
+        d.ui.select_for_test(at);
+        out
     }
 
     /// herdr says `idle` for four of the panes in the fixture and means four

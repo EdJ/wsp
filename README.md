@@ -115,8 +115,9 @@ agent running in the workspace.
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
 closes it again), `esc` closes it, `E` pops the row's file out into an editor
 tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `R` narrows
-to what needs reviewing, `w` shows the agents instead of the work, `i` shows
-ids, `r` syncs, `?` opens the key map.
+to what needs reviewing, `w` shows the agents instead of the work, `W` puts the
+tree back with the cursor on the task an agent is holding, `i` shows ids, `r`
+syncs, `?` opens the key map.
 
 ### The strip, and the agents view
 
@@ -171,6 +172,20 @@ is the point, since you open it to find who is free and end up already standing
 on the row that hands them something. Shells are left out of both: a pane with
 nobody in it is a fact about a place, and this is a list of people. `w` and `R`
 each put the other away.
+
+`W` is the way back out of it, standing on the work. The list answers who has
+stopped; the next question is always what they stopped *on*, and until now the
+only way to ask it was `w` again followed by hunting for the title by eye — in a
+tree that had no idea which row you meant, and might not have been drawing it at
+all. `W` on any agent row, in the list or in the section at the foot or under
+the task it claimed, brings the tree back with the cursor already on that task,
+and uncovers it if the tree was holding it out of sight: the projects above it
+unfold, the cap comes off the list it is in, and a filter that would leave it
+out — `A` for work that is finished, `R` for work that is not at review — goes
+off, in that order, stopping at the first that is enough. Each of those is a
+decision you made, so only the ones actually in the way are undone, and the two
+filters say so in the footer as they go. An agent holding nothing is told so
+rather than moved: that is a pane to give work to, which is `f` or `c`.
 
 `i` puts each task's id in front of its title — the thing you type at a shell
 beside the thing you read. Off by default: `t-260815-004` is thirteen columns of
