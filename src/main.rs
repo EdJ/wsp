@@ -226,6 +226,25 @@ fn die_on_broken_pipe() {
     }
 }
 
+/// Whether this invocation has to have a store to mean anything.
+///
+/// Three commands do not. `init` is what makes one. `doctor` reports on the
+/// store's state, and "there isn't one" is the most useful thing it can say.
+/// And `panel storyboard` reads neither the store nor herdr — it builds its
+/// fixtures itself, which is the whole claim in `story.rs`'s header: "the
+/// frames come out the same on a laptop with nothing running".
+///
+/// That claim was false, and not in `story.rs`. The refusal happens here,
+/// before dispatch, so the one command documented as needing nothing exited 2
+/// with "no store — run wsp init first" on exactly the machine it was written
+/// for. A seam that a gate three files away can close is not a seam.
+fn needs_store(args: &Args) -> bool {
+    if matches!(args.cmd.as_str(), "init" | "doctor") {
+        return false;
+    }
+    !(args.cmd == "panel" && args.rest.first().map(String::as_str) == Some("storyboard"))
+}
+
 fn main() {
     die_on_broken_pipe();
 
@@ -246,7 +265,7 @@ fn main() {
     }
 
     let store = store::Store::open();
-    if !store.exists() && args.cmd != "init" && args.cmd != "doctor" {
+    if !store.exists() && needs_store(&args) {
         eprintln!(
             "wsp: no store at {}. Run `wsp init` first.",
             util::contract(&store.root)
@@ -539,5 +558,27 @@ mod tests {
         // …but the flag still wins over an explicit off.
         assert!(super::Args::synth("brief", &[], &[("terse", "true")]).terse());
         std::env::remove_var("WSP_TERSE");
+    }
+
+    /// The storyboard is the offline surface, and the gate in front of dispatch
+    /// is the only thing that can make it not be. Asserted on the predicate
+    /// rather than by running the binary, because what went wrong is a
+    /// condition, not a code path: `panel` needs the store and `panel
+    /// storyboard` does not, and those two differ by one word in `rest`.
+    #[test]
+    fn the_storyboard_runs_with_no_store() {
+        use super::{needs_store, Args};
+        assert!(!needs_store(&Args::synth("panel", &["storyboard"], &[])));
+        assert!(!needs_store(&Args::synth("init", &[], &[])));
+        assert!(!needs_store(&Args::synth("doctor", &[], &[])));
+
+        // The exemption is that one subcommand and no more of `panel`: the
+        // live panel reads the store on its first frame, and letting it start
+        // without one trades a clear refusal for an empty tree.
+        assert!(needs_store(&Args::synth("panel", &[], &[])));
+        assert!(needs_store(&Args::synth("panel", &["install"], &[])));
+        assert!(needs_store(&Args::synth("ls", &[], &[])));
+        // And it is `panel storyboard`, not the word anywhere in the line.
+        assert!(needs_store(&Args::synth("storyboard", &[], &[])));
     }
 }
