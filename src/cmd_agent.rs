@@ -1216,10 +1216,18 @@ fn machine_of(id: &str) -> &str {
 /// behaviour is unchanged. When `workspaces()` fans out across machines
 /// (t-260816-037) the ids come back `@machine`-qualified and this partitions
 /// itself, with no further change here.
-fn answered_by_machine(workspaces: &[herdr::Workspace]) -> std::collections::BTreeMap<&str, usize> {
+///
+/// Takes ids rather than workspaces because `sync` needs the same judgement one
+/// layer over, about panes and bindings (t-260816-058). Two rules for "is this
+/// machine answering" is how they drift apart, and the one that drifts is the
+/// one that reaps — so there is one, and each caller brings whatever it has
+/// actually heard.
+pub(crate) fn answered_by_machine<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeMap<&'a str, usize> {
     let mut out = std::collections::BTreeMap::new();
-    for w in workspaces {
-        *out.entry(machine_of(&w.id)).or_insert(0) += 1;
+    for id in ids {
+        *out.entry(machine_of(id)).or_insert(0) += 1;
     }
     out
 }
@@ -1230,8 +1238,8 @@ fn answered_by_machine(workspaces: &[herdr::Workspace]) -> std::collections::BTr
 /// holds being handed back. Silence — unreachable, answering with nothing, or
 /// never asked — is not the same as "the work stopped", and only the machine
 /// that spoke gets its claims examined.
-fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, workspace_id: &str) -> bool {
-    answered.contains_key(machine_of(workspace_id))
+pub(crate) fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, id: &str) -> bool {
+    answered.contains_key(machine_of(id))
 }
 
 pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
@@ -1245,7 +1253,7 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
     let host = util::hostname();
 
     if reap {
-        let answered = answered_by_machine(&workspaces);
+        let answered = answered_by_machine(workspaces.iter().map(|w| w.id.as_str()));
         for (task_id, c) in &claims {
             let get = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("");
             if !get("host").is_empty() && get("host") != host {
@@ -2545,10 +2553,6 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
 mod tests {
     use super::*;
 
-    fn ws(id: &str) -> herdr::Workspace {
-        herdr::Workspace { id: id.into(), ..Default::default() }
-    }
-
     /// The correctness hazard the executor design is built around, at the one
     /// line that decides it.
     ///
@@ -2561,17 +2565,21 @@ mod tests {
     fn a_machine_that_said_nothing_keeps_its_claims() {
         // The seat answered; mb2 did not — an offline executor, or one whose
         // tunnel is down, or one nobody asked.
-        let seat_only = [ws("w0"), ws("w1")];
-        let answered = answered_by_machine(&seat_only);
+        let answered = answered_by_machine(["w0", "w1"]);
 
         assert!(may_reap(&answered, "w9"), "a workspace gone from a machine that answered");
         assert!(!may_reap(&answered, "w0@mb2"), "silence from mb2 is not mb2 being empty");
 
         // And once it does answer, its claims are examined like anyone else's.
-        let spoke = [ws("w0"), ws("w0@mb2")];
-        let both = answered_by_machine(&spoke);
+        let both = answered_by_machine(["w0", "w0@mb2"]);
         assert!(may_reap(&both, "w9@mb2"));
         assert!(may_reap(&both, "w9"));
+
+        // The same judgement over pane ids, which is what `sync` brings to it:
+        // one rule, and each caller hands it what it has actually heard.
+        let panes = answered_by_machine(["w0:p1", "w0:p2"]);
+        assert!(may_reap(&panes, "w3:p9"));
+        assert!(!may_reap(&panes, "w0:p1@mb2"));
     }
 
     /// The generalisation, not a second rule beside the old one: `reap` used to
@@ -2579,7 +2587,7 @@ mod tests {
     /// this reason, on the one machine there was. That case still holds.
     #[test]
     fn a_herdr_answering_with_nothing_still_reaps_nothing() {
-        let answered = answered_by_machine(&[]);
+        let answered = answered_by_machine(std::iter::empty());
         assert!(!may_reap(&answered, "w0"));
         assert!(!may_reap(&answered, ""), "a claim too old to carry a workspace id either");
     }

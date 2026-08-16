@@ -38,6 +38,38 @@ pub struct Report {
     pub reaped: usize,
 }
 
+/// Which bindings survive a sync: the ones herdr just named, plus every one on
+/// a machine that did not answer.
+///
+/// **Unreachable is not empty**, one layer over `reconcile --reap`, and the same
+/// judgement rather than a second one — `answered_by_machine` and `may_reap` are
+/// its, and `sync` hands them pane ids instead of workspace ids. A binding is
+/// keyed on a pane, so the evidence entitling us to drop one is a pane list from
+/// the machine that pane is on. No pane list, no reap; and when panes fan out
+/// across machines (t-260816-037) this partitions itself, because a qualified
+/// id carries the machine it came from.
+///
+/// The case that made this urgent has both halves at once: a `wsp daemon`
+/// started by a sandbox's herdr, holding an empty herdr and the *live* store
+/// (t-260816-076). Every machine says nothing, so nothing is reaped — where
+/// before, every binding on the seat went. A herdr restarting says the same
+/// thing for a moment, which is why the daemon's own startup `reconcile` has
+/// never been allowed to reap either.
+fn kept_bindings<'a>(
+    live_panes: &[String],
+    bound_panes: impl IntoIterator<Item = &'a String>,
+    answered: &std::collections::BTreeMap<&str, usize>,
+) -> Vec<String> {
+    let mut keep: Vec<String> = live_panes.to_vec();
+    keep.extend(
+        bound_panes
+            .into_iter()
+            .filter(|p| !crate::cmd_agent::may_reap(answered, p))
+            .cloned(),
+    );
+    keep
+}
+
 /// Compute and push tokens. `force` ignores the change cache (used on the
 /// periodic TTL refresh).
 pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Report> {
@@ -59,12 +91,21 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
     // `agent.list` meant a binding to a plain shell was destroyed by the very
     // next sync — including the one `claim` runs on its way out, so claiming
     // from a shell silently undid itself.
-    let live_panes: Vec<String> = herdr::panes()
-        .unwrap_or_default()
-        .iter()
-        .map(|p| p.pane_id.clone())
-        .collect();
-    let reaped = store.reap_bindings(&live_panes);
+    //
+    // `Err` is not an empty list. It used to be — `unwrap_or_default()` — and
+    // an empty list drops every binding in the store, so one `pane.list` that
+    // timed out unbound every agent on the seat. Silence is not evidence that
+    // the panes went away.
+    let reaped = match herdr::panes() {
+        Err(_) => 0,
+        Ok(panes) => {
+            let live: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+            let answered =
+                crate::cmd_agent::answered_by_machine(live.iter().map(|s| s.as_str()));
+            let keep = kept_bindings(&live, bindings.keys(), &answered);
+            store.reap_bindings(&keep)
+        }
+    };
     let bindings = if reaped > 0 { store.bindings() } else { bindings };
 
     // pane -> task
@@ -169,5 +210,65 @@ fn nonzero(n: usize) -> Option<String> {
         None
     } else {
         Some(n.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bound(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The line this task was filed about: an empty pane list dropped **every**
+    /// binding in the store, and there are two ordinary ways to get one — herdr
+    /// answering with nothing while it restores a session, and a wsp pointed at
+    /// an empty herdr while holding the live store.
+    ///
+    /// Asserted as "what survives" rather than "what is reaped", because the
+    /// failure was that the survivors were nobody.
+    #[test]
+    fn a_herdr_that_named_no_panes_reaps_no_bindings() {
+        let bindings = bound(&["w0:p1", "w1:p3", "w2:p7"]);
+        let answered = crate::cmd_agent::answered_by_machine(std::iter::empty());
+        let keep = kept_bindings(&[], bindings.iter(), &answered);
+        for b in &bindings {
+            assert!(keep.contains(b), "{b} was unbound by a herdr that said nothing");
+        }
+    }
+
+    /// …and when it does answer, a binding whose pane is gone still goes. The
+    /// guard has to be the difference between silence and an answer, not a
+    /// blanket refusal — otherwise a pane that exited keeps its binding for
+    /// ever and the sidebar goes on naming a task nobody is holding.
+    #[test]
+    fn a_pane_that_is_gone_from_a_machine_that_answered_still_goes() {
+        let bindings = bound(&["w0:p1", "w1:p3"]);
+        let live = bound(&["w0:p1", "w0:p2"]);
+        let answered = crate::cmd_agent::answered_by_machine(live.iter().map(|s| s.as_str()));
+        let keep = kept_bindings(&live, bindings.iter(), &answered);
+
+        assert!(keep.contains(&"w0:p1".to_string()), "a live pane lost its binding");
+        assert!(!keep.contains(&"w1:p3".to_string()), "a pane that is gone kept its binding");
+    }
+
+    /// One machine's silence must not reap another machine's bindings. This is
+    /// the executor case, and it is why the judgement is shared with
+    /// `reconcile` rather than written a second time here: the seat answering
+    /// says nothing whatever about mb2.
+    #[test]
+    fn silence_from_one_machine_does_not_unbind_another() {
+        let bindings = bound(&["w0:p1", "w0:p9", "w0:p1@mb2"]);
+        let live = bound(&["w0:p1"]);
+        let answered = crate::cmd_agent::answered_by_machine(live.iter().map(|s| s.as_str()));
+        let keep = kept_bindings(&live, bindings.iter(), &answered);
+
+        assert!(keep.contains(&"w0:p1".to_string()));
+        assert!(!keep.contains(&"w0:p9".to_string()), "the seat answered, so its dead pane goes");
+        assert!(
+            keep.contains(&"w0:p1@mb2".to_string()),
+            "mb2 said nothing and its agent was unbound anyway"
+        );
     }
 }
