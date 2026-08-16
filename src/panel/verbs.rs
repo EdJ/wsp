@@ -484,6 +484,49 @@ fn find_work(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
     Effect::Tell(tell)
 }
 
+/// `C`: hand this task to whoever is spare, if anybody is.
+///
+/// `c` with the picking taken out. The pick is right when you have somebody in
+/// mind, and it is three keys and a hunt down the dock when you have not — and
+/// the commonest case by far is the second: you are reading the tree, there is
+/// a task that should be moving, and the only question about *who* is whether
+/// anyone at all is free. That question the panel can already answer, because
+/// the census is exactly the list it would have made you walk.
+///
+/// Everything downstream is `c`'s: the same `claim --pane`, the same `--force`
+/// behind a refusal, the same sentence typed into the pane. Only the answer to
+/// "which pane" is arrived at differently, so a hand-over is one thing however
+/// it was started — see [`Ui::spare_agent`] for how the pane is chosen.
+///
+/// It refuses on nothing but the absence of anybody to hand to. Whether the
+/// task is finished, blocked, or in somebody else's hands is the CLI's to say,
+/// and saying it here would be a second copy of `claim`'s rules that could
+/// drift from the first — the refusal comes back as the y/n that `escalate`
+/// turns it into, exactly as it does from the pick.
+fn hand_over(target: &Target, ui: &mut Ui) -> Effect {
+    let Target::Task(id) = target else {
+        say(ui, "C hands work to a spare agent — aim at a task");
+        return Effect::None;
+    };
+    let project = ui.project_of_task(id);
+    let Some(a) = ui.spare_agent(project.as_deref()).cloned() else {
+        // Both halves of why, because they want different things done about
+        // them: everyone is busy, or there is nobody there at all.
+        say(
+            ui,
+            match ui.census.is_empty() {
+                true => "nobody is running · S starts one on it",
+                false => "nobody is spare · S starts one on it",
+            },
+        );
+        return Effect::None;
+    };
+    let argv = vec!["claim".into(), id.clone(), "--pane".into(), a.pane.clone()];
+    let mut forced = argv.clone();
+    forced.push("--force".into());
+    Effect::Run { argv, escalate: Some(forced), then: Some(tell_claimed(&a, id)) }
+}
+
 /// `u`: take the work back off an agent, and leave it spare.
 ///
 /// The inverse of `c`, and it undoes all three things a claim did. The binding
@@ -1076,6 +1119,10 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Effect::None
             }
         },
+        // The same join, made without being asked who. `c` is for when you
+        // know which pane you want; this is for when the only thing you want
+        // is that somebody takes it.
+        Key::Char('C') => hand_over(&target, ui),
         // The other direction. `c` joins a task to an agent; this takes the
         // join apart from whichever end you are looking at it from.
         Key::Char('u') => unassign(&target, ui),

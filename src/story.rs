@@ -2320,6 +2320,131 @@ mod tests {
         }
     }
 
+    // ---- handing it to whoever is spare ----------------------------------
+
+    /// `C` is `c` with the hunt taken out, and it has to end in the same place:
+    /// the same claim, the same override behind it, and the same sentence typed
+    /// into the pane it chose. A second hand-over that differed from the first
+    /// in any of the three would be a second way of doing one thing.
+    #[test]
+    fn handing_a_task_over_claims_it_onto_a_spare_agent_and_tells_it() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        // A task in `trance`, and w4:p2 is the spare agent standing there.
+        on_task(&mut ui, "t-001");
+        match press(&mut ui, &mut view, 'C') {
+            panel::Effect::Run { argv, escalate, then } => {
+                assert_eq!(argv, vec!["claim", "t-001", "--pane", "w4:p2"]);
+                assert_eq!(
+                    escalate.expect("a refused claim is worth asking about"),
+                    vec!["claim", "t-001", "--pane", "w4:p2", "--force"]
+                );
+                let t = then.expect("an agent handed a task is told about it");
+                assert_eq!(t.pane, "w4:p2");
+                assert_eq!(t.clear, Some("/clear"), "on an empty context, like every other");
+                let said = t.text.clone().expect("a sentence, not just a clear");
+                assert!(said.contains("t-001"), "said: {said}");
+            }
+            _ => panic!("C should claim onto the spare agent"),
+        }
+    }
+
+    /// Who it picks is not "the first one going": the spare agent already
+    /// standing in the work's own project is the one that can start on it,
+    /// and the other is in a different checkout entirely.
+    ///
+    /// w6:p1 sorts first of the two — the census is ordered by name and it has
+    /// none, so it answers to its workspace — which is what makes this a test
+    /// of the preference rather than of the order.
+    #[test]
+    fn the_spare_agent_in_the_right_project_is_the_one_it_picks() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        let pane_for = |ui: &mut panel::Ui, view: &mut panel::View, task: &str| -> String {
+            on_task(ui, task);
+            match press(ui, view, 'C') {
+                panel::Effect::Run { argv, .. } => argv[3].clone(),
+                _ => panic!("C should claim onto a spare agent"),
+            }
+        };
+
+        // In `trance`, where one of the two spare agents is standing.
+        assert_eq!(pane_for(&mut ui, &mut view, "t-001"), "w4:p2");
+        // Filed nowhere, so nothing is a better answer than anything else and
+        // the first spare agent takes it.
+        assert_eq!(pane_for(&mut ui, &mut view, "t-020"), "w6:p1");
+        // In `wsp`, where nobody is standing: still handed over, because "the
+        // agent is in another tree" is a worse answer than "nobody has it".
+        assert_eq!(pane_for(&mut ui, &mut view, "t-101"), "w6:p1");
+    }
+
+    /// Who is free is a fact about the machine, not about what is drawn. The
+    /// review filter takes the agents off the screen entirely, and a `C` that
+    /// read the rows would answer "nobody is spare" over a header strip still
+    /// showing two of them.
+    #[test]
+    fn a_hand_over_finds_an_agent_the_view_is_not_showing() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        if let panel::Effect::Refetch = press(&mut ui, &mut view, 'R') {
+            panel::refetch_into(&mut ui, &w, &mut view, Some("w0"));
+        }
+        assert!(
+            !has(&ui, &panel::Target::Pane("w6:p1".into())),
+            "the review filter is the case: no agent row is on screen at all",
+        );
+        on_task(&mut ui, "t-004");
+        match press(&mut ui, &mut view, 'C') {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["claim", "t-004", "--pane", "w6:p1"]);
+            }
+            _ => panic!("C should claim onto the spare agent the filter hid"),
+        }
+    }
+
+    /// The half the key is named for. Nobody spare is the ordinary answer on a
+    /// busy afternoon, and the panel says so and does nothing — a claim onto a
+    /// working agent is what `c` is for, deliberately, and interrupting one is
+    /// not something a single keystroke should be able to do by accident.
+    #[test]
+    fn a_hand_over_with_nobody_to_hand_to_does_nothing() {
+        let mut w = world();
+        for p in w.panes.iter_mut().filter(|p| !p.agent.is_empty()) {
+            p.agent_status = "working".into();
+        }
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_task(&mut ui, "t-001");
+        assert!(matches!(press(&mut ui, &mut view, 'C'), panel::Effect::None));
+
+        // And with nobody running at all, which is the same answer for a
+        // different reason — see the footer line, which says which.
+        let quiet = quiet_world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&quiet, &view);
+        on_task(&mut ui, "t-001");
+        assert!(matches!(press(&mut ui, &mut view, 'C'), panel::Effect::None));
+    }
+
+    /// Only a task is handed over. An agent row is the other end of the same
+    /// join and already has two keys — `c` to point it at work and `f` to send
+    /// it looking — so a third meaning here would be guesswork about which of
+    /// them was meant.
+    #[test]
+    fn only_a_task_is_handed_to_somebody() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_kind(&mut ui, panel::RowKind::Project);
+        assert!(matches!(press(&mut ui, &mut view, 'C'), panel::Effect::None));
+        on_pane(&mut ui, "w4:p2");
+        assert!(matches!(press(&mut ui, &mut view, 'C'), panel::Effect::None));
+    }
+
     // ---- taking the work back --------------------------------------------
 
     /// `u` is `c` run backwards, and it undoes both halves. The release is what

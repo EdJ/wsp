@@ -506,6 +506,39 @@ impl Ui {
         self.census.iter().map(|(_, a)| a).find(|a| a.task.as_deref() == Some(task))
     }
 
+    /// Somebody free to hand work to, preferring one already pointed at the
+    /// project the work is in.
+    ///
+    /// Off the census, like [`Ui::agent_on_task`] and for the same reason: who
+    /// is free is a fact about the machine, and the dock draws five of them.
+    /// `C` would otherwise miss the spare agent that a fold, a filter or the
+    /// cap happened to be hiding, and say nobody was free while the strip in
+    /// the header was showing one.
+    ///
+    /// [`AgentState::Spare`] is the whole test. It already means "stopped, and
+    /// holding no live work" — the two halves a hand-over needs — and it is the
+    /// same word the strip, the dock and the agents view draw, so the agent
+    /// this finds is one you can see it choose.
+    ///
+    /// The preference is exact and does not climb the tree. A pane pointed at
+    /// `verb` is in that checkout; the one standing in its parent is somewhere
+    /// else on disk, and calling that a match would hand over work in a tree
+    /// the agent is not in while an exact answer sat further down the list.
+    /// When nothing matches, any spare agent will do — that is what `c` already
+    /// lets you pick, and refusing here would leave the key useless on exactly
+    /// the afternoons it is for.
+    pub(super) fn spare_agent(&self, project: Option<&str>) -> Option<&AgentRef> {
+        let spare = || {
+            self.census
+                .iter()
+                .filter(|(state, _)| *state == AgentState::Spare)
+                .map(|(_, a)| a)
+        };
+        project
+            .and_then(|p| spare().find(|a| a.project.as_deref() == Some(p)))
+            .or_else(|| spare().next())
+    }
+
     /// Which project a task row sits under.
     pub(super) fn project_of_task(&self, task: &str) -> Option<String> {
         self.rows.iter().find_map(|r| match r {

@@ -451,6 +451,7 @@ disturbing a layout you will come back to.
 | `m` | task | move — the tree becomes the picker |
 | `m` | project | the same, one level up: move it under another project |
 | `c` | task or agent | claim, either direction — and how an agent moves on |
+| `C` | task | the same claim, onto whoever is spare — no picking |
 | `f` | idle agent | send it to find its own work |
 | | | asks which project, and remembers, if it stands nowhere |
 | `O` | task, project | open a herdr workspace for it, and claim it |
@@ -561,6 +562,25 @@ pane. A claim is a fact in the store and nothing at all in the pane it names —
 an idle agent goes on sitting at its prompt until somebody types in it — so
 `c` carries "you have been claimed onto `<id>`, run `wsp brief`", and `f`
 carries "run `wsp next -p <proj>`, claim what it names, do it".
+
+`C` is `c` with the hunt taken out: it claims the task under the cursor onto
+whoever is spare, and everything downstream is the same — the same
+`claim --pane`, the same `--force` behind a refusal, the same sentence on the
+same emptied context. Only "which pane" is arrived at differently. The pick is
+right when you have somebody in mind and it is three keys and a walk down the
+dock when you have not, which is the commoner case by far: you are reading the
+tree, a task should be moving, and the only question about *who* is whether
+anybody at all is free.
+
+Spare means what the `○` in the strip means — stopped, and holding no live work
+— so the agent it chooses is one you can watch it choose. Between two of them it
+prefers the one already pointed at the work's own project, because that is the
+pane standing in the right checkout; failing that, any spare agent takes it,
+since "in another tree" is a better answer than "nobody has it". It refuses on
+one thing only, that nobody is free, and says which of the two reasons it is.
+Everything else — finished work, blocked work, work in somebody else's hands —
+is `claim`'s to refuse, and comes back as the same `y`/`n` the pick gets rather
+than a second copy of those rules living in the panel.
 
 The project in that sentence comes from the same chain the agent's own
 `wsp where` would use — pin, then mandate, then cwd, then workspace label — so
