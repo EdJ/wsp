@@ -183,6 +183,16 @@ fn said_label(task: &Task, said: &str) -> Option<String> {
     Some(format!("{scope} · {}", util::truncate(said, room)))
 }
 
+/// What a pane wears once the work has been taken back off it.
+///
+/// A word rather than nothing. A pane with no label of ours falls back to its
+/// terminal title — the prompt an agent announced itself with and never
+/// revises — so blanking a released pane leaves the agents panel saying,
+/// confidently, that it is still on the thing it just handed back. This says
+/// the one fact that is certainly true about it, and it is the fact you are
+/// reading that list to find: nobody has given this agent anything.
+const UNASSIGNED_LABEL: &str = "unassigned";
+
 /// A label for a pane holding no task, which is the only kind that has to be
 /// checked for a name of ours.
 ///
@@ -227,6 +237,23 @@ fn name_after_task(pane: &str, workspace: &str, task: &Task) -> Option<String> {
     herdr::rename_workspace(workspace, &label).ok().map(|_| label)
 }
 
+/// Whether a name is one this task's claim put there.
+///
+/// Two shapes wear the same scope and only one of them is the title. `claim`
+/// writes [`task_label`], and every `wsp say` since has written a
+/// [`said_label`] over it — the same `render/047 ·` in front, a different
+/// sentence behind. Matching the title alone meant that an agent which had
+/// said anything at all kept the work's name for ever after handing it back,
+/// which is every agent that follows the brief.
+///
+/// The scope is what wsp owns and the only part of either shape that is not a
+/// sentence somebody chose: a project and an ident, and nothing a person types
+/// by hand looks like it. So the scope is what is recognised, and a name that
+/// does not carry it is somebody else's and is left alone.
+fn named_after_task(label: &str, task: &Task) -> bool {
+    label.trim().starts_with(&format!("{} ·", task_scope(task)))
+}
+
 /// Take the task's name back off the pane and the workspace that held it.
 ///
 /// The other half of [`name_after_task`], and the reason it is needed: a claim
@@ -235,11 +262,16 @@ fn name_after_task(pane: &str, workspace: &str, task: &Task) -> Option<String> {
 /// sidebar, in the panel's rows, in `workspace.list` — so the one place you look
 /// to find somebody free said the opposite.
 ///
-/// Only what the claim wrote. A label that is no longer the task's title is a
-/// name somebody typed since, and blanking that would be this function deciding
-/// something it was never asked to. Empty rather than a guess at what was there
-/// before: the overwritten name is printed by `claim` and kept nowhere, and
-/// "nobody has named this" is at least true.
+/// Only what the claim wrote — see [`named_after_task`] for what that comes to.
+/// A name without the task's scope on it is one somebody typed since, and
+/// blanking that would be this function deciding something it was never asked
+/// to.
+///
+/// The pane takes a word and the workspace takes nothing, because the two are
+/// asked different questions. A pane is a person, and "unassigned" is the
+/// answer the agents panel exists to give; a workspace is a room, and herdr
+/// names an unnamed one after what is standing in it, which is true again the
+/// moment the task stops being.
 ///
 /// The workspace waits on the last binding in it. Two agents in one tree are
 /// rare and one of them finishing is not a reason to unname the room they are
@@ -248,12 +280,12 @@ fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
     if !herdr::available() {
         return;
     }
-    let Some(label) = store.task(task_id).as_ref().and_then(task_label) else { return };
+    let Some(task) = store.task(task_id) else { return };
     let Ok(panes) = herdr::panes() else { return };
     let Some(p) = panes.iter().find(|p| p.pane_id == pane) else { return };
 
-    if p.label == label {
-        let _ = herdr::rename_pane(pane, "");
+    if named_after_task(&p.label, &task) {
+        let _ = herdr::rename_pane(pane, UNASSIGNED_LABEL);
     }
     if p.workspace_id.is_empty() {
         return;
@@ -268,7 +300,7 @@ fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
     if herdr::workspaces()
         .unwrap_or_default()
         .iter()
-        .any(|w| w.id == p.workspace_id && w.label == label)
+        .any(|w| w.id == p.workspace_id && named_after_task(&w.label, &task))
     {
         let _ = herdr::rename_workspace(&p.workspace_id, "");
     }
@@ -2516,6 +2548,34 @@ mod tests {
         // separates it from every other pane.
         let loose = Task::new("something nobody has filed", "t-260815-004");
         assert_eq!(task_label(&loose), Some("004 · something nobody has filed".to_string()));
+    }
+
+    /// What a release is entitled to take back. The bug it fixes: `u` on an
+    /// agent that had ever run `wsp say` left the pane wearing the work — the
+    /// name matched the sentence, not the title, so the old test for "is this
+    /// ours" said no and the agents panel went on showing a task and a project
+    /// for somebody holding neither.
+    #[test]
+    fn a_release_takes_back_the_scope_and_nothing_else() {
+        let mut t = Task::new("When unassigning an agent via u", "t-260816-047");
+        t.project = Some("render".into());
+
+        // Both shapes a claim leaves behind: the title it wrote, and whatever
+        // has been said over it since.
+        assert!(named_after_task(&task_label(&t).unwrap(), &t));
+        assert!(named_after_task(&said_label(&t, "reading how release names panes").unwrap(), &t));
+
+        // Somebody else's name, and another task's. Neither is ours to take.
+        assert!(!named_after_task("Trance Video", &t));
+        assert!(!named_after_task("", &t));
+        let mut other = Task::new("something else entirely", "t-260816-030");
+        other.project = Some("render".into());
+        assert!(!named_after_task(&task_label(&other).unwrap(), &t));
+
+        // The scope is a project and an ident together: the same ident under a
+        // different project is a different piece of work.
+        let elsewhere = Task::new("same ident, no project", "t-260816-047");
+        assert!(!named_after_task(&task_label(&t).unwrap(), &elsewhere));
     }
 
     /// The subtraction that separates a loaded index from an agent halfway
