@@ -232,7 +232,11 @@ fn begin(view: &mut View, verb: Pick) -> Effect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Tell {
     pub(crate) pane: String,
-    pub(crate) text: String,
+    /// The sentence, where there is one. `None` for [`tell_released`], whose
+    /// whole content is the clear in front of it: an agent that has just had
+    /// its work taken away is not being told to do anything, and a line typed
+    /// into it to say so would be the one thing left in its context.
+    pub(crate) text: Option<String>,
     /// Thirty-four columns' worth. The sentence above is for the agent; this is
     /// for the person who pressed the key.
     pub(crate) note: String,
@@ -260,13 +264,37 @@ fn clear_command(kind: &str) -> Option<&'static str> {
 pub(super) fn tell_find_work(a: &AgentRef, project: &str) -> Tell {
     Tell {
         pane: a.pane.clone(),
-        text: format!(
+        text: Some(format!(
             "Find your next piece of work: run `wsp next -p {project}`, `wsp claim` what it \
              names, then do it. If nothing is actionable, say so and stop."
-        ),
+        )),
         note: format!("{} → looking in {project}", a.where_),
         clear: clear_command(&a.kind),
     }
+}
+
+/// Leave an agent that has just handed work back with an empty window.
+///
+/// The clear and nothing after it. `c` empties a context so a work order does
+/// not land on the last task's reasoning; `u` empties it because there is no
+/// next task yet, and an agent sitting on a finished transcript is one that
+/// reads its next instruction — whenever it arrives, from whoever sends it —
+/// through work it no longer holds.
+///
+/// `None` where there is no clear to send. A `Tell` with neither a sentence nor
+/// a clear is a thread started to do nothing, and a footer line about it is a
+/// line saying something happened that did not.
+pub(super) fn tell_released(a: &AgentRef, task: &str) -> Option<Tell> {
+    Some(Tell {
+        pane: a.pane.clone(),
+        text: None,
+        // The mirror of `tell_claimed`'s `→`: the work going back the way it
+        // came. The name is the one the row had a moment ago — the release
+        // takes it off the pane, so by the time this is drawn it is already
+        // what the agent *was* called.
+        note: format!("{} ← {task}", a.where_),
+        clear: Some(clear_command(&a.kind)?),
+    })
 }
 
 /// Tell an agent about a task it has just been handed. The sentence itself is
@@ -275,7 +303,7 @@ pub(super) fn tell_find_work(a: &AgentRef, project: &str) -> Tell {
 pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
     Tell {
         pane: a.pane.clone(),
-        text: crate::cmd_spawn::claimed_text(task),
+        text: Some(crate::cmd_spawn::claimed_text(task)),
         note: format!("{} → {task}", a.where_),
         clear: clear_command(&a.kind),
     }
@@ -323,7 +351,10 @@ pub(super) fn send_tell(t: &Tell) -> Result<(), String> {
     if let Some(cmd) = t.clear {
         clear_agent(&t.pane, cmd)?;
     }
-    type_line(&t.pane, &t.text)
+    match &t.text {
+        Some(text) => type_line(&t.pane, text),
+        None => Ok(()),
+    }
 }
 
 /// Type a line into a pane and press return.
@@ -411,6 +442,61 @@ fn find_work(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
     let tell = tell_find_work(a, &project);
     say(ui, tell.note.clone());
     Effect::Tell(tell)
+}
+
+/// `u`: take the work back off an agent, and leave it spare.
+///
+/// The inverse of `c`, and it undoes all three things a claim did. The binding
+/// and the durable claim go — that is `wsp release`, which also puts back the
+/// name the claim wrote over the pane and the workspace. The context goes with
+/// them, because the rest is only true from the outside: an agent whose window
+/// is still full of a task it no longer holds will go on reasoning about that
+/// task, and the panel would be showing a free agent that is not one.
+///
+/// Both ends of the join answer it, exactly as `c` does. On an agent row it is
+/// "you are off this"; on a task row it is "nobody is on this" — one gesture,
+/// and the row under the cursor says which way round you were thinking about it.
+///
+/// The clear is withheld from a working agent and from a shell, the same rule
+/// [`pick_tell`] uses and for the same reason: a shell would run `/clear` as a
+/// command, and an agent in the middle of a turn has a prompt that is not a
+/// prompt. The release still lands — taking work off a runaway agent is when
+/// you most want this key — and only the emptying waits for it to stop.
+fn unassign(target: &Target, ui: &mut Ui) -> Effect {
+    let holder = match target {
+        Target::Pane(p) => ui.agent_at_pane(p),
+        Target::Task(id) => ui.agent_on_task(id),
+        _ => {
+            say(ui, "u takes work off an agent — aim at one, or at its task");
+            return Effect::None;
+        }
+    };
+    let Some(a) = holder.cloned() else {
+        say(
+            ui,
+            match target {
+                Target::Task(_) => "nobody is on it",
+                _ => "it holds nothing already",
+            },
+        );
+        return Effect::None;
+    };
+    let Some(task) = a.task.clone() else {
+        say(ui, format!("{} holds nothing already", a.where_));
+        return Effect::None;
+    };
+    let idle = a.agent && a.state == "idle";
+    let then = idle.then(|| tell_released(&a, &task)).flatten();
+    if !idle {
+        say(ui, format!("{} → nothing · still working, so not cleared", a.where_));
+    }
+    Effect::Run {
+        // No `--force`. `release` refuses on nothing: a pane either holds a
+        // binding or it does not, and the panel only got here by finding one.
+        argv: vec!["release".into(), "--pane".into(), a.pane.clone()],
+        escalate: None,
+        then,
+    }
 }
 
 /// Shut the workspace's detail pane, if it has one.
@@ -950,6 +1036,9 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Effect::None
             }
         },
+        // The other direction. `c` joins a task to an agent; this takes the
+        // join apart from whichever end you are looking at it from.
+        Key::Char('u') => unassign(&target, ui),
         // The dock's own verb. `c` needs you to have decided what the work is;
         // this needs only that there is some.
         Key::Char('f') => match ui.rows.get(ui.sel).and_then(|r| r.agent()).cloned() {

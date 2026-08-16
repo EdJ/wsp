@@ -495,6 +495,17 @@ impl Ui {
         self.rows.iter().filter_map(|r| r.agent()).find(|a| a.pane == pane)
     }
 
+    /// The agent holding a task, if one is.
+    ///
+    /// Off the census rather than the rows, unlike [`Ui::agent_at_pane`]. A
+    /// pane row can be absent for reasons that have nothing to do with the
+    /// claim — a folded project, the dock's cap, the tree filtered to review —
+    /// and `u` on a task row is a question about who holds it, which is a fact
+    /// about the world and not about what is currently drawn.
+    pub(super) fn agent_on_task(&self, task: &str) -> Option<&AgentRef> {
+        self.census.iter().map(|(_, a)| a).find(|a| a.task.as_deref() == Some(task))
+    }
+
     /// Which project a task row sits under.
     pub(super) fn project_of_task(&self, task: &str) -> Option<String> {
         self.rows.iter().find_map(|r| match r {

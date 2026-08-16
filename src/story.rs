@@ -2072,7 +2072,8 @@ mod tests {
         match press(&mut ui, &mut view, 'f') {
             panel::Effect::Tell(t) => {
                 assert_eq!(t.pane, "w4:p2");
-                assert!(t.text.contains("wsp next -p trance"), "said: {}", t.text);
+                let said = t.text.clone().expect("a sentence, not just a clear");
+                assert!(said.contains("wsp next -p trance"), "said: {said}");
             }
             _ => panic!("f on an idle unassigned agent should tell it something"),
         }
@@ -2091,7 +2092,8 @@ mod tests {
         on_pane(&mut ui, "w4:p2");
         match press(&mut ui, &mut view, 'f') {
             panel::Effect::Tell(t) => {
-                assert!(t.text.contains("wsp next -p verb"), "said: {}", t.text);
+                let said = t.text.clone().expect("a sentence, not just a clear");
+                assert!(said.contains("wsp next -p verb"), "said: {said}");
             }
             _ => panic!("a mandated pane is still tellable"),
         }
@@ -2139,7 +2141,8 @@ mod tests {
                 assert_eq!(argv, vec!["claim", "t-020", "--pane", "w4:p2"]);
                 let t = then.expect("an idle agent handed a task is told about it");
                 assert_eq!(t.pane, "w4:p2");
-                assert!(t.text.contains("t-020"), "said: {}", t.text);
+                let said = t.text.clone().expect("a sentence, not just a clear");
+                assert!(said.contains("t-020"), "said: {said}");
             }
             _ => panic!("the pick should run a claim"),
         }
@@ -2208,7 +2211,8 @@ mod tests {
                 assert_eq!(argv, vec!["mandate", "verb", "-w", "w6"]);
                 let t = then.expect("and it is told to go and look");
                 assert_eq!(t.pane, "w6:p1");
-                assert!(t.text.contains("wsp next -p verb"), "said: {}", t.text);
+                let said = t.text.clone().expect("a sentence, not just a clear");
+                assert!(said.contains("wsp next -p verb"), "said: {said}");
             }
             _ => panic!("the pick should set the mandate"),
         }
@@ -2314,6 +2318,123 @@ mod tests {
             }
             _ => panic!("the pick should run a claim"),
         }
+    }
+
+    // ---- taking the work back --------------------------------------------
+
+    /// `u` is `c` run backwards, and it undoes both halves. The release is what
+    /// takes the binding, the durable claim and the name the claim wrote; the
+    /// clear behind it is what stops an agent that now holds nothing going on
+    /// reasoning about the task it used to.
+    ///
+    /// Nothing typed after the clear. Every other `Tell` here exists to carry a
+    /// sentence and empties the context so the sentence lands cleanly; this one
+    /// is the empty context, and a line explaining that would be the only thing
+    /// left in the window it just cleared.
+    #[test]
+    fn taking_work_off_an_agent_releases_it_and_empties_its_window() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        // w2:p1 is idle on t-003 — the "needs you" case, and the one you most
+        // want this key for.
+        on_pane(&mut ui, "w2:p1");
+        match press(&mut ui, &mut view, 'u') {
+            panel::Effect::Run { argv, escalate, then } => {
+                assert_eq!(argv, vec!["release", "--pane", "w2:p1"]);
+                assert!(escalate.is_none(), "release has nothing to refuse on");
+                let t = then.expect("an idle agent handed its work back is cleared");
+                assert_eq!(t.pane, "w2:p1");
+                assert_eq!(t.clear, Some("/clear"));
+                assert!(t.text.is_none(), "nothing is typed after the clear");
+            }
+            _ => panic!("u should run a release"),
+        }
+    }
+
+    /// The same gesture from the other end of the join. "Take this agent off
+    /// its task" and "get whoever is on this task off it" are one fact asked
+    /// two ways, and the row under the cursor is the only difference — exactly
+    /// as `c` takes a task or a pane and ends in the same claim.
+    #[test]
+    fn a_task_row_answers_the_same_key_with_the_agent_holding_it() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_task(&mut ui, "t-003");
+        match press(&mut ui, &mut view, 'u') {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["release", "--pane", "w2:p1"]);
+                assert!(then.is_some(), "the agent it names is idle, so it is cleared");
+            }
+            _ => panic!("u on a claimed task should release the agent holding it"),
+        }
+    }
+
+    /// A busy agent is released and not cleared, the mirror of what a claim
+    /// does to one: the store is safe to change at any moment and a pane in the
+    /// middle of a turn is not. Taking work off an agent that will not stop is
+    /// most of the reason for the key, so the release itself cannot wait.
+    #[test]
+    fn a_working_agent_hands_the_task_back_without_being_cleared() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w1:p1"); // working, holding t-001
+        match press(&mut ui, &mut view, 'u') {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["release", "--pane", "w1:p1"]);
+                assert!(then.is_none(), "a working agent is not typed into");
+            }
+            _ => panic!("u should run a release"),
+        }
+    }
+
+    /// Only the kinds whose clear we know how to spell. herdr starts twenty of
+    /// them and `/clear` is Claude Code's word — and unlike a work order, which
+    /// still goes in on its own where the clear is unknown, there is nothing
+    /// left to send here. So the release lands alone and no thread is started
+    /// to type nothing into a pane.
+    #[test]
+    fn an_agent_whose_clear_we_cannot_spell_is_only_released() {
+        let mut w = world();
+        for p in w.panes.iter_mut().filter(|p| p.pane_id == "w2:p1") {
+            p.agent = "codex".into();
+        }
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w2:p1");
+        match press(&mut ui, &mut view, 'u') {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["release", "--pane", "w2:p1"]);
+                assert!(then.is_none(), "nothing to clear and nothing to say");
+            }
+            _ => panic!("u should run a release"),
+        }
+    }
+
+    /// Nothing to take back. An agent holding no work and a task nobody is on
+    /// are the same non-event, and running a release against either would be a
+    /// commit, an event and a log line about a change that did not happen.
+    #[test]
+    fn there_is_nothing_to_take_back_from_an_agent_holding_nothing() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_pane(&mut ui, "w4:p2"); // idle, spare, bound to nothing
+        assert!(matches!(press(&mut ui, &mut view, 'u'), panel::Effect::None));
+
+        on_task(&mut ui, "t-020"); // in the inbox, nobody on it
+        assert!(matches!(press(&mut ui, &mut view, 'u'), panel::Effect::None));
+
+        for i in 0..500 {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Project("verb".into()) {
+                break;
+            }
+        }
+        assert!(matches!(press(&mut ui, &mut view, 'u'), panel::Effect::None));
     }
 
     /// A project that holds nothing keeps its row. The quiet-branch filter is

@@ -419,6 +419,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("t", "tags: ␣ picks, ↵ saves"),
                 ("!", "high, low, normal"),
                 ("m c f", "move, claim, find work"),
+                ("u", "take the work back, clear"),
                 ("O S", "a terminal, an agent"),
                 ("X", "remove, after y/n"),
             ],

@@ -177,6 +177,53 @@ fn name_after_task(pane: &str, workspace: &str, title: &str) -> Option<String> {
     herdr::rename_workspace(workspace, &label).ok().map(|_| label)
 }
 
+/// Take the task's name back off the pane and the workspace that held it.
+///
+/// The other half of [`name_after_task`], and the reason it is needed: a claim
+/// writes the task's title over both, and until now nothing ever wrote it back.
+/// An agent that handed its work in went on reading as that work — in the
+/// sidebar, in the panel's rows, in `workspace.list` — so the one place you look
+/// to find somebody free said the opposite.
+///
+/// Only what the claim wrote. A label that is no longer the task's title is a
+/// name somebody typed since, and blanking that would be this function deciding
+/// something it was never asked to. Empty rather than a guess at what was there
+/// before: the overwritten name is printed by `claim` and kept nowhere, and
+/// "nobody has named this" is at least true.
+///
+/// The workspace waits on the last binding in it. Two agents in one tree are
+/// rare and one of them finishing is not a reason to unname the room they are
+/// both standing in.
+fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
+    if !herdr::available() {
+        return;
+    }
+    let Some(label) = store.task(task_id).and_then(|t| task_label(&t.title)) else { return };
+    let Ok(panes) = herdr::panes() else { return };
+    let Some(p) = panes.iter().find(|p| p.pane_id == pane) else { return };
+
+    if p.label == label {
+        let _ = herdr::rename_pane(pane, "");
+    }
+    if p.workspace_id.is_empty() {
+        return;
+    }
+    let still_bound = store.bindings().keys().any(|other| {
+        other != pane
+            && panes.iter().any(|q| q.pane_id == *other && q.workspace_id == p.workspace_id)
+    });
+    if still_bound {
+        return;
+    }
+    if herdr::workspaces()
+        .unwrap_or_default()
+        .iter()
+        .any(|w| w.id == p.workspace_id && w.label == label)
+    {
+        let _ = herdr::rename_workspace(&p.workspace_id, "");
+    }
+}
+
 /// `wsp say "<what you are doing>"` — an agent says where it has got to.
 ///
 /// The pane takes the sentence; the workspace keeps the task. That division is
@@ -932,6 +979,10 @@ pub fn release(store: &Store, args: &Args) -> i32 {
     let removed = store.clear_binding(&pane);
     if removed {
         if let Some(task_id) = had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
+            // The name goes back before the log line does, and while the task
+            // is still readable: `unname_after_task` needs the title to know
+            // whether the label it is looking at is one we wrote.
+            unname_after_task(store, &pane, task_id);
             // Releasing is a decision, so it clears the durable claim too —
             // unlike a pane exiting, which is only ever an accident of process
             // lifetime and must leave the intent standing. It ends the same way
