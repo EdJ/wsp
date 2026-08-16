@@ -42,8 +42,105 @@ pub fn live_holders<'a>(
         .collect()
 }
 
+/// Everything the standing-in chain reads, gathered into one value.
+///
+/// The chain itself — pin > binding > claim > mandate > cwd > label — is the
+/// precedence every command in wsp inherits, and two of its six steps are
+/// decided here rather than in [`resolve::resolve`]: where the mandate sits,
+/// and the label lookup at the bottom. Those two had no test, because reading
+/// them took a pane with the right environment, a store with the right
+/// mandate, and a herdr answering with the right label at once.
+pub(crate) struct Here {
+    pub index: Index,
+    pub pins: std::collections::BTreeMap<String, String>,
+    pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
+    pub claims: std::collections::BTreeMap<String, serde_json::Value>,
+    pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
+    pub tasks: Vec<Task>,
+    /// Read for one field, and only at the bottom of the chain: the label of
+    /// the workspace this pane stands in.
+    pub workspaces: Vec<herdr::Workspace>,
+    pub pane: Option<String>,
+    pub workspace: Option<String>,
+    pub cwd: Option<String>,
+}
+
+impl Here {
+    pub(crate) fn live(store: &Store, index: &Index) -> Here {
+        let env = herdr::Env::read();
+        Here {
+            index: Index::new(index.projects.clone()),
+            pins: store.pins(),
+            bindings: store.bindings(),
+            claims: store.claims(),
+            mandates: store.mandates(),
+            tasks: store.tasks(),
+            workspaces: match (&env.workspace_id, herdr::available()) {
+                (Some(_), true) => herdr::workspaces().unwrap_or_default(),
+                _ => Vec::new(),
+            },
+            pane: env.pane_id,
+            workspace: env.workspace_id,
+            cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        }
+    }
+}
+
+/// Walk the chain. Pure: everything it reads is in `h`.
+pub(crate) fn standing_in(h: &Here) -> Option<String> {
+    let bound_project = h.pane.as_ref().and_then(|pane| {
+        h.bindings
+            .get(pane)
+            .and_then(|b| b.get("task_id"))
+            .and_then(|t| t.as_str())
+            .and_then(|id| h.tasks.iter().find(|t| t.id == id))
+            .and_then(|t| t.project.clone())
+    });
+
+    // A mandate is a statement about what this workspace is *for*, so it beats
+    // the directory the shell happens to be sitting in — but not a pin, which
+    // is a statement about what the workspace *is*, and not a binding, which is
+    // the work actually in hand. Checked here rather than inside `resolve` so
+    // that the panel and `overlap` go on placing panes by where they stand:
+    // standing direction says nothing about which tree a pane is in.
+    let mandate = h
+        .workspace
+        .as_deref()
+        .and_then(|ws| crate::cmd_mandate::from_map(&h.mandates, ws));
+
+    let r = resolve::resolve(
+        &h.index,
+        &h.pins,
+        resolve::Held {
+            binding: bound_project,
+            claim: resolve::claimed_project(&h.claims, &h.tasks, h.workspace.as_deref(), None),
+        },
+        h.workspace.as_deref(),
+        None,
+        h.cwd.as_deref(),
+    );
+    // A claim is work in hand, like a binding, so it stands with the binding
+    // above the mandate: what this workspace is *doing* beats what it is *for*
+    // for as long as it is holding it.
+    if matches!(r.source, "pin" | "binding" | "claim") && r.project.is_some() {
+        return r.project;
+    }
+    if mandate.is_some() {
+        return mandate;
+    }
+    if r.project.is_some() {
+        return r.project;
+    }
+
+    // Last resort: the workspace's own label, which is the only link herdr
+    // supplies and the only one that goes away when it stops answering.
+    let ws = h.workspace.as_deref()?;
+    let w = h.workspaces.iter().find(|w| w.id == ws)?;
+    h.index.project_for_label(&w.label)
+}
+
 /// The project the caller is standing in. `-p` always wins; otherwise the
-/// precedence chain is pin > binding > mandate > cwd > workspace label.
+/// precedence chain is pin > binding > claim > mandate > cwd > label.
 pub fn current_project(
     store: &Store,
     args: &Args,
@@ -61,70 +158,7 @@ pub fn current_project(
             }
         };
     }
-
-    let env = herdr::Env::read();
-    let pins = store.pins();
-
-    let bound_project = env.pane_id.as_ref().and_then(|pane| {
-        store
-            .bindings()
-            .get(pane)
-            .and_then(|b| b.get("task_id"))
-            .and_then(|t| t.as_str())
-            .and_then(|id| store.task(id))
-            .and_then(|t| t.project)
-    });
-
-    let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
-
-    // A mandate is a statement about what this workspace is *for*, so it beats
-    // the directory the shell happens to be sitting in — but not a pin, which
-    // is a statement about what the workspace *is*, and not a binding, which is
-    // the work actually in hand. Checked here rather than inside `resolve` so
-    // that the panel and `overlap` go on placing panes by where they stand:
-    // standing direction says nothing about which tree a pane is in.
-    let mandate = crate::cmd_mandate::current(store, env.workspace_id.as_deref());
-
-    let r = resolve::resolve(
-        index,
-        &pins,
-        resolve::Held {
-            binding: bound_project,
-            claim: resolve::claimed_project(
-                &store.claims(),
-                &store.tasks(),
-                env.workspace_id.as_deref(),
-                None,
-            ),
-        },
-        env.workspace_id.as_deref(),
-        None,
-        cwd.as_deref(),
-    );
-    // A claim is work in hand, like a binding, so it stands with the binding
-    // above the mandate: what this workspace is *doing* beats what it is *for*
-    // for as long as it is holding it.
-    if matches!(r.source, "pin" | "binding" | "claim") && r.project.is_some() {
-        return Ok(r.project);
-    }
-    if mandate.is_some() {
-        return Ok(mandate);
-    }
-    if r.project.is_some() {
-        return Ok(r.project);
-    }
-
-    // Last resort: ask herdr for this workspace's label.
-    if let Some(ws) = env.workspace_id.as_deref() {
-        if herdr::available() {
-            if let Ok(list) = herdr::workspaces() {
-                if let Some(w) = list.iter().find(|w| w.id == ws) {
-                    return Ok(index.project_for_label(&w.label));
-                }
-            }
-        }
-    }
-    Ok(None)
+    Ok(standing_in(&Here::live(store, index)))
 }
 
 fn pane_id(args: &Args) -> Option<String> {
@@ -3440,6 +3474,119 @@ mod tests {
             Some(Holder { id: "t-002".into(), title: "nobody is on it".into(), panes: Vec::new() })
         };
         assert!(matches!(peek_target(&panes, None, None, "002", unheld), Peeked::Nothing(_)));
+    }
+
+
+    // ---- the standing-in chain, offline ------------------------------------
+
+    fn here() -> Here {
+        let mut wsp = crate::model::Project::new("wsp");
+        wsp.roots = vec!["/home/ed/claude/wsp".into()];
+        let mut strata = crate::model::Project::new("strata");
+        strata.roots = vec!["/home/ed/claude/strata".into()];
+        let mut music = crate::model::Project::new("music");
+        music.name = "Trance Video".into();
+
+        Here {
+            index: Index::new(vec![wsp, strata, music]),
+            pins: std::collections::BTreeMap::new(),
+            bindings: std::collections::BTreeMap::new(),
+            claims: std::collections::BTreeMap::new(),
+            mandates: std::collections::BTreeMap::new(),
+            tasks: vec![wip_task("t-001", "somebody else's tree", Some("strata"), "doing")],
+            workspaces: vec![herdr::Workspace {
+                id: "w1".into(),
+                label: "Trance Video".into(),
+                ..Default::default()
+            }],
+            pane: Some("w1:p1".into()),
+            workspace: Some("w1".into()),
+            cwd: Some("/home/ed/claude/wsp".into()),
+        }
+    }
+
+    /// The two steps this chain decides for itself rather than leaving to
+    /// `resolve`. A mandate says what a workspace is *for* and beats the
+    /// directory the shell happens to be sitting in; work actually in hand
+    /// beats both, for as long as it is held.
+    #[test]
+    fn a_mandate_beats_the_directory_and_loses_to_work_in_hand() {
+        let mut h = here();
+        // Nothing but a directory: the directory wins.
+        assert_eq!(standing_in(&h).as_deref(), Some("wsp"));
+
+        // A mandate over the top of it.
+        h.mandates.insert("w1".to_string(), json!({ "project": "music" }));
+        assert_eq!(standing_in(&h).as_deref(), Some("music"), "what this workspace is for");
+
+        // And a binding over the top of that: what it is *doing* beats what it
+        // is *for*, for as long as it is holding it.
+        h.bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
+        assert_eq!(standing_in(&h).as_deref(), Some("strata"), "work in hand wins");
+
+        // A pin is the person's own word and beats everything under it.
+        h.pins.insert("w1".to_string(), "wsp".to_string());
+        assert_eq!(standing_in(&h).as_deref(), Some("wsp"));
+    }
+
+    /// The bottom of the chain is the only link herdr supplies, so it is the
+    /// only one that goes away when herdr stops answering. Everything above it
+    /// is the store's and answers the same either way.
+    #[test]
+    fn the_workspace_label_is_the_last_resort_and_the_only_herdr_link() {
+        let mut h = here();
+        h.cwd = None;
+        assert_eq!(standing_in(&h).as_deref(), Some("music"), "matched by its name");
+
+        // herdr silent: the label link is gone and nothing else is.
+        h.workspaces.clear();
+        assert_eq!(standing_in(&h), None);
+        h.cwd = Some("/home/ed/claude/wsp".into());
+        assert_eq!(standing_in(&h).as_deref(), Some("wsp"), "the directory is the store's");
+
+        // A label that matches no project resolves to nothing rather than to
+        // the label — a workspace called after a film is not a project.
+        let mut h = here();
+        h.cwd = None;
+        h.workspaces[0].label = "something nobody named a project".into();
+        assert_eq!(standing_in(&h), None);
+    }
+
+    /// A mandate names a machine as well as a workspace: workspace ids are
+    /// herdr's and mean nothing on another host, which is why a claim carries
+    /// one too. Somebody else's mandate must not place this pane.
+    #[test]
+    fn a_mandate_from_another_machine_places_nobody() {
+        let mut h = here();
+        h.cwd = None;
+        h.workspaces.clear();
+        h.mandates.insert(
+            "w1".to_string(),
+            json!({ "project": "music", "host": "some-other-box" }),
+        );
+        assert_eq!(standing_in(&h), None, "a workspace id from another host names nothing here");
+
+        // The same record with this machine's name on it does place it.
+        h.mandates.insert(
+            "w1".to_string(),
+            json!({ "project": "music", "host": crate::util::hostname() }),
+        );
+        assert_eq!(standing_in(&h).as_deref(), Some("music"));
+    }
+
+    /// A pane herdr has told us nothing about — a shell outside it, or a hook
+    /// with no environment — falls through to the directory, which is the one
+    /// link that needs neither a pane nor a workspace.
+    #[test]
+    fn a_pane_herdr_never_named_still_has_a_directory() {
+        let mut h = here();
+        h.pane = None;
+        h.workspace = None;
+        h.bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
+        assert_eq!(standing_in(&h).as_deref(), Some("wsp"), "the binding is not this pane's");
+
+        h.cwd = Some("/tmp".into());
+        assert_eq!(standing_in(&h), None, "and nowhere is an answer");
     }
 
 }
