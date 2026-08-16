@@ -232,6 +232,23 @@ pub(super) fn spawn_events(tx: Sender<Msg>) {
     });
 }
 
+/// Did this command make something that was not there before?
+///
+/// It decides two things at once: whether the cursor jumps to the id the
+/// command answered with, and whether the footer says `… added · E to write it
+/// up` — a sentence that names a key, and so also takes the keyboard.
+///
+/// Spelt out as verbs rather than read off the first word. `project` used to be
+/// enough, back when `project add` was the only one of them a key could run.
+/// `project rm` answers `{"removed": <id>}` and `project set` answers the whole
+/// project, so both carry an id out of [`run_wsp`] — and under the old test
+/// both landed here, moved the cursor, took the keyboard, and announced that
+/// the thing you had just renamed or removed had been added.
+fn creates(argv: &[String]) -> bool {
+    let word = |i: usize| argv.get(i).map(|s| s.as_str());
+    matches!((word(0), word(1)), (Some("add"), _) | (Some("project"), Some("add")))
+}
+
 /// Make this pane the focused one.
 ///
 /// The mouse reaches an unfocused pane — that is what makes the panel worth
@@ -535,8 +552,9 @@ pub(super) fn event_loop(
                             // capture stays one line; writing it up is a
                             // keystroke away rather than a mode you were forced
                             // through.
-                            match (&m.id, argv.first().map(|s| s.as_str())) {
-                                (Some(id), Some("add")) | (Some(id), Some("project")) => {
+                            let created = creates(&argv).then(|| m.id.clone()).flatten();
+                            match &created {
+                                Some(id) => {
                                     view.land_on = Some(id.clone());
                                     say(&mut ui, format!("{id} added · E to write it up"));
                                     // …and take the keyboard, because that
@@ -558,7 +576,7 @@ pub(super) fn event_loop(
                                     took_focus = Instant::now();
                                     focus_self(me.as_deref(), self_ws);
                                 }
-                                _ => say(&mut ui, m.label),
+                                None => say(&mut ui, m.label),
                             }
                             // Only now the command has actually worked. The
                             // footer takes the sentence's line over the
@@ -846,5 +864,31 @@ mod tests {
         assert!(is(CHATTY, "workspace_focused"));
         assert!(!is(SHAPE, "pane_updated"));
         assert!(!is(SHAPE, "pane.agent_detected"));
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The footer sentence names a key and the panel takes the keyboard to
+    /// make sure it lands, so getting this wrong is not cosmetic: it moves the
+    /// cursor off what you were looking at and pulls focus out of whatever
+    /// pane had it. `project` as a whole word was the test until `project set`
+    /// existed, and `project rm` was already wrong under it — it answers with
+    /// the id it removed, so `X` on a project announced the removal as an
+    /// addition and sent the cursor after a row that had just gone.
+    #[test]
+    fn only_the_verbs_that_make_something_move_the_cursor_to_it() {
+        assert!(creates(&argv(&["add", "Retune the early reflections", "-p", "verb"])));
+        assert!(creates(&argv(&["project", "add", "verb"])));
+
+        assert!(!creates(&argv(&["project", "set", "wsp", "name=wsp control plane"])));
+        assert!(!creates(&argv(&["project", "set", "verb", "parent=tooling"])));
+        assert!(!creates(&argv(&["project", "rm", "verb"])));
+        // And the rest, which never carried an id anyway and must not start.
+        assert!(!creates(&argv(&["rename", "t-001", "Retune the early reflections"])));
+        assert!(!creates(&argv(&["tag", "t-001", "--", "+dsp"])));
+        assert!(!creates(&argv(&["pin", "trance", "-w", "w0"])));
+        assert!(!creates(&argv(&[])));
     }
 }

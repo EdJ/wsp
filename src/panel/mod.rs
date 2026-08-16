@@ -55,6 +55,22 @@ pub(crate) fn render_row_for_test(ui: &Ui, i: usize, w: usize) -> Line {
     let keys = rows::hotkeys(ui);
     rows::render_row(&ui.rows[i], w, keys[i])
 }
+/// The tag picker's rows, exactly as the frame draws them.
+///
+/// Read from the mode rather than scraped back out of the frame: the picker's
+/// rows and a task row both begin with a mark and a space, so a test hunting
+/// the frame for one finds the other — which is a test that passes for the
+/// wrong reason as readily as it fails.
+#[cfg(test)]
+pub(crate) fn tag_rows_for_test(view: &View, w: usize) -> Vec<String> {
+    match &view.mode {
+        keys::Mode::Tags(t) => {
+            render::tags_lines(t, w, render::TAGS_MAX).iter().map(|l| l.text()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// A row's own words, unabridged — what the focus dock is drawing when the
 /// cursor is on that row, so a test can ask whether the two agree.
 #[cfg(test)]

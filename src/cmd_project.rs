@@ -481,6 +481,29 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                     proj.parent = None;
                 } else {
                     match index.find(v) {
+                        // Into itself, or into something already beneath it.
+                        // Every walk over the tree guards against a cycle and
+                        // stops, so this does not hang — it does something
+                        // quieter and worse: the loop has no root, so nothing
+                        // in it is ever reached from `children(None)` and the
+                        // whole branch disappears from `wsp tree` and from the
+                        // panel. Two projects and everything under them, gone
+                        // from every list, with the files still on disk and
+                        // the command reporting success.
+                        //
+                        // Refused here rather than in the panel, which is
+                        // about to put this on a key: the rule belongs with
+                        // the index that can see the subtree, and a caller
+                        // that has to know it is a caller keeping a second
+                        // copy of it.
+                        Some(f) if index.subtree(&proj.id).contains(&f.id) => {
+                            eprintln!(
+                                "wsp: {} is {} — a project cannot go inside itself",
+                                f.id,
+                                if f.id == proj.id { "itself".into() } else { format!("under {}", proj.id) },
+                            );
+                            return 1;
+                        }
                         Some(f) => proj.parent = Some(f.id.clone()),
                         None => {
                             eprintln!("wsp: no such parent `{v}`");
@@ -533,4 +556,62 @@ pub fn project_json(p: &Project, index: &Index) -> serde_json::Value {
         "status": p.status,
         "brief": p.brief,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn scratch(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        store.ensure_dirs().unwrap();
+        store
+    }
+
+    fn proj(store: &Store, id: &str, parent: Option<&str>) {
+        let mut p = Project::new(id);
+        p.parent = parent.map(|s| s.to_string());
+        store.save_project(&p).unwrap();
+    }
+
+    /// The failure this guard is for is a silent one. Every walk over the
+    /// project tree already stops on a cycle, so nothing hangs — but a loop
+    /// has no root, so `children(None)` never reaches it and the whole branch
+    /// vanishes from `wsp tree` and from the panel, files still on disk,
+    /// command reporting success. Measured before the guard: `project set
+    /// alpha parent=alpha` printed `alpha updated: parent` and `wsp tree`
+    /// printed nothing at all.
+    ///
+    /// It matters more now than it did, because `m` on a project row is this
+    /// command with the tree as its picker, and a picker makes every wrong
+    /// answer one keystroke away.
+    #[test]
+    fn a_project_cannot_be_moved_inside_itself() {
+        let store = scratch("reparent-cycle");
+        proj(&store, "alpha", None);
+        proj(&store, "beta", Some("alpha"));
+        proj(&store, "gamma", Some("beta"));
+        proj(&store, "delta", None);
+
+        let set = |rest: &[&str]| set(&store, &Args::synth("project", rest, &[]));
+        let parent_of = |id: &str| {
+            Index::new(store.projects()).get(id).and_then(|p| p.parent.clone())
+        };
+
+        assert_eq!(set(&["set", "alpha", "parent=alpha"]), 1, "itself");
+        assert_eq!(set(&["set", "alpha", "parent=beta"]), 1, "its own child");
+        // Two levels down is the same cycle and was the same silence.
+        assert_eq!(set(&["set", "alpha", "parent=gamma"]), 1, "further beneath it");
+        assert_eq!(parent_of("alpha"), None, "and nothing was written");
+
+        // Everything else still moves. The guard is about the subtree, not
+        // about reparenting.
+        assert_eq!(set(&["set", "alpha", "parent=delta"]), 0);
+        assert_eq!(parent_of("alpha"), Some("delta".into()));
+        assert_eq!(set(&["set", "alpha", "parent=none"]), 0, "and back out again");
+        assert_eq!(parent_of("alpha"), None);
+    }
 }

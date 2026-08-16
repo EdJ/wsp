@@ -430,9 +430,13 @@ disturbing a layout you will come back to.
 | `s` `v` `d` `o` | task | start, review, done, reopen |
 | `b` | task | block, asking why |
 | `e` `n` | task | retitle, append a note |
+| `e` | project | rename it — its **name**, not its slug |
+| `t` | task | tags: a picker — `␣` flips one, `↵` applies them |
 | `!` | task | priority: high, then low, then normal again |
+| `p` | project | pin this workspace here; again on the same row unpins |
 | `E` | task, project | edit its prose full-screen in a tab |
 | `m` | task | move — the tree becomes the picker |
+| `m` | project | the same, one level up: move it under another project |
 | `c` | task or agent | claim, either direction — and how an agent moves on |
 | `f` | idle agent | send it to find its own work |
 | | | asks which project, and remembers, if it stands nowhere |
@@ -445,6 +449,93 @@ binary, so the event log, the hooks and the git commit all happen because it is
 the same path a person at a shell takes. `wsp rename`, `wsp rm` and
 `wsp project rm` exist because the panel needed them — `edit` opens `$EDITOR`,
 which is no use to something already drawing on the screen.
+
+`e` on a project changes its **name**, which is not the string the row is drawn
+with. The tree is slugs — `strata-strategy`, not "Questions & Strategy" — because
+a slug is short, unique, and the thing you type at a shell, and every project in
+a real store has a longer name behind it than a thirty-four column pane can
+hold. So the panel draws the id and `e` changes the other one, which is what
+`wsp project show` and the detail pane lead with. It is the only rename a
+project has: nothing in wsp moves a slug, because every task, pin and mandate
+refers to a project by it.
+
+`m` on a project moves it under another one, sub-tree and all — the same
+gesture as `m` on a task, one level up, and the same tree for a picker. Only a
+project answers: there is no row that means the top of the tree, so detaching
+one is `wsp project set <id> parent=none` and stays a deliberate act at a
+shell. Landing on itself, or on anything already beneath it, is refused — and
+refused by the CLI rather than by the panel, because the rule needs the subtree
+and the panel has no index to ask. That refusal is not a policy with a
+`--force` behind it: every walk over the project tree already stops on a cycle,
+so nothing hangs, but a loop has no root, and a branch nothing can reach from
+the root disappears from `wsp tree`, from the panel and from every list, with
+its files still on disk and the command reporting success.
+
+`p` pins the workspace the panel is installed in to the project under the
+cursor, and pressed again on that same row takes the pin off. A pin says what a
+workspace *is* — it is the top of the chain everything else resolves through,
+above the claim and the cwd — so `wsp add` with no `-p` files there, `wsp where`
+answers with it, and `f` sends an agent looking there. One per workspace, which
+is why the key that sets it is also the one that clears it, and why pressing it
+on a *different* project moves the pin rather than refusing: the answer to
+"which project is this workspace" is simply now that one. The row it names
+carries `⌂`, and at most one row ever does — on the panel in that workspace and
+nowhere else, since a pin is a fact about one workspace and the panels are
+otherwise showing each other the same tree. `wsp pin --top`, which marks a
+workspace as deliberately *not* work, has no key: it matches no project, so
+there is no row to press it on.
+
+`t` opens a **tag picker**, docked under the tree: every tag the store already
+uses, the task's own first and the rest commonest-first, `␣` to flip a row and
+`↵` to apply the lot.
+
+A picker rather than a prompt, and the removal is why. `wsp tag <id> +dsp -ui`
+is the right shape for a shell and the wrong one for a sidebar: it makes you
+spell out every tag, and the one you most have to spell is the one you are
+taking *off* — a name the panel is already holding and you are being asked to
+remember. The vocabulary is nineteen words across this whole store, counting
+projects, so it fits on screen; and picking from what is there is also what
+stops `dsp` and `DSP` becoming two tags that read as one.
+
+Nothing is written until `↵`. That is what makes toggling safe to explore, and
+it is why the marks distinguish four states rather than two — `✓` carried, `+`
+about to be added, `−` about to come off, `·` not carried — because a mode that
+defers the write has to say what the write will be. Toggling something on and
+off again leaves the diff empty, and an empty diff runs no command at all: no
+log line, no event, no commit. `esc` walks away from the whole thing. The rows
+never reorder while the picker is up, whatever you toggle, because a list that
+shuffles under the cursor is how you take off the tag next to the one you meant.
+
+Typing narrows the list, and doubles as how a tag nobody has used yet gets its
+name: filter to something the vocabulary does not hold and the last row offers
+to make it, lowercased. One line for both, because they are one gesture — you
+type what you want and take whichever of the two you are given. `␣` is free to
+mean toggle because a tag with a space in it is not a tag.
+
+The whole thing applies as a single `wsp tag <id> -- +new -old`. The `--` is not
+decoration: the argument parser reads any token beginning with `-` as a flag, so
+`wsp tag <id> -ui` otherwise answers with the usage line — half the verb, and
+the half you reach for more often.
+
+**Inherited tags are shown, and cannot be toggled.** This is the part that
+looked broken before it was: a task under `render` reads `tags rust herdr` in
+`wsp show` and in the detail pane, and owns *neither* — `render` owns nothing
+either, and both come from `wsp`, two levels up. A picker offering only the
+task's own tags drew `rust` as **absent** on a task every other surface says is
+tagged `rust`, so taking it off looked like it had failed rather than like it
+was never this task's to take off. They now draw dim, with a `✓` because they
+genuinely are on the task, and the project they come from on the right. `␣` on
+one says where to go instead.
+
+A tag can be both — the task's own *and* the project's, which is the common
+case for anything under `wsp` carrying its own `rust`. Then the lender is shown
+on that row too, so a `−` reads as "removing your copy, and the project puts it
+straight back": the removal is real, it just is not the whole story, and the row
+says so before you press `↵` rather than after.
+
+Tasks only — a project's tags are a whole list set at once by
+`wsp project set <id> tags=…`, which is a different gesture with a different way
+of going wrong, and it is where an inherited tag actually comes off.
 
 `O` and `S` are both `wsp spawn` — see [Spawning](#spawning) for what it does
 and why it is a CLI verb rather than a key. Two keys rather than one that asks,
@@ -523,6 +614,7 @@ prompt unsent, which looks exactly like an agent that read it and ignored it.
 | `◆` | in review | `■1` | tasks blocked |
 | `✓` | done — only under `A` | `✓` | all work here is finished |
 | | | `●2` | panes standing here |
+| | | `⌂` | this workspace is pinned here |
 
 A pane gets its own row: `●` working, `○` idle, `▫` a shell with no agent in it
 — never started, as against an idle agent that stopped. A task keeps its own
@@ -1177,7 +1269,9 @@ survives a restart — direction you have to repeat every morning is not standin
 direction, it is a reminder. In the resolution chain it sits at **pin > binding
 > claim > mandate > cwd > label**: a pin says what a workspace *is*, and a
 binding and a claim are the work actually in hand, but a mandate beats the
-directory a shell happens to be sitting in. It is deliberately not consulted
+directory a shell happens to be sitting in. The pin at the top of that chain is
+`wsp pin <project>`, or `p` on a project row in the panel, where the row it
+names then carries `⌂`. It is deliberately not consulted
 when the panel places a pane in the tree — where a pane is standing is a fact
 about the pane, and standing direction says nothing about it.
 

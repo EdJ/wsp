@@ -125,6 +125,20 @@ pub(crate) enum Mode {
     Pick {
         verb: Pick,
     },
+    /// Toggling a task's tags against the vocabulary the store already uses.
+    ///
+    /// The fourth shape, and it exists because the other three cannot do this
+    /// one well. A prompt taking `+dsp -ui` can add and remove in one line, and
+    /// still makes you *spell* every tag — including the one you want gone,
+    /// which is a name the panel knows and you are being asked to remember. A
+    /// pick points at one thing and ends; tagging is several toggles and then
+    /// a decision.
+    ///
+    /// So: a list you can see, `␣` to flip a row, `↵` to apply the lot as one
+    /// command and `esc` to walk away from all of it. Nothing is written until
+    /// `↵` — which is what makes toggling safe to explore, and why a fumble
+    /// that ends where it started costs no log line, no event and no commit.
+    Tags(Tags),
     Confirm {
         argv: Vec<String>,
         question: String,
@@ -140,6 +154,248 @@ pub(crate) enum Mode {
     },
 }
 
+
+/// What the tag picker is holding while it is up.
+///
+/// `list` is fixed the moment it opens and never reorders, because rows that
+/// move under the cursor as you toggle them are how you take off the tag next
+/// to the one you meant. The tags the task already had come first inside it —
+/// they are what you came to remove — and the rest of the vocabulary follows
+/// in the order it is used.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Tags {
+    pub(super) task: String,
+    /// What the task carried when this opened. The diff is against this, so
+    /// toggling something on and off again is not a change.
+    pub(super) was: Vec<String>,
+    /// What reaches it from its project chain, and where each comes from.
+    /// Drawn as carried — because it is — and never toggled: the only place
+    /// one of these comes off is the project that holds it.
+    pub(super) from_project: Vec<(String, String)>,
+    /// What it will carry when this closes.
+    pub(super) on: Vec<String>,
+    /// Every tag on offer, in the order they are drawn.
+    pub(super) list: Vec<String>,
+    /// Narrows the list, and is also how a tag nobody has used yet gets its
+    /// name: filter to something the list does not hold and the picker offers
+    /// to make it. One line doing both, because they are the same gesture —
+    /// you type what you want and take whichever of the two you are given.
+    pub(super) filter: String,
+    /// Which of the *filtered* rows the cursor is on.
+    pub(super) sel: usize,
+}
+
+impl Tags {
+    /// Open on a task: what it carries first — its own, then what its project
+    /// lends it — and the rest of the vocabulary under that.
+    ///
+    /// Everything on the task is at the top whether or not it can be changed,
+    /// because the first question a picker answers is "what has this got", and
+    /// an answer that silently leaves out two thirds of what `wsp show` prints
+    /// is not an answer.
+    pub(super) fn new(
+        task: &str,
+        own: Vec<String>,
+        from_project: Vec<(String, String)>,
+        vocabulary: &[String],
+    ) -> Tags {
+        let mut list = own.clone();
+        for t in from_project.iter().map(|(t, _)| t).chain(vocabulary.iter()) {
+            if !list.contains(t) {
+                list.push(t.clone());
+            }
+        }
+        Tags {
+            task: task.to_string(),
+            was: own.clone(),
+            on: own,
+            from_project,
+            list,
+            filter: String::new(),
+            sel: 0,
+        }
+    }
+
+    /// Where a tag reaches this task from, when it is not the task's own.
+    pub(super) fn lender(&self, tag: &str) -> Option<&str> {
+        self.from_project.iter().find(|(t, _)| t == tag).map(|(_, p)| p.as_str())
+    }
+
+    /// The rows as drawn: the list narrowed to the filter, and — when the
+    /// filter names something not in it — a row that would make that tag.
+    ///
+    /// Case-folded, and the new tag is offered lowercased: `wsp tag` takes the
+    /// word as typed, so `DSP` and `dsp` would be two tags that read as one.
+    pub(super) fn shown(&self) -> Vec<TagRow> {
+        let f = self.filter.trim().to_ascii_lowercase();
+        let mut out: Vec<TagRow> = self
+            .list
+            .iter()
+            .filter(|t| f.is_empty() || t.to_ascii_lowercase().contains(&f))
+            .map(|t| TagRow::Tag(t.clone()))
+            .collect();
+        if !f.is_empty() && !self.list.iter().any(|t| t.to_ascii_lowercase() == f) {
+            out.push(TagRow::New(f));
+        }
+        out
+    }
+
+    /// Flip whatever the cursor is on. A new tag joins the list where the
+    /// cursor already is, so it does not appear somewhere else on screen, and
+    /// the filter clears because it has done its job.
+    ///
+    /// Answers what it did, so the caller can say why when it did nothing.
+    pub(super) fn toggle(&mut self) -> Option<String> {
+        match self.shown().get(self.sel).cloned() {
+            Some(TagRow::Tag(t)) if self.lender(&t).is_some() && !self.was.contains(&t) => {
+                let p = self.lender(&t).unwrap_or_default().to_string();
+                return Some(format!("{t} comes from {p} · wsp project set {p} tags=…"));
+            }
+            Some(TagRow::Tag(t)) => {
+                if let Some(i) = self.on.iter().position(|x| *x == t) {
+                    self.on.remove(i);
+                } else {
+                    self.on.push(t);
+                }
+            }
+            Some(TagRow::New(t)) => {
+                self.list.push(t.clone());
+                self.on.push(t.clone());
+                self.filter.clear();
+                self.sel =
+                    self.shown().iter().position(|r| matches!(r, TagRow::Tag(x) if *x == t)).unwrap_or(0);
+            }
+            None => {}
+        }
+        None
+    }
+
+    /// What each row is: on, off, and the two that are about to change. Drawn
+    /// apart because the whole bargain of this mode is that nothing is written
+    /// until `↵`, and that is worth nothing if the frame will not say what `↵`
+    /// is going to do.
+    pub(super) fn state(&self, tag: &str) -> TagState {
+        match (self.was.iter().any(|t| t == tag), self.on.iter().any(|t| t == tag)) {
+            (true, true) => TagState::Kept,
+            (false, true) => TagState::Adding,
+            (true, false) => TagState::Removing,
+            // Only once the task's own answer is no. A tag can be both — held
+            // here *and* lent by the project — and then taking off the copy
+            // this task owns still leaves the tag on it, which is worth being
+            // shown rather than discovered.
+            (false, false) => match self.lender(tag) {
+                Some(p) => TagState::Inherited(p.to_string()),
+                None => TagState::Off,
+            },
+        }
+    }
+
+    /// `+new -old`, net, in the order the list draws them. Empty when the
+    /// picker was opened and closed without settling on anything different —
+    /// and empty means no command at all, not a command that does nothing.
+    pub(super) fn changes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in &self.list {
+            match self.state(t) {
+                TagState::Adding => out.push(format!("+{t}")),
+                TagState::Removing => out.push(format!("-{t}")),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// A row of the picker: a tag on offer, or the offer to make one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TagRow {
+    Tag(String),
+    New(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TagState {
+    /// On before, on after.
+    Kept,
+    /// Off before, on after.
+    Adding,
+    /// On before, off after.
+    Removing,
+    /// On the task, and not by this task's doing — it comes from the named
+    /// project. `wsp tag` cannot touch it: `-rust` against a tag the project
+    /// lends removes nothing and reports success.
+    Inherited(String),
+    Off,
+}
+
+/// Typing into the picker. Every printable key narrows the list — `q` included,
+/// the same bargain the prompt makes — with one exception: a space, because a
+/// tag with a space in it is not a tag, which leaves the key free to be the one
+/// that flips a row.
+pub(super) fn tags_key(k: Key, ui: &mut Ui, view: &mut View, mut t: Tags) -> Effect {
+    match k {
+        Key::Esc | Key::Interrupt => {
+            view.mode = Mode::Browse;
+            say(ui, "left alone");
+            Effect::None
+        }
+        Key::Char(' ') => {
+            if let Some(why) = t.toggle() {
+                say(ui, why);
+            }
+            view.mode = Mode::Tags(t);
+            Effect::None
+        }
+        Key::Enter => {
+            // On the row that would make a tag, `↵` makes it and then applies:
+            // typing a name and pressing return is one gesture, and refusing to
+            // read it as one would be the picker being clever at you.
+            if matches!(t.shown().get(t.sel), Some(TagRow::New(_))) {
+                t.toggle();
+            }
+            let changes = t.changes();
+            view.mode = Mode::Browse;
+            if changes.is_empty() {
+                say(ui, "unchanged");
+                return Effect::None;
+            }
+            let mut argv = vec!["tag".to_string(), t.task.clone(), "--".to_string()];
+            argv.extend(changes);
+            Effect::Run { argv, escalate: None, then: None }
+        }
+        Key::Down | Key::Up => {
+            let n = t.shown().len();
+            if n > 0 {
+                t.sel = match k {
+                    Key::Down => (t.sel + 1).min(n - 1),
+                    _ => t.sel.saturating_sub(1),
+                };
+            }
+            view.mode = Mode::Tags(t);
+            Effect::None
+        }
+        Key::Backspace | Key::KillLine | Key::Char(_) => {
+            match k {
+                Key::Backspace => {
+                    t.filter.pop();
+                }
+                Key::KillLine => t.filter.clear(),
+                Key::Char(c) => t.filter.push(c),
+                _ => {}
+            }
+            // The rows under the cursor have just changed, so the cursor goes
+            // back to the top rather than staying at an index that now names
+            // something else.
+            t.sel = 0;
+            view.mode = Mode::Tags(t);
+            Effect::None
+        }
+        _ => {
+            view.mode = Mode::Tags(t);
+            Effect::None
+        }
+    }
+}
 
 /// Every key the panel answers to. Keys that do the same kind of thing share a
 /// line — `s v` is one idea, not two — because the map is read in a column
@@ -160,8 +416,10 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("s v", "start, review"),
                 ("d o", "done, reopen"),
                 ("b e n", "block, retitle, note"),
+                ("t", "tags: ␣ picks, ↵ saves"),
                 ("!", "high, low, normal"),
                 ("m c f", "move, claim, find work"),
+                ("p", "pin the workspace here"),
                 ("O S", "a terminal, an agent"),
                 ("X", "remove, after y/n"),
             ],
@@ -265,7 +523,7 @@ pub(super) fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut bu
             // by the same key that sends a change. Running it would write the
             // title it already has: a log line, an event and a commit that
             // record a person pressing `↵` and nothing else.
-            if let Ask::Rename { from, .. } = &verb {
+            if let Some(from) = verb.opened_with() {
                 if buffer.trim() == from.trim() {
                     view.mode = Mode::Browse;
                     say(ui, "unchanged");
@@ -534,6 +792,10 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Mode::Pick { verb } => {
                 view.mode = Mode::Pick { verb: verb.clone() };
                 pick_key(k, ui, view, verb)
+            }
+            Mode::Tags(t) => {
+                view.mode = Mode::Tags(t.clone());
+                tags_key(k, ui, view, t)
             }
             Mode::Confirm { argv, question, escalate, then } => {
                 view.mode = Mode::Confirm {

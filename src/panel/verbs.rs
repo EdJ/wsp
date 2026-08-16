@@ -19,7 +19,7 @@ use crate::store::Store;
 
 use super::install::list_panes;
 use crate::util::shell_quote;
-use super::keys::{move_or_fold, say, Effect, Mode, View};
+use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
 use super::rows::{hotkeys, AgentRef, Target, Ui};
 use super::{PANEL_LABEL, VIEW_LABEL};
 
@@ -32,18 +32,35 @@ pub(crate) enum Ask {
     /// an untouched line can be nothing rather than a rename to the same
     /// words — which is a log entry, an event and a commit saying nothing.
     Rename { task: String, from: String },
+    /// The same gesture on a project, and a different field: a project's
+    /// *name*, not its id. The id is the slug — what the tree draws, what
+    /// `-p` takes, what every task and pin and mandate refers to it by — and
+    /// nothing in wsp can change one. So `e` here changes the other string,
+    /// which is what `wsp project show` and the detail pane lead with.
+    RenameProject { project: String, from: String },
     Note { task: String },
 }
 
 impl Ask {
-    pub(super) fn label(&self) -> &'static str {
+    pub(super) fn label(&self) -> String {
         match self {
-            Ask::AddTask { parent: Some(_), .. } => "sub-task",
-            Ask::AddTask { .. } => "task",
-            Ask::NewProject { .. } => "project",
-            Ask::Block { .. } => "why",
-            Ask::Rename { .. } => "title",
-            Ask::Note { .. } => "note",
+            Ask::AddTask { parent: Some(_), .. } => "sub-task".into(),
+            Ask::AddTask { .. } => "task".into(),
+            Ask::NewProject { .. } => "project".into(),
+            Ask::Block { .. } => "why".into(),
+            Ask::Rename { .. } => "title".into(),
+            Ask::RenameProject { .. } => "name".into(),
+            Ask::Note { .. } => "note".into(),
+        }
+    }
+
+    /// The value the prompt opened holding, for the verbs that open holding
+    /// one. `↵` on it untouched is not a change, and running it anyway spends
+    /// a log line, an event and a commit on a keystroke.
+    pub(super) fn opened_with(&self) -> Option<&str> {
+        match self {
+            Ask::Rename { from, .. } | Ask::RenameProject { from, .. } => Some(from),
+            _ => None,
         }
     }
 
@@ -77,6 +94,12 @@ impl Ask {
             Ask::NewProject { parent: None } => vec!["project".into(), "add".into(), v],
             Ask::Block { task } => vec!["block".into(), task.clone(), v],
             Ask::Rename { task, .. } => vec!["rename".into(), task.clone(), v],
+            // One argv element, spaces and all: `project set` splits on the
+            // first `=` and takes the rest whole, so a name is never quoted
+            // and never re-parsed.
+            Ask::RenameProject { project, .. } => {
+                vec!["project".into(), "set".into(), project.clone(), format!("name={v}")]
+            }
             Ask::Note { task } => vec!["note".into(), task.clone(), v],
         }
     }
@@ -86,6 +109,15 @@ impl Ask {
 pub(crate) enum Pick {
     /// Move a task: land on a project, or on the inbox to unfile it.
     MoveTask { task: String },
+    /// Move a project under another one, sub-tree and all.
+    ///
+    /// Only a project answers. There is no row that means the top of the tree
+    /// — the inbox is tasks filed nowhere, which is a different thing — so
+    /// detaching one is `wsp project set <id> parent=none` and stays a
+    /// deliberate act at a shell. Landing on itself, or on anything already
+    /// beneath it, is refused by the CLI rather than here: the rule needs the
+    /// subtree and the panel has no index to ask.
+    MoveProject { project: String },
     /// Bind a pane to the task the cursor started on.
     PaneForTask { task: String },
     /// Point an agent at different work — this is task 025's migration.
@@ -100,6 +132,7 @@ impl Pick {
     pub(super) fn hint(&self) -> &'static str {
         match self {
             Pick::MoveTask { .. } => "move to which project?",
+            Pick::MoveProject { .. } => "under which project?",
             Pick::PaneForTask { .. } => "which agent takes it?",
             Pick::TaskForPane { .. } => "which task does it take?",
             Pick::WorkForAgent { .. } => "which project does it work?",
@@ -115,6 +148,9 @@ impl Pick {
             // Unfiling. `mv` already understands `inbox` as "no project".
             (Pick::MoveTask { task }, Target::Inbox) => {
                 Some(vec!["mv".into(), task.clone(), "-p".into(), "inbox".into()])
+            }
+            (Pick::MoveProject { project }, Target::Project(p)) => {
+                Some(vec!["project".into(), "set".into(), project.clone(), format!("parent={p}")])
             }
             (Pick::PaneForTask { task }, Target::Pane(pane)) => {
                 Some(vec!["claim".into(), task.clone(), "--pane".into(), pane.clone()])
@@ -145,7 +181,11 @@ impl Pick {
     ///
     /// `mv` and `mandate` have nothing to refuse on, so there is nothing
     /// stronger to offer and offering it anyway would be a y/n that never
-    /// appears.
+    /// appears. `project set parent=` does refuse — a project cannot go inside
+    /// itself — and still has none, because that refusal is not a policy to be
+    /// overridden. There is no `--force` for it and there should not be: what
+    /// is on the other side of it is a branch that disappears from every list
+    /// with its files still on disk.
     pub(super) fn escalate(&self, argv: &[String]) -> Option<Vec<String>> {
         match self {
             Pick::PaneForTask { .. } | Pick::TaskForPane { .. } => {
@@ -153,7 +193,7 @@ impl Pick {
                 forced.push("--force".into());
                 Some(forced)
             }
-            Pick::MoveTask { .. } | Pick::WorkForAgent { .. } => None,
+            Pick::MoveTask { .. } | Pick::MoveProject { .. } | Pick::WorkForAgent { .. } => None,
         }
     }
 }
@@ -729,6 +769,13 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // meant to keep, from a title the row was too narrow to show you in
         // the first place. So the prompt opens holding the whole of it, caret
         // at the end. `ctrl-u` is there for the rarer case of starting over.
+        //
+        // A project takes the same key and changes its *name*, which is a
+        // different string from the id the row is drawn with — see
+        // [`Ask::RenameProject`]. It opens holding what it is changing for the
+        // same reason, and it is the only rename a project has: the slug is
+        // what every task, pin and mandate names it by, and nothing here can
+        // move one.
         Key::Char('e') => match &target {
             Target::Task(id) => {
                 let from = ui.title_of_task(id).unwrap_or_default();
@@ -738,8 +785,53 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 };
                 Effect::None
             }
+            Target::Project(p) => {
+                let from = ui.name_of_project(p).unwrap_or_default();
+                view.mode = Mode::Prompt {
+                    verb: Ask::RenameProject { project: p.clone(), from: from.clone() },
+                    buffer: from,
+                };
+                Effect::None
+            }
             _ => {
-                say(ui, "only a task can be retitled here");
+                say(ui, "only a task or a project is renamed here");
+                Effect::None
+            }
+        },
+        // Tags are what `wsp ls -t` and `wsp project ls -t` cut the store by,
+        // and until now the panel could read them and not touch them.
+        //
+        // A picker rather than a prompt. `wsp tag <id> +dsp -ui` is the right
+        // shape for a shell and the wrong one for a sidebar: it makes you spell
+        // out every tag, and the one you most want to spell is the one you are
+        // *removing* — a name the panel is already holding and you are being
+        // asked to remember. The vocabulary is nineteen words across the whole
+        // store, so it fits on screen, and picking from what is there also
+        // stops `dsp` and `DSP` becoming two tags that read as one.
+        //
+        // Tasks only: `wsp tag` is a task verb, and a project's tags are set as
+        // a whole list by `project set`, which is a different gesture with a
+        // different way of going wrong.
+        Key::Char('t') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Tags(Tags::new(
+                    id,
+                    ui.tags_of_task(id),
+                    ui.inherited_tags_of_task(id),
+                    &ui.vocabulary,
+                ));
+                // The picker takes rows off the tree, and the row it is about
+                // is one of the ones that can go. Tagging a task you can no
+                // longer see is the one thing this must not do — so the tree
+                // owes the cursor a look, exactly as it does when a key moves
+                // it. Otherwise a picker opened after a wheel or a click, where
+                // the view is deliberately somewhere else, opens onto a tree
+                // with the task nowhere in it.
+                view.keyed = true;
+                Effect::None
+            }
+            _ => {
+                say(ui, "tags go on a task · wsp project set <id> tags=…");
                 Effect::None
             }
         },
@@ -756,10 +848,16 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         },
 
         // ---- picked ----
+        // One key, two things that move: a task between projects, and a
+        // project inside the tree. Same gesture either way — the tree becomes
+        // the picker and `↵` takes the row it lands on — because "where does
+        // this belong" is one question, and the row under the cursor already
+        // says which of the two is being asked.
         Key::Char('m') => match &target {
             Target::Task(id) => begin(view, Pick::MoveTask { task: id.clone() }),
+            Target::Project(p) => begin(view, Pick::MoveProject { project: p.clone() }),
             _ => {
-                say(ui, "only a task moves");
+                say(ui, "a task or a project moves");
                 Effect::None
             }
         },
@@ -777,6 +875,40 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Some(a) => find_work(&a, ui, view),
             None => {
                 say(ui, "f sets an agent looking — aim it at one");
+                Effect::None
+            }
+        },
+
+        // ---- where this workspace belongs ----
+        //
+        // A pin says what a workspace *is*, and it is the top of the chain
+        // every other question resolves through: `wsp add` with no `-p` files
+        // here, `wsp where` answers with it, `f` sends an agent looking here.
+        // It outranks the claim and the cwd beneath it, which is the point —
+        // five workspaces can share one checkout, so where a pane is standing
+        // was never going to identify a project on its own.
+        //
+        // Toggling, like `!`, and for the same reason: one per workspace, so
+        // the key that sets it is the only key there is to take it off, and a
+        // second press has to mean something. Pressed on a *different* project
+        // it moves the pin rather than refusing — there is nothing to refuse,
+        // the answer to "which project is this workspace" is simply now that
+        // one — and the mark moving from one row to the other says so.
+        Key::Char('p') => match (&target, ui.self_ws.clone()) {
+            (Target::Project(_) | Target::Inbox | Target::Task(_) | Target::Pane(_), None) => {
+                say(ui, "no workspace of our own to pin");
+                Effect::None
+            }
+            (Target::Project(p), Some(ws)) => {
+                let argv = if ui.pinned.as_deref() == Some(p.as_str()) {
+                    vec!["unpin".into(), "-w".into(), ws]
+                } else {
+                    vec!["pin".into(), p.clone(), "-w".into(), ws]
+                };
+                Effect::Run { argv, escalate: None, then: None }
+            }
+            _ => {
+                say(ui, "a pin names a project · wsp pin --top for none");
                 Effect::None
             }
         },

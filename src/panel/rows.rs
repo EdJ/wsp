@@ -165,6 +165,20 @@ pub(super) fn agent_state(herdr_state: &str, holds: Option<Status>) -> AgentStat
 pub(super) enum Row {
     Project {
         id: String,
+        /// What `wsp project show` calls it, carried but never drawn.
+        ///
+        /// The tree is ids: a slug is short, unique and the thing you type at
+        /// a shell, and every project in the real store has a name that is
+        /// longer — `strata-strategy` is "Questions & Strategy" in a pane
+        /// thirty-four columns wide. So the row draws the id and this is here
+        /// for the one key that needs the other string: `e` opens its prompt
+        /// holding the name it is about to change, the same as a task's, and
+        /// the reducer has no store to go and ask.
+        name: String,
+        /// This panel's own workspace is pinned to this project — see
+        /// [`Ui::pinned`]. Per row rather than looked up at draw time because
+        /// the renderer is handed one row and nothing else.
+        pinned: bool,
         depth: usize,
         counts: Counts,
         collapsed: bool,
@@ -185,6 +199,21 @@ pub(super) enum Row {
         /// `!` has to know what it is cycling away from, and because it is
         /// what the rows are ordered by beneath status.
         priority: Priority,
+        /// The task's *own* tags, and deliberately not the effective ones.
+        /// `t` marks these as the ones it can actually take off.
+        tags: Vec<String>,
+        /// The tags that reach this task from its project chain, each with the
+        /// project it comes from.
+        ///
+        /// Carried beside the task's own rather than merged into them, because
+        /// the two are not the same thing and the difference is exactly what
+        /// `t` has to draw. `wsp show` and the detail pane merge them, which is
+        /// right for reading and wrong for editing: a task under `render` reads
+        /// `rust herdr` and owns neither, so a picker that offered only its own
+        /// tags showed `rust` as *absent* on a task every other surface says is
+        /// tagged `rust` — and removing it looked broken rather than
+        /// impossible.
+        inherited: Vec<(String, String)>,
         agent: Option<AgentRef>,
         needs_you: bool,
         /// Something is written in Overview or Details. Worth a mark: the
@@ -283,6 +312,32 @@ pub(crate) struct Ui {
     pub(super) sel: usize,
     pub(super) message: Option<(String, Instant)>,
     pub(super) self_focused: bool,
+    /// The workspace this panel is installed in. `p` names it in the argv
+    /// rather than letting `wsp pin` read it back out of the environment: the
+    /// panel already knows which workspace it is furniture in, and the footer
+    /// shows the command it ran.
+    pub(super) self_ws: Option<String>,
+    /// The project that workspace is pinned to, if any.
+    ///
+    /// A pin is the top of the resolution chain — it says what a workspace
+    /// *is*, and outranks the claim and the cwd beneath it — so `wsp add` with
+    /// no `-p` files here, and so does everything else that has to guess. One
+    /// per workspace, which is why this is a single value and why `p` on the
+    /// project already holding it means take it off.
+    ///
+    /// Holds `--top`'s sentinel as-is when the workspace is pinned out of the
+    /// tree entirely: it matches no project id, so no row is marked, which is
+    /// exactly what "deliberately no project" should look like.
+    pub(super) pinned: Option<String>,
+    /// Every tag anything in the store carries, commonest first.
+    ///
+    /// Tags are a small closed vocabulary — nineteen across the whole store,
+    /// counting projects — and that is the fact `t` is built on. Picking from
+    /// a list you can see beats typing a name you have to remember, and it is
+    /// the only way to take one *off* without spelling it out. Gathered from
+    /// projects as well as tasks, because a tag's first use is nearly always
+    /// on a project and it has to be offerable before any task carries it.
+    pub(super) vocabulary: Vec<String>,
     pub(super) show_done: bool,
     pub(super) review_only: bool,
     /// The agents are in place of the tree.
@@ -483,6 +538,40 @@ impl Ui {
             _ => None,
         })
     }
+
+    /// The tags it carries of its own — the ones `t` can take off. Empty is a
+    /// real answer and not a missing one.
+    pub(super) fn tags_of_task(&self, task: &str) -> Vec<String> {
+        self.rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Task { id, tags, .. } if id == task => Some(tags.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The tags that reach it from its project, and where each comes from.
+    /// Drawn by the picker and never editable there: the only way one of these
+    /// comes off is on the project that carries it.
+    pub(super) fn inherited_tags_of_task(&self, task: &str) -> Vec<(String, String)> {
+        self.rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Task { id, inherited, .. } if id == task => Some(inherited.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// What a project is called, as against what it is filed under. See
+    /// [`Row::Project::name`] for why the two are different things here.
+    pub(super) fn name_of_project(&self, project: &str) -> Option<String> {
+        self.rows.iter().find_map(|r| match r {
+            Row::Project { id, name, .. } if id == project => Some(name.clone()),
+            _ => None,
+        })
+    }
 }
 
 /// Everything `collect` reads, gathered into one value.
@@ -601,6 +690,7 @@ pub(super) fn task_rows(
     project: Option<&str>,
     depth: usize,
     view: &View,
+    index: &Index,
     agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
     rows: &mut Vec<Row>,
 ) {
@@ -650,6 +740,20 @@ pub(super) fn task_rows(
             depth: depth + sub,
             status: t.status(),
             priority: t.priority(),
+            tags: t.tags.clone(),
+            inherited: t
+                .project
+                .as_deref()
+                .map(|p| {
+                    index
+                        .effective_tags(p)
+                        .into_iter()
+                        .filter_map(|tag| {
+                            index.tag_source(p, &tag).map(|from| (tag, from))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             agent: a.clone(),
             needs_you,
             prose: crate::model::has_prose(&t.body),
@@ -923,7 +1027,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             collapsed: folded,
         });
         if !folded {
-            task_rows(&tasks, None, 1, view, &agent_for_task, &mut rows);
+            task_rows(&tasks, None, 1, view, &index, &agent_for_task, &mut rows);
         }
     }
 
@@ -940,6 +1044,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         loose: &std::collections::BTreeMap<String, Vec<AgentRef>>,
         interesting: &dyn Fn(&str) -> bool,
         agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
+        pinned: Option<&str>,
     ) {
         for p in index.children(parent) {
             if !interesting(&p.id) {
@@ -948,6 +1053,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             let is_collapsed = view.collapsed.contains(&p.id);
             rows.push(Row::Project {
                 id: p.id.clone(),
+                name: p.name.clone(),
+                pinned: pinned == Some(p.id.as_str()),
                 depth,
                 // Under the review filter the right-hand column counts what
                 // is *shown*. A project reading `5 ▸3 ■1` beside one visible
@@ -972,11 +1079,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             }
 
             // This project's own tasks, attention first.
-            task_rows(tasks, Some(&p.id), depth + 1, view, agent_for_task, rows);
+            task_rows(tasks, Some(&p.id), depth + 1, view, index, agent_for_task, rows);
 
             walk(
                 index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, loose, interesting,
-                agent_for_task,
+                agent_for_task, pinned,
             );
 
             // Then the panes that resolve here but are working on nothing
@@ -1008,6 +1115,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         }
     }
 
+    // What this panel's own workspace is pinned to. Read once here rather than
+    // per row: `collect` runs four times a second.
+    let pinned = self_ws.and_then(|ws| pins.get(ws)).cloned();
+
     walk(
         &index,
         None,
@@ -1020,6 +1131,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         &loose_by_project,
         &interesting,
         &agent_for_task,
+        pinned.as_deref(),
     );
 
     // Panes belonging to no project. Some are there because nothing resolved;
@@ -1131,9 +1243,36 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         sel: 0,
         message: None,
         self_focused,
+        self_ws: self_ws.map(|s| s.to_string()),
+        pinned,
+        vocabulary: vocabulary(snap),
         show_done: view.show_done,
         review_only: view.review_only,
     }
+}
+
+/// Every tag in use, commonest first and alphabetical inside that.
+///
+/// Frequency rather than the alphabet, because the tag you are reaching for is
+/// nearly always one already in use and the list is read from the top. Ties
+/// broken alphabetically so the order is stable between frames — a picker whose
+/// rows shuffle under the cursor is worse than no picker.
+///
+/// Projects count. A tag's first use is usually on a project, and `t` has to be
+/// able to offer one before any task has ever carried it.
+pub(super) fn vocabulary(snap: &Snapshot) -> Vec<String> {
+    let mut n: std::collections::BTreeMap<&str, usize> = Default::default();
+    let carried = snap
+        .tasks
+        .iter()
+        .flat_map(|t| t.tags.iter())
+        .chain(snap.projects.iter().flat_map(|p| p.tags.iter()));
+    for t in carried {
+        *n.entry(t.as_str()).or_default() += 1;
+    }
+    let mut out: Vec<(usize, &str)> = n.into_iter().map(|(t, c)| (c, t)).collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    out.into_iter().map(|(_, t)| t.to_string()).collect()
 }
 
 pub(super) fn state_dot(state: &str) -> (Style, &'static str) {
@@ -1147,11 +1286,21 @@ pub(super) fn state_dot(state: &str) -> (Style, &'static str) {
 pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
     let mut l = Line::default();
     match row {
-        Row::Project { id, depth, counts, collapsed, live, prose } => {
+        Row::Project { id, depth, counts, collapsed, live, prose, pinned, .. } => {
             l.pad(*depth);
             l.push(Style::Dim, if *collapsed { glyph::CLOSED } else { glyph::OPEN });
             l.push(Style::Plain, " ");
             l.push(Style::Bold, id.clone());
+            // At most one row on the panel ever carries this, and only on the
+            // panel in the pinned workspace — a pin is a fact about *this*
+            // workspace, so it is drawn for the person standing in it and
+            // nobody else. Without it `p` is a key whose whole effect is a
+            // footer line that clears after four seconds, and pressing it a
+            // second time to take the pin off would look like nothing at all.
+            if *pinned {
+                l.push(Style::Plain, " ");
+                l.push(Style::Accent, glyph::PINNED);
+            }
             if *prose {
                 l.push(Style::Plain, " ");
                 l.push(Style::Dim, glyph::NOTES);

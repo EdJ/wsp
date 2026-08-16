@@ -40,6 +40,14 @@ fn prio(mut t: Task, level: &str) -> Task {
     t
 }
 
+/// Tags of a task's own, as against the ones it inherits from its project.
+/// `t` can only change these, so a fixture with none cannot show what its
+/// prompt opens holding.
+fn tagged(mut t: Task, tags: &[&str]) -> Task {
+    t.tags = tags.iter().map(|s| s.to_string()).collect();
+    t
+}
+
 fn workspace(id: &str, label: &str, focused: bool) -> herdr::Workspace {
     herdr::Workspace {
         id: id.to_string(),
@@ -88,9 +96,22 @@ fn world() -> Snapshot {
     projects[2].roots = vec!["~/claude/trance".into()];
     projects[3].roots = vec!["~/claude/reverb".into()];
     projects[6].roots = vec!["~/claude/wsp".into()];
+    // A name that is not the slug, which in the real store is every project:
+    // the tree draws `wsp` and `wsp project show` leads with this. `e` on a
+    // project row changes this string and cannot change the other one.
+    projects[6].name = "wsp control plane".into();
+    // Tags live on projects at least as much as on tasks, and the picker
+    // offers the whole vocabulary — so a fixture whose only tags are the ones
+    // already on the task under test cannot show the half of it that matters:
+    // adding one you have not typed.
+    projects[2].tags = vec!["dsp".into(), "synth".into()];
+    projects[6].tags = vec!["rust".into(), "herdr".into()];
 
     let mut tasks = vec![
-        task("t-001", "Apply reverb fixes from the tuning table", Some("trance"), "doing"),
+        tagged(
+            task("t-001", "Apply reverb fixes from the tuning table", Some("trance"), "doing"),
+            &["dsp", "release"],
+        ),
         // Long on purpose, and not unusually so: the titles in the real store
         // run to a median of sixty-four characters and a tenth of them past a
         // hundred, against the twenty-five a row can draw. A fixture where
@@ -364,6 +385,22 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// And for a named project, when the scene is about which one — the slug
+    /// with a name behind it, the one this workspace is pinned to.
+    fn to_project(&mut self, id: &str) -> &mut Self {
+        let want = panel::Target::Project(id.to_string());
+        loop {
+            if self.ui.selected_target() == want {
+                return self;
+            }
+            let before = self.ui.selected_index();
+            self.key(Key::Down);
+            if self.ui.selected_index() == before {
+                panic!("no row for project {id}");
+            }
+        }
+    }
+
     /// Press `Down` until the cursor is on a particular pane's row. A scene
     /// that means a *specific* agent — the spare one, the one standing nowhere
     /// — has to say which: what a count of presses lands on changes the moment
@@ -433,6 +470,14 @@ impl<'a> Driver<'a> {
 fn scenes() -> Vec<Scene> {
     let w = world();
     let q = quiet_world();
+    // The same world with this panel's own workspace pinned, which is the only
+    // way to draw `⌂` — a pin is a fact about one workspace, and the storyboard
+    // stands in `w0` like the tests do.
+    let pinned = {
+        let mut s = world();
+        s.pins.insert("w0".into(), "trance".into());
+        s
+    };
     let mut out = Vec::new();
 
     out.push(Driver::new(&q).scene(
@@ -651,9 +696,43 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .to_project("wsp")
+            .key(Key::Char('e'))
+            .scene("Renaming a project", "The same key on a project changes its *name*, which is not the string the row is drawn with: the tree is slugs, because a slug is short, unique and the thing you type at a shell, and every project in a real store has a longer name behind it than a thirty-four column pane can hold. So the field opens holding `wsp control plane` on a row that says `wsp`. It is the only rename a project has — nothing here moves a slug, since every task, pin and mandate refers to a project by it."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_task("t-001")
+            .keys(&[Key::Char('t'), Key::Char(' '), Key::Down, Key::Down, Key::Char(' ')])
+            .scene("Tagging", "t docks a picker: what the task carries first, then the rest of the vocabulary. Nothing is written until ↵, so the marks say what ↵ will do — ✓ carried, + coming, − going, · not carried. `synth` is dim and named with `trance` because the project lends it: it is on the task, `wsp show` prints it, and `wsp tag` cannot reach it. `dsp` is both the task's own and the project's, so removing it takes off the copy the task owns and the row says `trance` will put it straight back."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_task("t-004")
+            .keys(&[Key::Char('t'), Key::Char('m'), Key::Char('i'), Key::Char('x')])
+            .scene("Naming a tag that does not exist yet", "Typing narrows the list and doubles as the field for a tag nobody has used — one line for both, because they are one gesture. The last row offers to make what you typed, lowercased, so `DSP` and `dsp` never become two tags that read as one; ␣ takes it, and so does ↵, which then applies. ␣ is free to mean toggle because a tag with a space in it is not a tag."),
+    );
+
+    out.push(
+        Driver::new(&pinned)
+            .to_project("trance")
+            .scene("Pinned here", "`⌂` says this workspace *is* that project — the top of the chain everything else resolves through, above the claim and the cwd beneath it, so `wsp add` with no `-p` files there and `f` sends an agent looking there. `p` sets it and, pressed again on the same row, takes it off; on a different project it moves, because the answer to \"which project is this workspace\" is simply now that one. At most one row ever carries it, and only on the panel in that workspace — every other panel is showing you the same tree without it."),
+    );
+
+    out.push(
+        Driver::new(&w)
             .down_to(panel::RowKind::Task)
             .key(Key::Char('m'))
             .scene("Moving a task", "m turns the tree itself into the picker. Navigation and folding still work, so you hunt for the destination the way you would read for it — then ↵ takes whatever the cursor is on."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_project("verb")
+            .key(Key::Char('m'))
+            .scene("Moving a project", "The same key one level up: a project moves under another project, sub-tree and all. Only a project answers — there is no row that means the top of the tree, so detaching one stays `wsp project set <id> parent=none` at a shell. Landing on itself, or on anything already beneath it, is refused by the CLI rather than by the panel, which has no index to ask; and it is refused rather than confirmed, because a project inside itself is a branch that vanishes from every list with its files still on disk."),
     );
 
     out.push(
@@ -879,6 +958,17 @@ h2.sec {
 "#;
 
 
+/// Prose going into the page, as prose.
+///
+/// The frames are HTML this file built and go in raw; the captions beside them
+/// are English and must not. A caption naming a command — `wsp project set
+/// <id> parent=none` — was silently swallowed from `<id>` to the next `>`,
+/// leaving a sentence about a flag that appeared to take no argument. Nothing
+/// errors, and there is no rendering that says the words are missing.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 fn page(scenes: &[Scene]) -> String {
     let mut out = String::new();
     out.push_str("<title>wsp panel storyboard</title>\n<style>");
@@ -897,15 +987,17 @@ fn page(scenes: &[Scene]) -> String {
     out.push_str("<section class=\"legend\"><h2 class=\"sec\">What the marks mean</h2>\n");
     for (group, blurb, marks) in panel::legend() {
         out.push_str(&format!(
-            "<div class=\"lgroup\"><div class=\"lhead\"><h3>{group}</h3><p>{blurb}</p></div><dl>"
+            "<div class=\"lgroup\"><div class=\"lhead\"><h3>{}</h3><p>{}</p></div><dl>",
+            esc(group),
+            esc(blurb),
         ));
         for m in marks {
             out.push_str(&format!(
                 "<div class=\"mark\"><dt><span class=\"chip\">{}</span></dt>\
                  <dd><b>{}</b><span>{}</span></dd></div>",
                 panel::to_html_spans(&m.sample),
-                m.name,
-                m.note
+                esc(m.name),
+                esc(m.note),
             ));
         }
         out.push_str("</dl></div>\n");
@@ -920,7 +1012,11 @@ fn page(scenes: &[Scene]) -> String {
              <p class=\"tgt\">cursor is on <b>{}</b></p></div>\
              <div class=\"frame\">{}</div>\
              </section>\n",
-            s.title, s.gesture, s.caption, s.target, s.html
+            esc(&s.title),
+            esc(&s.gesture),
+            esc(&s.caption),
+            esc(&s.target),
+            s.html,
         ));
     }
     out.push_str("</div>\n");
@@ -2308,5 +2404,423 @@ mod tests {
         panel::apply_key(Key::KillLine, &mut ui, &mut view);
         let shown = panel::frame(&ui, &mut view, W, H)[H - 1].text();
         assert!(!shown.contains(&tail), "ctrl-u should clear the line: {shown}");
+    }
+
+    /// Put the cursor on a project row by id, for the same reason `on_task`
+    /// exists: counting presses rots the moment the fixture gains a row.
+    fn on_project(ui: &mut panel::Ui, id: &str) {
+        let want = panel::Target::Project(id.to_string());
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_target() == want {
+                return;
+            }
+        }
+        panic!("no row for project {id}");
+    }
+
+    /// Every row of the frame, as text, for a test asking whether a mark is
+    /// drawn anywhere at all.
+    fn all_rows(ui: &panel::Ui) -> Vec<String> {
+        (0..ui.rows_for_test()).map(|i| panel::render_row_for_test(ui, i, W).text()).collect()
+    }
+
+    /// What the picker is offering, in the order it draws it.
+    fn tag_dock(view: &panel::View) -> Vec<String> {
+        panel::tag_rows_for_test(view, W).iter().map(|l| l.trim_end().to_string()).collect()
+    }
+
+    /// Tagging is a picker, not a prompt, and the reason is the removal. A
+    /// line taking `+dsp -ui` can add and remove in one go and still makes you
+    /// *spell* every tag — including the one you are taking off, which is a
+    /// name the panel is already holding and you are being asked to remember.
+    /// The vocabulary is nineteen words across the real store, so it fits.
+    #[test]
+    fn tagging_picks_from_the_tags_the_store_already_uses() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_task(&mut ui, "t-001");
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+
+        // What the task carries first — its own, then what its project lends
+        // it — and the vocabulary under that, commonest first. Projects count
+        // twice over: `synth` is on no task at all and has to be offerable,
+        // and it reaches this one from `trance` whether anybody offers it or
+        // not.
+        let dock = tag_dock(&view);
+        let names: Vec<String> =
+            dock.iter().map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string()).collect();
+        assert_eq!(names, ["dsp", "release", "synth", "herdr", "rust"], "{dock:?}");
+        assert!(dock[0].trim_start().starts_with(panel::glyph::TAG_ON), "carried: {}", dock[0]);
+        assert!(dock[3].trim_start().starts_with(panel::glyph::QUIET), "not carried: {}", dock[3]);
+        // The one the project lends is drawn as *on*, because it is: `wsp
+        // show` prints it and so does the detail pane. Showing only the task's
+        // own tags made `synth` read as absent on a task that every other
+        // surface says is tagged `synth`, which is why taking one off looked
+        // broken rather than impossible.
+        assert!(dock[2].trim_start().starts_with(panel::glyph::TAG_ON), "lent: {}", dock[2]);
+        assert!(dock[2].contains("trance"), "and says where from: {}", dock[2]);
+
+        // Nothing is written until `↵`, so the frame has to say what `↵` will
+        // do. `␣` on a carried tag marks it for removal where it stands — the
+        // rows do not reorder, because a list that shuffles under the cursor
+        // is how you take off the tag next to the one you meant.
+        panel::apply_key(Key::Char(' '), &mut ui, &mut view);
+        let dock = tag_dock(&view);
+        assert!(dock[0].trim_start().starts_with(panel::glyph::TAG_OFF), "going: {}", dock[0]);
+        assert_eq!(
+            dock.iter().map(|l| l.split_whitespace().nth(1).unwrap_or("")).collect::<Vec<_>>(),
+            ["dsp", "release", "synth", "herdr", "rust"],
+            "the order is fixed when it opens",
+        );
+
+        // `␣` on a lent tag does nothing at all and says why. `wsp tag <id>
+        // -synth` would remove nothing here and report success, so the picker
+        // refuses rather than passing that on.
+        panel::apply_key(Key::Down, &mut ui, &mut view);
+        panel::apply_key(Key::Down, &mut ui, &mut view);
+        panel::apply_key(Key::Char(' '), &mut ui, &mut view);
+        let dock = tag_dock(&view);
+        assert!(dock[2].trim_start().starts_with(panel::glyph::TAG_ON), "still lent: {}", dock[2]);
+
+        // And on one it does not carry, marks it for adding.
+        panel::apply_key(Key::Down, &mut ui, &mut view);
+        panel::apply_key(Key::Char(' '), &mut ui, &mut view);
+        let dock = tag_dock(&view);
+        assert!(dock[3].trim_start().starts_with(panel::glyph::TAG_NEW), "coming: {}", dock[3]);
+
+        // One command for the lot, in the order the list drew them — and the
+        // lent one is not in it, because there was never anything to send.
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["tag", "t-001", "--", "-dsp", "+herdr"]);
+            }
+            _ => panic!("↵ should apply the changes"),
+        }
+    }
+
+    /// A tag can be the task's *and* the project's, which in the real store is
+    /// the common case — a task under `wsp` carrying its own `rust`. Taking
+    /// off the copy the task owns leaves the tag on the task, because the
+    /// project puts it back, and a picker that did not say so would look like
+    /// the removal had failed. Which is the complaint this came from.
+    #[test]
+    fn removing_a_tag_the_project_also_lends_says_it_will_still_be_there() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        // t-001 owns `dsp`, and `trance` lends it too.
+        on_task(&mut ui, "t-001");
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+        assert!(tag_dock(&view)[0].contains("trance"), "{:?}", tag_dock(&view));
+
+        panel::apply_key(Key::Char(' '), &mut ui, &mut view);
+        let row = tag_dock(&view)[0].clone();
+        assert!(row.trim_start().starts_with(panel::glyph::TAG_OFF), "going: {row}");
+        assert!(row.contains("trance"), "…and coming straight back: {row}");
+
+        // The command is still honest about what it does: it takes off the
+        // copy the task owns, which is the only copy `wsp tag` can reach.
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["tag", "t-001", "--", "-dsp"]),
+            _ => panic!("↵ should still remove the task's own copy"),
+        }
+    }
+
+    /// The picker takes its rows off the tree, and the row it is about is one
+    /// of the ones that can go. A wheel is entitled to carry the view clean
+    /// off the selection and leave it selected — that is the whole point of
+    /// the view having a position of its own — so `t` pressed after one would
+    /// otherwise open a list of tags over a tree with the task nowhere in it.
+    #[test]
+    fn the_picker_brings_the_task_it_is_about_back_into_view() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let shows = |ui: &panel::Ui, view: &mut panel::View| {
+            panel::frame(ui, view, W, H).iter().any(|l| l.text().contains("Apply reverb fixes"))
+        };
+
+        on_task(&mut ui, "t-001");
+        panel::place(&ui, &mut view, W, H);
+        assert!(shows(&ui, &mut view), "the fixture should open with it on screen");
+
+        // Scroll away from it. The selection stays where it is and the view
+        // does not follow, which is what the wheel is for.
+        for _ in 0..8 {
+            panel::wheel(&mut ui, &mut view, W, H, false);
+        }
+        panel::place(&ui, &mut view, W, H);
+        assert!(!shows(&ui, &mut view), "the wheel should have left it behind");
+        assert_eq!(ui.selected_target(), panel::Target::Task("t-001".into()), "still selected");
+
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+        panel::place(&ui, &mut view, W, H);
+        assert!(shows(&ui, &mut view), "opening the picker owes the task a look");
+        // …and the tree is still a tree underneath it.
+        assert!(!tag_dock(&view).is_empty());
+    }
+
+    /// The whole bargain of a mode that writes nothing until `↵`: a fumble
+    /// costs nothing. `prio` had to grow the same guard for the same reason —
+    /// a key you can press by accident must not spend a log line, an event and
+    /// a commit recording that it was pressed.
+    #[test]
+    fn a_tag_toggled_back_is_not_a_change_and_esc_is_not_one_either() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_task(&mut ui, "t-001");
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+        panel::apply_key(Key::Char(' '), &mut ui, &mut view);
+        panel::apply_key(Key::Char(' '), &mut ui, &mut view);
+        assert!(
+            matches!(panel::apply_key(Key::Enter, &mut ui, &mut view), panel::Effect::None),
+            "on and off again is where it started",
+        );
+
+        // …and walking away from real changes discards them.
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+        panel::apply_key(Key::Char(' '), &mut ui, &mut view);
+        assert!(matches!(
+            panel::apply_key(Key::Esc, &mut ui, &mut view),
+            panel::Effect::None
+        ));
+        // Nothing stuck: opening again offers the tags the task still has.
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+        let dock = tag_dock(&view);
+        assert!(dock[0].trim_start().starts_with(panel::glyph::TAG_ON), "unchanged: {}", dock[0]);
+    }
+
+    /// Typing is still how a tag nobody has used yet gets its name — the
+    /// filter and the new-tag field are one line, because they are one
+    /// gesture: you type what you want and take whichever of the two you are
+    /// offered.
+    #[test]
+    fn typing_narrows_the_list_and_names_a_tag_that_is_not_in_it() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_task(&mut ui, "t-001");
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+        for c in "rus".chars() {
+            panel::apply_key(Key::Char(c), &mut ui, &mut view);
+        }
+        let dock = tag_dock(&view);
+        assert_eq!(dock.len(), 2, "one match, and the offer to make it anyway: {dock:?}");
+        assert!(dock[0].contains("rust"));
+        assert!(dock[1].contains("rus") && dock[1].contains("new"), "{}", dock[1]);
+
+        // `↵` on the row that would make one makes it and applies: typing a
+        // name and pressing return is a single gesture and reading it as two
+        // would be the picker being clever at you.
+        panel::apply_key(Key::Down, &mut ui, &mut view);
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["tag", "t-001", "--", "+rus"]),
+            _ => panic!("↵ on the new row should make the tag"),
+        }
+
+        // A filter that matches something exactly offers no duplicate of it.
+        panel::apply_key(Key::Char('t'), &mut ui, &mut view);
+        for c in "rust".chars() {
+            panel::apply_key(Key::Char(c), &mut ui, &mut view);
+        }
+        assert_eq!(tag_dock(&view).len(), 1, "rust is already a tag");
+
+        // Case-folded on the way in, or `DSP` and `dsp` become two tags that
+        // read as one everywhere they are listed.
+        panel::apply_key(Key::KillLine, &mut ui, &mut view);
+        for c in "DSP".chars() {
+            panel::apply_key(Key::Char(c), &mut ui, &mut view);
+        }
+        let dock = tag_dock(&view);
+        assert_eq!(dock.len(), 1, "DSP finds dsp rather than offering a second one: {dock:?}");
+
+        // Nowhere but a task. `wsp tag` is a task verb, and a project's tags
+        // are a whole list set at once by `project set`.
+        panel::apply_key(Key::Esc, &mut ui, &mut view);
+        on_kind(&mut ui, panel::RowKind::Project);
+        assert!(matches!(
+            panel::apply_key(Key::Char('t'), &mut ui, &mut view),
+            panel::Effect::None
+        ));
+    }
+
+    /// A project's *name*, which is not the string the row is drawn with. The
+    /// tree is slugs — short, unique, what `-p` takes — and every project in
+    /// the real store has a longer name behind it. `e` changes that one,
+    /// because it is the only rename a project has: nothing in wsp moves a
+    /// slug, since every task, pin and mandate refers to it by that.
+    #[test]
+    fn a_project_is_renamed_by_the_name_it_is_not_drawn_with() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_project(&mut ui, "wsp");
+        let row = panel::render_row_for_test(&ui, ui.selected_index(), W).text();
+        assert!(row.contains("wsp"), "the row draws the slug: {row}");
+        assert!(!row.contains("control plane"), "and never the name: {row}");
+
+        // The prompt opens holding the name, the same as a task's title does,
+        // and for the same reason: a rename is a correction.
+        panel::apply_key(Key::Char('e'), &mut ui, &mut view);
+        let shown = panel::frame(&ui, &mut view, W, H)[H - 1].text();
+        assert!(shown.contains("wsp control plane"), "should open holding the name: {shown}");
+
+        // Sent back untouched it is not a rename, so it does not spend a
+        // commit saying so.
+        assert!(matches!(
+            panel::apply_key(Key::Enter, &mut ui, &mut view),
+            panel::Effect::None
+        ));
+
+        // Changed, it is one key=value pair with the spaces intact: `project
+        // set` splits on the first `=` and takes the rest whole.
+        on_project(&mut ui, "wsp");
+        panel::apply_key(Key::Char('e'), &mut ui, &mut view);
+        panel::apply_key(Key::Char('!'), &mut ui, &mut view);
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["project", "set", "wsp", "name=wsp control plane!"]);
+            }
+            _ => panic!("a changed name should run a set"),
+        }
+    }
+
+    /// One key for both things that move. `m` on a task asks which project it
+    /// belongs to; on a project it asks which project it belongs *under*, and
+    /// the pick is the same tree either way.
+    #[test]
+    fn m_moves_a_project_the_way_it_moves_a_task() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_project(&mut ui, "verb");
+        assert!(matches!(
+            panel::apply_key(Key::Char('m'), &mut ui, &mut view),
+            panel::Effect::None
+        ));
+
+        // The tree is the picker, so the destination is wherever the cursor
+        // walks to.
+        on_project(&mut ui, "tooling");
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, escalate, .. } => {
+                assert_eq!(argv, vec!["project", "set", "verb", "parent=tooling"]);
+                // No stronger form. A project inside itself is not a policy to
+                // override — the branch simply stops being reachable from the
+                // root and vanishes from every list with its files still there.
+                assert_eq!(escalate, None);
+            }
+            _ => panic!("landing on a project should run a set"),
+        }
+
+        // Only a project answers. A task, the inbox and a pane are all rows
+        // the cursor reaches during the hunt and none of them is a parent.
+        on_project(&mut ui, "verb");
+        panel::apply_key(Key::Char('m'), &mut ui, &mut view);
+        on_task(&mut ui, "t-001");
+        assert!(matches!(
+            panel::apply_key(Key::Enter, &mut ui, &mut view),
+            panel::Effect::None
+        ));
+    }
+
+    /// A pin says what a workspace *is*. It is the top of the chain every
+    /// other question resolves through — `wsp add` with no `-p`, `wsp where`,
+    /// where `f` sends an agent looking — which is why it beats the cwd
+    /// underneath it: five workspaces can share one checkout.
+    ///
+    /// One per workspace, so the key that sets it is the only key there is to
+    /// take it off, and the mark is what makes a second press mean anything.
+    #[test]
+    fn p_pins_this_workspace_and_takes_the_pin_off_again() {
+        let mut w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        // Nothing pinned: no row carries the mark, and `p` sets one, naming
+        // the workspace rather than leaving `wsp pin` to read it back out of
+        // the environment.
+        assert!(
+            all_rows(&ui).iter().all(|r| !r.contains(panel::glyph::PINNED)),
+            "an unpinned workspace marks nothing",
+        );
+        on_project(&mut ui, "trance");
+        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["pin", "trance", "-w", "w0"]),
+            _ => panic!("p on a project should pin"),
+        }
+
+        // With the pin in the store, the row it names says so — and only that
+        // row, on only this workspace's own panel.
+        w.pins.insert("w0".into(), "trance".into());
+        let mut ui = ui_of(&w, &view);
+        let marked: Vec<String> =
+            all_rows(&ui).into_iter().filter(|r| r.contains(panel::glyph::PINNED)).collect();
+        assert_eq!(marked.len(), 1, "exactly one row is home: {marked:?}");
+        assert!(marked[0].contains("trance"), "and it is the pinned one: {}", marked[0]);
+
+        // Pressed again on the same project it comes off: there is nothing
+        // else that could mean.
+        on_project(&mut ui, "trance");
+        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["unpin", "-w", "w0"]),
+            _ => panic!("p on the pinned project should unpin"),
+        }
+
+        // …and on a different one it moves, rather than refusing. There is
+        // nothing to refuse: the answer to "which project is this workspace"
+        // is now that one.
+        on_project(&mut ui, "verb");
+        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["pin", "verb", "-w", "w0"]),
+            _ => panic!("p elsewhere should move the pin"),
+        }
+
+        // A pin is about a workspace, so a task or a pane is not one.
+        on_task(&mut ui, "t-001");
+        assert!(matches!(
+            panel::apply_key(Key::Char('p'), &mut ui, &mut view),
+            panel::Effect::None
+        ));
+
+        // Pinned outside the tree entirely — `wsp pin --top`, "this workspace
+        // is deliberately not work" — is not any project, so no row is marked
+        // and `p` on one is an ordinary pin that replaces it.
+        w.pins.insert("w0".into(), crate::resolve::TOP_LEVEL.into());
+        let mut ui = ui_of(&w, &view);
+        assert!(
+            all_rows(&ui).iter().all(|r| !r.contains(panel::glyph::PINNED)),
+            "pinned out of the tree marks no row in it",
+        );
+        on_project(&mut ui, "trance");
+        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["pin", "trance", "-w", "w0"]),
+            _ => panic!("p should replace a --top pin"),
+        }
+    }
+
+    /// The panel runs outside herdr in exactly one place — the storyboard —
+    /// and a key that assumed a workspace would build `wsp unpin -w ` with
+    /// nothing after it, which is a command about whatever workspace the
+    /// process happens to be in.
+    #[test]
+    fn a_panel_with_no_workspace_of_its_own_does_not_pin() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = panel::collect(&w, &view, None);
+        on_project(&mut ui, "trance");
+        assert!(matches!(
+            panel::apply_key(Key::Char('p'), &mut ui, &mut view),
+            panel::Effect::None
+        ));
     }
 }

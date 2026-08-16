@@ -128,6 +128,16 @@ pub(crate) mod glyph {
     pub const SHELL: &str = "▫";
     /// Something is written in Overview or Details.
     pub const NOTES: &str = "≡";
+    /// This workspace is pinned to that project — home, in the sense `wsp
+    /// where` means it. On the project row and nowhere else, because a pin is
+    /// one per workspace.
+    pub const PINNED: &str = "⌂";
+    /// In the tag picker: carried already, about to be added, about to be
+    /// taken off. Three marks rather than two, because nothing is written
+    /// until `↵` and the frame has to say what `↵` will do.
+    pub const TAG_ON: &str = "✓";
+    pub const TAG_NEW: &str = "+";
+    pub const TAG_OFF: &str = "−";
     /// Ahead of its project's other work, and behind it. Taken from the model
     /// so the panel and the CLI cannot end up marking the same task two ways.
     /// `normal` is absent on purpose: the tree draws it as no column at all,
@@ -196,6 +206,24 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Warn, g::BLOCKED), (Style::Warn, "1")], "blocked", "tasks parked and waiting"),
                 mark(&[(Style::Dim, g::DONE)], "all clear", "there is work here and all of it is finished"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Accent, "2")], "panes", "panes standing in this project, agent or not"),
+                mark(&[(Style::Accent, g::PINNED)], "pinned here", "this workspace is that project — `p` sets it and takes it off again; at most one row, and only on this workspace's own panel"),
+            ],
+        ),
+        (
+            "In the tag picker",
+            "`t` on a task docks the tags the store already uses. Nothing is \
+             written until `↵`, so the marks have to say what `↵` is going to \
+             do. Inherited tags are in the list and drawn as carried, because \
+             `wsp show` prints them and the detail pane prints them — leaving \
+             them out drew `rust` as absent on a task everything else says is \
+             tagged `rust`.",
+            vec![
+                mark(&[(Style::Plain, g::TAG_ON)], "carried", "on the task now, and staying"),
+                mark(&[(Style::Accent, g::TAG_NEW)], "coming", "`␣` put it on; `↵` is what writes it"),
+                mark(&[(Style::Warn, g::TAG_OFF)], "going", "on the task now and about to come off"),
+                mark(&[(Style::Dim, g::TAG_ON), (Style::Plain, " rust"), (Style::Dim, "  wsp")], "lent by a project", "on the task, and not this task's to remove — `wsp tag` cannot reach it. The name on the right is the project it comes from, which is where it does come off"),
+                mark(&[(Style::Muted, g::QUIET)], "not carried", "in the vocabulary, not on this task"),
+                mark(&[(Style::Accent, g::TAG_NEW), (Style::Plain, " mix"), (Style::Dim, "  new")], "a tag nobody has used", "what you typed is not in the list, so the last row offers to make it"),
             ],
         ),
         (
@@ -286,6 +314,85 @@ pub(super) fn help_lines(w: usize) -> Vec<Line> {
 /// of the titles here run past that — a focus panel that cuts the title is a
 /// panel that fails on exactly the rows it exists for. So: three lines always,
 /// six when the title needs them, and only the longest tenth ever moves it.
+/// How tall the tag picker is allowed to get, before its rule.
+///
+/// The vocabulary is nineteen words in the store this was built against, which
+/// is more than a sidebar can spare beside the task it is about — and the task
+/// has to stay on screen, or you are tagging something you can no longer see.
+/// So the list scrolls inside this and the filter is how you reach past it,
+/// which is the other half of what the filter is for.
+pub(super) const TAGS_MAX: usize = 8;
+
+/// The picker's rows: what is on, what is about to change, and — when the
+/// filter names something the vocabulary does not hold — the offer to make it.
+///
+/// `sel` is an index into the *filtered* rows, so the window is computed here
+/// against the same list the reducer moved through.
+pub(super) fn tags_lines(t: &super::keys::Tags, w: usize, room: usize) -> Vec<Line> {
+    use super::keys::{TagRow, TagState};
+    let shown = t.shown();
+    let rows = room.min(TAGS_MAX).max(1);
+    // Keep the cursor in the window, scrolling by as little as will do — the
+    // same bargain the tree makes, and for the same reason.
+    let first = t.sel.saturating_sub(rows.saturating_sub(1)).min(shown.len().saturating_sub(rows.min(shown.len())));
+
+    let mut out = Vec::new();
+    for (i, r) in shown.iter().enumerate().skip(first).take(rows) {
+        let mut l = Line::default();
+        // The right-hand note, when the row has one to make.
+        let mut note = Line::default();
+        let (mark, style, name) = match r {
+            TagRow::New(name) => {
+                note.push(Style::Dim, "new");
+                (glyph::TAG_NEW, Style::Accent, name.clone())
+            }
+            TagRow::Tag(name) => {
+                // Any row a project also lends says which one, whatever else
+                // is happening to it. On an inherited row it is the reason `␣`
+                // will not move it; on one being *removed* it is the warning
+                // that removing it will not take the tag off the task, because
+                // the project puts it back — which is common, since a task
+                // under `wsp` carrying its own `rust` is exactly this.
+                if let Some(from) = t.lender(name) {
+                    note.push(Style::Dim, util::truncate(from, 12));
+                }
+                match t.state(name) {
+                    // On before and on after: nothing is happening to it.
+                    TagState::Kept => (glyph::TAG_ON, Style::Plain, name.clone()),
+                    TagState::Adding => (glyph::TAG_NEW, Style::Accent, name.clone()),
+                    // Struck through would be better and is not available, so
+                    // the mark carries it and the ink goes warn: this row is
+                    // the one about to lose something.
+                    TagState::Removing => (glyph::TAG_OFF, Style::Warn, name.clone()),
+                    // On the task, and drawn as on, because it is — `wsp show`
+                    // prints it and so does the detail pane. Dim, because it is
+                    // the one row here `␣` cannot move.
+                    TagState::Inherited(_) => (glyph::TAG_ON, Style::Dim, name.clone()),
+                    TagState::Off => (glyph::QUIET, Style::Muted, name.clone()),
+                }
+            }
+        };
+        let room = w.saturating_sub(4 + if note.spans.is_empty() { 0 } else { note.width() + 1 });
+        l.push(Style::Plain, " ");
+        l.push(style, mark);
+        l.push(Style::Plain, " ");
+        l.push(style, util::truncate(&name, room));
+        if !note.spans.is_empty() {
+            l.pad(w.saturating_sub(l.width() + note.width()).max(1));
+            l.spans.extend(note.spans);
+        }
+        l.selected = i == t.sel;
+        out.push(l);
+    }
+    // A filter that matches nothing and offers nothing cannot happen — the
+    // `new` row is always there when the filter is non-empty — but an empty
+    // vocabulary on an untagged task can, and an empty box reads as broken.
+    if out.is_empty() {
+        out.push(line(Style::Dim, "  no tags yet — type one"));
+    }
+    out
+}
+
 pub(super) const FOCUS_MIN: usize = 3;
 
 pub(super) const FOCUS_MAX: usize = 6;
@@ -390,6 +497,8 @@ pub(crate) struct Geometry {
     /// Rows above the tree: the title and its rule.
     pub head: usize,
     pub map_rows: usize,
+    /// The tag picker and the rule above it, or zero when it is not up.
+    pub tags_rows: usize,
     /// The focus dock and the rule above it, or zero when it is off.
     pub focus_rows: usize,
     pub dock_rows: usize,
@@ -420,19 +529,34 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     } else {
         0
     };
+    // The picker takes its rows before the focus dock does, because it is a
+    // mode: it is what the panel is in the middle of, and the dock is a
+    // convenience that can wait until it closes.
+    let tags_rows = match &view.mode {
+        Mode::Tags(t) => {
+            let want = tags_lines(t, w, TAGS_MAX).len() + 1;
+            match want.min(room.saturating_sub(map_rows + MIN_TREE_ROWS)) {
+                n if n < 2 => 0,
+                n => n,
+            }
+        }
+        _ => 0,
+    };
     // Before the map's rows are taken as well, or a short pane with both up
     // would hand the same rows out twice.
     let focus_rows = if view.focus {
         // Its own rule included, and never that rule on its own: one line of
         // furniture with nothing under it says the title is missing.
-        match (focus_lines(ui, w).len() + 1).min(room.saturating_sub(map_rows + MIN_TREE_ROWS)) {
+        match (focus_lines(ui, w).len() + 1)
+            .min(room.saturating_sub(map_rows + tags_rows + MIN_TREE_ROWS))
+        {
             n if n < 2 => 0,
             n => n,
         }
     } else {
         0
     };
-    let body_rows = room - map_rows - focus_rows;
+    let body_rows = room - map_rows - tags_rows - focus_rows;
     let dock_rows = if ui.dock == 0 {
         0
     } else {
@@ -456,7 +580,7 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
         Some(s) => scroll_to(s, ui.sel, tree_len, tree_rows, LOOKAHEAD),
         None => scroll_for(ui.sel.min(tree_len.saturating_sub(1)), tree_len, tree_rows),
     };
-    Geometry { head: HEAD, map_rows, focus_rows, dock_rows, tree_rows, tree_len, scroll }
+    Geometry { head: HEAD, map_rows, tags_rows, focus_rows, dock_rows, tree_rows, tree_len, scroll }
 }
 
 /// The row a click at pane row `y` landed on, if it landed on one.
@@ -475,7 +599,8 @@ pub(crate) fn row_at(ui: &Ui, view: &View, w: usize, h: usize, y: usize) -> Opti
     // The dock sits at the bottom whatever the tree is doing, under a rule of
     // its own. `dock_rows` counts that rule, so its rows are one fewer.
     if g.dock_rows > 1 {
-        let first = h.saturating_sub(3 + g.focus_rows + g.map_rows + g.dock_rows) + 1;
+        let first =
+            h.saturating_sub(3 + g.focus_rows + g.tags_rows + g.map_rows + g.dock_rows) + 1;
         if y >= first && y < first + g.dock_rows - 1 {
             let i = g.tree_len + (y - first);
             if i < ui.rows.len() {
@@ -630,7 +755,9 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         l.selected = i == ui.sel;
         lines.push(l);
     }
-    while lines.len() < h.saturating_sub(footer_rows + g.focus_rows + map_rows + dock_rows) {
+    while lines.len()
+        < h.saturating_sub(footer_rows + g.focus_rows + g.tags_rows + map_rows + dock_rows)
+    {
         lines.push(Line::default());
     }
     if dock_rows > 0 {
@@ -643,6 +770,16 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     }
     let hidden = map.len() - map_rows;
     lines.extend(map.into_iter().take(map_rows));
+
+    // The picker, above the focus dock and below the map: it is the thing the
+    // panel is in the middle of, so it sits as near the footer — and the
+    // filter line — as anything that is not the footer itself.
+    if let Mode::Tags(t) = mode {
+        if g.tags_rows > 1 {
+            lines.push(line(Style::Dim, "─".repeat(w)));
+            lines.extend(tags_lines(t, w, g.tags_rows - 1).into_iter().take(g.tags_rows - 1));
+        }
+    }
 
     // Last before the footer, so it sits where the eye already goes for what
     // the panel is saying about right now — and so the tree above it is one
@@ -729,6 +866,29 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             let mut l = Line::default();
             l.push(Style::Accent, util::truncate(verb.hint(), w.saturating_sub(4)));
             l.push(Style::Dim, "  ↵");
+            l
+        }
+        // The filter and the hint share the line the prompt uses, because they
+        // are the same thing: a place to type. What is different is that the
+        // typing narrows a list rather than becoming the value — so the line
+        // has to say what the keys do, which a prompt never needs to.
+        Mode::Tags(t) => {
+            let mut l = Line::default();
+            l.push(Style::Accent, "tag> ");
+            l.push(Style::Plain, t.filter.clone());
+            l.push(Style::Accent, "▌");
+            // The key you next want, and only that. With nothing picked the
+            // thing to do is pick; with something picked it is save, and the
+            // count is what makes `↵` worth pressing rather than `esc`.
+            // Never "apply" over an empty diff: `↵` there says `unchanged` and
+            // runs no command, and a footer promising otherwise is a footer
+            // lying about what a key does.
+            let n = t.changes().len();
+            let hint = if n == 0 { "  ␣ toggle".to_string() } else { format!("  ↵ saves {n}") };
+            if w > l.width() + hint.chars().count() {
+                l.pad(w.saturating_sub(l.width() + hint.chars().count()));
+                l.push(Style::Dim, hint);
+            }
             l
         }
         Mode::Browse => match &ui.message {
