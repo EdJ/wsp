@@ -32,6 +32,7 @@
       "Bash(wsp claim:*)",
       "Bash(wsp release:*)",
       "Bash(wsp note:*)",
+      "Bash(wsp flag:*)",
       "Bash(wsp decide:*)",
       "Bash(wsp edit:*)",
       "Bash(wsp start:*)",
