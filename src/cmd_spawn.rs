@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::cmd_agent;
 use crate::herdr;
 use crate::resolve::Index;
 use crate::store::Store;
@@ -190,7 +191,9 @@ struct Work {
     task: Option<String>,
     project: Option<String>,
     /// The workspace's opening name. A claim renames it after the task a
-    /// moment later; a project keeps this one.
+    /// moment later — to the same thing, for a task, so the window does not
+    /// change its name under whoever was already looking at it. A project
+    /// keeps this one.
     label: String,
 }
 
@@ -218,7 +221,7 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
     if let Some(t) = store.find_task(&needle) {
         return Ok(Work {
             project: t.project.clone(),
-            label: t.title.clone(),
+            label: cmd_agent::task_label(&t).unwrap_or_else(|| t.title.clone()),
             task: Some(t.id),
         });
     }

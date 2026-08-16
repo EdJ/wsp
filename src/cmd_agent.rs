@@ -131,18 +131,67 @@ fn pane_id(args: &Args) -> Option<String> {
     args.get("pane").or_else(|| herdr::Env::read().pane_id)
 }
 
+/// The width every label wsp writes is cut to — the 44 characters `sync`
+/// already gives the `task` token. A herdr sidebar is 26 columns and draws its
+/// own ellipsis, so this is not about what fits: it is about not putting a
+/// paragraph on the wire as a name.
+const LABEL_MAX: usize = 44;
+
+/// What you would type to mean this task, with the project it is in:
+/// `render/109`. The panel's `ident_of` shortens the same id for the same
+/// reason — eleven of a task id's thirteen characters are the same on every
+/// row, and the suffix is the half `wsp show 109` resolves.
+///
+/// Always the bare suffix here, never the dated form the panel falls back to
+/// when two open tasks share it. A label is read at a glance in a column of
+/// other labels, and it is followed by the title, which is what settles a
+/// collision; `render/109 · …` beside `render/109 · …` is two agents whose
+/// work you can still tell apart.
+pub fn task_scope(task: &Task) -> String {
+    let ident = task.id.rsplit('-').next().unwrap_or(&task.id);
+    match &task.project {
+        Some(p) if !p.is_empty() => format!("{p}/{ident}"),
+        _ => ident.to_string(),
+    }
+}
+
 /// The name a task lends the workspace and pane holding it, or `None` if it
 /// lends none.
 ///
-/// Capped at the 44 characters `sync` already gives the `task` token. A herdr
-/// sidebar is 26 columns and draws its own ellipsis, so this is not about what
-/// fits — it is about not putting a paragraph on the wire as a name.
+/// Scope first, sentence second, because the ellipsis falls on the right and a
+/// collapsed sidebar is a rail a few columns wide. Three agents in one tree all
+/// wearing a title that starts "let's add the …" are three agents you cannot
+/// tell apart without widening the sidebar and reading to the end of each one;
+/// `render/109` in front of it is the whole answer in ten columns, and it is
+/// also what you would type to go and look at the work.
+pub fn task_label(task: &Task) -> Option<String> {
+    said_label(task, &task.title)
+}
+
+/// The same label, with something an agent said in place of the task's title.
+///
+/// The scope belongs to the pane for as long as it holds the task, not just
+/// until the first `wsp say` — the sentence is what changed, and losing which
+/// piece of work it is about was the cost of saying anything at all.
+fn said_label(task: &Task, said: &str) -> Option<String> {
+    let said = said.trim();
+    if said.is_empty() {
+        return None;
+    }
+    let scope = task_scope(task);
+    let room = LABEL_MAX.saturating_sub(scope.chars().count() + 3);
+    Some(format!("{scope} · {}", util::truncate(said, room)))
+}
+
+/// A label for a pane holding no task, which is the only kind that has to be
+/// checked for a name of ours.
 ///
 /// `wsp` and `wsp:view` are withheld. They are how the panel finds its own
 /// panes, and `install` adopts a stray pane labelled `wsp` as a panel it lost
-/// track of — a task called "wsp" would hand it an agent instead.
-fn task_label(title: &str) -> Option<String> {
-    let label = util::truncate(title.trim(), 44);
+/// track of — an agent that said "wsp" would be adopted as furniture. Nothing
+/// scoped can collide: a scope carries a `/` and those two do not.
+fn plain_label(said: &str) -> Option<String> {
+    let label = util::truncate(said.trim(), LABEL_MAX);
     match label.as_str() {
         "" | crate::panel::PANEL_LABEL | crate::panel::VIEW_LABEL => None,
         _ => Some(label),
@@ -159,12 +208,13 @@ fn task_label(title: &str) -> Option<String> {
 ///
 /// It renames over a name typed by hand, by decision on t-260815-041, and the
 /// claim prints what it overwrote so `herdr workspace rename` can put it back.
-/// The cost is `resolve`'s last resort: a workspace whose project was inferred
-/// from a label like `Trance Video` loses that inference once the label is a
-/// task title. Only ever last resort — a pin, this binding, or the cwd all beat
-/// it, and a workspace that has just claimed has a binding by definition.
-fn name_after_task(pane: &str, workspace: &str, title: &str) -> Option<String> {
-    let label = task_label(title)?;
+/// It used to cost `resolve` its last resort — a workspace whose project was
+/// inferred from a label like `Trance Video` lost that inference the moment the
+/// label became a task title — and the scope on the front hands it back: the
+/// label now leads with the project's own id, which is the first thing
+/// [`Index::project_for_label`] looks for.
+fn name_after_task(pane: &str, workspace: &str, task: &Task) -> Option<String> {
+    let label = task_label(task)?;
     if !herdr::available() {
         return None;
     }
@@ -198,7 +248,7 @@ fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
     if !herdr::available() {
         return;
     }
-    let Some(label) = store.task(task_id).and_then(|t| task_label(&t.title)) else { return };
+    let Some(label) = store.task(task_id).as_ref().and_then(task_label) else { return };
     let Ok(panes) = herdr::panes() else { return };
     let Some(p) = panes.iter().find(|p| p.pane_id == pane) else { return };
 
@@ -252,18 +302,21 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     // Home is the task this pane holds. Without one there is nothing to fall
     // back to, so the label is cleared outright and herdr goes back to naming
     // the pane whatever it named it before.
-    let home = store
+    let held = store
         .bindings()
         .get(&pane)
         .and_then(|b| b.get("task_id"))
         .and_then(|t| t.as_str())
-        .and_then(|id| store.task(id))
-        .and_then(|t| task_label(&t.title));
+        .and_then(|id| store.task(id));
 
-    let label = match (said.is_empty() || args.has("clear"), &home) {
-        (true, Some(h)) => Some(h.clone()),
+    // A sentence said by a pane holding work is scoped to that work, so the
+    // rail still says which of the agents this is while it talks. A pane
+    // holding none has nothing to scope it by, and says only what it said.
+    let label = match (said.is_empty() || args.has("clear"), &held) {
+        (true, Some(t)) => task_label(t),
         (true, None) => None,
-        (false, _) => task_label(said),
+        (false, Some(t)) => said_label(t, said),
+        (false, None) => plain_label(said),
     };
 
     let r = match &label {
@@ -639,7 +692,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // written: the claim records the label the workspace is to be *found* by
     // when its id is gone, so it has to record the name it is about to have and
     // not the one it is losing.
-    let named = name_after_task(&pane, &workspace, &t.title);
+    let named = name_after_task(&pane, &workspace, &t);
 
     // One lock around the state files a claim touches, so a claim
     // arriving in the middle of this one cannot read a half-made state: a
@@ -947,7 +1000,7 @@ fn name_bound(
             .get("task_id")
             .and_then(|t| t.as_str())
             .and_then(|id| tasks.iter().find(|t| t.id == id))
-            .and_then(|t| task_label(&t.title))
+            .and_then(task_label)
         else {
             continue;
         };
@@ -2029,23 +2082,53 @@ mod tests {
         assert_eq!(read_body(&empty).get("text").unwrap(), "");
     }
 
-    /// The two names a task may not lend a pane. `install` treats any pane
-    /// labelled `wsp` as a panel it lost track of, so a task called "wsp"
-    /// renaming its own pane would get that agent adopted as furniture and
-    /// dropped from the tree — the panel filters its own panes out of it.
+    /// The two names an unscoped pane may not take. `install` treats any pane
+    /// labelled `wsp` as a panel it lost track of, so an agent that said "wsp"
+    /// while holding nothing would be adopted as furniture and dropped from
+    /// the tree — the panel filters its own panes out of it.
     #[test]
-    fn a_task_never_lends_a_pane_the_panels_own_name() {
-        assert_eq!(task_label("wsp"), None);
-        assert_eq!(task_label("  wsp  "), None);
-        assert_eq!(task_label("wsp:view"), None);
-        assert_eq!(task_label(""), None);
+    fn a_pane_never_takes_the_panels_own_name() {
+        assert_eq!(plain_label("wsp"), None);
+        assert_eq!(plain_label("  wsp  "), None);
+        assert_eq!(plain_label("wsp:view"), None);
+        assert_eq!(plain_label(""), None);
 
         // Anything else is itself, and a long one is cut to the width `sync`
         // already uses for the same title.
-        assert_eq!(task_label("wsp panel"), Some("wsp panel".to_string()));
+        assert_eq!(plain_label("wsp panel"), Some("wsp panel".to_string()));
         let long = "Agents should rename as they pick up new tasks, and say so";
-        assert_eq!(task_label(long).unwrap().chars().count(), 44);
-        assert!(task_label(long).unwrap().ends_with('…'));
+        assert_eq!(plain_label(long).unwrap().chars().count(), LABEL_MAX);
+        assert!(plain_label(long).unwrap().ends_with('…'));
+    }
+
+    /// What the sidebar has to answer in the first ten columns: which of these
+    /// agents is this. The title is the same shape on every row of a project
+    /// being worked through — the scope is not.
+    #[test]
+    fn a_pane_holding_work_wears_the_scope_of_it() {
+        let mut t = Task::new("let's add the task scope to the agent window", "t-260815-109");
+        t.project = Some("render".into());
+
+        assert_eq!(
+            task_label(&t),
+            Some("render/109 · let's add the task scope to th…".to_string())
+        );
+        // Still the one width, prefix and all: it is a name on a wire, not a
+        // paragraph.
+        assert_eq!(task_label(&t).unwrap().chars().count(), LABEL_MAX);
+
+        // A sentence keeps the scope the title had, so saying something does
+        // not cost the pane its place in the list.
+        assert_eq!(
+            said_label(&t, "reading the claim guard"),
+            Some("render/109 · reading the claim guard".to_string())
+        );
+        assert_eq!(said_label(&t, "   "), None);
+
+        // An inbox task has no project to name, and its ident alone still
+        // separates it from every other pane.
+        let loose = Task::new("something nobody has filed", "t-260815-004");
+        assert_eq!(task_label(&loose), Some("004 · something nobody has filed".to_string()));
     }
 
     /// The subtraction that separates a loaded index from an agent halfway

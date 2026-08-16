@@ -143,6 +143,11 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("task", t.map(|t| util::truncate(&t.title, 44))),
             ("taskid", t.map(|t| t.id.clone())),
+            // `render/109`: which piece of work this is, in the ten columns a
+            // narrow sidebar has for it, and what you would type to open it.
+            // The pane's label leads with the same thing — this is for a row
+            // that would rather carry it on its own.
+            ("scope", t.map(crate::cmd_agent::task_scope)),
             ("tstatus", t.map(|t| t.status().as_str().to_string())),
         ];
         let fingerprint = tokens

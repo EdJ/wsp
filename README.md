@@ -26,8 +26,8 @@ nohup wsp daemon > ~/.local/state/wsp/daemon.log 2>&1 &
 ```
 
 Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` and
-`[ui.sidebar.agents]` there; `$proj`, `$todo`, `$doing`, `$blocked` and `$task`
-are published by the daemon.
+`[ui.sidebar.agents]` there; `$proj`, `$todo`, `$doing`, `$blocked`, `$task` and
+`$scope` are published by the daemon.
 
 ## Layout
 
@@ -896,6 +896,17 @@ answers *what is this work*, a pane answers *what is happening in there right
 now*. Putting both on the workspace would lose the name of the work every time
 somebody started a build. A claim resets the pane to the task title, so there
 is always a way home.
+
+Every name wsp writes leads with the task's scope — `render/109 · reading the
+claim guard` — because a collapsed sidebar is a rail a few columns wide, and the
+right-hand end is what it cuts. Three agents working through one project all
+wore titles that began the same way, and telling them apart meant widening the
+sidebar and reading each one to the end. Ten columns answer it instead, and they
+are the ten you would type to go and look: `wsp show 109`. The sentence keeps the
+scope too — saying something should not cost a pane its place in the list — and
+a pane holding no task has none to wear, which is itself the difference between
+an agent on a piece of work and an agent between two. The same string goes out
+as the `$scope` token, for a sidebar row that would rather carry it on its own.
 
 One sentence an agent does not have to remember to say: while it is looking for
 work, `wsp next` and `wsp brief` say it for it — `looking for work in render`,
