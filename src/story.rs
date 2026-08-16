@@ -879,6 +879,7 @@ fn scenes() -> Vec<Scene> {
     );
 
     out.extend(detail_scenes(&w));
+    out.extend(board_scenes(&w));
     out
 }
 
@@ -945,6 +946,90 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
         shot("Detail: a parent", "A task with work decomposed under it — what an agent given direction on this one would make for itself. The panel shows the shape as indentation and a count; there is room here to say which children and what state each is in, which is the question you open a parent to ask.", Focus::Task("t-005".into())),
         shot("Detail: a project", "↵ on a project: rolled-up work, what sits under it, and its own tasks in the panel's order.", Focus::Project("trance".into())),
         shot("Detail: nothing yet", "The pane before anything is opened. It is a reader — it waits rather than guessing.", Focus::Nothing),
+    ]
+}
+
+/// The board, over the same fixture. A second surface on the same facts, so a
+/// glyph or a colour that drifts in one drifts visibly against the other.
+///
+/// Wider than the panel and shorter, because that is what it is: the panel is a
+/// sidebar and this opens in a tab of its own.
+fn board_scenes(w: &Snapshot) -> Vec<Scene> {
+    use crate::kanban::{self, Cursor, Scope};
+    const BW: usize = 96;
+    const BH: usize = 22;
+
+    let ctx = kanban::Ctx {
+        tasks: w.tasks.clone(),
+        index: crate::resolve::Index::new(w.projects.clone()),
+        bindings: w.bindings.clone(),
+        // No `claimed_at`, for the reason the panel's fixture gives: a live
+        // claim prints how long it has been held, and a fixture that says
+        // "356d" is a fixture whose age is showing.
+        claims: BTreeMap::new(),
+        panes: w.panes.clone(),
+        workspaces: w.workspaces.clone(),
+    };
+
+    let shot = |title: &str, caption: &str, scope: Scope, cur: Cursor, done: bool, note: &str| {
+        let board = kanban::collect(&ctx, &scope, done);
+        let target = match board.card_at(&cur) {
+            Some(c) => format!("task {}", c.id),
+            None => "nothing".into(),
+        };
+        Scene {
+            title: title.to_string(),
+            caption: caption.to_string(),
+            gesture: "K".into(),
+            target,
+            html: panel::to_html(&kanban::frame(&board, &cur, BW, BH, note), BW),
+        }
+    };
+
+    // Where a key would land, pushed through the same reducer the live board
+    // runs — so a scene can only show a state you could arrive at.
+    let after = |scope: Scope, done: bool, keys: &[Key]| -> Cursor {
+        let board = kanban::collect(&ctx, &scope, done);
+        let mut cur = Cursor::default();
+        for k in keys {
+            kanban::apply_key(*k, &board, &mut cur);
+        }
+        cur
+    };
+
+    vec![
+        shot(
+            "The board",
+            "K opens the work by state rather than by tree: one column per lane, cards in each. The same join the panel makes — what herdr says about a pane, against what the store holds — drawn as a mark on the card an agent is on. The column the cursor is in is named in the live ink, because a board with three empty columns otherwise gives no clue where a verb would land.",
+            Scope::Everything,
+            Cursor::default(),
+            false,
+            "",
+        ),
+        shot(
+            "Scoped to a project",
+            "A board of one project and everything filed beneath it — sub-projects included, since a parent whose work all lives in its children would otherwise open as four empty columns. Scoped, the cards stop naming their project: it is the heading.",
+            Scope::Project("vst".into()),
+            after(Scope::Project("vst".into()), false, &[Key::Char('l'), Key::Char('j')]),
+            false,
+            "",
+        ),
+        shot(
+            "Finished work, brought back",
+            "A shows the done column. Off by default because a board is what is in flight, and a year of completions would be the widest column on it — but the question \"what did we finish\" is asked often enough to be one key away.",
+            Scope::Project("tooling".into()),
+            after(Scope::Project("tooling".into()), true, &[Key::Char('l'), Key::Char('l'), Key::Char('l')]),
+            true,
+            "",
+        ),
+        shot(
+            "A verb with nothing under it",
+            "The cursor in an empty column. A key aimed at nothing has to say so in the footer — silence reads as a board that has stopped answering, which is the one thing a live surface must never look like.",
+            Scope::Inbox,
+            after(Scope::Inbox, false, &[Key::Char('l')]),
+            false,
+            "nothing here to send to review",
+        ),
     ]
 }
 
@@ -1093,12 +1178,13 @@ fn page(scenes: &[Scene]) -> String {
     out.push_str("</style>\n<div class=\"wrap\">\n");
     out.push_str(
         "<header>\
-         <p class=\"eyebrow\">wsp · panel</p>\
-         <h1>Every state the sidebar can reach</h1>\
+         <p class=\"eyebrow\">wsp · panel · detail · board</p>\
+         <h1>Every state these surfaces can reach</h1>\
          <p>Each frame below is the real renderer over a fixed fixture — no herdr, \
          no store, no terminal. The flows are produced by pushing the keys shown \
-         through the same reducer the live panel runs, so a scene can only show a \
-         state you could actually arrive at.</p>\
+         through the same reducer the live surface runs, so a scene can only show a \
+         state you could actually arrive at. All three draw from one fixture, so a \
+         glyph or a colour that drifts in one drifts visibly against the others.</p>\
          </header>\n",
     );
     out.push_str("<section class=\"legend\"><h2 class=\"sec\">What the marks mean</h2>\n");
@@ -4197,4 +4283,53 @@ mod tests {
             _ => panic!("the next ask never came up"),
         }
     }
+
+    /// The board's scenes are the proof that its seam is real: kanban::Ctx has
+    /// existed since the board landed and nothing outside a live herdr had ever
+    /// built one. A frame that comes out empty, or at the wrong size, or with
+    /// the cursor pointing at a card that is not there, is a seam that only
+    /// looks like one.
+    #[test]
+    fn the_board_draws_from_a_fixture_with_nothing_running() {
+        let w = world();
+        let scenes = board_scenes(&w);
+        assert!(!scenes.is_empty());
+
+        // The frames are html; what a reader sees is the text between the
+        // tags, and a column heading split across two spans is still one word
+        // on the screen.
+        let text = |html: &str| {
+            let mut out = String::new();
+            let mut inside = false;
+            for c in html.chars() {
+                match c {
+                    '<' => inside = true,
+                    '>' => inside = false,
+                    _ if !inside => out.push(c),
+                    _ => {}
+                }
+            }
+            out
+        };
+
+        for s in &scenes {
+            assert!(text(&s.html).contains("todo"), "{}: no columns\n{}", s.title, s.html);
+            // Every scene names what a verb would act on, and "nothing" is only
+            // right for the one scene that is about an empty column.
+            let empty = s.target == "nothing";
+            assert_eq!(
+                empty,
+                s.title.contains("nothing under it"),
+                "{}: cursor is on {}",
+                s.title,
+                s.target
+            );
+        }
+
+        // The done column is off unless a scene asks for it, and one does —
+        // otherwise the key that brings it back is drawn nowhere.
+        let done: Vec<&Scene> = scenes.iter().filter(|s| text(&s.html).contains("done 1")).collect();
+        assert_eq!(done.len(), 1, "exactly one scene shows finished work");
+    }
+
 }
