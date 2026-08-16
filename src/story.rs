@@ -677,7 +677,7 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('w'))
             .scene(
                 "The agents, not the work",
-                "`w` puts every running agent in place of the tree, in runs under the project each one belongs to and ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ? stopped on a task parked with a question, in a colour of its own because an answer is a different thing to ask for than a nudge, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The heading is what the tree would have said by where it drew the row, and it is where the project used to be repeated down the right of every line; the groups come in the order of whoever in each of them most wants you, so grouping says where an agent belongs without changing who you read first. Only the agents take the cursor — a heading neither folds nor selects, because every row you can reach here leads to a terminal, and that is what keeps ↵, `c` and 1-9 meaning what they mean.",
+                "`w` puts every running agent in place of the tree, in runs under the project each one belongs to and ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ? stopped on a task parked with a question, in a colour of its own because an answer is a different thing to ask for than a nudge, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The heading is what the tree would have said by where it drew the row, and it is where the project used to be repeated down the right of every line; the groups come in the tree's own order and step in where one project lives inside another, because the panel has one spine and a second arrangement of the same projects is one more thing to hold in your head. Urgency is answered where it can be without moving a project — the strip is the whole census by state, and inside a run what wants you is at the top. Only the agents take the cursor — a heading neither folds nor selects, because every row you can reach here leads to a terminal, and that is what keeps ↵, `c` and 1-9 meaning what they mean.",
             ),
     );
 
@@ -1356,14 +1356,18 @@ mod tests {
     /// repeated word is least read — as a heading it is said once and the run
     /// under it answers "who is on this" without anybody counting.
     ///
-    /// The groups are ordered by whoever in each of them most wants you, not by
-    /// name: the list is read from the top for who has stopped, and a heading is
-    /// no reason to bury an agent asking for an answer under three that are
-    /// working. `verb` leads because its agent is the one asking, `wsp` is last
-    /// because its agent has said nothing at all, and the two groups that tie
-    /// break on the name — with the panes that resolve nowhere behind the
-    /// named ones, because `no project` is the least that can be said about a
-    /// pane.
+    /// The groups come in the tree's order, through the same walk the tree
+    /// makes. Ed: "we're not respecting the tree here, so my current version is
+    /// render->strata-prototype->wsp even though render is _below_ wsp in the
+    /// tree." Ordering them by who most wants you was a second arrangement of
+    /// the same projects to hold in your head, and it read as a list that had
+    /// lost the tree: `render` is inside `wsp` on every other surface.
+    ///
+    /// Urgency is answered where it can be without moving a project — the strip
+    /// is the whole census by state, and inside each run the census's own order
+    /// stands, so what wants you is at the top of the group it belongs to. The
+    /// panes that resolve nowhere are last of all: `no project` is the least
+    /// that can be said about a pane.
     #[test]
     fn the_agents_view_stands_each_agent_under_its_project() {
         let w = world();
@@ -1387,25 +1391,29 @@ mod tests {
             }
         }
 
-        assert_eq!(order, ["verb", "trance", "no project", "wsp"], "the groups, in order");
+        // `trance` and `verb` are both inside `vst`, which has no agents and so
+        // no heading; `wsp` is under `meta`, which has none either. The walk
+        // goes through them to reach the three that do.
+        assert_eq!(order, ["trance", "verb", "wsp", "no project"], "the groups, in the tree's order");
         assert_eq!(
             under,
             [
-                // Asking, then blocked: the census's own order, kept inside
-                // each run so an agent sits where the strip and the dock put it.
-                ("verb".into(), "w2:p1".into()),
-                ("verb".into(), "w3:p2".into()),
                 // Spare before working, there as everywhere: there is nothing
                 // to do about an agent that is busy. One is placed by the
                 // checkout it stands in and one by the task it holds — the two
                 // ways a pane comes to belong somewhere.
                 ("trance".into(), "w4:p2".into()),
                 ("trance".into(), "w1:p1".into()),
-                // Neither: a pane herdr reports from one directory above every
-                // checkout, which is the commonest pane there is.
+                // Asking, then blocked: the census's own order, kept inside
+                // each run so an agent sits where the strip and the dock put it.
+                ("verb".into(), "w2:p1".into()),
+                ("verb".into(), "w3:p2".into()),
+                ("wsp".into(), "w5:p2".into()),
+                // Neither a task nor a checkout: a pane herdr reports from one
+                // directory above every checkout, which is the commonest pane
+                // there is.
                 ("no project".into(), "w6:p1".into()),
                 ("no project".into(), "w3:p1".into()),
-                ("wsp".into(), "w5:p2".into()),
             ],
             "every agent under the heading that places it",
         );
@@ -1416,6 +1424,49 @@ mod tests {
             (0..ui.rows_for_test()).map(|i| panel::render_row_for_test(&ui, i, W).text()).collect();
         let row = names.iter().find(|l| l.contains("Trance Video")).expect("w1:p1's row");
         assert!(!row.contains("trance"), "the project twice over: {row}");
+    }
+
+    /// And a project inside another is drawn inside it: the case Ed reported,
+    /// where `render` lives under `wsp` and the view had them the other way up.
+    /// The heading steps right and the agents under it do not — a run is read
+    /// down one column whatever its heading is nested in, and thirty-four
+    /// characters go on being thirty-four.
+    #[test]
+    fn a_project_inside_another_is_drawn_inside_it() {
+        let mut w = world();
+        // A child of `wsp` with a checkout inside `wsp`'s own, which is how
+        // every real one of these is laid out.
+        let mut child = project("panel", Some("wsp"));
+        child.roots = vec!["~/claude/wsp/panel".into()];
+        w.projects.push(child);
+        // The pane that was standing nowhere, moved into it. Longest root wins,
+        // so it lands in `panel` rather than the `wsp` it is also inside.
+        let pane = w.panes.iter_mut().find(|p| p.pane_id == "w3:p1").expect("w3:p1");
+        pane.cwd = "~/claude/wsp/panel".into();
+
+        let (mut ui, _view) = showing(&w, &[Key::Char('w')]);
+        let mut headings = Vec::new();
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_kind() == panel::RowKind::Group {
+                headings.push(panel::render_row_for_test(&ui, i, W).text());
+            }
+        }
+        let at = |name: &str| -> usize {
+            let row = headings.iter().find(|h| h.contains(name)).unwrap_or_else(|| {
+                panic!("no heading for {name} in {headings:?}")
+            });
+            row.chars().take_while(|c| *c == ' ').count()
+        };
+        assert!(
+            headings.iter().position(|h| h.contains("wsp")).unwrap()
+                < headings.iter().position(|h| h.contains("panel")).unwrap(),
+            "the parent first: {headings:?}",
+        );
+        assert_eq!(at("panel"), at("wsp") + 1, "one step in, under the project it is inside");
+        // And `trance`, whose parents have no agents and so no headings, starts
+        // where `wsp` does: there is nothing on screen for it to be inside of.
+        assert_eq!(at("trance"), at("wsp"), "no heading above it to be indented under");
     }
 
     /// herdr says `idle` for four of the panes in the fixture and means four
@@ -1442,12 +1493,12 @@ mod tests {
         assert!(row("just started").contains(panel::glyph::QUIET));
         assert!(row("Trance Video").contains(panel::glyph::WORKING));
 
-        // What wants you is at the top, because that is what the list is read
-        // for. Sorted by state, so the first agent is never a working one —
-        // and grouping does not change that: the project whose agent is asking
-        // is the project the list opens on.
-        assert!(lines[0].contains("verb"), "the heading over it: {}", lines[0]);
-        assert!(lines[1].contains(panel::glyph::NEEDS_YOU), "{}", lines[1]);
+        // What wants you is at the top of the run it is in, because that is
+        // what a list of agents is read for. The groups follow the tree and the
+        // agents inside one follow their state, so the heading is never
+        // between you and the row that is asking.
+        let verb = lines.iter().position(|l| l.trim_start().starts_with("verb")).expect("verb");
+        assert!(lines[verb + 1].contains(panel::glyph::NEEDS_YOU), "{}", lines[verb + 1]);
     }
 
     /// The strip is the census, not a summary of whatever the tree is showing.

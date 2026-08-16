@@ -296,7 +296,12 @@ pub(super) enum Row {
     /// could land on would be the one row where none of the three did — which
     /// is also why it does not fold. `Section` is the heading that does both,
     /// and it is the tree's.
-    Group { project: Option<String>, n: usize },
+    ///
+    /// `depth` is how far inside another drawn group this project sits, so the
+    /// runs keep the shape the tree gives the same projects. The agents under
+    /// it do not move with it: a heading steps right, its rows stay in their
+    /// column, and thirty-four characters go on being thirty-four.
+    Group { project: Option<String>, depth: usize, n: usize },
     /// A line that belongs to the row above it. The cursor never lands on one
     /// and no digit addresses one: it is the second and third line of one
     /// agent, in the view that has the room to spend three lines on one.
@@ -1550,8 +1555,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // "who is on this project" without anybody counting.
     let (rows, dock) = if view.agents {
         let mut list: Vec<Row> = Vec::new();
-        for (project, group) in by_project(&census) {
-            list.push(Row::Group { project: project.clone(), n: group.len() });
+        for (project, depth, group) in by_project(&census, &index) {
+            list.push(Row::Group { project: project.clone(), depth, n: group.len() });
             for i in group {
                 let (state, c, a) = &census[i];
                 list.push(Row::Agent {
@@ -1672,20 +1677,33 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     }
 }
 
-/// The census in runs, one per project: the heading, and which agents stand
-/// under it, by their place in `census`.
+/// The census in runs, one per project: the heading, how deep it sits, and
+/// which agents stand under it, by their place in `census`.
 ///
-/// The groups are ordered by whoever in each of them most wants you, and only
-/// then by name. The list is read from the top for who has stopped, and a
-/// heading is no reason to put an agent asking for an answer below three that
-/// are working — grouping is meant to say where an agent belongs, not to
-/// reorder who needs looking at first. Ties break on the name, with the ones
-/// belonging nowhere last: `no project` is where a pane lands when nothing
-/// could be worked out about it, which is the least you can say about one.
+/// In the tree's own order, depth-first through the same walk the tree makes,
+/// and indented where one group's project lives inside another's. The panel has
+/// one spine and it is the project tree — `render` is inside `wsp` on every
+/// other surface, so a view that put it above `wsp` because somebody there had
+/// stopped would be a second arrangement of the same projects to hold in your
+/// head. Ordering by urgency was that, and it read as a list that had lost the
+/// tree: the question "which of these is under which" had no answer on screen.
 ///
-/// Within a run the census's own order stands, so an agent is in the same place
-/// relative to its neighbours here as it is in the strip and the dock.
-fn by_project(census: &[(AgentState, Census, AgentRef)]) -> Vec<(Option<String>, Vec<usize>)> {
+/// Urgency is still answered, twice, in the places that can answer it without
+/// moving a project: the strip in the header is the whole census by state, and
+/// inside each run the census's own order stands — so an agent sits where the
+/// strip and the dock already put it, and what wants you is at the top of the
+/// group it belongs to.
+///
+/// The depth counts only the ancestors that are *drawn*, because only they are
+/// on screen to be inside of: a group whose parent has no agents starts at the
+/// left margin rather than indented under a heading that is not there. Projects
+/// the index has never heard of come after the walk, and the panes that resolve
+/// nowhere come last of all — `no project` is the least that can be said about
+/// a pane.
+fn by_project(
+    census: &[(AgentState, Census, AgentRef)],
+    index: &Index,
+) -> Vec<(Option<String>, usize, Vec<usize>)> {
     let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
     for (i, (_, c, _)) in census.iter().enumerate() {
         match groups.iter_mut().find(|(p, _)| *p == c.project) {
@@ -1693,15 +1711,45 @@ fn by_project(census: &[(AgentState, Census, AgentRef)]) -> Vec<(Option<String>,
             None => groups.push((c.project.clone(), vec![i])),
         }
     }
-    // `xs[0]` is the group's most urgent because the census is already sorted
-    // by state — the same order this preserves inside each run.
-    groups.sort_by(|(ap, ax), (bp, bx)| {
-        let key = |p: &Option<String>, xs: &[usize]| {
-            (census[xs[0]].0, p.is_none(), p.clone().unwrap_or_default())
-        };
-        key(ap, ax).cmp(&key(bp, bx))
-    });
-    groups
+
+    // The tree's walk, so the two surfaces name the projects in one order. A
+    // project with no agents is not a heading — there is nothing to put under
+    // it — but it is still walked through to reach the ones that are.
+    fn walk(index: &Index, parent: Option<&str>, out: &mut Vec<String>) {
+        for p in index.children(parent) {
+            out.push(p.id.clone());
+            walk(index, Some(&p.id), out);
+        }
+    }
+    let mut order: Vec<String> = Vec::new();
+    walk(index, None, &mut order);
+
+    let drawn: Vec<String> = groups.iter().filter_map(|(p, _)| p.clone()).collect();
+    let mut out: Vec<(Option<String>, usize, Vec<usize>)> = Vec::new();
+    let mut take = |p: &Option<String>, groups: &mut Vec<(Option<String>, Vec<usize>)>| {
+        if let Some(i) = groups.iter().position(|(g, _)| g == p) {
+            let (g, xs) = groups.remove(i);
+            let depth = g
+                .as_deref()
+                .map(|id| {
+                    index.ancestors(id).iter().filter(|a| drawn.iter().any(|d| d == *a)).count()
+                })
+                .unwrap_or(0);
+            out.push((g, depth, xs));
+        }
+    };
+    for id in order {
+        take(&Some(id), &mut groups);
+    }
+    // Whatever the walk could not reach: a project the store has lost, or one
+    // whose parent it has. Named, so it is not folded in with the panes that
+    // resolve nowhere — those are a different fact, and the last one.
+    groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let rest: Vec<Option<String>> = groups.iter().map(|(p, _)| p.clone()).collect();
+    for p in rest.iter().filter(|p| p.is_some()).chain(rest.iter().filter(|p| p.is_none())) {
+        take(p, &mut groups);
+    }
+    out
 }
 
 /// The flags, newest first — the order the section draws them in and the order
@@ -1962,13 +2010,14 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
         }
         // A heading rather than a section: no caret, because there is nothing
         // to fold — the agents view is the census, and a census with a run of
-        // it folded away is a count you cannot trust. Unindented, with the run
-        // beneath it stepped in one, so the shape says which is which before
-        // any word is read.
-        Row::Group { project, n } => {
+        // it folded away is a count you cannot trust. Stepped in by the tree's
+        // own depth, with the run beneath it always in the same column, so the
+        // shape says which heading is inside which and costs the rows nothing.
+        Row::Group { project, depth, n } => {
             l.push(Style::Plain, " ");
+            l.pad(*depth);
             let right = line(Style::Dim, n.to_string());
-            let avail = w.saturating_sub(right.width() + 2).max(4);
+            let avail = w.saturating_sub(right.width() + depth + 2).max(4);
             match project {
                 Some(p) => l.push(Style::Bold, util::truncate(p, avail)),
                 // The words the tree's own group of homeless panes uses. Two
