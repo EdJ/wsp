@@ -250,7 +250,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::NOTES)], "written on", "something is in this row's Overview or Details — E opens it"),
                 mark(&[(Style::Warn, g::FLAG)], "raised", "an agent has flagged this task and said why — x lowers it"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
-                mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "agents"), (Style::Plain, " "), (Style::Dim, "7")], "the section", "pinned at the foot: five agents, in the strip's order, with the count of all of them"),
+                mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "agents"), (Style::Plain, " "), (Style::Dim, "7")], "the section", "pinned at the foot: the five agents the strip puts first, under the project each is in, with the count of all of them"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
                 mark(&[(Style::Accent, "+done")], "showing done", "A is on, so finished work is included"),
             ],

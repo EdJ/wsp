@@ -588,7 +588,7 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .to_pane("w2:p1")
-            .scene("The agents, always on", "Under a rule of its own at the foot: the agents, five of them, in the order the strip is drawn in — what wants you, what is free, what is busy. Pinned, so the tree above scrolls and this does not, because who has stopped is the question you ask between reading anything else and it must not be a keystroke away. The heading counts them all, so the sixth is never silently absent, and 1-9 start here rather than in the tree: a digit you can always see is worth more than one in row order."),
+            .scene("The agents, always on", "Under a rule of its own at the foot: the agents, five of them, picked in the order the strip is drawn in — what wants you, what is free, what is busy — and then stood under the project each one is in, the same runs `w` draws at length. Which five is a question about who has stopped; where they sit is a question about the tree, and neither answer is allowed to be the other's. Pinned, so the tree above scrolls and this does not, because who has stopped is the question you ask between reading anything else and it must not be a keystroke away. The headings cost the foot a row each and give the rows back the column the project used to be repeated down — a pane's name has half the width here that it has in the tree, and it is the same name. The section's heading counts them all, so the sixth is never silently absent, and 1-9 start here rather than in the tree: a digit you can always see is worth more than one in row order."),
     );
 
     out.push(
@@ -1543,9 +1543,21 @@ mod tests {
         let agent = ui.selected_index();
         assert_eq!(ui.selected_kind(), panel::RowKind::Agent);
         let detail = screen_row(&ui, &view, agent + 1);
+
+        // The cursor is elsewhere, so the click brings it here.
+        panel::apply_key(Key::Down, &mut ui, &mut view);
+        assert_ne!(ui.selected_index(), agent);
         assert_eq!(panel::click(&mut ui, &mut view, W, H, 2, detail, WORKING_HERE), panel::Hit::Select);
         assert_eq!(ui.selected_index(), agent, "the agent it belongs to");
         assert_eq!(ui.selected_kind(), panel::RowKind::Agent);
+
+        // And the second click on the same words is `↵` on that agent, exactly
+        // as a second click on its own row is: what the pointer is on has not
+        // changed, so what the click means must not either.
+        assert_eq!(
+            panel::click(&mut ui, &mut view, W, H, 2, detail, WORKING_HERE),
+            panel::Hit::Activate,
+        );
     }
 
     /// And the heading over a run belongs to the agents *under* it. Walking up
@@ -1670,6 +1682,63 @@ mod tests {
             .expect("a row the cursor is not on");
         assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, other, nobody), panel::Hit::Keyboard);
         assert_eq!(ui.selected_index(), sel, "nothing under the pointer was read at all");
+    }
+
+    /// Ed: "looks like that's only applied to the popover agents mode (w), not
+    /// the inline agents panel — let's apply to both."
+    ///
+    /// One census, one arrangement of it. The section at the foot stands its
+    /// agents under the same headings in the same tree order, and the project
+    /// comes off the right of the rows there too — which is where that column
+    /// cost most, since a pane's name has about half the width in the foot that
+    /// it has in the tree.
+    ///
+    /// What the cap means is unchanged, and that is the half worth pinning
+    /// down: the five on screen are still the five the census puts first, so an
+    /// agent asking for you is never displaced by one that is merely busy in a
+    /// project the tree happens to walk sooner. The cap picks; the tree only
+    /// arranges what it picked.
+    #[test]
+    fn the_section_at_the_foot_is_grouped_the_same_way() {
+        let w = world();
+        let (mut ui, _view) = showing(&w, &[]);
+        let census = ui.census_for_test();
+        let docked = ui.dock_for_test();
+
+        let mut headings = Vec::new();
+        let mut panes = Vec::new();
+        for i in ui.rows_for_test() - docked..ui.rows_for_test() {
+            ui.select_for_test(i);
+            match ui.selected_kind() {
+                panel::RowKind::Group => headings.push(panel::full_text_for_test(&ui, i)),
+                panel::RowKind::Agent => match ui.selected_target() {
+                    panel::Target::Pane(p) => panes.push(p),
+                    t => panic!("an agent row that is not a pane: {t:?}"),
+                },
+                _ => {}
+            }
+        }
+
+        assert_eq!(headings, ["trance", "verb", "no project"], "the tree's order, in the foot");
+        let first_five: Vec<String> =
+            census.iter().take(5).map(|(_, a)| a.pane().to_string()).collect();
+        let mut sorted = panes.clone();
+        sorted.sort();
+        let mut want = first_five.clone();
+        want.sort();
+        assert_eq!(sorted, want, "the five the census puts first, whatever the tree does");
+        assert_ne!(panes, first_five, "and stood in runs rather than left in that order");
+
+        // The heading says the project, so the rows do not — the width goes to
+        // the name, which in this pane is what was being cut.
+        let names: Vec<String> =
+            (0..ui.rows_for_test()).map(|i| panel::render_row_for_test(&ui, i, W).text()).collect();
+        let row = names
+            .iter()
+            .filter(|l| l.contains("waiting on the tuning"))
+            .next_back()
+            .expect("the docked row for w3:p2");
+        assert!(row.contains("waiting on the tuning table"), "cut short for a project: {row}");
     }
 
     /// The section keeps a few on screen and says how many there are, so the

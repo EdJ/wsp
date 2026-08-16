@@ -971,6 +971,14 @@ pub(crate) fn click(
             if !ui.rows[owner].selectable() {
                 return Hit::Nothing;
             }
+            // From here it is a click on that row, including the second one:
+            // point at a heading twice and you meant the agent it stands over
+            // both times, so the first selects it and the next goes there.
+            // Anything else makes a line you can click forever without it ever
+            // meaning `↵`.
+            if owner == ui.sel {
+                return Hit::Activate;
+            }
             view.scroll = Some(at);
             view.keyed = false;
             ui.sel = owner;

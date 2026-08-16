@@ -1555,7 +1555,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // "who is on this project" without anybody counting.
     let (rows, dock) = if view.agents {
         let mut list: Vec<Row> = Vec::new();
-        for (project, depth, group) in by_project(&census, &index) {
+        let all: Vec<usize> = (0..census.len()).collect();
+        for (project, depth, group) in by_project(&census, &index, &all) {
             list.push(Row::Group { project: project.clone(), depth, n: group.len() });
             for i in group {
                 let (state, c, a) = &census[i];
@@ -1616,22 +1617,45 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             // tree that is still a tree. The heading counts them all, so a
             // sixth agent is never silently absent, and `⋯` opens the rest in
             // place for anyone who would rather not leave the tree at all.
+            //
+            // In runs, like the view `w` gives — one surface over the census,
+            // so it is arranged one way. The cap still picks by state, so the
+            // five on screen are the five that most want you; the tree only
+            // says where they sit once picked. The headings are rows the foot
+            // did not spend before, and they are what the right-hand column
+            // used to spend on saying the same project down every line.
+            let before = rows.len();
             let more = view.expanded.contains(AGENTS_KEY);
             let shown = if more { census.len() } else { census.len().min(MAX_AGENTS_DOCKED) };
-            for (state, c, a) in census.iter().take(shown) {
-                rows.push(Row::Agent {
-                    title: a.where_.clone(),
-                    agent: a.clone(),
-                    depth: 1,
-                    state: *state,
-                    census: Some(c.clone()),
-                });
+            let take: Vec<usize> = (0..shown).collect();
+            for (project, depth, group) in by_project(&census, &index, &take) {
+                // A step in on the section's own indent, where the view that
+                // has no section above it starts at the margin.
+                rows.push(Row::Group { project, depth: depth + 1, n: group.len() });
+                for i in group {
+                    let (state, c, a) = &census[i];
+                    rows.push(Row::Agent {
+                        title: a.where_.clone(),
+                        agent: a.clone(),
+                        depth: 1,
+                        state: *state,
+                        // The heading says the project here too, so the row
+                        // gets the width back — and these are the rows that
+                        // needed it most: a name in the foot is cut at half
+                        // what the same name has in the tree.
+                        census: Some(Census { project: None, ..c.clone() }),
+                    });
+                }
             }
             let hidden = census.len() - shown;
             if hidden > 0 {
                 rows.push(Row::More { key: AGENTS_KEY.to_string(), depth: 1, n: hidden });
             }
-            let dock = shown + usize::from(hidden > 0) + 1;
+            // Counted rather than added up: the headings make the section's
+            // height depend on how many projects the five span, and a `dock`
+            // that disagreed with the rows would put the seam between tree and
+            // foot in the wrong place — which is a cursor that jumps.
+            let dock = rows.len() - before + 1;
             (rows, dock)
         }
     };
@@ -1680,6 +1704,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
 /// The census in runs, one per project: the heading, how deep it sits, and
 /// which agents stand under it, by their place in `census`.
 ///
+/// `take` is which of the census to arrange, in census order — everything, for
+/// the view that has room for everything, and the first few for the section at
+/// the foot that does not. The cap picks and this arranges: which agents are on
+/// screen is a question about who has stopped, and where they sit is a question
+/// about the tree, and neither answer is allowed to be the other's.
+///
 /// In the tree's own order, depth-first through the same walk the tree makes,
 /// and indented where one group's project lives inside another's. The panel has
 /// one spine and it is the project tree — `render` is inside `wsp` on every
@@ -1703,9 +1733,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
 fn by_project(
     census: &[(AgentState, Census, AgentRef)],
     index: &Index,
+    take: &[usize],
 ) -> Vec<(Option<String>, usize, Vec<usize>)> {
     let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
-    for (i, (_, c, _)) in census.iter().enumerate() {
+    for &i in take {
+        let c = &census[i].1;
         match groups.iter_mut().find(|(p, _)| *p == c.project) {
             Some((_, xs)) => xs.push(i),
             None => groups.push((c.project.clone(), vec![i])),
