@@ -39,7 +39,7 @@ use crate::Args;
 /// onto, and `spawn` says it to the agent it just started. Two wordings would
 /// be two contracts.
 pub fn claimed_text(task: &str) -> String {
-    format!("You have been claimed onto {task}. Run `wsp brief`, then work it.")
+    format!("You have been claimed onto {task}. Please run `wsp brief`, then begin work on the task when you're ready.")
 }
 
 /// Open a workspace for a piece of work, rooted where that work lives.
