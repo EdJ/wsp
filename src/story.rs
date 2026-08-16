@@ -245,6 +245,11 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // showing. The panel draws the duration when there is one and says
         // nothing when there is not, which is what these frames show.
         claims: BTreeMap::new(),
+        // Nothing raised. A flag is an interruption and the world is what the
+        // panel looks like when nobody is interrupting — [`flagged_world`] is
+        // the one that shows the section, so every other frame goes on saying
+        // what the panel says on an ordinary afternoon.
+        flags: BTreeMap::new(),
         workspaces,
         panes: agents,
     }
@@ -256,6 +261,60 @@ fn quiet_world() -> Snapshot {
     let mut s = world();
     s.panes.clear();
     s.bindings.clear();
+    s
+}
+
+/// Two agents asking to be looked at.
+///
+/// One is the case the feature was asked for — an agent that has found work it
+/// thinks it should take and cannot decide that for itself. The other is the
+/// weaker and commoner one: a task that exists and wants eyes, with nothing
+/// written on it beyond that, which the row has to draw as the title rather
+/// than as an empty line.
+fn flagged_world() -> Snapshot {
+    let mut s = world();
+    s.flags.insert(
+        "t-105".to_string(),
+        json!({
+            "said": "this is next — can I take it?",
+            "title": "the panel work, in order",
+            "body": "Items 1-4 are done and this one is the first that is not. \
+It needs the reducer, which nobody else is in, so it will not collide with \
+anything running.\n\nI have context on it already — I wrote the four above it.",
+            "ask": "claim",
+            // A spare agent, and idle — which is what makes the sentence
+            // reach it when the ask is answered. herdr calls the pane in w5
+            // neither working nor idle, and a `y` there would land the claim
+            // and go untold, the same way `c` does on a pane that has not
+            // spoken since it started.
+            "pane": "w4:p2",
+            "at": "2026-08-16T09:41:00Z",
+        }),
+    );
+    // Read, and still up: the card has been put away and the row is what is
+    // left. Also the older of the two, so the fixture shows the card that comes
+    // up *next* rather than the one somebody has already dealt with.
+    s.flags.insert(
+        "t-004".to_string(),
+        json!({ "said": "", "pane": "w2:p1", "at": "2026-08-16T09:12:00Z", "seen": true }),
+    );
+    s
+}
+
+/// The same asks, every one of them read.
+///
+/// A card is up for as long as it takes to answer and the section is up until
+/// somebody deals with the work, so this is what the panel looks like for the
+/// vastly longer half of a flag's life — and it is the fixture anything about
+/// the *section* has to use, because a card holds the keyboard and a frame with
+/// one up is a frame where no other key did anything.
+fn read_world() -> Snapshot {
+    let mut s = flagged_world();
+    for f in s.flags.values_mut() {
+        if let Some(m) = f.as_object_mut() {
+            m.insert("seen".into(), json!(true));
+        }
+    }
     s
 }
 
@@ -479,7 +538,7 @@ fn scenes() -> Vec<Scene> {
 
     out.push(Driver::new(&w).scene(
         "Live",
-        "Three agents. One working a task (●), one idle on a task that is still doing — which raises the ← asking for you — and one unclaimed at the foot. The cursor opens on the inbox, because unfiled work is what you triage before reading anything that already has a home.",
+        "Three agents. One working a task (●), one idle on a task that is still doing — which raises the ← asking for you, on the agent's own row in the tree as well as in the strip — and one unclaimed at the foot. An agent is drawn the same way wherever it appears: the tree used to give every stopped pane the same grey ○ and leave the difference to the section at the foot. The cursor opens on the inbox, because unfiled work is what you triage before reading anything that already has a home.",
     ));
 
     out.push(
@@ -582,12 +641,43 @@ fn scenes() -> Vec<Scene> {
             ),
     );
 
+    let f = flagged_world();
+    let r = read_world();
+
+    out.push(Driver::new(&r).scene(
+        "A hand raised",
+        "`wsp flag <id> \"why\"` is how an agent asks to be looked at, and this is where it arrives: a section pinned above the agents, in every panel, without anybody pressing anything. The sentence is what the row draws, because the sentence is the news — the task's own title is up in the tree with a `\u{25b2}` on it, and the pane that raised it is on the right. A flag with nothing written on it draws the title instead, which is the whole of \"look at this, it exists\". The footer counts them for the pane too short to give the section any rows.",
+    ));
+
+    out.push(Driver::new(&f).scene(
+        "The card, which nobody pressed a key for",
+        "A raised hand comes up over the tree on its own — this is the one thing on the panel that arrives rather than being asked for, and the only one drawn with a border: everything else here is furniture that is always there, and a rule is enough to separate that. It is inset by a column so the rows behind it show at both edges, which is the difference between a card lying on the tree and a pane that has replaced it. The heading is the agent's own where it wrote one, because a task's title is often the wrong sentence for the moment. It holds the keyboard while it is up, so `y` cannot land on the tree behind it, and it never covers the section at the foot — answering one ask must not hide the queue of the others.",
+    ));
+
+    out.push(
+        Driver::new(&f)
+            .key(Key::Esc)
+            .scene(
+                "Not now",
+                "`esc` is *not now*: the card goes and the hand stays raised, so the section still says somebody is waiting and `↵` on that row brings the card back. It is written into the flag rather than remembered per panel — there are twenty-two panels, and a card put away on this one would otherwise come up again on the next one you switched to. `x` is the other answer, and it means dealt with: the flag comes down everywhere.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&r)
+            .down_to(panel::RowKind::Flag)
+            .scene(
+                "The flag is the task",
+                "The cursor is on a raised hand and the target is the task it points at — which is the deeplink the agent could not otherwise draw. Every verb already aimed at a task works from here: `\u{21b5}` opens it, `c` claims it, `s` starts it, `E` writes it up. `x` lowers the flag, and only `x` does: reading the ask must not be what clears it, or it would be gone from every panel before you had decided whether to leave it up.",
+            ),
+    );
+
     out.push(
         Driver::new(&w)
             .key(Key::Char('w'))
             .scene(
                 "The agents, not the work",
-                "`w` puts every running agent in place of the tree, ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ■ stopped on a task parked with a question, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The project on the right is what the tree would have said by where it drew the row. Every key still means what it means — ↵ jumps to the terminal, `c` hands it a task, 1-9 are the same hotkeys.",
+                "`w` puts every running agent in place of the tree, ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ? stopped on a task parked with a question, in a colour of its own because an answer is a different thing to ask for than a nudge, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The project on the right is what the tree would have said by where it drew the row. Every key still means what it means — ↵ jumps to the terminal, `c` hands it a task, 1-9 are the same hotkeys.",
             ),
     );
 
@@ -910,9 +1000,10 @@ pre.wsp .b { font-weight:700; }
 pre.wsp .m { color:#7D8C96; }
 pre.wsp .a { color:#5FBFA4; }
 pre.wsp .w { color:#E08A4B; }
+pre.wsp .q { color:#B08CD9; }
 pre.wsp .sel { background:#E4EAE7; color:#0D1110; }
 pre.wsp .sel .d, pre.wsp .sel .m, pre.wsp .sel .a, pre.wsp .sel .w,
-pre.wsp .sel .p { color:#0D1110; }
+pre.wsp .sel .q, pre.wsp .sel .p { color:#0D1110; }
 
 footer {
   margin-top:3rem; padding-top:1.25rem; border-top:1px solid var(--edge);
@@ -949,6 +1040,7 @@ h2.sec {
 .chip .m { color:#7D8C96; }
 .chip .a { color:#5FBFA4; }
 .chip .w { color:#E08A4B; }
+.chip .q { color:#B08CD9; }
 .mark dd { margin:0; display:flex; flex-direction:column; gap:.1rem; }
 .mark dd b { font-weight:600; font-size:.9rem; }
 .mark dd span { color:var(--sub); font-size:.83rem; }
@@ -1268,7 +1360,7 @@ mod tests {
         assert!(row("Verb UI").contains(panel::glyph::NEEDS_YOU));
         // Idle, holding a task parked with a question on it — waiting on an
         // answer that is at least written down.
-        assert!(row("waiting on the tuning").contains(panel::glyph::BLOCKED));
+        assert!(row("waiting on the tuning").contains(panel::glyph::QUESTION));
         // Idle, holding nothing at all: a person's worth of attention going spare.
         assert!(row("spare hands").contains(panel::glyph::IDLE));
         // No state from herdr yet, and nothing here pretends otherwise.
@@ -1289,12 +1381,12 @@ mod tests {
             panel::frame(ui, view, W, H)[0]
                 .text()
                 .chars()
-                .filter(|c| "←■●○·".contains(*c))
+                .filter(|c| "←?●○·".contains(*c))
                 .collect()
         };
         // One mark per agent, ordered as the list is: wants you, blocked,
         // spare, working, quiet.
-        let want = "←■○○●●·";
+        let want = "←?○○●●·";
 
         let (ui, mut view) = showing(&w, &[]);
         assert_eq!(marks(&ui, &mut view), want, "at rest");
@@ -3229,4 +3321,489 @@ mod tests {
         ));
     }
 
+
+    /// Put the cursor on the first row of a kind, wherever it is.
+    fn on_row_kind(ui: &mut panel::Ui, want: panel::RowKind) -> usize {
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_kind() == want {
+                return i;
+            }
+        }
+        panic!("no row of kind {want:?}");
+    }
+
+    /// A raised hand is on screen without anybody having asked for it, and it
+    /// stays on screen whatever view is up.
+    ///
+    /// That is the whole feature. `R` and `w` are filters over *work*, and a
+    /// flag is somebody asking for you rather than work waiting — so a section
+    /// that went quiet under either would be one you learn to distrust, and the
+    /// view you happened to leave the panel in would decide whether an agent
+    /// could reach you at all.
+    #[test]
+    fn a_raised_hand_is_pinned_in_every_view() {
+        // Read, so the keys under test reach the tree: a card holds the
+        // keyboard, and `R` pressed into one would prove nothing about `R`.
+        let f = read_world();
+        for keys in [vec![], vec![Key::Char('R')], vec![Key::Char('w')], vec![Key::Char('A')]] {
+            let (mut ui, _view) = showing(&f, &keys);
+            let docked = ui.dock_for_test();
+            let mut flags = 0;
+            for i in ui.rows_for_test() - docked..ui.rows_for_test() {
+                ui.select_for_test(i);
+                if ui.selected_kind() == panel::RowKind::Flag {
+                    flags += 1;
+                }
+            }
+            assert_eq!(flags, f.flags.len(), "raised hands went missing under {keys:?}");
+        }
+    }
+
+    /// The row is the deeplink: it stands for the task it points at, so every
+    /// verb already aimed at a task works from it without knowing flags exist.
+    ///
+    /// And the task's own row in the tree carries the mark, because once you
+    /// have read the ask the next question is what the work sits beside — which
+    /// is a question only the tree answers.
+    #[test]
+    fn the_flag_row_is_the_task_and_the_task_row_says_so() {
+        let f = read_world();
+        let (mut ui, _view) = showing(&f, &[]);
+
+        let at = on_row_kind(&mut ui, panel::RowKind::Flag);
+        assert_eq!(
+            ui.selected_target(),
+            panel::Target::Task("t-105".into()),
+            "the newest hand is the first row, and it means its task",
+        );
+        // Drawn twice on purpose — once here, once up in the tree — which is
+        // exactly the shape a pane row already has, and is why the cursor keeps
+        // which side of the dock it was on.
+        assert_eq!(
+            ui.rows_for_target(&panel::Target::Task("t-105".into())).len(),
+            2,
+            "the tree row and the raised hand are two ways to one task",
+        );
+        assert!(
+            panel::render_row_for_test(&ui, at, W).text().contains("this is next"),
+            "the sentence is what the row draws, cut to the pane like any other",
+        );
+
+        // The flag with nothing written on it falls back to the title, because
+        // "look at this, it exists" is a complete thing for an agent to say.
+        ui.select_for_test(at + 1);
+        assert!(
+            panel::render_row_for_test(&ui, at + 1, W).text().contains("release notes"),
+            "a flag with no sentence names the task instead",
+        );
+
+        // And the work is findable in place.
+        on_task(&mut ui, "t-105");
+        assert!(
+            panel::render_row_for_test(&ui, ui.selected_index(), W)
+                .text()
+                .contains(panel::glyph::FLAG),
+            "the task's own row carries the mark",
+        );
+    }
+
+    /// `x` lowers it, from either row, and runs the same CLI the agent raised
+    /// it with. Nothing else takes it down — reading the ask must not be what
+    /// clears it, or it is gone from every panel before you have decided
+    /// anything about it, including the decision to leave it up.
+    #[test]
+    fn x_lowers_a_raised_hand_and_only_a_raised_hand() {
+        let f = read_world();
+        let (mut ui, mut view) = showing(&f, &[]);
+
+        on_row_kind(&mut ui, panel::RowKind::Flag);
+        match panel::apply_key(Key::Char('x'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["flag", "--clear", "t-105"]);
+            }
+            _ => panic!("x on a raised hand should lower it"),
+        }
+
+        // From the task's own row too: you lower it from wherever you were
+        // when you read it, not by walking back down to the section.
+        on_task(&mut ui, "t-105");
+        match panel::apply_key(Key::Char('x'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["flag", "--clear", "t-105"]);
+            }
+            _ => panic!("x on a flagged task should lower it"),
+        }
+
+        // Opening it does not. `↵` on a raised hand brings its card back —
+        // reading the ask is not answering it, and nothing about the flag
+        // changes for having been read a second time.
+        on_row_kind(&mut ui, panel::RowKind::Flag);
+        assert!(matches!(
+            panel::apply_key(Key::Enter, &mut ui, &mut view),
+            panel::Effect::None,
+        ));
+        assert!(matches!(view.mode, panel::Mode::Card(_)), "↵ on a flag opens its card");
+
+        // And a task nobody has flagged is not something `x` can act on: it
+        // would otherwise be a key that quietly does nothing on most rows.
+        // The card goes away first — `esc` marks it read and leaves it raised,
+        // which is the state the section is for.
+        assert!(matches!(
+            panel::apply_key(Key::Esc, &mut ui, &mut view),
+            panel::Effect::Run { .. },
+        ));
+        on_task(&mut ui, "t-001");
+        assert!(matches!(
+            panel::apply_key(Key::Char('x'), &mut ui, &mut view),
+            panel::Effect::None,
+        ));
+    }
+
+    /// Three, and a `⋯` for the rest, so a burst of asks cannot push the census
+    /// it is pinned above off the pane — and none of them is silently absent,
+    /// because the heading counts them all.
+    #[test]
+    fn the_flag_section_keeps_three_and_counts_them_all() {
+        let mut f = read_world();
+        for (i, id) in ["t-001", "t-003", "t-020"].iter().enumerate() {
+            f.flags.insert(
+                (*id).to_string(),
+                json!({
+                    "said": format!("look at this {i}"),
+                    "pane": "w1:p1",
+                    "at": "2026-08-16T08:00:00Z",
+                    "seen": true,
+                }),
+            );
+        }
+        let (mut ui, mut view) = showing(&f, &[]);
+        let count = |ui: &mut panel::Ui| {
+            let docked = ui.dock_for_test();
+            let mut n = 0;
+            for i in ui.rows_for_test() - docked..ui.rows_for_test() {
+                ui.select_for_test(i);
+                if ui.selected_kind() == panel::RowKind::Flag {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert_eq!(count(&mut ui), 3, "three drawn, whatever is raised");
+
+        let head = panel::render_row_for_test(&ui, ui.rows_for_test() - ui.dock_for_test(), W);
+        assert!(
+            head.text().contains("flagged") && head.text().contains(&f.flags.len().to_string()),
+            "the heading counts every one of them: {}",
+            head.text(),
+        );
+
+        // `→` on the `⋯` opens the tail in place, exactly as the agents' does.
+        on_row_kind(&mut ui, panel::RowKind::More);
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_kind() == panel::RowKind::More
+                && ui.selected_target() == panel::Target::Overflow("(flagged)".into())
+            {
+                break;
+            }
+        }
+        if let panel::Effect::Refetch = panel::apply_key(Key::Right, &mut ui, &mut view) {
+            panel::refetch_into(&mut ui, &f, &mut view, Some("w0"));
+        }
+        assert_eq!(count(&mut ui), f.flags.len(), "all of them, once asked");
+    }
+
+    /// A card comes up because somebody else raised a hand, and it holds the
+    /// keyboard while it is up.
+    ///
+    /// The holding is the point. Every other mode here is entered by a key, so
+    /// the person who opened it knows it is open; this one lands in front of
+    /// whatever you were reading. A `d` typed a quarter-second before it
+    /// arrived must not close a task, and `y` must not reach the tree behind
+    /// it.
+    #[test]
+    fn a_card_arrives_on_its_own_and_holds_the_keyboard() {
+        let f = flagged_world();
+        let (mut ui, mut view) = showing(&f, &[]);
+        let card = match &view.mode {
+            panel::Mode::Card(c) => c.clone(),
+            _ => panic!("an unread ask should come up on its own"),
+        };
+        assert_eq!(
+            card.task(),
+            "t-105",
+            "the oldest unread ask, not the newest — a queue is answered in order",
+        );
+
+        // Keys the tree would act on do nothing at all while it is up.
+        let sel = ui.selected_index();
+        for k in [Key::Char('j'), Key::Char('d'), Key::Down, Key::Char('R')] {
+            assert!(matches!(panel::apply_key(k, &mut ui, &mut view), panel::Effect::None));
+            assert!(matches!(view.mode, panel::Mode::Card(_)), "{k:?} put the card away");
+        }
+        assert_eq!(ui.selected_index(), sel, "the cursor moved under a card");
+
+        // And a click reads as nothing rather than as the row it is covering.
+        assert_eq!(
+            panel::click(&mut ui, &mut view, W, H, 4, 6, WORKING_HERE),
+            panel::Hit::Nothing,
+            "a click went through the card to whatever was underneath",
+        );
+    }
+
+    /// It waits for the panel to be idle. Somebody else's question landing on a
+    /// half-typed title would take the keys meant for the title and answer the
+    /// question with them.
+    #[test]
+    fn a_card_waits_rather_than_interrupting() {
+        let f = flagged_world();
+        // `a` on the first row opens a prompt. The card is already up at that
+        // point, so the flag has to be put away first — which is the sequence
+        // this is about: dismissed, then typing, then no second card.
+        let (_ui, view) = showing(&f, &[Key::Esc, Key::Char('a'), Key::Char('h')]);
+        assert!(matches!(view.mode, panel::Mode::Prompt { .. }), "the prompt was taken over");
+    }
+
+    /// Three answers, and the difference between them is what happens to the
+    /// hand: `esc` leaves it raised, `x` takes it down, and answering the
+    /// question does whatever the question asked for.
+    #[test]
+    fn the_card_has_three_answers_and_they_do_different_things() {
+        let f = flagged_world();
+
+        let (mut ui, mut view) = showing(&f, &[]);
+        match panel::apply_key(Key::Esc, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["flag", "t-105", "--seen"], "esc leaves it raised");
+            }
+            _ => panic!("esc should mark it read"),
+        }
+        assert!(matches!(view.mode, panel::Mode::Browse), "and puts the card away");
+
+        let (mut ui, mut view) = showing(&f, &[]);
+        match panel::apply_key(Key::Char('x'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["flag", "--clear", "t-105"], "x takes it down");
+            }
+            _ => panic!("x should lower it"),
+        }
+
+        // `↵` is not an answer to a card that asked for something. A return
+        // pressed out of habit must never hand a task over.
+        let (mut ui, mut view) = showing(&f, &[]);
+        assert!(matches!(
+            panel::apply_key(Key::Enter, &mut ui, &mut view),
+            panel::Effect::None,
+        ));
+        assert!(matches!(view.mode, panel::Mode::Card(_)), "↵ answered a question it was asked");
+
+        // …and it is the answer to a card that only wanted to be looked at.
+        let mut only_looking = flagged_world();
+        only_looking.flags.remove("t-004");
+        if let Some(f) = only_looking.flags.get_mut("t-105").and_then(|f| f.as_object_mut()) {
+            f.insert("ask".into(), json!(""));
+        }
+        let (mut ui, mut view) = showing(&only_looking, &[]);
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["flag", "t-105", "--seen"]),
+            _ => panic!("↵ should put away a card with nothing to answer"),
+        }
+    }
+
+    /// `y` runs the claim the agent asked for, into the pane that asked, and
+    /// tells it so. The same argv `c` builds from the other direction — the
+    /// agent picked the task and you picked the agent — because a claim is
+    /// thirty lines of guards that must have one implementation.
+    ///
+    /// Nothing lowers the flag here and nothing needs to: `claim` lowers the
+    /// flags on the task it claims, so a failure between two commands cannot
+    /// leave the ask up over work already handed over.
+    #[test]
+    fn y_hands_the_task_to_the_agent_that_asked() {
+        let f = flagged_world();
+        let (mut ui, mut view) = showing(&f, &[]);
+        match panel::apply_key(Key::Char('y'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["claim", "t-105", "--pane", "w4:p2"]);
+                assert!(then.is_some(), "the agent that asked is told it can have it");
+            }
+            _ => panic!("y should hand it over"),
+        }
+
+        // And `n` says so out loud. An agent that asked and heard nothing is an
+        // agent still waiting on an answer that never came.
+        let (mut ui, mut view) = showing(&f, &[]);
+        match panel::apply_key(Key::Char('n'), &mut ui, &mut view) {
+            panel::Effect::Run { argv, then, .. } => {
+                assert_eq!(argv, vec!["flag", "--clear", "t-105"]);
+                assert!(then.is_some(), "a refusal is worth typing back");
+            }
+            _ => panic!("n should refuse it"),
+        }
+    }
+
+    /// The card is asked once. The flag is marked read by a command, and the
+    /// rows in hand were built before it ran — so a panel that popped whatever
+    /// was unread on every frame would put the same card back up on the next
+    /// one, for ever, with `esc` doing nothing you could see.
+    #[test]
+    fn a_card_that_was_put_away_stays_away() {
+        let f = flagged_world();
+        let (ui, mut view) = showing(&f, &[Key::Esc]);
+        assert!(matches!(view.mode, panel::Mode::Browse));
+        // The snapshot has not changed — the CLI that would mark it read never
+        // ran here — so this is the exact state the live panel is in between
+        // the key and the rebuild.
+        panel::place(&ui, &mut view, W, H);
+        assert!(matches!(view.mode, panel::Mode::Browse), "the card came back on the next frame");
+    }
+
+    /// It never covers the section at the foot. Answering one ask by hiding the
+    /// queue of the others is the one thing a popup here must not do — and the
+    /// dock is also where the agents are, which is what you look at to decide
+    /// whether to hand anything over at all.
+    #[test]
+    fn a_card_leaves_the_foot_of_the_panel_alone() {
+        let f = flagged_world();
+        let (ui, mut view) = showing(&f, &[]);
+        assert!(matches!(view.mode, panel::Mode::Card(_)));
+        let with = panel::frame(&ui, &mut view, W, H);
+
+        let (ui, mut view) = showing(&read_world(), &[]);
+        let without = panel::frame(&ui, &mut view, W, H);
+
+        let tail = |f: &[panel::Line]| -> Vec<String> {
+            f.iter().rev().take(12).map(|l| l.text()).collect()
+        };
+        // The footer's own line differs — it says what is raised while a card
+        // is up — so the comparison starts above it.
+        assert_eq!(
+            tail(&with)[1..],
+            tail(&without)[1..],
+            "the card covered the dock",
+        );
+    }
+
+    /// Every panel draws the same card, and exactly one of them is answered.
+    ///
+    /// This is the half that was missing. A card comes up in all twenty-two
+    /// panels at once — they read one file and they all drew it — and `esc`,
+    /// `x` or `y` happens in whichever one you are looking at. Nothing told the
+    /// others, so they went on holding a question that was already settled; and
+    /// since a card holds the keyboard, switching workspaces meant arriving at
+    /// a modal ask about work already in somebody's hands.
+    ///
+    /// The card is derived from the record now, not remembered, so the panels
+    /// agree the same way the folds and the cursor do one file down.
+    #[test]
+    fn a_card_answered_on_one_panel_goes_from_the_others() {
+        let f = flagged_world();
+        // Two panels, both showing it — which is what actually happens.
+        let (here, mut mine) = showing(&f, &[]);
+        let (there, mut theirs) = showing(&f, &[]);
+        assert!(matches!(mine.mode, panel::Mode::Card(_)));
+        assert!(matches!(theirs.mode, panel::Mode::Card(_)));
+
+        // Answered here: `esc` marks it read, which is a write to the file both
+        // panels are reading.
+        let mut ui = here;
+        assert!(matches!(
+            panel::apply_key(Key::Esc, &mut ui, &mut mine),
+            panel::Effect::Run { .. },
+        ));
+        let mut answered = flagged_world();
+        if let Some(r) = answered.flags.get_mut("t-105").and_then(|r| r.as_object_mut()) {
+            r.insert("seen".into(), json!(true));
+        }
+
+        // The other panel rebuilds on its own tick and puts it away, with
+        // nobody having touched that pane.
+        let mut ui = there;
+        panel::refetch_into(&mut ui, &answered, &mut theirs, Some("w0"));
+        panel::place(&ui, &mut theirs, W, H);
+        assert!(
+            matches!(theirs.mode, panel::Mode::Browse),
+            "a panel nobody answered kept the card",
+        );
+    }
+
+    /// The same when the hand comes down altogether — `x` here, or `wsp flag
+    /// --clear` at any shell on the machine. A card is a question, and a
+    /// question that has been withdrawn must not still be answerable: `y` on a
+    /// stale one would claim a task for an agent that stopped asking.
+    #[test]
+    fn a_lowered_flag_takes_its_card_with_it() {
+        let f = flagged_world();
+        let (mut ui, mut view) = showing(&f, &[]);
+        assert!(matches!(view.mode, panel::Mode::Card(_)));
+
+        let mut lowered = flagged_world();
+        lowered.flags.remove("t-105");
+        panel::refetch_into(&mut ui, &lowered, &mut view, Some("w0"));
+        panel::place(&ui, &mut view, W, H);
+        assert!(matches!(view.mode, panel::Mode::Browse), "the card outlived the flag");
+    }
+
+    /// An agent that raises its hand again with more to say replaces the card
+    /// where it stands.
+    ///
+    /// In place, rather than closed and re-opened: closing it would count as
+    /// this panel having asked, and the once-only guard would then refuse to
+    /// put the new words up at all — so the panel would be showing the old
+    /// sentence with no way to reach the new one.
+    #[test]
+    fn a_second_thought_replaces_the_card_rather_than_closing_it() {
+        let f = flagged_world();
+        let (mut ui, mut view) = showing(&f, &[]);
+
+        let mut again = flagged_world();
+        if let Some(r) = again.flags.get_mut("t-105").and_then(|r| r.as_object_mut()) {
+            r.insert("said".into(), json!("actually the reducer is free now"));
+        }
+        panel::refetch_into(&mut ui, &again, &mut view, Some("w0"));
+        panel::place(&ui, &mut view, W, H);
+        match &view.mode {
+            panel::Mode::Card(c) => assert_eq!(c.said(), "actually the reducer is free now"),
+            _ => panic!("the card closed instead of taking the new words"),
+        }
+    }
+
+    /// Answering one and finding the next underneath it is the point of a
+    /// queue. The footer says how many there are, so it is never a surprise.
+    #[test]
+    fn the_next_ask_comes_up_behind_the_one_answered() {
+        // A second unread ask, newer than the first — so it is the one that
+        // comes up *after*, not instead.
+        let queued = || {
+            let mut s = flagged_world();
+            s.flags.insert(
+                "t-006".to_string(),
+                json!({
+                    "said": "and this one is still parked",
+                    "pane": "w2:p1",
+                    "at": "2026-08-16T09:55:00Z",
+                }),
+            );
+            s
+        };
+        let f = queued();
+        let (mut ui, mut view) = showing(&f, &[]);
+        match &view.mode {
+            panel::Mode::Card(c) => assert_eq!(c.task(), "t-105", "the oldest unread is first"),
+            _ => panic!("nothing came up"),
+        }
+
+        let mut answered = queued();
+        if let Some(r) = answered.flags.get_mut("t-105").and_then(|r| r.as_object_mut()) {
+            r.insert("seen".into(), json!(true));
+        }
+        panel::apply_key(Key::Esc, &mut ui, &mut view);
+        panel::refetch_into(&mut ui, &answered, &mut view, Some("w0"));
+        panel::place(&ui, &mut view, W, H);
+        match &view.mode {
+            panel::Mode::Card(c) => assert_eq!(c.task(), "t-006", "the queue stopped after one"),
+            _ => panic!("the next ask never came up"),
+        }
+    }
 }

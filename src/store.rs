@@ -630,6 +630,57 @@ impl Store {
         removed
     }
 
+    // ---- raised hands ---------------------------------------------------
+    //
+    // A flag is an agent asking to be looked at: this task, and here is why.
+    // It lives here rather than in the task file because it is addressed to a
+    // person *now* — the same kind of fact as a claim or a pin, true while
+    // somebody is at the machine and meaningless a week later. Writing it into
+    // the store would put an interruption into git and leave it in the history
+    // of the work for ever; `wsp note` is the verb for the half of it that is
+    // worth keeping.
+
+    /// task id -> flag record: what was said, and by which pane.
+    pub fn flags(&self) -> BTreeMap<String, Value> {
+        match self.read_json("flags.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_flag(&self, task: &str, value: Value) {
+        self.update_json("flags.json", |f| {
+            f.insert(task.to_string(), value);
+        });
+    }
+
+    pub fn clear_flag(&self, task: &str) -> bool {
+        let mut removed = false;
+        self.update_json("flags.json", |f| removed = f.remove(task).is_some());
+        removed
+    }
+
+    /// Has anybody raised or lowered a flag since this said otherwise?
+    ///
+    /// [`Store::fingerprint`] walks `projects/` and `tasks/` and cannot see
+    /// this: flags are state, deliberately, and the panel's refetch is gated on
+    /// that fingerprint. Without a stamp of its own a raised hand would wait
+    /// for whatever else happened to change the store — which on a quiet
+    /// machine is nothing at all, and a hand nobody sees is worse than no hand.
+    ///
+    /// One `stat`, which is why it can sit in the same tick gate. Nanoseconds
+    /// for the same reason the fingerprint uses them: raising and lowering
+    /// inside one second is two pieces of news. A missing file is zero — the
+    /// resting state, and equal to itself.
+    pub fn flags_stamp(&self) -> u64 {
+        fs::metadata(self.state_file("flags.json"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+
     pub fn set_claim(&self, task: &str, value: Value) {
         self.update_json("claims.json", |c| {
             c.insert(task.to_string(), value);
@@ -994,6 +1045,35 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A hand raised is state, and the panel's refetch is gated on a
+    /// fingerprint that walks `projects/` and `tasks/` — so the stamp is what
+    /// stands between a flag and a panel that shows it whenever something else
+    /// happens to change. Nothing about the store moves when one is raised,
+    /// which is the whole reason this exists.
+    #[test]
+    fn a_raised_hand_is_visible_without_the_store_moving() {
+        let store = scratch("flags");
+        assert_eq!(store.flags_stamp(), 0, "nothing written yet is the resting state");
+        let before = store.fingerprint();
+
+        store.set_flag("t-1", json!({ "said": "can I take this?", "pane": "w1:p6" }));
+        assert_eq!(store.fingerprint(), before, "a flag is not a change to the work");
+        let raised = store.flags_stamp();
+        assert_ne!(raised, 0, "…and it is a change the panel can see");
+        assert_eq!(
+            store.flags().get("t-1").and_then(|f| f.get("said")).and_then(|s| s.as_str()),
+            Some("can I take this?"),
+        );
+
+        // Lowering is news of exactly the same kind. A stamp that only moved
+        // on the way up would leave a flag drawn in every panel on the machine
+        // until something else changed.
+        assert!(store.clear_flag("t-1"));
+        assert!(store.flags().is_empty());
+        assert!(store.flags_stamp() >= raised, "lowering it is a change too");
+        assert!(!store.clear_flag("t-1"), "and there is nothing left to lower");
+    }
 
     /// The two halves of a machine, and the line between them.
     ///

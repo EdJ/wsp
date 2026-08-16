@@ -20,6 +20,15 @@ pub(crate) const PANEL_LABEL: &str = "wsp";
 /// The label herdr carries on a detail pane, so we can find ours again.
 pub(crate) const VIEW_LABEL: &str = "wsp:view";
 
+/// And on a board's. Furniture like the other two, and marked so for the same
+/// two reasons: the tree must not draw it as a pane somebody is working in, and
+/// the next `K` has to be able to find the board already open and replace it.
+///
+/// Its own label rather than [`VIEW_LABEL`] shared: `inspect` and `close_view`
+/// find the detail pane by that string, and a board wearing it would be closed
+/// by `esc` and mistaken for a detail pane that already exists.
+pub(crate) const BOARD_LABEL: &str = "wsp:board";
+
 mod install;
 mod keys;
 mod render;
@@ -29,13 +38,22 @@ mod shared;
 mod verbs;
 
 pub(crate) use keys::{apply_key, Effect, View};
+// The card a raised hand becomes, and the mode it holds the keyboard in. Out
+// here for the storyboard, which has to be able to ask whether a card is up —
+// a popup that only the live panel could reach would be one no fixture could
+// ever draw.
+#[cfg(test)]
+pub(crate) use keys::Mode;
+#[cfg(test)]
+pub(crate) use rows::Card;
 // The live path reaches these through `super::keys`; only the storyboard's
 // tests need them from outside.
 #[cfg(test)]
 pub(crate) use keys::{click, wheel, Hit};
-// Same bargain: `rows` builds the tree for this module, and the storyboard
-// tests the naming rule directly rather than through six fabricated panes.
-#[cfg(test)]
+// What to call a pane. Out here because the board names the same panes, and a
+// second answer to "what is this terminal called" is how the two surfaces come
+// to disagree about which of the three strings is current. The storyboard also
+// tests the rule directly, rather than through six fabricated panes.
 pub(crate) use rows::pane_name;
 pub(crate) use render::{
     frame, glyph, legend, line, place, to_ansi, to_html, to_html_spans, Line, Style,
@@ -78,6 +96,14 @@ pub(crate) fn full_text_for_test(ui: &Ui, i: usize) -> String {
     rows::full_text(&ui.rows[i])
 }
 pub(crate) use rows::{collect, refetch_into, RowKind, Snapshot, Target, Ui};
+// The board is a second surface over the same facts, so it takes its glyphs and
+// its join of "what herdr says" with "what the store holds" from here rather
+// than keeping a copy. A second table of marks would drift the first time
+// either gained a state.
+pub(crate) use rows::{agent_state, status_mark, word as agent_word, AgentState};
 pub(crate) use run::{stty, term_size};
+// And it runs the CLI the same way every key in the panel does — same capture,
+// same closed stdin, same one implementation of what a verb means.
+pub(crate) use verbs::{inspect, pop_out, run_wsp};
 pub use install::{install, install_if_adopted, uninstall};
 pub use run::run;

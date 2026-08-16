@@ -1001,7 +1001,7 @@ fn prose_source(args: &Args) -> Option<String> {
     }
 }
 
-fn read_source(src: &str) -> std::io::Result<String> {
+pub(crate) fn read_source(src: &str) -> std::io::Result<String> {
     if src == "-" {
         use std::io::Read;
         let mut s = String::new();

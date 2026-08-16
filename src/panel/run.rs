@@ -22,7 +22,7 @@ use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
 use super::shared;
-use super::verbs::{close_view, inspect, pop_out, run_wsp, send_tell, Tell};
+use super::verbs::{close_view, inspect, open_board, pop_out, run_wsp, send_tell, Tell};
 
 pub(super) enum Msg {
     Key(Key),
@@ -493,6 +493,12 @@ pub(super) fn event_loop(
     // on the first of a burst and not on the ninety after it.
     let mut took_focus = Instant::now() - Duration::from_secs(60);
     let mut last_fingerprint = store.fingerprint();
+    // The other half of "has anything changed": a hand raised or lowered. It
+    // is a state file rather than a task, so the fingerprint above — which
+    // walks `projects/` and `tasks/` — cannot see it, and a panel that watched
+    // only the store would show a flag whenever the store next happened to
+    // change and never on a quiet machine.
+    let mut last_flags = store.flags_stamp();
     // The status the frame in front of the reader was drawn with, and when we
     // last asked herdr whether it still holds. See [`STATUS_POLL`].
     let mut drawn_status: HashMap<String, String> = HashMap::new();
@@ -636,6 +642,9 @@ pub(super) fn event_loop(
                 Effect::PopOut { argv, label } => {
                     say(&mut ui, pop_out(&argv, &label, self_ws));
                 }
+                Effect::Board { argv, label } => {
+                    say(&mut ui, open_board(&argv, &label, self_ws));
+                }
                 // Off the loop, deliberately. `wsp spawn --agent` creates a
                 // workspace, claims into it, waits for an agent to boot and
                 // then tells it what it holds — seconds, not milliseconds, and
@@ -769,6 +778,32 @@ pub(super) fn event_loop(
                 refetch = true;
             }
             Msg::Tick => {
+                // A hand raised outranks the cadence.
+                //
+                // Everything else the background gate defers is *news about
+                // work* — a task started somewhere, an agent picking something
+                // up — and half a minute late is fine for that, because nobody
+                // is waiting on this pane to notice. A card is the opposite: an
+                // agent has stopped and asked, and the answer is a keystroke on
+                // a panel. Thirty seconds of that is thirty seconds of an agent
+                // idle for no reason, and worse in the other direction — a card
+                // answered on the panel in front of you stayed up on the other
+                // twenty-one for the rest of the interval, so switching
+                // workspaces inside it landed on a settled question holding the
+                // keyboard.
+                //
+                // It can be checked this often because of what it costs: one
+                // `stat` of one file, against the `readdir` of two directories
+                // and the two socket round-trips a refetch makes. At five ticks
+                // a second across twenty-two panels that is a hundred stats a
+                // second and no allocation — cheaper than the status poll
+                // below, which is a socket call and already runs on every
+                // unfocused panel.
+                let flags_now = store.flags_stamp();
+                if flags_now != last_flags {
+                    refetch = true;
+                    dirty = false;
+                }
                 // Ask the one question the event stream cannot answer, and only
                 // where it goes unanswered: an unfocused panel, between its full
                 // refetches. A status that has moved is news of exactly the kind
@@ -800,6 +835,9 @@ pub(super) fn event_loop(
                     if started_as.is_some() && exe_stamp() != started_as {
                         return Outcome::Reload;
                     }
+                    // Flags are not read here: they are checked on every tick
+                    // above, at the top of this arm, and a second reading on
+                    // the slow gate would only ever be the same answer later.
                     let store_changed = store.fingerprint() != last_fingerprint;
                     if dirty || store_changed {
                         refetch = true;
@@ -812,6 +850,7 @@ pub(super) fn event_loop(
         if refetch {
             last_fetch = Instant::now();
             last_fingerprint = store.fingerprint();
+            last_flags = store.flags_stamp();
             // Adopt before rebuilding, because the folds and the filters decide
             // which rows there are to rebuild. A panel that has just been
             // switched to refetches on the `workspace.focused` that named it,
@@ -856,6 +895,50 @@ pub(super) fn event_loop(
 mod tests {
     use super::*;
 
+    /// The source of this file, for the one test below that is about *where* a
+    /// line sits rather than what it computes. Read the way the help test in
+    /// `main.rs` reads its own dispatch: the check then reads exactly what the
+    /// binary does, rather than a restatement of it that can drift.
+    const SRC: &str = include_str!("run.rs");
+
+    /// A raised hand is not on the background cadence.
+    ///
+    /// An unfocused panel refetches every thirty seconds, which is right for
+    /// news about work — nobody is waiting on that pane to notice a task
+    /// changing status. A card is the opposite: an agent has stopped and asked,
+    /// and the answer is a keystroke on a panel. Half a minute of that is half
+    /// a minute of an agent idle for nothing, and worse the other way round — a
+    /// card answered on the panel in front of you stayed up on the other
+    /// twenty-one until their interval came round, so switching workspaces
+    /// inside it arrived at a settled question holding the keyboard.
+    ///
+    /// So the stamp is read at the top of the tick, before the gate, and this
+    /// is a test about that order. It is one `stat` against the `readdir` and
+    /// two socket calls a refetch costs, which is what makes the position
+    /// affordable — put it back inside the gate and the cost is unchanged and
+    /// the cards are late.
+    #[test]
+    fn a_flag_is_read_on_every_tick_rather_than_on_the_cadence() {
+        // The newline matters: `Msg::Tick => {}` appears first, in the drain
+        // that coalesces a burst of herdr events, and splitting on the bare
+        // prefix would land in that one — which reads no flags and would fail
+        // this test for a reason that has nothing to do with it.
+        let tick = SRC
+            .split("Msg::Tick => {\n")
+            .nth(1)
+            .expect("the tick arm moved");
+        let stamp = tick.find("flags_stamp()").expect("the tick no longer reads the flags at all");
+        let gate = tick
+            .find("if last_fetch.elapsed() >= interval")
+            .expect("the cadence gate moved");
+        assert!(
+            stamp < gate,
+            "the flag check sits behind the cadence gate — an unfocused panel \
+             would take up to thirty seconds to raise a card, and as long again \
+             to put away one somebody else has answered",
+        );
+    }
+
     /// The bug this came from. A subscription list is validated as a whole, so
     /// one per-pane type sent without a `pane_id` refuses every global type
     /// beside it — and `subscribe` used to read that refusal as an empty
@@ -895,6 +978,7 @@ mod tests {
             pins: Default::default(),
             mandates: Default::default(),
             claims: Default::default(),
+            flags: Default::default(),
             workspaces: Vec::new(),
             panes: panes
                 .iter()

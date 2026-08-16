@@ -313,6 +313,16 @@ pub fn colour_enabled() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
+    stdout_is_tty()
+}
+
+/// Whether anything we print is going to a terminal at all.
+///
+/// Separate from [`colour_enabled`], which is the same question plus `NO_COLOR`
+/// — a pane whose owner has turned colour off is still a pane, and a full-screen
+/// view has to know the difference between "print this plainly" and "do not
+/// take over the screen".
+pub fn stdout_is_tty() -> bool {
     // Not a perfect isatty, but avoids pulling libc in for one call.
     unsafe { is_tty() }
 }

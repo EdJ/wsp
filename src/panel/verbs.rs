@@ -22,7 +22,7 @@ use super::install::list_panes;
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
 use super::rows::{hotkeys, AgentRef, Target, Ui};
-use super::{PANEL_LABEL, VIEW_LABEL};
+use super::{BOARD_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ask {
@@ -370,6 +370,42 @@ pub(super) fn pick_tell(verb: &Pick, at: &Target, ui: &Ui) -> Option<Tell> {
     }
 }
 
+/// The sentence for a pane a *card* named, rather than one the cursor landed
+/// on.
+///
+/// Same guard as [`pick_tell`] and for the same reasons — a shell would run the
+/// sentence as a command, and a working agent's prompt may not be a prompt —
+/// so an answer given to an agent that has gone back to work lands in the store
+/// and goes untold, exactly as a claim from the tree does.
+pub(super) fn tell_for_pane(ui: &Ui, pane: &str, task: &str) -> Option<Tell> {
+    let a = ui.agent_at_pane(pane)?;
+    (a.agent && a.state == "idle").then(|| tell_claimed(a, task))
+}
+
+/// No, not this one.
+///
+/// A refusal is worth typing back. The agent raised its hand and carried on
+/// with something else, so silence is indistinguishable from an answer that
+/// never came — and an agent waiting on one is an agent doing nothing.
+///
+/// No clear in front of it, unlike every other sentence here. The others hand
+/// over new work and want the last task's reasoning out of the way first; this
+/// one is an answer to a question asked *during* whatever the agent is still
+/// holding, and emptying its context to deliver a `no` would cost the work the
+/// answer was about.
+pub(super) fn tell_refused(ui: &Ui, pane: &str, task: &str) -> Option<Tell> {
+    let a = ui.agent_at_pane(pane)?;
+    (a.agent && a.state == "idle").then(|| Tell {
+        pane: a.pane.clone(),
+        text: Some(format!(
+            "Not {task} — your flag on it was answered no. Carry on with what you have, and \
+             `wsp flag` again if you think it is still the right next thing."
+        )),
+        note: format!("{} → not {task}", a.where_),
+        clear: None,
+    })
+}
+
 /// Between the sentence and the return that sends it.
 const RETURN_MS: u64 = 150;
 /// How long to wait for a cleared agent to come back as a new session, and how
@@ -623,12 +659,64 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
     }
 }
 
+/// Open a board full-size in a tab of its own.
+///
+/// The plain half of [`pop_out`]: a tab, its root pane, and the command in it.
+/// No splits, no editors, no marker files — a board wants the whole width and
+/// draws its own screen.
+///
+/// `exec`, so the command *is* the pane: when it quits the pane goes, and the
+/// tab with it. A shell left behind would be a tab you have to close twice.
+///
+/// One at a time, and the pane is labelled. A board holds nothing that is not
+/// already in the store — it is the project, drawn by state — so a second one
+/// is a second window onto one fact, and a key this cheap to press would leave
+/// a stack of them. The label is what makes "the one already open" findable,
+/// and what stops the panel drawing a board as a shell standing in the very
+/// project it is a board of.
+pub(super) fn open_board(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
+    let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "wsp".into());
+
+    // Whatever board is open goes first. Closing its pane takes the tab with
+    // it, exactly as quitting one does.
+    if let Ok(panes) = list_panes(ws) {
+        for p in panes.into_iter().filter(|p| p.label == BOARD_LABEL) {
+            let _ = herdr::call("pane.close", json!({ "pane_id": p.id }));
+        }
+    }
+
+    let Ok(r) = herdr::call(
+        "tab.create",
+        json!({ "workspace_id": ws, "label": label, "focus": true, "env": crate::util::store_env() }),
+    ) else {
+        return "could not create a tab".into();
+    };
+    let Some(pane) = r
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+    else {
+        return "tab reported no pane".into();
+    };
+    let cmd = std::iter::once(shell_quote(&exe))
+        .chain(argv.iter().map(|a| shell_quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": BOARD_LABEL }));
+    let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": format!("exec {cmd}\n") }));
+    format!("opened {label}")
+}
+
 /// Open a file full-size in a tab of its own, in the user's editor.
 ///
 /// A tab rather than a split: the store is Markdown and editing a task means
 /// its whole body — notes, acceptance criteria, the log — which wants width,
 /// and a tab gives that without disturbing a layout you will come back to.
-pub(super) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
+pub(crate) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
     let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -728,7 +816,7 @@ pub(super) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> St
 /// goes through a file the view polls, so retargeting costs no process churn —
 /// the alternative, killing and relaunching, would blink the pane on every
 /// press of a key whose whole job is to be cheap.
-pub(super) fn inspect(store: &Store, self_ws: Option<&str>, focus: &crate::detail::Focus) -> String {
+pub(crate) fn inspect(store: &Store, self_ws: Option<&str>, focus: &crate::detail::Focus) -> String {
     let Some(ws) = self_ws else {
         return "no workspace to open a view in".into();
     };
@@ -773,12 +861,12 @@ pub(super) fn inspect(store: &Store, self_ws: Option<&str>, focus: &crate::detai
 /// is closed so nothing can sit waiting for input the panel will never send.
 /// What a command did: a line for the footer, and the id of whatever it made,
 /// when it made something.
-pub(super) struct Made {
-    pub(super) label: String,
+pub(crate) struct Made {
+    pub(crate) label: String,
     pub(super) id: Option<String>,
 }
 
-pub(super) fn run_wsp(argv: &[String]) -> Result<Made, String> {
+pub(crate) fn run_wsp(argv: &[String]) -> Result<Made, String> {
     let exe = std::env::current_exe().unwrap_or_else(|_| "wsp".into());
     let out = Command::new(exe)
         .args(argv)
@@ -867,6 +955,21 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::None
         }
 
+        // A raised hand opens the card again — the ask is what a flag row is
+        // *for*, and the card is the whole of it: the heading the agent wrote,
+        // the paragraph the row had no room for, and the question. The task
+        // itself is one more key from there, `o`, which is the right way round:
+        // you read the ask and then go looking, rather than being sent to the
+        // task with the ask left behind you.
+        Key::Enter if matches!(ui.rows.get(ui.sel), Some(super::rows::Row::Flag { .. })) => {
+            match ui.rows.get(ui.sel) {
+                Some(super::rows::Row::Flag { card }) => {
+                    view.mode = Mode::Card(card.clone());
+                    Effect::None
+                }
+                _ => Effect::None,
+            }
+        }
         Key::Enter => match &target {
             // An overflow row has nothing to look at; opening it is the only
             // thing it does.
@@ -1172,6 +1275,30 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
         },
 
+        // ---- a raised hand comes down ----
+        //
+        // Lowering is deliberately its own key rather than something `↵` does
+        // on the way past. Opening a task is how you *read* the ask, and a
+        // flag that cleared itself the moment you looked would be gone from
+        // every panel before you had decided anything about it — including the
+        // decision to leave it up while you finish what you are doing. So the
+        // panel takes it down when you say so, and not before.
+        //
+        // It runs the CLI like every other key here, so the agent that raised
+        // it and the person lowering it go through one implementation, one
+        // event and one file.
+        Key::Char('x') => match ui.selected_flag() {
+            Some(id) => Effect::Run {
+                argv: vec!["flag".into(), "--clear".into(), id],
+                escalate: None,
+                then: None,
+            },
+            None => {
+                say(ui, "x lowers a raised flag — aim at one");
+                Effect::None
+            }
+        },
+
         // ---- pop out, full size, in an editor ----
         Key::Char('E') => match &target {
             // `wsp edit`, not the file: it opens the prose and keeps the
@@ -1190,6 +1317,28 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Effect::None
             }
         },
+
+        // ---- the same work, by state instead of by tree ----
+        //
+        // A board is a project's, so a task hands over the project it is filed
+        // in rather than refusing: you press this having noticed a card, and
+        // what you want to see is the pile it came out of. The inbox is a scope
+        // like any other and gets one too.
+        Key::Char('K') => {
+            let (arg, label) = match &target {
+                Target::Project(p) => (p.clone(), p.clone()),
+                Target::Task(id) => match ui.project_of_task(id) {
+                    Some(p) => (p.clone(), p),
+                    None => ("inbox".to_string(), "inbox".to_string()),
+                },
+                Target::Inbox => ("inbox".to_string(), "inbox".to_string()),
+                _ => {
+                    say(ui, "a board is a project's — aim at one, or at a task in it");
+                    return Effect::None;
+                }
+            };
+            Effect::Board { argv: vec!["kanban".into(), arg], label: format!("board {label}") }
+        }
 
         // ---- open a workspace for this row, with or without somebody in it ----
         //

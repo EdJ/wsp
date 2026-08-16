@@ -19,6 +19,7 @@ mod detail;
 mod fm;
 mod herdr;
 mod input;
+mod kanban;
 mod model;
 mod overlap;
 mod panel;
@@ -33,7 +34,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "terse",
+    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "terse", "seen",
 ];
 
 pub struct Args {
@@ -286,7 +287,9 @@ fn main() {
         "doctor" => cmd_agent::doctor(&store, &args),
         "adopt" => cmd_agent::adopt(&store, &args),
         "view" => detail::run(&store, &args),
+        "kanban" | "board" => kanban::run(&store, &args),
         "say" => cmd_agent::say(&store, &args),
+        "flag" => cmd_agent::flag(&store, &args),
         "reconcile" => {
             let r = cmd_agent::reconcile(&store, args.has("reap"));
             println!("reconciled {} binding(s) from claims", r.bound);
@@ -364,7 +367,7 @@ fn help() {
   wsp where                         what project am I in, and why
   wsp wip                           everything in flight, with agents
   wsp overlap                       who else is standing in this tree
-  wsp peek [panel|view|<task>]      what is actually on that pane
+  wsp peek [panel|view|board|<task>]  what is actually on that pane
 
 {machines}
   wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is
@@ -377,6 +380,8 @@ fn help() {
 {plumbing}
   wsp panel                         the sidebar replacement (runs in a pane)
   wsp view [<id>]                   detail pane; follows the panel unless given an id
+  wsp kanban|board [<proj>] [--done]  the work as todo/doing/review/done columns;
+                                    K in the panel opens it in a tab
   wsp panel install [--all]         split it into a workspace, or all of them
   wsp panel uninstall [-w ws]       take it back out
   wsp sync [--force]                push tokens to herdr once
@@ -384,6 +389,10 @@ fn help() {
   wsp hook <event>                  herdr event-hook entrypoint
   wsp doctor                        integrity check
   wsp say "…" [--clear]             say where you have got to, on your pane
+  wsp flag <id> ["why"]             raise a hand on a task, on every panel
+  wsp flag <id> --title T --body -  …with a card: a heading and a paragraph
+  wsp flag <id> --ask claim         …and a question a keypress answers
+  wsp flag [--clear <id>]           what is raised; --clear lowers one
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
   wsp adopt [--yes]                 turn live workspaces into tasks

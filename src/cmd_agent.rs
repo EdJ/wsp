@@ -274,6 +274,262 @@ fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
     }
 }
 
+/// `wsp flag <id> "why"` — an agent raises a hand about one task.
+///
+/// The thing an agent cannot do from inside its own pane is point. It can write
+/// the task up, it can claim it, it can park it with a question on it — and all
+/// of that lands somewhere a person has to go and look. What it could not do
+/// was say *this row, now*, which is the difference between a backlog somebody
+/// reads at the end of the day and a question that gets answered.
+///
+/// So a flag is one sentence about one task, and the panel is where it arrives.
+/// A panel is already installed in every workspace and they all read one shared
+/// view, so nothing here has to find a window or know which screen is in front
+/// of anybody: it writes the flag, and the panel the person is looking at draws
+/// it inside a tick, pinned at the foot where it cannot be scrolled away from.
+///
+/// Two things an agent wants and one primitive. "Can I take this?" is a flag
+/// with a question in the sentence; "this exists and you should look at it" is
+/// a flag with or without one. Both are a hand raised about a single row, and
+/// the answer to both is a person putting their eyes on it — which is the one
+/// thing the panel is good at and the one thing a sentence in a transcript
+/// nobody is reading is not.
+///
+/// State, not store. A flag is true while somebody is at the machine and
+/// meaningless a week later, so it sits beside the claims and the pins rather
+/// than in the task file: no commit, nothing in the history of the work, and
+/// nothing left behind when it is answered. `wsp note` is the verb for the half
+/// of it that is worth keeping.
+///
+/// The event is the seam for anything louder. `~/wsp/hooks/on-task-flagged`
+/// gets the JSON on stdin, so a desktop notification is an executable file.
+pub fn flag(store: &Store, args: &Args) -> i32 {
+    let p = Paint::new();
+    let clearing = args.has("clear");
+    let needle = args.rest.first().cloned();
+
+    // No id and nothing to clear: what is raised. The question a person asks
+    // from a shell is the same one the panel answers by drawing the section,
+    // and it should not need a second verb.
+    let Some(needle) = needle else {
+        if clearing {
+            eprintln!("usage: wsp flag --clear <id>");
+            return 2;
+        }
+        return list_flags(store, args);
+    };
+
+    let Some(task) = store.find_task(&needle) else {
+        eprintln!("wsp: no task matching `{needle}`");
+        return 1;
+    };
+
+    // Read, and still up. The card is the interruption and the row is the
+    // reminder, so putting the card away has to be a different act from taking
+    // the flag down — `esc` says "not now", `x` says "dealt with", and a panel
+    // that could only do the second would train you to clear things you had not
+    // answered. Written into the flag rather than kept per panel, because there
+    // are twenty-two panels and the card would otherwise pop again on the next
+    // one you switched to.
+    if args.has("seen") {
+        let mut flags = store.flags();
+        let Some(f) = flags.get_mut(&task.id) else {
+            eprintln!("wsp: nothing raised on {}", task.id);
+            return 1;
+        };
+        if let Some(m) = f.as_object_mut() {
+            m.insert("seen".into(), json!(true));
+        }
+        let f = f.clone();
+        store.set_flag(&task.id, f);
+        if args.json() {
+            println!("{}", json!({ "id": task.id, "seen": true }));
+        } else {
+            println!("{} {}  {}", p.dim("·"), p.bold(&task.id), p.dim("seen · still raised"));
+        }
+        return 0;
+    }
+
+    if clearing {
+        let was = store.clear_flag(&task.id);
+        if was {
+            store.log_event(
+                "task-unflagged",
+                json!({ "id": task.id, "project": task.project, "title": task.title }),
+            );
+        }
+        if args.json() {
+            println!("{}", json!({ "id": task.id, "flagged": false, "was": was }));
+        } else if was {
+            println!("{} {}  {}", p.dim("·"), p.bold(&task.id), p.dim("lowered"));
+        } else {
+            println!("{} {}  {}", p.dim("·"), p.bold(&task.id), p.dim("nothing raised"));
+        }
+        return 0;
+    }
+
+    // The sentence is optional on purpose: "look at this task" is a complete
+    // thing to say, and a verb that refused without a reason would be a verb
+    // nobody reached for in the case that matters most — a task somebody has
+    // to see the existence of.
+    // A lone `-` is not part of the sentence, it is the conventional name for
+    // stdin — the same spelling `wsp edit <id> --overview -` uses. Without this
+    // it read as a word and the receipt printed the dash on the end of what the
+    // agent said, which is the sort of thing nobody reports and everybody sees.
+    let from_stdin = args.rest.iter().skip(1).any(|a| a == "-");
+    let said = args
+        .rest
+        .iter()
+        .skip(1)
+        .filter(|a| *a != "-")
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let said = said.trim();
+    let env = herdr::Env::read();
+    let pane = args.get("pane").or(env.pane_id).unwrap_or_default();
+    let workspace = env.workspace_id.unwrap_or_default();
+
+    // The card's three parts, and each is optional because the cheap version of
+    // this has to stay cheap: `wsp flag <id>` on its own still works and the
+    // card fills itself in from the task. A title where the task's own is
+    // wrong for the moment — "the store is corrupt", on a task called something
+    // else — a body for the paragraph a row cannot hold, and an ask for the one
+    // thing a keypress can answer.
+    let title = args.get("title").unwrap_or_default();
+    let body = match args.get("body") {
+        // `--body -` reaches the parser as `true`, the same way `--from` does:
+        // a lone dash is not a value, it is the conventional name for stdin.
+        Some(v) if v == "true" || v == "-" => match crate::cmd_task::read_source("-") {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("wsp: cannot read stdin: {e}");
+                return 1;
+            }
+        },
+        Some(v) => v,
+        None if from_stdin => match crate::cmd_task::read_source("-") {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("wsp: cannot read stdin: {e}");
+                return 1;
+            }
+        },
+        None => String::new(),
+    };
+    let ask = args.get("ask").unwrap_or_default();
+    // A closed vocabulary, because the answer is a key on somebody's panel and
+    // that key runs a command. An agent naming its own argv would be an agent
+    // choosing what a keystroke does — so it names a *question* the panel
+    // already knows how to answer, and the panel decides what answering means.
+    if !ask.is_empty() && ask != "claim" {
+        eprintln!("wsp: `--ask {ask}` is not a question the panel can answer. Try: --ask claim");
+        return 2;
+    }
+    // Nothing to hand it to. A claim needs a pane to claim *into*, and asking
+    // from outside herdr would draw a `y` that could not do anything.
+    if ask == "claim" && pane.is_empty() {
+        eprintln!("wsp: --ask claim needs a pane to hand it to — run it inside a herdr pane");
+        return 2;
+    }
+
+    store.set_flag(
+        &task.id,
+        json!({
+            "said": said,
+            "title": title,
+            "body": body.trim_end(),
+            "ask": ask,
+            "pane": pane,
+            "workspace": workspace,
+            "at": util::now_iso(),
+        }),
+    );
+    store.log_event(
+        "task-flagged",
+        json!({
+            "id": task.id,
+            "project": task.project,
+            "status": task.status().as_str(),
+            "title": task.title,
+            "said": said,
+            "pane": pane,
+        }),
+    );
+
+    if args.json() {
+        println!(
+            "{}",
+            json!({ "id": task.id, "flagged": true, "said": said, "pane": pane })
+        );
+    } else {
+        println!("{} {}  {}", p.red(glyph_flag()), p.bold(&task.id), task.title);
+        if !said.is_empty() {
+            println!("  {}", p.dim(said));
+        }
+        if ask == "claim" {
+            println!("  {}", p.dim("asking to take it · y there hands it over"));
+        }
+        // Say where it went. A command whose whole effect is on somebody else's
+        // screen has to name the screen, or it reads as having done nothing.
+        println!("  {}", p.dim("raised on every panel · x there lowers it"));
+    }
+    0
+}
+
+/// The panel's mark, borrowed for the receipt so the two agree about what a
+/// raised hand looks like.
+fn glyph_flag() -> &'static str {
+    crate::panel::glyph::FLAG
+}
+
+/// `wsp flag` with nothing to raise: what is already up.
+fn list_flags(store: &Store, args: &Args) -> i32 {
+    let flags = store.flags();
+    if args.json() {
+        println!("{}", serde_json::to_string_pretty(&flags).unwrap_or_default());
+        return 0;
+    }
+    let p = Paint::new();
+    if flags.is_empty() {
+        println!("{}", p.dim("nothing raised"));
+        return 0;
+    }
+    // Newest first: a flag is an interruption, and the one raised while you
+    // were reading the last one is the one you have not seen.
+    let mut rows: Vec<(&String, &serde_json::Value)> = flags.iter().collect();
+    let at = |v: &serde_json::Value| v.get("at").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    rows.sort_by(|a, b| at(b.1).cmp(&at(a.1)));
+
+    for (id, f) in rows {
+        let get = |k: &str| f.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        // A flag on a task that has since been retired is a hand raised about
+        // nothing. Say so rather than printing a bare id: the fix is to lower
+        // it, and nothing else here will.
+        let title = match store.task(id) {
+            Some(t) => t.title,
+            None => p.dim("(no such task)").to_string(),
+        };
+        println!("{} {}  {}", p.red(glyph_flag()), p.bold(id), title);
+        let mut second: Vec<String> = Vec::new();
+        if !get("said").is_empty() {
+            second.push(get("said").to_string());
+        }
+        if !get("pane").is_empty() {
+            second.push(get("pane").to_string());
+        }
+        let held = util::since(get("at"));
+        if held > 0 {
+            second.push(util::duration_human(held));
+        }
+        if !second.is_empty() {
+            println!("  {}", p.dim(&second.join(" · ")));
+        }
+    }
+    println!("{}", p.dim("wsp flag --clear <id> lowers one"));
+    0
+}
+
 /// `wsp say "<what you are doing>"` — an agent says where it has got to.
 ///
 /// The pane takes the sentence; the workspace keeps the task. That division is
@@ -732,6 +988,18 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
                 "claimed_at": util::now_iso(),
             }),
         );
+
+        // A hand raised about this task has been answered by somebody taking
+        // it. That is the rule the card's `y` is built on: it runs a plain
+        // `claim`, and the flag comes down because the thing it asked for has
+        // happened — rather than the panel running a second command to tidy up
+        // after the first, which is a tidy-up that a failure between the two
+        // would skip.
+        //
+        // It holds whoever claims and however: from the card, from `c` in the
+        // tree, or by the agent itself at a shell. A flag on work now in
+        // somebody's hands is a question about the past.
+        store.clear_flag(&t.id);
     });
 
     // `hand_off` wrote to the tasks it released, and one of them may be this
@@ -1577,6 +1845,7 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
         // does the sidebar look like right now".
         "" | "panel" => (mine(crate::panel::PANEL_LABEL), "the panel".to_string()),
         "view" | "detail" => (mine(crate::panel::VIEW_LABEL), "the view".to_string()),
+        "board" | "kanban" => (mine(crate::panel::BOARD_LABEL), "the board".to_string()),
         "me" => (env.pane_id.clone(), "this pane".to_string()),
         // A pane id, given as herdr writes them.
         n if n.contains(':') && panes.iter().any(|p| p.pane_id == n) => {

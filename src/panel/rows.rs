@@ -19,7 +19,7 @@ use crate::util;
 
 use super::keys::View;
 use super::render::{glyph, line, Line, Style};
-use super::{PANEL_LABEL, VIEW_LABEL};
+use super::{BOARD_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 pub(super) const MAX_TASKS_PER_PROJECT: usize = 6;
 
@@ -34,6 +34,18 @@ pub(super) const NOPROJECT_KEY: &str = "(noproject)";
 
 /// The section pinned at the foot: the agents, whatever they are doing.
 pub(super) const AGENTS_KEY: &str = "(agents)";
+
+/// And above them, what an agent has raised a hand about.
+pub(super) const FLAGS_KEY: &str = "(flagged)";
+
+/// How many raised hands the foot draws before the rest need `→` on the tail.
+///
+/// Three, where the agents get five, and for the opposite reason: the agents
+/// section is a standing census that is always the same length, and this is
+/// news. Three is enough for the case that happens — one or two agents asking
+/// at once — and small enough that a burst of them cannot push the census off
+/// the pane it is pinned to.
+pub(super) const MAX_FLAGS_DOCKED: usize = 3;
 
 /// How many agents the foot keeps on screen before the rest need `w`. Five is
 /// what a pane can spare beside a tree and still be a tree — the strip in the
@@ -111,13 +123,27 @@ pub(crate) enum AgentState {
 }
 
 impl AgentState {
-    pub(super) fn mark(self) -> (Style, &'static str) {
+    /// Reaches outside the panel: the board draws the same mark for the same
+    /// state, and two copies of this table would drift the first time one of
+    /// them gained a state.
+    pub(crate) fn mark(self) -> (Style, &'static str) {
         match self {
             AgentState::Asking => (Style::Warn, glyph::NEEDS_YOU),
-            AgentState::Blocked => (Style::Warn, glyph::BLOCKED),
+            AgentState::Blocked => (Style::Query, glyph::QUESTION),
             AgentState::Working => (Style::Accent, glyph::WORKING),
             AgentState::Spare => (Style::Muted, glyph::IDLE),
             AgentState::Quiet => (Style::Dim, glyph::QUIET),
+        }
+    }
+
+    /// The colour the pane's own name is drawn in beside that mark. The mark's
+    /// colour everywhere but `Quiet`, where dim is reserved for structure and a
+    /// pane nobody has heard from is still a pane. Shared, because the tree and
+    /// the agents view draw the same agent and must not colour it two ways.
+    pub(crate) fn ink(self) -> Style {
+        match self {
+            AgentState::Quiet => Style::Muted,
+            _ => self.mark().0,
         }
     }
 }
@@ -126,7 +152,6 @@ impl AgentState {
 /// view, rather than nested under the task or project that explains it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Census {
-    pub(super) state: AgentState,
     /// Where its work lives: the project of the task it holds, else the one it
     /// is standing in or pointed at. The tree says this by where it draws the
     /// row; a flat list has to say it in words.
@@ -139,7 +164,7 @@ pub(super) struct Census {
 
 /// Read the two halves together: what herdr says the pane is doing, and what
 /// the store says it is holding while it does it.
-pub(super) fn agent_state(herdr_state: &str, holds: Option<Status>) -> AgentState {
+pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>) -> AgentState {
     match herdr_state {
         "working" => AgentState::Working,
         // `done` is a third value herdr sends and nothing here knew about. It
@@ -228,18 +253,33 @@ pub(super) enum Row {
         /// here rather than at draw time because how short it can be depends on
         /// the other tasks, and the renderer sees one row at a time.
         ident: Option<String>,
+        /// An agent has raised a hand about this task. The section at the foot
+        /// is where the sentence is; this is so the work can still be found
+        /// *in place*, under the project it belongs to, which is where you go
+        /// once you have read the sentence and want to know what it is near.
+        ///
+        /// Set by a pass over the finished rows rather than by the walk that
+        /// builds them: a flag is not a fact about the task, it is a fact about
+        /// somebody asking, and threading it through four call sites to reach
+        /// one glyph would put it in the walk's vocabulary for good.
+        flagged: bool,
     },
     /// `key` is the project the hidden tasks belong to, or `INBOX_KEY`.
     More { key: String, depth: usize, n: usize },
     /// A group that is not a project: the inbox, loose agents. `key` names it
     /// so it can be folded and so a command can be aimed at it.
     Section { key: String, label: String, count: usize, collapsed: bool },
+    /// `state` is what the pane is waiting for, and is carried on every agent
+    /// row rather than only the ones standing alone: the tree used to draw an
+    /// agent from herdr's two words, so a pane stopped in front of you and a
+    /// pane parked behind a question both came out as the same grey `○` —
+    /// the answer the agents view had all along, two lines further down.
+    ///
     /// `census` is set only in the agents view, where the row stands on its
-    /// own: there it has to say what the pane is waiting for and where it
-    /// belongs, because there is no branch above it doing either. In the tree
-    /// it is `None` and the row draws as it always has, under the thing that
-    /// explains it.
-    Agent { agent: AgentRef, title: String, depth: usize, census: Option<Census> },
+    /// own: there it has to say where it belongs and what is in its hands,
+    /// because there is no branch above it doing either. In the tree it is
+    /// `None` and the branch says both.
+    Agent { agent: AgentRef, title: String, depth: usize, state: AgentState, census: Option<Census> },
     /// A line that belongs to the row above it. The cursor never lands on one
     /// and no digit addresses one: it is the second and third line of one
     /// agent, in the view that has the room to spend three lines on one.
@@ -248,6 +288,143 @@ pub(super) enum Row {
     /// rows to row indices one for one — a row that drew two lines would put
     /// every click below it on the wrong thing.
     Detail(Detail),
+    /// A hand an agent has raised: this task, and why.
+    ///
+    /// It stands for a task and answers as one, so every verb already aimed at
+    /// a task works here — `↵` opens it, `c` claims it, `s` starts it — and the
+    /// row is the deeplink the agent could not otherwise draw. What it carries
+    /// beyond the id is what the tree cannot say: the sentence, and which pane
+    /// said it.
+    Flag { card: Card },
+}
+
+/// A raised hand, in full: what the row draws and what the card over the panel
+/// draws, which are the same fact at two sizes.
+///
+/// One value rather than two, because the row and the card have to agree. A row
+/// is thirty-four columns and a card is a paragraph, and the moment they were
+/// built from different fields the section would say one thing and the popup
+/// another about the same ask.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Card {
+    pub(super) task: String,
+    /// The card's heading: the agent's own, else the task's title. An agent
+    /// gets to name it because the task's title is often the wrong sentence for
+    /// the moment — "the store will not parse" on a task called something else
+    /// is the case, and re-titling the task to say so would be a lie about the
+    /// work.
+    pub(super) title: String,
+    /// The one line the row draws.
+    pub(super) said: String,
+    /// The paragraph the card draws, when there is one. Falls back to `said`,
+    /// and then to the task's own overview — a card with a heading and nothing
+    /// under it is a knock on the door with nobody there.
+    pub(super) body: String,
+    /// The pane that raised it.
+    pub(super) who: String,
+    /// The one thing a keypress can answer, if it asked for anything.
+    pub(super) ask: Option<Request>,
+    /// Read already: the card has been put away, and the row is what is left.
+    pub(super) seen: bool,
+}
+
+/// What a raised hand can ask for.
+///
+/// A closed vocabulary, and that is the whole of the security model here: the
+/// answer to a card is a keystroke that runs a command, so an agent naming its
+/// own argv would be an agent deciding what `y` does on somebody else's panel.
+/// It names a question the panel already knows how to answer instead, and the
+/// panel decides what answering it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// "Let me take this one." `y` claims the task into the pane that asked and
+    /// tells it so — which is exactly what `c` does, arriving from the other
+    /// direction.
+    Claim,
+}
+
+impl Request {
+    fn parse(s: &str) -> Option<Request> {
+        match s {
+            "claim" => Some(Request::Claim),
+            _ => None,
+        }
+    }
+
+    /// What the card says it is asking, in the fewest words that are true.
+    pub(super) fn asking(self) -> &'static str {
+        match self {
+            // Short enough to survive the narrowest pane a panel is installed
+            // in. The line under it is the keys, and a phrase that gets cut at
+            // the border reads as a card that has gone wrong rather than as one
+            // that ran out of room.
+            Request::Claim => "asks to take it",
+        }
+    }
+
+    /// The keys, in the order they are read: the answers first, then the two
+    /// ways of not answering yet. Two lines rather than one wrapped, because
+    /// what separates them is what they do — one pair settles the question and
+    /// the other pair does not.
+    pub(super) fn keys(self) -> &'static str {
+        match self {
+            Request::Claim => "y hand it over · n no\no open · esc later",
+        }
+    }
+}
+
+impl Card {
+    /// The task this ask is about. The only field anything outside the panel
+    /// has business with — it is what a test checks a card against, and what
+    /// the answer's command names.
+    #[cfg(test)]
+    pub(crate) fn task(&self) -> &str {
+        &self.task
+    }
+
+    /// The one line the row draws, for a test about a card whose words changed
+    /// under it.
+    #[cfg(test)]
+    pub(crate) fn said(&self) -> &str {
+        &self.said
+    }
+
+    /// Everything the card needs, out of one flag record and the task it names.
+    fn of(task: &str, f: &serde_json::Value, tasks: &[Task]) -> Card {
+        let field = |k: &str| {
+            f.get(k).and_then(|x| x.as_str()).unwrap_or_default().trim().to_string()
+        };
+        let found = tasks.iter().find(|t| t.id == task);
+        let said = field("said");
+        let title = match field("title") {
+            t if !t.is_empty() => t,
+            // The id when the task is gone. A hand raised about something that
+            // has since been retired is still a hand raised, and the row has to
+            // stay selectable — `x` on it is the only thing that will ever take
+            // it down.
+            _ => found.map(|t| t.title.clone()).unwrap_or_else(|| task.to_string()),
+        };
+        let body = match (field("body"), said.as_str()) {
+            (b, _) if !b.is_empty() => b,
+            (_, s) if !s.is_empty() => s.to_string(),
+            // Neither, which is `wsp flag <id>` on its own — "look at this, it
+            // exists". The task's own overview is the honest thing to put under
+            // that heading: it is what the person is being asked to look at,
+            // and the panel is holding it already.
+            _ => found
+                .and_then(|t| crate::model::section_of(&t.body, "Overview"))
+                .unwrap_or_default(),
+        };
+        Card {
+            task: task.to_string(),
+            title,
+            said,
+            body: util::truncate(body.trim(), 600),
+            who: field("pane"),
+            ask: Request::parse(&field("ask")),
+            seen: f.get("seen").and_then(|x| x.as_bool()).unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +466,10 @@ pub(crate) enum RowKind {
     /// A line under an agent in the agents view. Never selected, so a driver
     /// that hunts for one has gone wrong.
     Detail,
+    /// A raised hand in the section at the foot. It answers as a task, so a
+    /// driver that wants the flag rather than the task it points at has to ask
+    /// for the row.
+    Flag,
     Nothing,
 }
 
@@ -310,6 +491,14 @@ pub(crate) struct Ui {
     /// agent's work ends; only a person says `done`, so this is a count of
     /// things waiting on one.
     pub(super) review: usize,
+    /// Hands raised, whether or not the section at the foot had room to draw
+    /// them. The footer says this number for the pane too short to show the
+    /// section at all.
+    pub(super) flagged: usize,
+    /// The ask that has not been read yet, waiting to come up over the tree.
+    /// Held on the `Ui` rather than decided in the event loop so the storyboard
+    /// reaches the same state the live panel does, through the same rebuild.
+    pub(super) pending: Option<Card>,
     pub(super) sel: usize,
     pub(super) message: Option<(String, Instant)>,
     pub(super) self_focused: bool,
@@ -405,6 +594,12 @@ pub(super) fn target_of(row: &Row) -> Target {
     match row {
         Row::Project { id, .. } => Target::Project(id.clone()),
         Row::Task { id, .. } => Target::Task(id.clone()),
+        // The same target as the task's own row in the tree, deliberately: a
+        // flag is a second way of reaching one piece of work, not a second
+        // piece of work. Which of the two the cursor is on is [`Cursor`]'s
+        // `docked`, exactly as it is for a pane drawn under its task and again
+        // in the section at the foot.
+        Row::Flag { card } => Target::Task(card.task.clone()),
         Row::More { key, .. } => Target::Overflow(key.clone()),
         Row::Agent { agent, .. } => Target::Pane(agent.pane.clone()),
         Row::Section { key, .. } if key == NOPROJECT_KEY => Target::Unattached,
@@ -455,6 +650,21 @@ impl Ui {
         self.census.clone()
     }
 
+    /// The task the cursor is on, if an agent has raised a hand about it.
+    ///
+    /// Either row answers: the one in the section at the foot and the task's
+    /// own row up in the tree, which is the point of marking both. You lower a
+    /// flag from wherever you were when you read it — having to walk back down
+    /// to the section to be rid of a mark you are looking at is the kind of
+    /// thing that leaves flags up.
+    pub(super) fn selected_flag(&self) -> Option<String> {
+        match self.rows.get(self.sel) {
+            Some(Row::Flag { card }) => Some(card.task.clone()),
+            Some(Row::Task { id, flagged: true, .. }) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn selected_target(&self) -> Target {
         self.rows.get(self.sel).map(target_of).unwrap_or(Target::Nothing)
     }
@@ -479,6 +689,7 @@ impl Ui {
             Some(Row::Section { .. }) => RowKind::Section,
             Some(Row::Agent { .. }) => RowKind::Agent,
             Some(Row::Detail(_)) => RowKind::Detail,
+            Some(Row::Flag { .. }) => RowKind::Flag,
             None => RowKind::Nothing,
         }
     }
@@ -621,6 +832,10 @@ pub struct Snapshot {
     /// pane has been holding what it holds is the difference between an agent
     /// working and an agent stuck, and it is the one fact herdr cannot supply.
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
+    /// task id -> flag record: an agent has raised a hand about this task and
+    /// said why. Machine-local state like the claims beside it, and the one
+    /// input here that arrives from outside the person's own hands.
+    pub flags: std::collections::BTreeMap<String, serde_json::Value>,
     pub workspaces: Vec<herdr::Workspace>,
     pub panes: Vec<herdr::Pane>,
 }
@@ -637,6 +852,7 @@ impl Snapshot {
             pins: store.pins(),
             mandates: store.mandates(),
             claims: store.claims(),
+            flags: store.flags(),
             workspaces: herdr::workspaces().unwrap_or_default(),
             panes: herdr::panes().unwrap_or_default(),
         }
@@ -790,6 +1006,7 @@ pub(super) fn task_rows(
             // because `A` is off.
             under: resolve::counts_under(tasks, &t.id),
             ident: view.ids.then(|| ident_of(tasks, t)),
+            flagged: false,
         });
         // The pane working it hangs beneath, so the join is visible and the
         // task keeps its own status glyph instead of surrendering it to the
@@ -798,6 +1015,10 @@ pub(super) fn task_rows(
         if let Some(a) = a {
             rows.push(Row::Agent {
                 title: a.where_.clone(),
+                // The task is right here, so the row can say what the pane is
+                // waiting for rather than only whether it is running — which
+                // is the whole of the difference between `←` and `?`.
+                state: agent_state(&a.state, Some(t.status())),
                 agent: a.clone(),
                 depth: depth + sub + 1,
                 census: None,
@@ -962,8 +1183,13 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // Our own panels are furniture, not work. Everything else is a pane
     // someone opened, agent or not — a shell sitting in a project is a fact
     // about that project whether or not an agent ever attaches to it.
+    //
+    // A board is furniture too, and the most misleading kind: it is a pane with
+    // no agent in it, standing in the project it is a board *of*, so the tree
+    // would draw the project's own summary as a shell sitting inside it.
+    let furniture = [PANEL_LABEL, VIEW_LABEL, BOARD_LABEL];
     let panes: Vec<&herdr::Pane> =
-        snap.panes.iter().filter(|p| p.label != PANEL_LABEL && p.label != VIEW_LABEL).collect();
+        snap.panes.iter().filter(|p| !furniture.contains(&p.label.as_str())).collect();
     let self_focused = self_ws
         .and_then(|id| workspaces.iter().find(|w| w.id == id))
         .map(|w| w.focused)
@@ -1015,7 +1241,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // Gathered in this same pass because resolving a pane's project is the
     // expensive half of this function and it runs four times a second — and
     // because the two answers must not be worked out twice and disagree.
-    let mut census: Vec<(Census, AgentRef)> = Vec::new();
+    let mut census: Vec<(AgentState, Census, AgentRef)> = Vec::new();
 
     for a in panes.iter() {
         let bound = bound_task_of_pane(&a.pane_id);
@@ -1055,8 +1281,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         if !a.agent.is_empty() {
             let holds = bound.as_ref().and_then(|id| tasks.iter().find(|t| &t.id == id));
             census.push((
+                agent_state(&a.agent_status, holds.map(|t| t.status())),
                 Census {
-                    state: agent_state(&a.agent_status, holds.map(|t| t.status())),
                     // Where it stands, before where it is aimed: a pane holding
                     // a task is placed by that task's project, and only one
                     // with no work of its own is described by its direction.
@@ -1224,6 +1450,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 for a in ps.iter().take(shown) {
                     rows.push(Row::Agent {
                         title: a.where_.clone(),
+                        // Shells, every one of them — nothing is bound here, so
+                        // there is no task to read a state off and the row
+                        // draws `▫` regardless.
+                        state: agent_state(&a.state, None),
                         agent: a.clone(),
                         depth: depth + 1,
                         census: None,
@@ -1267,12 +1497,13 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         if !folded {
             for a in homeless {
                 let title = a.where_.clone();
-                rows.push(Row::Agent { agent: a, title, depth: 1, census: None });
+                let state = agent_state(&a.state, None);
+                rows.push(Row::Agent { agent: a, title, depth: 1, state, census: None });
             }
         }
     }
 
-    census.sort_by(|(a, ar), (b, br)| a.state.cmp(&b.state).then(ar.where_.cmp(&br.where_)));
+    census.sort_by(|(a, _, ar), (b, _, br)| a.cmp(b).then(ar.where_.cmp(&br.where_)));
 
     // The agents, either way round.
     //
@@ -1284,15 +1515,16 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // said.
     let (rows, dock) = if view.agents {
         let mut list: Vec<Row> = Vec::new();
-        for (c, a) in census.iter() {
+        for (state, c, a) in census.iter() {
             list.push(Row::Agent {
                 title: a.where_.clone(),
                 agent: a.clone(),
                 depth: 0,
+                state: *state,
                 census: Some(c.clone()),
             });
             list.push(Row::Detail(Detail::Standing {
-                state: c.state,
+                state: *state,
                 pane: a.pane.clone(),
                 held: c.held.clone(),
                 // Only when it differs from where the row already says it is:
@@ -1332,11 +1564,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             // place for anyone who would rather not leave the tree at all.
             let more = view.expanded.contains(AGENTS_KEY);
             let shown = if more { census.len() } else { census.len().min(MAX_AGENTS_DOCKED) };
-            for (c, a) in census.iter().take(shown) {
+            for (state, c, a) in census.iter().take(shown) {
                 rows.push(Row::Agent {
                     title: a.where_.clone(),
                     agent: a.clone(),
                     depth: 1,
+                    state: *state,
                     census: Some(c.clone()),
                 });
             }
@@ -1349,10 +1582,35 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         }
     };
 
+    // The raised hands, above the agents and below everything else.
+    //
+    // Pinned for the same reason the agents are and a stronger one: this is
+    // somebody asking, and an ask that scrolls off the end of a tree is an ask
+    // nobody answers. Above the census because the census is furniture — it
+    // says the same thing every minute of the day — and this is news, which is
+    // read from the top of the block it is in.
+    //
+    // Spliced in front of the agents rather than pushed, because the agents
+    // section is already built and the dock is a slice off the end of one list.
+    // Whichever branch above ran, `dock` says where that slice begins.
+    let (rows, dock) = flag_rows(snap, view, rows, dock);
+
+    // The mark on the work itself, wherever the tree happens to draw it. The
+    // section says which task and why; this is what makes it findable in place
+    // once you have read that and want to see what it sits beside.
+    let mut rows = rows;
+    for r in rows.iter_mut() {
+        if let Row::Task { id, flagged, .. } = r {
+            *flagged = snap.flags.contains_key(id);
+        }
+    }
+
     Ui {
         rows,
         dock,
-        census: census.into_iter().map(|(c, a)| (c.state, a)).collect(),
+        flagged: snap.flags.len(),
+        pending: pending_card(snap),
+        census: census.into_iter().map(|(state, _, a)| (state, a)).collect(),
         agents: view.agents,
         blocked: tasks.iter().filter(|t| t.status() == Status::Blocked).count(),
         review: tasks.iter().filter(|t| t.status() == Status::Review).count(),
@@ -1363,6 +1621,84 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         show_done: view.show_done,
         review_only: view.review_only,
     }
+}
+
+/// The flags, newest first — the order the section draws them in and the order
+/// the cards come up in, which have to be the same one or the popup and the row
+/// under it disagree about which ask is next.
+///
+/// A flag is an interruption, and the one raised while you were reading the
+/// last one is the one you have not seen.
+fn flags_in_order(snap: &Snapshot) -> Vec<(&String, &serde_json::Value)> {
+    let at = |v: &serde_json::Value| {
+        v.get("at").and_then(|x| x.as_str()).unwrap_or_default().to_string()
+    };
+    let mut list: Vec<(&String, &serde_json::Value)> = snap.flags.iter().collect();
+    list.sort_by(|a, b| at(b.1).cmp(&at(a.1)));
+    list
+}
+
+/// The card waiting to come up, if one is.
+///
+/// The oldest unread one, deliberately, where the section draws the newest
+/// first: a queue of asks is answered in the order it arrived, and popping the
+/// newest would leave the first agent that asked waiting behind every agent
+/// that asked after it.
+///
+/// Computed from the flags rather than from the rows, because the section can
+/// be folded and a card must come up anyway — folding a heading is a statement
+/// about a list, not about whether anybody may interrupt you.
+pub(super) fn pending_card(snap: &Snapshot) -> Option<Card> {
+    flags_in_order(snap)
+        .into_iter()
+        .rev()
+        .map(|(id, f)| Card::of(id, f, &snap.tasks))
+        .find(|c| !c.seen)
+}
+
+/// The raised hands, as a section pinned above the agents.
+///
+/// It is drawn in every view, including `w` and under `R`, and that is the
+/// point: those are filters over *work*, and a hand raised is somebody asking
+/// for you rather than a piece of work waiting. A section that went quiet under
+/// a filter would be a section you learn to distrust, and there is no filter you
+/// would want to be holding when the answer to "why has nothing happened for
+/// twenty minutes" is on the row it hid.
+///
+/// Newest first. A flag is an interruption, and the one raised while you were
+/// reading the last one is the one you have not seen.
+fn flag_rows(snap: &Snapshot, view: &View, rows: Vec<Row>, dock: usize) -> (Vec<Row>, usize) {
+    if snap.flags.is_empty() {
+        return (rows, dock);
+    }
+    let list = flags_in_order(snap);
+
+    let folded = view.collapsed.contains(FLAGS_KEY);
+    let mut out: Vec<Row> = vec![Row::Section {
+        key: FLAGS_KEY.to_string(),
+        label: "flagged".into(),
+        count: list.len(),
+        collapsed: folded,
+    }];
+    if !folded {
+        let more = view.expanded.contains(FLAGS_KEY);
+        let shown = if more { list.len() } else { list.len().min(MAX_FLAGS_DOCKED) };
+        for (id, f) in list.iter().take(shown) {
+            out.push(Row::Flag { card: Card::of(id, f, &snap.tasks) });
+        }
+        let hidden = list.len() - shown;
+        if hidden > 0 {
+            out.push(Row::More { key: FLAGS_KEY.to_string(), depth: 1, n: hidden });
+        }
+    }
+
+    // In front of the agents, which are already built and sit at the end of the
+    // list: `dock` is where that slice begins whichever branch produced it.
+    let n = out.len();
+    let mut rows = rows;
+    let at = rows.len() - dock;
+    rows.splice(at..at, out);
+    (rows, dock + n)
 }
 
 /// Every tag in use, commonest first and alphabetical inside that.
@@ -1387,14 +1723,6 @@ pub(super) fn vocabulary(snap: &Snapshot) -> Vec<String> {
     let mut out: Vec<(usize, &str)> = n.into_iter().map(|(t, c)| (c, t)).collect();
     out.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
     out.into_iter().map(|(_, t)| t.to_string()).collect()
-}
-
-pub(super) fn state_dot(state: &str) -> (Style, &'static str) {
-    match state {
-        "working" => (Style::Accent, glyph::WORKING),
-        "idle" => (Style::Muted, glyph::IDLE),
-        _ => (Style::Dim, glyph::QUIET),
-    }
 }
 
 pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
@@ -1442,7 +1770,9 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Task { title, depth, status, priority, agent, needs_you, prose, under, ident, .. } => {
+        Row::Task {
+            title, depth, status, priority, agent, needs_you, prose, under, ident, flagged, ..
+        } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
@@ -1481,11 +1811,21 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                 Priority::Normal => None,
             };
             let prio_w = if prio.is_some() { 2 } else { 0 };
+            // The raised hand is the loudest thing on the row, so it goes to
+            // the left of everything the title is preceded by — read down the
+            // column like the status glyph above it, rather than found by
+            // reading along whichever row happens to carry one.
+            let raised_w = if *flagged { 2 } else { 0 };
             let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
             // The id is the point when it is on, so it comes out of the
             // title's budget rather than off the end of the row.
             let id_w = ident.as_ref().map(|i| i.chars().count() + 2).unwrap_or(0);
-            let avail = w.saturating_sub(*depth + 5 + flag_w + count_w + id_w + prio_w);
+            let avail =
+                w.saturating_sub(*depth + 5 + flag_w + count_w + id_w + prio_w + raised_w);
+            if *flagged {
+                l.push(Style::Warn, glyph::FLAG);
+                l.push(Style::Plain, " ");
+            }
             // Before the id and the title, not after them: it is read down the
             // column, and a mark that moves left and right with the length of
             // what precedes it is one you have to hunt for on every row.
@@ -1539,33 +1879,32 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        Row::Agent { agent, title, depth, census } => {
+        Row::Agent { agent, title, depth, state, census } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
             }
             l.pad(*depth);
             l.push(Style::Plain, " ");
-            // Standing on its own, in the agents view: the glyph says what it
-            // is waiting for rather than only whether it is running, and the
-            // project it belongs to goes on the right — in the tree that is
-            // said by which branch the row is drawn under, and here there is
-            // no branch to say it.
+            // A shell nobody is driving keeps its own mark wherever it is
+            // drawn. Distinct from an idle agent: one has stopped, the other
+            // never started, and no state either of them can be in makes that
+            // difference legible on its own.
+            let (st, dot) =
+                if agent.agent { state.mark() } else { (Style::Dim, glyph::SHELL) };
+            let ink = if agent.agent { state.ink() } else { Style::Muted };
+            l.push(st, dot);
+            l.push(Style::Plain, " ");
+            // Standing on its own, in the agents view: the project it belongs
+            // to goes on the right — in the tree that is said by which branch
+            // the row is drawn under, and here there is no branch to say it.
             if let Some(c) = census {
-                let (st, dot) = c.state.mark();
-                l.push(st, dot);
-                l.push(Style::Plain, " ");
                 let mut right = Line::default();
                 if let Some(p) = &c.project {
                     right.push(Style::Dim, util::truncate(p, 12));
                 }
                 let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
                 let avail = w.saturating_sub(*depth + 4 + count_w).max(4);
-                let ink = match c.state {
-                    AgentState::Asking | AgentState::Blocked => Style::Warn,
-                    AgentState::Working => Style::Accent,
-                    _ => Style::Muted,
-                };
                 l.push(ink, util::truncate(title, avail));
                 if !right.spans.is_empty() {
                     l.pad(w.saturating_sub(l.width() + right.width()).max(1));
@@ -1573,26 +1912,7 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                 }
                 return l;
             }
-            if agent.agent {
-                let (st, dot) = state_dot(&agent.state);
-                l.push(st, dot);
-            } else {
-                // A shell nobody is driving. Distinct from an idle agent: one
-                // has stopped, the other never started.
-                l.push(Style::Dim, glyph::SHELL);
-            }
-            l.push(Style::Plain, " ");
-            // An agent line is live work, and accent is what live work looks
-            // like everywhere else in the tree — the counts on a project row,
-            // the ● on a working pane. Muted put a running agent in the same
-            // ink as an unclaimed task, which is the one row it is never
-            // telling you about.
-            //
-            // A shell is not live work: nobody is driving it. It stays muted,
-            // so the ▫/● distinction still separates "stopped" from "never
-            // started" in colour as well as in glyph.
             let avail = w.saturating_sub(*depth + 4).max(4);
-            let ink = if agent.agent { Style::Accent } else { Style::Muted };
             l.push(ink, util::truncate(title, avail));
         }
         // Indented under the name it belongs to and drawn dim throughout: this
@@ -1619,6 +1939,30 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.push(Style::Plain, " ");
             l.push(Style::Muted, util::truncate(title, w.saturating_sub(7).max(4)));
         }
+        // The sentence first, because the sentence is the news. The task's own
+        // title is one row up in the tree with a `▲` on it, and the pane that
+        // raised it is on the right where the agents section keeps its right-
+        // hand column — so what is left to say here is the thing only this row
+        // says. A flag with nothing written on it falls back to the title,
+        // which is the whole of "look at this task, it exists".
+        Row::Flag { card } => {
+            let (title, said, who) = (&card.title, &card.said, &card.who);
+            l.push(Style::Plain, " ");
+            l.push(Style::Warn, glyph::FLAG);
+            l.push(Style::Plain, " ");
+            let mut right = Line::default();
+            if !who.is_empty() {
+                right.push(Style::Dim, util::truncate(who, 8));
+            }
+            let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
+            let avail = w.saturating_sub(4 + count_w).max(4);
+            let body = if said.is_empty() { title } else { said };
+            l.push(Style::Warn, util::truncate(body, avail));
+            if !right.spans.is_empty() {
+                l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+                l.spans.extend(right.spans);
+            }
+        }
     }
     l
 }
@@ -1635,6 +1979,20 @@ pub(super) fn full_text(row: &Row) -> String {
         Row::Task { title, .. } => title.clone(),
         Row::More { n, .. } => format!("{n} more"),
         Row::Section { label, .. } => label.clone(),
+        // Both halves, and the title as well: the row draws the sentence and
+        // cuts it at a pane's width, and `F` is where the whole of a raised
+        // hand is read — which task, what was said, and who said it.
+        Row::Flag { card } => {
+            let (title, said, who) = (&card.title, &card.said, &card.who);
+            let mut out = title.clone();
+            if !said.is_empty() {
+                out = format!("{said} — {out}");
+            }
+            match who.is_empty() {
+                true => out,
+                false => format!("{out} · {who}"),
+            }
+        }
         Row::Agent { agent, title, .. } => {
             // The title is the pane's name, which is what the row draws. What
             // it does not draw, and what a name alone will not tell you, is
@@ -1652,7 +2010,7 @@ pub(super) fn full_text(row: &Row) -> String {
 /// What an agent is waiting for, in the fewest words that are true. Beside the
 /// mark rather than instead of it: the glyph is what you read in the strip, and
 /// the word is what tells you the glyph's name the first time you meet it.
-pub(super) fn word(state: AgentState) -> &'static str {
+pub(crate) fn word(state: AgentState) -> &'static str {
     match state {
         AgentState::Asking => "wants you",
         AgentState::Blocked => "blocked",
@@ -1663,7 +2021,7 @@ pub(super) fn word(state: AgentState) -> &'static str {
 }
 
 /// A task's own status, in the first column, exactly as a task row draws it.
-pub(super) fn status_mark(status: Status) -> (Style, &'static str) {
+pub(crate) fn status_mark(status: Status) -> (Style, &'static str) {
     match status {
         Status::Blocked => (Style::Warn, glyph::BLOCKED),
         Status::Review => (Style::Muted, glyph::REVIEW),

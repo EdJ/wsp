@@ -14,7 +14,7 @@ use std::time::Instant;
 use crate::input::Key;
 use crate::util;
 
-use super::rows::{AgentRef, Row, Ui};
+use super::rows::{AgentRef, Card, Request, Row, Ui};
 use super::verbs::{browse_key, pick_tell, Ask, Pick, Tell};
 
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
@@ -107,6 +107,16 @@ pub(crate) struct View {
     /// pane and takes the cursor out of the tree. This reads it where you are
     /// and follows the cursor, so it is scrolling rather than looking things up.
     pub(super) focus: bool,
+    /// The ask this panel last put up, so it puts it up once.
+    ///
+    /// Without it a card that was dismissed would come straight back: the flag
+    /// is marked read by a command, the rows are rebuilt from a snapshot taken
+    /// before it ran, and the next frame would find the same unread ask waiting
+    /// and open it again. It is also what stops a card the *CLI* failed to mark
+    /// becoming a popup that cannot be closed — the panel asks once, and a hand
+    /// it could not put away stays in the section, where a row is all it was
+    /// ever going to be.
+    pub(super) asked: Option<String>,
 }
 
 /// Management needs three shapes of input beyond a single key: a value to
@@ -139,6 +149,20 @@ pub(crate) enum Mode {
     /// `↵` — which is what makes toggling safe to explore, and why a fumble
     /// that ends where it started costs no log line, no event and no commit.
     Tags(Tags),
+    /// A raised hand, over the tree, waiting to be answered.
+    ///
+    /// The one mode nobody asked for: every other is entered by a key, and this
+    /// arrives because an agent somewhere else raised its hand. That is what
+    /// makes it a mode rather than a dock — it holds the keyboard until it is
+    /// answered, so `y` cannot land on the tree behind it, and it is the only
+    /// honest way to draw something over the rows a key would otherwise act on.
+    ///
+    /// It only ever comes up over [`Mode::Browse`]. Interrupting a half-typed
+    /// title with somebody else's question would cost the typing and answer the
+    /// question badly, so a card waits for the panel to be idle — the row and
+    /// the footer count are already there in the meantime, and it comes up the
+    /// moment the prompt closes.
+    Card(Card),
     Confirm {
         argv: Vec<String>,
         question: String,
@@ -422,6 +446,8 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("C", "hand it to a spare agent"),
                 ("u", "take the work back, clear"),
                 ("O S", "a terminal, an agent"),
+                ("x", "lower a raised flag"),
+                ("↵", "on a flag: the card again"),
                 ("X", "remove, after y/n"),
             ],
         ),
@@ -431,6 +457,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("↵ esc", "open it, close it"),
                 ("F", "the title in full, docked"),
                 ("E", "edit in a tab"),
+                ("K", "the board, in a tab"),
                 ("A i r", "show done, ids, sync"),
                 ("R", "only what needs review"),
                 ("w", "the agents, not the work"),
@@ -474,6 +501,11 @@ pub(crate) enum Effect {
     CloseView,
     /// Open the row full-size in a tab of its own, to be written in.
     PopOut { argv: Vec<String>, label: String },
+    /// The board, in a tab of its own. Where [`Effect::PopOut`] builds the
+    /// editing layout — a context pane with editors beside it — this is one
+    /// pane taking the whole tab: four columns of readable title is ninety
+    /// columns, and this pane is thirty-four.
+    Board { argv: Vec<String>, label: String },
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
@@ -588,6 +620,146 @@ pub(super) fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effe
                 other => other,
             };
             move_or_fold(nav, ui, view)
+        }
+        _ => Effect::None,
+    }
+}
+
+/// Keep the card on this panel equal to what the store says is being asked.
+///
+/// Both directions, and the second one is the half that was missing. Putting a
+/// card *up* is the obvious job: an unread flag arrives and the panel asks. But
+/// a card is up in **every** panel at once — they all read the same file and
+/// they all drew it — and answering it happens in exactly one of them. Nothing
+/// told the other twenty-one, so they sat holding a question that had already
+/// been settled: the flag lowered, the task claimed, and a card still standing
+/// over the tree with `y` on it. Since a card holds the keyboard, switching to
+/// one of those panels meant arriving at a modal question about work that was
+/// already in somebody's hands.
+///
+/// So the card is *derived* rather than remembered. `flags.json` is the record
+/// every panel reads, `pending` is what it currently says is being asked, and
+/// this makes the panel agree with it on every frame — which is the same
+/// bargain the folds and the cursor make through `panel-view.json`, one file
+/// down. A card that is no longer the ask goes; one whose words have changed —
+/// an agent that raised its hand again with more to say — is replaced where it
+/// stands rather than closed and re-opened.
+///
+/// Putting one up has two conditions, and both are about not talking over
+/// somebody: the panel has to be browsing — a prompt, a pick or a confirm is a
+/// sentence half-said, and a card landing on it would take the keys meant for
+/// it — and it must not be the one this panel has already asked about.
+///
+/// Not gated on this panel being the one on screen. There are twenty-two of
+/// them and only one is ever in front of you; a card that came up on the
+/// focused panel alone would be one you could dodge by switching workspaces,
+/// which is exactly when you would most like to have been asked.
+pub(crate) fn pop_pending(ui: &Ui, view: &mut View) {
+    // What is up, against what is being asked.
+    if let Mode::Card(up) = &view.mode {
+        match &ui.pending {
+            // Settled somewhere else — answered, lowered, or read on another
+            // panel. The question is gone, so the card is.
+            None => view.mode = Mode::Browse,
+            Some(now) if now.task != up.task => view.mode = Mode::Browse,
+            // The same ask, said differently. Replaced in place: closing and
+            // re-opening would count as this panel having asked, and the guard
+            // below would then refuse to put the new words up at all.
+            Some(now) if now != up => view.mode = Mode::Card(now.clone()),
+            Some(_) => {}
+        }
+    }
+
+    let Some(card) = ui.pending.clone() else {
+        // Nothing waiting. Forget what was asked, so a hand raised on the same
+        // task again — which is an agent asking twice, and worth reading twice
+        // — comes up rather than being taken for the one already answered.
+        view.asked = None;
+        return;
+    };
+    if !matches!(view.mode, Mode::Browse) || view.asked.as_deref() == Some(card.task.as_str()) {
+        return;
+    }
+    view.asked = Some(card.task.clone());
+    view.mode = Mode::Card(card);
+}
+
+/// What the keys mean while a card is up.
+///
+/// Three answers and a way out, and the difference between them is the whole
+/// design: `esc` is *not now* — the card goes and the hand stays raised, so the
+/// section still says somebody is waiting. `x` is *dealt with*, which takes the
+/// flag down everywhere. Answering the question does both, because a question
+/// that has been answered is not still waiting on an answer.
+///
+/// `o` opens the task in the detail pane and leaves the card standing. A card
+/// is three lines about a piece of work and the decision it asks for is often
+/// not answerable from three lines — without this, deciding meant dismissing
+/// the question first, which is how a `y` gets pressed on a card nobody read.
+pub(super) fn card_key(k: Key, ui: &mut Ui, view: &mut View, card: Card) -> Effect {
+    let seen = |view: &mut View| {
+        view.mode = Mode::Browse;
+        Effect::Run {
+            argv: vec!["flag".into(), card.task.clone(), "--seen".into()],
+            escalate: None,
+            then: None,
+        }
+    };
+    match k {
+        // Not now. The card goes; the hand stays up.
+        //
+        // `ctrl-c` too. In [`Mode::Browse`] it quits the panel, and every mode
+        // here takes it to mean "out of this" instead — a reflex that would
+        // otherwise take down a sidebar because somebody wanted rid of a
+        // question.
+        Key::Esc | Key::Char('q') | Key::Interrupt => seen(view),
+        // `↵` is the answer to a card that only wanted to be looked at, and is
+        // deliberately not an answer to one that asked for something: a return
+        // pressed out of habit must never hand a task over.
+        Key::Enter if card.ask.is_none() => seen(view),
+        Key::Enter => {
+            say(ui, "y or n · esc leaves it raised");
+            Effect::None
+        }
+        // Dealt with, whatever it was asking.
+        Key::Char('x') => {
+            view.mode = Mode::Browse;
+            Effect::Run {
+                argv: vec!["flag".into(), "--clear".into(), card.task.clone()],
+                escalate: None,
+                then: None,
+            }
+        }
+        // Read the work before answering for it. The card stays up: this is
+        // what you pressed to be able to answer, not instead of answering.
+        Key::Char('o') => Effect::Inspect(crate::detail::Focus::Task(card.task.clone())),
+        Key::Char('y') | Key::Char('Y') if card.ask == Some(Request::Claim) => {
+            view.mode = Mode::Browse;
+            // The same argv `c` builds, arriving from the other direction: the
+            // agent picked the task and you picked the agent, and a claim is
+            // thirty lines of guards that must have one implementation.
+            //
+            // Nothing lowers the flag here, and nothing needs to: `claim`
+            // lowers the flags on the task it claims, because a hand raised
+            // about work somebody has just been handed has been answered.
+            let argv = vec![
+                "claim".into(),
+                card.task.clone(),
+                "--pane".into(),
+                card.who.clone(),
+            ];
+            Effect::Run { argv, escalate: None, then: super::verbs::tell_for_pane(ui, &card.who, &card.task) }
+        }
+        Key::Char('n') | Key::Char('N') if card.ask == Some(Request::Claim) => {
+            view.mode = Mode::Browse;
+            // A no is worth typing back. The agent asked and then went on with
+            // something else; silence reads as an answer that never came, and
+            // an agent that is still waiting on one is an agent doing nothing.
+            Effect::Run {
+                argv: vec!["flag".into(), "--clear".into(), card.task.clone()],
+                escalate: None,
+                then: super::verbs::tell_refused(ui, &card.who, &card.task),
+            }
         }
         _ => Effect::None,
     }
@@ -769,6 +941,13 @@ pub(crate) fn click(
     if !keyboard {
         return Hit::Keyboard;
     }
+    // A card is over the rows, so a click cannot mean the row under it — the
+    // pointer is on a box, and the box takes keys rather than clicks. Reading
+    // through it would select whatever the popup happens to be covering, which
+    // is a row nobody can see.
+    if matches!(view.mode, Mode::Card(_)) {
+        return Hit::Nothing;
+    }
     // The top line is the strip, and a mark on it is an agent.
     if y == 0 {
         return match super::render::strip_at(ui, w, x) {
@@ -827,6 +1006,10 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Mode::Tags(t) => {
                 view.mode = Mode::Tags(t.clone());
                 tags_key(k, ui, view, t)
+            }
+            Mode::Card(card) => {
+                view.mode = Mode::Card(card.clone());
+                card_key(k, ui, view, card)
             }
             Mode::Confirm { argv, question, escalate, then } => {
                 view.mode = Mode::Confirm {

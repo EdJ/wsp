@@ -116,8 +116,8 @@ Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (an
 closes it again), `esc` closes it, `E` pops the row's file out into an editor
 tab, `1`-`9` jump straight to an agent, `A` shows finished tasks, `R` narrows
 to what needs reviewing, `w` shows the agents instead of the work, `W` puts the
-tree back with the cursor on the task an agent is holding, `i` shows ids, `r`
-syncs, `?` opens the key map.
+tree back with the cursor on the task an agent is holding, `i` shows ids, `x`
+lowers a flag an agent has raised, `r` syncs, `?` opens the key map.
 
 ### The strip, and the agents view
 
@@ -130,7 +130,7 @@ have to get up. The store holds the other half, so the two become four:
 | Mark | What it is waiting for |
 |---|---|
 | `←` | stopped, holding a task that is still live — you are the blocker |
-| `■` | stopped, on a task parked with a question written on it |
+| `?` | stopped, on a task parked with a question written on it |
 | `●` | running |
 | `○` | spare — stopped and holding nothing at all |
 | `·` | herdr says neither, usually a pane that has not spoken since it started |
@@ -471,6 +471,8 @@ disturbing a layout you will come back to.
 | | | asks which project, and remembers, if it stands nowhere |
 | `O` | task, project | open a herdr workspace for it, and claim it |
 | `S` | task, project | the same, with an agent started in it and told |
+| `x` | flagged task | lower a hand an agent raised — either row |
+| `↵` | flagged task | the card again: what was asked, and by whom |
 | `X` | task, project | remove, after a `y`/`n` |
 
 Nothing is reimplemented here: a key builds an argv and the panel runs its own
@@ -649,15 +651,22 @@ prompt unsent, which looks exactly like an agent that read it and ignored it.
 | `✓` | done — only under `A` | `✓` | all work here is finished |
 | | | `●2` | panes standing here |
 
-A pane gets its own row: `●` working, `○` idle, `▫` a shell with no agent in it
-— never started, as against an idle agent that stopped. A task keeps its own
-status glyph even when claimed, because the pane is on the row beneath rather
-than borrowing the task's.
+A pane gets its own row, drawn with the same mark and the same colour the strip
+and the agents view give it: `●` working, `←` stopped in front of you, `?`
+parked on a question, `○` spare, `·` not saying, and `▫` a shell with no agent
+in it — never started, as against an idle agent that stopped. A task keeps its
+own status glyph even when claimed, because the pane is on the row beneath
+rather than borrowing the task's.
 
 `←` marks an idle agent on a task that is still `doing` — it has stopped and
 you are the blocker; the header carries the count. `⋯ n more` is the tail past
 the six-task cap, which counts top-level work only: a sub-task is never hidden
 while its parent is on screen.
+
+`▲` is a hand an agent has raised about that task — see
+[The raised hand](#the-raised-hand). It sits to the left of everything else the
+title is preceded by, because it is the loudest thing on the row and is read
+down the column rather than found along it; `x` takes it off.
 
 `!` and `↓` are priority: ahead of the rest of this project's work, and behind
 it. `normal` has no mark, because nearly everything is normal and a column
@@ -707,12 +716,169 @@ of the tree therefore used to land in the dock and be dragged straight back up
 to wherever that agent's work happened to sit, four times a second, for as long
 as the cursor stayed there.
 
-Colour carries six roles: **bold** is a project, plain is a claimed task, muted
-is an unclaimed one, dim is structure and finished work, accent is live work,
-and warn wants a decision.
+Colour carries seven roles: **bold** is a project, plain is a claimed task,
+muted is an unclaimed one, dim is structure and finished work, accent is live
+work, warn is waiting on you, and query — violet — is a question somebody has
+written down. The last two were one colour until the tree started drawing
+agents the way the strip does: a nudge and an answer are different things to be
+asked for, and a stopped agent sits a row below the task it stopped on, so one
+orange for both left the pair unreadable exactly where they meet.
 
 Note `▸` does double duty — a folded caret on the left of a project row, a
 count of tasks in flight on the right.
+
+### The raised hand
+
+An agent cannot point. It can write a task up, claim it, park it with a
+question on it — and all of that lands somewhere you have to go and look. What
+it could not do was say *this row, now*, which is the difference between a
+backlog read at the end of the day and a question that gets answered.
+
+```sh
+wsp flag <id> "this is next — can I take it?"
+wsp flag <id>                # …or just: look at this, it exists
+wsp flag                     # what is raised
+wsp flag --clear <id>        # lower it
+```
+
+It arrives as a section pinned above the agents, in every panel, without
+anybody pressing anything — a panel is already installed in every workspace and
+they all read the same shared view, so nothing has to find a window or know
+which screen is in front of you. The row draws the sentence, because the
+sentence is the news: the task's own title is up in the tree with a `▲` on it,
+and the pane that raised it is on the right. A flag with nothing written on it
+draws the title instead, which is the whole of "look at this, it exists".
+
+**The row is the deeplink.** It stands for the task it points at, so every verb
+already aimed at a task works from it and none of them had to learn that flags
+exist: `↵` opens it, `c` claims it, `s` starts it, `E` writes it up. The task's
+own row carries the mark as well, because once you have read the ask the next
+question is what the work sits beside, and only the tree answers that.
+
+`x` lowers it, from either row. Deliberately not something `↵` does on the way
+past: reading the ask is how you decide, and a flag that cleared itself the
+moment you looked would be gone from every panel before you had decided
+anything about it — including the decision to leave it up while you finish what
+you are doing. `↵` on a flag row brings its card back.
+
+**A raised hand is not on the background cadence.** A panel nobody is looking
+at refetches every thirty seconds, which is right for news about work — nothing
+is waiting on that pane to notice a status change — and wrong for a card, in
+both directions: half a minute before an agent's question reaches you, and half
+a minute of a card you have already answered still standing over the other
+twenty-one panels with the keyboard in it. So the flag file's timestamp is read
+on every tick, ahead of the gate. It is one `stat`, against the `readdir` of two
+directories and the two socket calls a refetch costs — a hundred a second across
+every panel on the machine, and cheaper than the status poll that already runs.
+
+It is pinned in every view, `R` and `w` included. Those are filters over
+*work*, and a hand raised is somebody asking for you rather than work waiting;
+a section that went quiet under one would be a section you learn to distrust,
+and the view you happened to leave the panel in would decide whether an agent
+could reach you at all. Three are drawn and a `⋯` opens the rest, so a burst of
+asks cannot take the whole dock and leave nothing of the census beneath it, and
+the heading counts them all. On a pane too short for both, the flags are the
+half that stays: the header strip carries every agent in every frame, and
+nothing else on screen carries a raised hand. The footer carries the count too, for a pane too short to give
+the section any rows.
+
+#### The card
+
+A row says a hand is up. It cannot say what was asked — thirty-four columns
+against a paragraph and a question — and it does not *arrive*, it waits for you
+to look down. So a raised flag opens a card over the tree:
+
+```
+ ┌──────────────────────────────┐
+ │ ▲ the panel work, in order   │
+ │                              │
+ │ Items 1-4 are done and this  │
+ │ one is the first that is …   │
+ │                              │
+ │ w4:p2 asks to take this on   │
+ │ y hand it over · n no        │
+ │ o open · esc later           │
+ └──────────────────────────────┘
+```
+
+```sh
+wsp flag <id> --title "the store will not parse" --body - --ask claim
+```
+
+Three optional parts, because the cheap version has to stay cheap: `wsp flag
+<id>` on its own still works, and the card fills itself in from the task — the
+task's title as the heading, and its Overview as the body. A title of its own
+matters when the task's is the wrong sentence for the moment; a body carries
+the paragraph a row cannot; and an ask is the one thing a keypress can settle.
+
+It is the only thing on the panel drawn with a border. Everything else here is
+furniture that is always there, and a rule is enough to separate that; this
+arrived, it is in front of what you were reading, and it is going away again.
+Inset by a column so the rows show at both edges, which is the difference
+between a card lying on the tree and a pane that has replaced it. It never
+covers the section at the foot: answering one ask must not hide the queue of
+the others, and the footer says `1 of 3 raised` so a second is never a surprise.
+
+**It holds the keyboard.** Every other mode here is entered by a key, so
+whoever opened it knows it is open; this one lands in front of whatever you
+were reading, which is exactly why `d` typed a quarter-second earlier must not
+close a task and `y` must not reach the tree behind it. For the same reason it
+only comes up over an idle panel — a half-typed title is a sentence somebody is
+in the middle of, and the card waits for it rather than taking the keys meant
+for it. And it is asked once: a panel that popped whatever was unread on every
+frame would put the same card back up for ever, with `esc` doing nothing you
+could see.
+
+| Key | Means |
+|---|---|
+| `esc` | not now — the card goes, the hand stays raised |
+| `x` | dealt with — the flag comes down everywhere |
+| `o` | open the task in the detail pane, card still up |
+| `y` `n` | answer the question, where there is one |
+
+`↵` puts away a card that only wanted to be looked at, and is deliberately
+*not* an answer to one that asked for something: a return pressed out of habit
+must never hand a task over.
+
+**The asks are a closed vocabulary** — `--ask claim`, and nothing else yet.
+That is the whole of the security model here: the answer to a card is a
+keystroke that runs a command, so an agent naming its own argv would be an
+agent deciding what `y` does on somebody else's panel. It names a question the
+panel already knows how to answer instead, and the panel decides what answering
+it means.
+
+`y` runs the same `wsp claim <id> --pane <asker>` that `c` builds from the
+other direction — the agent picked the task and you picked the agent — and the
+flag comes down because **`claim` lowers the flags on the task it claims**,
+rather than because the panel ran a second command to tidy up after the first.
+A hand raised about work now in somebody's hands is a question about the past,
+however it got there.
+
+`n` lowers it and types the refusal back into the agent's pane. A refusal is
+worth saying: the agent asked and carried on with something else, and silence
+is indistinguishable from an answer that never came. It goes in without a
+`/clear` in front of it, unlike every other sentence the panel sends — those
+hand over new work and want the last task's reasoning out of the way, and this
+one is an answer to a question asked *during* work the agent is still holding.
+
+**A flag is state, not store.** It sits beside the claims and the pins in
+`~/.local/state/wsp`: no commit, nothing in the task file, nothing left in the
+history of the work once it is answered. A raised hand is true while somebody
+is at the machine and meaningless a week later. `wsp note` is the verb for the
+half of it worth keeping — and the two are a pair, not a choice: flag it so it
+is seen today, note it so it is read tomorrow.
+
+Something louder is a hook away, the same seam `review` uses:
+
+```sh
+#!/bin/sh
+# ~/wsp/hooks/on-task-flagged
+exec terminal-notifier -title "wsp: $(jq -r .data.id)" -message "$(jq -r .data.said)"
+```
+
+The panel is the deeplink and this is the doorbell. Which is the honest split:
+nothing here can raise a window on a machine it is not sitting at, and nothing
+needs to — the surface you are already looking at is the one to reach.
 
 ### Storyboard
 
@@ -1100,8 +1266,9 @@ and would take away the one signal `wsp wip` exists to give — a task underway
 with nobody on it.
 
 The **permissions** half matters as much as the hook. Create, claim, note,
-decide and move through the workflow are pre-allowed, because a store an agent
-has to ask permission to write is a store that stays empty. `done`, `rm`, `mv`,
+decide, flag and move through the workflow are pre-allowed, because a store an
+agent has to ask permission to write is a store that stays empty — and `flag`
+doubly so: an agent that has to ask before it can ask is one that never does. `done`, `rm`, `mv`,
 `project rm` and `archive` are denied outright: finishing work and retiring it
 are yours, and a deny rule states that better than a paragraph does — an agent
 that finishes to `review` because the rule says so is one prompt away from

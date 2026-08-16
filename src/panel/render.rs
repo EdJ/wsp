@@ -19,6 +19,12 @@ pub(super) const WARN: &str = "\x1b[38;2;224;138;75m";
 
 pub(super) const MUTED: &str = "\x1b[38;2;125;140;150m";
 
+/// A question somebody has written down. Its own hue rather than a second use
+/// of [`WARN`]: an agent stopped in front of you and an agent parked behind a
+/// question are two different calls on your time, and one colour for both made
+/// the pair unreadable in the tree, where they sit a row apart.
+pub(super) const QUERY: &str = "\x1b[38;2;176;140;217m";
+
 pub(super) const DIMC: &str = "\x1b[2m";
 
 pub(super) const BOLD: &str = "\x1b[1m";
@@ -40,6 +46,8 @@ pub enum Style {
     Muted,
     Accent,
     Warn,
+    /// A question that is written down and waiting on an answer.
+    Query,
 }
 
 #[derive(Debug, Clone)]
@@ -119,11 +127,19 @@ pub(crate) mod glyph {
     pub const IDLE: &str = "○";
     pub const QUIET: &str = "·";
     pub const BLOCKED: &str = "■";
+    /// An agent parked behind a question. The task's own `■` says the work is
+    /// stopped; this says there is a sentence on it addressed to you, which is
+    /// the half a square never managed to say.
+    pub const QUESTION: &str = "?";
     pub const REVIEW: &str = "◆";
     pub const DONE: &str = "✓";
     pub const DOING: &str = "▸";
     pub const MORE: &str = "⋯";
     pub const NEEDS_YOU: &str = "←";
+    /// A hand raised by an agent: look at this task. Drawn on the task's own
+    /// row wherever it is in the tree, and again in the section pinned at the
+    /// foot — the row is the deeplink, so it has to be findable in both.
+    pub const FLAG: &str = "▲";
     /// A pane with no agent in it.
     pub const SHELL: &str = "▫";
     /// Something is written in Overview or Details.
@@ -227,10 +243,12 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
             vec![
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "an idle agent on a task that is still doing — it has stopped and you are the blocker"),
                 mark(&[(Style::Warn, g::NEEDS_YOU), (Style::Accent, g::WORKING), (Style::Muted, g::IDLE)], "the strip", "the same question in the header, once per agent — see below"),
+                mark(&[(Style::Query, g::QUESTION)], "a question", "an agent parked on a task with a question written on it — drawn wherever that agent is, tree or strip"),
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
-                mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Muted, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in"),
+                mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Accent, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in — the same mark and the same colour the agents view gives it, so one pane does not read two ways in one glance"),
                 mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
                 mark(&[(Style::Dim, g::NOTES)], "written on", "something is in this row's Overview or Details — E opens it"),
+                mark(&[(Style::Warn, g::FLAG)], "raised", "an agent has flagged this task and said why — x lowers it"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "agents"), (Style::Plain, " "), (Style::Dim, "7")], "the section", "pinned at the foot: five agents, in the strip's order, with the count of all of them"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
@@ -247,7 +265,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
              working. Each mark is clickable and goes to that terminal.",
             vec![
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "stopped, holding work that is still live — you are the blocker"),
-                mark(&[(Style::Warn, g::BLOCKED)], "blocked", "stopped, on a task parked with a question written on it"),
+                mark(&[(Style::Query, g::QUESTION)], "blocked", "stopped, on a task parked with a question written on it — its own colour, because it wants an answer rather than a nudge"),
                 mark(&[(Style::Accent, g::WORKING)], "working", "running"),
                 mark(&[(Style::Muted, g::IDLE)], "spare", "stopped, holding nothing — a person's worth of attention going spare"),
                 mark(&[(Style::Dim, g::QUIET)], "quiet", "herdr says neither, usually an agent that has not spoken since it started"),
@@ -256,14 +274,15 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
         ),
         (
             "Colour on its own",
-            "Six roles, used consistently regardless of glyph.",
+            "Seven roles, used consistently regardless of glyph.",
             vec![
                 mark(&[(Style::Plain, "plain")], "claimed", "a task with an agent on it"),
                 mark(&[(Style::Muted, "muted")], "unclaimed", "a task nobody is on; agent names"),
                 mark(&[(Style::Dim, "dim")], "structure", "carets, counts, punctuation, finished work"),
                 mark(&[(Style::Bold, "bold")], "project", "project names only"),
                 mark(&[(Style::Accent, "accent")], "live", "running agents and work in flight"),
-                mark(&[(Style::Warn, "warn")], "wants a decision", "blocked, or waiting on you"),
+                mark(&[(Style::Warn, "warn")], "waiting on you", "an agent stopped in front of you, and work parked without a question"),
+                mark(&[(Style::Query, "query")], "a question", "somebody has written one down and is waiting on the answer"),
             ],
         ),
     ]
@@ -385,6 +404,110 @@ pub(super) fn tags_lines(t: &super::keys::Tags, w: usize, room: usize) -> Vec<Li
     if out.is_empty() {
         out.push(line(Style::Dim, "  no tags yet — type one"));
     }
+    out
+}
+
+/// The most rows a card will take out of the tree behind it.
+///
+/// A card is a knock on the door, not a document: the paragraph an agent wrote
+/// may be long and what is worth reading over somebody else's tree is the top
+/// of it. What is cut says so, and `o` opens the task in the detail pane, which
+/// is the surface with room.
+pub(super) const CARD_MAX: usize = 14;
+
+/// The ask, drawn as a card over the tree.
+///
+/// A box rather than another dock, and it is the one thing on the panel drawn
+/// with a border. Everything else here is furniture — it is *always* there, so
+/// a rule is enough to separate it — and this is the exception: it arrived, it
+/// is in front of what you were reading, and it is going away again. The border
+/// is what says all three.
+///
+/// Inset by a column so the rows behind it show at both edges. That gap is the
+/// whole difference between a card lying on top of the tree and a pane that has
+/// replaced it, and it costs two columns of a pane that has thirty-four.
+pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec<Line> {
+    let box_w = w.saturating_sub(2).max(12);
+    // Two for the border, two for the padding inside it.
+    let text_w = box_w.saturating_sub(4).max(6);
+    let rule = |left: &str, right: &str| {
+        let mut l = Line::default();
+        l.push(Style::Plain, " ");
+        l.push(Style::Warn, format!("{left}{}{right}", "─".repeat(box_w - 2)));
+        l
+    };
+    let row = |body: Line| {
+        let mut l = Line::default();
+        l.push(Style::Plain, " ");
+        l.push(Style::Warn, "│");
+        l.push(Style::Plain, " ");
+        let mut body = body;
+        body.fit(text_w);
+        l.spans.extend(body.spans);
+        l.push(Style::Plain, " ");
+        l.push(Style::Warn, "│");
+        l
+    };
+
+    // What is under the body, worked out before the body is: who is asking, and
+    // the keys. Both are fixed and both have to be on screen — a card cut off
+    // above its own keys is a popup with no way out written on it — so the
+    // paragraph is what gives way, and it is the part that has somewhere else
+    // to be read in full.
+    let mut tail: Vec<Line> = Vec::new();
+    let mut who = Line::default();
+    if !card.who.is_empty() {
+        who.push(Style::Muted, card.who.clone());
+        who.push(Style::Muted, " ");
+    }
+    who.push(
+        Style::Muted,
+        match card.ask {
+            Some(a) => a.asking().to_string(),
+            // Nothing is being asked for, so the line says what raised it
+            // rather than inventing a question. `raised this` is thin and it is
+            // the truth: somebody wanted it in front of you.
+            None => "raised this".to_string(),
+        },
+    );
+    tail.push(who);
+    for t in util::wrap(card.ask.map(|a| a.keys()).unwrap_or("↵ ok · o open · x lower"), text_w) {
+        tail.push(line(Style::Accent, t));
+    }
+
+    // The heading, then the paragraph, then the tail. Built as a list first so
+    // the box can be closed at whatever height the pane actually allows.
+    let mut inner: Vec<Line> = Vec::new();
+    let mut head = Line::default();
+    head.push(Style::Warn, format!("{} ", glyph::FLAG));
+    head.push(Style::Bold, util::truncate(&card.title, text_w.saturating_sub(2)));
+    inner.push(head);
+    inner.push(Line::default());
+
+    // Two rules, the heading, and the blank line either side of the body, plus
+    // however many lines the tail needs.
+    let body_room = room.saturating_sub(5 + tail.len()).max(1);
+    let wrapped = util::wrap(&card.body, text_w);
+    let cut = wrapped.len() > body_room;
+    for (i, t) in wrapped.into_iter().take(body_room).enumerate() {
+        let last = cut && i + 1 == body_room;
+        inner.push(line(
+            Style::Plain,
+            if last { util::truncate(&format!("{t} …"), text_w) } else { t },
+        ));
+    }
+
+    inner.push(Line::default());
+    inner.extend(tail);
+
+    let mut out = vec![rule("┌", "┐")];
+    out.extend(inner.into_iter().map(row));
+    // The bottom rule is never what gets cut. A box that is open at the foot
+    // does not read as a box lying over the tree, it reads as a panel that has
+    // gone wrong — so if anything has to go it is a line of the paragraph,
+    // which is what `body_room` already took care of.
+    out.truncate(room.saturating_sub(1).max(2));
+    out.push(rule("└", "┘"));
     out
 }
 
@@ -510,6 +633,11 @@ pub(crate) struct Geometry {
 /// it is exercising a view that never keeps its place, which is the whole of
 /// what the scrolling now is.
 pub(crate) fn place(ui: &Ui, view: &mut View, w: usize, h: usize) -> Geometry {
+    // An ask nobody has read yet comes up here, on the way to being drawn —
+    // which is the one step every path takes, live or offline, where the view
+    // can be written to. [`geometry`] deliberately does not: a click asks it
+    // where the rows are, and answering that question must not raise a popup.
+    super::keys::pop_pending(ui, view);
     let g = geometry(ui, view, w, h);
     view.scroll = Some(g.scroll);
     g
@@ -763,6 +891,24 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             lines.push(l);
         }
     }
+    // The card, over the rows the tree just drew.
+    //
+    // Last, so it lies on top of whatever was there, and clipped to the tree's
+    // own rows so it never covers the dock — the section at the foot is where
+    // the *other* asks are, and a popup that hid them would answer one question
+    // by hiding the queue behind it. Centred in what is left, because a card
+    // pinned to the top edge reads as a header and this is not one.
+    if let Mode::Card(card) = mode {
+        let room = tree_rows.min(CARD_MAX);
+        let card = card_lines(card, w, room);
+        let top = g.head + tree_rows.saturating_sub(card.len()) / 2;
+        for (i, l) in card.into_iter().enumerate() {
+            if let Some(slot) = lines.get_mut(top + i) {
+                *slot = l;
+            }
+        }
+    }
+
     let hidden = map.len() - map_rows;
     lines.extend(map.into_iter().take(map_rows));
 
@@ -802,6 +948,14 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     if ui.review > 0 && !ui.review_only {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Warn, format!("review {}", ui.review));
+    }
+    // And what an agent has raised a hand about. The section at the foot draws
+    // these in full, and this is here for the one case the section cannot
+    // cover: a pane too short to give it any rows. A hand raised and nowhere on
+    // screen is the one failure this whole thing exists to prevent.
+    if ui.flagged > 0 {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Warn, format!("{} {}", glyph::FLAG, ui.flagged));
     }
     if ui.show_done {
         foot.push(Style::Plain, "  ");
@@ -886,6 +1040,22 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             }
             l
         }
+        // The card carries its own keys, inside the box where the question is.
+        // What the footer is worth here is the queue: answering one of three
+        // and finding another underneath is fine, and being surprised by it is
+        // not.
+        Mode::Card(_) => {
+            let mut l = Line::default();
+            l.push(Style::Warn, format!("{} ", glyph::FLAG));
+            l.push(
+                Style::Muted,
+                match ui.flagged {
+                    0 | 1 => "raised".to_string(),
+                    n => format!("1 of {n} raised"),
+                },
+            );
+            l
+        }
         Mode::Browse => match &ui.message {
             Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
                 line(Style::Accent, util::truncate(m, w))
@@ -917,6 +1087,7 @@ pub(super) fn ansi_of(style: Style) -> &'static str {
         Style::Muted => MUTED,
         Style::Accent => ACCENT,
         Style::Warn => WARN,
+        Style::Query => QUERY,
     }
 }
 
@@ -951,6 +1122,7 @@ pub(super) fn class_of(style: Style) -> &'static str {
         Style::Muted => "m",
         Style::Accent => "a",
         Style::Warn => "w",
+        Style::Query => "q",
     }
 }
 
