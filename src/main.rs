@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 mod cmd_agent;
 mod cmd_brief;
+mod cmd_install;
 mod cmd_machine;
 mod cmd_mandate;
 mod cmd_project;
@@ -41,6 +42,8 @@ const BOOL_FLAGS: &[&str] = &[
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm",
+    // And for `install`, whose positional is the binary to install.
+    "dry-run",
     // Same for `sandbox`, whose positional is a sandbox name.
     "keep", "seed",
 ];
@@ -191,6 +194,7 @@ fn expand_short(s: &str) -> String {
         "a" => "all".into(),
         "v" => "verbose".into(),
         "j" => "json".into(),
+        "n" => "dry-run".into(),
         "w" => "workspace".into(),
         other => other.to_string(),
     }
@@ -280,6 +284,7 @@ fn main() {
         "brief" => cmd_brief::brief(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
+        "install" => cmd_install::install(&store, &args),
         "sandbox" => cmd_sandbox::sandbox(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "spawn" => cmd_spawn::spawn(&store, &args),
@@ -371,6 +376,11 @@ fn help() {
                                     build and test your change in a tree of your
                                     own, at HEAD — the only build whose result
                                     means anything while somebody else is here
+  wsp install [<path>] [--why "…"] [-n] [--force] [--to PATH]
+                                    put that build at ~/.local/bin/wsp, one
+                                    install at a time — the one file nothing can
+                                    isolate; defaults to your verify tree's
+                                    release build, -n to look without touching it
   wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own herdr session,
                                     store and state — and the exports to use it;
                                     inside it `wsp` is the binary you ran

@@ -67,7 +67,7 @@ use crate::Args;
 /// staging rather than the repository, and `worktree add` would write the new
 /// worktree's index over it. The two commands that genuinely want a private
 /// index set it themselves, on themselves.
-fn git(dir: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -99,7 +99,7 @@ fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
 /// The repository containing `dir`, resolved through git rather than by walking
 /// up looking for `.git` — a worktree's `.git` is a file, and a submodule's is
 /// somewhere else again.
-fn toplevel(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn toplevel(dir: &Path) -> Option<PathBuf> {
     let out = git(dir, &["rev-parse", "--show-toplevel"])?;
     let line = out.trim();
     (!line.is_empty()).then(|| PathBuf::from(line))
@@ -132,7 +132,7 @@ pub fn agent_key() -> String {
 /// Under `WSP_STATE` rather than a fixed path so a sandbox
 /// (see t-260816-056) gets its own and does not warm — or corrupt — the real
 /// one.
-fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
+pub(crate) fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     store.state.join("build").join(format!("{}-{}", util::slugify(name), key))
 }

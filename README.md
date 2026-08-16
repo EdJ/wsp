@@ -13,7 +13,7 @@ Design rationale and the full spec: `../wsp-spec.md`.
 
 ```sh
 cargo build --release
-install -m 755 target/release/wsp ~/.local/bin/wsp
+install -m 755 target/release/wsp ~/.local/bin/wsp   # the first one; after that, `wsp install`
 wsp init                       # creates ~/wsp (git) and ~/.local/state/wsp
 herdr plugin link "$PWD/herdr-plugin"
 ```
@@ -91,9 +91,9 @@ wsp panel uninstall
 ```
 
 The panel, the view and the daemon all watch their own binary and re-exec when
-it changes, so `install -m 755 target/release/wsp ~/.local/bin/wsp` reaches
-every long-lived process within a tick. `exec` rather than a respawn: the pane,
-its pty and its place in the layout all survive. Without it, twenty-two panes
+it changes, so `wsp install` reaches every long-lived process within a tick.
+`exec` rather than a respawn: the pane, its pty and its place in the layout all
+survive. Without it, twenty-two panes
 sit holding a stale image and a key silently does what it used to do — which is
 worse than one that errors.
 
@@ -1930,6 +1930,7 @@ spot of the check we were relying on at the time.
 | A private `GIT_INDEX_FILE` | the other agent's staged work entering your commit | the working tree; two people still editing one file; **the shared index, which nobody is now reading** |
 | `wsp doctor` | a shared index holding something older than HEAD, in any declared project root | a shared index holding something *newer* — staged work is indistinguishable from staged work |
 | `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one |
+| `wsp install` | a second install while one is in flight, and a build older than what is already live | what the live binary *contains*, if somebody installed it by hand — the record beside it describes wsp's own installs and admits when it no longer matches |
 
 ### The index nobody looks at
 
@@ -2116,6 +2117,68 @@ and the server log (no line containing "plugin" — it never prints one either
 way). Neither could have shown the process, because `pgrep` was never run. The
 redirect that made the probe safe is what suppressed the evidence, and the
 absence of an effect was read as the absence of a cause.
+
+### `wsp install`, because it is the one thing nothing isolates
+
+`verify` isolates the build and `sandbox` isolates the run. Neither touches the
+install, and no version of either could: `~/.local/bin/wsp` is a single file
+that every panel, every detail pane, the daemon and every agent re-execs into
+within a tick, and being shared is the entire point of it. It is the one row of
+the shared-state table with no isolation story, which leaves only the copy
+itself to make safe.
+
+Two agents installing different HEADs a minute apart is a real race, and the
+losing side is the quiet one. What ends up live is whichever `install -m 755`
+ran second; the agent whose commit it reverted has a green build, a clean `git
+log` and no reason to look.
+
+```sh
+wsp install                    # what `wsp verify --release` built — HEAD plus your patch
+wsp install -n                 # what it would do, and who is holding the lock
+wsp install <path> --why "…"   # a binary you name, and a reason worth reading tomorrow
+wsp install --to <path>        # somewhere that is not the live one
+```
+
+Three things, and it is worth being clear which is the point:
+
+- **The copy is exclusive.** A lock beside the destination —
+  `~/.local/bin/.wsp.install.lock`, deliberately not in the state directory,
+  because a sandbox replaces the state directory and cannot replace the file —
+  held across the copy and nothing else. It waits the two seconds
+  `Store::locked` waits and then *refuses* rather than carrying on, which is
+  where the two locks part: a lost state update is recoverable, and an install
+  that went ahead anyway is the thing this exists to prevent. The refusal names
+  the holder, its pid and what it said it was installing, because "held by
+  w24:p1 (pid 4123) for 3s — installing fdefcab" is a sentence you can act on
+  and `busy` is not.
+
+- **The loser finds out.** Every install is written down beside the binary: who,
+  when, at what commit, and the size and mtime of what landed. So the next one
+  can say what it is replacing — and refuse, before the copy, when what is live
+  was installed *after* the binary in your hand was built. That is the race seen
+  from the losing side and the one moment where refusing beats warning.
+  `--force` is there for the deliberate rollback, and a newer install of the
+  same commit with nothing uncommitted on either side is allowed through: two
+  agents building one commit in two trees is not a revert, and a lock people
+  work around is a lock they stop using.
+
+- **Nothing execs half a file.** The bytes go to a temporary in the
+  destination's own directory and arrive by `rename`, so a running panel holds
+  the old inode until it re-execs of its own accord and there is no instant at
+  which the path is half a binary. Then the copy is read back and compared,
+  which is the `cmp` step 6 of `committing.md` asks for by hand — and a check
+  done by hand is a check that gets skipped.
+
+What it does not do is build, and it does not decide *when*. Installing is timed
+around the other agents being idle, and that is a judgement no lock replaces;
+the lock is for the case where two people made it at once.
+
+What it still cannot answer is what the *live* binary contains. The record
+describes what wsp put there and says so plainly when the file no longer matches
+it — every install before this command was a hand-run `install -m 755`, which
+writes nothing down. The commit stamped into the binary itself is
+`t-260816-050`; until that ships, "which of these three commits is live" is
+answered by the record beside the file rather than by the file.
 
 ### What none of it fixes
 
