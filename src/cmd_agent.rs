@@ -1579,42 +1579,86 @@ pub fn where_am_i(store: &Store, args: &Args) -> i32 {
 }
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
-    let index = Index::new(store.projects());
-    let tasks = store.tasks();
-    let bindings = store.bindings();
-    let claims = store.claims();
-    let pins = store.pins();
-
-    let agents = if herdr::available() { herdr::agents().unwrap_or_default() } else { Vec::new() };
-    let workspaces = if herdr::available() { herdr::workspaces().unwrap_or_default() } else { Vec::new() };
-
-    struct Row {
-        project: String,
-        task: String,
-        task_id: String,
-        pane: String,
-        workspace: String,
-        state: String,
-        needs_you: bool,
+    let w = Wip::live(store);
+    match args.json() {
+        true => println!("{}", serde_json::to_string_pretty(&wip_json(&w)).unwrap_or_default()),
+        false => {
+            for l in wip_lines(&w, &Paint::new(), args.terse()) {
+                println!("{l}");
+            }
+        }
     }
+    0
+}
 
-    let mut rows: Vec<Row> = Vec::new();
-    for a in &agents {
-        let bound = bindings
+/// Everything `wsp wip` reads, gathered into one value.
+///
+/// The same bargain [`crate::panel::Snapshot`] and [`crate::cmd_machine::Fleet`]
+/// make. This view's whole subject is the join — an agent that has stopped on
+/// a task that is still `doing` is a person being the blocker — and while it
+/// read the store and asked herdr mid-print, seeing that state took two live
+/// agents in the states you wanted and a task in the right status underneath
+/// them. There was nowhere to put one.
+pub(crate) struct Wip {
+    pub tasks: Vec<Task>,
+    pub index: Index,
+    pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
+    pub claims: std::collections::BTreeMap<String, serde_json::Value>,
+    pub pins: std::collections::BTreeMap<String, String>,
+    /// Only the panes running an agent: `wip` is about who is working, and a
+    /// shell is a person at a terminal rather than work in progress.
+    pub agents: Vec<herdr::Pane>,
+    /// For naming only — a pane's workspace label, which is also one link in
+    /// the chain that resolves which project it is standing in.
+    pub workspaces: Vec<herdr::Workspace>,
+}
+
+impl Wip {
+    pub(crate) fn live(store: &Store) -> Wip {
+        let up = herdr::available();
+        Wip {
+            tasks: store.tasks(),
+            index: Index::new(store.projects()),
+            bindings: store.bindings(),
+            claims: store.claims(),
+            pins: store.pins(),
+            agents: if up { herdr::agents().unwrap_or_default() } else { Vec::new() },
+            workspaces: if up { herdr::workspaces().unwrap_or_default() } else { Vec::new() },
+        }
+    }
+}
+
+/// One agent, as `wip` wants it.
+struct WipRow {
+    project: String,
+    task: String,
+    task_id: String,
+    pane: String,
+    workspace: String,
+    state: String,
+    needs_you: bool,
+}
+
+/// The agents, resolved and in reading order: by project, then by pane.
+fn wip_rows(w: &Wip) -> Vec<WipRow> {
+    let mut rows: Vec<WipRow> = Vec::new();
+    for a in &w.agents {
+        let bound = w
+            .bindings
             .get(&a.pane_id)
             .and_then(|b| b.get("task_id"))
             .and_then(|t| t.as_str())
-            .and_then(|id| tasks.iter().find(|t| t.id == id));
+            .and_then(|id| w.tasks.iter().find(|t| t.id == id));
 
-        let label = workspaces.iter().find(|w| w.id == a.workspace_id).map(|w| w.label.clone());
+        let label = w.workspaces.iter().find(|x| x.id == a.workspace_id).map(|x| x.label.clone());
         let r = resolve::resolve(
-            &index,
-            &pins,
+            &w.index,
+            &w.pins,
             resolve::Held {
                 binding: bound.and_then(|t| t.project.clone()),
                 claim: resolve::claimed_project(
-                    &claims,
-                    &tasks,
+                    &w.claims,
+                    &w.tasks,
                     Some(&a.workspace_id),
                     label.as_deref(),
                 ),
@@ -1627,7 +1671,7 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
         let idle = a.agent_status == "idle";
         let needs_you = idle && bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
 
-        rows.push(Row {
+        rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),
             task: bound
                 .map(|t| t.title.clone())
@@ -1640,51 +1684,60 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
         });
     }
     rows.sort_by(|a, b| a.project.cmp(&b.project).then(a.pane.cmp(&b.pane)));
+    rows
+}
 
-    let blocked: Vec<_> = tasks.iter().filter(|t| t.status() == Status::Blocked).collect();
-    let in_review: Vec<_> = tasks.iter().filter(|t| t.status() == Status::Review).collect();
-    let inbox = tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count();
+/// The three lists under the agents: work waiting on a person, in the order it
+/// is drawn.
+fn wip_queues(w: &Wip) -> (Vec<&Task>, Vec<&Task>, usize) {
+    (
+        w.tasks.iter().filter(|t| t.status() == Status::Blocked).collect(),
+        w.tasks.iter().filter(|t| t.status() == Status::Review).collect(),
+        w.tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count(),
+    )
+}
+
+fn wip_json(w: &Wip) -> serde_json::Value {
+    let rows = wip_rows(w);
+    let (blocked, in_review, inbox) = wip_queues(w);
+    json!({
+        "agents": rows.iter().map(|r| json!({
+            "project": r.project, "task": r.task, "task_id": r.task_id,
+            "pane": r.pane, "workspace": r.workspace, "state": r.state,
+            "needs_you": r.needs_you,
+        })).collect::<Vec<_>>(),
+        "needs_you": rows.iter().filter(|r| r.needs_you).count(),
+        "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
+        "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
+        "inbox": inbox,
+    })
+}
+
+fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
+    let rows = wip_rows(w);
+    let (blocked, in_review, inbox) = wip_queues(w);
     let needs = rows.iter().filter(|r| r.needs_you).count();
+    let mut out = Vec::new();
 
-    if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "agents": rows.iter().map(|r| json!({
-                    "project": r.project, "task": r.task, "task_id": r.task_id,
-                    "pane": r.pane, "workspace": r.workspace, "state": r.state,
-                    "needs_you": r.needs_you,
-                })).collect::<Vec<_>>(),
-                "needs_you": needs,
-                "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
-                "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
-                "inbox": inbox,
-            }))
-            .unwrap_or_default()
-        );
-        return 0;
-    }
-
-    let p = Paint::new();
     if rows.is_empty() {
-        println!("{}", p.dim("no agents running"));
+        out.push(p.dim("no agents running"));
     } else {
-        println!(
+        out.push(format!(
             "{}  ·  {} agents  ·  {}",
             p.bold("WIP"),
             rows.len(),
             if needs > 0 { p.yellow(&format!("{needs} need you")) } else { p.dim("all busy") }
-        );
-        println!();
+        ));
+        out.push(String::new());
         let pw = rows.iter().map(|r| r.project.chars().count()).max().unwrap_or(7).max(7);
         let tw = 46;
-        println!(
+        out.push(format!(
             "{}  {}  {}  {}",
             p.dim(&util::pad("PROJECT", pw)),
             p.dim(&util::pad("TASK", tw)),
             p.dim(&util::pad("PANE", 7)),
             p.dim("STATE")
-        );
+        ));
         for r in &rows {
             let state = match r.state.as_str() {
                 "working" => p.green(&util::pad("working", 8)),
@@ -1692,16 +1745,26 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
                 other => p.dim(&util::pad(other, 8)),
             };
             let flag = if r.needs_you { p.yellow("← needs you") } else { String::new() };
-            println!(
+            out.push(format!(
                 "{}  {}  {}  {} {}",
                 util::pad(&r.project, pw),
                 util::pad(&util::truncate(&r.task, tw), tw),
                 p.dim(&util::pad(&r.pane, 7)),
                 state,
                 flag
-            );
+            ));
         }
     }
+
+    // One task under a heading, for the two named queues below.
+    let named = |out: &mut Vec<String>, t: &Task| {
+        out.push(format!(
+            "  {}  {}  {}",
+            p.dim(&t.id),
+            util::pad(&t.project.clone().unwrap_or_else(|| "—".into()), 8),
+            util::truncate(&t.title, 56)
+        ));
+    };
 
     // Blocked work, named. Under `--terse` the count alone: `wip` is asked
     // repeatedly through a session to see who is free, and the answer to that
@@ -1710,18 +1773,13 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     // Still a line, because a count going up is the reason you would go and
     // read it.
     if !blocked.is_empty() {
-        println!();
-        if args.terse() {
-            println!("{}  {}   {}", p.red(&util::pad("BLOCKED", 8)), blocked.len(), p.dim("wsp ls -s blocked"));
+        out.push(String::new());
+        if terse {
+            out.push(format!("{}  {}   {}", p.red(&util::pad("BLOCKED", 8)), blocked.len(), p.dim("wsp ls -s blocked")));
         } else {
-            println!("{}  {}", p.red(&util::pad("BLOCKED", 8)), blocked.len());
+            out.push(format!("{}  {}", p.red(&util::pad("BLOCKED", 8)), blocked.len()));
             for t in &blocked {
-                println!(
-                    "  {}  {}  {}",
-                    p.dim(&t.id),
-                    util::pad(&t.project.clone().unwrap_or_else(|| "—".into()), 8),
-                    util::truncate(&t.title, 56)
-                );
+                named(&mut out, t);
             }
         }
     }
@@ -1730,21 +1788,17 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     // it stops there and says so, and only a person says `done` — so this is
     // the list of things waiting on you rather than on anybody working.
     if !in_review.is_empty() {
-        println!();
-        println!("{}  {}   {}", p.yellow(&util::pad("REVIEW", 8)), in_review.len(), p.dim("wsp done <id> · wsp reopen <id>"));
+        out.push(String::new());
+        out.push(format!("{}  {}   {}", p.yellow(&util::pad("REVIEW", 8)), in_review.len(), p.dim("wsp done <id> · wsp reopen <id>")));
         for t in &in_review {
-            println!(
-                "  {}  {}  {}",
-                p.dim(&t.id),
-                util::pad(&t.project.clone().unwrap_or_else(|| "—".into()), 8),
-                util::truncate(&t.title, 56)
-            );
+            named(&mut out, t);
         }
     }
     if inbox > 0 {
-        println!("\n{}  {}   {}", p.dim(&util::pad("INBOX", 8)), inbox, p.dim("wsp inbox"));
+        out.push(String::new());
+        out.push(format!("{}  {}   {}", p.dim(&util::pad("INBOX", 8)), inbox, p.dim("wsp inbox")));
     }
-    0
+    out
 }
 
 /// `wsp overlap` — who else is standing in this tree.
@@ -2789,5 +2843,160 @@ mod tests {
         let mut bare = Task::new("…", "t-026");
         bare.log("blocked:");
         assert_eq!(blocked_question(&bare), None);
+    }
+
+    // ---- wip, offline ------------------------------------------------------
+
+    fn wip_agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Pane {
+        herdr::Pane {
+            pane_id: pane.to_string(),
+            workspace_id: ws.to_string(),
+            agent: "claude".into(),
+            agent_status: state.to_string(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn wip_task(id: &str, title: &str, project: Option<&str>, status: &str) -> Task {
+        let mut t = Task::new(title, id);
+        t.project = project.map(str::to_string);
+        t.status_raw = status.to_string();
+        t
+    }
+
+    /// Two agents on two tasks, one of them stopped on work that is still
+    /// `doing` — plus the three queues waiting on a person underneath.
+    ///
+    /// The state this view exists to show is a join of a herdr fact (an agent
+    /// is idle) with a store fact (its task is still open), and standing it up
+    /// live means two real agents in the states you want with the right rows
+    /// underneath them. This is the fixture there was nowhere to hang.
+    fn wip_world() -> Wip {
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
+        bindings.insert("w2:p1".to_string(), json!({ "task_id": "t-002" }));
+
+        Wip {
+            tasks: vec![
+                wip_task("t-001", "the seam under the panel", Some("wsp"), "doing"),
+                wip_task("t-002", "a board over the same facts", Some("wsp"), "doing"),
+                wip_task("t-003", "waiting on a decision", Some("wsp"), "blocked"),
+                wip_task("t-004", "finished, waiting on you", Some("wsp"), "review"),
+                wip_task("t-005", "unfiled", None, "todo"),
+            ],
+            index: Index::new(vec![crate::model::Project::new("wsp")]),
+            bindings,
+            claims: std::collections::BTreeMap::new(),
+            pins: std::collections::BTreeMap::new(),
+            agents: vec![
+                wip_agent("w1:p1", "w1", "working", "wsp"),
+                // Stopped, on a task that is still doing: the ← this view is for.
+                wip_agent("w2:p1", "w2", "idle", "wsp"),
+                // An agent holding nothing, which is its own kind of row.
+                wip_agent("w3:p1", "w3", "working", "reading the README"),
+            ],
+            workspaces: vec![
+                herdr::Workspace { id: "w1".into(), label: "wsp".into(), ..Default::default() },
+                herdr::Workspace { id: "w2".into(), label: "wsp".into(), ..Default::default() },
+                herdr::Workspace { id: "w3".into(), label: "elsewhere".into(), ..Default::default() },
+            ],
+        }
+    }
+
+    /// An idle agent on a task that is still `doing` is a person being the
+    /// blocker, and saying so is what this view is for. One of the three
+    /// agents is in that state and exactly one row carries the mark.
+    #[test]
+    fn wip_names_the_agent_that_is_waiting_on_you() {
+        let w = wip_world();
+        let rows = wip_rows(&w);
+        let flagged: Vec<&str> = rows.iter().filter(|r| r.needs_you).map(|r| r.pane.as_str()).collect();
+        assert_eq!(flagged, ["w2:p1"], "idle on doing, and only that");
+
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("1 need you"), "the heading counts it:\n{text}");
+        assert!(text.contains("← needs you"), "and the row carries it:\n{text}");
+
+        // A working agent on the same kind of task is not waiting on anybody.
+        let mut busy = wip_world();
+        busy.agents[1].agent_status = "working".into();
+        assert!(wip_rows(&busy).iter().all(|r| !r.needs_you));
+        assert!(wip_lines(&busy, &Paint::new(), false).join("\n").contains("all busy"));
+    }
+
+    /// A pane holding nothing still appears — `wip` is who is running, not who
+    /// has claimed — and says what it can about itself rather than nothing.
+    #[test]
+    fn an_agent_holding_nothing_is_still_an_agent() {
+        let rows = wip_rows(&wip_world());
+        let bare = rows.iter().find(|r| r.pane == "w3:p1").expect("a pane with no binding is still a row");
+        assert_eq!(bare.task, "(reading the README)", "its terminal title is the best on offer");
+        assert!(bare.task_id.is_empty());
+        assert!(!bare.needs_you, "holding nothing cannot be blocked on you");
+
+        // With not even a title, it says so rather than leaving the cell blank.
+        let mut w = wip_world();
+        w.agents[2].title = String::new();
+        let rows = wip_rows(&w);
+        assert_eq!(rows.iter().find(|r| r.pane == "w3:p1").unwrap().task, "(unbound)");
+    }
+
+    /// herdr silent costs the view its agents and nothing else. The queues
+    /// below are the store's, and they are what you read `wip` for when
+    /// nothing is running.
+    #[test]
+    fn no_herdr_is_wip_without_the_agents() {
+        let mut w = wip_world();
+        w.agents.clear();
+        w.workspaces.clear();
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+
+        assert!(text.contains("no agents running"), "{text}");
+        assert!(text.contains("BLOCKED"), "blocked work is the store's:\n{text}");
+        assert!(text.contains("waiting on a decision"), "{text}");
+        assert!(text.contains("REVIEW"), "{text}");
+        assert!(text.contains("finished, waiting on you"), "{text}");
+        assert!(text.contains("INBOX"), "unfiled work is still unfiled:\n{text}");
+    }
+
+    /// `--terse` cuts the blocked list to its count and nothing else. `wip` is
+    /// asked repeatedly through a session to see who is free; that answer moves
+    /// every few minutes while the blocked list does not.
+    #[test]
+    fn terse_keeps_the_blocked_count_and_drops_the_names() {
+        let w = wip_world();
+        let full = wip_lines(&w, &Paint::new(), false).join("\n");
+        let terse = wip_lines(&w, &Paint::new(), true).join("\n");
+
+        assert!(terse.contains("BLOCKED"), "the line survives — a count going up is why you go and read it");
+        assert!(!terse.contains("waiting on a decision"), "…without the names:\n{terse}");
+        assert!(full.contains("waiting on a decision"));
+
+        // Review is not cut: it is work an agent has finished with, and every
+        // line of it is something only a person can move.
+        assert!(terse.contains("finished, waiting on you"), "{terse}");
+    }
+
+    /// The json is the same reckoning as the text, not a second one. When they
+    /// were built in two passes over the same data that was a thing to keep
+    /// true by hand; asserted here so it stays one.
+    #[test]
+    fn the_json_says_what_the_text_says() {
+        let w = wip_world();
+        let v = wip_json(&w);
+        assert_eq!(v["needs_you"], json!(1));
+        assert_eq!(v["agents"].as_array().unwrap().len(), 3);
+        assert_eq!(v["blocked"].as_array().unwrap().len(), 1);
+        assert_eq!(v["review"].as_array().unwrap().len(), 1);
+        assert_eq!(v["inbox"], json!(1));
+
+        let agents = v["agents"].as_array().unwrap();
+        let waiting: Vec<&str> = agents
+            .iter()
+            .filter(|a| a["needs_you"] == json!(true))
+            .map(|a| a["pane"].as_str().unwrap())
+            .collect();
+        assert_eq!(waiting, ["w2:p1"]);
     }
 }

@@ -779,46 +779,77 @@ pub fn prio(store: &Store, args: &Args) -> i32 {
     })
 }
 
-pub fn next(store: &Store, args: &Args) -> i32 {
-    let index = Index::new(store.projects());
-    let scope = match current_project(store, args, &index) {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
-    let scope_ids: Option<Vec<String>> = scope.as_ref().map(|s| index.subtree(s));
+/// Everything the pick reads, gathered into one value.
+///
+/// The same bargain the panel's `Snapshot` makes. The interesting half of
+/// `next` is a join — which open task is *not* already in another live agent's
+/// hand — and while it read the store and asked herdr inline, checking the
+/// answer meant standing up two agents, binding one of them, and asking the
+/// other. Three idle agents set going at once and all handed the same task is
+/// the failure this filter exists to stop; there was nowhere to write it down.
+pub(crate) struct Backlog {
+    pub tasks: Vec<Task>,
+    pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Every pane herdr knows about — a binding to a pane that no longer
+    /// exists is stale rather than a holder.
+    pub panes: Vec<herdr::Pane>,
+    /// This pane. A `doing` task in the caller's own hand is precisely the
+    /// caller's next piece of work, so it is not "taken".
+    pub me: Option<String>,
+}
 
-    // `next` means "what do I pick up and work on", so the filter has to answer
-    // for the caller rather than for the backlog.
-    //
-    // `review` is deliberately absent, and its absence is the whole point:
-    // `Status::rank` puts it ahead of `doing` and `todo`, so it did not merely
-    // appear here, it *won* — every agent asking what to do next was handed
-    // work it had already finished and given back. `review` is where an agent
-    // stops; only a person says `done`, and a person finds that pile through
-    // `R` in the panel or `wsp wip`. `blocked` is absent for the neighbouring
-    // reason: a decision is owed, and that is not an agent's to make either.
-    let in_scope = |t: &Task| match &scope_ids {
+impl Backlog {
+    pub(crate) fn live(store: &Store) -> Backlog {
+        Backlog {
+            tasks: store.tasks(),
+            bindings: store.bindings(),
+            panes: if herdr::available() { herdr::panes().unwrap_or_default() } else { Vec::new() },
+            me: crate::herdr::Env::read().pane_id,
+        }
+    }
+}
+
+/// What `next` found, and — when it found nothing — what the backlog was doing
+/// instead. "Nothing actionable" on its own reads as an empty backlog, and the
+/// commonest reason for landing there is the opposite.
+pub(crate) struct Pick {
+    pub task: Option<Task>,
+    /// Open work another live agent is already holding.
+    pub held: usize,
+    /// Work at review: finished, and waiting on a person rather than an agent.
+    pub at_review: usize,
+}
+
+/// Choose the caller's next task.
+///
+/// `review` is deliberately absent from the candidates, and its absence is the
+/// whole point: `Status::rank` puts it ahead of `doing` and `todo`, so it did
+/// not merely appear here, it *won* — every agent asking what to do next was
+/// handed work it had already finished and given back. `review` is where an
+/// agent stops; only a person says `done`, and a person finds that pile through
+/// `R` in the panel or `wsp wip`. `blocked` is absent for the neighbouring
+/// reason: a decision is owed, and that is not an agent's to make either.
+pub(crate) fn pick(b: &Backlog, scope_ids: Option<&[String]>) -> Pick {
+    let in_scope = |t: &Task| match scope_ids {
         Some(ids) => t.project.as_ref().map(|p| ids.contains(p)).unwrap_or(false),
         None => true,
     };
-    let mut candidates: Vec<Task> = store
-        .tasks()
-        .into_iter()
-        .filter(|t| matches!(t.status(), Status::Doing | Status::Todo))
-        .filter(&in_scope)
-        .collect();
 
-    // And nothing another live agent is already holding. `claim` refuses those,
-    // so naming one sends the caller into a guaranteed refusal — and three idle
+    // Nothing another live agent is already holding. `claim` refuses those, so
+    // naming one sends the caller into a guaranteed refusal — and three idle
     // agents set going at once would otherwise all be handed the same task and
-    // all three bounce. Held by the *caller* stays: a `doing` task in this
-    // pane's own hand is precisely this pane's next piece of work.
-    let bindings = store.bindings();
-    let panes_now = if herdr::available() { herdr::panes().unwrap_or_default() } else { Vec::new() };
-    let me = crate::herdr::Env::read().pane_id;
+    // all three bounce.
     let taken = |t: &Task| {
-        !crate::cmd_agent::live_holders(&bindings, &panes_now, &t.id, me.as_deref()).is_empty()
+        !crate::cmd_agent::live_holders(&b.bindings, &b.panes, &t.id, b.me.as_deref()).is_empty()
     };
+
+    let mut candidates: Vec<Task> = b
+        .tasks
+        .iter()
+        .filter(|t| matches!(t.status(), Status::Doing | Status::Todo))
+        .filter(|t| in_scope(t))
+        .cloned()
+        .collect();
     let held = candidates.iter().filter(|t| taken(t)).count();
     candidates.retain(|t| !taken(t));
 
@@ -830,36 +861,56 @@ pub fn next(store: &Store, args: &Args) -> i32 {
             .then(a.id.cmp(&b.id))
     });
 
-    let Some(t) = candidates.first() else {
+    Pick {
+        task: candidates.into_iter().next(),
+        held,
+        at_review: b
+            .tasks
+            .iter()
+            .filter(|t| t.status() == Status::Review)
+            .filter(|t| in_scope(t))
+            .count(),
+    }
+}
+
+/// Why there was nothing, in the words a person reads. Empty when the backlog
+/// really is empty, which is the one case that needs no explaining.
+pub(crate) fn nothing_because(p: &Pick) -> String {
+    let mut why: Vec<String> = Vec::new();
+    if p.at_review > 0 {
+        why.push(format!("{} at review, waiting on a person", p.at_review));
+    }
+    if p.held > 0 {
+        why.push(format!("{} held by other agents", p.held));
+    }
+    why.join(" · ")
+}
+
+pub fn next(store: &Store, args: &Args) -> i32 {
+    let index = Index::new(store.projects());
+    let scope = match current_project(store, args, &index) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let scope_ids: Option<Vec<String>> = scope.as_ref().map(|s| index.subtree(s));
+
+    let b = Backlog::live(store);
+    let found = pick(&b, scope_ids.as_deref());
+
+    let Some(t) = found.task.as_ref() else {
         // Asked, and there was nothing — which is a state worth wearing rather
         // than a moment. This pane stays like this until somebody hands it
         // something, so of the two labels `say_looking` writes, this is the one
         // that is still on screen when a person comes looking.
-        crate::cmd_agent::say_looking(store, &panes_now, scope.as_deref(), false);
+        crate::cmd_agent::say_looking(store, &b.panes, scope.as_deref(), false);
 
-        // "nothing actionable" on its own reads as an empty backlog, and the
-        // commonest reason for landing here is the opposite — a backlog that is
-        // entirely at review or entirely in other agents' hands. An agent that
-        // has just been told to find work needs to know which.
-        let waiting = store
-            .tasks()
-            .iter()
-            .filter(|t| t.status() == Status::Review)
-            .filter(|t| in_scope(t))
-            .count();
         if args.json() {
             println!("null");
         } else {
-            let mut why: Vec<String> = Vec::new();
-            if waiting > 0 {
-                why.push(format!("{waiting} at review, waiting on a person"));
-            }
-            if held > 0 {
-                why.push(format!("{held} held by other agents"));
-            }
+            let why = nothing_because(&found);
             match why.is_empty() {
                 true => println!("nothing actionable"),
-                false => println!("nothing actionable — {}", why.join(" · ")),
+                false => println!("nothing actionable — {why}"),
             }
         }
         return 0;
@@ -867,7 +918,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
 
     // Named, but not yet taken up: the claim is the agent's next move and the
     // reading of the task comes in between. The claim renames over this.
-    crate::cmd_agent::say_looking(store, &panes_now, scope.as_deref(), true);
+    crate::cmd_agent::say_looking(store, &b.panes, scope.as_deref(), true);
 
     if args.json() {
         println!("{}", t.json());
@@ -1448,4 +1499,118 @@ mod tests {
         assert!(t.parent.is_none());
         assert!(t.body.contains("detached to the top level of verb"), "{}", t.body);
     }
+
+    // ---- what `next` picks, offline ---------------------------------------
+
+    fn open_task(id: &str, title: &str, status: &str, prio: &str) -> Task {
+        let mut t = Task::new(title, id);
+        t.project = Some("wsp".into());
+        t.status_raw = status.to_string();
+        t.priority_raw = prio.to_string();
+        t
+    }
+
+    fn live_pane(id: &str) -> herdr::Pane {
+        herdr::Pane { pane_id: id.to_string(), agent: "claude".into(), ..Default::default() }
+    }
+
+    /// Four open tasks, one of them in another agent's hand.
+    fn backlog() -> Backlog {
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert("w2:p1".to_string(), json!({ "task_id": "t-002" }));
+        Backlog {
+            tasks: vec![
+                open_task("t-001", "a todo, high", "todo", "high"),
+                open_task("t-002", "held by somebody else", "doing", "high"),
+                open_task("t-003", "a todo, normal", "todo", "normal"),
+                open_task("t-004", "finished, waiting on a person", "review", "high"),
+                open_task("t-005", "waiting on a decision", "blocked", "high"),
+            ],
+            bindings,
+            panes: vec![live_pane("w1:p1"), live_pane("w2:p1")],
+            me: Some("w1:p1".into()),
+        }
+    }
+
+    /// The failure this filter exists to stop: three idle agents set going at
+    /// once, all handed the same task, all three bounced off `claim`. Writable
+    /// now because the pick takes its inputs in — before this it needed two
+    /// live agents with a binding between them.
+    #[test]
+    fn next_does_not_name_work_another_live_agent_is_holding() {
+        let p = pick(&backlog(), None);
+        assert_eq!(p.task.map(|t| t.id), Some("t-001".to_string()));
+        assert_eq!(p.held, 1, "and it says how many it stepped over");
+
+        // The holder's own pane asking gets it back: a `doing` task in the
+        // caller's hand is precisely the caller's next piece of work.
+        let mut mine = backlog();
+        mine.me = Some("w2:p1".into());
+        let p = pick(&mine, None);
+        assert_eq!(p.task.map(|t| t.id), Some("t-002".to_string()), "doing outranks todo, and it is mine");
+        assert_eq!(p.held, 0);
+    }
+
+    /// A binding to a pane herdr no longer reports is stale, not a holder —
+    /// which is the state a re-claim exists to clear. A pane that is a person
+    /// at a terminal is not a holder either; they can be asked to move.
+    #[test]
+    fn a_dead_pane_is_not_holding_anything() {
+        let mut gone = backlog();
+        gone.panes.retain(|p| p.pane_id != "w2:p1");
+        let p = pick(&gone, None);
+        assert_eq!(p.task.map(|t| t.id), Some("t-002".to_string()), "the binding outlived the pane");
+        assert_eq!(p.held, 0);
+
+        let mut shell = backlog();
+        shell.panes[1].agent = String::new();
+        assert_eq!(pick(&shell, None).held, 0, "a shell is a person, who can be asked");
+    }
+
+    /// `review` outranks `doing` and `todo`, so leaving it in the candidates
+    /// did not merely offer it — it won, every time. Every agent asking what to
+    /// do next was handed work it had already finished and given back.
+    #[test]
+    fn work_already_finished_is_never_the_next_thing_to_do() {
+        let mut only_review = backlog();
+        only_review.tasks.retain(|t| matches!(t.status_raw.as_str(), "review" | "blocked"));
+        let p = pick(&only_review, None);
+        assert!(p.task.is_none(), "nothing an agent can pick up");
+        assert_eq!(p.at_review, 1);
+
+        // And "nothing actionable" alone reads as an empty backlog, which is
+        // the opposite of what this is.
+        assert_eq!(nothing_because(&p), "1 at review, waiting on a person");
+        let empty = pick(&Backlog { tasks: Vec::new(), ..backlog() }, None);
+        assert_eq!(nothing_because(&empty), "", "an empty backlog needs no explaining");
+    }
+
+    /// Both reasons at once, in the order a person wants them: what is waiting
+    /// on you first, what is waiting on somebody else after.
+    #[test]
+    fn nothing_actionable_says_which_kind_of_nothing() {
+        let mut b = backlog();
+        b.tasks.retain(|t| t.id != "t-001" && t.id != "t-003");
+        let p = pick(&b, None);
+        assert!(p.task.is_none());
+        assert_eq!(nothing_because(&p), "1 at review, waiting on a person · 1 held by other agents");
+    }
+
+    /// Scope filters the candidates and the count of what is waiting with them:
+    /// an agent told to work in one project is not told about another's queue.
+    #[test]
+    fn a_scoped_next_counts_only_its_own_backlog() {
+        let mut b = backlog();
+        b.tasks.push({
+            let mut t = open_task("t-006", "somebody else's project", "todo", "high");
+            t.project = Some("strata".into());
+            t
+        });
+        let ids = ["strata".to_string()];
+        let p = pick(&b, Some(&ids));
+        assert_eq!(p.task.map(|t| t.id), Some("t-006".to_string()));
+        assert_eq!(p.at_review, 0, "wsp's review pile is not strata's business");
+        assert_eq!(p.held, 0);
+    }
+
 }
