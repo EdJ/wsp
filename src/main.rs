@@ -305,7 +305,9 @@ fn main() {
             Some("install") => panel::install(&store, &args),
             Some("uninstall" | "remove") => panel::uninstall(&store, &args),
             Some("storyboard") => story::run(&args),
-            _ => panel::run(&store),
+            // `--full` is the panel `Z` opens in a tab: the same panel, at the
+            // width of the workspace, and quit rather than kept.
+            _ => panel::run(&store, args.has("full")),
         },
 
         other => {
@@ -380,7 +382,9 @@ fn help() {
   wsp machine rm <name> [--force]   retire it; --force removes the record
 
 {plumbing}
-  wsp panel                         the sidebar replacement (runs in a pane)
+  wsp panel [--full]                the sidebar replacement (runs in a pane);
+                                    --full is the whole tree at the width of the
+                                    workspace, which Z in the panel opens in a tab
   wsp view [<id>]                   detail pane; follows the panel unless given an id
   wsp kanban|board [<proj>] [--done]  the work as todo/doing/review/done columns;
                                     K in the panel opens it in a tab

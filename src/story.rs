@@ -399,12 +399,14 @@ impl<'a> Driver<'a> {
         Driver::at(snap, W, H)
     }
 
-    /// The same, in a pane of a stated size — what `Z` leaves behind.
+    /// The panel `Z` opens: a tab of its own, at the width of the workspace.
     fn at(snap: &'a Snapshot, w: usize, h: usize) -> Driver<'a> {
         let mut view = panel::View::default();
         // Exactly what the live loop does before it builds its rows: which rows
-        // there are depends on whether this is a page or a sidebar.
+        // there are depends on whether this is a page or a sidebar, and what
+        // `q` means depends on whether this panel is the tab or the furniture.
         view.fit_to_pane(w);
+        view.takes_the_tab(true);
         let ui = panel::collect(snap, &view, Some("w0"));
         panel::place(&ui, &mut view, w, h);
         Driver { snap, view, ui, log: Vec::new(), size: (w, h) }
@@ -600,8 +602,8 @@ fn scenes() -> Vec<Scene> {
     // drawn to it.
     out.push(
         Driver::at(&w, 120, 30).scene(
-            "Fullscreen",
-            "Z gives the panel the whole workspace — herdr zooms the pane it is already running in, so the process, the folds and the cursor are the ones from the sidebar. Nothing is laid out differently: the tree is the same one row to a line, and every one of those rows is now as wide as the pane, so a title that was twenty-five characters and an ellipsis is a sentence. The one thing that does change is which rows there are — the six-task cap comes off, because six was what a project could spend of a column that had to hold thirty projects, and a pane this size has no such shortage.",
+            "The whole tree",
+            "Z opens the panel in a tab of its own, at the width of the workspace. It is a second panel and it costs nothing to be one: the folds, the filters and the cursor live in the store, so this and the sidebar are the same panel at two widths — it opens on the row you pressed Z from. Nothing is laid out differently, either. The tree is the same one row to a line, and every one of those rows is now as wide as the pane, so a title that was twenty-five characters and an ellipsis is a sentence. Two things do change: the six-task cap comes off, because six was what a project could spend of a column that had to hold thirty projects; and the footer says how to leave, because this is a tab somebody opened rather than furniture that is always there.",
         ),
     );
 
@@ -1977,6 +1979,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `Z` opens the whole tree in a tab, and in that tab it closes it again.
+    ///
+    /// The asymmetry underneath is the point. The sidebar is installed
+    /// furniture: quitting it costs a reinstall and buys nothing, so `q` refuses
+    /// and says which key does mean it. The tab is the opposite — somebody
+    /// opened it a minute ago, `Z` opens it again for nothing, and a fullscreen
+    /// whose exit you have to hunt for is one you close by closing the tab.
+    #[test]
+    fn the_tab_z_opens_is_the_tab_z_closes() {
+        let w = world();
+        let quits = |full: bool, k: Key| -> bool {
+            let mut view = panel::View::default();
+            view.takes_the_tab(full);
+            let mut ui = ui_of(&w, &view);
+            matches!(panel::apply_key(k, &mut ui, &mut view), panel::Effect::Quit)
+        };
+
+        // In the sidebar, `Z` asks for the tab and nothing closes anything.
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        assert!(matches!(
+            panel::apply_key(Key::Char('Z'), &mut ui, &mut view),
+            panel::Effect::Full
+        ));
+        assert!(!quits(false, Key::Char('q')), "a stray q must not take the sidebar down");
+        assert!(!quits(false, Key::Char('Z')));
+
+        // In the tab, all three ways of saying "put this away" put it away.
+        for k in [Key::Char('Z'), Key::Char('q'), Key::Esc] {
+            assert!(quits(true, k), "{k:?} should close the fullscreen tab");
+        }
+        // …but not over something that is itself open. The key map goes first,
+        // as it does in the sidebar — closing the whole tab to put away a list
+        // of keys would be the panel taking the loudest possible reading of
+        // `esc`. The detail pane sits between the two and is guarded the same
+        // way, one line above this in `browse_key`.
+        let mut view = panel::View::default();
+        view.takes_the_tab(true);
+        view.set_help_for_test(true);
+        let mut ui = ui_of(&w, &view);
+        assert!(matches!(
+            panel::apply_key(Key::Esc, &mut ui, &mut view),
+            panel::Effect::None
+        ));
+        assert!(quits(true, Key::Esc), "and once it is closed, esc means the tab again");
     }
 
     /// A page shows the branch whole; a sidebar shows six of it and says so.

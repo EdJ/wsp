@@ -1118,6 +1118,11 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
                 }
                 l
             }
+            // The way out, on the surface that needs one said. The sidebar is
+            // always there and `?` is the answer to everything else; this is a
+            // tab somebody opened a minute ago, and a fullscreen you have to
+            // hunt the exit of is one you close by closing the tab.
+            _ if view.full => line(Style::Dim, "↵ open · E edit · a add · q closes · ? keys"),
             _ => line(Style::Dim, "↵ open · E edit · a add · ? keys"),
         },
     });

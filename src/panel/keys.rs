@@ -31,6 +31,13 @@ impl View {
         self.wide = super::render::is_page(w);
     }
 
+    /// This panel is the tab `Z` opened rather than the sidebar. Set from the
+    /// command line at startup and never changed, because it is what this
+    /// process *is*; see [`View::full`].
+    pub(crate) fn takes_the_tab(&mut self, full: bool) {
+        self.full = full;
+    }
+
     /// The key map changes how many rows the tree gets, which changes where a
     /// click lands. Test-only, so a sweep can check both.
     #[cfg(test)]
@@ -52,6 +59,14 @@ pub(crate) struct View {
     pub(super) collapsed: HashSet<String>,
     /// Projects (or the inbox) showing past `MAX_TASKS_PER_PROJECT`.
     pub(super) expanded: HashSet<String>,
+    /// This panel *is* the tab: the one `Z` opened, drawn at the width of the
+    /// workspace.
+    ///
+    /// What it changes is the way out. The sidebar is installed furniture and
+    /// refuses to be quit by a stray `q` — losing it costs a reinstall and buys
+    /// nothing. This one is a tab somebody opened a moment ago and will close
+    /// again, so `q`, `esc` and `Z` all close it, and the footer says so.
+    pub(super) full: bool,
     /// The pane is a page rather than a sidebar — wide enough to be read rather
     /// than glanced at, which is what `Z` makes it.
     ///
@@ -476,7 +491,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
             vec![
                 ("↵ esc", "open it, close it"),
                 ("F", "the title in full, docked"),
-                ("Z", "fullscreen, and back"),
+                ("Z", "the whole tree, in a tab"),
                 ("E", "edit in a tab"),
                 ("K", "the board, in a tab"),
                 ("A i r", "show done, ids, sync"),
@@ -527,14 +542,15 @@ pub(crate) enum Effect {
     /// pane taking the whole tab: four columns of readable title is ninety
     /// columns, and this pane is thirty-four.
     Board { argv: Vec<String>, label: String },
-    /// The panel over the whole workspace, and back again.
+    /// The whole tree, in a tab of its own — or the one already open, brought
+    /// to the front.
     ///
-    /// Nothing is opened and nothing is launched: herdr zooms the pane this
-    /// panel is already running in, the pty resizes under it, and the next frame
-    /// is drawn to whatever it is now — which is why a fullscreen panel is the
-    /// same folds, the same cursor and the same process rather than a second
-    /// surface to keep in step with this one.
-    Zoom,
+    /// A tab rather than a zoom of this pane: a zoomed pane makes the terminal
+    /// beside it unreachable, and the sidebar is furniture and has no business
+    /// doing that to a workspace. It is a second panel and that costs nothing —
+    /// the folds and the cursor live in the store, so the two are the same panel
+    /// at two widths.
+    Full,
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.

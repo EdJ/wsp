@@ -138,7 +138,10 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
                 Action::Open { id } => {
                     let ws = herdr::Env::read().workspace_id;
                     let focus = crate::detail::Focus::Task(id);
-                    match panel::inspect(store, ws.as_deref(), &focus) {
+                    // No pane of our own to split off: the board hands the
+                    // task to the *sidebar's* detail pane and closes, so the
+                    // detail is left where the panel that owns it can see it.
+                    match panel::inspect(store, ws.as_deref(), &focus, None) {
                         m if m.is_empty() => return 0,
                         m => note = Some((m, Instant::now())),
                     }

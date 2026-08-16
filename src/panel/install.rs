@@ -13,7 +13,7 @@ use crate::herdr;
 use crate::store::Store;
 use crate::util::shell_quote;
 
-use super::{PANEL_LABEL, VIEW_LABEL};
+use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 pub(super) fn panel_command() -> Vec<String> {
     let exe = std::env::current_exe()
@@ -50,6 +50,10 @@ pub(super) fn save_panels(store: &Store, map: &std::collections::BTreeMap<String
 pub(super) struct PaneInfo {
     pub(super) id: String,
     pub(super) label: String,
+    /// The tab it is in. A workspace's panes span every tab it has, so this is
+    /// what tells the panel's own detail pane from one belonging to a board or
+    /// to the fullscreen panel two tabs over.
+    pub(super) tab: String,
 }
 
 pub(super) fn list_panes(ws_id: &str) -> Result<Vec<PaneInfo>, String> {
@@ -64,6 +68,7 @@ pub(super) fn list_panes(ws_id: &str) -> Result<Vec<PaneInfo>, String> {
             Some(PaneInfo {
                 id: p.get("pane_id")?.as_str()?.to_string(),
                 label: p.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                tab: p.get("tab_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             })
         })
         .collect())
@@ -73,7 +78,13 @@ pub(super) fn list_panes(ws_id: &str) -> Result<Vec<PaneInfo>, String> {
 /// Width comes from herdr's layout, because "first in the list" is an
 /// arbitrary answer that happens to be right only when there is one pane.
 pub(super) fn widest<'a>(ws_id: &str, panes: &'a [PaneInfo]) -> Option<&'a PaneInfo> {
-    let mine = |p: &PaneInfo| p.label == PANEL_LABEL || p.label == VIEW_LABEL;
+    // Everything of ours, not just the two that live in this tab: `pane.list`
+    // is per *workspace*, so a board or a fullscreen panel open in another tab
+    // is in this list too, and splitting the sidebar off one of those would put
+    // it in a tab nobody has the sidebar open in.
+    let mine = |p: &PaneInfo| {
+        [PANEL_LABEL, VIEW_LABEL, BOARD_LABEL, FULL_LABEL].contains(&p.label.as_str())
+    };
     let candidates: Vec<&PaneInfo> = panes.iter().filter(|p| !mine(p)).collect();
     if candidates.len() <= 1 {
         return candidates.into_iter().next();
@@ -248,10 +259,12 @@ pub fn uninstall(store: &Store, args: &crate::Args) -> i32 {
         if herdr::call("pane.close", json!({ "pane_id": pane })).is_ok() {
             removed += 1;
         }
-        // The view pane is ours too. Leaving it behind orphans a pane nothing
-        // will reclaim, and the next install would try to split it.
+        // The view pane is ours too, and so is a fullscreen panel in a tab of
+        // its own. Leaving either behind orphans a pane nothing will reclaim —
+        // and in the second case, a panel in a workspace somebody has just said
+        // they want no panel in.
         if let Ok(ps) = list_panes(&ws) {
-            for v in ps.iter().filter(|p| p.label == VIEW_LABEL) {
+            for v in ps.iter().filter(|p| p.label == VIEW_LABEL || p.label == FULL_LABEL) {
                 let _ = herdr::call("pane.close", json!({ "pane_id": v.id }));
             }
         }

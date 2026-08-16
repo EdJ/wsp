@@ -113,9 +113,9 @@ that call and every pane in it gets a fresh terminal, which takes down any
 agent running in the workspace.
 
 Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
-closes it again), `esc` closes it, `Z` gives the panel the whole workspace and
-`Z` gives it back, `E` pops the row's file out into an editor tab, `1`-`9` jump
-straight to an agent, `A` shows finished tasks, `R` narrows to what needs
+closes it again), `esc` closes it, `Z` opens the whole tree in a tab of its own
+and closes it again, `E` pops the row's file out into an editor tab, `1`-`9`
+jump straight to an agent, `A` shows finished tasks, `R` narrows to what needs
 reviewing, `w` shows the agents instead of the work, `W` puts the tree back with
 the cursor on the task an agent is holding, `i` shows ids, `x` lowers a flag an
 agent has raised, `r` syncs, `?` opens the key map.
@@ -269,16 +269,14 @@ The verbs are listed first because a pane too short for the whole map cuts from
 the bottom, and movement is the half you can find by pressing an arrow and
 watching. The footer says how many lines it could not fit.
 
-### Fullscreen
+### The whole tree, in a tab
 
-`Z` gives the panel the whole workspace, and `Z` gives it back. There is no
-fullscreen *version* of it: herdr zooms the pane the panel is already running
-in, the pty resizes underneath, and the next frame is drawn to whatever the pane
-now measures — same process, same folds, same cursor on the same row. A second
-pane running a second copy would be two panels to keep in step and a tab to
-close afterwards; this is one call and a repaint. The footer says `fullscreen ·
-Z back`, because a key that changes the shape of the screen has to say how to
-undo itself.
+`Z` opens the panel in a tab of its own — `wsp panel --full`, at the width of
+the workspace — and `Z`, `q` or `esc` closes it again. It is a second panel and
+it costs nothing to be one: the folds, the filters and the cursor are in the
+store, so this and the sidebar are the same panel at two widths, and it opens on
+the row you pressed `Z` from. Press `Z` in the sidebar while one is already open
+and you go to it rather than getting a second.
 
 Nothing is laid out differently. The tree stays one row to a line and every one
 of those rows is the width of the pane, so the title that was twenty-five
@@ -291,14 +289,27 @@ off, so a project shows all its tasks rather than six and a `⋯ 4 more`. Six wa
 what one project could spend of a column that had to hold thirty projects, and a
 pane this size has no such shortage. It follows the width rather than the key —
 a pane is a page at 96 columns, which is about where a row stops abbreviating —
-so dragging the split wider by hand gets the same tree, and herdr's own zoom
-keybinding works as well as `Z` does.
+so dragging a sidebar wider by hand gets the same tree.
 
-`↵` while zoomed puts you back in the sidebar with the detail pane open, and
-that is herdr rather than the panel: splitting a pane into a zoomed workspace
-ends the zoom, which is the right answer — the row you asked to read is opening
-in a second pane, and a zoom is the one state where a second pane cannot be
-seen. `Z` again when you have read it.
+This was `pane.zoom` first, and that is worth writing down because it looked
+right: zoom the pane the panel is already in, the pty resizes underneath, one
+process and no tab to close. It cost a panel on the first afternoon — `Z`, a
+switch to another agent, and the pane never came back.
+
+A zoom is not a bigger pane. It is a display mode over the whole tab, set by one
+pane and outliving it: measured against the live server, it survives a switch to
+another workspace and back, and `pane.focus` will move the keyboard onto a pane
+the zoom is hiding, so what is on the screen and what the keys reach stop being
+the same question. The panel is furniture — installed in every workspace,
+thought about by nobody — and furniture must not hold a workspace in a mode it
+cannot see the state of and whose only undo is a key inside itself. A tab hides
+nothing, herdr's own switcher lists it, and closing it puts you back.
+
+The fullscreen panel gets its own detail pane, in its own tab: `↵` splits it
+underneath, the same way the sidebar does. That is why `inspect` splits off *our
+own pane* rather than the pane labelled `wsp` — with two panels in a workspace,
+the label finds whichever herdr lists first, and a detail pane in a tab you are
+not looking at is a `↵` that appears to do nothing.
 
 ## The detail pane
 

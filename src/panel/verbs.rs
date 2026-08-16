@@ -22,7 +22,7 @@ use super::install::list_panes;
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
 use super::rows::{hotkeys, AgentRef, Target, Ui};
-use super::{BOARD_LABEL, PANEL_LABEL, VIEW_LABEL};
+use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ask {
@@ -648,42 +648,83 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
     Effect::Refetch
 }
 
-/// Shut the workspace's detail pane, if it has one.
-pub(super) fn close_view(store: &Store, self_ws: Option<&str>) -> bool {
+/// The detail pane this panel opened, if it has one.
+///
+/// Ours means *in this tab*, not merely in this workspace: `pane.list` is per
+/// workspace, and the fullscreen panel `Z` opens is a second panel in a tab of
+/// its own. Reading the workspace's first view pane would have each of the two
+/// closing the other's, and `↵` in the fullscreen retargeting a pane in a tab
+/// nobody is looking at — which is a key that appears to do nothing.
+fn my_view(ws: &str, me: Option<&str>) -> Option<String> {
+    let panes = list_panes(ws).ok()?;
+    let mine = me.and_then(|id| panes.iter().find(|p| p.id == id)).map(|p| p.tab.clone());
+    panes
+        .iter()
+        .filter(|p| p.label == VIEW_LABEL)
+        .find(|p| mine.as_ref().is_none_or(|tab| &p.tab == tab))
+        .map(|p| p.id.clone())
+}
+
+/// Shut this panel's detail pane, if it has one.
+pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>) -> bool {
     let Some(ws) = self_ws else { return false };
     crate::detail::set_focus(store, ws, &crate::detail::Focus::Nothing);
-    let Ok(panes) = list_panes(ws) else { return false };
-    match panes.into_iter().find(|p| p.label == VIEW_LABEL) {
-        Some(p) => herdr::call("pane.close", json!({ "pane_id": p.id })).is_ok(),
+    match my_view(ws, me) {
+        Some(pane) => herdr::call("pane.close", json!({ "pane_id": pane })).is_ok(),
         None => false,
     }
 }
 
-/// Fullscreen, and back: herdr zooms the pane this panel is running in.
+/// The whole tree, in a tab of its own.
 ///
-/// The whole of what `Z` does. There is no fullscreen *version* of the panel to
-/// build — the frame is drawn to whatever the pane measures, so a pane made
-/// larger is a panel showing more, with the folds, the cursor and the process
-/// all untouched. A second pane running a second copy would be two panels to
-/// keep in step and a tab to close; this is a call and a repaint.
+/// The panel drawn at the width of the workspace rather than of a sidebar: the
+/// same rows, the same one row to a line, and a row wide enough to say what the
+/// work is instead of its first twenty-five characters. It is a second process
+/// and that costs nothing, because the folds, the filters and the cursor are in
+/// the store — two panels on one tree are the same panel, which is the whole
+/// bargain `panel-view.json` makes.
 ///
-/// A workspace with nothing beside the panel has nothing to zoom over, and
-/// herdr says so rather than failing — `single_pane` is the reason it gives, and
-/// it is worth passing on, because pressing this and seeing no change otherwise
-/// reads as a key that did not work.
-pub(super) fn zoom(me: Option<&str>) -> String {
-    let Some(pane) = me else { return "no pane to zoom — this panel is not in herdr".into() };
-    let r = match herdr::call("pane.zoom", json!({ "pane_id": pane, "mode": "toggle" })) {
-        Ok(r) => r,
-        Err(e) => return format!("could not zoom: {e}"),
-    };
-    let z = r.get("zoom");
-    let zoomed = z.and_then(|z| z.get("zoomed")).and_then(|x| x.as_bool()).unwrap_or(false);
-    match z.and_then(|z| z.get("reason")).and_then(|x| x.as_str()) {
-        Some("single_pane") => "nothing to zoom over — the panel is the only pane".into(),
-        _ if zoomed => "fullscreen · Z back".into(),
-        _ => "back in the sidebar".into(),
+/// This was `pane.zoom` first, and a zoom is not a bigger pane: it is a display
+/// mode over the whole tab, set by one pane and outliving it. See
+/// [`super::FULL_LABEL`] for what that cost and how it was measured.
+///
+/// One at a time. A second one would be a second window onto a view both of
+/// them read out of the same file, so pressing `Z` again from the sidebar goes
+/// to the one that is open rather than making another.
+pub(super) fn open_full(self_ws: Option<&str>) -> String {
+    let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
+
+    if let Some(open) = list_panes(ws).ok().and_then(|ps| ps.into_iter().find(|p| p.label == FULL_LABEL)) {
+        let _ = herdr::call("tab.focus", json!({ "tab_id": open.tab }));
+        let _ = herdr::call("pane.focus", json!({ "pane_id": open.id }));
+        return "the whole tree".into();
     }
+
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "wsp".into());
+    let Ok(r) = herdr::call(
+        "tab.create",
+        json!({ "workspace_id": ws, "label": "wsp", "focus": true, "env": crate::util::store_env() }),
+    ) else {
+        return "could not create a tab".into();
+    };
+    let Some(pane) = r
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+    else {
+        return "tab reported no pane".into();
+    };
+    // `exec`, so the command *is* the pane: `q` quits the panel, the pane goes
+    // and the tab with it. A shell left behind would be a tab you close twice.
+    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": FULL_LABEL }));
+    let _ = herdr::call(
+        "pane.send_text",
+        json!({ "pane_id": pane, "text": format!("exec {} panel --full\n", shell_quote(&exe)) }),
+    );
+    "the whole tree · q closes it".into()
 }
 
 /// Open a board full-size in a tab of its own.
@@ -843,25 +884,30 @@ pub(crate) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> St
 /// goes through a file the view polls, so retargeting costs no process churn —
 /// the alternative, killing and relaunching, would blink the pane on every
 /// press of a key whose whole job is to be cheap.
-pub(crate) fn inspect(store: &Store, self_ws: Option<&str>, focus: &crate::detail::Focus) -> String {
+pub(crate) fn inspect(
+    store: &Store,
+    self_ws: Option<&str>,
+    focus: &crate::detail::Focus,
+    me: Option<&str>,
+) -> String {
     let Some(ws) = self_ws else {
         return "no workspace to open a view in".into();
     };
     crate::detail::set_focus(store, ws, focus);
 
-    let existing = list_panes(ws).ok().and_then(|ps| {
-        ps.into_iter().find(|p| p.label == VIEW_LABEL).map(|p| p.id)
-    });
-    if existing.is_some() {
+    if my_view(ws, me).is_some() {
         return String::new();
     }
 
-    // Split downward off our own pane, so the detail shares the sidebar's
-    // column and the working pane beside it is never touched.
-    let Some(me) = list_panes(ws)
-        .ok()
-        .and_then(|ps| ps.into_iter().find(|p| p.label == PANEL_LABEL).map(|p| p.id))
-    else {
+    // Split downward off our own pane, so the detail shares the panel's column
+    // and the working pane beside it is never touched. Our own by pane id where
+    // we know it — the fullscreen panel is not the pane labelled `wsp`, and a
+    // detail pane split off the sidebar two tabs away is one it cannot see.
+    // The label is the fallback for a caller with no pane of its own to split:
+    // the board hands a task to the *sidebar's* detail pane and then closes.
+    let Some(me) = me.map(|s| s.to_string()).or_else(|| {
+        list_panes(ws).ok()?.into_iter().find(|p| p.label == PANEL_LABEL).map(|p| p.id)
+    }) else {
         return "cannot find the panel pane".into();
     };
     let res = herdr::call(
@@ -957,6 +1003,11 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::None
         }
         Key::Char('q') | Key::Esc if view.showing.is_some() => Effect::CloseView,
+        // …and in the tab `Z` opened, the panel itself is what is in front of
+        // you, so the same keys close that. It is not installed furniture —
+        // nothing is lost by quitting it and `Z` opens it again — and a
+        // fullscreen with no `q` is one you go looking for the way out of.
+        Key::Char('q') | Key::Esc if view.full => Effect::Quit,
         Key::Char('q') => {
             say(ui, "nothing to close · ctrl-c quits the panel");
             Effect::None
@@ -1096,12 +1147,11 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             say(ui, if view.focus { "titles in full" } else { "titles as they fit" });
             Effect::None
         }
-        // The sidebar over the whole workspace. It is a key rather than a
-        // second surface because the panel is already the thing you want to
-        // look at — what is wrong with it at thirty-four columns is the
-        // thirty-four columns, and the pane herdr gives back is the same panel
-        // with the cursor still on the row you pressed it from.
-        Key::Char('Z') => Effect::Zoom,
+        // The whole tree, in a tab. From the tab itself the same key is the way
+        // out — one key for one idea, and a fullscreen that opens with `Z` and
+        // closes with something else is a fullscreen you leave open.
+        Key::Char('Z') if view.full => Effect::Quit,
+        Key::Char('Z') => Effect::Full,
         // Nothing else changes while it is up: the tree keeps the cursor, and
         // every key on the map still does what the map says it does — which is
         // the only way to read one and act on it in the same breath.

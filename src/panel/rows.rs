@@ -19,7 +19,7 @@ use crate::util;
 
 use super::keys::View;
 use super::render::{glyph, line, Line, Style};
-use super::{BOARD_LABEL, PANEL_LABEL, VIEW_LABEL};
+use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 pub(super) const MAX_TASKS_PER_PROJECT: usize = 6;
 
@@ -1226,8 +1226,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     //
     // A board is furniture too, and the most misleading kind: it is a pane with
     // no agent in it, standing in the project it is a board *of*, so the tree
-    // would draw the project's own summary as a shell sitting inside it.
-    let furniture = [PANEL_LABEL, VIEW_LABEL, BOARD_LABEL];
+    // would draw the project's own summary as a shell sitting inside it. The
+    // fullscreen panel is the same kind of mistake waiting to happen — a tab
+    // holding a copy of this very tree, drawn inside it as a shell somebody is
+    // standing in.
+    let furniture = [PANEL_LABEL, VIEW_LABEL, BOARD_LABEL, FULL_LABEL];
     let panes: Vec<&herdr::Pane> =
         snap.panes.iter().filter(|p| !furniture.contains(&p.label.as_str())).collect();
     let self_focused = self_ws

@@ -203,7 +203,9 @@ const UNASSIGNED_LABEL: &str = "unassigned";
 fn plain_label(said: &str) -> Option<String> {
     let label = util::truncate(said.trim(), LABEL_MAX);
     match label.as_str() {
-        "" | crate::panel::PANEL_LABEL | crate::panel::VIEW_LABEL => None,
+        "" | crate::panel::PANEL_LABEL | crate::panel::VIEW_LABEL | crate::panel::FULL_LABEL => {
+            None
+        }
         _ => Some(label),
     }
 }
@@ -1878,6 +1880,9 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
         "" | "panel" => (mine(crate::panel::PANEL_LABEL), "the panel".to_string()),
         "view" | "detail" => (mine(crate::panel::VIEW_LABEL), "the view".to_string()),
         "board" | "kanban" => (mine(crate::panel::BOARD_LABEL), "the board".to_string()),
+        "full" | "fullscreen" => {
+            (mine(crate::panel::FULL_LABEL), "the whole tree".to_string())
+        }
         "me" => (env.pane_id.clone(), "this pane".to_string()),
         // A pane id, given as herdr writes them.
         n if n.contains(':') && panes.iter().any(|p| p.pane_id == n) => {

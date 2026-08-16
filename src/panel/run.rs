@@ -22,7 +22,7 @@ use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
 use super::shared;
-use super::verbs::{close_view, inspect, open_board, pop_out, run_wsp, send_tell, zoom, Tell};
+use super::verbs::{close_view, inspect, open_board, open_full, pop_out, run_wsp, send_tell, Tell};
 
 pub(super) enum Msg {
     Key(Key),
@@ -361,7 +361,10 @@ pub(super) enum Outcome {
     Reload,
 }
 
-pub fn run(store: &Store) -> i32 {
+/// `full` is the panel `Z` opens in a tab of its own: the same panel, drawn at
+/// the width of the workspace, and quit rather than kept when you have finished
+/// with it. See [`super::keys::View::full`].
+pub fn run(store: &Store, full: bool) -> i32 {
     if !herdr::available() {
         eprintln!("wsp: no herdr socket");
         return 1;
@@ -391,7 +394,7 @@ pub fn run(store: &Store) -> i32 {
     let _ = std::io::stdout().flush();
     stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
-    let outcome = event_loop(store, &tx, &rx, self_ws.as_deref());
+    let outcome = event_loop(store, &tx, &rx, self_ws.as_deref(), full);
 
     stty(&["sane"]);
     // Off in the reverse order, and before the alternate screen goes: a pane
@@ -405,7 +408,14 @@ pub fn run(store: &Store) -> i32 {
         // reattach.
         if let Ok(exe) = std::env::current_exe() {
             use std::os::unix::process::CommandExt;
-            let err = Command::new(exe).arg("panel").exec();
+            let mut c = Command::new(exe);
+            c.arg("panel");
+            // The fullscreen panel comes back as itself. Without this a reload
+            // would land a sidebar in a tab of its own, with no `q` in it.
+            if full {
+                c.arg("--full");
+            }
+            let err = c.exec();
             eprintln!("wsp: could not reload: {err}");
             return 1;
         }
@@ -456,9 +466,11 @@ pub(super) fn event_loop(
     tx: &Sender<Msg>,
     rx: &Receiver<Msg>,
     self_ws: Option<&str>,
+    full: bool,
 ) -> Outcome {
     let started_as = exe_stamp();
     let mut view = View::default();
+    view.takes_the_tab(full);
     // Open on what the last panel was showing rather than on a default tree.
     // A panel installed in every workspace is one panel as far as anyone using
     // it is concerned, and it should not lose the folds and the cursor every
@@ -637,7 +649,7 @@ pub(super) fn event_loop(
                     refetch = true;
                 }
                 Effect::Inspect(focus) => {
-                    let msg = inspect(store, self_ws, &focus);
+                    let msg = inspect(store, self_ws, &focus, me.as_deref());
                     if msg.is_empty() {
                         view.showing = Some(focus);
                     } else {
@@ -645,7 +657,7 @@ pub(super) fn event_loop(
                     }
                 }
                 Effect::CloseView => {
-                    if close_view(store, self_ws) {
+                    if close_view(store, self_ws, me.as_deref()) {
                         say(&mut ui, "closed");
                     }
                     view.showing = None;
@@ -656,11 +668,8 @@ pub(super) fn event_loop(
                 Effect::Board { argv, label } => {
                     say(&mut ui, open_board(&argv, &label, self_ws));
                 }
-                // herdr resizes the pty under us, so there is nothing to redraw
-                // here: `draw` measures the pane every time it runs, and the
-                // tick behind this keystroke is 200ms away at worst.
-                Effect::Zoom => {
-                    let m = zoom(me.as_deref());
+                Effect::Full => {
+                    let m = open_full(self_ws);
                     say(&mut ui, m);
                 }
                 // Off the loop, deliberately. `wsp spawn --agent` creates a
