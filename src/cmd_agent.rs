@@ -1990,6 +1990,102 @@ fn read_body(r: &serde_json::Value) -> &serde_json::Value {
 ///
 /// So the target resolves the way everything else in wsp resolves: by what you
 /// call the thing, not by the id herdr filed it under.
+/// What a needle named, once it has been read against the panes herdr
+/// reported.
+///
+/// Reading the pane is herdr's and cannot be anything else. *Naming* it is
+/// ours, and it is the half with rules in it — which label, preferring this
+/// workspace, falling back to any; a pane id only if a pane wears it; a task
+/// only if the store knows it. Those rules were inside `peek`, between a
+/// socket check and a `pane.read`, so none of them could be asked about
+/// without a herdr and two panels open in different workspaces.
+pub(crate) enum Peeked {
+    /// A pane to read, and what to call it in the header.
+    At(String, String),
+    /// The needle named something real that nothing is currently on. Carries
+    /// the hint, which names what is *missing* rather than what was asked for:
+    /// "no view pane" is a fact you can act on, "nothing to peek at for view"
+    /// is not.
+    Nothing(&'static str),
+    /// The needle named nothing at all.
+    Unknown,
+}
+
+/// The task half of a needle, resolved by the store: its id, its title, and
+/// the panes bound to it. Supplied by the caller because the fuzzy id search is
+/// the store's business and has its own tests.
+pub(crate) struct Holder {
+    pub id: String,
+    pub title: String,
+    pub panes: Vec<String>,
+}
+
+/// Read a needle against what herdr reported.
+///
+/// `here` is the workspace to prefer — the caller's, or whatever `--workspace`
+/// said. A label is preferred within it and accepted outside it, because there
+/// is a panel in every workspace and the one you mean is almost always yours,
+/// but peeking at another workspace's is a real thing to want.
+///
+/// The task lookup arrives as a closure rather than a value because it is only
+/// reached by the last arm. `find_task("")` matches every open task by suffix,
+/// so resolving it up front to hand in would be a fuzzy search over the whole
+/// store on every `wsp peek` — the commonest call, which names no task at all.
+pub(crate) fn peek_target(
+    panes: &[herdr::Pane],
+    here: Option<&str>,
+    me: Option<&str>,
+    needle: &str,
+    holder: impl FnOnce(&str) -> Option<Holder>,
+) -> Peeked {
+    let mine = |label: &str| {
+        panes
+            .iter()
+            .find(|p| p.label == label && Some(p.workspace_id.as_str()) == here)
+            .or_else(|| panes.iter().find(|p| p.label == label))
+            .map(|p| p.pane_id.clone())
+    };
+    let named = |pane: Option<String>, what: &str, hint: &'static str| match pane {
+        Some(id) => Peeked::At(id, what.to_string()),
+        None => Peeked::Nothing(hint),
+    };
+    const NOTHING_HOLDS: &str = "nothing holds that — `wsp wip` says who holds what";
+
+    match needle {
+        // The common case, and the reason there is a default at all: "what
+        // does the sidebar look like right now".
+        "" | "panel" => named(
+            mine(crate::panel::PANEL_LABEL),
+            "the panel",
+            "no panel in this workspace — `wsp panel install`",
+        ),
+        "view" | "detail" => named(
+            mine(crate::panel::VIEW_LABEL),
+            "the view",
+            "no view pane open — `↵` on a row in the panel opens one",
+        ),
+        "board" | "kanban" => named(mine(crate::panel::BOARD_LABEL), "the board", NOTHING_HOLDS),
+        "full" | "fullscreen" => {
+            named(mine(crate::panel::FULL_LABEL), "the whole tree", NOTHING_HOLDS)
+        }
+        "me" => named(me.map(str::to_string), "this pane", NOTHING_HOLDS),
+        // A pane id, given as herdr writes them.
+        n if n.contains(':') && panes.iter().any(|p| p.pane_id == n) => {
+            Peeked::At(n.to_string(), format!("pane {n}"))
+        }
+        // Otherwise a task: whichever pane holds it. This is how you look at
+        // what another agent is doing without knowing where it is sitting.
+        n => match holder(n) {
+            Some(t) => named(
+                t.panes.into_iter().next(),
+                &format!("{} — {}", t.id, util::truncate(&t.title, 44)),
+                NOTHING_HOLDS,
+            ),
+            None => Peeked::Unknown,
+        },
+    }
+}
+
 pub fn peek(store: &Store, args: &Args) -> i32 {
     if !herdr::available() {
         eprintln!("wsp: no herdr socket");
@@ -1998,53 +2094,30 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
     let env = herdr::Env::read();
     let here = args.get("workspace").or(env.workspace_id.clone());
     let panes = herdr::panes().unwrap_or_default();
-    let mine = |label: &str| {
-        panes
-            .iter()
-            .find(|p| p.label == label && Some(&p.workspace_id) == here.as_ref())
-            .or_else(|| panes.iter().find(|p| p.label == label))
-            .map(|p| p.pane_id.clone())
-    };
-
     let needle = args.rest.first().cloned().unwrap_or_default();
-    let (target, what) = match needle.as_str() {
-        // The common case, and the reason there is a default at all: "what
-        // does the sidebar look like right now".
-        "" | "panel" => (mine(crate::panel::PANEL_LABEL), "the panel".to_string()),
-        "view" | "detail" => (mine(crate::panel::VIEW_LABEL), "the view".to_string()),
-        "board" | "kanban" => (mine(crate::panel::BOARD_LABEL), "the board".to_string()),
-        "full" | "fullscreen" => {
-            (mine(crate::panel::FULL_LABEL), "the whole tree".to_string())
-        }
-        "me" => (env.pane_id.clone(), "this pane".to_string()),
-        // A pane id, given as herdr writes them.
-        n if n.contains(':') && panes.iter().any(|p| p.pane_id == n) => {
-            (Some(n.to_string()), format!("pane {n}"))
-        }
-        // Otherwise a task: whichever pane holds it. This is how you look at
-        // what another agent is doing without knowing where it is sitting.
-        n => match store.find_task(n) {
-            Some(t) => {
-                let pane = store.panes_for_task(&t.id).into_iter().next();
-                (pane, format!("{} — {}", t.id, util::truncate(&t.title, 44)))
-            }
-            None => {
-                eprintln!("wsp: no pane, task or project matching `{n}`");
-                return 1;
-            }
-        },
-    };
 
-    let Some(pane) = target else {
-        // Name what is missing rather than what was asked for: "no view pane"
-        // is a fact you can act on, "nothing to peek at for view" is not.
-        let hint = match needle.as_str() {
-            "" | "panel" => "no panel in this workspace — `wsp panel install`",
-            "view" | "detail" => "no view pane open — `↵` on a row in the panel opens one",
-            _ => "nothing holds that — `wsp wip` says who holds what",
-        };
-        eprintln!("wsp: {hint}");
-        return 1;
+    let (pane, what) = match peek_target(
+        &panes,
+        here.as_deref(),
+        env.pane_id.as_deref(),
+        &needle,
+        |n| {
+            store.find_task(n).map(|t| Holder {
+                panes: store.panes_for_task(&t.id),
+                id: t.id,
+                title: t.title,
+            })
+        },
+    ) {
+        Peeked::At(pane, what) => (pane, what),
+        Peeked::Nothing(hint) => {
+            eprintln!("wsp: {hint}");
+            return 1;
+        }
+        Peeked::Unknown => {
+            eprintln!("wsp: no pane, task or project matching `{needle}`");
+            return 1;
+        }
     };
 
     // `visible` is what is on the pane now, which is what "what does it look
@@ -2248,6 +2321,57 @@ fn store_uncommitted(root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// What asking herdr got us, as `doctor` needs to distinguish it.
+///
+/// Three answers, not two, and telling them apart is the whole of what this
+/// part of `doctor` is for. A socket that is not there is a normal machine. A
+/// socket that is there and will not answer is broken. A socket that answers
+/// with nothing is a herdr running with no agents in it — which reads exactly
+/// like the second one if you only look at the length of the list, and is the
+/// confusion the reap guard exists to survive.
+pub(crate) enum Probe {
+    Down,
+    Unreachable(String),
+    Up(Vec<herdr::Pane>),
+}
+
+impl Probe {
+    pub(crate) fn live() -> Probe {
+        if !herdr::available() {
+            return Probe::Down;
+        }
+        match herdr::agents() {
+            Ok(agents) => Probe::Up(agents),
+            Err(e) => Probe::Unreachable(e.to_string()),
+        }
+    }
+}
+
+/// What `doctor` says about herdr, and about the bindings that outlived it.
+fn herdr_health(
+    probe: &Probe,
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    problems: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    match probe {
+        Probe::Up(agents) => {
+            let live: Vec<&String> = agents.iter().map(|a| &a.pane_id).collect();
+            let stale = bindings.keys().filter(|p| !live.contains(p)).count();
+            if stale > 0 {
+                notes.push(format!("{stale} binding(s) on dead panes — `wsp sync` reaps them"));
+            }
+            notes.push(format!("herdr up, {} agents", agents.len()));
+        }
+        Probe::Unreachable(e) => problems.push(format!("herdr socket present but unreachable: {e}")),
+        // Not a problem. A machine with no herdr on it is a machine wsp works
+        // on, and calling that broken is how a check nobody can act on gets
+        // ignored along with the ones they can.
+        Probe::Down => notes
+            .push("herdr socket not found (CLI still works, sidebar tokens will not update)".into()),
+    }
+}
+
 pub fn doctor(store: &Store, args: &Args) -> i32 {
     let mut problems: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -2410,21 +2534,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
 
     section_damage(store, args, &tasks, &index.projects, &mut problems, &mut notes);
 
-    if herdr::available() {
-        match herdr::agents() {
-            Ok(agents) => {
-                let live: Vec<String> = agents.iter().map(|a| a.pane_id.clone()).collect();
-                let stale = bindings.keys().filter(|p| !live.contains(p)).count();
-                if stale > 0 {
-                    notes.push(format!("{stale} binding(s) on dead panes — `wsp sync` reaps them"));
-                }
-                notes.push(format!("herdr up, {} agents", agents.len()));
-            }
-            Err(e) => problems.push(format!("herdr socket present but unreachable: {e}")),
-        }
-    } else {
-        notes.push("herdr socket not found (CLI still works, sidebar tokens will not update)".into());
-    }
+    herdr_health(&Probe::live(), &bindings, &mut problems, &mut notes);
 
     if args.json() {
         println!("{}", json!({ "problems": problems, "notes": notes }));
@@ -3184,6 +3294,152 @@ mod tests {
         assert_eq!(v["pane_id"], json!("w1:p1"));
         assert_eq!(v["workspace_id"], json!("w1"));
         assert_eq!(v["task"]["id"], json!("t-001"));
+    }
+
+
+    // ---- doctor and peek, offline ------------------------------------------
+
+    /// Three answers, not two. A machine with no herdr is normal; a socket
+    /// that will not answer is broken; a herdr answering with nothing is a
+    /// herdr with no agents in it — and the third reads exactly like the
+    /// second if you only look at the length of the list.
+    #[test]
+    fn doctor_tells_no_herdr_from_a_broken_one_from_an_empty_one() {
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert("w1:p1".to_string(), json!({ "task_id": "t-001" }));
+
+        let say = |probe: Probe| {
+            let (mut problems, mut notes) = (Vec::new(), Vec::new());
+            herdr_health(&probe, &bindings, &mut problems, &mut notes);
+            (problems, notes)
+        };
+
+        // Not there. A note, never a problem: wsp works on a machine with no
+        // herdr on it, and calling that broken is how a check nobody can act
+        // on gets ignored along with the ones they can.
+        let (problems, notes) = say(Probe::Down);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(notes.iter().any(|n| n.contains("socket not found")), "{notes:?}");
+
+        // There and not answering. A problem, and it says what herdr said.
+        let (problems, notes) = say(Probe::Unreachable("connection refused".into()));
+        assert!(problems.iter().any(|p| p.contains("connection refused")), "{problems:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // Answering with nothing. Not a problem either — but the binding it
+        // does not account for is now stale, and saying so is the point.
+        let (problems, notes) = say(Probe::Up(Vec::new()));
+        assert!(problems.is_empty(), "an empty herdr is a running herdr: {problems:?}");
+        assert!(notes.iter().any(|n| n.contains("1 binding(s) on dead panes")), "{notes:?}");
+        assert!(notes.iter().any(|n| n == "herdr up, 0 agents"), "{notes:?}");
+
+        // And answering with the pane the binding names: nothing stale.
+        let (_, notes) = say(Probe::Up(vec![wip_agent("w1:p1", "w1", "working", "")]));
+        assert!(!notes.iter().any(|n| n.contains("dead panes")), "{notes:?}");
+    }
+
+    fn labelled(pane: &str, ws: &str, label: &str) -> herdr::Pane {
+        herdr::Pane {
+            pane_id: pane.to_string(),
+            workspace_id: ws.to_string(),
+            label: label.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn no_task(_: &str) -> Option<Holder> {
+        None
+    }
+
+    fn at(p: Peeked) -> (String, String) {
+        match p {
+            Peeked::At(pane, what) => (pane, what),
+            Peeked::Nothing(hint) => panic!("nothing: {hint}"),
+            Peeked::Unknown => panic!("unknown"),
+        }
+    }
+
+    /// There is a panel in every workspace, so "the panel" has to mean yours —
+    /// and peeking at another workspace's is still a real thing to want, which
+    /// is why the fallback exists rather than a refusal.
+    #[test]
+    fn peek_prefers_the_panel_in_your_own_workspace_and_takes_any_other() {
+        let panes = vec![
+            labelled("w1:p9", "w1", crate::panel::PANEL_LABEL),
+            labelled("w2:p9", "w2", crate::panel::PANEL_LABEL),
+            labelled("w2:p8", "w2", crate::panel::VIEW_LABEL),
+        ];
+        assert_eq!(at(peek_target(&panes, Some("w2"), None, "", no_task)).0, "w2:p9");
+        assert_eq!(at(peek_target(&panes, Some("w1"), None, "panel", no_task)).0, "w1:p9");
+
+        // A workspace with no panel of its own falls through to one that has.
+        assert_eq!(at(peek_target(&panes, Some("w7"), None, "panel", no_task)).0, "w1:p9");
+        // …and so does a caller with no workspace at all, which is what a
+        // shell outside herdr is.
+        assert_eq!(at(peek_target(&panes, None, None, "panel", no_task)).0, "w1:p9");
+
+        // The view is a different surface with a different label, and asking
+        // for it from a workspace that has none finds the one that exists.
+        assert_eq!(at(peek_target(&panes, Some("w1"), None, "view", no_task)).0, "w2:p8");
+    }
+
+    /// Missing is named as what is missing, not as what was asked for: "no view
+    /// pane open" is a fact you can act on, "nothing to peek at for view" is
+    /// not — and the two surfaces are opened in different ways, so the hint has
+    /// to differ too.
+    #[test]
+    fn a_surface_that_is_not_open_says_how_to_open_it() {
+        let none: Vec<herdr::Pane> = Vec::new();
+        let hint = |needle: &str| match peek_target(&none, Some("w1"), None, needle, no_task) {
+            Peeked::Nothing(h) => h,
+            _ => panic!("expected nothing for {needle}"),
+        };
+        assert!(hint("").contains("wsp panel install"));
+        assert!(hint("panel").contains("wsp panel install"));
+        assert!(hint("view").contains("↵` on a row in the panel"));
+        assert!(hint("board").contains("wsp wip"));
+
+        // A needle nothing recognises is a different answer again: the target
+        // does not exist, rather than existing and being empty.
+        assert!(matches!(peek_target(&none, None, None, "banana", no_task), Peeked::Unknown));
+    }
+
+    /// A pane id is taken literally, but only if a pane wears it — otherwise it
+    /// falls through to the task search, where `w9:p1` is a needle like any
+    /// other rather than a confident answer that is wrong.
+    #[test]
+    fn a_pane_id_is_only_a_pane_id_if_a_pane_has_it() {
+        let panes = vec![labelled("w1:p3", "w1", "")];
+        assert_eq!(at(peek_target(&panes, None, None, "w1:p3", no_task)).1, "pane w1:p3");
+        assert!(matches!(peek_target(&panes, None, None, "w9:p1", no_task), Peeked::Unknown));
+
+        // `me` is this pane, whatever herdr reported — and a caller herdr has
+        // not told about itself has no `me` to look at.
+        assert_eq!(at(peek_target(&panes, None, Some("w1:p3"), "me", no_task)).0, "w1:p3");
+        assert!(matches!(peek_target(&panes, None, None, "me", no_task), Peeked::Nothing(_)));
+    }
+
+    /// A task names whichever pane is holding it, which is how you look at what
+    /// another agent is doing without knowing where it is sitting. A task
+    /// nobody is holding is not a failure to find the task.
+    #[test]
+    fn a_task_resolves_to_whoever_is_holding_it() {
+        let panes = vec![labelled("w4:p1", "w4", "")];
+        let held = |_: &str| {
+            Some(Holder {
+                id: "t-001".into(),
+                title: "the seam under the panel".into(),
+                panes: vec!["w4:p1".into()],
+            })
+        };
+        let (pane, what) = at(peek_target(&panes, None, None, "001", held));
+        assert_eq!(pane, "w4:p1");
+        assert!(what.starts_with("t-001 — the seam under the panel"), "{what}");
+
+        let unheld = |_: &str| {
+            Some(Holder { id: "t-002".into(), title: "nobody is on it".into(), panes: Vec::new() })
+        };
+        assert!(matches!(peek_target(&panes, None, None, "002", unheld), Peeked::Nothing(_)));
     }
 
 }
