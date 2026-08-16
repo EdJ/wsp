@@ -210,12 +210,26 @@
 //! file lost track of it — a crash between the split and the save would
 //! otherwise install twice.*
 //!
-//! **Size has no policy, and pretending otherwise is the trap.** The only
-//! resize herdr offers is inside `layout.apply`, which rebuilds every terminal;
-//! see rule 2. So a ratio is a creation-time argument and nothing else, a pane a
-//! person has dragged wider stays wider, and [`plan`] emits nothing for it under
-//! any policy. A declarative window manager that silently re-imposes geometry is
-//! resented for it, and here it would also kill an agent to do it.
+//! **Size gets one policy, chosen rather than inherited.** A ratio is a
+//! creation-time argument, a pane a person dragged wider stays wider, and
+//! [`plan`] emits nothing for it under any policy — because re-imposing a width
+//! fights the person, which is this rule applied rather than a limit handed to
+//! us. A declarative window manager that silently re-imposes geometry is
+//! resented for it.
+//!
+//! The first draft of this file said something stronger and false: that herdr
+//! has no resize outside `layout.apply`. It has `pane.resize` — direction,
+//! amount, no rebuild — and the reason it looked absent is the trap worth more
+//! than the fact. **`src/herdr.rs` is not a measurement of herdr.** wsp wraps
+//! about a third of the socket's methods, and `pane.resize`, `pane.move`,
+//! `pane.zoom`, `pane.neighbor`, `pane.edges`, `pane.focus_direction` and
+//! `pane.send_keys` are all in `herdr api schema --json` and in none of wsp.
+//! Reading capability off wsp's wrapper turns "we never needed it" into "it
+//! cannot be done", and a port is exactly the wrong file to make that mistake
+//! in: the whole document is a claim about what a backend must be able to do.
+//! Anything below asserting that the runtime cannot do something was checked
+//! against the schema, not against `herdr.rs`. (Found by the coordination seat
+//! reviewing this file, 2026-08-17.)
 //!
 //! **6. Two writers.** herdr's own UI changes panes underneath us — the same
 //! shape as the shared `.git/index` problem the store already had, and not a
@@ -264,14 +278,41 @@
 //!   new pane gets onto the correct side ([`Arrange::swap`] is in the trait for
 //!   it), but the plan cannot name a surface that does not exist yet — and
 //!   between two panes that *do* exist, a swap would be re-imposing position,
-//!   which is rule 5's forbidden move by another route. The spec describes
-//!   structure at creation, never geometry afterwards.
+//!   which is the same choice rule 5 makes about width and is made the same way.
+//!   The spec describes structure at creation and not geometry afterwards, which
+//!   is why there is nothing in it for such an op to be planned from.
 //! - **`zoom`.** It was tried and reverted: *a zoom is not a bigger pane, it is
 //!   a display mode over the whole tab, set by one pane and outliving it*
 //!   (`panel/verbs.rs:687`). A spec cannot describe it, which is the strongest
 //!   argument yet that it was the wrong primitive.
-//! - **A resize verb.** Rule 5. Adding one would mean `layout.apply`, and
-//!   `panel/install.rs` exists because of what that cost.
+//! - **A resize verb, and a move verb.** Re-decided in the open once
+//!   `pane.resize` and `pane.move` turned out to exist, because the first
+//!   answer rested on them not existing. Same answer, and now for reasons that
+//!   can be argued with:
+//!
+//!   *No caller.* Nothing in `panel/` or `detail/` resizes or moves a pane
+//!   today. 081's rule applies unchanged — a verb with no caller is the tax this
+//!   store keeps warning about — and it applies harder to a capability that has
+//!   sat in the socket unused for as long as wsp has been talking to it.
+//!
+//!   *The spec has nothing to plan one from.* Ratios are creation-time and there
+//!   is no position in a [`Spec`] at all, so a resize op would have no desired
+//!   state to be a diff against. Adding the verb honestly means adding geometry
+//!   to the spec first, and that is the decision to weigh — not this one.
+//!
+//!   *And the API shape is a cost worth knowing before anyone signs up for it.*
+//!   `pane.resize` takes a direction and an amount: it is a nudge, not an
+//!   assignment. There is no "make this pane 22%". Converging on a declared
+//!   ratio means read the layout, compute a delta, nudge, read again — against a
+//!   runtime that can answer `changed: false, reason: "unchanged"` when it will
+//!   not move, so the loop needs a stop condition or it spins. That is a real
+//!   design, and it should arrive with the caller that wants it.
+//!
+//!   The trigger, named rather than guessed: **a spec that has to restore a
+//!   width somebody temporarily changed** — a zoom being undone, an edit tab
+//!   collapsing back — is the first thing that cannot be expressed without it.
+//!   When that arrives, geometry enters the spec, this verb comes with it, and
+//!   the convergence rule above is part of the same change.
 //! - **Reading a pane's contents.** `pane.read` is the observe half's
 //!   (t-260816-059), and no arrange call site uses it.
 //! - **Migrating the call sites.** t-260816-061's, exactly as it was for 081.
@@ -525,7 +566,8 @@ pub struct Want {
     pub label: String,
     pub at: Anchor,
     pub dir: Dir,
-    /// Creation-time only. See rule 5: there is no resize.
+    /// Creation-time only, by choice: see rule 5. herdr can resize a pane and
+    /// wsp declines to, because a width a person changed is a width they meant.
     pub ratio: f64,
 }
 
@@ -548,8 +590,10 @@ impl Want {
 /// What to do about a world that has stopped matching the spec.
 ///
 /// Rule 5. Applies to *identity* — a pane of ours we lost track of, a pane
-/// somebody closed — and never to size, which has no policy because the runtime
-/// has no resize that does not rebuild.
+/// somebody closed. Size is not one of the three, and that is a decision rather
+/// than a limit: `pane.resize` exists and is not destructive, and wsp still
+/// leaves a width alone, because the only policy re-imposing it could implement
+/// is one that fights the person holding the mouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Drift {
     /// Take it back. A live pane carrying our label is our pane, whatever the
@@ -1113,8 +1157,10 @@ pub trait Arrange {
 
     /// Exchange two panes' positions, touching neither process.
     ///
-    /// The only move in the port. It is here because `pane.split` puts the new
-    /// pane in the remainder — so a sidebar arrives on the wrong side at the
+    /// The only move the port takes, out of the three the socket offers —
+    /// `pane.move` and `pane.resize` are real and are left out on the grounds in
+    /// the module docs, so this one is here for a reason rather than by default.
+    /// It is here because `pane.split` puts the new pane in the remainder — so a sidebar arrives on the wrong side at the
     /// wrong width, and swapping is what lands it in the narrow slot without
     /// disturbing either process (`panel/install.rs:155`).
     fn swap(&self, a: &Surface, b: &Surface) -> Result<()>;
@@ -1349,10 +1395,18 @@ mod tests {
         assert_eq!(p.notes.len(), 1, "and it says why, or it looks like it did nothing");
     }
 
-    /// Rule 5's other half, which is a finding rather than a policy: the only
-    /// resize this runtime has is inside `layout.apply`, and that rebuilds every
-    /// terminal. So a pane a person dragged wider stays wider, whatever the
-    /// spec's ratio says, under every policy.
+    /// Rule 5's other half, and a **policy** rather than a limit — the
+    /// distinction is the whole value of this test, because the reason is what a
+    /// future reader will check before changing the behaviour.
+    ///
+    /// herdr *can* resize: `pane.resize` takes a direction and an amount and
+    /// rebuilds nothing. wsp declines to use it, because a width somebody
+    /// dragged is a width they meant, and a reconciler that puts it back is one
+    /// they will turn off. So a ratio applies once, at creation, and a resized
+    /// pane produces no ops under any of the three policies.
+    ///
+    /// If that is ever revisited, revisit it here: the assertion is the
+    /// decision, and the module docs carry what adding the verb would cost.
     #[test]
     fn a_pane_a_person_resized_is_left_alone() {
         let spec = Spec::new(vec![rendered("panel", "panel").at(Anchor::Widest, Dir::Right, 0.22)]);
