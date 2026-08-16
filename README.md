@@ -1687,6 +1687,172 @@ which is what `c` still does: `c` speaks to agents herdr did not start and may
 not consider ready, and pays for it with two writes and a sleep between them.
 Here the readiness is established, so there is nothing to guess at.
 
+## Machines
+
+A second machine, driven from the one you are sitting at. Same projects, same
+store, same panel — a bigger hand.
+
+```sh
+wsp machine add mb2 mac-mini       # a name, and an ssh Host alias
+wsp machine ls                     # what exists, and whether it is answering
+wsp machine show mb2               # ssh target, tunnel, last seen, why not
+wsp spawn 033 --agent --on mb2     # open the work over there
+```
+
+The far machine is an **executor**, never a seat. Nobody sits at it. It holds
+no store, no `~/.local/state/wsp` and no wsp binary — the seat is the one source
+of truth, which is what makes there be no sync of `~/wsp`, no merge story for
+two git repositories that both autocommit, and nothing on the far machine to
+hot-patch when you ship a fix. `wsp` over there is a shim that runs this
+machine's wsp back over the same connection.
+
+### What is actually running
+
+On the executor, three things, none of them ours:
+
+- `herdr server`, headless, under launchd or systemd so it outlives the ssh
+  session that started it and comes back after a reboot
+- sshd
+- the `wsp` shim, from `executor/wsp` in this repository
+
+On the seat, inside the `wsp daemon` you are already running: one ssh per
+machine, holding `-L <local.sock>:<remote herdr.sock>` open. That is the whole
+of it. Nothing long-lived of ours runs on the executor at all.
+
+### How one wsp talks to two herdrs
+
+herdr has no idea another herdr exists. Its socket API is 89 methods and none of
+them has a host in it: one server is one machine. Two facts make spanning them
+cheap rather than a rewrite.
+
+**The socket is forwarded, not proxied.** `ssh -L` (OpenSSH ≥ 6.7) puts the far
+machine's herdr socket at a path here, and wsp's existing herdr client speaks to
+it unmodified. There is no second protocol and no re-implementation of those 89
+methods.
+
+**The id is the routing key.** Nearly every herdr method is addressed by a
+`pane_id`, a `workspace_id` or a `target`, so a remote pane is `w0:p3@mb2` and
+`herdr::call` splits the `@machine` off to pick the socket — stripping it on the
+way out, because the far herdr has never heard of it. Local ids stay bare, so
+no existing call site, state file or claim changed. `@` and not `:`, because a
+herdr pane id already contains a colon: `w0:p3` is one id, not two.
+
+The calls that carry no id — `pane.list`, `workspace.list`, `agent.list`,
+`events.subscribe` — fan out across every reachable machine and qualify what
+comes back, so a pane is routable from the moment it enters wsp and everything
+downstream is unchanged. `workspace.create` is the exception in the other
+direction: nothing to route on, so `spawn` tells it, which is what `--on` is.
+
+### Three states, and the middle one is the point
+
+`wsp machine ls` says **connected**, **offline** with a last-seen, or **retired**.
+The distinction that matters is between a machine that is answering with nothing
+and a machine that is not answering at all.
+
+`wsp reconcile --reap` ends a claim whose workspace is gone. A machine that is
+merely unreachable reports no workspaces — which looks exactly like a machine
+with nothing running on it. Reaped on that basis, one dropped link hands back
+every task the executor is holding while its agents carry on working on tasks
+that no longer know about them. So a machine has to have been *heard from*
+before anything it holds is touched, and "unreachable" is a third state rather
+than a synonym for empty. It is the one thing in this design that is worth
+being paranoid about.
+
+### The network is `~/.ssh/config`, and Tailscale under it
+
+A machine in wsp is a name and a `Host` alias. wsp never parses ssh config,
+never learns an address and has no idea a tailnet exists — that ignorance is
+the seam, and it is why "make the machine reachable" is not a wsp feature.
+
+Tailscale is what makes the address stable, chosen because the seat is a
+laptop: its address was never going to hold still, and plain LAN ssh would have
+broken the first time either machine changed network. MagicDNS gives each
+machine a name that resolves from anywhere with no inbound firewall rule and no
+port forward, and that name is one `HostName` line. Plain ssh over the tailnet
+rather than Tailscale SSH — the latter replaces key auth with tailnet ACLs,
+which is a second auth path to debug for no gain. Headscale is available on
+identical terms if the coordination server ever becomes the objection.
+
+Two costs worth knowing. `tailscaled` is now a thing that can be down, which
+makes the unreachable-is-not-empty case above more likely to fire rather than
+less. And we are tunnelling a chatty JSON-RPC socket that the panel polls, so a
+connection that falls back to a DERP relay instead of a direct WireGuard path
+will be *felt*: check `tailscale status` for `direct` before blaming wsp for a
+slow panel.
+
+### Making a machine an executor
+
+On the far machine:
+
+1. `tailscale up`, and confirm `tailscale status` shows a **direct** path.
+2. Enable Remote Login (macOS) or sshd (Linux), and authorise the seat's key.
+3. Install herdr and run `herdr server` headless under launchd or systemd.
+4. Put `executor/wsp` on PATH ahead of anything else called `wsp`, and set
+   `WSP_SEAT` and `WSP_MACHINE` for every shell an agent might run in — a
+   `launchctl setenv` on macOS, or the profile the herdr server inherits.
+5. Install Claude Code, authenticate it, and add the `SessionStart` hook from
+   `claude-code/`. It needs no change: it finds the shim and the shim finds the
+   seat.
+
+On the seat:
+
+6. A `Host` block in `~/.ssh/config` pointing at the MagicDNS name, with
+   `ControlMaster auto` and `ControlPersist` so the connection is cheap to
+   reuse.
+7. `wsp machine add mb2 <that Host alias>`.
+
+The daemon takes it from there: it dials, holds the tunnel up, retries with
+backoff, and writes what it can see into `wsp machine ls`.
+
+That is the whole install, and its being a list rather than a script is the
+point — replication was the requirement, and anything longer would have meant
+the design had gone wrong somewhere.
+
+### The three things that bite
+
+**The far herdr socket is an absolute path on the far machine.** `ssh -L` does
+not expand `~` on the remote side, so wsp records the path rather than
+discovering it — asking the machine for its `$HOME` would put a blocking round
+trip, to a machine that may be down, inside the daemon's tick. It defaults to
+this machine's own herdr socket, which is right while the machines mirror each
+other and is exactly what a Linux box breaks:
+
+```sh
+wsp machine set mb2 herdr_sock=/home/ed/.config/herdr/herdr.sock
+```
+
+**The shim has to qualify ids.** herdr on the executor numbers its panes from
+zero too, so `HERDR_PANE_ID` over there is `w0:p3` and means a different pane on
+the seat. `executor/wsp` adds `@$WSP_MACHINE` before handing it across; that is
+what `WSP_MACHINE` is for, and it is why the shim is a file in this repository
+rather than a one-line alias in the README. It also quotes every argument for
+the remote shell — `wsp say "two words"` would otherwise arrive as two — and
+passes stdin through, which `wsp edit --overview -` needs.
+
+**The seat's `wsp` must be on a non-interactive PATH.** `ssh host wsp` runs a
+non-login shell, and `~/.local/bin` is often not on it. Set `WSP_SEAT_BIN` to
+the absolute path if `wsp brief` on the executor comes back "command not found"
+about a command that plainly exists.
+
+### What is deliberately not here
+
+- **How code gets to the executor, and how the work comes back.** Undecided.
+  Either the agent pushes git→git or the executor works in a worktree, and if
+  worktrees win they are built first. Nothing here assumes an answer: the
+  executor is handed a cwd and an agent, and how that tree got there is that
+  decision's business.
+- **Host-qualified roots.** A project root is a path in the store and `~`
+  expands on the seat. Correct while paths mirror; the Linux box is what forces
+  the change, and the machines file is where it will hang.
+- **Affinity.** No `machine` field on a task or project, and no scheduler.
+  Placement is asked, never inferred — auto-placement hides the thing you most
+  want to see — and because it is explicit, affinity later changes a default
+  rather than a design.
+- **A wsp-shaped TUI on the executor.** `herdr --remote <target>` already
+  attaches a real herdr client to the headless server over ssh, which is the
+  "see and manage the agents on that machine" this would be for. A second one
+  would be a worse copy.
+
 ## Two agents in one tree
 
 Two agents worked this repository at once on 2026-08-15. Six times, one of them
@@ -1815,6 +1981,9 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_spawn.rs` | a workspace on a task, and an agent started in it |
+| `src/cmd_machine.rs` | the machines agents can be run on |
+| `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
+| `executor/wsp` | the shim that stands in for wsp on a machine that has none |
 | `src/cmd_*.rs` | the commands |
 
 The panel is split where the *work* splits rather than by layer: a row's data
