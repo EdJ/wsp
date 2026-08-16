@@ -57,8 +57,84 @@ pub fn host_of(id: &str) -> Option<&str> {
     split_host(id).1
 }
 
+/// The params a herdr method is addressed by.
+///
+/// Nearly all of herdr's 89 methods take one of these, which is what makes
+/// spanning machines cheap: the id is the routing key, so no host parameter has
+/// to be threaded through the 179 `herdr::` references in this crate. The
+/// leftovers — `pane.list`, `workspace.list`, `agent.list`, `events.subscribe`
+/// and `workspace.create` — carry no id at all and are t-260816-037's problem,
+/// not this list's.
+///
+/// wsp's own `task_id` is deliberately not here. It is not a herdr id, nothing
+/// routes on it, and a `@` in one would mean something else entirely.
+const ID_KEYS: [&str; 6] =
+    ["pane_id", "workspace_id", "target", "target_pane_id", "source_pane_id", "tab_id"];
+
+/// Which machine a call is addressed to, and the params with the ids made bare
+/// again.
+///
+/// Both halves matter. The far herdr has never heard of `@mb2` — it is one
+/// server on one machine and its ids are bare — so the suffix is wsp's own and
+/// has to come off on the way out, at the same point it is read. Doing those
+/// two things anywhere but together is how an id reaches a server that cannot
+/// find it.
+///
+/// Two ids naming two different machines is refused rather than resolved. It
+/// means a call is trying to move a pane from one machine into another's
+/// layout, which herdr cannot do and which no correct caller asks for; picking
+/// one of them would send it somewhere plausible and wrong.
+fn route(mut params: Value) -> std::io::Result<(Option<String>, Value)> {
+    let Some(obj) = params.as_object_mut() else { return Ok((None, params)) };
+    let mut machine: Option<String> = None;
+    for key in ID_KEYS {
+        let Some(id) = obj.get(key).and_then(|v| v.as_str()) else { continue };
+        let (bare, found) = split_host(id);
+        let Some(found) = found else { continue };
+        if let Some(first) = &machine {
+            if first != found {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("one call cannot span machines: {first} and {found}"),
+                ));
+            }
+        } else {
+            machine = Some(found.to_string());
+        }
+        let bare = Value::String(bare.to_string());
+        obj.insert(key.to_string(), bare);
+    }
+    Ok((machine, params))
+}
+
+/// The socket a machine's herdr is reachable on from here: this one's own, or
+/// the path the daemon's tunnel forwards the far one to.
+///
+/// Computed rather than looked up in `machines.json`. The path is a convention
+/// with one home — `Store::machine_socket` — so computing it is not a second
+/// implementation, and `Store::open` is two paths out of the environment with
+/// no file touched. Looking the record up would mean a read of state per call
+/// on a socket the panel polls, to learn something we already know, and would
+/// make a caller's opinion of where the socket is depend on whether the daemon
+/// had got round to writing it down.
+///
+/// Liveness is not consulted either. A machine that is not up has no socket to
+/// connect to and `connect` says so immediately; asking `machines.json` first
+/// would be a second opinion on reachability, held to a slower clock than the
+/// filesystem's.
+fn socket_for(machine: Option<&str>) -> PathBuf {
+    match machine {
+        Some(name) => crate::store::Store::open().machine_socket(name),
+        None => socket_path(),
+    }
+}
+
 fn connect(timeout: Option<Duration>) -> std::io::Result<UnixStream> {
-    let s = UnixStream::connect(socket_path())?;
+    connect_to(&socket_path(), timeout)
+}
+
+fn connect_to(path: &std::path::Path, timeout: Option<Duration>) -> std::io::Result<UnixStream> {
+    let s = UnixStream::connect(path)?;
     s.set_read_timeout(timeout)?;
     s.set_write_timeout(Some(Duration::from_secs(2)))?;
     Ok(s)
@@ -78,7 +154,17 @@ pub fn call(method: &str, params: Value) -> std::io::Result<Value> {
 /// quiet: the agent started, the reply arrived after we had stopped listening,
 /// and the caller reported a failure that had not happened.
 pub fn call_for(method: &str, params: Value, timeout: Duration) -> std::io::Result<Value> {
-    let mut s = connect(Some(timeout))?;
+    let (machine, params) = route(params)?;
+    let mut s = connect_to(&socket_for(machine.as_deref()), Some(timeout)).map_err(|e| {
+        // Named, because the bare errno is the wrong diagnosis. "No such file
+        // or directory" on a path nobody typed reads as a broken install; what
+        // it actually means is that the daemon is not holding a tunnel to that
+        // machine, which is a different thing to go and look at.
+        match &machine {
+            Some(name) => std::io::Error::new(e.kind(), format!("{name}: no tunnel ({e})")),
+            None => e,
+        }
+    })?;
     let req = json!({ "id": format!("wsp:{}", util::epoch_nanos()), "method": method, "params": params });
     s.write_all(format!("{req}\n").as_bytes())?;
     s.flush()?;
@@ -336,5 +422,112 @@ impl Env {
             event: std::env::var("HERDR_PLUGIN_EVENT").ok(),
             event_json: ev,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(v: Value) -> (Option<String>, Value) {
+        route(v).expect("routable")
+    }
+
+    /// The suffix is wsp's own. It picks the socket and then it comes off,
+    /// because the server on the other end is one machine that has never heard
+    /// of `@mb2` and will not find `w0:p3@mb2` in its own pane table.
+    #[test]
+    fn the_machine_picks_the_socket_and_the_id_goes_out_bare() {
+        let (machine, p) = params(json!({ "pane_id": "w0:p3@mb2", "text": "hello@example" }));
+        assert_eq!(machine.as_deref(), Some("mb2"));
+        assert_eq!(p["pane_id"], "w0:p3", "the far herdr is sent its own id");
+        assert_eq!(p["text"], "hello@example", "and nothing else is touched");
+    }
+
+    /// The whole point of routing on the id: a local call is byte-for-byte the
+    /// call it was before this existed, so no existing call site, state file or
+    /// claim needs migrating.
+    #[test]
+    fn a_bare_id_is_this_machine_and_is_passed_through_unchanged() {
+        let before = json!({ "workspace_id": "w0", "label": "wsp" });
+        let (machine, after) = params(before.clone());
+        assert_eq!(machine, None);
+        assert_eq!(after, before);
+
+        // And params that are not an object at all route nowhere rather than
+        // panicking on the way past.
+        let (machine, after) = params(json!([]));
+        assert_eq!(machine, None);
+        assert_eq!(after, json!([]));
+    }
+
+    /// Every key a herdr method is addressed by, and the two that agree.
+    #[test]
+    fn all_the_routing_keys_are_read_and_must_agree() {
+        let (machine, p) = params(json!({ "source_pane_id": "w0:p1@mb2", "target_pane_id": "w0:p3@mb2" }));
+        assert_eq!(machine.as_deref(), Some("mb2"));
+        assert_eq!(p["source_pane_id"], "w0:p1");
+        assert_eq!(p["target_pane_id"], "w0:p3");
+
+        // Splitting a pane on one machine into a pane on another is not a thing
+        // herdr can do, so it is refused rather than half-done.
+        let err = route(json!({ "source_pane_id": "w0:p1@mb2", "target_pane_id": "w0:p3@gpu" }))
+            .expect_err("a call across two machines");
+        assert!(err.to_string().contains("span machines"), "{err}");
+
+        // wsp's own ids are not herdr's and nothing routes on them.
+        let (machine, p) = params(json!({ "task_id": "t-260816-036", "pane_id": "w0:p3" }));
+        assert_eq!(machine, None);
+        assert_eq!(p["task_id"], "t-260816-036");
+    }
+
+    /// The end of the wire, with a real socket at the end of it.
+    ///
+    /// A stand-in herdr is bound at exactly the path the daemon's tunnel would
+    /// forward `mb2` to, and a call carrying `@mb2` has to arrive there rather
+    /// than at this machine's socket — carrying the bare id. That is the whole
+    /// mechanism: no proxy, no second protocol, no re-implementation of the 89
+    /// methods, just a different socket and an id the far end recognises.
+    ///
+    /// One test, because it sets `WSP_STATE` for the process.
+    #[test]
+    fn a_qualified_id_arrives_at_that_machines_socket_and_nowhere_else() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let state = std::env::temp_dir().join(format!("wsp-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(state.join("sock")).unwrap();
+        std::env::set_var("WSP_STATE", &state);
+
+        let sock = state.join("sock").join("mb2.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            // Hand the request back as the result, so the caller can see
+            // exactly what reached the far end.
+            let reply = json!({ "id": req["id"], "result": { "saw": req } });
+            let mut stream = stream;
+            stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let got = call("agent.get", json!({ "target": "w0:p3@mb2" })).expect("routed to mb2");
+        server.join().unwrap();
+
+        assert_eq!(got["saw"]["method"], "agent.get");
+        assert_eq!(got["saw"]["params"]["target"], "w0:p3", "the suffix did not survive the wire");
+
+        // And a machine with no tunnel says so as a machine, not as an errno on
+        // a path nobody typed.
+        let err = call("agent.get", json!({ "target": "w0:p3@gpu" })).expect_err("no tunnel to gpu");
+        assert!(err.to_string().contains("gpu: no tunnel"), "{err}");
+
+        std::env::remove_var("WSP_STATE");
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
