@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 mod cmd_agent;
 mod cmd_brief;
+mod cmd_machine;
 mod cmd_mandate;
 mod cmd_project;
 mod cmd_spawn;
@@ -271,6 +272,7 @@ fn main() {
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "spawn" => cmd_spawn::spawn(&store, &args),
+        "machine" | "machines" => cmd_machine::dispatch(&store, &args),
         "mandate" => cmd_mandate::mandate(&store, &args),
         "release" => cmd_agent::release(&store, &args),
         "pin" => cmd_agent::pin(&store, &args),
@@ -364,6 +366,14 @@ fn help() {
   wsp overlap                       who else is standing in this tree
   wsp peek [panel|view|<task>]      what is actually on that pane
 
+{machines}
+  wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is
+                                    a Host alias from ~/.ssh/config, not an address
+  wsp machine ls|machines           what exists, and whether it is answering
+  wsp machine show <name>           ssh target, tunnel, last seen, why not
+  wsp machine set <name> k=v…       ssh/os/arch/status
+  wsp machine rm <name> [--force]   retire it; --force removes the record
+
 {plumbing}
   wsp panel                         the sidebar replacement (runs in a pane)
   wsp view [<id>]                   detail pane; follows the panel unless given an id
@@ -386,6 +396,7 @@ the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
         projects = h("PROJECTS"),
         tasks = h("TASKS"),
         agents = h("AGENTS"),
+        machines = h("MACHINES"),
         plumbing = h("PLUMBING"),
     );
 }

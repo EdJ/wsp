@@ -477,6 +477,116 @@ fn fm_key_refs() -> &'static str {
     "refs"
 }
 
+/// A machine wsp can run agents on — an executor, reached over SSH from the
+/// seat you are sitting at.
+///
+/// Durable and committed, one file per machine exactly as a project is,
+/// because which machines exist is a fact about the setup rather than about
+/// this afternoon. What is *live* about a machine — reachable, last seen,
+/// which socket the daemon forwarded it to — is state and lives in
+/// `machines.json`, so a machine that has gone away is still a row with a
+/// last-seen on it rather than a hole in the list.
+///
+/// [`Machine::ssh`] is a `Host` alias out of `~/.ssh/config` and never an
+/// address. wsp does not parse ssh config, does not learn a hostname and has
+/// no idea a tailnet exists; that ignorance is the seam Tailscale plugs into,
+/// and keeping it is why "make a machine reachable" is somebody else's problem
+/// and not a wsp feature.
+#[derive(Debug, Clone, Default)]
+pub struct Machine {
+    /// The file stem, and the suffix on a host-qualified id: `w0:p3@mb2`.
+    pub name: String,
+    /// A `Host` alias, not a hostname. See the struct docs.
+    pub ssh: String,
+    /// `darwin` | `linux`, and whatever comes next. Free text: nothing branches
+    /// on it yet, and a machine you cannot describe is still a machine.
+    pub os: String,
+    pub arch: String,
+    /// `active` | `retired`. A retired machine is not deleted, because the
+    /// agents that ran on it are in the log and a row with a last-seen reads
+    /// better than a missing one.
+    pub status: String,
+    pub added: String,
+    pub body: String,
+}
+
+/// The characters a machine name may use, and why it is not just a filename.
+///
+/// The name is the `@mb2` suffix on a host-qualified id, so anything that
+/// could be mistaken for part of an id makes routing ambiguous: `@` would
+/// nest, `:` is already *inside* a pane id — `w0:p3` is one id, not two — and
+/// whitespace would split an argument on its way to `ssh`. Lowercase
+/// alphanumerics, `-` and `_`, and nothing else.
+///
+/// Rejected rather than slugified, unlike a project slug. A project slug is
+/// typed once and read by people; a machine name is typed into `--on` and
+/// pasted out of an id, and silently answering to a different name than the
+/// one you gave is how you end up with two machines you believe are one.
+pub fn valid_machine_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a machine needs a name".into());
+    }
+    if let Some(bad) = name.chars().find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '_')) {
+        return Err(match bad {
+            '@' => "`@` separates a machine from an id (w0:p3@mb2) and cannot be in the name".into(),
+            ':' => "`:` is already inside a pane id (w0:p3 is one id) and cannot be in the name".into(),
+            c if c.is_ascii_uppercase() => format!("`{c}`: machine names are lowercase"),
+            c => format!("`{c}`: machine names are lowercase letters, digits, `-` and `_`"),
+        });
+    }
+    Ok(())
+}
+
+impl Machine {
+    pub fn new(name: &str, ssh: &str) -> Machine {
+        Machine {
+            name: name.to_string(),
+            ssh: ssh.to_string(),
+            status: "active".into(),
+            added: util::now_iso(),
+            ..Default::default()
+        }
+    }
+
+    pub fn from_doc(doc: &Doc, fallback_name: &str) -> Machine {
+        let name = doc.opt("name").unwrap_or_else(|| fallback_name.to_string());
+        Machine {
+            // An `ssh` that was never written defaults to the name, which is
+            // the case where the `Host` alias and the machine are called the
+            // same thing — the common one, and the one worth not having to say
+            // twice.
+            ssh: doc.opt("ssh").unwrap_or_else(|| name.clone()),
+            name,
+            os: doc.str("os"),
+            arch: doc.str("arch"),
+            status: doc.opt("status").unwrap_or_else(|| "active".into()),
+            added: doc.str("added"),
+            body: doc.body.clone(),
+        }
+    }
+
+    pub fn to_doc(&self) -> Doc {
+        let mut d = Doc::default();
+        d.set_str("name", &self.name);
+        d.set_str("ssh", &self.ssh);
+        d.set_str("os", &self.os);
+        d.set_str("arch", &self.arch);
+        d.set_str("status", &self.status);
+        d.set_str("added", &self.added);
+        d.set_str("schema", SCHEMA);
+        d.body = self.body.clone();
+        d
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status != "retired"
+    }
+
+    pub fn render(&self) -> String {
+        fm::emit(&self.to_doc())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +654,36 @@ mod tests {
         assert_eq!(section_of(b, "Details"), None, "empty reads as absent");
         assert!(has_section(b, "Details"), "…but the heading is still there");
         assert!(!has_section(b, "Decisions"), "and one never written is not");
+    }
+
+    /// A machine name is not a filename. It is the `@mb2` on the end of a pane
+    /// id, so the two characters that already mean something inside an id have
+    /// to be refused rather than tidied away — and refused with a message that
+    /// says which one, because "invalid name" tells you nothing you can act on.
+    #[test]
+    fn a_machine_name_may_not_contain_what_an_id_already_uses() {
+        assert!(valid_machine_name("mb2").is_ok());
+        assert!(valid_machine_name("linux-box_2").is_ok());
+
+        assert!(valid_machine_name("w0:p3@mb2").unwrap_err().contains(':'), "the colon is caught first");
+        assert!(valid_machine_name("mb2@home").unwrap_err().contains('@'));
+        assert!(valid_machine_name("MB2").unwrap_err().contains("lowercase"));
+        assert!(valid_machine_name("mb 2").is_err(), "whitespace would split an ssh argument");
+        assert!(valid_machine_name("").is_err());
+    }
+
+    /// The alias and the machine are usually called the same thing, and a
+    /// record written before `ssh` existed as a field must not come back with
+    /// nothing to dial.
+    #[test]
+    fn a_machine_with_no_ssh_alias_answers_to_its_own_name() {
+        let m = Machine::from_doc(&fm::parse("---\nname: mb2\n---\n"), "mb2");
+        assert_eq!(m.ssh, "mb2");
+        assert_eq!(m.status, "active", "and is active until something says otherwise");
+
+        let round = Machine::from_doc(&fm::parse(&Machine::new("mb2", "mac-mini").render()), "ignored");
+        assert_eq!(round.ssh, "mac-mini", "an alias that was given is kept");
+        assert_eq!(round.name, "mb2");
     }
 
     /// `Log` is append-only and belongs to `wsp note`, so it is not offered to

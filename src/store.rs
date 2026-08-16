@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::fm;
-use crate::model::{Project, Task};
+use crate::model::{Machine, Project, Task};
 use crate::util;
 
 thread_local! {
@@ -30,6 +30,65 @@ pub struct Store {
     /// Files this process has written to the store, waiting for the commit
     /// that names them. See `git_commit`.
     written: RefCell<BTreeSet<PathBuf>>,
+}
+
+/// What the daemon last saw of one machine. The ephemeral half of a
+/// [`Machine`]; see `Store::machines_live` for why the halves are apart.
+///
+/// A struct rather than a bare `Value` because four different things read this
+/// — the tunnel supervisor that writes it, `herdr::call` picking a socket, the
+/// panel, and the reap guard that must not mistake unreachable for empty — and
+/// a field name mistyped in one of them would read as `false` rather than as
+/// an error.
+#[derive(Debug, Clone, Default)]
+pub struct MachineLive {
+    /// Answering *now*, as of `last_seen`. The third state — "unreachable" as
+    /// distinct from "answering with nothing" — is this being false, and it is
+    /// the distinction t-260816-038 exists to protect.
+    pub reachable: bool,
+    /// When it last answered. Kept across a drop, so an offline row can say how
+    /// long it has been offline rather than just that it is.
+    pub last_seen: String,
+    /// `up` | `down` | `starting` | `retrying`. The ssh connection, which can
+    /// be down while the machine itself is fine and is worth telling apart when
+    /// you are looking at why nothing is arriving.
+    pub tunnel: String,
+    /// The forwarded socket, as `Store::machine_socket` named it. Recorded
+    /// rather than recomputed so a reader is talking to the socket the daemon
+    /// actually made, not the one it would have made.
+    pub socket: String,
+    /// Whatever the far herdr says it is. A protocol that has moved under us is
+    /// worth seeing in a list before it is worth handling.
+    pub herdr_version: String,
+    /// Why it is not reachable, in the words of whatever failed. Empty when it
+    /// is. This is the whole diagnostic surface for "why is mb2 grey", so it
+    /// keeps the message rather than a code.
+    pub error: String,
+}
+
+impl MachineLive {
+    pub fn from_value(v: &Value) -> MachineLive {
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        MachineLive {
+            reachable: v.get("reachable").and_then(|x| x.as_bool()).unwrap_or(false),
+            last_seen: s("last_seen"),
+            tunnel: s("tunnel"),
+            socket: s("socket"),
+            herdr_version: s("herdr_version"),
+            error: s("error"),
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        json!({
+            "reachable": self.reachable,
+            "last_seen": self.last_seen,
+            "tunnel": self.tunnel,
+            "socket": self.socket,
+            "herdr_version": self.herdr_version,
+            "error": self.error,
+        })
+    }
 }
 
 impl Store {
@@ -101,6 +160,58 @@ impl Store {
         fs::create_dir_all(self.projects_dir())?;
         let path = self.projects_dir().join(format!("{}.md", p.id));
         write_atomic(&path, &p.render())?;
+        self.wrote(path);
+        Ok(())
+    }
+
+    // ---- machines ---------------------------------------------------------
+    //
+    // Which machines exist is durable and committed, one file each as a
+    // project is. How they are *doing* is not: see `machines_live` further
+    // down, and the note there on why the two halves are deliberately apart.
+
+    pub fn machines_dir(&self) -> PathBuf {
+        self.root.join("machines")
+    }
+
+    pub fn machine_path(&self, name: &str) -> PathBuf {
+        self.machines_dir().join(format!("{name}.md"))
+    }
+
+    /// Every machine in the store, retired ones included, by name.
+    ///
+    /// Retired ones are here rather than filtered out because the only caller
+    /// that wants them gone — the daemon, which will not dial a retired
+    /// machine — can say so, and every caller that draws a list wants them:
+    /// that is the whole reason retiring is not deleting.
+    pub fn machines(&self) -> Vec<Machine> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(self.machines_dir()) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            if let Ok(text) = fs::read_to_string(&path) {
+                out.push(Machine::from_doc(&fm::parse(&text), &stem));
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    pub fn machine(&self, name: &str) -> Option<Machine> {
+        let text = fs::read_to_string(self.machine_path(name)).ok()?;
+        Some(Machine::from_doc(&fm::parse(&text), name))
+    }
+
+    pub fn save_machine(&self, m: &Machine) -> std::io::Result<()> {
+        fs::create_dir_all(self.machines_dir())?;
+        let path = self.machine_path(&m.name);
+        write_atomic(&path, &m.render())?;
         self.wrote(path);
         Ok(())
     }
@@ -613,6 +724,72 @@ impl Store {
         removed
     }
 
+    // ---- machine liveness -------------------------------------------------
+    //
+    // The other half of a machine, and state rather than store for two
+    // reasons. Liveness has no business in git — a commit per reachability
+    // flip would drown the history of the actual work — and it is *this
+    // seat's* view: the same store is one directory, but whether `mb2` answers
+    // is a fact about the connection between here and there, which the seat
+    // owns and nobody else can write.
+    //
+    // Nothing here dials anything. The daemon's tunnel supervisor is the only
+    // writer (t-260816-035); everybody else — the panel, the machines view,
+    // `herdr::call` picking a socket — reads what it last wrote. A reader that
+    // probed for itself would be a second opinion on reachability, and two
+    // opinions is exactly the ambiguity that makes an offline machine look
+    // like an empty one.
+
+    /// Where the daemon forwards a machine's herdr socket to.
+    ///
+    /// Named here rather than by whoever gets there first, because the process
+    /// that creates it (the daemon) and the process that connects to it (any
+    /// `herdr::call` on an `@machine` id) are different processes that never
+    /// speak — a convention each spelled out for itself would be a bug nobody
+    /// could see. Under the state dir and not `/tmp`, so it goes when the
+    /// state does.
+    ///
+    /// Kept short deliberately: a unix socket path is capped at 104 bytes on
+    /// macOS, and `~/.local/state/wsp/sock/<name>.sock` leaves room for a long
+    /// home directory and a long machine name without either being the thing
+    /// that breaks.
+    // Unused until the tunnel supervisor lands (t-260816-035) and `herdr::call`
+    // learns to route on `@machine` (t-260816-036). Here now because it is the
+    // agreement between those two, and an agreement written down after the
+    // fact is one that was guessed at twice.
+    #[allow(dead_code)]
+    pub fn machine_socket(&self, name: &str) -> PathBuf {
+        self.state.join("sock").join(format!("{name}.sock"))
+    }
+
+    /// machine name -> what the daemon last saw of it.
+    pub fn machines_live(&self) -> BTreeMap<String, MachineLive> {
+        match self.read_json("machines.json") {
+            Value::Object(m) => m.into_iter().map(|(k, v)| (k, MachineLive::from_value(&v))).collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn machine_live(&self, name: &str) -> Option<MachineLive> {
+        self.machines_live().remove(name)
+    }
+
+    /// The daemon's tunnel supervisor is the only caller (t-260816-035); see
+    /// the section note above for why it is the only one.
+    #[allow(dead_code)]
+    pub fn set_machine_live(&self, name: &str, live: &MachineLive) {
+        let v = live.to_value();
+        self.update_json("machines.json", |m| {
+            m.insert(name.to_string(), v);
+        });
+    }
+
+    pub fn clear_machine_live(&self, name: &str) -> bool {
+        let mut removed = false;
+        self.update_json("machines.json", |m| removed = m.remove(name).is_some());
+        removed
+    }
+
     pub fn log_event(&self, kind: &str, data: Value) {
         let _ = fs::create_dir_all(&self.state);
         let line = json!({ "ts": util::now_iso(), "kind": kind, "data": data });
@@ -817,6 +994,62 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The two halves of a machine, and the line between them.
+    ///
+    /// The durable half is a file in the store and moves the fingerprint,
+    /// because adding a machine is a change to the setup. The live half is
+    /// state and must not: a machine flapping in and out of reach would
+    /// otherwise look to every panel on the seat like the work having changed.
+    #[test]
+    fn a_machine_is_a_committed_file_and_its_liveness_is_not() {
+        let store = scratch("machines");
+        assert!(store.machines().is_empty(), "no machines dir yet is no machines");
+
+        let mut m = Machine::new("mb2", "mb2.tail");
+        m.os = "darwin".into();
+        store.save_machine(&m).unwrap();
+        let after_add = store.fingerprint();
+
+        let back = store.machine("mb2").expect("round-trips through the file");
+        assert_eq!(back.ssh, "mb2.tail");
+        assert_eq!(back.os, "darwin");
+        assert!(back.is_active(), "a new machine is active");
+
+        store.set_machine_live(
+            "mb2",
+            &MachineLive { reachable: true, tunnel: "up".into(), ..Default::default() },
+        );
+        assert_eq!(store.fingerprint(), after_add, "liveness is not a change to the setup");
+        assert!(store.machine_live("mb2").unwrap().reachable);
+
+        // Retiring keeps the row. This is the whole reason `rm` retires by
+        // default: a machine that has gone away is still where those pane ids
+        // came from.
+        let mut retired = back;
+        retired.status = "retired".into();
+        store.save_machine(&retired).unwrap();
+        assert_eq!(store.machines().len(), 1, "still listed");
+        assert!(!store.machines()[0].is_active());
+    }
+
+    /// Absent is not offline. A machine the daemon has never reported on has no
+    /// record at all, and reading that as `reachable: false` would be the same
+    /// collapse — unreachable standing in for empty — one layer lower down.
+    #[test]
+    fn a_machine_nobody_has_reported_on_has_no_record_rather_than_a_false_one() {
+        let store = scratch("machines-absent");
+        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
+        assert!(store.machine_live("mb2").is_none());
+
+        store.set_machine_live("mb2", &MachineLive { reachable: false, error: "no route".into(), ..Default::default() });
+        let l = store.machine_live("mb2").expect("now there is one, and it says why");
+        assert!(!l.reachable);
+        assert_eq!(l.error, "no route");
+
+        assert!(store.clear_machine_live("mb2"));
+        assert!(store.machine_live("mb2").is_none(), "back to no opinion, not a negative one");
+    }
 
     fn scratch(tag: &str) -> Store {
         let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
