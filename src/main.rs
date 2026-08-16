@@ -14,6 +14,7 @@ mod cmd_mandate;
 mod cmd_project;
 mod cmd_spawn;
 mod cmd_task;
+mod cmd_verify;
 mod daemon;
 mod detail;
 mod fm;
@@ -36,6 +37,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "terse", "seen",
+    // `verify` takes paths as positionals, so every flag it owns has to be
+    // known here or `wsp verify --check src/main.rs` eats the path as a value.
+    "release", "check", "rm",
 ];
 
 pub struct Args {
@@ -272,6 +276,7 @@ fn main() {
 
         "brief" => cmd_brief::brief(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
+        "verify" => cmd_verify::verify(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "spawn" => cmd_spawn::spawn(&store, &args),
         "machine" | "machines" => cmd_machine::dispatch(&store, &args),
@@ -358,6 +363,10 @@ fn help() {
 {agents}
   wsp brief                         what this pane is for, and who else is working
   wsp commit-help                   how to commit in a tree somebody else is in
+  wsp verify [<path>…] [--check] [--release] [--rm]
+                                    build and test your change in a tree of your
+                                    own, at HEAD — the only build whose result
+                                    means anything while somebody else is here
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
                                     open a workspace on it, claim it there, and

@@ -1926,6 +1926,7 @@ spot of the check we were relying on at the time.
 | Explicit paths (`git add <file>`) | staging a file you never meant to name | anything already staged in the shared index by someone else |
 | Reading `git diff --cached` | a hunk you did not write, if you read the **file list** and not just the hunks | nothing — but only if you actually read it; every swept hunk looked plausible in isolation |
 | Isolated build in a worktree | what you wrongly left *out*, and what you took in that only compiles against uncommitted work | whose commit it is; a coherent tree under the wrong author's message compiles perfectly |
+| `wsp verify` | the above, without anyone remembering how — and it names what changed that you did *not* put under test | the same blind spot: it proves the patch stands alone, not that the patch is yours |
 | A private `GIT_INDEX_FILE` | the other agent's staged work entering your commit | the working tree; two people still editing one file; **the shared index, which nobody is now reading** |
 | `wsp doctor` | a shared index holding something older than HEAD, in any declared project root | a shared index holding something *newer* — staged work is indistinguishable from staged work |
 | `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one |
@@ -1984,15 +1985,51 @@ actually do it. The short version: commit through your own index, read the file
 list before the hunks, prove it in a worktree, and verify the artefact rather
 than the intention.
 
+### `wsp verify`, because step 3 wants to be code
+
+A rule that catches two different agents on two consecutive days is not a rule
+anyone is going to start following. `wsp verify [<path>…]` does step 3 —
+private index at HEAD, a detached worktree, the patch applied, `cargo test` —
+and gets right the parts that are always got wrong. `GIT_INDEX_FILE` is set per
+command rather than exported, so `git worktree add` cannot write the new
+worktree's index over the private one you just built. The patch comes from `git
+add` rather than `git diff HEAD`, so a file git has never seen is still under
+test — a new module is the commonest thing an agent adds and the easiest thing
+for a diff to miss.
+
+The tree is keyed on the *agent*, not the build, and kept: `CARGO_TARGET_DIR`
+sits beside it and persists, so only what you changed rebuilds. Measured on this
+repository, 25s cold and 7s warm, of which ~5s is the test run. One tree per
+agent to leak rather than one per commit, and `--rm` to drop it.
+
+It also prints what changed that you did **not** name. Naming paths keeps the
+other agent's work out of your build, which is the point — and it lets you leave
+out something of your own, which fails in the worst direction: a patch holding a
+new module that nothing declares compiles perfectly, because nothing compiles
+it. That happened while this was being written, a green build in 7s for a change
+that did not build. Most of what is listed will be somebody else's and correctly
+excluded; the value is seeing at a glance whether one of them is yours.
+
+What it does not do is commit. Steps 1, 2 and 4 are still yours, and the
+`read-tree` immediately before the commit is still the one that stops a silent
+revert.
+
 ### What none of it fixes
 
 Every rule above reduces the chance of taking someone's work; none removes it,
 because the tree itself is shared. `t-260815-022` — one working tree per agent —
-is the structural answer, and it is deliberately parked: it breaks
-`project_for_cwd`, costs a checkout and a build per agent, and isolates only the
-code, leaving the store, the index of record and the installed binary shared.
-The judgement was that the rules are cheaper until agents run unattended. The
-day nobody is reading the staged diff, that judgement changes.
+is the structural answer. It was parked on 2026-08-15 with its own revisit
+conditions written down: agents running unattended, a backlog outgrowing what
+two agents can keep disjoint, sweeps continuing after the render/data
+segmentation. All three came true within a day, and it was unparked on
+2026-08-16.
+
+Most of it has since been split out into pieces that need none of its open
+questions — `wsp verify` above is the build half, `wsp sandbox` the live-run
+half — which leaves 022 holding the part that has no cheaper version: a tree you
+*edit* in, and therefore branch policy, where the worktrees live, how a review
+sees the whole change rather than one agent's corner, and the `project_for_cwd`
+resolution that only a tree with a pane standing in it needs.
 
 The other half is not a rule at all. Three of the six incidents cost nothing but
 the time spent not knowing what had happened, and all three were resolved by one
