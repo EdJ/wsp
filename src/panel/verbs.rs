@@ -108,7 +108,19 @@ impl Ask {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Pick {
-    /// Move a task: land on a project, or on the inbox to unfile it.
+    /// Move a task: land on a project to put it at the top of one, on another
+    /// task to make it a sub-task of that one, or on the inbox to unfile it.
+    ///
+    /// The two answers are one question — "where does this belong" — asked at
+    /// two scales, which is why they share a key. A tree deeper than one level
+    /// is the expected result and not a mistake: work decomposes as far as it
+    /// decomposes, and `add --parent` could already build the shape this now
+    /// lets you build after the fact.
+    ///
+    /// Landing on itself, or on anything already beneath it, is refused by the
+    /// CLI rather than here — the same division as [`Pick::MoveProject`], for
+    /// the same reason: a cycle is a fact about the sub-tree and the panel has
+    /// no index to ask.
     MoveTask { task: String },
     /// Move a project under another one, sub-tree and all.
     ///
@@ -132,7 +144,7 @@ pub(crate) enum Pick {
 impl Pick {
     pub(super) fn hint(&self) -> &'static str {
         match self {
-            Pick::MoveTask { .. } => "move to which project?",
+            Pick::MoveTask { .. } => "under which project or task?",
             Pick::MoveProject { .. } => "under which project?",
             Pick::PaneForTask { .. } => "which agent takes it?",
             Pick::TaskForPane { .. } => "which task does it take?",
@@ -143,12 +155,40 @@ impl Pick {
     /// `None` when the cursor is somewhere this pick cannot accept.
     pub(super) fn argv(&self, at: &Target) -> Option<Vec<String>> {
         match (self, at) {
-            (Pick::MoveTask { task }, Target::Project(p)) => {
-                Some(vec!["mv".into(), task.clone(), "-p".into(), p.clone()])
-            }
-            // Unfiling. `mv` already understands `inbox` as "no project".
-            (Pick::MoveTask { task }, Target::Inbox) => {
-                Some(vec!["mv".into(), task.clone(), "-p".into(), "inbox".into()])
+            // A project row means the top level of that project, so the detach
+            // travels with the move. The row you land on is the whole answer to
+            // where the task belongs, and one that stayed a sub-task of
+            // something else would have answered it twice — it is also the only
+            // way back out of a sub-tree from here, since `--parent <task>` can
+            // add a level and never remove one.
+            //
+            // `mv` says nothing about a detachment that detached nothing, so a
+            // task that was already at the top level logs the plain move it is.
+            (Pick::MoveTask { task }, Target::Project(p)) => Some(vec![
+                "mv".into(),
+                task.clone(),
+                "-p".into(),
+                p.clone(),
+                "--parent".into(),
+                "none".into(),
+            ]),
+            // Unfiling. `mv` already understands `inbox` as "no project", and
+            // the top of the inbox is a top level like any other.
+            (Pick::MoveTask { task }, Target::Inbox) => Some(vec![
+                "mv".into(),
+                task.clone(),
+                "-p".into(),
+                "inbox".into(),
+                "--parent".into(),
+                "none".into(),
+            ]),
+            // The same question one level down: this work belongs *inside*
+            // that, not beside it. No `-p`, because the project follows the
+            // parent — `mv` refuses a `-p` that disagrees with one, and naming
+            // the project the cursor happened to be in would be exactly that
+            // disagreement whenever the two rows are in different projects.
+            (Pick::MoveTask { task }, Target::Task(parent)) => {
+                Some(vec!["mv".into(), task.clone(), "--parent".into(), parent.clone()])
             }
             (Pick::MoveProject { project }, Target::Project(p)) => {
                 Some(vec!["project".into(), "set".into(), project.clone(), format!("parent={p}")])

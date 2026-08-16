@@ -711,7 +711,7 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .down_to(panel::RowKind::Task)
             .key(Key::Char('m'))
-            .scene("Moving a task", "m turns the tree itself into the picker. Navigation and folding still work, so you hunt for the destination the way you would read for it — then ↵ takes whatever the cursor is on."),
+            .scene("Moving a task", "m turns the tree itself into the picker. Navigation and folding still work, so you hunt for the destination the way you would read for it — then ↵ takes whatever the cursor is on. A project row means the top level of that project; a task row means inside that task, as a sub-task of it. One question, asked at two scales, which is why they share a key."),
     );
 
     out.push(
@@ -725,7 +725,7 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .down_to(panel::RowKind::Task)
             .keys(&[Key::Char('m'), Key::Down, Key::Down])
-            .scene("Landing somewhere valid", "Still picking. A project is a destination; so is the inbox, which unfiles the task. Anything else and ↵ says so rather than doing something surprising."),
+            .scene("Landing somewhere valid", "Still picking. A project is a destination, and so is a task — it becomes a sub-task of the one you land on, and the project follows the parent rather than being asked about separately. So is the inbox, which unfiles it. A project row also detaches, because the top level of that project is what the row means: it is the way back out of a sub-tree, and without it a key that could only push work down is one you learn not to press. Anything else and ↵ says so rather than doing something surprising."),
     );
 
     out.push(
@@ -2890,6 +2890,77 @@ mod tests {
                 assert_eq!(argv, vec!["project", "set", "wsp", "name=wsp control plane!"]);
             }
             _ => panic!("a changed name should run a set"),
+        }
+    }
+
+    /// Put the cursor on the inbox heading.
+    fn on_inbox(ui: &mut panel::Ui) {
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            if ui.selected_target() == panel::Target::Inbox {
+                return;
+            }
+        }
+        panic!("no inbox row");
+    }
+
+    /// `m` on a task is one question — where does this belong — and the tree
+    /// answers it at whichever scale the cursor lands on. A project row means
+    /// the top level of that project; a task row means inside that task.
+    ///
+    /// The pair has to be a pair. A key that could only push work down into a
+    /// sub-tree would be one you learn not to press, because the way back out
+    /// would be a shell and an id you had to go and read — so a project row
+    /// carries the detach, and landing on one is how a sub-task stops being
+    /// one.
+    #[test]
+    fn m_files_a_task_under_another_and_takes_it_back_out() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        // Down a level, across projects: `t-004` is in `verb` and `t-005` is in
+        // `tooling`. No `-p` in the argv — the project follows the parent, and
+        // naming the one the cursor was in would be the disagreement `mv`
+        // refuses.
+        on_task(&mut ui, "t-004");
+        assert!(matches!(
+            panel::apply_key(Key::Char('m'), &mut ui, &mut view),
+            panel::Effect::None
+        ));
+        on_task(&mut ui, "t-005");
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, escalate, .. } => {
+                assert_eq!(argv, vec!["mv", "t-004", "--parent", "t-005"]);
+                // Nothing to override: a cycle is not a policy, it is a branch
+                // that stops being reachable.
+                assert_eq!(escalate, None);
+            }
+            _ => panic!("landing on a task should make it a sub-task"),
+        }
+
+        // …and back up. `t-052` is a sub-task of `t-005`; a project row means
+        // the top of that project, so the detach travels with the move.
+        on_task(&mut ui, "t-052");
+        panel::apply_key(Key::Char('m'), &mut ui, &mut view);
+        on_project(&mut ui, "verb");
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["mv", "t-052", "-p", "verb", "--parent", "none"]);
+            }
+            _ => panic!("landing on a project should file it at the top of one"),
+        }
+
+        // The inbox is a top level like any other, and unfiling a sub-task has
+        // to detach it for the same reason.
+        on_task(&mut ui, "t-052");
+        panel::apply_key(Key::Char('m'), &mut ui, &mut view);
+        on_inbox(&mut ui);
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["mv", "t-052", "-p", "inbox", "--parent", "none"]);
+            }
+            _ => panic!("the inbox should unfile it"),
         }
     }
 

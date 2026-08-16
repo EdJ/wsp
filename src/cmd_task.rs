@@ -674,7 +674,16 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         }
     }
 
-    let verb = if new_parent.is_some() { "re-parented" } else { "moved" };
+    // `--parent none` on work that was never a sub-task changed no parent, and
+    // saying otherwise is not a detail: the panel sends it on every move to a
+    // project, so that landing on a project row means the top level of it —
+    // which makes "detached" the commonest thing in the log and the rarest
+    // thing to have happened. The receipt, the event and the commit line all
+    // come off this word, so it has to answer what the task did, not what the
+    // flags said.
+    let attaches = matches!(new_parent, Some(Some(_)));
+    let detaches = matches!(new_parent, Some(None)) && subject.parent.is_some();
+    let verb = if attaches || detaches { "re-parented" } else { "moved" };
     mutate(store, args, verb, |t| {
         let was_project = t.project.clone();
         t.project = target.clone();
@@ -686,8 +695,10 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         }
         match &new_parent {
             Some(Some(p)) => t.log(&format!("moved under {} in {}", p.id, label(&target))),
-            Some(None) => t.log(&format!("detached to the top level of {}", label(&target))),
-            None => t.log(&format!("moved to {}", label(&target))),
+            Some(None) if detaches => {
+                t.log(&format!("detached to the top level of {}", label(&target)))
+            }
+            _ => t.log(&format!("moved to {}", label(&target))),
         }
         if carried > 0 {
             t.log(&format!(
@@ -1362,5 +1373,50 @@ mod tests {
         assert_eq!(prio(&store, &Args::synth("prio", &["047", "urgent"], &[])), 2);
         assert_eq!(prio(&store, &Args::synth("prio", &["047"], &[])), 2);
         assert_eq!(store.find_task("047").expect("the task").priority(), Priority::High);
+    }
+
+    /// The move that makes a sub-tree, which until now only `add --parent`
+    /// could: work decomposes after it is written down at least as often as
+    /// before, and the piece that turns out to belong inside another one is
+    /// already a task with a body and a log.
+    #[test]
+    fn a_task_becomes_a_sub_task_of_another() {
+        let store = scratch("mv-parent");
+        task_with(&store, "t-260815-047", "normal");
+        task_with(&store, "t-260815-048", "normal");
+
+        let code = mv(&store, &Args::synth("mv", &["048"], &[("parent", "047")]));
+        assert_eq!(code, 0);
+
+        let t = store.find_task("048").expect("the task");
+        assert_eq!(t.parent.as_deref(), Some("t-260815-047"));
+        assert!(t.body.contains("moved under t-260815-047"), "the log should carry it: {}", t.body);
+    }
+
+    /// `--parent none` on work that was never a sub-task moved it and detached
+    /// nothing, and the receipt has to say the true one of the two.
+    ///
+    /// It is not a corner: the panel sends `--parent none` on *every* move to a
+    /// project, so that landing on a project row means the top level of it —
+    /// which makes a task that had no parent the commonest thing this is asked
+    /// about, and "detached" the wrong word for nearly all of them.
+    #[test]
+    fn detaching_a_task_with_no_parent_says_it_moved() {
+        let store = scratch("mv-detach");
+        task_with(&store, "t-260815-047", "normal");
+        task_with(&store, "t-260815-048", "normal");
+
+        assert_eq!(mv(&store, &Args::synth("mv", &["048"], &[("parent", "none")])), 0);
+        let t = store.find_task("048").expect("the task");
+        assert!(t.parent.is_none());
+        assert!(t.body.contains("moved to verb"), "the log should carry it: {}", t.body);
+        assert!(!t.body.contains("detached"), "nothing was detached: {}", t.body);
+
+        // …and when there *is* one, the same flag is a detachment and says so.
+        assert_eq!(mv(&store, &Args::synth("mv", &["048"], &[("parent", "047")])), 0);
+        assert_eq!(mv(&store, &Args::synth("mv", &["048"], &[("parent", "none")])), 0);
+        let t = store.find_task("048").expect("the task");
+        assert!(t.parent.is_none());
+        assert!(t.body.contains("detached to the top level of verb"), "{}", t.body);
     }
 }
