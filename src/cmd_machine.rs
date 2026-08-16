@@ -16,10 +16,12 @@
 //! off must still be a machine, and a second opinion on whether it answers is
 //! how "offline" and "empty" get confused.
 
-use serde_json::json;
+use std::collections::BTreeMap;
+
+use serde_json::{json, Value};
 
 use crate::herdr;
-use crate::model::{valid_machine_name, Machine};
+use crate::model::{valid_machine_name, Machine, Task};
 use crate::store::{MachineLive, Store};
 use crate::util::{self, Paint};
 use crate::Args;
@@ -126,6 +128,49 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Everything the machines view reads, gathered into one value.
+///
+/// The same bargain [`crate::panel::Snapshot`] and [`crate::overlap::World`]
+/// make, and for the same reason: this view joins a file the store holds with
+/// an answer herdr gives, and while it did both itself the only way to see a
+/// frame was to have a daemon, a tunnel and a second box. The three states it
+/// exists to tell apart — never reported, answered and stopped, answering — are
+/// exactly the ones nobody can stand up on demand.
+pub(crate) struct Fleet {
+    pub machines: Vec<Machine>,
+    pub live: BTreeMap<String, MachineLive>,
+    /// Every agent there is, `@machine`-qualified. Empty when herdr is not
+    /// answering, which is a machines list without the agents on it rather than
+    /// no machines list — the durable half of a machine is a file and does not
+    /// need a socket to be read.
+    pub agents: Vec<herdr::Pane>,
+    pub bindings: BTreeMap<String, Value>,
+    pub tasks: Vec<Task>,
+    /// This seat's hostname, in the snapshot rather than read where it is
+    /// drawn. A fixture that called `util::hostname` would render the name of
+    /// whichever box the test ran on, which is a frame that differs between two
+    /// machines for a reason that has nothing to do with the code.
+    pub seat: String,
+}
+
+impl Fleet {
+    /// The live join: the store for what machines exist and what the daemon
+    /// last saw, herdr for who is on them.
+    pub(crate) fn live(store: &Store) -> Fleet {
+        Fleet {
+            machines: store.machines(),
+            live: store.machines_live(),
+            agents: match herdr::available() {
+                true => herdr::agents().unwrap_or_default(),
+                false => Vec::new(),
+            },
+            bindings: store.bindings(),
+            tasks: store.tasks(),
+            seat: util::hostname(),
+        }
+    }
+}
+
 /// One agent, as a machines list wants it: which pane, what it is, what it is
 /// holding.
 struct Standing {
@@ -138,28 +183,19 @@ struct Standing {
 
 /// Every agent there is, partitioned by the machine it is on.
 ///
-/// A partition of one list rather than a query per machine: `herdr::agents()`
+/// A partition of one list rather than a query per machine: [`herdr::agents`]
 /// already fans out and comes back `@machine`-qualified, so where each one is
 /// is written on it. `""` is this seat.
-///
-/// Empty when herdr is not answering, which is a machines list without the
-/// agents on it rather than no machines list — the durable half of a machine is
-/// a file and does not need a socket to be read.
-fn standing(store: &Store) -> Vec<Standing> {
-    if !herdr::available() {
-        return Vec::new();
-    }
-    let bindings = store.bindings();
-    let tasks = store.tasks();
-    herdr::agents()
-        .unwrap_or_default()
-        .into_iter()
+fn standing(f: &Fleet) -> Vec<Standing> {
+    f.agents
+        .iter()
         .map(|a| {
-            let held = bindings
+            let held = f
+                .bindings
                 .get(&a.pane_id)
                 .and_then(|b| b.get("task_id"))
                 .and_then(|t| t.as_str())
-                .and_then(|id| tasks.iter().find(|t| t.id == id));
+                .and_then(|id| f.tasks.iter().find(|t| t.id == id));
             Standing {
                 machine: herdr::host_of(&a.pane_id).unwrap_or("").to_string(),
                 pane: a.pane_id.clone(),
@@ -184,44 +220,65 @@ fn standing(store: &Store) -> Vec<Standing> {
 /// wants the same three states and the same partition; this is the half that
 /// does not need the panel to hold still to be written. See t-260816-053.
 pub fn list(store: &Store, args: &Args) -> i32 {
-    let machines = store.machines();
-    let live = store.machines_live();
-    let here = standing(store);
-    let p = Paint::new();
-
-    let agents_on = |name: &str| -> Vec<&Standing> {
-        here.iter().filter(|s| s.machine == name).collect()
-    };
-
-    if args.json() {
-        let rows: Vec<_> = machines
-            .iter()
-            .map(|m| {
-                let mut v = machine_json(m, live.get(&m.name));
-                v["agents"] = json!(agents_on(&m.name).iter().map(|s| json!({
-                    "pane": s.pane, "agent": s.agent, "state": s.state, "holding": s.holding,
-                })).collect::<Vec<_>>());
-                v
-            })
-            .collect();
-        println!(
-            "{}",
-            json!({
-                "seat": util::hostname(),
-                "machines": rows,
-                "seat_agents": agents_on("").iter().map(|s| json!({
-                    "pane": s.pane, "agent": s.agent, "state": s.state, "holding": s.holding,
-                })).collect::<Vec<_>>(),
-            })
-        );
-        return 0;
+    let f = Fleet::live(store);
+    match args.json() {
+        true => println!("{}", list_json(&f)),
+        false => {
+            for l in list_lines(&f, &Paint::new()) {
+                println!("{l}");
+            }
+        }
     }
+    0
+}
+
+/// Partition the agents by machine. `""` is this seat.
+fn agents_on<'a>(here: &'a [Standing], name: &str) -> Vec<&'a Standing> {
+    here.iter().filter(|s| s.machine == name).collect()
+}
+
+fn agents_json(rows: &[&Standing]) -> Value {
+    json!(rows
+        .iter()
+        .map(|s| json!({
+            "pane": s.pane, "agent": s.agent, "state": s.state, "holding": s.holding,
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn list_json(f: &Fleet) -> Value {
+    let here = standing(f);
+    let rows: Vec<_> = f
+        .machines
+        .iter()
+        .map(|m| {
+            let mut v = machine_json(m, f.live.get(&m.name));
+            v["agents"] = agents_json(&agents_on(&here, &m.name));
+            v
+        })
+        .collect();
+    json!({
+        "seat": f.seat,
+        "machines": rows,
+        "seat_agents": agents_json(&agents_on(&here, "")),
+    })
+}
+
+/// The list as text, one line per element and nothing printed.
+///
+/// Returned rather than written so the three states this view exists to tell
+/// apart can be read back by a test. Standing up the live inputs for even one
+/// of them takes a daemon, a tunnel and a second box; all three at once, in one
+/// frame, is not a thing anybody can arrange on demand.
+fn list_lines(f: &Fleet, p: &Paint) -> Vec<String> {
+    let here = standing(f);
+    let mut out = Vec::new();
 
     // An agent line, indented under whatever it is standing on.
-    let under = |rows: Vec<&Standing>| {
+    let under = |out: &mut Vec<String>, rows: Vec<&Standing>| {
         let w = rows.iter().map(|s| s.pane.len()).max().unwrap_or(0);
         for s in rows {
-            println!(
+            out.push(format!(
                 "  {}  {}",
                 p.dim(&format!("{:<w$}", s.pane)),
                 p.dim(&format!(
@@ -233,45 +290,47 @@ pub fn list(store: &Store, args: &Args) -> i32 {
                         false => format!(" · {}", util::truncate(&s.holding, 48)),
                     }
                 )),
-            );
+            ));
         }
     };
 
-    if machines.is_empty() {
-        println!("{}", p.dim("no machines — this seat only"));
-        println!("{}", p.dim("  wsp machine add <name> <ssh-target>"));
-        println!("{}", p.bold(&format!("seat  {}", util::hostname())));
-        under(agents_on(""));
-        return 0;
+    // The seat has no record of its own — it is where you are, not somewhere
+    // you reach — but a list of machines that leaves out the one you are on
+    // reads as if it were missing, and the agents on it are half of what this
+    // list is for.
+    let seat = |out: &mut Vec<String>| out.push(p.bold(&format!("seat  {}", f.seat)));
+
+    if f.machines.is_empty() {
+        out.push(p.dim("no machines — this seat only"));
+        out.push(p.dim("  wsp machine add <name> <ssh-target>"));
+        seat(&mut out);
+        under(&mut out, agents_on(&here, ""));
+        return out;
     }
 
-    let w = machines.iter().map(|m| m.name.len()).max().unwrap_or(4).max(4);
-    let ssh_w = machines.iter().map(|m| m.ssh.len()).max().unwrap_or(3).max(3);
-    println!("{}", p.dim(&format!("{:<w$}  {:<ssh_w$}  {}", "NAME", "SSH", "STATE")));
-    for m in &machines {
-        let (state, mut note) = state_of(&p, m, live.get(&m.name));
+    let w = f.machines.iter().map(|m| m.name.len()).max().unwrap_or(4).max(4);
+    let ssh_w = f.machines.iter().map(|m| m.ssh.len()).max().unwrap_or(3).max(3);
+    out.push(p.dim(&format!("{:<w$}  {:<ssh_w$}  {}", "NAME", "SSH", "STATE")));
+    for m in &f.machines {
+        let (state, mut note) = state_of(p, m, f.live.get(&m.name));
         // Why, not just that — but cut, because an ssh failure is a sentence
         // and a half and this is one cell of a list. `show` prints it whole,
         // which is where you go when forty characters were not enough.
-        if let Some(err) = live.get(&m.name).map(|l| l.error.as_str()).filter(|e| !e.is_empty()) {
+        if let Some(err) = f.live.get(&m.name).map(|l| l.error.as_str()).filter(|e| !e.is_empty()) {
             note = format!("{note} · {}", util::truncate(err, 44));
         }
-        println!(
+        out.push(format!(
             "{}  {}  {}{}",
             p.bold(&format!("{:<w$}", m.name)),
             p.dim(&format!("{:<ssh_w$}", m.ssh)),
             state,
             if note.is_empty() { String::new() } else { format!("  {}", p.dim(&note)) },
-        );
-        under(agents_on(&m.name));
+        ));
+        under(&mut out, agents_on(&here, &m.name));
     }
-    // The seat has no record of its own — it is where you are, not somewhere
-    // you reach — but a list of machines that leaves out the one you are on
-    // reads as if it were missing, and the agents on it are half of what this
-    // list is for.
-    println!("{}", p.bold(&format!("seat  {}", util::hostname())));
-    under(agents_on(""));
-    0
+    seat(&mut out);
+    under(&mut out, agents_on(&here, ""));
+    out
 }
 
 pub fn show(store: &Store, args: &Args) -> i32 {
@@ -527,6 +586,132 @@ mod tests {
             Some(&MachineLive { reachable: false, last_seen: String::new(), ..Default::default() }),
         );
         assert_eq!(why, "never seen");
+    }
+
+    // ---- the whole view, offline -----------------------------------------
+
+    fn agent(pane: &str, agent: &str, state: &str, title: &str) -> herdr::Pane {
+        herdr::Pane {
+            pane_id: pane.to_string(),
+            agent: agent.to_string(),
+            agent_status: state.to_string(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A fleet in all three states at once, with agents on two of them.
+    ///
+    /// This is the frame nobody can arrange: it needs a machine the daemon has
+    /// never reported on, a second that answered and stopped, a third
+    /// answering, and agents standing on two boxes — one of them somebody
+    /// else's. Buildable here because the view takes its inputs in.
+    fn fleet() -> Fleet {
+        let mut live = BTreeMap::new();
+        live.insert(
+            "mb2".to_string(),
+            MachineLive { reachable: true, herdr_version: "0.4.1".into(), ..Default::default() },
+        );
+        live.insert(
+            "rack".to_string(),
+            MachineLive {
+                reachable: false,
+                last_seen: util::now_iso(),
+                error: "ssh: connect to host rack port 22: Connection refused".into(),
+                ..Default::default()
+            },
+        );
+
+        let mut bindings = BTreeMap::new();
+        bindings.insert("w1:p2@mb2".to_string(), json!({ "task_id": "t-001" }));
+
+        Fleet {
+            machines: vec![
+                Machine::new("mb2", "mb2"),
+                Machine::new("rack", "rack"),
+                // No entry in `live`: added, and the daemon has not been round
+                // to it yet.
+                Machine::new("shed", "shed.local"),
+            ],
+            live,
+            agents: vec![
+                agent("w1:p2@mb2", "claude", "working", "renaming the thing"),
+                agent("w3:p1@mb2", "", "idle", "zsh"),
+                agent("w0:p6", "claude", "idle", "reading sync.rs"),
+            ],
+            bindings,
+            tasks: vec![crate::model::Task::new("lift the machines view off herdr", "t-001")],
+            seat: "seat-under-test".into(),
+        }
+    }
+
+    /// The list renders with no daemon, no tunnel and no second box — which is
+    /// the point of taking the inputs in, and was not possible before.
+    ///
+    /// Asserted on the shape rather than the exact text: what matters is that
+    /// every machine is on it, each agent lands under the box it is standing
+    /// on, and the seat's own agents are not attributed to a machine.
+    #[test]
+    fn the_machines_view_renders_with_nothing_running() {
+        let out = list_lines(&fleet(), &plain());
+        let text = out.join("\n");
+
+        for name in ["mb2", "rack", "shed"] {
+            assert!(out.iter().any(|l| l.starts_with(name)), "{name} is not on the list:\n{text}");
+        }
+        assert!(text.contains("seat  seat-under-test"), "the seat is a heading of its own:\n{text}");
+
+        // Each agent under its own machine: `@mb2` on the id is where it is,
+        // and an unqualified id is this seat.
+        let row = |needle: &str| out.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no row for {needle}:\n{text}"));
+        assert!(row("w1:p2@mb2") > row("mb2"), "an agent sits under its machine");
+        assert!(row("w3:p1@mb2") < row("rack"), "…and above the next one");
+        assert!(row("w0:p6") > row("seat"), "an unqualified pane is on the seat");
+
+        // What it is holding, and the two fallbacks for a pane holding nothing.
+        assert!(text.contains("lift the machines view off herdr"), "a bound pane shows its task:\n{text}");
+        assert!(text.contains("(zsh)"), "an unbound pane falls back to its title:\n{text}");
+        assert!(text.contains("a shell"), "a pane with no agent is a shell:\n{text}");
+
+        // And the three states, in one frame, distinct.
+        assert!(text.contains("connected"), "{text}");
+        assert!(text.contains("offline"), "{text}");
+        assert!(text.contains("no daemon report yet"), "{text}");
+        // Why, and cut: an ssh failure is a sentence and a half, and this is
+        // one cell of a list. `show` is where the whole of it is.
+        assert!(text.contains("ssh: connect to host rack"), "an offline row says why:\n{text}");
+        assert!(!text.contains("Connection refused"), "…and no more than a cell of it:\n{text}");
+    }
+
+    /// herdr not answering costs the list its agents and nothing else. This is
+    /// the distinction the whole executor design is built around — "unreachable"
+    /// is not "answering with nothing" — and the durable half of a machine is a
+    /// file, which does not need a socket to be read.
+    #[test]
+    fn no_herdr_is_a_machines_list_without_the_agents_on_it() {
+        let mut f = fleet();
+        f.agents.clear();
+        let out = list_lines(&f, &plain());
+
+        for name in ["mb2", "rack", "shed"] {
+            assert!(out.iter().any(|l| l.starts_with(name)), "{name} went with the socket");
+        }
+        assert!(out.iter().any(|l| l.contains("seat-under-test")), "so did the seat");
+        assert!(!out.join("\n").contains("w1:p2"), "no agents, since none were reported");
+    }
+
+    /// No machines at all is the common case — one seat, and whatever is on it
+    /// — and it must still say what is running here.
+    #[test]
+    fn a_seat_with_no_machines_still_lists_its_own_agents() {
+        let mut f = fleet();
+        f.machines.clear();
+        let text = list_lines(&f, &plain()).join("\n");
+        assert!(text.contains("no machines"), "{text}");
+        assert!(text.contains("wsp machine add"), "and what to do about it:\n{text}");
+        assert!(text.contains("w0:p6"), "the seat's own agent is still the point:\n{text}");
+        // The panes on machines that are gone from the list go with them.
+        assert!(!text.contains("w1:p2@mb2"), "an agent on no listed machine is not the seat's:\n{text}");
     }
 }
 
