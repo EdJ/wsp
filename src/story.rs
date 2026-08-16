@@ -677,7 +677,7 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('w'))
             .scene(
                 "The agents, not the work",
-                "`w` puts every running agent in place of the tree, ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ? stopped on a task parked with a question, in a colour of its own because an answer is a different thing to ask for than a nudge, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The project on the right is what the tree would have said by where it drew the row. Every key still means what it means — ↵ jumps to the terminal, `c` hands it a task, 1-9 are the same hotkeys.",
+                "`w` puts every running agent in place of the tree, in runs under the project each one belongs to and ordered by what it is waiting for rather than by what has to be done — the one question the tree cannot answer, because an agent with nothing to do has no work to be filed under. The marks are the header strip's, one per row: ← stopped on live work and waiting on you, ? stopped on a task parked with a question, in a colour of its own because an answer is a different thing to ask for than a nudge, ● running, ○ spare, · not saying. herdr reports only working or idle; which of the four an idle agent is comes from the task in its hands, which is the half the store knows. The heading is what the tree would have said by where it drew the row, and it is where the project used to be repeated down the right of every line; the groups come in the order of whoever in each of them most wants you, so grouping says where an agent belongs without changing who you read first. Only the agents take the cursor — a heading neither folds nor selects, because every row you can reach here leads to a terminal, and that is what keeps ↵, `c` and 1-9 meaning what they mean.",
             ),
     );
 
@@ -1215,10 +1215,11 @@ mod tests {
         (ui, view)
     }
 
-    /// Every row of the agents view leads to a terminal, which is what makes
-    /// `↵`, `c` and the 1-9 hotkeys go on working inside it. A list of agents
-    /// with a project heading in it would put the cursor somewhere none of the
-    /// three verbs mean anything.
+    /// Every row of the agents view the cursor can reach leads to a terminal,
+    /// which is what makes `↵`, `c` and the 1-9 hotkeys go on working inside
+    /// it. The project headings are drawn and are not reachable, for exactly
+    /// that reason: a heading you could land on is the one row where none of
+    /// the three verbs mean anything.
     #[test]
     fn the_agents_view_is_every_agent_and_nothing_else() {
         let w = world();
@@ -1236,8 +1237,12 @@ mod tests {
             running,
             "one agent row per running agent, and no more"
         );
-        // Everything else in the view is one of those agents' own lines.
-        assert!(kinds.iter().all(|k| matches!(k, panel::RowKind::Agent | panel::RowKind::Detail)));
+        // Everything else in the view is one of those agents' own lines, or a
+        // heading saying which project the run under it belongs to.
+        assert!(kinds.iter().all(|k| matches!(
+            k,
+            panel::RowKind::Agent | panel::RowKind::Detail | panel::RowKind::Group
+        )));
 
         // And the cursor only ever lands on the agents: the lines beneath one
         // are the row above said at length, and stopping on them would be the
@@ -1343,6 +1348,76 @@ mod tests {
         out
     }
 
+    /// Ed: "group agents by project on the agents panel, for easier
+    /// visibility".
+    ///
+    /// Seven agents is a list you read; twenty is one you scan for the two that
+    /// are yours. The project was already on every row, on the right, where a
+    /// repeated word is least read — as a heading it is said once and the run
+    /// under it answers "who is on this" without anybody counting.
+    ///
+    /// The groups are ordered by whoever in each of them most wants you, not by
+    /// name: the list is read from the top for who has stopped, and a heading is
+    /// no reason to bury an agent asking for an answer under three that are
+    /// working. `verb` leads because its agent is the one asking, `wsp` is last
+    /// because its agent has said nothing at all, and the two groups that tie
+    /// break on the name — with the panes that resolve nowhere behind the
+    /// named ones, because `no project` is the least that can be said about a
+    /// pane.
+    #[test]
+    fn the_agents_view_stands_each_agent_under_its_project() {
+        let w = world();
+        let (mut ui, _view) = showing(&w, &[Key::Char('w')]);
+
+        let mut heading = String::new();
+        let mut under: Vec<(String, String)> = Vec::new();
+        let mut order: Vec<String> = Vec::new();
+        for i in 0..ui.rows_for_test() {
+            ui.select_for_test(i);
+            match ui.selected_kind() {
+                panel::RowKind::Group => {
+                    heading = panel::full_text_for_test(&ui, i);
+                    order.push(heading.clone());
+                }
+                panel::RowKind::Agent => match ui.selected_target() {
+                    panel::Target::Pane(p) => under.push((heading.clone(), p)),
+                    t => panic!("an agent row that is not a pane: {t:?}"),
+                },
+                _ => {}
+            }
+        }
+
+        assert_eq!(order, ["verb", "trance", "no project", "wsp"], "the groups, in order");
+        assert_eq!(
+            under,
+            [
+                // Asking, then blocked: the census's own order, kept inside
+                // each run so an agent sits where the strip and the dock put it.
+                ("verb".into(), "w2:p1".into()),
+                ("verb".into(), "w3:p2".into()),
+                // Spare before working, there as everywhere: there is nothing
+                // to do about an agent that is busy. One is placed by the
+                // checkout it stands in and one by the task it holds — the two
+                // ways a pane comes to belong somewhere.
+                ("trance".into(), "w4:p2".into()),
+                ("trance".into(), "w1:p1".into()),
+                // Neither: a pane herdr reports from one directory above every
+                // checkout, which is the commonest pane there is.
+                ("no project".into(), "w6:p1".into()),
+                ("no project".into(), "w3:p1".into()),
+                ("wsp".into(), "w5:p2".into()),
+            ],
+            "every agent under the heading that places it",
+        );
+
+        // The heading says it, so the row does not say it again — the width
+        // that word cost is the pane's name, which is what the row is for.
+        let names: Vec<String> =
+            (0..ui.rows_for_test()).map(|i| panel::render_row_for_test(&ui, i, W).text()).collect();
+        let row = names.iter().find(|l| l.contains("Trance Video")).expect("w1:p1's row");
+        assert!(!row.contains("trance"), "the project twice over: {row}");
+    }
+
     /// herdr says `idle` for four of the panes in the fixture and means four
     /// different things by it. Which one comes from the task in the agent's
     /// hands, which is the half of the answer the store is holding.
@@ -1368,8 +1443,11 @@ mod tests {
         assert!(row("Trance Video").contains(panel::glyph::WORKING));
 
         // What wants you is at the top, because that is what the list is read
-        // for. Sorted by state, so the first row is never a working agent.
-        assert!(lines[0].contains(panel::glyph::NEEDS_YOU), "{}", lines[0]);
+        // for. Sorted by state, so the first agent is never a working one —
+        // and grouping does not change that: the project whose agent is asking
+        // is the project the list opens on.
+        assert!(lines[0].contains("verb"), "the heading over it: {}", lines[0]);
+        assert!(lines[1].contains(panel::glyph::NEEDS_YOU), "{}", lines[1]);
     }
 
     /// The strip is the census, not a summary of whatever the tree is showing.
@@ -1409,13 +1487,45 @@ mod tests {
     fn clicking_an_agents_own_lines_selects_the_agent() {
         let w = world();
         let (mut ui, mut view) = showing(&w, &[Key::Char('w')]);
-        // The first agent's second line, two screen rows under the header.
-        let head = 2;
-        let detail = head + 1;
-        assert_eq!(panel::row_at(&ui, &view, W, H, detail), Some(1), "the line under the first");
-        assert_eq!(panel::click(&mut ui, &mut view, W, H, 2, detail, WORKING_HERE), panel::Hit::Select);
-        assert_eq!(ui.selected_index(), 0, "the agent it belongs to");
+        // The first agent — under its project's heading, which is why this is
+        // asked for rather than counted to.
+        let agent = ui.selected_index();
         assert_eq!(ui.selected_kind(), panel::RowKind::Agent);
+        let detail = screen_row(&ui, &view, agent + 1);
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 2, detail, WORKING_HERE), panel::Hit::Select);
+        assert_eq!(ui.selected_index(), agent, "the agent it belongs to");
+        assert_eq!(ui.selected_kind(), panel::RowKind::Agent);
+    }
+
+    /// And the heading over a run belongs to the agents *under* it. Walking up
+    /// the way an agent's own lines do would land on the last agent of the
+    /// group above — the one click on the panel that goes backwards, and the
+    /// row furthest from the words the pointer was on.
+    #[test]
+    fn clicking_a_project_heading_selects_the_first_agent_under_it() {
+        let w = world();
+        let (mut ui, mut view) = showing(&w, &[Key::Char('w')]);
+        // The second heading, so there is a group above it to be wrongly
+        // pulled back into.
+        let heading = (0..ui.rows_for_test())
+            .filter(|i| {
+                ui.select_for_test(*i);
+                ui.selected_kind() == panel::RowKind::Group
+            })
+            .nth(1)
+            .expect("the fixture has agents in more than one project");
+        let y = screen_row(&ui, &view, heading);
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 2, y, WORKING_HERE), panel::Hit::Select);
+        assert_eq!(ui.selected_index(), heading + 1, "the first agent of the run it heads");
+        assert_eq!(ui.selected_kind(), panel::RowKind::Agent);
+    }
+
+    /// Where a row is drawn, asked of the frame rather than counted from the
+    /// top — every row above it is free to change height or arrive.
+    fn screen_row(ui: &panel::Ui, view: &panel::View, row: usize) -> usize {
+        (0..H)
+            .find(|&y| panel::row_at(ui, view, W, H, y) == Some(row))
+            .unwrap_or_else(|| panic!("row {row} is not on the pane"))
     }
 
     /// The strip is a row of single columns, and each one is an agent. Nothing

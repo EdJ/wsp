@@ -942,7 +942,12 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         Key::Left | Key::Char('h') => move_or_fold(Key::Left, ui, view),
         Key::Right | Key::Char('l') => move_or_fold(Key::Right, ui, view),
         Key::Char('g') | Key::Home => {
+            // The first row that takes the cursor, which in the agents view is
+            // not the first line: a project heading stands over the first run.
             ui.sel = 0;
+            if !ui.rows.is_empty() && !ui.rows[0].selectable() {
+                ui.sel = super::keys::step(&ui.rows, 0, true);
+            }
             Effect::None
         }
         Key::Char('G') | Key::End => {

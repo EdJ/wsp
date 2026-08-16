@@ -962,9 +962,12 @@ pub(crate) fn click(
     match super::render::row_at(ui, view, w, h, y) {
         None => Hit::Nothing,
         // A line under an agent belongs to that agent: the click lands on the
-        // row it is written beneath, which is the row it is about.
+        // row it is written beneath, which is the row it is about. A group
+        // heading belongs to the run under it, so the pointer walks the other
+        // way — clicking `verb` and landing on the last agent of the group
+        // above it would be the one click on the panel that goes backwards.
         Some(i) if !ui.rows[i].selectable() => {
-            let owner = step(&ui.rows, i, false);
+            let owner = step(&ui.rows, i, matches!(ui.rows[i], Row::Group { .. }));
             if !ui.rows[owner].selectable() {
                 return Hit::Nothing;
             }

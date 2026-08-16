@@ -32,6 +32,11 @@ pub(super) const INBOX_KEY: &str = "(inbox)";
 
 pub(super) const NOPROJECT_KEY: &str = "(noproject)";
 
+/// What both surfaces call a pane that resolves to no project at all: the
+/// tree's group of shells, and the agents view's last heading. One string,
+/// because it is one fact and two words for it would read as two.
+pub(super) const NOPROJECT_LABEL: &str = "no project";
+
 /// The section pinned at the foot: the agents, whatever they are doing.
 pub(super) const AGENTS_KEY: &str = "(agents)";
 
@@ -154,7 +159,9 @@ impl AgentState {
 pub(super) struct Census {
     /// Where its work lives: the project of the task it holds, else the one it
     /// is standing in or pointed at. The tree says this by where it draws the
-    /// row; a flat list has to say it in words.
+    /// row, and the agents view by which heading the row is under — so there it
+    /// is what the runs are cut on, and the row itself carries `None`. The dock
+    /// has neither a branch nor a heading, and is where it is drawn in words.
     pub(super) project: Option<String>,
     /// The task in its hands, as the panel would draw it anywhere else.
     pub(super) task: Option<(Status, String)>,
@@ -280,6 +287,16 @@ pub(super) enum Row {
     /// because there is no branch above it doing either. In the tree it is
     /// `None` and the branch says both.
     Agent { agent: AgentRef, title: String, depth: usize, state: AgentState, census: Option<Census> },
+    /// The project a run of agents belongs to, in the agents view: the heading
+    /// the tree says by where it draws a row, and a list has to say in words.
+    ///
+    /// Like [`Row::Detail`] it never takes the cursor, and for the same reason
+    /// read the other way round: every row in that view leads to a terminal, so
+    /// `↵`, `c` and the digits mean something wherever you stand. A heading you
+    /// could land on would be the one row where none of the three did — which
+    /// is also why it does not fold. `Section` is the heading that does both,
+    /// and it is the tree's.
+    Group { project: Option<String>, n: usize },
     /// A line that belongs to the row above it. The cursor never lands on one
     /// and no digit addresses one: it is the second and third line of one
     /// agent, in the view that has the room to spend three lines on one.
@@ -437,10 +454,13 @@ pub(super) enum Detail {
 }
 
 impl Row {
-    /// Every row takes the cursor. A heading you cannot select is a heading you
-    /// cannot fold or add to, and both are things the groups need.
+    /// Every row in the tree takes the cursor: a heading you cannot select is a
+    /// heading you cannot fold or add to, and both are things the groups need.
+    /// The two exceptions are the agents view's, where a row that is not an
+    /// agent is a row three verbs have nothing to say about — an agent's own
+    /// lines, and the project heading over a run of them.
     pub(super) fn selectable(&self) -> bool {
-        !matches!(self, Row::Detail(_))
+        !matches!(self, Row::Detail(_) | Row::Group { .. })
     }
     /// The pane this row *is*. A task that has one is not it — the pane sits
     /// on its own row directly beneath, and letting both answer meant two
@@ -463,6 +483,9 @@ pub(crate) enum RowKind {
     More,
     Section,
     Agent,
+    /// A project heading over a run of agents in the agents view. Never
+    /// selected, like [`RowKind::Detail`].
+    Group,
     /// A line under an agent in the agents view. Never selected, so a driver
     /// that hunts for one has gone wrong.
     Detail,
@@ -606,7 +629,11 @@ pub(super) fn target_of(row: &Row) -> Target {
         Row::Section { key, .. } if key == AGENTS_KEY => Target::Unattached,
         Row::Section { key, .. } if key == INBOX_KEY => Target::Inbox,
         Row::Section { .. } => Target::Nothing,
-        Row::Detail(_) => Target::Nothing,
+        // Neither is ever the cursor's, so neither has anything to be aimed at.
+        // A group heading names a project and deliberately does not answer as
+        // one: `S`, `a` and `↵` on it would be verbs pressed on a row the
+        // cursor cannot reach.
+        Row::Group { .. } | Row::Detail(_) => Target::Nothing,
     }
 }
 
@@ -688,6 +715,7 @@ impl Ui {
             Some(Row::More { .. }) => RowKind::More,
             Some(Row::Section { .. }) => RowKind::Section,
             Some(Row::Agent { .. }) => RowKind::Agent,
+            Some(Row::Group { .. }) => RowKind::Group,
             Some(Row::Detail(_)) => RowKind::Detail,
             Some(Row::Flag { .. }) => RowKind::Flag,
             None => RowKind::Nothing,
@@ -1490,7 +1518,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         let folded = view.collapsed.contains(NOPROJECT_KEY);
         rows.push(Row::Section {
             key: NOPROJECT_KEY.to_string(),
-            label: "no project".into(),
+            label: NOPROJECT_LABEL.into(),
             count: homeless.len(),
             collapsed: folded,
         });
@@ -1513,29 +1541,50 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // away. `w` gives the same list the whole pane and three lines each: the
     // difference is how much room there is to say it in, not what is being
     // said.
+    //
+    // Given the whole pane it is also given headings. Seven agents is a list
+    // you read; twenty is one you scan for the two that are yours, and the
+    // project each one is standing in was a word on the right of every row —
+    // the same word repeated down a column, in the place a row is least read.
+    // As a heading it is read once, and the run beneath it is the answer to
+    // "who is on this project" without anybody counting.
     let (rows, dock) = if view.agents {
         let mut list: Vec<Row> = Vec::new();
-        for (state, c, a) in census.iter() {
-            list.push(Row::Agent {
-                title: a.where_.clone(),
-                agent: a.clone(),
-                depth: 0,
-                state: *state,
-                census: Some(c.clone()),
-            });
-            list.push(Row::Detail(Detail::Standing {
-                state: *state,
-                pane: a.pane.clone(),
-                held: c.held.clone(),
-                // Only when it differs from where the row already says it is:
-                // a mandate that agrees with the cwd is not news.
-                direction: a.project.clone().filter(|d| Some(d) != c.project.as_ref()),
-            }));
-            if let Some((status, title)) = &c.task {
-                list.push(Row::Detail(Detail::Holding {
-                    status: *status,
-                    title: title.clone(),
+        for (project, group) in by_project(&census) {
+            list.push(Row::Group { project: project.clone(), n: group.len() });
+            for i in group {
+                let (state, c, a) = &census[i];
+                list.push(Row::Agent {
+                    title: a.where_.clone(),
+                    agent: a.clone(),
+                    depth: 1,
+                    state: *state,
+                    census: Some(Census {
+                        // The heading over the run says which project this is,
+                        // so the row saying it again would be the same word
+                        // down every line of the group — and it is the width
+                        // the pane's name is short of. The dock's rows keep it:
+                        // there is no heading over those.
+                        project: None,
+                        ..c.clone()
+                    }),
+                });
+                list.push(Row::Detail(Detail::Standing {
+                    state: *state,
+                    pane: a.pane.clone(),
+                    held: c.held.clone(),
+                    // Only when it differs from where the row already says it
+                    // is: a mandate that agrees with the cwd is not news. Read
+                    // against the group's project rather than the row's, which
+                    // is now blank for the heading's sake.
+                    direction: a.project.clone().filter(|d| Some(d) != c.project.as_ref()),
                 }));
+                if let Some((status, title)) = &c.task {
+                    list.push(Row::Detail(Detail::Holding {
+                        status: *status,
+                        title: title.clone(),
+                    }));
+                }
             }
         }
         // No dock: every agent is already here, and pinning five of them to the
@@ -1621,6 +1670,38 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         show_done: view.show_done,
         review_only: view.review_only,
     }
+}
+
+/// The census in runs, one per project: the heading, and which agents stand
+/// under it, by their place in `census`.
+///
+/// The groups are ordered by whoever in each of them most wants you, and only
+/// then by name. The list is read from the top for who has stopped, and a
+/// heading is no reason to put an agent asking for an answer below three that
+/// are working — grouping is meant to say where an agent belongs, not to
+/// reorder who needs looking at first. Ties break on the name, with the ones
+/// belonging nowhere last: `no project` is where a pane lands when nothing
+/// could be worked out about it, which is the least you can say about one.
+///
+/// Within a run the census's own order stands, so an agent is in the same place
+/// relative to its neighbours here as it is in the strip and the dock.
+fn by_project(census: &[(AgentState, Census, AgentRef)]) -> Vec<(Option<String>, Vec<usize>)> {
+    let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+    for (i, (_, c, _)) in census.iter().enumerate() {
+        match groups.iter_mut().find(|(p, _)| *p == c.project) {
+            Some((_, xs)) => xs.push(i),
+            None => groups.push((c.project.clone(), vec![i])),
+        }
+    }
+    // `xs[0]` is the group's most urgent because the census is already sorted
+    // by state — the same order this preserves inside each run.
+    groups.sort_by(|(ap, ax), (bp, bx)| {
+        let key = |p: &Option<String>, xs: &[usize]| {
+            (census[xs[0]].0, p.is_none(), p.clone().unwrap_or_default())
+        };
+        key(ap, ax).cmp(&key(bp, bx))
+    });
+    groups
 }
 
 /// The flags, newest first — the order the section draws them in and the order
@@ -1879,6 +1960,25 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
+        // A heading rather than a section: no caret, because there is nothing
+        // to fold — the agents view is the census, and a census with a run of
+        // it folded away is a count you cannot trust. Unindented, with the run
+        // beneath it stepped in one, so the shape says which is which before
+        // any word is read.
+        Row::Group { project, n } => {
+            l.push(Style::Plain, " ");
+            let right = line(Style::Dim, n.to_string());
+            let avail = w.saturating_sub(right.width() + 2).max(4);
+            match project {
+                Some(p) => l.push(Style::Bold, util::truncate(p, avail)),
+                // The words the tree's own group of homeless panes uses. Two
+                // names for a pane that resolves nowhere would read as two
+                // kinds of pane.
+                None => l.push(Style::Muted, util::truncate(NOPROJECT_LABEL, avail)),
+            }
+            l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+            l.spans.extend(right.spans);
+        }
         Row::Agent { agent, title, depth, state, census } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
@@ -1919,7 +2019,10 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
         // is the row above, said at length, and it must not compete with the
         // rows the cursor can actually land on.
         Row::Detail(Detail::Standing { state, pane, held, direction }) => {
-            l.pad(4);
+            // Five, which is where the name of the agent this belongs to
+            // starts: the digit, the group's indent, the mark and the spaces
+            // either side of it.
+            l.pad(5);
             let (st, _) = state.mark();
             l.push(st, word(*state));
             l.push(Style::Dim, format!(" · {pane}"));
@@ -1933,11 +2036,11 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             }
         }
         Row::Detail(Detail::Holding { status, title }) => {
-            l.pad(4);
+            l.pad(5);
             let (st, g) = status_mark(*status);
             l.push(st, g);
             l.push(Style::Plain, " ");
-            l.push(Style::Muted, util::truncate(title, w.saturating_sub(7).max(4)));
+            l.push(Style::Muted, util::truncate(title, w.saturating_sub(8).max(4)));
         }
         // The sentence first, because the sentence is the news. The task's own
         // title is one row up in the tree with a `▲` on it, and the pane that
@@ -1979,6 +2082,11 @@ pub(super) fn full_text(row: &Row) -> String {
         Row::Task { title, .. } => title.clone(),
         Row::More { n, .. } => format!("{n} more"),
         Row::Section { label, .. } => label.clone(),
+        // Never selected, so never asked for — answered in its own words for
+        // the same reason a detail line is.
+        Row::Group { project, .. } => {
+            project.clone().unwrap_or_else(|| NOPROJECT_LABEL.to_string())
+        }
         // Both halves, and the title as well: the row draws the sentence and
         // cuts it at a pane's width, and `F` is where the whole of a raised
         // hand is read — which task, what was said, and who said it.
