@@ -116,13 +116,11 @@ pub(super) fn spawn_input(tx: Sender<Msg>) {
 /// cannot be: it is per-pane and its request requires a `pane_id`, so asking
 /// for it globally refuses the whole list — see the note in [`crate::herdr`].
 ///
-/// An agent *finishing* belongs in this list too and is not in it, because
-/// there is no event that means it. It is recovered instead: see
-/// [`status_changed`], which promotes the one `pane.updated` in a hundred that
-/// carries a status the pane did not have before. An agent appearing was
-/// immediate on every panel on the machine while an agent stopping waited up to
-/// thirty seconds on all but the focused one — and "who has stopped, and who is
-/// free" is the question the census exists to answer.
+/// An agent *finishing* belongs in this list too and cannot be in it, because
+/// no event means it and none can. [`status_changed`] recovers what it can by
+/// promoting the one `pane.updated` in a hundred that carries a status the pane
+/// did not have before, and that is worth having — but it is not a guarantee,
+/// and [`STATUS_POLL`] says why and covers the rest.
 const SHAPE: &[&str] = &[
     "workspace.created",
     "workspace.closed",
@@ -147,6 +145,47 @@ const SHAPE: &[&str] = &[
 /// status the pane did not have before is promoted to structural by
 /// [`status_changed`], and the other ninety-nine go on being coalesced.
 const CHATTY: &[&str] = &["workspace.focused", "workspace.renamed", "pane.updated"];
+
+/// How often an unfocused panel asks herdr, itself, who has stopped.
+///
+/// Nothing pushes agent status to herdr. The hook it installs —
+/// `~/.claude/hooks/herdr-agent-state.sh` — exits without a word for every
+/// action but `session`, and the one message it does send is
+/// `pane.report_agent_session`, carrying a session id and a transcript path. It
+/// goes out of its way to drop `SubagentStop`. herdr classifies from that
+/// transcript: `pane.list` reports `agent_session {kind: "id", value: <uuid>}`
+/// per pane, and `blocked` is among the statuses, which nothing reading a PTY
+/// could know.
+///
+/// That is the whole asymmetry. An agent *starting* is an edge — a write to a
+/// file — so a filesystem notification can carry it at once, and does: measured
+/// against the live server, 0.2s. An agent *finishing* is the **absence** of
+/// writes for some quiet interval, and nothing fires on the passing of time.
+/// Worse, the last write to the transcript is the agent's closing message,
+/// which still looks like work. Only a timer can see a finish, and herdr's runs
+/// on its own schedule: the event carrying one came 6.8s late once and 28.9s
+/// late once, with 147s of unbroken silence on the stream across the second.
+///
+/// `pane.list` evaluates the same rule when it is asked, so it sees the absence
+/// for free. That makes it not the fresher of two channels but the *only* one
+/// that can report a finish on time — and a panel that waits for the event
+/// instead is the half-minute of staleness that reads as broken from a chair.
+///
+/// Hence a poll, and one this side of human patience. It is far cheaper than
+/// the refetch it guards: one socket call, where a refetch also reads the whole
+/// store off disk and rebuilds every row. Only unfocused panels run it, because
+/// a focused one already refetches four times a second.
+const STATUS_POLL: Duration = Duration::from_secs(3);
+
+/// Has any pane changed the status the frame was drawn with?
+///
+/// The poll-side twin of [`status_changed`], and it keeps the same rule for the
+/// same reason: only panes in both are compared. A pane arriving or leaving is
+/// structural, [`SHAPE`] already refetches on it at once, and counting it here
+/// as well would refetch twice for one event.
+fn status_moved(drawn: &HashMap<String, String>, now: &[herdr::Pane]) -> bool {
+    now.iter().any(|p| drawn.get(&p.pane_id).is_some_and(|was| was != &p.agent_status))
+}
 
 /// Subscriptions herdr scopes to a single pane. Its request struct for these
 /// requires a `pane_id`, and there is no wildcard — `*` and `""` both answer
@@ -435,6 +474,10 @@ pub(super) fn event_loop(
     // on the first of a burst and not on the ninety after it.
     let mut took_focus = Instant::now() - Duration::from_secs(60);
     let mut last_fingerprint = store.fingerprint();
+    // The status the frame in front of the reader was drawn with, and when we
+    // last asked herdr whether it still holds. See [`STATUS_POLL`].
+    let mut drawn_status: HashMap<String, String> = HashMap::new();
+    let mut last_poll = Instant::now();
     // Messages taken off the channel while coalescing a burst of herdr events,
     // to be handled in the order they arrived rather than thrown away.
     let mut carry: std::collections::VecDeque<Msg> = Default::default();
@@ -713,6 +756,24 @@ pub(super) fn event_loop(
                 refetch = true;
             }
             Msg::Tick => {
+                // Ask the one question the event stream cannot answer, and only
+                // where it goes unanswered: an unfocused panel, between its full
+                // refetches. A status that has moved is news of exactly the kind
+                // [`SHAPE`] exists for, so it refetches now rather than waiting
+                // out the rest of the thirty seconds.
+                //
+                // An empty list is herdr not answering, not everybody finishing
+                // at once — `panes()` degrades to empty the same way
+                // [`Snapshot::live`] does, and reading that as news would clear
+                // the dock every time the socket hiccuped.
+                if !ui.self_focused && last_poll.elapsed() >= STATUS_POLL {
+                    last_poll = Instant::now();
+                    let now = herdr::panes().unwrap_or_default();
+                    if !now.is_empty() && status_moved(&drawn_status, &now) {
+                        refetch = true;
+                        dirty = false;
+                    }
+                }
                 // The one you are looking at should feel immediate; the twenty
                 // behind it should cost nothing. Both the fingerprint stat and
                 // the two socket calls sit behind this gate, so an idle
@@ -754,6 +815,13 @@ pub(super) fn event_loop(
             // Free: the panes were fetched for the frame either way, and this is
             // the same list herdr answers "who has the keyboard" out of.
             keyboard = holds_keyboard(&snap, me.as_deref());
+            // Likewise free, and it has to be taken from the same list the frame
+            // is drawn from: the poll asks whether herdr has moved on from what
+            // the reader is looking at, so what the reader is looking at is what
+            // it must be compared against.
+            drawn_status.clear();
+            drawn_status
+                .extend(snap.panes.iter().map(|p| (p.pane_id.clone(), p.agent_status.clone())));
             refetch_into(&mut ui, &snap, &mut view, self_ws);
             if point_at(&mut ui, &want) {
                 want = Cursor::default();
@@ -911,6 +979,52 @@ mod tests {
         // Nor is an event that carries no pane at all — `workspace.focused`
         // goes through the same reducer.
         assert!(!status_changed(&mut seen, &json!({ "workspace_id": "w1" })));
+    }
+
+    /// The other half of the same asymmetry, and the half that has no event at
+    /// all behind it.
+    ///
+    /// herdr is never told an agent's status — it classifies from the
+    /// transcript the hook reports — so a finish is the *absence* of writes to
+    /// a file, and nothing fires on the passing of time. Measured against the
+    /// live server, the `pane.updated` carrying a finish arrived 6.8s late
+    /// once and 28.9s late once, with 147s of silence on the stream across the
+    /// second. `pane.list` reads the same rule when asked and so has it at
+    /// once. That is what this poll is for; see [`STATUS_POLL`].
+    #[test]
+    fn a_finish_that_never_reached_the_stream_is_still_found_by_asking() {
+        let census = |panes: &[(&str, &str)]| {
+            panes
+                .iter()
+                .map(|(id, status)| herdr::Pane {
+                    pane_id: (*id).to_string(),
+                    agent_status: (*status).to_string(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let drawn: HashMap<String, String> = [("w0:p3", "working"), ("w1:p6", "idle")]
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+
+        // The frame still says what herdr says. Nothing to do, and this is the
+        // answer on all but a few polls a minute.
+        assert!(!status_moved(&drawn, &census(&[("w0:p3", "working"), ("w1:p6", "idle")])));
+
+        // The one the event stream lost: an agent that stopped while the panel
+        // was not being looked at.
+        assert!(status_moved(&drawn, &census(&[("w0:p3", "done"), ("w1:p6", "idle")])));
+        // And the same fact from the other side.
+        assert!(status_moved(&drawn, &census(&[("w0:p3", "working"), ("w1:p6", "working")])));
+
+        // A pane the frame has never drawn is structural, and `SHAPE` has
+        // already refetched on it. Counting it here refetches twice for one
+        // event.
+        assert!(!status_moved(&drawn, &census(&[("w2:p1", "working")])));
+        // A pane that has gone likewise: it is absent from the census, which
+        // is not a status that moved.
+        assert!(!status_moved(&drawn, &census(&[("w0:p3", "working")])));
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
