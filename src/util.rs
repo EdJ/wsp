@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The store we are talking to, as environment for anything we spawn.
+/// The instance we are talking to, as environment for anything we spawn.
 ///
 /// A pane, tab or workspace herdr creates starts a fresh shell, which inherits
 /// nothing from us — so a panel pointed at a non-default store would open
@@ -11,14 +11,53 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// and take the tab down with them, which looks exactly like the key not
 /// working. An agent spawned onto a task has the same problem and a longer
 /// fuse: it would sit in a tree reading the wrong backlog.
+///
+/// `WSP_BIN` joins them on the same argument: it is what `herdr-plugin/run.sh`
+/// checks before `~/.local/bin/wsp`, so a pane opened by a wsp under test
+/// should run the binary under test rather than whatever is installed. Nothing
+/// but `wsp sandbox` sets it.
+///
+/// The socket is the exception, and carrying it unconditionally was a bug.
+/// `HERDR_SOCKET_PATH` is set in *every* live herdr pane — herdr puts it there
+/// itself, which is also why propagating it is pointless for an ordinary spawn:
+/// whichever herdr creates the workspace tells its panes where it is. What it
+/// is not is portable. `open_workspace` sends this map to `workspace.create` on
+/// whichever machine the workspace is being made on, so an ordinary `wsp spawn
+/// --on <machine>` would bake *this* machine's socket path into a workspace on
+/// the executor — working by accident for as long as the two home layouts
+/// match, failing silently the moment a username differs, and contradicting the
+/// qualify-and-route design the whole executor stack rests on.
+///
+/// So it goes only where it means something: a sandbox, where the socket is the
+/// entire point and a workspace whose panes talked to the live server would be
+/// half of each instance. `WSP_BIN` is the marker, being the one variable
+/// nothing but a sandbox sets.
 pub fn store_env() -> serde_json::Map<String, serde_json::Value> {
+    store_env_from(|k| std::env::var(k).ok())
+}
+
+/// The same, against any environment. Taking the lookup as an argument is what
+/// makes the rule above testable: the claim that was wrong is a claim about
+/// which variables are set, and a test that had to set them process-wide to
+/// check it would be a test that cannot be trusted to run beside another.
+fn store_env_from(
+    get: impl Fn(&str) -> Option<String>,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut env = serde_json::Map::new();
-    for key in ["WSP_HOME", "WSP_STATE", "WSP_NO_COMMIT"] {
-        if let Ok(v) = std::env::var(key) {
+    let mut carry = |key: &str| {
+        if let Some(v) = get(key) {
             if !v.is_empty() {
                 env.insert(key.to_string(), serde_json::Value::String(v));
+                return true;
             }
         }
+        false
+    };
+    for key in ["WSP_HOME", "WSP_STATE", "WSP_NO_COMMIT"] {
+        carry(key);
+    }
+    if carry("WSP_BIN") {
+        carry("HERDR_SOCKET_PATH");
     }
     env
 }
@@ -410,6 +449,44 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    /// The premise this was first written on was false: `HERDR_SOCKET_PATH` is
+    /// not "unset outside a sandbox", it is set in *every* live herdr pane. So
+    /// carrying it unconditionally put this machine's socket path into the env
+    /// of a workspace created on another machine by `wsp spawn --on <machine>`
+    /// — which works by accident while two home layouts match and fails
+    /// silently when a username differs. The rule is that the socket travels
+    /// only with `WSP_BIN`, which nothing but `wsp sandbox` sets, and this is
+    /// the claim worth pinning rather than the code that implements it.
+    #[test]
+    fn the_socket_travels_only_inside_a_sandbox() {
+        let live = |k: &str| match k {
+            "WSP_HOME" => Some("/Users/edjames/wsp".to_string()),
+            "WSP_STATE" => Some("/Users/edjames/.local/state/wsp".to_string()),
+            // Set in every pane herdr makes, which is the whole point.
+            "HERDR_SOCKET_PATH" => Some("/Users/edjames/.config/herdr/herdr.sock".to_string()),
+            _ => None,
+        };
+        let env = store_env_from(live);
+        assert!(
+            !env.contains_key("HERDR_SOCKET_PATH"),
+            "a spawn from a live pane would carry this machine's socket to another machine: {env:?}"
+        );
+        assert_eq!(env.get("WSP_HOME").and_then(|v| v.as_str()), Some("/Users/edjames/wsp"));
+
+        // …and inside a sandbox it is the one thing that must travel, or the
+        // workspace comes up with its panes on the live server.
+        let sandboxed = |k: &str| match k {
+            "WSP_BIN" => Some("/Users/edjames/claude/wsp/target/debug/wsp".to_string()),
+            other => live(other),
+        };
+        let env = store_env_from(sandboxed);
+        assert_eq!(
+            env.get("HERDR_SOCKET_PATH").and_then(|v| v.as_str()),
+            Some("/Users/edjames/.config/herdr/herdr.sock"),
+            "a sandbox spawned a workspace that could not find its own herdr"
+        );
+    }
 
     fn write_at(path: &Path, body: &str, at: SystemTime) {
         fs::write(path, body).unwrap();

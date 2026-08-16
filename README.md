@@ -2014,6 +2014,66 @@ What it does not do is commit. Steps 1, 2 and 4 are still yours, and the
 `read-tree` immediately before the commit is still the one that stops a silent
 revert.
 
+### `wsp sandbox`, because a build is not a run
+
+`verify` isolates the build. It does nothing for the verbs that *write* —
+`sync`, `reconcile --reap`, `adopt`, `spawn`, the panel's keys — because those
+talk to the one herdr everybody is standing in and the one store everybody's
+claims are in. Testing them live is how an agent ends another agent's claim
+while checking that reaping works.
+
+`wsp sandbox` needs no new mechanism: the three variables wsp has always read,
+and a herdr feature we had not noticed.
+
+```sh
+herdr --session <name> server
+```
+
+brings up a second headless server under `~/.config/herdr/sessions/<name>/`
+with its own socket and log, beside the running one and without disturbing it.
+With `WSP_HOME` and `WSP_STATE` that is a complete instance: own herdr, own
+store, own state. Proved on 2026-08-16 with four agents in this checkout — a
+session came up in 0.1s, `wsp reconcile --reap` ran against it, and
+`claims.json` and `bindings.json` were byte-identical before and after.
+
+```sh
+wsp sandbox                       # up; prints the exports and how to attach
+wsp sandbox --seed                # …with the live store's projects and tasks in it
+wsp sandbox --run "wsp reconcile --reap && wsp wip"   # one thing, then torn down
+wsp sandbox --run "…" --keep      # …and left up to look at
+wsp sandbox ls | wsp sandbox rm [--all]
+```
+
+Two things make the difference between it working and it quietly not.
+
+**`wsp` inside a sandbox is the binary under test.** The rule is to run the
+built binary by path and never `~/.local/bin/wsp` — the install is one file that
+every panel, every detail pane and the daemon re-execs into, and making it a
+step in testing something puts everyone else's live session downstream of your
+experiment. Remembering to type `target/debug/wsp` is exactly the sort of rule
+that gets followed for a day, so the sandbox holds a `bin/wsp` symlink at
+whichever binary invoked it and puts that directory first on `PATH`. `WSP_BIN`
+is exported at the same binary, which is what `herdr-plugin/run.sh` checks
+before `~/.local/bin/wsp`.
+
+**It tears the session down.** A cleanup step at the end of a long piece of work
+is a step that gets abandoned when something more interesting happens — `git
+worktree list` held four stale trees on the day this was written, and an
+abandoned herdr session is a worse version of the same thing, because it is a
+process. `--run` stops and deletes it whatever the command exited with; `ls`
+shows both halves of a half-torn-down one, a directory whose session is gone and
+a session whose directory is; and asking for a sandbox that already exists
+replaces it rather than quietly handing back whatever state the last run left.
+
+The herdr it brings up is empty, and manufacturing twenty-two workspaces is not
+something this can do. `--seed` copies the store — projects and tasks, so `ls`,
+`tree`, `show` and the panel have something to draw — and deliberately not the
+machine state, because a claim names a workspace id that exists in nobody's
+herdr but the live one. The one mitigating fact about plugins, which are global
+rather than per-session: a *headless* session loads none at all, verified twice,
+so a sandbox is clean while it stays headless. Attaching a TUI to one is the
+untested case.
+
 ### What none of it fixes
 
 Every rule above reduces the chance of taking someone's work; none removes it,

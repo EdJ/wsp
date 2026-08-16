@@ -112,7 +112,10 @@ fn toplevel(dir: &Path) -> Option<PathBuf> {
 /// changed identity on every restart would be a cold build on every restart.
 /// Outside herdr there is no workspace, and `solo` is honest: one shell at a
 /// terminal gets one tree and shares it with the next.
-fn agent_key() -> String {
+/// `wsp sandbox` keys its instance the same way, deliberately: an agent's build
+/// tree and its sandbox are the same pair of scratch things, and one name for
+/// both means `verify` and `sandbox` cannot disagree about whose they are.
+pub fn agent_key() -> String {
     if let Ok(v) = std::env::var("WSP_AGENT") {
         if !v.trim().is_empty() {
             return util::slugify(v.trim());

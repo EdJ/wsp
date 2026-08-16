@@ -8,11 +8,15 @@ use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
 
-pub fn init(store: &Store, args: &Args) -> i32 {
-    if let Err(e) = store.ensure_dirs() {
-        eprintln!("wsp: cannot create {}: {e}", util::contract(&store.root));
-        return 1;
-    }
+/// What a store *is* when it is new, without saying so.
+///
+/// `wsp init` is the command; `wsp sandbox` needs the same store made somewhere
+/// else and has its own thing to print. A sandbox whose store differed from a
+/// real one in any particular would be answering a question about itself rather
+/// than about wsp, so there is one implementation of "new store" and both call
+/// it.
+pub fn init_store(store: &Store) -> std::io::Result<()> {
+    store.ensure_dirs()?;
     store.git_init();
 
     let readme = store.root.join("README.md");
@@ -23,12 +27,19 @@ pub fn init(store: &Store, args: &Args) -> i32 {
              Mutate through the `wsp` CLI — it owns id allocation, atomic writes and commits.\n",
         );
     }
-    let hooks = store.root.join("hooks");
-    let _ = std::fs::create_dir_all(&hooks);
+    let _ = std::fs::create_dir_all(store.root.join("hooks"));
 
     // The whole store, and the one command entitled to it: what `init` is
     // about is the store itself, not a file in it.
     store.git_commit_all("wsp: init store");
+    Ok(())
+}
+
+pub fn init(store: &Store, args: &Args) -> i32 {
+    if let Err(e) = init_store(store) {
+        eprintln!("wsp: cannot create {}: {e}", util::contract(&store.root));
+        return 1;
+    }
 
     if args.json() {
         println!("{}", json!({ "root": util::contract(&store.root), "state": util::contract(&store.state) }));

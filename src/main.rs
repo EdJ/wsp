@@ -12,6 +12,7 @@ mod cmd_brief;
 mod cmd_machine;
 mod cmd_mandate;
 mod cmd_project;
+mod cmd_sandbox;
 mod cmd_spawn;
 mod cmd_task;
 mod cmd_verify;
@@ -40,6 +41,8 @@ const BOOL_FLAGS: &[&str] = &[
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm",
+    // Same for `sandbox`, whose positional is a sandbox name.
+    "keep", "seed",
 ];
 
 pub struct Args {
@@ -277,6 +280,7 @@ fn main() {
         "brief" => cmd_brief::brief(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
+        "sandbox" => cmd_sandbox::sandbox(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "spawn" => cmd_spawn::spawn(&store, &args),
         "machine" | "machines" => cmd_machine::dispatch(&store, &args),
@@ -367,6 +371,11 @@ fn help() {
                                     build and test your change in a tree of your
                                     own, at HEAD — the only build whose result
                                     means anything while somebody else is here
+  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own herdr session,
+                                    store and state — and the exports to use it;
+                                    inside it `wsp` is the binary you ran
+  wsp sandbox --run "cmd" [--keep]  …or run one thing in it and take it down
+  wsp sandbox ls|rm [<name>] [--all]  what is up, and how to drop it
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
                                     open a workspace on it, claim it there, and
