@@ -1102,6 +1102,12 @@ mod tests {
         assert_eq!(panel::row_at(&ui, &view, W, H, 3), Some(1));
     }
 
+    /// The keyboard is in this pane, which is the state every click below is
+    /// about unless it says otherwise. On a pane nobody is working in a click
+    /// means one thing and only that — see
+    /// [`a_click_on_a_pane_nobody_is_working_in_only_goes_there`].
+    const WORKING_HERE: bool = true;
+
     /// Drive the panel the way a person would and hand back what it is
     /// showing: the reducer, then the rebuild the live loop does for it.
     fn showing(snap: &Snapshot, keys: &[Key]) -> (panel::Ui, panel::View) {
@@ -1229,7 +1235,7 @@ mod tests {
         let head = 2;
         let detail = head + 1;
         assert_eq!(panel::row_at(&ui, &view, W, H, detail), Some(1), "the line under the first");
-        assert_eq!(panel::click(&mut ui, &mut view, W, H, 2, detail), panel::Hit::Select);
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 2, detail, WORKING_HERE), panel::Hit::Select);
         assert_eq!(ui.selected_index(), 0, "the agent it belongs to");
         assert_eq!(ui.selected_kind(), panel::RowKind::Agent);
     }
@@ -1245,15 +1251,15 @@ mod tests {
 
         // Column by column, against the census the strip was drawn from.
         for (i, (_, agent)) in ui.census_for_test().into_iter().enumerate() {
-            let hit = panel::click(&mut ui, &mut view, W, H, 4 + i, 0);
+            let hit = panel::click(&mut ui, &mut view, W, H, 4 + i, 0, WORKING_HERE);
             match hit {
                 panel::Hit::Focus(a) => assert_eq!(a.pane(), agent.pane(), "mark {i}"),
                 other => panic!("mark {i} should go to a terminal, got {other:?}"),
             }
         }
         // The name is not a mark, and neither is the gap before the total.
-        assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, 0), panel::Hit::Nothing);
-        assert_eq!(panel::click(&mut ui, &mut view, W, H, W - 1, 0), panel::Hit::Nothing);
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, 0, WORKING_HERE), panel::Hit::Nothing);
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, W - 1, 0, WORKING_HERE), panel::Hit::Nothing);
         // And clicking one does not move the cursor: there is no row to move to.
         assert_eq!(ui.selected_index(), 0);
     }
@@ -1270,7 +1276,61 @@ mod tests {
         let clipped = panel::frame(&ui, &mut view, narrow, H)[0].text();
         assert!(clipped.contains(panel::glyph::MORE), "{clipped}");
         let at = clipped.chars().position(|c| c.to_string() == panel::glyph::MORE).unwrap();
-        assert_eq!(panel::click(&mut ui, &mut view, narrow, H, at, 0), panel::Hit::Rest);
+        assert_eq!(panel::click(&mut ui, &mut view, narrow, H, at, 0, WORKING_HERE), panel::Hit::Rest);
+    }
+
+    /// Ed: "clicks should only perform their action if the pane was already
+    /// focused, to avoid bouncing when clicking on an agent when the pane is
+    /// unfocused but the agent is selected".
+    ///
+    /// The mouse reaches a pane the keyboard is not in — that is what makes the
+    /// panel worth pointing at — and the panel answers a click by taking the
+    /// keyboard. Acting as well is the bounce: point at the agent the cursor is
+    /// already on, which is the one you have been watching and is why the cursor
+    /// is there, and the click means `↵`. So focus arrives here and leaves again
+    /// for that agent's terminal in the same gesture, and you are somewhere you
+    /// did not decide to be, by way of a pane you were only looking at.
+    ///
+    /// Every shape of click is the same rule, and it has to be: which of them a
+    /// pixel is depends on what the cursor is on and what is drawn under the
+    /// pointer, so a panel that swallowed only the ones that jump would be one
+    /// you had to read before you could predict your own first click.
+    #[test]
+    fn a_click_on_a_pane_nobody_is_working_in_only_goes_there() {
+        let w = world();
+        let nobody = false;
+
+        // The agents view, cursor on the first of them: the case in the report.
+        let (mut ui, mut view) = showing(&w, &[Key::Char('w')]);
+        let on = ui.selected_index();
+        let y = (0..H)
+            .find(|&y| panel::row_at(&ui, &view, W, H, y) == Some(on))
+            .expect("the selected row is on the pane");
+
+        // With the keyboard here it is `↵` on that agent, which goes to its
+        // terminal. That is the half of the gesture worth avoiding twice over.
+        let (mut spare, mut spare_view) = (ui.clone(), view.clone());
+        assert_eq!(
+            panel::click(&mut spare, &mut spare_view, W, H, 0, y, WORKING_HERE),
+            panel::Hit::Activate,
+        );
+
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, y, nobody), panel::Hit::Keyboard);
+        assert_eq!(ui.selected_index(), on, "and the cursor stayed where it was");
+        // And the click after it, which now has the keyboard, means what it says.
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, y, WORKING_HERE), panel::Hit::Activate);
+
+        // A mark in the strip is one click to another terminal, so it is the
+        // same jump by a shorter route; a row the cursor is not on would only
+        // select, and does not do even that.
+        let (mut ui, mut view) = showing(&w, &[]);
+        let sel = ui.selected_index();
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 4, 0, nobody), panel::Hit::Keyboard);
+        let other = (0..H)
+            .find(|&y| matches!(panel::row_at(&ui, &view, W, H, y), Some(i) if i != sel))
+            .expect("a row the cursor is not on");
+        assert_eq!(panel::click(&mut ui, &mut view, W, H, 0, other, nobody), panel::Hit::Keyboard);
+        assert_eq!(ui.selected_index(), sel, "nothing under the pointer was read at all");
     }
 
     /// The section keeps a few on screen and says how many there are, so the
@@ -1518,7 +1578,10 @@ mod tests {
                 continue;
             }
             let (mut after_ui, mut after_view) = (ui.clone(), view.clone());
-            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, 0, y), panel::Hit::Select);
+            let at = |ui: &mut panel::Ui, view: &mut panel::View| {
+                panel::click(ui, view, W, H, 0, y, WORKING_HERE)
+            };
+            assert_eq!(at(&mut after_ui, &mut after_view), panel::Hit::Select);
             assert_eq!(
                 panel::row_at(&after_ui, &after_view, W, H, y),
                 Some(i),
@@ -1526,7 +1589,7 @@ mod tests {
             );
             // And the row it selected is the row that was clicked, so the
             // second click activates rather than selecting something else.
-            assert_eq!(panel::click(&mut after_ui, &mut after_view, W, H, 0, y), panel::Hit::Activate);
+            assert_eq!(at(&mut after_ui, &mut after_view), panel::Hit::Activate);
         }
     }
 

@@ -147,7 +147,9 @@ there are.
 the select-then-activate a row gets: a mark is a single column with nothing to
 read on the way, and the `←` you are reaching for is the one you have already
 decided to answer. Clicking the `⋯` of a clipped strip opens the agents view,
-which is what the rest of them are.
+which is what the rest of them are. One click from a panel you are working in,
+that is: the first click on a panel you are not brings the keyboard here and
+does nothing else — see *How the tree scrolls*, below.
 
 Beneath the tree, under a rule of its own, the first five agents are pinned in
 that same order: who has stopped and who is free is the question you ask between
@@ -234,6 +236,18 @@ the view comes back to it, and carries on from there.
 
 A click moves the cursor and never the view: a pointer is owed the row staying
 exactly where it was clicked, which is the one case that gets no lookahead.
+
+A click on a panel nobody is working in does none of that, and brings the
+keyboard here instead. The mouse reaches an unfocused pane — that is what makes
+the panel worth pointing at — and the panel answers by taking focus, so a click
+that acted as well would be two gestures at once. Point at the agent the cursor
+is already on, which is the one you have been watching and is why the cursor is
+there, and the click means `↵`: focus arrives here and leaves again for that
+agent's terminal in the same movement, and you are somewhere you did not decide
+to be by way of a pane you were only looking at. So the first click says where
+you are working and the one after it means what it says. The wheel is not gated
+that way — it cannot send you anywhere, and a pane you have to click into before
+you can scroll it is worse at the one thing the panel is for.
 
 The verbs are listed first because a pane too short for the whole map cuts from
 the bottom, and movement is the half you can find by pressing an arrow and

@@ -267,6 +267,28 @@ fn focus_self(pane: Option<&str>, ws: Option<&str>) {
     }
 }
 
+/// Does the keyboard belong to this pane, according to herdr's own census?
+///
+/// One pane on the machine answers yes: `pane.list` marks the focused pane of
+/// the focused workspace and nothing else, which is why this is a census
+/// question rather than a workspace one. `self_focused` is the other half of the
+/// same picture and is not a substitute — a panel in the workspace being looked
+/// at is on screen, and the shell beside it may still be the pane being worked
+/// in.
+///
+/// Current because the loop refetches the moment focus lands anywhere in this
+/// workspace, and every 250ms while it is on screen; see the `focused_us` branch
+/// for why that covers the keyboard crossing between two panes of one workspace.
+///
+/// A panel with no pane id of its own — run outside herdr — answers yes, the
+/// same way `collect` treats a workspace it cannot find. Something that cannot
+/// tell whether it is being worked in should act on what it is told rather than
+/// refuse.
+fn holds_keyboard(snap: &Snapshot, me: Option<&str>) -> bool {
+    let Some(me) = me else { return true };
+    snap.panes.iter().find(|p| p.pane_id == me).map(|p| p.focused).unwrap_or(true)
+}
+
 pub(super) fn focus(agent: &AgentRef) {
     let _ = herdr::call("workspace.focus", json!({ "workspace_id": agent.workspace }));
     let _ = herdr::call("pane.focus", json!({ "pane_id": agent.pane }));
@@ -391,7 +413,15 @@ pub(super) fn event_loop(
     // by any key, because a person moving the cursor outranks a wish taken off
     // disk before they did.
     let mut want = adopt(store, &mut view, &mut agreed);
-    let mut ui = collect(&Snapshot::live(store), &view, self_ws);
+    // Who we are, for taking focus when the mouse says the reader is here, and
+    // for knowing whether it was already here when they clicked.
+    let me = herdr::Env::read().pane_id;
+    let snap = Snapshot::live(store);
+    // Whether the keyboard is in this pane. Kept by the loop rather than read
+    // off the frame: it decides what a click means, and a click is the one
+    // gesture that arrives in a pane nobody is working in.
+    let mut keyboard = holds_keyboard(&snap, me.as_deref());
+    let mut ui = collect(&snap, &view, self_ws);
     if point_at(&mut ui, &want) {
         want = Cursor::default();
     }
@@ -401,8 +431,6 @@ pub(super) fn event_loop(
     let mut last = String::new();
     let mut dirty = false;
     let mut last_fetch = Instant::now();
-    // Who we are, for taking focus when the mouse says the reader is here.
-    let me = herdr::Env::read().pane_id;
     // A scroll is a burst of events, and focus is a socket round-trip. Take it
     // on the first of a burst and not on the ninety after it.
     let mut took_focus = Instant::now() - Duration::from_secs(60);
@@ -445,21 +473,30 @@ pub(super) fn event_loop(
         // Translated before the dispatch rather than inside it: only the loop
         // knows the pane's size, and `render::row_at` is the arithmetic that
         // drew the frame, so the row under the pointer is the row that acts.
+        //
+        // Whether the pane was being worked in is read before the line that
+        // changes it, because that is the question the click is answering.
+        let had_keyboard = keyboard;
         if matches!(msg, Msg::Key(Key::Click { .. } | Key::Wheel { .. }))
             && took_focus.elapsed() > Duration::from_millis(400)
         {
             took_focus = Instant::now();
             focus_self(me.as_deref(), self_ws);
+            // `focus_self` is a round-trip that has already returned, so this is
+            // not a guess: the keyboard is here, and the next click within the
+            // 400ms above — which does not ask herdr again — knows it.
+            keyboard = true;
         }
 
         if let Msg::Key(Key::Click { x, y }) = msg {
             let (w, h) = term_size();
-            match super::keys::click(&mut ui, &mut view, w, h, x, y) {
+            match super::keys::click(&mut ui, &mut view, w, h, x, y, had_keyboard) {
                 super::keys::Hit::Activate => msg = Msg::Key(Key::Enter),
                 // A mark in the strip is an agent, and going there is the whole
                 // of what it means.
                 super::keys::Hit::Focus(a) => {
                     focus(&a);
+                    keyboard = false;
                     continue;
                 }
                 // The `⋯`: the agents the strip could not draw. It stands for
@@ -470,6 +507,10 @@ pub(super) fn event_loop(
                     draw(&ui, &mut view, &mut last);
                     continue;
                 }
+                // The pane was not the one being worked in, and now it is. That
+                // is the whole of what the click did: the frame has not changed
+                // and there is nothing to draw.
+                super::keys::Hit::Keyboard => continue,
                 super::keys::Hit::Nothing => continue,
             }
         }
@@ -477,6 +518,11 @@ pub(super) fn event_loop(
         // The wheel moves the view, so it needs the pane's size the way a
         // click does: how far three rows is depends on nothing, but where the
         // last screen ends depends on how many rows the tree has been given.
+        //
+        // It is not gated on the keyboard being here the way a click is: a
+        // wheel cannot send you anywhere, so there is nothing to bounce, and a
+        // pane you cannot scroll without clicking into it first is worse at the
+        // one thing the panel is for — being read from across the screen.
         if let Msg::Key(Key::Wheel { up }) = msg {
             let (w, h) = term_size();
             super::keys::wheel(&mut ui, &mut view, w, h, up);
@@ -496,7 +542,15 @@ pub(super) fn event_loop(
                 Effect::Quit => return Outcome::Quit,
                 Effect::None => {}
                 Effect::Refetch => refetch = true,
-                Effect::Focus(a) => focus(&a),
+                // The keyboard has gone to that agent's terminal, and this pane
+                // is one somebody is looking at rather than working in until
+                // they come back. Said here rather than waited for: the census
+                // will agree within the tick, and a click landing inside it
+                // would be the bounce with a stopwatch on it.
+                Effect::Focus(a) => {
+                    focus(&a);
+                    keyboard = false;
+                }
                 Effect::Sync => {
                     let mut cache = crate::sync::Cache::default();
                     let _ = crate::sync::sync(store, &mut cache, true);
@@ -575,6 +629,7 @@ pub(super) fn event_loop(
                                     // herdr twice.
                                     took_focus = Instant::now();
                                     focus_self(me.as_deref(), self_ws);
+                                    keyboard = true;
                                 }
                                 None => say(&mut ui, m.label),
                             }
@@ -637,6 +692,15 @@ pub(super) fn event_loop(
                 // snapshot — so deferring it would leave the panel deciding it
                 // is slow *because* the last snapshot said it was not being
                 // looked at, and never taking the one that would say otherwise.
+                //
+                // It is also what keeps [`holds_keyboard`] honest, and this is
+                // the event that can do it: measured against the live server,
+                // herdr raises `workspace.focused` on every move of the keyboard
+                // — including one pane to the next inside a single workspace,
+                // where the workspace being focused has not changed at all. So
+                // the reader stepping off this pane onto the shell beside it
+                // lands here, and the census that says who has the keyboard is
+                // re-read before the next click can ask.
                 if shape || focused_us {
                     refetch = true;
                     dirty = false;
@@ -686,7 +750,11 @@ pub(super) fn event_loop(
             if taken.target != Target::Nothing {
                 want = taken;
             }
-            refetch_into(&mut ui, &Snapshot::live(store), &mut view, self_ws);
+            let snap = Snapshot::live(store);
+            // Free: the panes were fetched for the frame either way, and this is
+            // the same list herdr answers "who has the keyboard" out of.
+            keyboard = holds_keyboard(&snap, me.as_deref());
+            refetch_into(&mut ui, &snap, &mut view, self_ws);
             if point_at(&mut ui, &want) {
                 want = Cursor::default();
             }
@@ -719,6 +787,52 @@ mod tests {
                 "{t} needs a pane_id, and asking for it globally refuses the whole list",
             );
         }
+    }
+
+    /// Which pane has the keyboard decides what a click means, and the panel
+    /// learns that a pane at a time from the census. What makes the census
+    /// timely enough to decide a click is this subscription: measured against
+    /// the live server, herdr raises `workspace.focused` on every move of the
+    /// keyboard, including one pane to the next inside a single workspace, so
+    /// the move that matters most — off this panel onto the shell beside it —
+    /// is one the loop is told about rather than one it waits out.
+    #[test]
+    fn the_keyboard_moving_is_something_the_panel_is_told() {
+        assert!(CHATTY.contains(&"workspace.focused"));
+        assert!(is(CHATTY, "workspace_focused"), "and by the name the stream uses");
+    }
+
+    /// One pane in the census has the keyboard, and a click means one thing in
+    /// that pane and another in every other. This is where the loop starts from
+    /// and where it recovers to when the event stream has been away.
+    #[test]
+    fn the_keyboard_is_where_the_census_says_it_is() {
+        let census = |panes: &[(&str, bool)]| Snapshot {
+            projects: Vec::new(),
+            tasks: Vec::new(),
+            bindings: Default::default(),
+            pins: Default::default(),
+            mandates: Default::default(),
+            claims: Default::default(),
+            workspaces: Vec::new(),
+            panes: panes
+                .iter()
+                .map(|(id, has)| herdr::Pane {
+                    pane_id: (*id).to_string(),
+                    focused: *has,
+                    ..Default::default()
+                })
+                .collect(),
+        };
+
+        let snap = census(&[("w1:p1", false), ("w0:p3", true)]);
+        assert!(!holds_keyboard(&snap, Some("w1:p1")));
+        assert!(holds_keyboard(&snap, Some("w0:p3")));
+        // A panel that cannot name itself is one running outside herdr, where
+        // there is no focus to lose. It acts on what it is told rather than
+        // swallowing every click it is ever sent.
+        assert!(holds_keyboard(&snap, None));
+        assert!(holds_keyboard(&snap, Some("w9:p9")), "and a pane herdr has never heard of");
     }
 
     /// A pane gaining an agent is the event the dock exists for, and herdr

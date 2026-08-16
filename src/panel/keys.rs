@@ -729,6 +729,9 @@ pub(crate) enum Hit {
     /// The `⋯` at the end of a clipped strip: the rest of the agents, which is
     /// what the agents view is.
     Rest,
+    /// The click landed on a pane that was not the one being worked in. Taking
+    /// the keyboard is the whole of what it did.
+    Keyboard,
 }
 
 /// Decide what a click does, and move the cursor if that is what it does.
@@ -737,7 +740,33 @@ pub(crate) enum Hit {
 /// the loop's job is to read the pane's size and act on the answer, and the
 /// interesting half — select, then activate, without the tree moving — is
 /// policy that a fixture can drive.
-pub(crate) fn click(ui: &mut Ui, view: &mut View, w: usize, h: usize, x: usize, y: usize) -> Hit {
+///
+/// `keyboard` is whether this pane held the keyboard when the click arrived,
+/// and it is as much a part of what a click means as where it landed. The mouse
+/// reaches a pane nobody is working in — that is what makes the panel worth
+/// pointing at — so the same pixel is two gestures: on the pane you are working
+/// in it is select, or activate; on a pane you are not, it is "I am working
+/// here now", and the panel has just answered it by taking focus.
+///
+/// Doing both is the bounce. Point at an agent the cursor is already on and the
+/// click means `↵`, which goes to that agent's terminal — so the keyboard
+/// arrives here and leaves again in the same gesture, and you end up in a pane
+/// you had not decided to be in, by way of one you were only looking at.
+pub(crate) fn click(
+    ui: &mut Ui,
+    view: &mut View,
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    keyboard: bool,
+) -> Hit {
+    // Before anything is read off the geometry: where the pointer landed does
+    // not come into it, because this click was about the pane and not about a
+    // row in it. The next one has the keyboard and means what it says.
+    if !keyboard {
+        return Hit::Keyboard;
+    }
     // The top line is the strip, and a mark on it is an agent.
     if y == 0 {
         return match super::render::strip_at(ui, w, x) {
