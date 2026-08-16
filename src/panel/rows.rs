@@ -52,6 +52,11 @@ pub(crate) struct AgentRef {
     pub(super) where_: String,
     /// Whether an agent is running here, or it is just a shell.
     pub(super) agent: bool,
+    /// Which agent, as herdr spells it — `claude`, `codex`, `gemini` — and the
+    /// empty string for a shell. Carried because one thing a verb does to a
+    /// pane is not the same sentence at every kind: emptying a context is
+    /// `/clear` at Claude Code and something else, or nothing, everywhere else.
+    pub(super) kind: String,
     /// The task claimed to this pane, if it holds one. Carried so a verb aimed
     /// at the pane can refuse on the ground that matters — it already has work
     /// — rather than on where the row happens to sit.
@@ -849,6 +854,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         state: a.agent_status.clone(),
         where_: pane_name(&a.label, &a.title, &ws_label(&a.workspace_id)),
         agent: !a.agent.is_empty(),
+        kind: a.agent.clone(),
         task: bound_task_of_pane(&a.pane_id),
         project,
     };

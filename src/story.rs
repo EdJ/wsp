@@ -2145,6 +2145,42 @@ mod tests {
         }
     }
 
+    /// And it arrives on an empty context. The pane a claim lands in is nearly
+    /// always an agent that has just finished something else, and a work order
+    /// read through the last task's reasoning is the thing this stops.
+    ///
+    /// Only for the kinds whose clear we know how to spell. herdr starts twenty
+    /// of them and `/clear` is Claude Code's word: anywhere else the sentence
+    /// goes in on its own, rather than behind a line the agent would read as
+    /// the first half of its instructions.
+    #[test]
+    fn the_work_order_goes_in_behind_a_clear() {
+        let clear_before_the_claim = |w: &Snapshot| -> Option<&'static str> {
+            let mut view = panel::View::default();
+            let mut ui = ui_of(w, &view);
+            for i in 0..500 {
+                ui.select_for_test(i);
+                if ui.selected_target() == panel::Target::Task("t-020".into()) {
+                    break;
+                }
+            }
+            press(&mut ui, &mut view, 'c');
+            on_pane(&mut ui, "w4:p2");
+            match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+                panel::Effect::Run { then, .. } => then.expect("an idle agent is told").clear,
+                _ => panic!("the pick should run a claim"),
+            }
+        };
+
+        assert_eq!(clear_before_the_claim(&world()), Some("/clear"));
+
+        let mut other = world();
+        for p in other.panes.iter_mut().filter(|p| p.pane_id == "w4:p2") {
+            p.agent = "codex".into();
+        }
+        assert_eq!(clear_before_the_claim(&other), None);
+    }
+
     /// The commonest pane there is: an agent that resolves to no project,
     /// because herdr reports where its *shell* started and that is one
     /// directory above every checkout. Refusing there made `f` useless, so it

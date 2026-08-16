@@ -9,6 +9,7 @@
 //! the map, and the command it becomes.
 
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -235,6 +236,24 @@ pub(crate) struct Tell {
     /// Thirty-four columns' worth. The sentence above is for the agent; this is
     /// for the person who pressed the key.
     pub(crate) note: String,
+    /// What to type first to empty the context this sentence would otherwise
+    /// land on top of — see [`clear_command`]. `None` where nothing here knows
+    /// how to ask, and the sentence goes in on its own as it always did.
+    pub(crate) clear: Option<&'static str>,
+}
+
+/// What empties this kind of agent's context, for the kinds we know how to ask.
+///
+/// Claude Code and nothing else. `/clear` is Claude Code's spelling, herdr
+/// starts twenty other kinds, and the cost of guessing is a work order with a
+/// line in front of it that the agent reads as the first half of its
+/// instructions. `spawn` starts `claude` unless told otherwise, so the case
+/// this covers is very nearly all of them, and the rest lose nothing they had.
+fn clear_command(kind: &str) -> Option<&'static str> {
+    match kind {
+        "claude" => Some("/clear"),
+        _ => None,
+    }
 }
 
 /// Send an agent looking for its own work.
@@ -246,6 +265,7 @@ pub(super) fn tell_find_work(a: &AgentRef, project: &str) -> Tell {
              names, then do it. If nothing is actionable, say so and stop."
         ),
         note: format!("{} → looking in {project}", a.where_),
+        clear: clear_command(&a.kind),
     }
 }
 
@@ -257,6 +277,7 @@ pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
         pane: a.pane.clone(),
         text: crate::cmd_spawn::claimed_text(task),
         note: format!("{} → {task}", a.where_),
+        clear: clear_command(&a.kind),
     }
 }
 
@@ -281,19 +302,79 @@ pub(super) fn pick_tell(verb: &Pick, at: &Target, ui: &Ui) -> Option<Tell> {
     }
 }
 
-/// Type a sentence into a pane and press return.
+/// Between the sentence and the return that sends it.
+const RETURN_MS: u64 = 150;
+/// How long to wait for a cleared agent to come back as a new session, and how
+/// often to ask. Measured at four hundred milliseconds on this machine, which
+/// is a Claude Code resetting and running its `SessionStart` hooks; the ceiling
+/// is for a machine having a worse day, not for a clear that is never coming.
+const CLEAR_MS: u64 = 5_000;
+const CLEAR_POLL_MS: u64 = 100;
+
+/// Hand an agent a sentence, on an empty context where we can give it one.
+///
+/// The clear is the point. A pane that takes a claim is nearly always an agent
+/// that has just finished something else, and the work order was landing on a
+/// full window of the last task's reasoning — the agent then reads its brief
+/// through whatever it was thinking about before. `spawn` hands over the same
+/// sentence to an agent that has just booted, and this is what makes the two
+/// hand-overs the same hand-over.
+pub(super) fn send_tell(t: &Tell) -> Result<(), String> {
+    if let Some(cmd) = t.clear {
+        clear_agent(&t.pane, cmd)?;
+    }
+    type_line(&t.pane, &t.text)
+}
+
+/// Type a line into a pane and press return.
 ///
 /// Two writes with a pause between, the same bargain the editor panes make: a
 /// TUI that takes a burst of input as a paste swallows the return on the end of
 /// it, and the sentence then sits in the prompt unsent — which looks exactly
 /// like an agent that read the instruction and ignored it.
-pub(super) fn send_tell(t: &Tell) -> Result<(), String> {
-    herdr::call("pane.send_text", json!({ "pane_id": t.pane, "text": t.text }))
+fn type_line(pane: &str, text: &str) -> Result<(), String> {
+    herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }))
         .map_err(|e| e.to_string())?;
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    herdr::call("pane.send_text", json!({ "pane_id": t.pane, "text": "\r" }))
+    std::thread::sleep(Duration::from_millis(RETURN_MS));
+    herdr::call("pane.send_text", json!({ "pane_id": pane, "text": "\r" }))
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Empty an agent's context, and wait for the session that replaces it.
+///
+/// The waiting is on the session id, not on the status. A clear is not a turn:
+/// `agent.prompt --wait` spent five seconds on one and answered
+/// `agent_prompt_stalled` — "no observed state change" — with the clear long
+/// since done, and the status either side of it was the same word. What does
+/// change is the agent's session: herdr learns the id from Claude Code's own
+/// `SessionStart` hook, so a new one appearing here means the clear has landed
+/// *and* the session that replaced it has started its hooks, which is the same
+/// moment `wsp brief` is being read into it.
+///
+/// Not an error when the wait runs out. The sentence goes in either way,
+/// because a work order that never arrives is worse than one arriving on a
+/// context that was not emptied, and an agent still busy at that point queues
+/// what is typed at it rather than dropping it.
+fn clear_agent(pane: &str, cmd: &str) -> Result<(), String> {
+    let before = session_of(pane);
+    type_line(pane, cmd)?;
+    let deadline = Instant::now() + Duration::from_millis(CLEAR_MS);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(CLEAR_POLL_MS));
+        let now = session_of(pane);
+        if now.is_some() && now != before {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// The agent session herdr can see in this pane, if it can see one.
+fn session_of(pane: &str) -> Option<String> {
+    let r = herdr::call("agent.get", json!({ "target": pane })).ok()?;
+    let v = r.get("agent")?.get("agent_session")?.get("value")?;
+    v.as_str().map(|s| s.to_string())
 }
 
 /// `f`: send an idle agent to find its own work.

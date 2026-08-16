@@ -22,16 +22,17 @@ use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
 use super::shared;
-use super::verbs::{close_view, inspect, pop_out, run_wsp, send_tell};
+use super::verbs::{close_view, inspect, pop_out, run_wsp, send_tell, Tell};
 
 pub(super) enum Msg {
     Key(Key),
     Herdr(HerdrEvent),
     Tick,
     /// A line for the footer from something that took too long to do on the
-    /// loop. Only `S` and `O` produce these today: starting an agent means
-    /// waiting on `claude` to answer, and the sidebar must go on drawing while
-    /// it does.
+    /// loop. `S` and `O` produce these — starting an agent means waiting on
+    /// `claude` to answer, and the sidebar must go on drawing while it does —
+    /// and so does every sentence typed at an agent, which waits on the clear
+    /// in front of it.
     Note(String),
 }
 
@@ -331,6 +332,24 @@ fn holds_keyboard(snap: &Snapshot, me: Option<&str>) -> bool {
 pub(super) fn focus(agent: &AgentRef) {
     let _ = herdr::call("workspace.focus", json!({ "workspace_id": agent.workspace }));
     let _ = herdr::call("pane.focus", json!({ "pane_id": agent.pane }));
+}
+
+/// Type a work order into an agent's pane, off the loop.
+///
+/// Off it for the same reason a spawn is: the sentence now goes in behind a
+/// clear, and a clear is a second of waiting for the session that replaces the
+/// one it ended — a second in which this pane would draw nothing, right after
+/// a keystroke, which reads as a panel that has died rather than one that is
+/// busy. The footer says what the key did as the key is pressed; the thread
+/// speaks only if the typing itself failed.
+fn tell(t: Tell, ui: &mut Ui, tx: &Sender<Msg>) {
+    say(ui, t.note.clone());
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = send_tell(&t) {
+            let _ = tx.send(Msg::Note(e));
+        }
+    });
 }
 
 /// Why the loop stopped.
@@ -637,10 +656,7 @@ pub(super) fn event_loop(
                         let _ = tx.send(Msg::Note(line));
                     });
                 }
-                Effect::Tell(t) => match send_tell(&t) {
-                    Ok(()) => say(&mut ui, t.note),
-                    Err(e) => say(&mut ui, e),
-                },
+                Effect::Tell(t) => tell(t, &mut ui, tx),
                 Effect::Run { argv, escalate, then } => {
                     match (run_wsp(&argv), escalate) {
                         (Ok(m), _) => {
@@ -681,10 +697,7 @@ pub(super) fn event_loop(
                             // command's: what you want to know about a claim
                             // is whether the agent was told.
                             if let Some(t) = then {
-                                match send_tell(&t) {
-                                    Ok(()) => say(&mut ui, t.note),
-                                    Err(e) => say(&mut ui, e),
-                                }
+                                tell(t, &mut ui, tx);
                             }
                         }
                         // Refused, and there is a stronger form of the same
