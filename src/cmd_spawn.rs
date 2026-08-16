@@ -59,6 +59,7 @@ pub fn open_workspace(
     project: Option<&str>,
     task: Option<&str>,
     focus: bool,
+    machine: Option<&str>,
 ) -> Result<(String, String), String> {
     // The store first, then what this workspace is for — the latter wins if
     // someone has both, which is right: it is more specific.
@@ -73,20 +74,64 @@ pub fn open_workspace(
     if let Some(c) = cwd {
         params["cwd"] = json!(util::expand(c).display().to_string());
     }
-    let r = herdr::call("workspace.create", params).map_err(|e| e.to_string())?;
-    let ws = r
-        .get("workspace")
-        .and_then(|w| w.get("workspace_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "workspace.create returned no id".to_string())?;
-    let pane = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "workspace.create returned no pane".to_string())?;
-    Ok((ws, pane))
+    // The one herdr call with nothing in it to route on: a workspace that does
+    // not exist yet has no id to say where it should be. So the machine is
+    // named, and this is the only place in `spawn` where it has to be —
+    // everything after this is addressed by the pane id below, which comes back
+    // already qualified and routes itself.
+    let r = herdr::call_on(machine, "workspace.create", params, Duration::from_secs(10))
+        .map_err(|e| e.to_string())?;
+    let id = |outer: &str, inner: &str| -> Result<String, String> {
+        let bare = r
+            .get(outer)
+            .and_then(|w| w.get(inner))
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("workspace.create returned no {inner}"))?;
+        // Qualified here, at the door, like everything else arriving from a far
+        // herdr — which has never heard of `@mb2` and answers with its own bare
+        // id. An id that went into a claim unqualified would name *this*
+        // machine's workspace, and the claim would be about a workspace on the
+        // wrong box for as long as it lived.
+        Ok(match machine {
+            Some(m) => format!("{bare}@{m}"),
+            None => bare.to_string(),
+        })
+    };
+    Ok((id("workspace", "workspace_id")?, id("root_pane", "pane_id")?))
+}
+
+/// Where a spawn is going: this machine unless `--on` says otherwise.
+///
+/// Asked, never inferred. There is no scheduler and no load model here on
+/// purpose — auto-placement hides the thing you most want to see — and the
+/// default is this machine so every existing caller and script keeps exactly
+/// the behaviour it had.
+///
+/// A machine that is not in the store is a typo, and worth saying so rather
+/// than letting it become a socket error about a path nobody typed. A machine
+/// that is in the store but not answering is a different sentence, and carries
+/// what the daemon last saw, because "why can I not spawn on mb2" is answered
+/// by that line and nothing else.
+fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
+    let Some(name) = args.get("on") else { return Ok(None) };
+    let Some(m) = store.machine(&name) else {
+        let known: Vec<String> = store.machines().into_iter().map(|m| m.name).collect();
+        return Err(match known.is_empty() {
+            true => format!("no machine `{name}` — this seat has none. wsp machine add <name> <ssh-target>"),
+            false => format!("no machine `{name}` — there is {}", known.join(", ")),
+        });
+    };
+    if !m.is_active() {
+        return Err(format!("`{name}` is retired — wsp machine set {name} status=active"));
+    }
+    match store.machine_live(&name) {
+        Some(l) if l.reachable => Ok(Some(m.name)),
+        Some(l) if !l.error.is_empty() => Err(format!("`{name}` is not answering — {}", l.error)),
+        Some(_) => Err(format!("`{name}` is not answering yet")),
+        None => Err(format!(
+            "`{name}` has no tunnel — is `wsp daemon` running? Nothing has reported on it"
+        )),
+    }
 }
 
 /// herdr's default when nobody says which agent. Every other kind it knows is
@@ -250,6 +295,18 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         }
     };
 
+    let on = match placement(store, args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+
+    // Still this machine's paths, deliberately. A project root is a path in the
+    // store and `~` expands here, which is right while the machines mirror each
+    // other and is exactly what the Linux box breaks; host-qualified roots are
+    // t-260815-060 and are not smuggled in here.
     let cwd = args
         .get("cwd")
         .or_else(|| work.project.as_deref().and_then(|p| index.root_of(p)));
@@ -260,6 +317,7 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         work.project.as_deref(),
         work.task.as_deref(),
         !args.has("no-focus"),
+        on.as_deref(),
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -366,6 +424,62 @@ fn cmd_agent_claim(store: &Store, task: &str, flags: &[(&str, &str)]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seat(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("wsp-place-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        store.ensure_dirs().unwrap();
+        store
+    }
+
+    /// Every way `--on` can be wrong, and the sentence each one earns.
+    ///
+    /// They are four different problems — a typo, a machine you retired, a
+    /// machine that is down, and a daemon that is not running — and the fix for
+    /// each is different, so one "cannot spawn on mb2" for all four would be
+    /// the least useful thing this could say. The unreachable case carries what
+    /// the daemon last saw, because that line is the whole answer to "why can I
+    /// not spawn on mb2".
+    #[test]
+    fn saying_where_is_checked_before_anything_is_opened() {
+        use crate::model::Machine;
+        use crate::store::MachineLive;
+        let store = seat("errs");
+        let on = |v: &str| Args::synth("spawn", &["t-1"], &[("on", v)]);
+
+        assert!(placement(&store, &Args::synth("spawn", &["t-1"], &[])).unwrap().is_none(),
+            "no flag is this machine, which is what every existing caller passes");
+
+        let err = placement(&store, &on("mb2")).unwrap_err();
+        assert!(err.contains("this seat has none"), "{err}");
+
+        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
+        let err = placement(&store, &on("mb3")).unwrap_err();
+        assert!(err.contains("there is mb2"), "a typo is told what there was: {err}");
+
+        let err = placement(&store, &on("mb2")).unwrap_err();
+        assert!(err.contains("is `wsp daemon` running"), "nothing has reported: {err}");
+
+        store.set_machine_live("mb2", &MachineLive {
+            reachable: false,
+            error: "ssh: no route to host".into(),
+            ..Default::default()
+        });
+        let err = placement(&store, &on("mb2")).unwrap_err();
+        assert!(err.contains("no route to host"), "what the daemon saw: {err}");
+
+        store.set_machine_live("mb2", &MachineLive { reachable: true, ..Default::default() });
+        assert_eq!(placement(&store, &on("mb2")).unwrap().as_deref(), Some("mb2"));
+
+        let mut retired = store.machine("mb2").unwrap();
+        retired.status = "retired".into();
+        store.save_machine(&retired).unwrap();
+        let err = placement(&store, &on("mb2")).unwrap_err();
+        assert!(err.contains("retired"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
     use crate::model::Project;
 
     /// The two sub-projects the backlog is split into have no checkout of

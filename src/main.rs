@@ -357,9 +357,10 @@ fn help() {
   wsp brief                         what this pane is for, and who else is working
   wsp commit-help                   how to commit in a tree somebody else is in
   wsp claim <id>                    bind this pane to a task, leaving the last
-  wsp spawn <id> [-p proj] [--agent [--kind claude]]
+  wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
                                     open a workspace on it, claim it there, and
-                                    start an agent in it; --no-focus to stay put
+                                    start an agent in it; --no-focus to stay put,
+                                    --on to run it on another machine
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project
