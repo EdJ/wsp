@@ -18,6 +18,7 @@
 
 use serde_json::json;
 
+use crate::herdr;
 use crate::model::{valid_machine_name, Machine};
 use crate::store::{MachineLive, Store};
 use crate::util::{self, Paint};
@@ -125,21 +126,122 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// One agent, as a machines list wants it: which pane, what it is, what it is
+/// holding.
+struct Standing {
+    machine: String,
+    pane: String,
+    agent: String,
+    state: String,
+    holding: String,
+}
+
+/// Every agent there is, partitioned by the machine it is on.
+///
+/// A partition of one list rather than a query per machine: `herdr::agents()`
+/// already fans out and comes back `@machine`-qualified, so where each one is
+/// is written on it. `""` is this seat.
+///
+/// Empty when herdr is not answering, which is a machines list without the
+/// agents on it rather than no machines list — the durable half of a machine is
+/// a file and does not need a socket to be read.
+fn standing(store: &Store) -> Vec<Standing> {
+    if !herdr::available() {
+        return Vec::new();
+    }
+    let bindings = store.bindings();
+    let tasks = store.tasks();
+    herdr::agents()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| {
+            let held = bindings
+                .get(&a.pane_id)
+                .and_then(|b| b.get("task_id"))
+                .and_then(|t| t.as_str())
+                .and_then(|id| tasks.iter().find(|t| t.id == id));
+            Standing {
+                machine: herdr::host_of(&a.pane_id).unwrap_or("").to_string(),
+                pane: a.pane_id.clone(),
+                agent: match a.agent.is_empty() {
+                    true => "a shell".into(),
+                    false => a.agent.clone(),
+                },
+                state: a.agent_status.clone(),
+                holding: match held {
+                    Some(t) => t.title.clone(),
+                    None if !a.title.is_empty() => format!("({})", a.title),
+                    None => String::new(),
+                },
+            }
+        })
+        .collect()
+}
+
+/// The machines view: what exists, whether it is answering, and who is on it.
+///
+/// A command and not a panel view, for now. The panel is the other surface and
+/// wants the same three states and the same partition; this is the half that
+/// does not need the panel to hold still to be written. See t-260816-053.
 pub fn list(store: &Store, args: &Args) -> i32 {
     let machines = store.machines();
     let live = store.machines_live();
+    let here = standing(store);
     let p = Paint::new();
 
+    let agents_on = |name: &str| -> Vec<&Standing> {
+        here.iter().filter(|s| s.machine == name).collect()
+    };
+
     if args.json() {
-        let rows: Vec<_> = machines.iter().map(|m| machine_json(m, live.get(&m.name))).collect();
-        println!("{}", json!({ "seat": util::hostname(), "machines": rows }));
+        let rows: Vec<_> = machines
+            .iter()
+            .map(|m| {
+                let mut v = machine_json(m, live.get(&m.name));
+                v["agents"] = json!(agents_on(&m.name).iter().map(|s| json!({
+                    "pane": s.pane, "agent": s.agent, "state": s.state, "holding": s.holding,
+                })).collect::<Vec<_>>());
+                v
+            })
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "seat": util::hostname(),
+                "machines": rows,
+                "seat_agents": agents_on("").iter().map(|s| json!({
+                    "pane": s.pane, "agent": s.agent, "state": s.state, "holding": s.holding,
+                })).collect::<Vec<_>>(),
+            })
+        );
         return 0;
     }
 
+    // An agent line, indented under whatever it is standing on.
+    let under = |rows: Vec<&Standing>| {
+        let w = rows.iter().map(|s| s.pane.len()).max().unwrap_or(0);
+        for s in rows {
+            println!(
+                "  {}  {}",
+                p.dim(&format!("{:<w$}", s.pane)),
+                p.dim(&format!(
+                    "{} · {}{}",
+                    s.agent,
+                    s.state,
+                    match s.holding.is_empty() {
+                        true => String::new(),
+                        false => format!(" · {}", util::truncate(&s.holding, 48)),
+                    }
+                )),
+            );
+        }
+    };
+
     if machines.is_empty() {
         println!("{}", p.dim("no machines — this seat only"));
-        println!("{}", p.dim(&format!("  seat  {}", util::hostname())));
         println!("{}", p.dim("  wsp machine add <name> <ssh-target>"));
+        println!("{}", p.bold(&format!("seat  {}", util::hostname())));
+        under(agents_on(""));
         return 0;
     }
 
@@ -161,13 +263,14 @@ pub fn list(store: &Store, args: &Args) -> i32 {
             state,
             if note.is_empty() { String::new() } else { format!("  {}", p.dim(&note)) },
         );
+        under(agents_on(&m.name));
     }
     // The seat has no record of its own — it is where you are, not somewhere
     // you reach — but a list of machines that leaves out the one you are on
-    // reads as if it were missing. A footer rather than a row: a hostname is
-    // routinely longer than every machine name put together, and widening the
-    // whole table to fit one cell that is not really in it is the wrong trade.
-    println!("{}", p.dim(&format!("seat  {}", util::hostname())));
+    // reads as if it were missing, and the agents on it are half of what this
+    // list is for.
+    println!("{}", p.bold(&format!("seat  {}", util::hostname())));
+    under(agents_on(""));
     0
 }
 
