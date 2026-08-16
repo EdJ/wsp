@@ -447,7 +447,6 @@ disturbing a layout you will come back to.
 | `e` | project | rename it — its **name**, not its slug |
 | `t` | task | tags: a picker — `␣` flips one, `↵` applies them |
 | `!` | task | priority: high, then low, then normal again |
-| `p` | project | pin this workspace here; again on the same row unpins |
 | `E` | task, project | edit its prose full-screen in a tab |
 | `m` | task | move — the tree becomes the picker |
 | `m` | project | the same, one level up: move it under another project |
@@ -484,20 +483,6 @@ and the panel has no index to ask. That refusal is not a policy with a
 so nothing hangs, but a loop has no root, and a branch nothing can reach from
 the root disappears from `wsp tree`, from the panel and from every list, with
 its files still on disk and the command reporting success.
-
-`p` pins the workspace the panel is installed in to the project under the
-cursor, and pressed again on that same row takes the pin off. A pin says what a
-workspace *is* — it is the top of the chain everything else resolves through,
-above the claim and the cwd — so `wsp add` with no `-p` files there, `wsp where`
-answers with it, and `f` sends an agent looking there. One per workspace, which
-is why the key that sets it is also the one that clears it, and why pressing it
-on a *different* project moves the pin rather than refusing: the answer to
-"which project is this workspace" is simply now that one. The row it names
-carries `⌂`, and at most one row ever does — on the panel in that workspace and
-nowhere else, since a pin is a fact about one workspace and the panels are
-otherwise showing each other the same tree. `wsp pin --top`, which marks a
-workspace as deliberately *not* work, has no key: it matches no project, so
-there is no row to press it on.
 
 `t` opens a **tag picker**, docked under the tree: every tag the store already
 uses, the task's own first and the rest commonest-first, `␣` to flip a row and
@@ -628,7 +613,6 @@ prompt unsent, which looks exactly like an agent that read it and ignored it.
 | `◆` | in review | `■1` | tasks blocked |
 | `✓` | done — only under `A` | `✓` | all work here is finished |
 | | | `●2` | panes standing here |
-| | | `⌂` | this workspace is pinned here |
 
 A pane gets its own row: `●` working, `○` idle, `▫` a shell with no agent in it
 — never started, as against an idle agent that stopped. A task keeps its own
@@ -1283,9 +1267,7 @@ survives a restart — direction you have to repeat every morning is not standin
 direction, it is a reminder. In the resolution chain it sits at **pin > binding
 > claim > mandate > cwd > label**: a pin says what a workspace *is*, and a
 binding and a claim are the work actually in hand, but a mandate beats the
-directory a shell happens to be sitting in. The pin at the top of that chain is
-`wsp pin <project>`, or `p` on a project row in the panel, where the row it
-names then carries `⌂`. It is deliberately not consulted
+directory a shell happens to be sitting in. It is deliberately not consulted
 when the panel places a pane in the tree — where a pane is standing is a fact
 about the pane, and standing direction says nothing about it.
 

@@ -128,10 +128,6 @@ pub(crate) mod glyph {
     pub const SHELL: &str = "▫";
     /// Something is written in Overview or Details.
     pub const NOTES: &str = "≡";
-    /// This workspace is pinned to that project — home, in the sense `wsp
-    /// where` means it. On the project row and nowhere else, because a pin is
-    /// one per workspace.
-    pub const PINNED: &str = "⌂";
     /// In the tag picker: carried already, about to be added, about to be
     /// taken off. Three marks rather than two, because nothing is written
     /// until `↵` and the frame has to say what `↵` will do.
@@ -206,7 +202,6 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Warn, g::BLOCKED), (Style::Warn, "1")], "blocked", "tasks parked and waiting"),
                 mark(&[(Style::Dim, g::DONE)], "all clear", "there is work here and all of it is finished"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Accent, "2")], "panes", "panes standing in this project, agent or not"),
-                mark(&[(Style::Accent, g::PINNED)], "pinned here", "this workspace is that project — `p` sets it and takes it off again; at most one row, and only on this workspace's own panel"),
             ],
         ),
         (

@@ -470,14 +470,6 @@ impl<'a> Driver<'a> {
 fn scenes() -> Vec<Scene> {
     let w = world();
     let q = quiet_world();
-    // The same world with this panel's own workspace pinned, which is the only
-    // way to draw `⌂` — a pin is a fact about one workspace, and the storyboard
-    // stands in `w0` like the tests do.
-    let pinned = {
-        let mut s = world();
-        s.pins.insert("w0".into(), "trance".into());
-        s
-    };
     let mut out = Vec::new();
 
     out.push(Driver::new(&q).scene(
@@ -713,12 +705,6 @@ fn scenes() -> Vec<Scene> {
             .to_task("t-004")
             .keys(&[Key::Char('t'), Key::Char('m'), Key::Char('i'), Key::Char('x')])
             .scene("Naming a tag that does not exist yet", "Typing narrows the list and doubles as the field for a tag nobody has used — one line for both, because they are one gesture. The last row offers to make what you typed, lowercased, so `DSP` and `dsp` never become two tags that read as one; ␣ takes it, and so does ↵, which then applies. ␣ is free to mean toggle because a tag with a space in it is not a tag."),
-    );
-
-    out.push(
-        Driver::new(&pinned)
-            .to_project("trance")
-            .scene("Pinned here", "`⌂` says this workspace *is* that project — the top of the chain everything else resolves through, above the claim and the cwd beneath it, so `wsp add` with no `-p` files there and `f` sends an agent looking there. `p` sets it and, pressed again on the same row, takes it off; on a different project it moves, because the answer to \"which project is this workspace\" is simply now that one. At most one row ever carries it, and only on the panel in that workspace — every other panel is showing you the same tree without it."),
     );
 
     out.push(
@@ -2482,12 +2468,6 @@ mod tests {
         panic!("no row for project {id}");
     }
 
-    /// Every row of the frame, as text, for a test asking whether a mark is
-    /// drawn anywhere at all.
-    fn all_rows(ui: &panel::Ui) -> Vec<String> {
-        (0..ui.rows_for_test()).map(|i| panel::render_row_for_test(ui, i, W).text()).collect()
-    }
-
     /// What the picker is offering, in the order it draws it.
     fn tag_dock(view: &panel::View) -> Vec<String> {
         panel::tag_rows_for_test(view, W).iter().map(|l| l.trim_end().to_string()).collect()
@@ -2796,94 +2776,4 @@ mod tests {
         ));
     }
 
-    /// A pin says what a workspace *is*. It is the top of the chain every
-    /// other question resolves through — `wsp add` with no `-p`, `wsp where`,
-    /// where `f` sends an agent looking — which is why it beats the cwd
-    /// underneath it: five workspaces can share one checkout.
-    ///
-    /// One per workspace, so the key that sets it is the only key there is to
-    /// take it off, and the mark is what makes a second press mean anything.
-    #[test]
-    fn p_pins_this_workspace_and_takes_the_pin_off_again() {
-        let mut w = world();
-        let mut view = panel::View::default();
-        let mut ui = ui_of(&w, &view);
-
-        // Nothing pinned: no row carries the mark, and `p` sets one, naming
-        // the workspace rather than leaving `wsp pin` to read it back out of
-        // the environment.
-        assert!(
-            all_rows(&ui).iter().all(|r| !r.contains(panel::glyph::PINNED)),
-            "an unpinned workspace marks nothing",
-        );
-        on_project(&mut ui, "trance");
-        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
-            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["pin", "trance", "-w", "w0"]),
-            _ => panic!("p on a project should pin"),
-        }
-
-        // With the pin in the store, the row it names says so — and only that
-        // row, on only this workspace's own panel.
-        w.pins.insert("w0".into(), "trance".into());
-        let mut ui = ui_of(&w, &view);
-        let marked: Vec<String> =
-            all_rows(&ui).into_iter().filter(|r| r.contains(panel::glyph::PINNED)).collect();
-        assert_eq!(marked.len(), 1, "exactly one row is home: {marked:?}");
-        assert!(marked[0].contains("trance"), "and it is the pinned one: {}", marked[0]);
-
-        // Pressed again on the same project it comes off: there is nothing
-        // else that could mean.
-        on_project(&mut ui, "trance");
-        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
-            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["unpin", "-w", "w0"]),
-            _ => panic!("p on the pinned project should unpin"),
-        }
-
-        // …and on a different one it moves, rather than refusing. There is
-        // nothing to refuse: the answer to "which project is this workspace"
-        // is now that one.
-        on_project(&mut ui, "verb");
-        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
-            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["pin", "verb", "-w", "w0"]),
-            _ => panic!("p elsewhere should move the pin"),
-        }
-
-        // A pin is about a workspace, so a task or a pane is not one.
-        on_task(&mut ui, "t-001");
-        assert!(matches!(
-            panel::apply_key(Key::Char('p'), &mut ui, &mut view),
-            panel::Effect::None
-        ));
-
-        // Pinned outside the tree entirely — `wsp pin --top`, "this workspace
-        // is deliberately not work" — is not any project, so no row is marked
-        // and `p` on one is an ordinary pin that replaces it.
-        w.pins.insert("w0".into(), crate::resolve::TOP_LEVEL.into());
-        let mut ui = ui_of(&w, &view);
-        assert!(
-            all_rows(&ui).iter().all(|r| !r.contains(panel::glyph::PINNED)),
-            "pinned out of the tree marks no row in it",
-        );
-        on_project(&mut ui, "trance");
-        match panel::apply_key(Key::Char('p'), &mut ui, &mut view) {
-            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["pin", "trance", "-w", "w0"]),
-            _ => panic!("p should replace a --top pin"),
-        }
-    }
-
-    /// The panel runs outside herdr in exactly one place — the storyboard —
-    /// and a key that assumed a workspace would build `wsp unpin -w ` with
-    /// nothing after it, which is a command about whatever workspace the
-    /// process happens to be in.
-    #[test]
-    fn a_panel_with_no_workspace_of_its_own_does_not_pin() {
-        let w = world();
-        let mut view = panel::View::default();
-        let mut ui = panel::collect(&w, &view, None);
-        on_project(&mut ui, "trance");
-        assert!(matches!(
-            panel::apply_key(Key::Char('p'), &mut ui, &mut view),
-            panel::Effect::None
-        ));
-    }
 }

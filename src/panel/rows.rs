@@ -175,10 +175,6 @@ pub(super) enum Row {
         /// holding the name it is about to change, the same as a task's, and
         /// the reducer has no store to go and ask.
         name: String,
-        /// This panel's own workspace is pinned to this project — see
-        /// [`Ui::pinned`]. Per row rather than looked up at draw time because
-        /// the renderer is handed one row and nothing else.
-        pinned: bool,
         depth: usize,
         counts: Counts,
         collapsed: bool,
@@ -312,23 +308,6 @@ pub(crate) struct Ui {
     pub(super) sel: usize,
     pub(super) message: Option<(String, Instant)>,
     pub(super) self_focused: bool,
-    /// The workspace this panel is installed in. `p` names it in the argv
-    /// rather than letting `wsp pin` read it back out of the environment: the
-    /// panel already knows which workspace it is furniture in, and the footer
-    /// shows the command it ran.
-    pub(super) self_ws: Option<String>,
-    /// The project that workspace is pinned to, if any.
-    ///
-    /// A pin is the top of the resolution chain — it says what a workspace
-    /// *is*, and outranks the claim and the cwd beneath it — so `wsp add` with
-    /// no `-p` files here, and so does everything else that has to guess. One
-    /// per workspace, which is why this is a single value and why `p` on the
-    /// project already holding it means take it off.
-    ///
-    /// Holds `--top`'s sentinel as-is when the workspace is pinned out of the
-    /// tree entirely: it matches no project id, so no row is marked, which is
-    /// exactly what "deliberately no project" should look like.
-    pub(super) pinned: Option<String>,
     /// Every tag anything in the store carries, commonest first.
     ///
     /// Tags are a small closed vocabulary — nineteen across the whole store,
@@ -1044,7 +1023,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         loose: &std::collections::BTreeMap<String, Vec<AgentRef>>,
         interesting: &dyn Fn(&str) -> bool,
         agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
-        pinned: Option<&str>,
     ) {
         for p in index.children(parent) {
             if !interesting(&p.id) {
@@ -1054,7 +1032,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             rows.push(Row::Project {
                 id: p.id.clone(),
                 name: p.name.clone(),
-                pinned: pinned == Some(p.id.as_str()),
                 depth,
                 // Under the review filter the right-hand column counts what
                 // is *shown*. A project reading `5 ▸3 ■1` beside one visible
@@ -1083,7 +1060,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
 
             walk(
                 index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, loose, interesting,
-                agent_for_task, pinned,
+                agent_for_task,
             );
 
             // Then the panes that resolve here but are working on nothing
@@ -1115,10 +1092,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         }
     }
 
-    // What this panel's own workspace is pinned to. Read once here rather than
-    // per row: `collect` runs four times a second.
-    let pinned = self_ws.and_then(|ws| pins.get(ws)).cloned();
-
     walk(
         &index,
         None,
@@ -1131,7 +1104,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         &loose_by_project,
         &interesting,
         &agent_for_task,
-        pinned.as_deref(),
     );
 
     // Panes belonging to no project. Some are there because nothing resolved;
@@ -1243,8 +1215,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         sel: 0,
         message: None,
         self_focused,
-        self_ws: self_ws.map(|s| s.to_string()),
-        pinned,
         vocabulary: vocabulary(snap),
         show_done: view.show_done,
         review_only: view.review_only,
@@ -1286,21 +1256,11 @@ pub(super) fn state_dot(state: &str) -> (Style, &'static str) {
 pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
     let mut l = Line::default();
     match row {
-        Row::Project { id, depth, counts, collapsed, live, prose, pinned, .. } => {
+        Row::Project { id, depth, counts, collapsed, live, prose, .. } => {
             l.pad(*depth);
             l.push(Style::Dim, if *collapsed { glyph::CLOSED } else { glyph::OPEN });
             l.push(Style::Plain, " ");
             l.push(Style::Bold, id.clone());
-            // At most one row on the panel ever carries this, and only on the
-            // panel in the pinned workspace — a pin is a fact about *this*
-            // workspace, so it is drawn for the person standing in it and
-            // nobody else. Without it `p` is a key whose whole effect is a
-            // footer line that clears after four seconds, and pressing it a
-            // second time to take the pin off would look like nothing at all.
-            if *pinned {
-                l.push(Style::Plain, " ");
-                l.push(Style::Accent, glyph::PINNED);
-            }
             if *prose {
                 l.push(Style::Plain, " ");
                 l.push(Style::Dim, glyph::NOTES);

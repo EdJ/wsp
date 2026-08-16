@@ -879,40 +879,6 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
         },
 
-        // ---- where this workspace belongs ----
-        //
-        // A pin says what a workspace *is*, and it is the top of the chain
-        // every other question resolves through: `wsp add` with no `-p` files
-        // here, `wsp where` answers with it, `f` sends an agent looking here.
-        // It outranks the claim and the cwd beneath it, which is the point —
-        // five workspaces can share one checkout, so where a pane is standing
-        // was never going to identify a project on its own.
-        //
-        // Toggling, like `!`, and for the same reason: one per workspace, so
-        // the key that sets it is the only key there is to take it off, and a
-        // second press has to mean something. Pressed on a *different* project
-        // it moves the pin rather than refusing — there is nothing to refuse,
-        // the answer to "which project is this workspace" is simply now that
-        // one — and the mark moving from one row to the other says so.
-        Key::Char('p') => match (&target, ui.self_ws.clone()) {
-            (Target::Project(_) | Target::Inbox | Target::Task(_) | Target::Pane(_), None) => {
-                say(ui, "no workspace of our own to pin");
-                Effect::None
-            }
-            (Target::Project(p), Some(ws)) => {
-                let argv = if ui.pinned.as_deref() == Some(p.as_str()) {
-                    vec!["unpin".into(), "-w".into(), ws]
-                } else {
-                    vec!["pin".into(), p.clone(), "-w".into(), ws]
-                };
-                Effect::Run { argv, escalate: None, then: None }
-            }
-            _ => {
-                say(ui, "a pin names a project · wsp pin --top for none");
-                Effect::None
-            }
-        },
-
         // ---- pop out, full size, in an editor ----
         Key::Char('E') => match &target {
             // `wsp edit`, not the file: it opens the prose and keeps the
