@@ -26,6 +26,7 @@ mod kanban;
 mod model;
 mod overlap;
 mod panel;
+mod place;
 mod resolve;
 mod story;
 mod store;
