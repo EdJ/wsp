@@ -234,7 +234,7 @@ pub fn has_section(body: &str, name: &str) -> bool {
 /// worse failure than any it prevents.
 pub fn set_section_in(body: &mut String, name: &str, text: &str) {
     let mut secs = split_sections(body);
-    let text = text.trim_end().to_string();
+    let text = demote_headings(text.trim_end());
     match secs.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         Some(slot) => slot.1 = text,
         None if !text.trim().is_empty() => secs.push((name.to_string(), text)),
@@ -242,15 +242,25 @@ pub fn set_section_in(body: &mut String, name: &str, text: &str) {
     }
     secs.retain(|(n, t)| !(n.is_empty() && t.trim().is_empty()));
 
+    // `Log` last, whatever else the body is carrying. Everything that appends
+    // to it writes to the end of the body, so a heading sorted after it stops
+    // being a heading in a file and starts being a hole: three log lines on
+    // t-260816-012 went under `## Not doing`, where nothing would ever read
+    // them, and nothing failed while it happened. A heading the schema does not
+    // know about is still kept — losing prose nobody anticipated would be a
+    // worse failure — but it is kept *before* the log.
     let rank = |n: &str| -> usize {
         if n.is_empty() {
             return 0;
+        }
+        if n.eq_ignore_ascii_case("Log") {
+            return SECTIONS.len() + 1;
         }
         SECTIONS
             .iter()
             .position(|s| s.eq_ignore_ascii_case(n))
             .map(|i| i + 1)
-            .unwrap_or(SECTIONS.len() + 1)
+            .unwrap_or(SECTIONS.len())
     };
     secs.sort_by_key(|(n, _)| rank(n));
 
@@ -269,6 +279,157 @@ pub fn set_section_in(body: &mut String, name: &str, text: &str) {
         out.push('\n');
     }
     *body = out;
+}
+
+/// The `## ` headings a chunk of markdown carries, in the order it carries
+/// them.
+pub fn headings(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("## "))
+        .map(|h| h.trim().to_string())
+        .collect()
+}
+
+/// The headings in a body that the schema does not know about.
+///
+/// What [`fold_stray_sections`] repairs, and what a writer is told it sent.
+pub fn stray_sections(body: &str) -> Vec<String> {
+    headings(body)
+        .into_iter()
+        .filter(|n| !SECTIONS.iter().any(|s| s.eq_ignore_ascii_case(n)))
+        .collect()
+}
+
+/// Demote `## ` headings inside a section's own text to `###`.
+///
+/// The payload handed to [`set_section_in`] is the *inside* of one section, so
+/// a `## ` line in it is not a heading in that section — it is a sibling
+/// section, and that is how it comes back out of [`split_sections`] next time
+/// the file is read. A long brief written into `--overview` therefore came
+/// apart into six top-level sections, and because `split_sections` rightly
+/// keeps every heading it does not recognise, rewriting the same brief added a
+/// second copy of all of them rather than replacing them.
+///
+/// Demoting rather than refusing, because `## ` is simply what you type when
+/// you are writing a section of prose, and the person writing it is thinking
+/// about the content and not about this parser. Knowing about the defect was
+/// not enough to avoid it: the agent that filed it hit it again the same day.
+/// The prose and its structure both survive; only the level changes.
+///
+/// Fenced code is not special-cased, deliberately. `split_sections` does not
+/// look at fences either, so demoting exactly what it would read as a heading
+/// is what keeps a body round-tripping — a rule that disagreed with the parser
+/// would leave the damage it is here to prevent.
+pub fn demote_headings(text: &str) -> String {
+    if !text.lines().any(|l| l.starts_with("## ")) {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            out.push('#');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+/// Fold headings the schema does not know about back into the prose they were
+/// written as part of, and put `Log` back last. `None` when there is nothing
+/// to repair.
+///
+/// For bodies written before [`set_section_in`] demoted them. There is no other
+/// way back out: no command deletes a section it does not know about, so a task
+/// damaged this way could only be repaired through `--raw` and an editor.
+///
+/// Which section a stray belonged to is not recoverable from the file — the
+/// canonical sort has already moved it — so it is read off document order, and
+/// only from the two sections a payload is ever written into. A stray sitting
+/// after `Decisions` or `Log` is there because the sort put it there, not
+/// because anyone wrote it there, and the brief it came from was the last
+/// `Overview` or `Details` above it.
+pub fn fold_stray_sections(body: &str) -> Option<String> {
+    if stray_sections(body).is_empty() {
+        return None;
+    }
+    let secs = split_sections(body);
+    let known = |n: &str| SECTIONS.iter().any(|s| s.eq_ignore_ascii_case(n));
+    let last = secs.len() - 1;
+    let logged_before_end = secs
+        .iter()
+        .position(|(n, _)| n.eq_ignore_ascii_case("Log"))
+        .is_some_and(|i| i < last);
+
+    let mut kept: Vec<(String, String)> = Vec::new();
+    let mut host: Option<usize> = None;
+    for (i, (name, text)) in secs.into_iter().enumerate() {
+        if name.is_empty() || known(&name) {
+            kept.push((name.clone(), text));
+            if ["Overview", "Details"].iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                host = Some(kept.len() - 1);
+            }
+            continue;
+        }
+        // Only the last section can have swallowed log lines: `Task::log`
+        // appends to the end of the body, and only ever the end.
+        let (text, dated) = match i == last && logged_before_end {
+            true => peel_trailing_dated(&text),
+            false => (text, Vec::new()),
+        };
+        if !dated.is_empty() {
+            if let Some(log) = kept.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case("Log")) {
+                log.1 = format!("{}\n{}", log.1.trim_end(), dated.join("\n"));
+            }
+        }
+        // Blank lines off the front, and not a character more: the first line
+        // of a section is as often an indented block as it is a sentence, and
+        // `trim` would quietly unindent it.
+        let folded = format!("### {name}\n\n{}", text.trim_start_matches('\n').trim_end());
+        match host {
+            Some(h) => {
+                let into = &mut kept[h].1;
+                *into = format!("{}\n\n{folded}", into.trim_end());
+            }
+            None => {
+                kept.insert(0, ("Overview".to_string(), folded));
+                host = Some(0);
+            }
+        }
+    }
+
+    let mut out = String::new();
+    for (name, text) in kept {
+        set_section_in(&mut out, &name, &text);
+    }
+    Some(out)
+}
+
+/// Split off the run of dated entries at the end of a section's text.
+///
+/// Everything that appends to the log writes `- <date> …` at the end of the
+/// body, so when a stray heading was sorted after `## Log` the entries written
+/// since are exactly that: dated lines, at the end, under prose that is not
+/// dated. That is enough to give them back.
+fn peel_trailing_dated(text: &str) -> (String, Vec<String>) {
+    let dated = |l: &str| match l.trim().strip_prefix("- ").and_then(|r| r.split_once(' ')) {
+        Some((d, _)) => d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'),
+        None => false,
+    };
+    let mut lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    while let Some(l) = lines.last() {
+        if l.trim().is_empty() {
+            lines.pop();
+        } else if dated(l) {
+            out.push(l.trim().to_string());
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+    out.reverse();
+    (lines.join("\n").trim_end().to_string(), out)
 }
 
 /// True when any written section carries anything — what the tree uses to mark
@@ -397,20 +558,14 @@ impl Task {
     }
 
     /// Append a timestamped line under a `## Log` heading.
+    ///
+    /// Through [`append_dated`] rather than by writing to the end of the body,
+    /// which is the same thing only while `Log` is last. In a body carrying a
+    /// heading the schema does not know about it was not, and every entry
+    /// written went under that heading instead — a log that had stopped being
+    /// the log without anything failing.
     pub fn log(&mut self, line: &str) {
-        let stamp = util::today_ymd();
-        if !self.body.contains("## Log") {
-            if !self.body.is_empty() && !self.body.ends_with('\n') {
-                self.body.push('\n');
-            }
-            if !self.body.is_empty() {
-                self.body.push('\n');
-            }
-            self.body.push_str("## Log\n");
-        } else if !self.body.ends_with('\n') {
-            self.body.push('\n');
-        }
-        self.body.push_str(&format!("- {stamp} {line}\n"));
+        append_dated(&mut self.body, "Log", line);
     }
 
     /// The text under `## <name>`, heading excluded.
@@ -712,6 +867,66 @@ mod tests {
         let round = Machine::from_doc(&fm::parse(&Machine::new("mb2", "mac-mini").render()), "ignored");
         assert_eq!(round.ssh, "mac-mini", "an alias that was given is kept");
         assert_eq!(round.name, "mb2");
+    }
+
+    /// The defect this file was fixed for. A brief with its own `## ` headings
+    /// is one section's text, and storing it verbatim makes it six.
+    #[test]
+    fn a_headings_payload_stays_one_section_however_often_it_is_written() {
+        let brief = "what this is\n\n## The shape\n\nlike so\n\n## Open\n\nnot yet";
+        let mut b = String::new();
+        set_section_in(&mut b, "Overview", brief);
+        assert_eq!(headings(&b), ["Overview"], "one section, not three");
+        assert!(b.contains("### The shape"), "the structure is kept, one level down");
+
+        // Rewriting the same brief replaces it. Before, the second write left
+        // the sections of the first behind and added its own on the end.
+        let once = b.clone();
+        set_section_in(&mut b, "Overview", brief);
+        assert_eq!(b, once, "no second copy");
+    }
+
+    /// Everything that appends to the log writes to the end of the body, so a
+    /// heading sorted after it silently takes the entries.
+    #[test]
+    fn the_log_stays_last_whatever_else_the_body_carries() {
+        let mut b = String::from("## Overview\nwhat this is\n\n## Not doing\nthe other thing\n");
+        append_dated(&mut b, "Log", "claimed");
+        assert_eq!(headings(&b).last().unwrap(), "Log");
+
+        // And an entry lands in it even when it arrives out of order.
+        let mut t = Task::new("t", "t-1");
+        t.body = String::from("## Overview\nwhat this is\n\n## Log\n- 2026-08-15 claimed\n\n## Not doing\nthe other thing\n");
+        t.log("blocked");
+        assert!(section_of(&t.body, "Log").unwrap().contains("blocked"));
+        assert!(!section_of(&t.body, "Not doing").unwrap().contains("blocked"));
+    }
+
+    /// The repair. Which section a stray belonged to is read off document
+    /// order, from the sections a payload is written into — `Details` here.
+    #[test]
+    fn a_stray_section_folds_back_into_the_prose_above_it() {
+        let b = "## Overview\nshort\n\n## Details\nthe question\n\n## Answer\nno\n\n## Log\n- 2026-08-15 claimed\n";
+        let got = fold_stray_sections(b).expect("something to fold");
+        assert_eq!(headings(&got), ["Overview", "Details", "Log"]);
+        assert!(section_of(&got, "Details").unwrap().contains("### Answer"));
+        assert!(section_of(&got, "Overview").unwrap().trim() == "short", "not the nearest, the right one");
+        assert!(fold_stray_sections(&got).is_none(), "and it is idempotent");
+    }
+
+    /// A stray sorted after `## Log` is there because the sort put it there, so
+    /// it belongs to `Overview` — and the dated lines appended into it since
+    /// belong back in the log.
+    #[test]
+    fn entries_swallowed_by_a_displaced_heading_come_back() {
+        let b = "## Overview\nthe brief\n\n## Log\n- 2026-08-15 claimed\n\n## The shape\nlike so\n- 2026-08-16 → todo\n";
+        let got = fold_stray_sections(b).expect("something to fold");
+        assert_eq!(headings(&got), ["Overview", "Log"]);
+        let log = section_of(&got, "Log").unwrap();
+        assert!(log.contains("2026-08-15 claimed") && log.contains("2026-08-16 → todo"));
+        let overview = section_of(&got, "Overview").unwrap();
+        assert!(overview.contains("### The shape") && overview.contains("like so"));
+        assert!(!overview.contains("→ todo"), "the entry is not left in the prose as well");
     }
 
     /// `Log` is append-only and belongs to `wsp note`, so it is not offered to

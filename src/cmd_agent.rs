@@ -2270,6 +2270,8 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    section_damage(store, args, &tasks, &index.projects, &mut problems, &mut notes);
+
     if herdr::available() {
         match herdr::agents() {
             Ok(agents) => {
@@ -2303,6 +2305,113 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         0
     } else {
         1
+    }
+}
+
+/// Bodies carrying headings the schema does not know about — reported always,
+/// repaired with `--fix`.
+///
+/// `wsp edit --overview` used to store a payload's own `## ` headings verbatim,
+/// and the next read took them for sibling sections. Three things follow, in
+/// order of how much they cost: the body is split into sections nobody wrote;
+/// rewriting the same brief adds a second copy of all of them, because
+/// `split_sections` rightly keeps every heading it does not recognise; and once
+/// one of them sorts after `## Log`, every entry appended since has gone under
+/// it, where nothing will ever read it.
+///
+/// The write no longer does that. This is for the bodies written before it
+/// stopped — and there is no other way back, since no command deletes a section
+/// it does not know about.
+fn section_damage(
+    store: &Store,
+    args: &Args,
+    tasks: &[Task],
+    projects: &[crate::model::Project],
+    problems: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    let fix = args.has("fix");
+    let mut swallowing: Vec<String> = Vec::new();
+    let mut split: Vec<String> = Vec::new();
+    let mut fixed: Vec<String> = Vec::new();
+
+    let bodies: Vec<(&str, &str, &str)> = tasks
+        .iter()
+        .map(|t| ("task", t.id.as_str(), t.body.as_str()))
+        .chain(projects.iter().map(|p| ("project", p.id.as_str(), p.body.as_str())))
+        .collect();
+
+    for (what, id, body) in bodies {
+        if crate::model::stray_sections(body).is_empty() {
+            continue;
+        }
+        // A displaced log is the half that is actively losing entries; the rest
+        // is a body that reads oddly and would duplicate on the next rewrite.
+        let heads = crate::model::headings(body);
+        match heads.iter().any(|h| h == "Log") && heads.last().map(|h| h.as_str()) != Some("Log") {
+            true => swallowing.push(id.to_string()),
+            false => split.push(id.to_string()),
+        }
+        if !fix {
+            continue;
+        }
+        // Folded from the copy on disk rather than the one scanned above. The
+        // store is shared and a repair pass over thirty files takes long enough
+        // for a note or a claim to land in the middle of it; folding what was
+        // read at the start would write that away again.
+        let fresh = match what {
+            "project" => store.project(id).map(|p| p.body),
+            _ => store.task(id).map(|t| t.body),
+        };
+        let Some(fresh) = fresh else {
+            problems.push(format!("{what} {id} disappeared while repairing it"));
+            continue;
+        };
+        // Nothing left to fold means somebody else got there first.
+        let Some(folded) = crate::model::fold_stray_sections(&fresh) else {
+            continue;
+        };
+        let saved = match what {
+            "project" => store.project(id).map(|mut p| {
+                p.body = folded;
+                store.save_project(&p)
+            }),
+            _ => store.task(id).map(|mut t| {
+                t.body = folded;
+                // The fold moves prose, and lifts swallowed entries back into
+                // the log. A change to a body that nobody can see afterwards is
+                // the failure this whole task is about, so it says so in the
+                // one place that is read for that.
+                t.log("sections folded back under the prose they were written in (`wsp doctor --fix`)");
+                store.save_task(&t)
+            }),
+        };
+        match saved {
+            Some(Ok(())) => fixed.push(id.to_string()),
+            Some(Err(e)) => problems.push(format!("{what} {id}: write failed: {e}")),
+            None => problems.push(format!("{what} {id} disappeared while repairing it")),
+        }
+    }
+
+    let list = |ids: &[String]| ids.join(", ");
+    if !fixed.is_empty() {
+        store.log_event("sections-folded", json!({ "ids": fixed }));
+        store.git_commit("wsp: fold stray sections back into the prose they belong to");
+        notes.push(format!("folded {} item(s): {}", fixed.len(), list(&fixed)));
+        return;
+    }
+    if !swallowing.is_empty() {
+        problems.push(format!(
+            "{} task(s) have a heading sorted after `## Log` and are swallowing log entries: {} — `wsp doctor --fix` folds them back",
+            swallowing.len(),
+            list(&swallowing)
+        ));
+    }
+    if !split.is_empty() {
+        notes.push(format!(
+            "{} item(s) carry headings outside the schema — harmless until the next `--overview` rewrite duplicates them; `wsp doctor --fix` folds them back",
+            split.len()
+        ));
     }
 }
 

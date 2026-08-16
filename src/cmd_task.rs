@@ -1133,6 +1133,24 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
             text
         }
     };
+    // A `## ` heading in a *section's* payload is not a heading in that
+    // section — the next read takes it for a sibling section, and the rewrite
+    // after that adds a second copy of it. `set_section_in` demotes it either
+    // way; doing it here as well is what lets the comparison below see the
+    // second write of the same brief as the no-op it is, and what lets the
+    // writer be told rather than left to find out from the file.
+    //
+    // The combined buffer is exempt: there `## ` is the section separator, and
+    // demoting it would merge every section into the first.
+    let demoted = match one {
+        Some(_) => crate::model::headings(&after),
+        None => Vec::new(),
+    };
+    let after = match one {
+        Some(_) => crate::model::demote_headings(&after),
+        None => after,
+    };
+
     // Trailing whitespace is not an edit. It matters more than it sounds:
     // prose arriving from a file rather than an editor differs by a newline
     // often enough that an agent rewriting the same brief would otherwise
@@ -1253,9 +1271,20 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
     store.git_commit(&format!("wsp: edit {} {}", item.what, item.id));
 
     if args.json() {
-        println!("{}", json!({ "id": item.id, "edited": one.unwrap_or("body") }));
+        println!(
+            "{}",
+            json!({ "id": item.id, "edited": one.unwrap_or("body"), "demoted": demoted })
+        );
     } else {
         println!("edited {}", item.id);
+        if !demoted.is_empty() {
+            eprintln!(
+                "wsp: {} `##` heading{} demoted to `###` — the payload is one section's text: {}",
+                demoted.len(),
+                if demoted.len() == 1 { "" } else { "s" },
+                demoted.join(", ")
+            );
+        }
     }
     0
 }
