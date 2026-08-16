@@ -870,6 +870,68 @@ pub struct Reconciled {
 /// *pane* is an accident of process lifetime and must stand, and a daemon
 /// starting before herdr has finished restoring a session would otherwise read
 /// a half-built world as a mass closure.
+/// The machine an id sits on, as a map key: `""` for this seat, the `@mb2`
+/// suffix for anywhere else.
+///
+/// A thin skin on [`herdr::split_host`], which is the one place that suffix
+/// means anything. Here so the two sides of the guard below are keyed the same
+/// way without either of them spelling out the rule.
+///
+/// The *id* and not the claim's `host` field, deliberately. `host` is
+/// `hostname()` as the process that wrote the claim saw it — and an agent on
+/// an executor runs a `wsp` shim that executes on the seat, so its claims
+/// record the seat's hostname and `host` cannot tell the machines apart. The
+/// workspace id can: it comes back from that machine's own herdr already
+/// qualified. The id is the routing key everywhere else in this design; it is
+/// the routing key here too.
+fn machine_of(id: &str) -> &str {
+    herdr::host_of(id).unwrap_or("")
+}
+
+/// Which machines actually answered, and with how many workspaces.
+///
+/// **The judgement the whole reap turns on: unreachable is not empty.**
+///
+/// `reconcile --reap` ends a claim whose workspace is gone, and a machine that
+/// is merely unreachable reports no workspaces — which looks exactly like a
+/// machine with nothing running on it. Reaped on that basis, the first network
+/// blip hands back every task an executor is holding, kills the claims, and
+/// leaves real agents working on tasks that no longer know about them.
+///
+/// So a machine must have been *heard from* before anything it holds is
+/// touched: present in this map, which it only ever is by having reported a
+/// workspace. Absent covers all three ways of saying nothing — unreachable,
+/// answering-but-empty, and never asked — and none of them is evidence that
+/// the work stopped.
+///
+/// This generalises the check that used to sit at the top of the reap as
+/// `if reap && !workspaces.is_empty()`, which made exactly this judgement, for
+/// exactly this reason, on the one machine there was. Widening it rather than
+/// adding a second test beside it: two rules for "is this machine answering"
+/// is how they drift apart, and the one that drifts is the one that reaps.
+///
+/// Today every workspace is local, so this is one entry keyed `""` and the
+/// behaviour is unchanged. When `workspaces()` fans out across machines
+/// (t-260816-037) the ids come back `@machine`-qualified and this partitions
+/// itself, with no further change here.
+fn answered_by_machine(workspaces: &[herdr::Workspace]) -> std::collections::BTreeMap<&str, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for w in workspaces {
+        *out.entry(machine_of(&w.id)).or_insert(0) += 1;
+    }
+    out
+}
+
+/// Whether the machine this claim sits on has said enough to be believed.
+///
+/// The one line standing between a network blip and every task an executor
+/// holds being handed back. Silence — unreachable, answering with nothing, or
+/// never asked — is not the same as "the work stopped", and only the machine
+/// that spoke gets its claims examined.
+fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, workspace_id: &str) -> bool {
+    answered.contains_key(machine_of(workspace_id))
+}
+
 pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
     let mut out = Reconciled::default();
     let claims = store.claims();
@@ -880,12 +942,14 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
     let workspaces = herdr::workspaces().unwrap_or_default();
     let host = util::hostname();
 
-    // Nothing at all is a herdr that is not answering properly, not a machine
-    // with no workspaces on it: there is one open to have asked from.
-    if reap && !workspaces.is_empty() {
+    if reap {
+        let answered = answered_by_machine(&workspaces);
         for (task_id, c) in &claims {
             let get = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("");
             if !get("host").is_empty() && get("host") != host {
+                continue;
+            }
+            if !may_reap(&answered, get("workspace_id")) {
                 continue;
             }
             let alive = workspaces.iter().any(|w| {
@@ -2065,6 +2129,60 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ws(id: &str) -> herdr::Workspace {
+        herdr::Workspace { id: id.into(), ..Default::default() }
+    }
+
+    /// The correctness hazard the executor design is built around, at the one
+    /// line that decides it.
+    ///
+    /// A machine that is merely unreachable reports no workspaces, which reads
+    /// exactly like a machine with nothing running on it. Reaped on that
+    /// basis, one dropped link hands back every task the executor is holding
+    /// while its agents carry on working on tasks that no longer know about
+    /// them. So a machine has to have been heard from first.
+    #[test]
+    fn a_machine_that_said_nothing_keeps_its_claims() {
+        // The seat answered; mb2 did not — an offline executor, or one whose
+        // tunnel is down, or one nobody asked.
+        let seat_only = [ws("w0"), ws("w1")];
+        let answered = answered_by_machine(&seat_only);
+
+        assert!(may_reap(&answered, "w9"), "a workspace gone from a machine that answered");
+        assert!(!may_reap(&answered, "w0@mb2"), "silence from mb2 is not mb2 being empty");
+
+        // And once it does answer, its claims are examined like anyone else's.
+        let spoke = [ws("w0"), ws("w0@mb2")];
+        let both = answered_by_machine(&spoke);
+        assert!(may_reap(&both, "w9@mb2"));
+        assert!(may_reap(&both, "w9"));
+    }
+
+    /// The generalisation, not a second rule beside the old one: `reap` used to
+    /// refuse outright when herdr answered with nothing at all, for exactly
+    /// this reason, on the one machine there was. That case still holds.
+    #[test]
+    fn a_herdr_answering_with_nothing_still_reaps_nothing() {
+        let answered = answered_by_machine(&[]);
+        assert!(!may_reap(&answered, "w0"));
+        assert!(!may_reap(&answered, ""), "a claim too old to carry a workspace id either");
+    }
+
+    /// The claim's `host` field cannot key this. An agent on an executor runs a
+    /// `wsp` shim that executes on the seat, so its claims record the *seat's*
+    /// hostname; the workspace id is the only thing that came back from the far
+    /// machine, and it comes back qualified.
+    #[test]
+    fn the_machine_is_read_off_the_id_and_a_bare_id_is_this_one() {
+        assert_eq!(machine_of("w0:p3@mb2"), "mb2");
+        assert_eq!(machine_of("w0:p3"), "", "a local id stays bare, and keys as this seat");
+        assert_eq!(machine_of(""), "");
+        // A colon is inside a pane id, not a separator — hence `@`.
+        assert_eq!(herdr::split_host("w0:p3@mb2"), ("w0:p3", Some("mb2")));
+        assert_eq!(herdr::split_host("w0:p3"), ("w0:p3", None));
+        assert_eq!(herdr::split_host("w0@"), ("w0@", None), "a trailing @ names no machine");
+    }
 
     /// The shape that cost the first half hour of this command: a wrapped
     /// payload read flat gives `""`, which looks exactly like a pane with

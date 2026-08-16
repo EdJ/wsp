@@ -31,6 +31,32 @@ pub fn available() -> bool {
     socket_path().exists()
 }
 
+/// Take a host-qualified id apart: `w0:p3@mb2` is pane `w0:p3` on machine
+/// `mb2`, and a bare `w0:p3` is here.
+///
+/// **The only place `@` means anything.** herdr has no concept of a host — one
+/// server is one machine — so wsp spans machines by qualifying the id and
+/// routing on it, and "which machine is this id on" answered in two places is
+/// the bug that design exists to avoid. Everything that needs the answer, from
+/// picking a socket to deciding whose claims may be reaped, comes here.
+///
+/// `@` and not `:`, because a herdr pane id already contains a colon: `w0:p3`
+/// is one id, not two. Split from the right for the same reason.
+///
+/// A bare id is this machine and stays bare, which is what lets every existing
+/// call site, state file and claim go on working untouched.
+pub fn split_host(id: &str) -> (&str, Option<&str>) {
+    match id.rsplit_once('@') {
+        Some((bare, machine)) if !machine.is_empty() => (bare, Some(machine)),
+        _ => (id, None),
+    }
+}
+
+/// The machine an id names, or `None` for this one.
+pub fn host_of(id: &str) -> Option<&str> {
+    split_host(id).1
+}
+
 fn connect(timeout: Option<Duration>) -> std::io::Result<UnixStream> {
     let s = UnixStream::connect(socket_path())?;
     s.set_read_timeout(timeout)?;
