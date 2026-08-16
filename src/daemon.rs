@@ -86,6 +86,63 @@ fn reload(verbose: bool) -> std::io::Error {
     c.exec()
 }
 
+
+/// Machines we already have an event reader thread for. Each thread puts its
+/// own name in and takes it out again on the way past, so the tick can tell
+/// "already watching" from "needs watching" without keeping a handle.
+type Readers = std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
+
+/// Start an event reader for every reachable machine that has not got one.
+///
+/// Started here rather than by the supervisor because the supervisor holds
+/// connections and this holds a subscription to the far end of one: it is only
+/// worth starting once the tunnel is up and answering, which is precisely what
+/// the supervisor has just decided.
+///
+/// The thread owns its own lifetime. It re-subscribes when a stream ends — a
+/// far herdr restarting, or a tunnel dropping — and gives up only when the
+/// machine has gone from the store or been retired, which is the one condition
+/// under which nobody wants it back.
+fn watch_machines(
+    tunnels: &Supervisor,
+    readers: &Readers,
+    tx: &mpsc::Sender<()>,
+    verbose: bool,
+) {
+    for name in tunnels.reachable() {
+        {
+            let mut held = readers.lock().unwrap_or_else(|e| e.into_inner());
+            if !held.insert(name.clone()) {
+                continue;
+            }
+        }
+        if verbose {
+            eprintln!("wsp daemon: watching {name}");
+        }
+        let readers = readers.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                // Retired or removed is the only way out. Unreachable is not:
+                // the machine is expected back, and giving up on it here would
+                // leave it silent until something else happened to restart us.
+                let store = Store::open();
+                if !store.machine(&name).map(|m| m.is_active()).unwrap_or(false) {
+                    break;
+                }
+                let tx2 = tx.clone();
+                let res =
+                    herdr::subscribe_on(Some(&name), EVENTS, move |_e, _d| tx2.send(()).is_ok());
+                std::thread::sleep(match res {
+                    Err(_) => Duration::from_secs(5),
+                    Ok(()) => Duration::from_millis(500),
+                });
+            }
+            readers.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
+        });
+    }
+}
+
 pub fn run(store: &Store, verbose: bool) -> i32 {
     if !herdr::available() {
         eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
@@ -93,6 +150,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     }
 
     let (tx, rx) = mpsc::channel::<()>();
+    let far = tx.clone();
 
     // Event reader. If the server restarts the stream ends; we retry rather
     // than exiting, because herdr restarts this daemon only on its own restart.
@@ -105,6 +163,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             std::thread::sleep(Duration::from_millis(500));
         }
     });
+
+    // One more reader per executor, feeding the same channel. Which machine
+    // woke us does not matter — only that something did — so the join is the
+    // channel, exactly where it already was.
+    let readers: Readers = Default::default();
 
     let mut cache = Cache::default();
     // Every executor's herdr socket, held open on this machine. Inert until
@@ -183,6 +246,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // fell over five minutes ago must not wait for a sidebar hover to be
         // noticed.
         let moved = tunnels.tick(store);
+        watch_machines(&tunnels, &readers, &far, verbose);
         if verbose && !moved.is_empty() {
             for name in &moved {
                 match store.machine_live(name) {

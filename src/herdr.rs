@@ -129,10 +129,6 @@ fn socket_for(machine: Option<&str>) -> PathBuf {
     }
 }
 
-fn connect(timeout: Option<Duration>) -> std::io::Result<UnixStream> {
-    connect_to(&socket_path(), timeout)
-}
-
 fn connect_to(path: &std::path::Path, timeout: Option<Duration>) -> std::io::Result<UnixStream> {
     let s = UnixStream::connect(path)?;
     s.set_read_timeout(timeout)?;
@@ -243,20 +239,105 @@ pub struct Pane {
     pub session_id: String,
 }
 
-pub fn workspaces() -> std::io::Result<Vec<Workspace>> {
-    let r = call("workspace.list", json!({}))?;
+/// Stamp a machine onto an id, on the way in.
+///
+/// Everything that enters wsp from a far herdr is qualified at the door, so
+/// that from the moment it exists here it is already routable and every
+/// downstream consumer — the panel, the detail view, `sync`, a claim written to
+/// disk — is unchanged. An id qualified later is an id that spent some time
+/// unable to say where it came from, and the places it can be lost in between
+/// are every place it is copied.
+///
+/// An empty id stays empty. A pane with no workspace is a pane with no
+/// workspace, not one belonging to `@mb2`.
+fn qualify(id: &mut String, machine: &str) {
+    if !id.is_empty() {
+        id.push('@');
+        id.push_str(machine);
+    }
+}
+
+/// The machines to ask, besides this one.
+///
+/// Active, and last seen answering. Skipping the rest is not a second opinion
+/// on reachability — it is *using* the daemon's, which is what that field is
+/// for. It matters because a machine whose tunnel is up but whose far end has
+/// wedged costs a full timeout on every call, and this is on the path the panel
+/// takes to draw a frame.
+///
+/// A store read per call. Two directory reads when there are no machines, which
+/// is what every seat costs until somebody adds one.
+fn fanout() -> Vec<String> {
+    let store = crate::store::Store::open();
+    let live = store.machines_live();
+    store
+        .machines()
+        .into_iter()
+        .filter(|m| m.is_active())
+        .map(|m| m.name)
+        .filter(|n| live.get(n).map(|l| l.reachable).unwrap_or(false))
+        .collect()
+}
+
+/// Ask this machine, then every reachable one, and put the answers together.
+///
+/// **This machine's failure is an error and a far machine's is not.** A herdr
+/// that is not answering here is wsp having nothing to work with; a machine
+/// that has dropped off the tailnet is a partition, and a partition is not a
+/// failed sync. Turning one into the other would empty the panel every time a
+/// laptop closed — and, worse, would hand an empty list to the reap guard,
+/// which is exactly the confusion the guard exists to prevent.
+fn everywhere<T>(one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>) -> std::io::Result<Vec<T>> {
+    let mut out = one(None)?;
+    for m in fanout() {
+        if let Ok(mut more) = one(Some(&m)) {
+            out.append(&mut more);
+        }
+    }
+    Ok(out)
+}
+
+/// How long a machine gets to answer a listing.
+///
+/// This machine keeps [`call`]'s three seconds: a local `pane.list` that has
+/// gone quiet means wsp has nothing to work with, and shortening its patience
+/// would turn a busy herdr into an error where it used to be a wait. A far
+/// machine gets less, because a fan-out is on the path the panel takes to draw
+/// a frame and it waits on the slowest machine in it — and a machine that is
+/// slow to list its own panes over an established tunnel is better left out of
+/// this frame than made everybody else's problem.
+fn patience(machine: Option<&str>) -> Duration {
+    match machine {
+        None => Duration::from_secs(3),
+        Some(_) => Duration::from_millis(1500),
+    }
+}
+
+fn workspaces_on(machine: Option<&str>) -> std::io::Result<Vec<Workspace>> {
+    let r = call_on(machine, "workspace.list", json!({}), patience(machine))?;
     let arr = r.get("workspaces").and_then(|w| w.as_array()).cloned().unwrap_or_default();
     Ok(arr
         .iter()
-        .map(|w| Workspace {
-            id: sget(w, "workspace_id"),
-            label: sget(w, "label"),
-            number: w.get("number").and_then(|n| n.as_i64()).unwrap_or(0),
-            focused: w.get("focused").and_then(|b| b.as_bool()).unwrap_or(false),
-            agent_status: sget(w, "agent_status"),
-            tokens: w.get("tokens").cloned().unwrap_or(Value::Null),
+        .map(|w| {
+            let mut ws = Workspace {
+                id: sget(w, "workspace_id"),
+                label: sget(w, "label"),
+                number: w.get("number").and_then(|n| n.as_i64()).unwrap_or(0),
+                focused: w.get("focused").and_then(|b| b.as_bool()).unwrap_or(false),
+                agent_status: sget(w, "agent_status"),
+                tokens: w.get("tokens").cloned().unwrap_or(Value::Null),
+            };
+            if let Some(m) = machine {
+                qualify(&mut ws.id, m);
+            }
+            ws
         })
         .collect())
+}
+
+/// Every workspace on every machine, each one carrying where it is.
+pub fn workspaces() -> std::io::Result<Vec<Workspace>> {
+    everywhere(workspaces_on)
 }
 
 fn parse_pane(a: &Value) -> Pane {
@@ -282,18 +363,39 @@ fn parse_pane(a: &Value) -> Pane {
     }
 }
 
-/// Every pane herdr knows about, agent or not.
-pub fn panes() -> std::io::Result<Vec<Pane>> {
-    let r = call("pane.list", json!({}))?;
-    let arr = r.get("panes").and_then(|w| w.as_array()).cloned().unwrap_or_default();
-    Ok(arr.iter().map(parse_pane).collect())
+fn panes_on(machine: Option<&str>, method: &str, key: &str) -> std::io::Result<Vec<Pane>> {
+    let r = call_on(machine, method, json!({}), patience(machine))?;
+    let arr = r.get(key).and_then(|w| w.as_array()).cloned().unwrap_or_default();
+    Ok(arr
+        .iter()
+        .map(|a| {
+            let mut p = parse_pane(a);
+            if let Some(m) = machine {
+                // Every id on the record, not just the one it is named by. A
+                // pane whose own id said `@mb2` while its `workspace_id` did
+                // not would route itself correctly and route everything asked
+                // about its workspace to the wrong machine.
+                //
+                // `session_id` is not one: it is herdr's own agent-session
+                // handle, nothing routes on it, and it is only ever compared
+                // against another one read the same way.
+                qualify(&mut p.pane_id, m);
+                qualify(&mut p.workspace_id, m);
+                qualify(&mut p.tab_id, m);
+            }
+            p
+        })
+        .collect())
 }
 
-/// Only the panes running an agent.
+/// Every pane on every machine, agent or not.
+pub fn panes() -> std::io::Result<Vec<Pane>> {
+    everywhere(|m| panes_on(m, "pane.list", "panes"))
+}
+
+/// Only the panes running an agent — the same fan-out, one method along.
 pub fn agents() -> std::io::Result<Vec<Pane>> {
-    let r = call("agent.list", json!({}))?;
-    let arr = r.get("agents").and_then(|w| w.as_array()).cloned().unwrap_or_default();
-    Ok(arr.iter().map(parse_pane).collect())
+    everywhere(|m| panes_on(m, "agent.list", "agents"))
 }
 
 fn sget(v: &Value, key: &str) -> String {
@@ -377,12 +479,29 @@ pub fn report_pane_tokens(
 
 /// Blocking event stream. `f` is called per event with (event_name, data);
 /// returning false ends the subscription.
-pub fn subscribe<F>(types: &[&str], mut f: F) -> std::io::Result<()>
+pub fn subscribe<F>(types: &[&str], f: F) -> std::io::Result<()>
+where
+    F: FnMut(&str, &Value) -> bool,
+{
+    subscribe_on(None, types, f)
+}
+
+/// The same, from one named machine.
+///
+/// One stream per machine, and the daemon does not care which of them woke it —
+/// only that something did. So this stays a per-machine primitive and the
+/// joining happens at the channel, where it already happened.
+///
+/// The ids in an event are qualified on the way past, for the same reason the
+/// ids in a listing are: a caller acting on `pane_id` out of a `pane.exited`
+/// from `mb2` would otherwise act on this machine's pane of that name. The
+/// panel does exactly that.
+pub fn subscribe_on<F>(machine: Option<&str>, types: &[&str], mut f: F) -> std::io::Result<()>
 where
     F: FnMut(&str, &Value) -> bool,
 {
     let subs: Vec<Value> = types.iter().map(|t| json!({ "type": t })).collect();
-    let mut s = connect(None)?;
+    let mut s = connect_to(&socket_for(machine), None)?;
     let req = json!({
         "id": format!("wsp:sub:{}", util::epoch_nanos()),
         "method": "events.subscribe",
@@ -410,7 +529,16 @@ where
             ));
         }
         let Some(event) = v.get("event").and_then(|e| e.as_str()) else { continue };
-        let data = v.get("data").cloned().unwrap_or(Value::Null);
+        let mut data = v.get("data").cloned().unwrap_or(Value::Null);
+        if let (Some(m), Some(obj)) = (machine, data.as_object_mut()) {
+            for key in ID_KEYS {
+                if let Some(id) = obj.get(key).and_then(|v| v.as_str()) {
+                    let mut id = id.to_string();
+                    qualify(&mut id, m);
+                    obj.insert(key.to_string(), Value::String(id));
+                }
+            }
+        }
         if !f(event, &data) {
             break;
         }
@@ -456,6 +584,44 @@ impl Env {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    /// `WSP_STATE` and `HERDR_SOCKET_PATH` are process-wide, and cargo runs
+    /// tests in threads. Everything below that reaches for either takes this
+    /// first, so two of them cannot be halfway through setting up at once.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A herdr that is not herdr: answers `n` connections with `reply`, having
+    /// recorded what it was asked.
+    fn stand_in(
+        path: &std::path::Path,
+        n: usize,
+        reply: Value,
+    ) -> std::thread::JoinHandle<Vec<Value>> {
+        // A unix socket outlives the process that bound it, so the second
+        // stand-in on a path would otherwise fail as AddrInUse.
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..n {
+                let Ok((stream, _)) = listener.accept() else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    break;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap();
+                let out = json!({ "id": req["id"], "result": reply });
+                seen.push(req);
+                let mut stream = stream;
+                let _ = stream.write_all(format!("{out}\n").as_bytes());
+                let _ = stream.flush();
+            }
+            seen
+        })
+    }
 
     fn params(v: Value) -> (Option<String>, Value) {
         route(v).expect("routable")
@@ -509,6 +675,86 @@ mod tests {
         assert_eq!(p["task_id"], "t-260816-036");
     }
 
+    /// Two machines, one list, and the same id on both.
+    ///
+    /// `w0:p1` exists here *and* on mb2 — which is not a contrived case, since
+    /// herdr numbers workspaces and panes from zero on every machine it runs
+    /// on. Nothing but the qualification tells them apart, so if the fan-out
+    /// got it wrong the panel would draw one pane and every call about the
+    /// other would land on the wrong machine.
+    ///
+    /// The far machine's ids come back qualified all the way through the
+    /// record, not only in the field it is named by: a pane whose own id said
+    /// `@mb2` while its `workspace_id` did not would route itself correctly and
+    /// route everything asked about its workspace to this machine.
+    #[test]
+    fn two_machines_come_back_as_one_list_with_the_far_one_saying_so() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("wsp-fan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("sock")).unwrap();
+        std::fs::create_dir_all(root.join("wsp/machines")).unwrap();
+        std::env::set_var("WSP_HOME", root.join("wsp"));
+        std::env::set_var("WSP_STATE", &state);
+
+        // mb2 exists and the daemon last saw it answering. Both halves are
+        // needed: the fan-out asks the store what exists and state what is up.
+        std::fs::write(
+            root.join("wsp/machines/mb2.md"),
+            "---\nname: mb2\nssh: mb2\nstatus: active\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            state.join("machines.json"),
+            r#"{"mb2":{"reachable":true,"tunnel":"up"}}"#,
+        )
+        .unwrap();
+
+        let here = state.join("here.sock");
+        std::env::set_var("HERDR_SOCKET_PATH", &here);
+        let pane = |cwd: &str| {
+            json!({ "panes": [{ "pane_id": "w0:p1", "workspace_id": "w0", "tab_id": "t1", "cwd": cwd }] })
+        };
+        let local = stand_in(&here, 1, pane("/here"));
+        let far = stand_in(&state.join("sock").join("mb2.sock"), 1, pane("/there"));
+
+        let mut got = panes().expect("this machine answered, so the list is good");
+        let asked_far = far.join().unwrap();
+        local.join().unwrap();
+        got.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+
+        assert_eq!(got.len(), 2, "one from each machine");
+        assert_eq!(got[0].pane_id, "w0:p1");
+        assert_eq!(got[0].cwd, "/here");
+        assert_eq!(got[1].pane_id, "w0:p1@mb2", "the same id, and not the same pane");
+        assert_eq!(got[1].workspace_id, "w0@mb2", "every id on the record, not just its own");
+        assert_eq!(got[1].tab_id, "t1@mb2");
+        assert_eq!(got[1].cwd, "/there");
+
+        // And the far machine was asked its own question, not ours.
+        assert_eq!(asked_far[0]["method"], "pane.list");
+
+        // A machine that is no longer answering contributes nothing, and does
+        // not turn the whole list into an error. A partition is not a failed
+        // sync — and an empty list handed to the reap guard is the one thing
+        // this design must never produce.
+        let local = stand_in(&here, 1, pane("/here"));
+        let got = panes().expect("mb2 being gone is not this machine's problem");
+        local.join().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pane_id, "w0:p1");
+
+        // This machine failing *is* an error: there is nothing to work with.
+        std::env::set_var("HERDR_SOCKET_PATH", state.join("nothing-here.sock"));
+        assert!(panes().is_err());
+
+        std::env::remove_var("HERDR_SOCKET_PATH");
+        std::env::remove_var("WSP_STATE");
+        std::env::remove_var("WSP_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The end of the wire, with a real socket at the end of it.
     ///
     /// A stand-in herdr is bound at exactly the path the daemon's tunnel would
@@ -520,9 +766,7 @@ mod tests {
     /// One test, because it sets `WSP_STATE` for the process.
     #[test]
     fn a_qualified_id_arrives_at_that_machines_socket_and_nowhere_else() {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixListener;
-
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let state = std::env::temp_dir().join(format!("wsp-route-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(state.join("sock")).unwrap();

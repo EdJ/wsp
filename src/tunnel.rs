@@ -207,6 +207,19 @@ impl Supervisor {
         }
     }
 
+    /// The machines that are answering right now.
+    ///
+    /// Out of what this pass found rather than out of `machines.json`, because
+    /// the caller is the same tick that just wrote it and a read back would be
+    /// the same fact with a chance of being staler.
+    pub fn reachable(&self) -> Vec<String> {
+        self.tunnels
+            .iter()
+            .filter(|(_, t)| t.live.reachable)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Take every tunnel down. The daemon calls this before it `exec`s itself.
     pub fn shutdown(&mut self) {
         for t in self.tunnels.values_mut() {
