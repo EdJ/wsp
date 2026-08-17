@@ -62,7 +62,7 @@ pub enum Handover {
 pub fn claimed_text(task: &str, how: Handover) -> String {
     match how {
         Handover::Spawned => format!(
-            "You have been claimed onto {task}. Your brief is already above — the task, \
+            "You have been claimed onto {task}. Your brief is already above: the task, \
              what binds it, and what to read. Begin work when you're ready."
         ),
         Handover::Running => format!(
@@ -664,6 +664,29 @@ mod tests {
         let running = claimed_text("t-260815-033", Handover::Running);
         assert!(running.contains("t-260815-033"));
         assert!(running.contains("wsp brief --session"), "the whole payload in one call: {running}");
+    }
+
+    /// The work order is ASCII, and it is not a style rule.
+    ///
+    /// t-260817-004: a spawned agent sat with its work order typed into the
+    /// input box and never submitted. The pane had the text and the agent had
+    /// nothing to do, so `wsp wip` showed a healthy spawn doing no work — it
+    /// fails open, which is the worst way for the loop's start verb to fail.
+    /// The one thing that sentence had which every working one before it did
+    /// not was an em-dash.
+    ///
+    /// Asserted over both cases and over the whole string rather than the one
+    /// character, because the next well-meant curly quote or ellipsis costs
+    /// another unattended spawn to find. Ed's call, 2026-08-17: do not use them.
+    #[test]
+    fn the_work_order_is_ascii_because_a_spawn_once_hung_on_one_character() {
+        for how in [Handover::Spawned, Handover::Running] {
+            let text = claimed_text("t-260815-033", how);
+            assert!(
+                text.is_ascii(),
+                "non-ASCII in a work order, which is what t-260817-004 was: {text}"
+            );
+        }
     }
 
     /// The trim names what it takes away, and the names are the ones the work
