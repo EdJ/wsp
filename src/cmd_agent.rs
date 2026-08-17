@@ -162,7 +162,18 @@ pub fn current_project(
 }
 
 fn pane_id(args: &Args) -> Option<String> {
-    args.get("pane").or_else(|| herdr::Env::read().pane_id)
+    args.get("pane").or_else(my_pane)
+}
+
+/// Which seat this process is standing in, or none.
+///
+/// The one reading of it, so there is one place to change when a seat stops
+/// being a herdr pane: `place::SEAT_ENV` is the replacement and nothing sets it
+/// yet (`place_herdr` records why herdr cannot). Every agent-side verb — `claim`,
+/// `say`, `release` — is downstream of this, and so is `despawn`'s refusal to
+/// end the seat it is running in.
+pub(crate) fn my_pane() -> Option<String> {
+    herdr::Env::read().pane_id
 }
 
 /// The width every label wsp writes is cut to — the 44 characters `sync`
@@ -1436,14 +1447,35 @@ pub fn release(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no pane — pass --pane or run inside herdr");
         return 2;
     };
-    let had = store.bindings().get(&pane).cloned();
-    let removed = store.clear_binding(&pane);
+    let (removed, _task) = release_pane(store, &pane);
+    if args.json() {
+        println!("{}", json!({ "pane": pane, "released": removed }));
+    } else if removed {
+        println!("released {pane}");
+    } else {
+        println!("nothing bound to {pane}");
+    }
+    0
+}
+
+/// Drop a pane's binding and, with it, the claim it stood for.
+///
+/// The mechanism of `release` with no printing in it, because there are two
+/// callers and they say different things: this verb, and `wsp despawn`, which
+/// ends the seat first and then has to end the claim through exactly this path
+/// rather than a second copy of it. Returns whether there was a binding, and the
+/// task whose claim was ended.
+pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) {
+    let had = store.bindings().get(pane).cloned();
+    let mut released: Option<String> = None;
+    let removed = store.clear_binding(pane);
     if removed {
         if let Some(task_id) = had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
+            released = Some(task_id.to_string());
             // The name goes back before the log line does, and while the task
             // is still readable: `unname_after_task` needs the title to know
             // whether the label it is looking at is one we wrote.
-            unname_after_task(store, &pane, task_id);
+            unname_after_task(store, pane, task_id);
             // Releasing is a decision, so it clears the durable claim too —
             // unlike a pane exiting, which is only ever an accident of process
             // lifetime and must leave the intent standing. It ends the same way
@@ -1458,14 +1490,7 @@ pub fn release(store: &Store, args: &Args) -> i32 {
         let mut cache = sync::Cache::default();
         let _ = sync::sync(store, &mut cache, true);
     }
-    if args.json() {
-        println!("{}", json!({ "pane": pane, "released": removed }));
-    } else if removed {
-        println!("released {pane}");
-    } else {
-        println!("nothing bound to {pane}");
-    }
-    0
+    (removed, released)
 }
 
 pub fn pin(store: &Store, args: &Args) -> i32 {

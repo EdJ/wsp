@@ -39,6 +39,11 @@
 //! `detail/` bar one, so they are the arrange-panes port's herdr adapter rather
 //! than anything wsp needs from a backend.
 //!
+//! The split is between what wsp *means*, not between herdr methods:
+//! [`Place::stop`] and the arrange port's close are both `pane.close` on this
+//! backend, and are still two verbs, because one ends somebody's work and the
+//! other tidies a viewport. A method can serve both ports; a verb cannot.
+//!
 //! Reading is not here either. `pane.list`, `workspace.list`, `agent.list`,
 //! `agent.get`, `pane.read` and `events.subscribe` are the observe half, whose
 //! seam is `panel::Snapshot` and whose task is t-260816-059. [`Place::census`]
@@ -162,6 +167,40 @@
 //! does. Any backend must honour that window; it is wsp's ordering rule rather
 //! than herdr's shape.
 //!
+//! # Ending it: one verb here, and the claim released after it
+//!
+//! [`Place::stop`] is the other end of that sentence, and it was left out of the
+//! first cut of this file on the house rule that a verb with no caller is a tax.
+//! The caller exists: wsp puts agents on work one at a time, and a loop that can
+//! start work and not end it makes despawning part of the loop rather than an
+//! edge case. Measured the same evening, ending the agent that wrote this file:
+//! `wsp release --pane w26:p1` and then `herdr workspace close w26` — two
+//! commands, one of them not wsp. The coordination seat drops out of wsp and
+//! into the backend for the one verb wsp did not have.
+//!
+//! **The order is stop first, release last, and it is the reverse of what was
+//! done by hand.** Both halves can fail and the two failures are not
+//! comparable. A claim released against a seat that then refuses to close leaves
+//! the work looking unowned while an agent is still standing in it — and nothing
+//! catches that: `claim`'s live-holder guard reads bindings, so once the binding
+//! is gone it will hand the same task to a second agent without a word, which is
+//! two agents in one tree. A seat closed whose claim then fails to clear leaves
+//! a claim over a workspace that no longer exists, which is exactly the residue
+//! `reconcile --reap` exists to sweep. One failure has a sweeper and the other
+//! has a way of costing somebody a morning.
+//!
+//! **Ending a seat ends the claim, not just the binding.** A pane exiting is an
+//! accident of process lifetime and must leave the intent standing; this is a
+//! decision, and it ends the same way `release` does — the claim goes, and a
+//! `worked` record and a line in the task's log say who had it and for how long.
+//! Leaving the claim would also not be quiet: `reconcile` rebuilds a binding
+//! *from* a claim, so a claim left standing over a closed seat is one a later
+//! reconcile tries to bind an agent back onto.
+//!
+//! None of that is in this file. The port ends a seat; the claim is the caller's
+//! and lives in `cmd_spawn::despawn`, which is where the ordering above is
+//! carried out and where the store is the only thing that knows a claim exists.
+//!
 //! # What is deliberately absent
 //!
 //! - **`available()`.** It is a herdr question — is there a socket — and every
@@ -175,13 +214,12 @@
 //!   that brought it back is narrower than it looks — `show` is a fact about
 //!   *placing* work, and every other verb about what a screen looks like is
 //!   still the arrange-panes port's.
-//! - **`stop`.** wsp has never despawned anything. Both `pane.close` call sites
-//!   close wsp's *own* panes — the detail view (`panel/verbs.rs:673`) and the
-//!   board (`755`) — and no call site closes a workspace or kills an agent. A
-//!   verb with no caller is the tax this store keeps warning about, so it is
-//!   not in the trait. The trigger to add it is named rather than guessed: **a
-//!   supervisor that starts processes must be able to stop them**, so the first
-//!   TTY-less backend brings `stop` with it or leaks an agent per crash.
+//! - **`stop`** *was* absent, on the grounds that wsp had never despawned
+//!   anything, and the trigger named for adding it was the first TTY-less
+//!   backend. That was late rather than wrong: the caller was already there and
+//!   is `wsp despawn`, above. What has not changed is the rule — the next verb
+//!   will need a caller of its own, and this is not a licence to port the rest
+//!   of herdr's eighty-nine methods on the same reasoning.
 //! - **retries and timeouts.** `spawn` used to retry `agent_pane_busy` for five
 //!   seconds and retype with a `ctrl-u` after six, because herdr types the
 //!   agent's name at a shell prompt that may not be ready. That is a herdr shell
@@ -479,7 +517,7 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 
 /// Where wsp puts work.
 ///
-/// Six methods. Every one of them is a clause of the sentence at the top of
+/// Seven methods. Every one of them is a clause of the sentence at the top of
 /// this file, and nothing in any signature names a pane, a window, a tab or a
 /// terminal.
 ///
@@ -516,6 +554,24 @@ pub trait Place {
     /// keystrokes, and a backend with one should use its own submit rather than
     /// a sleep long enough for a TUI to finish pasting.
     fn tell(&self, seat: &Seat, text: &str) -> Result<()>;
+
+    /// End whatever agent is in a seat, and let the seat go.
+    ///
+    /// **Not the arrange-panes port's `close`.** They are spelled with the same
+    /// herdr method and they are not the same verb: this one ends somebody's
+    /// work, and that one tidies a viewport. A backend is entitled to implement
+    /// the two identically; a caller that confuses them shuts down an agent to
+    /// close a detail pane.
+    ///
+    /// One call, and it must be the whole of it — the agent, and the seat it was
+    /// standing in. A backend that can only stop the process leaves a seat wsp
+    /// will go on counting; one that can only drop the seat leaks the process.
+    ///
+    /// [`Refusal::NoSeat`] where there was nothing there. That is not a failure
+    /// to a caller whose aim is a seat that is gone — an agent whose backend
+    /// crashed under it is the ordinary case for this verb — so the caller
+    /// treats it as the first half already done, and goes on to the claim.
+    fn stop(&self, seat: &Seat) -> Result<()>;
 
     /// What is happening in one seat, right now.
     ///

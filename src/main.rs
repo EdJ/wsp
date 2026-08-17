@@ -311,6 +311,7 @@ fn main() {
         "sandbox" => cmd_sandbox::sandbox(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "spawn" => cmd_spawn::spawn(&store, &args),
+        "despawn" => cmd_spawn::despawn(&store, &args),
         "machine" | "machines" => cmd_machine::dispatch(&store, &args),
         "mandate" => cmd_mandate::mandate(&store, &args),
         "release" => cmd_agent::release(&store, &args),
@@ -427,8 +428,11 @@ fn help() {
                                     --on to run it on another machine, --full to
                                     start it with sub-agents, workflows and the
                                     MCP servers it is otherwise spawned without
+  wsp despawn <id> | --pane <seat>  the other end of it: end the agent working
+                                    that task, then release the claim — a seat
+                                    that will not close keeps its claim
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
-  wsp release                       unbind this pane
+  wsp release                       unbind this pane, leaving whatever is in it
   wsp pin <proj> [-w ws]            pin a workspace to a project
   wsp pin --top [-w ws]             pin it outside the tree entirely
   wsp unpin [-w ws]                 take the pin off again

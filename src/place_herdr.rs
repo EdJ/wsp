@@ -68,6 +68,31 @@
 //!    the caller that the agent exists when it returns, so [`Herdr::start`]
 //!    waits for it — and that wait is where the retype lives.
 //!
+//! # Ending a seat is `pane.close`, and the workspace goes with it
+//!
+//! herdr has no verb for *stop this agent*. Its eighty-nine methods can start
+//! one, prompt one, rename one and release wsp's authority over one, and the
+//! only thing that ends the process is taking its pane away. So
+//! [`Place::stop`] is `pane.close` on the seat — the one call, on the one id the
+//! port already holds, with no workspace to resolve first.
+//!
+//! Which is *not* what the two-command hand procedure did (`herdr workspace
+//! close w26`), and the difference is measured rather than argued. Recorded
+//! against a live herdr 0.7.5 in a sandbox session on 2026-08-17:
+//!
+//! - closing a pane kills what was running in it — a backgrounded child of the
+//!   pane's shell went with it, so the whole group goes;
+//! - closing the **last** pane of a workspace takes the workspace with it:
+//!   `workspace.list` came back empty. A seat wsp opened is a workspace's root
+//!   pane, so one `pane.close` is the whole of what two commands did by hand;
+//! - closing a pane that has siblings leaves the workspace and the siblings
+//!   standing. This is why the verb is not `workspace.close`: a seat is one
+//!   place an agent runs, and a backend asked to end one must not take down the
+//!   pane somebody else is reading beside it.
+//!
+//! `workspace_not_found` is therefore a code this file never has to read, and
+//! [`refusal`] does not know it: the id in hand is always a pane's.
+//!
 //! # What the caller stopped having to know
 //!
 //! - **A brand-new pane has no shell.** `agent.start` ten milliseconds after
@@ -421,6 +446,20 @@ impl Place for Herdr {
             .map_err(|e| refusal(seat, &e))
     }
 
+    /// Take the seat's pane away, which is the only thing herdr has that ends
+    /// an agent — and, when the seat is a workspace's last pane, ends the
+    /// workspace too. See the module docs for what was measured.
+    ///
+    /// [`herdr::call`]'s three seconds rather than [`SLOW`]: the two calls that
+    /// wait longer wait on something outside herdr — a shell coming up, an agent
+    /// answering a prompt — and this waits on herdr killing a process it owns.
+    /// Recorded answering immediately.
+    fn stop(&self, seat: &Seat) -> Result<()> {
+        herdr::call("pane.close", json!({ "pane_id": seat.as_str() }))
+            .map(|_| ())
+            .map_err(|e| refusal(seat, &e))
+    }
+
     fn state(&self, seat: &Seat) -> Result<State> {
         match look(seat)? {
             Some(a) => Ok(state_of_agent(&a)),
@@ -543,6 +582,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Ending a seat, and ending one that has already gone.
+    ///
+    /// The verb is one call and the interesting half is the second one: an agent
+    /// whose backend crashed under it is the ordinary case for `stop`, and the
+    /// caller has to be able to tell "there was nothing there" from "the backend
+    /// said no" — because it releases the claim on the first and must not on the
+    /// second. herdr spells both `pane_not_found`, which is the word [`refusal`]
+    /// already turns into [`Refusal::NoSeat`].
+    ///
+    /// What a socket cannot check is asserted in prose instead: that closing a
+    /// pane kills what was running in it, and takes the workspace with it when it
+    /// was the only pane, is recorded in the module docs from a live herdr — the
+    /// fake has no processes to kill.
+    #[test]
+    fn a_seat_that_is_ended_is_gone_and_ending_it_twice_is_not_a_failure() {
+        let _env = util::env_lock();
+        let (fake, dir) = bound(
+            "stop",
+            Stage::of(vec![
+                Spot::agent("w1:p1", "claude", "t-1", State::Idle).labelled("robustness/095"),
+                Spot::agent("w2:p1", "claude", "t-2", State::Working).labelled("robustness/094"),
+            ]),
+        );
+        let place = brisk();
+        let seat = Seat::new("w1:p1");
+
+        place.stop(&seat).expect("the seat was there");
+        assert!(fake.stage().find(&seat).is_none(), "the seat outlived its stop");
+        // Somebody else's seat is not swept up with it. On herdr this is why the
+        // verb is `pane.close` and not `workspace.close`.
+        assert_eq!(place.state(&Seat::new("w2:p1")).unwrap(), State::Working);
+
+        assert_eq!(place.stop(&seat), Err(Refusal::NoSeat(seat.clone())), "already gone");
+        assert_eq!(place.state(&seat), Err(Refusal::NoSeat(seat)));
+
+        std::env::remove_var("HERDR_SOCKET_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The bug this adapter exists to stop porting faithfully.
     ///
     /// herdr says `agent_status: "idle"` for the three seconds it takes a Claude
@@ -636,6 +714,10 @@ mod tests {
         assert!(matches!(place.state(&seat), Err(Refusal::Unreachable(_))));
         assert!(matches!(place.tell(&seat, "go"), Err(Refusal::Unreachable(_))));
         assert!(matches!(place.census(), Err(Refusal::Unreachable(_))), "an error is not an empty census");
+        // The one that costs something to get wrong: a backend that did not
+        // answer has not told us the seat is gone, and `despawn` releases a claim
+        // on `NoSeat` alone.
+        assert!(matches!(place.stop(&seat), Err(Refusal::Unreachable(_))));
 
         // A seat that is not there is a different sentence from a backend that
         // is not there, which is the distinction `available()` could not make.

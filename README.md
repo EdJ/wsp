@@ -67,6 +67,7 @@ wsp wip                     # every agent, its task, and who needs you
 wsp where                   # what project am I in, and why
 wsp overlap                 # who else is standing in this tree
 wsp spawn 003 --agent       # open a workspace on it and put an agent in it
+wsp despawn 003             # end that agent and release the claim
 ```
 
 ## The panel
@@ -1866,6 +1867,24 @@ agents herdr did not start and may not consider ready, and pays for it with two
 writes and a sleep between them. Here the readiness is established, so there is
 nothing to guess at.
 
+### Ending it
+
+```sh
+wsp despawn 033                    # end the agent working it, and put the work down
+wsp despawn --pane w26:p1          # …or name the seat, bound or not
+```
+
+What this replaces is two commands, one of which is not wsp: `wsp release --pane
+w26:p1` and then `herdr workspace close w26`. **Stop first, release last** — the
+reverse of the order it was done by hand, because the two failures are not
+comparable: a seat that will not close keeps its claim and says so, while a claim
+released over a live agent is handed straight to the next one. A seat that was
+*already* gone counts as done, since an agent whose backend died under it is the
+ordinary case for this verb. The argument in full, including why ending a seat
+ends the claim rather than only the binding, is in `src/place.rs`; under herdr the
+verb is `pane.close` on the seat, and `src/place_herdr.rs` records what was
+measured to choose it over `workspace.close`.
+
 ## Machines
 
 A second machine, driven from the one you are sitting at. Same projects, same
@@ -2415,7 +2434,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
-| `src/cmd_spawn.rs` | a workspace on a task, and an agent started in it |
+| `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |

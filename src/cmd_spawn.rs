@@ -17,6 +17,9 @@
 //!
 //! That order is also what lets the sentence stop asking for a brief: see
 //! [`Handover`], and what the agent is *not* handed is [`TRIM`].
+//!
+//! [`despawn`] is the other end of it, and its order is the reverse: the seat
+//! goes first and the claim last, for the reason `place.rs` gives.
 
 use std::time::{Duration, Instant};
 
@@ -470,6 +473,138 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// `wsp despawn` — end the agent on a piece of work, and put the work down.
+///
+/// The other end of [`spawn`], and the reason the port has a `stop` at all: a
+/// loop that starts agents one at a time and cannot end one makes despawning
+/// part of the loop rather than an edge case. What it replaces is two commands,
+/// one of which is not wsp:
+///
+///     wsp release --pane w26:p1     # drop the claim
+///     herdr workspace close w26     # kill the workspace
+///
+/// **Stop first, release last** — the reverse of that, and the argument for it is
+/// where the rule about the claim and the seat already lives, in `place.rs`. This
+/// is the half of it that is code: the claim is released only once the seat is
+/// gone, a seat that was *already* gone counts as gone, and a backend that did
+/// not answer is neither.
+///
+/// No guard on an agent that is busy, and that is a decision rather than an
+/// omission. `claim`'s live-holder guard protects you from a *third party* you
+/// may not have known was there; this verb is aimed at a seat by somebody who
+/// knows what is in it. What ending it costs is the session, not the work — the
+/// files in the tree are untouched — and the state it would refuse on is the one
+/// a wedged agent reads as, which is when you most want this.
+pub fn despawn(store: &Store, args: &Args) -> i32 {
+    end_work(&Herdr::new(), store, args, cmd_agent::my_pane().as_deref())
+}
+
+/// Which seat a despawn is about: the one named, or the one holding the task.
+///
+/// A task resolves through its *binding*, which is the only record that names a
+/// seat — a claim names a workspace, and the port cannot turn one into a seat
+/// (`place::Seated` does not say where a seat is). So a task whose binding has
+/// been lost, which is what a herdr restart leaves behind, is refused with the
+/// command that rebuilds it rather than a guess: `wsp reconcile` binds a claim
+/// back to a pane by label, and despawn works again afterwards.
+fn seat_of(store: &Store, args: &Args, index: &Index) -> Result<(Seat, Option<String>), String> {
+    let task_of = |seat: &str| {
+        store
+            .bindings()
+            .get(seat)
+            .and_then(|b| b.get("task_id"))
+            .and_then(|t| t.as_str())
+            .map(String::from)
+    };
+    if let Some(given) = args.get("pane").or_else(|| args.get("seat")) {
+        let task = task_of(&given);
+        return Ok((Seat::new(given), task));
+    }
+    if args.rest.is_empty() {
+        return Err("usage: wsp despawn <task> | wsp despawn --pane <seat>".into());
+    }
+    let work = resolve(store, args, index)?;
+    let Some(task) = work.task else {
+        return Err("despawn ends the agent on a task — a project is not a seat".into());
+    };
+    match store.panes_for_task(&task).first() {
+        Some(seat) => Ok((Seat::new(seat.clone()), Some(task))),
+        None => Err(match store.claims().contains_key(&task) {
+            // The claim outlived the pane it was made in, which is what a herdr
+            // restart does. Nothing here can say which seat holds it.
+            true => format!(
+                "{task} is claimed but no seat is bound to it — `wsp reconcile` to bind it again, \
+                 or `wsp release --pane <seat>` if the agent is already gone"
+            ),
+            false => format!("nothing is working {task}"),
+        }),
+    }
+}
+
+/// `me` is which seat this process is standing in, passed in rather than read
+/// here: the refusal below is the one behaviour of this verb that depends on the
+/// environment, and a test that had to export `HERDR_PANE_ID` to reach it would
+/// be changing a process-wide variable every other test can see — which is a
+/// flake somebody else's test pays for. It has already happened once in this
+/// tree, to `cmd_install`'s lock test, from the first draft of these tests.
+fn end_work(place: &dyn Place, store: &Store, args: &Args, me: Option<&str>) -> i32 {
+    let p = Paint::new();
+    let index = Index::new(store.projects());
+    let (seat, task) = match seat_of(store, args, &index) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+
+    // Ending the seat you are standing in kills this process partway through,
+    // which is the one case where stopping first cannot work: there would be
+    // nobody left to release the claim. Refused rather than reordered, because
+    // an agent that wants to put its work down has a verb for that already, and
+    // a loop that has resolved its own seat by accident wants to be told.
+    if me == Some(seat.as_str()) {
+        eprintln!("wsp: {seat} is this pane — `wsp release`, then leave");
+        return 2;
+    }
+
+    let closed = match place.stop(&seat) {
+        Ok(()) => true,
+        // Already gone. The first half of the verb is done, however it happened.
+        Err(Refusal::NoSeat(_)) => false,
+        Err(e) => {
+            eprintln!("wsp: {seat} is still standing, so nothing was released: {e}");
+            return 1;
+        }
+    };
+
+    // The claim, through the one implementation of ending one. `release` writes
+    // the `worked` record, the line in the task's log and the commit; a second
+    // copy of that here would be a second contract.
+    let (released, ended) = cmd_agent::release_pane(store, seat.as_str());
+    // What the binding said, unless the release found something else there —
+    // which it will not, and if it ever does, the release is the later reading.
+    let task = ended.or(task);
+
+    if args.json() {
+        println!(
+            "{}",
+            json!({ "seat": seat.as_str(), "closed": closed, "task": task, "released": released })
+        );
+    } else {
+        println!("  {}", p.dim(&match closed {
+            true => format!("ended {seat}"),
+            false => format!("{seat} was already gone"),
+        }));
+        match (&task, released) {
+            (Some(t), true) => println!("  {}", p.dim(&format!("released {t}"))),
+            (Some(t), false) => println!("  {}", p.dim(&format!("{t} was not bound to it"))),
+            (None, _) => println!("  {}", p.dim("it was holding nothing")),
+        }
+    }
+    0
+}
+
 /// `wsp claim <task> --pane <pane>`, called rather than shelled out to.
 fn cmd_agent_claim(store: &Store, task: &str, flags: &[(&str, &str)]) -> i32 {
     crate::cmd_agent::claim(store, &Args::synth("claim", &[task], flags))
@@ -665,6 +800,233 @@ mod tests {
         for kept in ["Bash", "Read", "Edit", "Write"] {
             assert!(!trim.contains(&kept.to_string()), "{kept} is how the work gets done: {trim:?}");
         }
+    }
+
+    /// A backend that answers `stop` however the test needs, and nothing else.
+    ///
+    /// In-process rather than the fake behind a socket, and for the reason the
+    /// fake's own docs record: `stop` and the arrange port's close are the same
+    /// herdr method, so a socket can see that a pane was taken away and cannot
+    /// see which verb meant it. What is under test here is the *order* — which
+    /// half ran, and what survived the other half failing — and that is a
+    /// question about wsp, not about a wire.
+    struct Ends {
+        snub: Option<Refusal>,
+        asked: std::cell::RefCell<Vec<Seat>>,
+    }
+
+    impl Ends {
+        fn ok() -> Ends {
+            Ends { snub: None, asked: std::cell::RefCell::new(Vec::new()) }
+        }
+        fn refusing(snub: Refusal) -> Ends {
+            Ends { snub: Some(snub), asked: std::cell::RefCell::new(Vec::new()) }
+        }
+    }
+
+    impl Place for Ends {
+        fn stop(&self, seat: &Seat) -> crate::place::Result<()> {
+            self.asked.borrow_mut().push(seat.clone());
+            match &self.snub {
+                Some(r) => Err(r.clone()),
+                None => Ok(()),
+            }
+        }
+        // Loudly rather than politely: a despawn that opened a seat or told an
+        // agent something would be a defect these tests exist to notice.
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("despawn does not open seats")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("despawn does not start agents")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<()> {
+            panic!("despawn does not talk to agents")
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            panic!("despawn does not ask how the work is going")
+        }
+        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+            panic!("despawn is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("despawn does not wait for anything")
+        }
+    }
+
+    /// A task somebody is working: the task, the binding that names the seat, and
+    /// the claim the binding stands for.
+    fn working(store: &Store, task: &str, seat: &str) {
+        let mut t = crate::model::Task::new("stop, and the claim with it", task);
+        t.project = Some("robustness".into());
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        store.set_binding(seat, json!({ "task_id": task, "pane_id": seat, "workspace_id": "w1" }));
+        store.set_claim(
+            task,
+            json!({ "workspace_id": "w1", "workspace_label": "robustness/095", "cwd": "/tmp" }),
+        );
+    }
+
+    /// Nothing in these tests may reach a herdr, and one of them would: `release`
+    /// re-syncs on its way out, and this machine has a live herdr with real
+    /// workspaces in it. A socket path that answers nothing makes every call fail
+    /// at once rather than pushing a fixture's metadata onto somebody's pane.
+    fn no_backend() -> std::sync::MutexGuard<'static, ()> {
+        let lock = util::env_lock();
+        std::env::set_var("HERDR_SOCKET_PATH", "/nonexistent/wsp-despawn-tests.sock");
+        lock
+    }
+
+    /// **The decision this task was opened for.** A seat that will not close
+    /// keeps its claim.
+    ///
+    /// The two failures are not comparable, which is why the order is not a
+    /// matter of taste: work that looks unowned while an agent is still standing
+    /// in it is handed to a second agent by the next `claim` — that guard reads
+    /// bindings, so releasing first blinds it — and two agents in one tree is the
+    /// failure this whole store is arranged against. A claim left over a closed
+    /// seat is residue `reconcile --reap` already sweeps.
+    #[test]
+    fn a_seat_that_will_not_close_keeps_its_claim() {
+        let _env = no_backend();
+        let store = seat("stop-refused");
+        working(&store, "t-260816-095", "w1:p1");
+
+        let place = Ends::refusing(Refusal::Backend("pane is not going anywhere".into()));
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None);
+
+        assert_eq!(code, 1, "a despawn that ended nothing must not report success");
+        assert_eq!(place.asked.borrow().len(), 1, "it did try");
+        assert!(store.claims().contains_key("t-260816-095"), "the claim went with the agent still there");
+        assert!(store.bindings().contains_key("w1:p1"), "and so did the binding");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// The other half of the direction's question: ending a seat ends the
+    /// **claim**, not only the binding.
+    ///
+    /// A pane exiting is an accident of process lifetime and leaves the intent
+    /// standing; this is a decision, so it ends the way `release` does and leaves
+    /// the same record — a `worked` row saying who had it and for how long, and a
+    /// line in the task's log. The status stays `doing`, because work with nobody
+    /// on it is a true and useful state.
+    #[test]
+    fn ending_a_seat_ends_the_claim_and_leaves_the_record_a_release_leaves() {
+        let _env = no_backend();
+        let store = seat("stop-ok");
+        working(&store, "t-260816-095", "w1:p1");
+
+        let place = Ends::ok();
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None);
+
+        assert_eq!(code, 0);
+        assert_eq!(place.asked.borrow().as_slice(), &[Seat::new("w1:p1")], "the bound seat");
+        assert!(!store.claims().contains_key("t-260816-095"), "the claim outlived the seat");
+        assert!(!store.bindings().contains_key("w1:p1"));
+        assert!(store.worked().contains_key("t-260816-095"), "no trace of who had it");
+        let t = store.task("t-260816-095").expect("the task");
+        assert_eq!(t.status_raw, "doing", "work nobody is on is still work");
+        assert!(t.body.contains("released"), "the log should say it was put down:\n{}", t.body);
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A seat that had already gone still ends the claim, and this is the case
+    /// the verb is most needed for.
+    ///
+    /// An agent whose backend crashed under it leaves exactly this: no seat, and
+    /// a claim. Treating `NoSeat` as a failure would leave the one command that
+    /// ends a claim unable to end the claims that most need ending — and the
+    /// residue would be swept by a reaper instead, which is a person noticing
+    /// later rather than a verb doing what it was asked.
+    #[test]
+    fn a_seat_that_was_already_gone_still_ends_the_claim() {
+        let _env = no_backend();
+        let store = seat("stop-gone");
+        working(&store, "t-260816-095", "w1:p1");
+
+        let place = Ends::refusing(Refusal::NoSeat(Seat::new("w1:p1")));
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None);
+
+        assert_eq!(code, 0);
+        assert!(!store.claims().contains_key("t-260816-095"));
+
+        // A backend that did not answer is not the same sentence, and must not
+        // release: silence is not evidence that the seat is gone.
+        working(&store, "t-260816-094", "w1:p2");
+        let quiet = Ends::refusing(Refusal::Unreachable("no socket".into()));
+        assert_eq!(end_work(&quiet, &store, &Args::synth("despawn", &["094"], &[]), None), 1);
+        assert!(store.claims().contains_key("t-260816-094"), "released on a backend's silence");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// Which seat a despawn is about, and the two ways there is not one.
+    ///
+    /// A claim names a workspace and a binding names a seat, so a task whose
+    /// binding was lost — a herdr restart, and the claim is the half that
+    /// survives — cannot be resolved to a seat by anything in the port. Said
+    /// with the command that rebuilds the binding, rather than guessed at.
+    #[test]
+    fn a_task_whose_seat_is_unknown_is_told_what_would_find_it() {
+        let _env = no_backend();
+        let store = seat("stop-unbound");
+        let index = Index::new(store.projects());
+        working(&store, "t-260816-095", "w1:p1");
+
+        let of = |a: &Args| seat_of(&store, a, &index);
+        assert_eq!(
+            of(&Args::synth("despawn", &["095"], &[])).unwrap(),
+            (Seat::new("w1:p1"), Some("t-260816-095".into()))
+        );
+        // Named directly, the seat is whatever was said — including one no
+        // binding knows about, which is how a stray agent is ended.
+        assert_eq!(
+            of(&Args::synth("despawn", &[], &[("pane", "w9:p9")])).unwrap(),
+            (Seat::new("w9:p9"), None)
+        );
+
+        store.clear_binding("w1:p1");
+        let err = of(&Args::synth("despawn", &["095"], &[])).unwrap_err();
+        assert!(err.contains("wsp reconcile"), "the way back is not named: {err}");
+
+        store.clear_claim("t-260816-095");
+        let err = of(&Args::synth("despawn", &["095"], &[])).unwrap_err();
+        assert!(err.contains("nothing is working"), "{err}");
+
+        let err = of(&Args::synth("despawn", &[], &[])).unwrap_err();
+        assert!(err.contains("usage"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// An agent cannot despawn itself, and the refusal is the ordering decision
+    /// showing its edge.
+    ///
+    /// Stopping first means the process dies partway through, before the claim is
+    /// released — so the one seat this verb must not touch is the one it is
+    /// running in. `wsp release` is the verb for putting your own work down, and
+    /// saying so is more use than saying no.
+    ///
+    /// Which seat this is arrives as an argument, so this asserts the behaviour
+    /// without exporting `HERDR_PANE_ID` for every other test in the process to
+    /// trip over; see [`end_work`].
+    #[test]
+    fn a_despawn_will_not_end_the_seat_it_is_running_in() {
+        let _env = no_backend();
+        let store = seat("stop-self");
+        working(&store, "t-260816-095", "w1:p1");
+
+        let place = Ends::ok();
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Some("w1:p1"));
+
+        assert_eq!(code, 2);
+        assert!(place.asked.borrow().is_empty(), "it asked the backend to end this pane");
+        assert!(store.claims().contains_key("t-260816-095"), "and it dropped its own claim");
+
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 
     /// Two ways back to the whole preamble, and both are needed.

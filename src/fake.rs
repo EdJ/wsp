@@ -102,11 +102,18 @@
 //! t-260816-061's to build if it is worth building. Recorded here rather than
 //! guessed at later.
 //!
-//! That question is answered for the *place-work* port and open for the other:
-//! its six verbs reach the wire as six distinguishable methods, so migrating
-//! `spawn` onto it needed no double at all — `place_herdr`'s tests drive wsp's
-//! own client against this fake. `arrange`'s `run`/`send` split is still the one
-//! thing a socket cannot see.
+//! That question was answered for the *place-work* port while it had six verbs:
+//! all six reached the wire as six distinguishable methods, so migrating `spawn`
+//! onto it needed no double at all — `place_herdr`'s tests drive wsp's own client
+//! against this fake.
+//!
+//! `Place::stop` is the seventh and it ends that. It is `pane.close` on this
+//! backend and so is the arrange port's close, so **the two collide at the wire
+//! exactly as `run` and `send` do**: this file can record that a pane was taken
+//! away and cannot say whether the caller meant *end that agent's work* or *tidy
+//! that viewport*. Both collisions are the same shape — one herdr method, two
+//! wsp verbs — and a test that has to tell them apart wants an in-process double
+//! rather than a socket.
 //!
 //! [`Arrange::run`]: crate::arrange::Arrange::run
 //!
@@ -199,6 +206,10 @@ pub enum Verb {
     /// `workspace.focus`.
     Focus,
     /// Take a pane down. `pane.close`, `tab.close`, `workspace.close`.
+    ///
+    /// Both the arrange port's close and the place-work port's
+    /// [`crate::place::Place::stop`] arrive here, because on herdr they are the
+    /// same method; see the module docs on what a socket cannot see.
     Close,
     /// Read what is on a screen. `pane.read`.
     Peek,
