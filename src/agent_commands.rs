@@ -64,6 +64,58 @@
 //! when a spawn fails, and the sentence it produces is the one that turned seven
 //! hand-recoveries into a guess at which name matched which pane.
 //!
+//! # Why that sentence was silent on every failure it was written for
+//!
+//! robustness-049, and it is worth the space because the shape of the answer is
+//! the design rule this file is built on rather than a patch. Measured during
+//! robustness-041's reproduction: `wsp spawn`'s recovery line printed **nothing,
+//! three times out of three**, on exactly the failures it exists for. Two
+//! independent causes, and only one of them is the race it looked like.
+//!
+//! **The deterministic one: the backend's census is the wrong place to recompute
+//! the handle from.** `address` used to mint from `Seated::agent.name`, and on
+//! the failure path there is no such name. Measured against herdr's live socket
+//! on 2026-08-17: an `agent.list` row carries `name` and `agent_session.value`,
+//! and a `pane.list` row carries the agent's *kind* and neither of the other
+//! two. `Herdr::census` merges them per pane and falls back to the pane row —
+//! and a seat herdr has gone blind on is precisely a seat with no `agent.list`
+//! row: `State::Empty` is `agent.get` answering that this pane has no agent, and
+//! a pane with no agent has no row in the list of them either, the same record
+//! read two ways. So on every failure of the sort robustness-041 reproduces, the
+//! census offers an empty name; [`mint`] turns that into a seat-only handle
+//! nothing answers to, and [`pick`] is left with no session id and a worktree it
+//! cannot prove is anybody's. Silence, every time, with no timing in it at all.
+//!
+//! wsp never needed to ask. It chose the handle before the agent existed, which
+//! is the whole point of minting, so [`Kind::address`] now takes the same
+//! [`Spawn`] [`Kind::running`] does and recomputes from that. The census is kept
+//! for one job only — [`pick`], for agents wsp did not start — and a census wsp
+//! cannot read no longer costs the sentence.
+//!
+//! **The race, which is real but second: the runtime's registry is written after
+//! the agent starts.** Measured three times on 2026-08-17, launch to the session
+//! file under `~/.claude/sessions/`: **1,306ms, 1,440ms, 1,345ms**, and
+//! `claude agents --json` answers about it ~500-700ms later still, because that
+//! is what the subprocess costs. A spawn that fails fails early, so an ask that
+//! fires once loses. [`Lag`] is the answer: ask again for a few seconds, which
+//! costs nothing but a failure path's patience.
+//!
+//! **And when the wait runs out, say the handle anyway.** [`Address`] carries the
+//! confidence with the name, because confirmation answers *is it alive* and not
+//! *is this the right name* — see [`Address::Unconfirmed`]. A hedged sentence is
+//! strictly better than the silence a person got, and this is the shape the
+//! contrast with [`Kind::running`] recommends: being late costs a hedge instead
+//! of costing the answer.
+//!
+//! One measurement fell out of the same probe and is recorded because it makes
+//! both readings blind in a case nobody would suspect: a session that inherits
+//! [`crate::place::CHILD_MARKER`] **never registers at all**. The first probe of
+//! the lag above came up, drew its banner and took a prompt, and no session file
+//! or `claude agents --json` row ever appeared for it in twenty seconds; with
+//! the caller's identity shed, 1.3s. So [`crate::place::shed`] is what keeps
+//! wsp's own spawns visible here, and an agent a person launched by hand from
+//! inside another agent's pane has no address for wsp to find.
+//!
 //! # The next tenants
 //!
 //! Named rather than absorbed, because the layer is worth more than any one of
@@ -143,11 +195,13 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::place::{Place, Refusal, Result, Seat, Seated};
 use crate::util;
+use crate::util::Clock;
 
 /// How wsp talks to one sort of agent.
 ///
@@ -178,8 +232,16 @@ pub trait Kind {
     ///
     /// `None` for a kind with no such notion, and — deliberately — for one where
     /// the answer is ambiguous. A wrong handle is worse than no handle: it names
-    /// somebody else's agent.
-    fn address(&self, place: &dyn Place, seat: &Seat) -> Option<String>;
+    /// somebody else's agent. An *unnamed* one is a third thing and not that
+    /// one: see [`Address::Unconfirmed`], which is a name wsp is certain of and
+    /// an agent it is not.
+    ///
+    /// Takes the [`Spawn`] rather than the seat alone, which is robustness-049's
+    /// correction and the module docs carry the measurement. The seat is on the
+    /// spawn; what the spawn adds is the name wsp chose, and asking the backend
+    /// to remember that instead is what made this silent on every failure it was
+    /// written for.
+    fn address(&self, place: &dyn Place, spawn: &Spawn) -> Option<Address>;
 
     /// Give the agent in a seat a sentence to act on.
     ///
@@ -277,7 +339,7 @@ impl Kind for Plain {
         Vec::new()
     }
 
-    fn address(&self, _place: &dyn Place, _seat: &Seat) -> Option<String> {
+    fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<Address> {
         None
     }
 
@@ -398,23 +460,33 @@ impl Kind for Claude {
         argv
     }
 
-    /// What wsp called it, confirmed alive — or, for an agent wsp did not start,
-    /// what the runtime called it.
+    /// What wsp called it, confirmed alive if the runtime will confirm it — or,
+    /// for an agent wsp did not start, what the runtime called it.
     ///
     /// The mint is tried first and it is still *checked* against the listing,
     /// which is not a wasted call. This is asked on the failure path, where the
     /// open question is whether the agent that would not take a work order is
-    /// even running: an unconfirmed handle would put "it is reachable as X" on
-    /// stderr for a session that never started, and the trait's rule is that a
-    /// wrong handle is worse than none.
+    /// even running, and the difference between "it is reachable as X" and
+    /// "nothing answers to X" is the whole of what a person is about to do next.
     ///
     /// What minting buys here is that the answer is **exact** where [`pick`] can
     /// only be probable. `pick` needs herdr to have seen the session id — which
     /// is the whole of t-260817-010, and it often has not — and then falls back
     /// to whoever is alone in the tree. A minted name is matched against itself.
-    fn address(&self, place: &dyn Place, seat: &Seat) -> Option<String> {
-        let row = place.census().ok()?.into_iter().find(|s| &s.seat == seat)?;
-        resolve(&listing().ok()?, &row)
+    ///
+    /// The census is read **once, and only for [`pick`]**. It is the one reading
+    /// here that cannot be waited into existence: a seat whose agent herdr has
+    /// no record of has no name and no session on its row however long you ask,
+    /// which is the measurement in the module docs. A census wsp could not read
+    /// at all is no longer fatal to the sentence for the same reason — the
+    /// handle does not come from there any more.
+    fn address(&self, place: &dyn Place, spawn: &Spawn) -> Option<Address> {
+        let row = place.census().ok().and_then(|c| c.into_iter().find(|s| &s.seat == spawn.seat));
+        // A listing wsp could not take is treated as an empty one, which is the
+        // opposite of what [`Kind::running`] does with the same failure and right
+        // for the opposite reason: there the difference decides whether to
+        // condemn a live agent, and here both answers lead to the same hedge.
+        addressed(spawn, row.as_ref(), &Lag::default(), &|| listing().unwrap_or_default())
     }
 
     /// Typed at the terminal, because there is nothing else yet.
@@ -452,7 +524,7 @@ impl Kind for Claude {
 /// Whether any live session goes by this name.
 ///
 /// A line of its own so the order above can be argued about in a test without
-/// shelling out, which is the same seam [`resolve`] is split on.
+/// shelling out, which is the same seam [`confirmed`] is split on.
 fn answers_to(live: &[Live], handle: &str) -> bool {
     live.iter().any(|s| s.name == handle)
 }
@@ -473,21 +545,116 @@ pub struct Live {
     pub status: String,
 }
 
-/// The handle for one seated agent, given the runtime's whole census.
+/// How the recovery sentence names an agent, and how sure it is of it.
 ///
-/// Split from [`Kind::address`] for the reason the handbook gives about seams:
+/// Two answers rather than one because the failure path has two truths to tell
+/// and a reading that could only tell the first told neither. The distinction is
+/// **not** the trait's "a wrong handle is worse than no handle": that rule is
+/// about naming *somebody else's* agent, and it still holds without exception.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Address {
+    /// A live session answers to this name — the runtime's own census says so.
+    Confirmed(String),
+    /// The name wsp gave this agent, which no live session answers to.
+    ///
+    /// **Not a guess at which name.** wsp passed this exact string to that
+    /// launch as `-n`, and [`mint`] is task *and* seat precisely so that no
+    /// other agent of wsp's can be answering to it — herdr issues at most one
+    /// live agent per pane. So what is unconfirmed here is whether the agent
+    /// exists, never who it would be, and that is what makes saying it safe: the
+    /// only thing this can name wrongly is nothing at all.
+    ///
+    /// Which is worth having, because "nothing at all" is what it says. A spawn
+    /// that failed *early* is the case — the registry lands 1.3-1.4s after
+    /// launch and a failure can beat it, measured in the module docs — and an
+    /// agent that comes up a moment later comes up under this name. The
+    /// alternative on offer was silence, and a person recovering a spawn by hand
+    /// at midnight can use a hedged name and cannot use nothing.
+    Unconfirmed(String),
+}
+
+/// How long to keep asking the runtime before an address is only [`mint`]ed.
+///
+/// A struct rather than two constants for the reason `cmd_spawn::Patience` gives
+/// about its own, and the clock is handed in for the reason [`util::Clock`]
+/// gives: a test that waits three real seconds to check what happens after three
+/// seconds is a test nobody runs, and one that shortens the window instead is
+/// measuring this machine's load.
+///
+/// The budget is a fact about **Claude Code's registry**, not about the caller's
+/// patience, which is why it lives here beside the measurement rather than in
+/// `spawn`'s three numbers: the session file appears 1.3-1.4s after launch and
+/// `claude agents --json` costs another ~0.5s to read it. Three seconds from the
+/// ask covers that from any failure early enough to race it, and it is only ever
+/// spent by a spawn that has already printed why it failed — the diagnosis is on
+/// stderr before this is asked, so what the wait delays is the advice and never
+/// the error.
+///
+/// `poll` is short beside the ask it throttles on purpose. The subprocess is the
+/// real interval here (~0.5s, measured), so this is what stops a *cheap* listing
+/// — a fake, an empty `PATH`, a `claude` that fails instantly — from spinning
+/// the budget away in a tight loop.
+struct Lag<'a> {
+    until: Duration,
+    poll: Duration,
+    clock: &'a dyn Clock,
+}
+
+impl Default for Lag<'static> {
+    fn default() -> Lag<'static> {
+        Lag {
+            until: Duration::from_millis(3_000),
+            poll: Duration::from_millis(250),
+            clock: &util::Wall,
+        }
+    }
+}
+
+/// The handle for one spawned agent: waited for, then said anyway.
+///
+/// Split from [`Kind::address`] for the reason the handbook gives about seams —
 /// `address` has to shell out for the listing, so anything decided inside it is
-/// decided where no test can reach. What is interesting is the *order*, and the
-/// order is here, taking the listing as an argument like [`pick`] does.
+/// decided where no test can reach. The listing is a closure rather than a slice
+/// because what is interesting here is what happens *between* two readings of
+/// it, which is the one thing a single slice cannot express.
+///
+/// Returns as soon as either reading answers, so the budget is only ever spent
+/// when nothing is answering at all. A registry that never catches up leaves the
+/// mint, unconfirmed; a spawn with nothing to mint from leaves nothing, and that
+/// is still the honest answer.
+fn addressed(
+    spawn: &Spawn,
+    row: Option<&Seated>,
+    lag: &Lag,
+    live: &dyn Fn() -> Vec<Live>,
+) -> Option<Address> {
+    let deadline = lag.clock.now() + lag.until;
+    loop {
+        if let Some(handle) = confirmed(&live(), spawn, row) {
+            return Some(Address::Confirmed(handle));
+        }
+        if lag.clock.now() >= deadline {
+            return mint(spawn.name, spawn.seat).map(Address::Unconfirmed);
+        }
+        lag.clock.rest(lag.poll);
+    }
+}
+
+/// The order, given one reading of the runtime's census and one of the backend's.
 ///
 /// Minted first, and only if the runtime confirms a session by that name. Then
 /// [`pick`], unchanged, for every agent wsp did not start — a person's own
 /// `claude` in a pane, an agent from before this shipped, one restarted by hand.
 /// That path is byte-identical to what it was, which is why demoting it is a
 /// cheap change rather than a risky one.
-fn resolve(live: &[Live], row: &Seated) -> Option<String> {
-    let minted = mint(&row.agent.name, &row.seat).filter(|h| live.iter().any(|s| &s.name == h));
-    minted.or_else(|| pick(live, &row.session, &row.cwd))
+///
+/// The mint comes from the [`Spawn`] and no longer from the census row, which is
+/// robustness-049 and the module docs carry why. `row` is therefore optional and
+/// only [`pick`] reads it: there is nothing left that a missing census row can
+/// take away.
+fn confirmed(live: &[Live], spawn: &Spawn, row: Option<&Seated>) -> Option<String> {
+    let minted = mint(spawn.name, spawn.seat).filter(|h| answers_to(live, h));
+    minted.or_else(|| row.and_then(|r| pick(live, &r.session, &r.cwd)))
 }
 
 /// Which live session is the one in this seat.
@@ -598,8 +765,22 @@ fn listing() -> std::result::Result<Vec<Live>, String> {
 /// channel, each of them beginning with somebody listing every agent on the
 /// machine and guessing which name went with which pane. This is that step,
 /// done.
-pub fn recovery(handle: Option<String>) -> Option<String> {
-    handle.map(|h| format!("it is reachable as `{h}` — the work order can be sent there by hand"))
+///
+/// Two sentences, because a person does two different things next. A confirmed
+/// handle is somewhere to send the work order now. An unconfirmed one is a name
+/// to look for, and saying so in the first clause rather than the last is the
+/// difference between a hedge and a lie — the reader must not have to reach the
+/// end of the line to learn that nothing answered.
+pub fn recovery(address: Option<Address>) -> Option<String> {
+    Some(match address? {
+        Address::Confirmed(h) => {
+            format!("it is reachable as `{h}` — the work order can be sent there by hand")
+        }
+        Address::Unconfirmed(h) => format!(
+            "nothing is answering to `{h}` — that is the name this spawn asked for, \
+             so if the agent comes up at all the work order can be sent there by hand"
+        ),
+    })
 }
 
 /// The refusal a kind gives when asked for something it has no notion of.
@@ -725,7 +906,7 @@ mod tests {
         assert_eq!(pick(&parse_listing("[]"), "s-1", "/tmp"), None);
     }
 
-    /// A seat, as the backend reports one, for arguing about [`resolve`].
+    /// A seat, as the backend reports one, for arguing about [`confirmed`].
     fn seated(seat: &str, task: &str, session: &str, cwd: &str) -> Seated {
         Seated {
             seat: Seat::new(seat),
@@ -753,9 +934,48 @@ mod tests {
             cwd: "/Users/edjames/claude/wsp".into(),
             status: "busy".into(),
         });
+        let seat = Seat::new("w2J:p1");
         let row = seated("w2J:p1", "t-260817-014", "", "/Users/edjames/claude/wsp");
         assert_eq!(pick(&live, &row.session, &row.cwd), None, "three agents in one tree");
-        assert_eq!(resolve(&live, &row).as_deref(), Some("t-260817-014-w2J:p1"));
+        assert_eq!(
+            confirmed(&live, &spawn(false, "t-260817-014", &seat), Some(&row)).as_deref(),
+            Some("t-260817-014-w2J:p1")
+        );
+    }
+
+    /// **The silence that had no timing in it.** A seat the backend has no agent
+    /// record for is still addressed, because the handle never needed the record.
+    ///
+    /// This is robustness-049's deterministic half and the row below is what was
+    /// measured on 2026-08-17: herdr's `agent.list` carries an agent's `name` and
+    /// its session, `pane.list` carries neither, and `Herdr::census` falls back
+    /// to the pane row for exactly the seat whose agent it has lost sight of —
+    /// which is the seat every failed spawn asks about. So the old reading minted
+    /// from an empty name, got a handle that is only the seat, and matched
+    /// nothing; `pick` had no session id and a worktree it could not prove was
+    /// this agent's. Three failures, three silences, and no wait would have
+    /// helped any of them.
+    #[test]
+    fn a_seat_the_backend_kept_no_record_of_is_named_by_what_wsp_called_it() {
+        let live = vec![Live {
+            session: "d28a4237-8811-42ef-b89e-34ffc2d0df9f".into(),
+            name: "robustness-049-w32:p1".into(),
+            cwd: "/Users/edjames/claude/wsp/.worktrees/robustness-049".into(),
+            status: "idle".into(),
+        }];
+        // A `pane.list` row: the kind, the cwd, and nothing that names the agent.
+        let blind = seated("w32:p1", "", "", "/Users/edjames/claude/wsp/.worktrees/robustness-049");
+        assert_ne!(
+            mint(&blind.agent.name, &blind.seat).as_deref(),
+            Some("robustness-049-w32:p1"),
+            "the census cannot rebuild a handle it was never told"
+        );
+        let seat = Seat::new("w32:p1");
+        assert_eq!(
+            confirmed(&live, &spawn(false, "robustness-049", &seat), Some(&blind)).as_deref(),
+            Some("robustness-049-w32:p1"),
+            "wsp chose this name before the agent existed and still holds it"
+        );
     }
 
     /// An agent wsp did not start is still found the way it always was.
@@ -766,23 +986,105 @@ mod tests {
     #[test]
     fn an_agent_wsp_did_not_name_falls_back_to_the_census_lookup() {
         let live = parse_listing(CAPTURE);
+        let seat = Seat::new("w1:p1");
         let row = seated("w1:p1", "t-260817-011", "7a188ba8-7ca6-4743-921f-35fcc7079c11", "");
-        assert_eq!(resolve(&live, &row).as_deref(), Some("wsp-f3"), "the lookup still answers");
+        assert_eq!(
+            confirmed(&live, &spawn(false, "t-260817-011", &seat), Some(&row)).as_deref(),
+            Some("wsp-f3"),
+            "the lookup still answers"
+        );
     }
 
-    /// A handle wsp minted for an agent that is not running is not offered.
+    /// A handle wsp minted for an agent that is not running is not *confirmed*.
     ///
-    /// This is the whole reason `resolve` checks the listing instead of trusting
+    /// This is the whole reason the order checks the listing instead of trusting
     /// its own arithmetic. It is asked on the failure path, where "the agent
-    /// never started" is a live possibility — and `recovery` would otherwise
-    /// print "it is reachable as t-260817-014-w2J:p1" about nothing at all.
+    /// never started" is a live possibility — and `recovery` must not print "it
+    /// is reachable as t-260817-014-w2J:p1" about nothing at all.
+    ///
+    /// What it may print is the other sentence, and the two tests below are why
+    /// that is a different claim rather than the same one weakened.
     #[test]
     fn a_name_wsp_minted_for_an_agent_that_never_started_is_not_reported_as_reachable() {
         let live = parse_listing(CAPTURE);
+        let seat = Seat::new("w2J:p1");
         let row = seated("w2J:p1", "t-260817-014", "", "/Users/edjames/claude/wsp");
-        assert_eq!(resolve(&live, &row), None, "minted, and nothing answers to it");
+        let spawned = spawn(false, "t-260817-014", &seat);
+        assert_eq!(confirmed(&live, &spawned, Some(&row)), None, "minted, nothing answers to it");
         // The seat being empty of everything is the same answer, not a panic.
-        assert_eq!(resolve(&[], &row), None);
+        assert_eq!(confirmed(&[], &spawned, Some(&row)), None);
+        assert_eq!(confirmed(&[], &spawned, None), None, "and a census wsp could not read");
+    }
+
+    /// **The race, and the wait that wins it.** A registry written after the
+    /// spawn has already failed is asked again rather than believed once.
+    ///
+    /// The 1,400ms below is the measurement and not a round number: launch to
+    /// session file was 1,306ms, 1,440ms and 1,345ms over three runs on
+    /// 2026-08-17, and `claude agents --json` needs another ~500ms to read it.
+    /// The clock is wound rather than waited on, so this asserts the rule instead
+    /// of this machine's load — `util::Clock` holds that argument.
+    #[test]
+    fn an_address_the_runtime_has_not_written_yet_is_asked_for_again() {
+        let seat = Seat::new("w32:p1");
+        let handle = "robustness-049-w32:p1";
+        let registered = std::cell::Cell::new(false);
+        let asks = std::cell::Cell::new(0);
+        let dial = util::Dial::new().at(Duration::from_millis(1_400), || registered.set(true));
+        let live = || {
+            asks.set(asks.get() + 1);
+            match registered.get() {
+                true => {
+                    vec![Live { name: handle.into(), session: "s-1".into(), ..Live::default() }]
+                }
+                false => Vec::new(),
+            }
+        };
+        // The budget the CLI ships, on a clock the test winds — so a change to
+        // either number has to survive the arithmetic below rather than a copy
+        // of it kept here.
+        let lag = Lag { clock: &dial, ..Lag::default() };
+        assert_eq!(
+            addressed(&spawn(false, "robustness-049", &seat), None, &lag, &live),
+            Some(Address::Confirmed(handle.to_string())),
+            "the sentence a person got nothing of"
+        );
+        let took = dial.elapsed();
+        assert!(took >= Duration::from_millis(1_400), "gave up before the registry: {took:?}");
+        assert!(took < Duration::from_millis(1_700), "kept asking after it answered: {took:?}");
+        // Arithmetic rather than a guess about scheduling: the polls it takes to
+        // reach the registry, and then the ask that finds it.
+        let poll = lag.poll.as_millis();
+        assert_eq!(asks.get() as u128, 1_400u128.div_ceil(poll) + 1, "one ask per poll, no more");
+    }
+
+    /// A registry that never catches up costs a hedge, not the sentence.
+    ///
+    /// The budget is spent exactly once and then the handle is said anyway, which
+    /// is the whole design note on `Address::Unconfirmed`: what is unconfirmed is
+    /// whether the agent exists, never which agent it would be. Silence is what a
+    /// person got on all three failures of 2026-08-17 and it is strictly worse.
+    #[test]
+    fn an_agent_the_runtime_never_confirms_is_still_named_once_the_waiting_is_done() {
+        let seat = Seat::new("w32:p1");
+        let dial = util::Dial::new();
+        let asks = std::cell::Cell::new(0);
+        let live = || {
+            asks.set(asks.get() + 1);
+            Vec::new()
+        };
+        let lag = Lag { clock: &dial, ..Lag::default() };
+        assert_eq!(
+            addressed(&spawn(false, "robustness-049", &seat), None, &lag, &live),
+            Some(Address::Unconfirmed("robustness-049-w32:p1".to_string()))
+        );
+        assert_eq!(dial.elapsed(), lag.until, "the budget, and no more of it");
+        let (until, poll) = (lag.until.as_millis(), lag.poll.as_millis());
+        assert_eq!(asks.get() as u128, until / poll + 1, "the polls, and the ask that ends it");
+        // Nothing to mint from is still nothing to say. A spawn with neither a
+        // task nor a seat has no name to offer, hedged or otherwise.
+        let nowhere = Seat::new("");
+        assert_eq!(addressed(&spawn(false, "", &nowhere), None, &lag, &live), None);
     }
 
     /// The trim moved and did not change, and it is still Claude Code's alone.
@@ -974,8 +1276,27 @@ mod tests {
                 ..Seated::default()
             }],
         };
-        assert_eq!(of("codex").address(&place, &Seat::new("w1:p1")), None);
+        let seat = Seat::new("w1:p1");
+        assert_eq!(of("codex").address(&place, &spawn(false, "t-260817-011", &seat)), None);
         assert_eq!(recovery(None), None);
-        assert!(recovery(Some("wsp-f3".into())).unwrap().contains("wsp-f3"));
+    }
+
+    /// The two sentences say different things, and the hedged one says its hedge
+    /// first.
+    ///
+    /// Asserted on the wording because the wording is the whole deliverable here:
+    /// a person reading a failed spawn at midnight acts on the first clause, and
+    /// "it is reachable as X" about an agent that never started would send them
+    /// looking for something that is not there.
+    #[test]
+    fn a_handle_the_runtime_would_not_confirm_is_offered_as_one_that_may_not_exist() {
+        let sure = recovery(Some(Address::Confirmed("wsp-f3".into()))).expect("a sentence");
+        assert!(sure.contains("wsp-f3") && sure.contains("reachable"), "{sure}");
+
+        let hedged = recovery(Some(Address::Unconfirmed("wsp-f3".into()))).expect("a sentence");
+        assert!(hedged.contains("wsp-f3"), "a hedge with no name in it is silence: {hedged}");
+        assert!(!hedged.contains("is reachable"), "it is not reachable — the point: {hedged}");
+        let doubt = hedged.find("nothing is answering").expect("the hedge, up front");
+        assert!(doubt < hedged.find("wsp-f3").expect("the name"), "the hedge is last: {hedged}");
     }
 }

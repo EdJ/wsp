@@ -339,12 +339,18 @@ fn wait_ready(
 /// on the machine and working out which name belonged to the pane that had just
 /// failed. wsp is the only thing that already knows.
 ///
-/// Best effort by construction, and silent when it is not sure — the sentence is
-/// only worth printing if it is right, because a work order sent to the handle
-/// named here would go to whoever it names. `agent_commands::pick` is where that
-/// care is taken.
-fn unreached(how: &dyn agent_commands::Kind, place: &dyn Place, seat: &Seat) {
-    if let Some(line) = agent_commands::recovery(how.address(place, seat)) {
+/// Best effort by construction, and never wrong about *whose* agent it names —
+/// a work order sent to the handle here would go to whoever it names, so
+/// `agent_commands::pick` refuses an ambiguous one and always will. What it is no
+/// longer allowed to be is **silent**, which is what it was on all three of the
+/// failures robustness-041 reproduced; it is asked the spawn rather than the seat
+/// for the reason `agent_commands` measures, and it may hedge.
+///
+/// The order of the two lines at the call sites is load-bearing: the caller
+/// prints *why* the spawn failed and then calls this, so the wait inside delays
+/// the advice and never the diagnosis.
+fn unreached(how: &dyn agent_commands::Kind, place: &dyn Place, spawn: &agent_commands::Spawn) {
+    if let Some(line) = agent_commands::recovery(how.address(place, spawn)) {
         eprintln!("wsp: {line}");
     }
 }
@@ -579,14 +585,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                         Ok(()) => told = true,
                         Err(e) => {
                             eprintln!("wsp: agent started but not told: {e}");
-                            unreached(how, place, &seat);
+                            unreached(how, place, &spawn);
                         }
                     }
                 }
             }
             Err(e) => {
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
-                unreached(how, place, &seat);
+                unreached(how, place, &spawn);
             }
         }
     }
@@ -1109,7 +1115,11 @@ mod tests {
         fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
             Vec::new()
         }
-        fn address(&self, _: &dyn Place, _: &Seat) -> Option<String> {
+        fn address(
+            &self,
+            _: &dyn Place,
+            _: &agent_commands::Spawn,
+        ) -> Option<agent_commands::Address> {
             None
         }
         fn tell(&self, _: &dyn Place, _: &Seat, _: &str) -> crate::place::Result<()> {
