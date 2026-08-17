@@ -485,6 +485,13 @@ pub enum Filler {
 /// should not grow one for this: two fillers are the same when they would start
 /// the same thing, which is a question this port asks and the place-work port
 /// does not.
+///
+/// `place::Agent::args` is deliberately not read here, and that is a decision
+/// rather than an oversight. A running claude and a spec asking for a claude
+/// with one more flag on it are the same filler, because the alternative is a
+/// reconcile that kills somebody's session to restart it with a different
+/// preamble — a change to `cmd_spawn::TRIM` would then close every agent on the
+/// seat. Flags decide what a *new* agent starts with, and nothing else.
 impl PartialEq for Filler {
     fn eq(&self, other: &Filler) -> bool {
         match (self, other) {

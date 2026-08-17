@@ -16,7 +16,7 @@
 //! and the sentence would be the only thing it ever heard about the work.
 //!
 //! That order is also what lets the sentence stop asking for a brief: see
-//! [`Handover`].
+//! [`Handover`], and what the agent is *not* handed is [`TRIM`].
 
 use std::time::{Duration, Instant};
 
@@ -170,6 +170,98 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
 /// which is a better list than one kept here and left to go stale.
 const DEFAULT_KIND: &str = "claude";
 
+/// What a spawned Claude Code session is *not* given, and why each name is on
+/// the list.
+///
+/// Every request re-reads the whole context, so a token present before the
+/// agent has done anything is paid once per request — ~102 times in the session
+/// t-260816-096 measured. The preamble is the largest single thing in that
+/// context and almost none of it is wsp's: `wsp brief --session` is ~3,300
+/// tokens of it, the rest is Claude Code's own.
+///
+/// **Measured against a live spawn on 2026-08-17, not estimated.** Two
+/// `wsp spawn --agent` runs into a sandbox — its own herdr session, its own
+/// store — on this task, one with `--full` and one without, read back off the
+/// two transcripts:
+///
+/// | | first-request context |
+/// |---|---|
+/// | `--full` | 37,756 |
+/// | trimmed | 25,306 |
+///
+/// **12,450 tokens off every request of the session — 33%.** At the ~102
+/// requests that session ran, ~1.27M tokens.
+///
+/// Which is *worth saying plainly*: the parent task's arithmetic hoped for
+/// ~28.6K, on the reading that the ~34K preamble was mostly sheddable. It is
+/// not. What can be shed through a flag is the tool schemas and the MCP prose;
+/// the system prompt underneath them is ~25K and there is no lever here for it.
+/// This is 44% of the hoped saving and the rest is not available.
+///
+/// Attribution, one lever at a time, by running `claude -p` with the flag and
+/// summing `input + cache_creation + cache_read` on the reply — the print-mode
+/// baseline is 26,816 and each figure is what removing that one thing saved:
+///
+/// | dropped | tokens | why it is safe to drop |
+/// |---|---|---|
+/// | `Workflow` | 6,024 | the work order forbids it in as many words |
+/// | `Agent` | 2,682 | same, and this task exists because sub-agents are what blew the budget |
+/// | every MCP server, and its instruction prose | 831 | two spawned agents made zero MCP calls between them |
+///
+/// The 831 is the print-mode floor for it: an interactive session also carries
+/// `claude-in-chrome`, Gmail, Calendar and Drive, whose instruction blocks are
+/// prose rather than schema, which is most of the gap between the 9,537 those
+/// three lines account for in print and the 12,450 measured live.
+///
+/// **Named removals rather than a named allowlist, and the difference is not
+/// cosmetic.** `--tools` takes an allowlist of built-ins, and the first attempt
+/// at this used one: `Bash,Read,Edit,Write,Glob,Grep,TodoWrite,Task`. Four of
+/// those eight do not exist in this build, and unknown names are ignored in
+/// silence — so it measured something other than what it said, and quietly
+/// withheld several tools that do exist and were never considered. That is
+/// precisely the failure this trim is supposed to avoid: an agent that silently
+/// lacks a tool does not report it, it works around it, expensively and out of
+/// sight. An allowlist withholds every tool nobody thought of, including every
+/// one Claude Code gains after this line was written. A denylist withholds only
+/// what it names, and what it names is here to read.
+///
+/// The same rule says what is deliberately *kept*, and it was priced rather
+/// than assumed, so nobody has to re-measure to argue with it: `ScheduleWakeup`
+/// 1,250, `ReportFindings` 609, `ListAgents` 306. Each is small, each is
+/// reachable from a slash command a person might type into this pane, and 2,165
+/// tokens is not worth a capability going missing without a sentence about it.
+/// `Read`, `Edit`, `Write` and `Bash` are not negotiable: the same measurement
+/// found those agents doing all their reading through `sed` and `head` at ~28K,
+/// and a trim that pushes more work into Bash has made things worse while
+/// appearing to make them better. Both probe agents above reached for `Read`
+/// on their first tool call, which is the thing to watch if this list ever
+/// grows.
+///
+/// What the trim leaves behind is legible, which was the other requirement: a
+/// trimmed session asked what it has answers "No Workflow tool", "No mcp__
+/// prefixed tools", and lists its fourteen skills. It does not silently
+/// improvise around an absence it cannot see.
+const TRIM: &[&str] = &["--strict-mcp-config", "--disallowedTools", "Agent", "Workflow"];
+
+/// The arguments an agent of this kind is started with.
+///
+/// Keyed on the kind because [`TRIM`] is Claude Code's spelling and nothing
+/// else's. `codex --strict-mcp-config` does not start, and a kind that does not
+/// start leaves a workspace with a shell in it and no agent — a worse outcome
+/// than the tokens are worth. Every other kind herdr knows is passed through
+/// untrimmed, exactly as before.
+///
+/// `--full` is the way back. A trim is a capability change, so there has to be
+/// one, and it has to be a flag rather than an edit: the agent that needs the
+/// design MCP server to draw an artefact is a real spawn on this backlog, not a
+/// hypothetical.
+fn preamble(kind: &str, full: bool) -> Vec<String> {
+    match (full, kind) {
+        (false, "claude") => TRIM.iter().map(|s| (*s).to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// How long to give the new workspace's shell before deciding it is never
 /// coming, and how long to give the agent after it. A cold Claude Code measured
 /// four seconds to readiness on this machine; herdr's own default for the same
@@ -209,10 +301,17 @@ fn ready(pane: &str) -> bool {
 /// measured at ten milliseconds old. So the first attempt lands inside that
 /// window as a matter of course, and only a refusal that is not that one is a
 /// real failure.
-fn launch(pane: &str, kind: &str, name: &str) -> Result<(), String> {
+/// `args` is what herdr appends to the command line it types, and is omitted
+/// from the call entirely when there is nothing to say — so an untrimmed spawn
+/// puts exactly the bytes on the socket that it always did.
+fn launch(pane: &str, kind: &str, name: &str, args: &[String]) -> Result<(), String> {
+    let mut params = json!({ "pane_id": pane, "kind": kind, "name": name });
+    if !args.is_empty() {
+        params["args"] = json!(args);
+    }
     let deadline = Instant::now() + Duration::from_millis(SHELL_MS);
     loop {
-        match herdr::call("agent.start", json!({ "pane_id": pane, "kind": kind, "name": name })) {
+        match herdr::call("agent.start", params.clone()) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 let msg = e.to_string();
@@ -237,8 +336,8 @@ fn launch(pane: &str, kind: &str, name: &str) -> Result<(), String> {
 /// start is the other reason for the wait to run on, and typing `claude` at a
 /// Claude Code that is merely still booting would leave the word sitting in its
 /// input box for somebody to find later.
-fn start_agent(pane: &str, kind: &str, name: &str) -> Result<(), String> {
-    launch(pane, kind, name)?;
+fn start_agent(pane: &str, kind: &str, name: &str, args: &[String]) -> Result<(), String> {
+    launch(pane, kind, name, args)?;
     let began = Instant::now();
     let mut retyped = false;
     loop {
@@ -255,7 +354,7 @@ fn start_agent(pane: &str, kind: &str, name: &str) -> Result<(), String> {
         if !retyped && waited >= Duration::from_millis(RETYPE_MS) && agent_of(pane).is_none() {
             retyped = true;
             let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": "\x15" }));
-            launch(pane, kind, name)?;
+            launch(pane, kind, name, args)?;
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
     }
@@ -386,7 +485,8 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
     if args.has("agent") {
         let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
         let name = work.task.clone().or_else(|| work.project.clone()).unwrap_or_default();
-        match start_agent(&pane, &kind, &name) {
+        let trim = preamble(&kind, args.has("full"));
+        match start_agent(&pane, &kind, &name, &trim) {
             Ok(()) => {
                 started = Some(kind.clone());
                 // Only a task gives an agent something to be told. A project
@@ -564,5 +664,42 @@ mod tests {
         let running = claimed_text("t-260815-033", Handover::Running);
         assert!(running.contains("t-260815-033"));
         assert!(running.contains("wsp brief --session"), "the whole payload in one call: {running}");
+    }
+
+    /// The trim names what it takes away, and the names are the ones the work
+    /// order already forbids.
+    ///
+    /// Asserted as names rather than as a count, because the point of a
+    /// denylist is that it is legible: a test that only checked the length
+    /// would pass on a list that had quietly become something else. `Read`,
+    /// `Edit`, `Write` and `Bash` appearing here would be the bad change —
+    /// the measurement that prompted this found agents doing all their reading
+    /// through `sed` at ~28K, and a trim that pushes work into Bash costs more
+    /// than it saves.
+    #[test]
+    fn a_spawned_claude_is_not_given_the_two_tools_it_is_told_not_to_use() {
+        let trim = preamble("claude", false);
+        assert!(trim.contains(&"--strict-mcp-config".to_string()), "{trim:?}");
+        assert!(trim.contains(&"--disallowedTools".to_string()), "{trim:?}");
+        assert!(trim.contains(&"Agent".to_string()), "sub-agents are what blew the budget: {trim:?}");
+        assert!(trim.contains(&"Workflow".to_string()), "6,024 tokens of tool nobody may call: {trim:?}");
+        for kept in ["Bash", "Read", "Edit", "Write"] {
+            assert!(!trim.contains(&kept.to_string()), "{kept} is how the work gets done: {trim:?}");
+        }
+    }
+
+    /// Two ways back to the whole preamble, and both are needed.
+    ///
+    /// `--full` is the person's: a trim is a capability change, and the agent
+    /// that needs the design MCP server to draw an artefact is a spawn on this
+    /// backlog rather than a hypothesis. The kind is the machine's: these are
+    /// Claude Code's flag spellings, and handing them to `codex` or `gemini`
+    /// buys a workspace with a shell in it and no agent.
+    #[test]
+    fn the_trim_is_claude_codes_alone_and_one_flag_undoes_it() {
+        assert!(preamble("claude", true).is_empty(), "--full is the way back");
+        assert!(preamble("codex", false).is_empty(), "not codex's spelling");
+        assert!(preamble("gemini", false).is_empty());
+        assert!(preamble("codex", true).is_empty());
     }
 }

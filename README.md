@@ -1286,6 +1286,55 @@ it has. The panel's `f` hands work to an agent that has been running since
 before the claim existed, so that one is still asked to fetch, once, with
 `--session`. The duplicate is gone by construction rather than by remembering.
 
+### What it is *not* handed
+
+```sh
+wsp spawn <id> --agent          # trimmed
+wsp spawn <id> --agent --full   # everything, for the spawn that needs it
+```
+
+The brief is not the expensive half. A spawned Claude Code session starts at
+~37,000 tokens before it has done anything, of which `wsp brief --session` is
+~3,300 — the rest is Claude Code's own system prompt, its tool schemas, and the
+instruction prose every configured MCP server contributes. All of it is re-read
+on every request.
+
+So `spawn` starts the agent without three things, named in `cmd_spawn::TRIM`:
+
+| dropped | why |
+|---|---|
+| the `Workflow` tool | the work order forbids it in as many words |
+| the `Agent` tool | same — and sub-agents are what blew the budget in the first place |
+| every MCP server, and its instructions | two measured agents made zero MCP calls between them |
+
+Measured live on 2026-08-17, two `wsp spawn --agent` runs into a sandbox on the
+same task, read back off the transcripts: **37,756 → 25,306, a third off every
+request.** Worth stating against the estimate that prompted it, which hoped for
+28.6K: the system prompt underneath the schemas is ~25K and no flag reaches it.
+This is 44% of what was hoped for and the rest is not on offer.
+
+It is a *denylist*, and deliberately not the allowlist the estimate called for.
+`--tools` takes an allowlist, and the first attempt here used one —
+`Bash,Read,Edit,Write,Glob,Grep,TodoWrite,Task`. Four of those eight do not
+exist in this build; unknown names are ignored in silence, so the list measured
+something other than what it said and quietly withheld tools nobody had
+considered. An allowlist withholds everything nobody thought of, including
+everything Claude Code gains after the line was written, and an agent that
+silently lacks a tool does not report it — it works around it, expensively and
+out of sight. That is the failure this is supposed to prevent, so the list names
+what it takes and takes nothing else.
+
+`Read`, `Edit`, `Write` and `Bash` are not on it and must not go on it. The
+measurement that started this found agents doing all their reading through `sed`
+and `head` at ~28K, which is the same failure one level down: remove the
+affordance and the work still happens, just worse.
+
+`--full` is the way back, and there has to be one, because a trim is a
+capability change — the agent that needs the design MCP server to draw an
+artefact is a spawn on this backlog rather than a hypothesis. The trim applies
+to `--kind claude` only; these are Claude Code's flag spellings and handing them
+to `codex` buys a workspace with a shell in it and no agent.
+
 ### Looking at a pane
 
 ```sh

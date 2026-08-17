@@ -40,7 +40,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "terse", "seen",
+    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "terse", "seen", "full",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm",
@@ -418,7 +418,9 @@ fn help() {
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
                                     open a workspace on it, claim it there, and
                                     start an agent in it; --no-focus to stay put,
-                                    --on to run it on another machine
+                                    --on to run it on another machine, --full to
+                                    start it with sub-agents, workflows and the
+                                    MCP servers it is otherwise spawned without
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp release                       unbind this pane
   wsp pin <proj> [-w ws]            pin a workspace to a project

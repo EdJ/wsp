@@ -288,10 +288,20 @@ pub struct Order {
 /// one kept here and left to go stale — and a second backend's catalogue is its
 /// own. `name` is what the backend should call the running agent; wsp passes
 /// the task or project id.
+///
+/// `args` is the third thing and it is not decoration: what an agent is started
+/// with decides what it reads before it does anything, and on 2026-08-17 that
+/// was measured at 37,756 tokens re-read on every request of the session
+/// (`cmd_spawn::TRIM` holds the numbers and the argument). A port that could
+/// only say *which* agent, never *how*, would have had a third of every
+/// spawned session's cost outside it. It is passed through like `kind` — these
+/// are the agent's own flags, not the backend's, and a backend that inspected
+/// them would be enumerating a catalogue that belongs to somebody else.
 #[derive(Debug, Clone, Default)]
 pub struct Agent {
     pub kind: String,
     pub name: String,
+    pub args: Vec<String>,
 }
 
 /// What an agent in a seat is doing, as far as the backend can tell.
