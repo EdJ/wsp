@@ -486,6 +486,10 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
 
     let mine_log: Vec<String> = mine
         .and_then(|t| crate::model::section_of(&t.body, "Log"))
+        // The brief is the one place an agent reads its own history, and it is
+        // read at 01:15 as often as at any other hour. The stamp goes out as
+        // the reader's date, the same as the decisions above it.
+        .map(|log| crate::model::localise_dates(&log))
         .map(|log| {
             let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
             lines
@@ -1522,6 +1526,37 @@ mod tests {
         let session = brief_lines(&r, &plain(), Depth::Session).join("\n");
         assert!(session.contains("architecture.md"), "{session}");
         assert!(!session.contains("the shape of it"), "no task, so no task prose:\n{session}");
+    }
+
+    /// The payload is where an agent reads its own history back, and it is read
+    /// at 01:15 as often as at any other hour — the reported case is an agent
+    /// being handed four lines dated the day before the night it was working.
+    /// The stored stamp never reaches it: it is converted, and it would be
+    /// twice the width of the date it replaced if it were not.
+    #[test]
+    fn the_log_an_agent_is_handed_is_dated_in_its_own_calendar() {
+        let mut b = with_work();
+        for t in b.world.tasks.iter_mut().filter(|t| t.id == "t-001") {
+            t.body = t.body.replace(
+                "- 2026-08-17 claimed by pane w1:p1",
+                "- 2026-08-14 claimed by pane w1:p1\n- 2026-08-16T23:15:00Z blocked: which offset source",
+            );
+        }
+        let r = compose(&b);
+        assert_eq!(r.mine_log.len(), 2, "{:?}", r.mine_log);
+        assert!(
+            r.mine_log[0].starts_with("2026-08-14 claimed"),
+            "a line written before the hour was stored stands: {:?}",
+            r.mine_log
+        );
+        assert!(
+            r.mine_log[1].starts_with(&format!("{} blocked:", util::local_ymd("2026-08-16T23:15:00Z"))),
+            "and the new one reads local: {:?}",
+            r.mine_log
+        );
+
+        let session = brief_lines(&r, &plain(), Depth::Session).join("\n");
+        assert!(!session.contains("23:15:00Z"), "no stored stamp reaches the payload:\n{session}");
     }
 
     /// The json is the same reckoning as the text, not a second one — and it

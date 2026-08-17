@@ -443,9 +443,13 @@ pub fn fold_stray_sections(body: &str) -> Option<String> {
 /// body, so when a stray heading was sorted after `## Log` the entries written
 /// since are exactly that: dated lines, at the end, under prose that is not
 /// dated. That is enough to give them back.
+///
+/// Both stamp shapes count — see [`util::is_stamp`]. A body that a stray
+/// heading has been swallowing entries from will have some of each in it, and
+/// recognising only the newer ones would fold half a log back and leave half.
 fn peel_trailing_dated(text: &str) -> (String, Vec<String>) {
     let dated = |l: &str| match l.trim().strip_prefix("- ").and_then(|r| r.split_once(' ')) {
-        Some((d, _)) => d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'),
+        Some((d, _)) => util::is_stamp(d),
         None => false,
     };
     let mut lines: Vec<&str> = text.lines().collect();
@@ -531,13 +535,67 @@ pub const SECTIONS: [&str; 5] = ["Overview", "Details", "Handbook", "Decisions",
 /// Append a dated line under `## <section>`, adding the section if it is not
 /// there. Written through [`set_section_in`], so the body comes back in
 /// canonical order however out of order it was.
+///
+/// The stamp is the *instant*, in UTC, and not the date. This is the single
+/// writer for both `## Log` and `## Decisions`, and it used to bake
+/// `util::today_ymd()` — a UTC date — into text that is then stored and read
+/// back as written. Everything recorded in the hours between local midnight and
+/// UTC midnight was therefore filed on yesterday: four decisions taken at 01:15
+/// CEST came back stamped `2026-08-16`, next to prose that said 2026-08-17.
+///
+/// Storing the instant is what makes that a rendering question again. The date
+/// a reader sees is computed where it is shown, by [`util::local_ymd`], from a
+/// record that still knows what hour it was. Lines written before this change
+/// cannot be recovered — the hour was thrown away at the point of writing — so
+/// they stand as they are and every reader here takes both shapes.
 pub fn append_dated(body: &mut String, section: &str, line: &str) {
     let mut text = section_of(body, section).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!("- {} {}\n", util::today_ymd(), line));
+    text.push_str(&format!("- {} {}\n", util::now_iso(), line));
     set_section_in(body, section, &text);
+}
+
+/// A stored body as it is shown: every stamp written by [`append_dated`]
+/// replaced by the date it falls on in the reader's own zone.
+///
+/// For the paths that print or draw a body whole rather than going through
+/// [`decisions`] — `wsp show`, `wsp project show`, the detail pane's log. They
+/// have no structure to hang a conversion on, so the conversion is by shape:
+/// a bullet whose first word is a `…T…Z` instant. Nothing else writes that at
+/// the head of a list item, and a bare date — every line in the store older
+/// than this — passes through untouched, which is what makes this safe to run
+/// over a whole body rather than over two named sections.
+///
+/// Display only. The editors deliberately do **not** call it: `wsp edit
+/// --decisions` puts the section in a buffer and writes back what comes out, so
+/// localising on the way in would launder every instant in it into a date and
+/// lose the hour for good — the exact damage this change exists to undo.
+pub fn localise_dates(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let stamp = line
+            .trim_start()
+            .strip_prefix("- ")
+            .and_then(|r| r.split_once(' '))
+            .map(|(d, _)| d)
+            .filter(|d| d.len() == 20 && util::is_stamp(d));
+        match stamp {
+            Some(d) => {
+                let (a, b) = line.split_once(d).unwrap_or((line, ""));
+                out.push_str(a);
+                out.push_str(&util::local_ymd(d));
+                out.push_str(b);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    if !body.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// The `## Decisions` entries, oldest first, as `(date, text)`.
@@ -551,17 +609,21 @@ pub fn append_dated(body: &mut String, section: &str, line: &str) {
 /// A line with no leading date is not dropped. It comes back with an empty
 /// date, because a decision somebody wrote by hand is still a decision and
 /// losing it to a formatting rule would be the worst thing this could do.
+///
+/// The date comes back **local**, and this split is why the conversion belongs
+/// here rather than in the writers: the record keeps the instant it was taken
+/// at, and the one place that already takes a stored line apart for display is
+/// the one place that has to put it back together in the reader's calendar.
 pub fn decisions(body: &str) -> Vec<(String, String)> {
-    let ymd = |s: &str| {
-        s.len() == 10 && s.chars().all(|c| c.is_ascii_digit() || c == '-')
-    };
     section_of(body, "Decisions")
         .unwrap_or_default()
         .lines()
         .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
         .filter(|l| !l.is_empty())
         .map(|l| match l.split_once(' ') {
-            Some((d, rest)) if ymd(d) => (d.to_string(), rest.trim().to_string()),
+            Some((d, rest)) if util::is_stamp(d) => {
+                (util::local_ymd(d), rest.trim().to_string())
+            }
             _ => (String::new(), l),
         })
         .collect()
@@ -671,13 +733,18 @@ impl Task {
     /// word the reader typed on four of the first five hits it was tried on.
     /// The window slides just far enough, and only to a space, so it opens on a
     /// word rather than mid-syllable.
+    ///
+    /// Through [`localise_dates`] because a hit can land in the log, and a
+    /// window forty characters wide that opens with twenty of stored stamp is
+    /// the search failing at the one job described above. One copy of the body
+    /// per task searched, which is nothing beside the scan that found it.
     pub fn prose_line(&self, needle: &str, width: usize) -> Option<String> {
         let n = needle.trim().to_ascii_lowercase();
         if n.is_empty() {
             return None;
         }
-        let line = self
-            .body
+        let body = localise_dates(&self.body);
+        let line = body
             .lines()
             .map(|l| l.trim_start_matches(['#', '-', '*', ' ']).trim_end())
             .find(|l| l.to_ascii_lowercase().contains(&n))?;
@@ -979,6 +1046,54 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!(got[0].1, "render and data are separate sub-projects");
     }
 
+    /// The hour is the whole fix. A dated line used to store a UTC *date*, so
+    /// a decision taken at 01:15 CEST was filed on the previous day and there
+    /// was nothing left in the record to tell anyone otherwise. Storing the
+    /// instant is what makes the date a rendering question again.
+    #[test]
+    fn a_dated_line_stores_the_instant_it_was_written_at() {
+        let mut b = String::new();
+        append_dated(&mut b, "Log", "claimed by pane w3K:p1");
+        let stored = section_of(&b, "Log").expect("a log");
+        let stamp = stored.trim().trim_start_matches("- ").split(' ').next().unwrap();
+        assert_eq!(stamp.len(), 20, "a date, not an instant, and the hour is gone: {stored:?}");
+        assert!(util::is_stamp(stamp) && stamp.ends_with('Z'), "{stored:?}");
+    }
+
+    /// The two halves of the same rule, on one body: what was written today
+    /// carries an instant and is converted; what was written before this
+    /// landed carries a date and is left alone, because there is no hour in it
+    /// to convert from and inventing one would be worse than the bug.
+    #[test]
+    fn a_body_is_shown_with_dates_in_it_whatever_shape_it_was_stored_in() {
+        let body = "## Overview\nwhat this is\n\n\
+                    ## Log\n- 2026-08-14 claimed by pane w2:p1\n\
+                    - 2026-08-16T23:15:00Z blocked: which offset source\n";
+        let shown = localise_dates(body);
+        assert!(shown.contains("- 2026-08-14 claimed"), "an old line is not touched: {shown}");
+        assert!(!shown.contains('Z'), "no stored stamp reaches a reader: {shown}");
+        assert!(
+            shown.contains(&format!("- {} blocked:", util::local_ymd("2026-08-16T23:15:00Z"))),
+            "the new line reads in the reader's own calendar: {shown}"
+        );
+        assert_eq!(shown.lines().count(), body.lines().count(), "line for line");
+    }
+
+    /// Prose is prose. The conversion is by shape, over a whole body, so the
+    /// thing it must never do is rewrite something that only looks like a
+    /// stamp — or lose the text either side of one it does convert.
+    #[test]
+    fn text_that_is_not_a_stored_stamp_goes_out_as_written() {
+        for s in [
+            "## Overview\n- 2026-08-16 is when we noticed\n",
+            "- not a date at all\n",
+            "the instant 2026-08-16T23:15:00Z appears mid-sentence\n",
+            "",
+        ] {
+            assert_eq!(localise_dates(s), s, "rewritten and it should not have been");
+        }
+    }
+
     #[test]
     fn they_accumulate_oldest_first() {
         let mut b = String::new();
@@ -1104,11 +1219,15 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
     /// belong back in the log.
     #[test]
     fn entries_swallowed_by_a_displaced_heading_come_back() {
-        let b = "## Overview\nthe brief\n\n## Log\n- 2026-08-15 claimed\n\n## The shape\nlike so\n- 2026-08-16 → todo\n";
+        // One of each shape, which is what a body that has been swallowing
+        // entries across this change actually looks like. Recognising only the
+        // newer stamp would fold half a log back and leave half behind.
+        let b = "## Overview\nthe brief\n\n## Log\n- 2026-08-15 claimed\n\n## The shape\nlike so\n- 2026-08-16 → todo\n- 2026-08-17T09:04:00Z → doing\n";
         let got = fold_stray_sections(b).expect("something to fold");
         assert_eq!(headings(&got), ["Overview", "Log"]);
         let log = section_of(&got, "Log").unwrap();
         assert!(log.contains("2026-08-15 claimed") && log.contains("2026-08-16 → todo"));
+        assert!(log.contains("2026-08-17T09:04:00Z → doing"), "the instant-stamped entry too: {log}");
         let overview = section_of(&got, "Overview").unwrap();
         assert!(overview.contains("### The shape") && overview.contains("like so"));
         assert!(!overview.contains("→ todo"), "the entry is not left in the prose as well");

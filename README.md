@@ -1044,6 +1044,14 @@ five on a project:
 | `## Decisions` | what was settled and now binds; `wsp decide` writes it |
 | `## Log` | dated, append-only; `wsp note` writes it, nothing edits it |
 
+Both dated sections store the *instant*, in UTC — `- 2026-08-16T23:15:00Z …` —
+and every command that shows one converts it to the reader's own date, so a
+decision taken at 01:15 CEST reads as the day it was taken rather than the day
+UTC was still on. Lines written before 2026-08-17 carry a bare UTC date with the
+hour already discarded; they stand as they are and every reader takes both
+shapes. The argument is on `model::append_dated`; the offset comes out of libc,
+and `util::local_offset` says why that and not the three obvious alternatives.
+
 ```sh
 wsp decide 022 "parked rather than dropped — the mechanism is right, the moment is not"
 wsp decide wsp "the backlog is split into render and data, and here is what that means"

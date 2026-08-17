@@ -396,7 +396,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // five things you point it at, which is how a flag stops being believed.
     // What was expensive here was the decisions block, and abridging it took
     // 4,104 tokens to 1,058 for every caller rather than the ones who ask.
-    let mut rest = proj.body.clone();
+    let mut rest = crate::model::localise_dates(&proj.body);
     crate::model::set_section_in(&mut rest, "Decisions", "");
     crate::model::set_section_in(&mut rest, "Handbook", "");
     if !rest.trim().is_empty() {

@@ -541,7 +541,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             println!("  {}  {}", p.dim(&util::pad(when, 10)), what);
         }
     }
-    let mut rest = t.body.clone();
+    // `## Log` goes out with the rest of the body, so the stamps in it are
+    // converted here — the same date the DECISIONS block above just showed,
+    // arrived at the same way.
+    let mut rest = crate::model::localise_dates(&t.body);
     crate::model::set_section_in(&mut rest, "Decisions", "");
     if !rest.trim().is_empty() {
         println!("\n{}", rest.trim());

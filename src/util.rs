@@ -330,22 +330,132 @@ pub fn now_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-/// `2026-08-14`
-pub fn today_ymd() -> String {
-    let (y, m, d, ..) = parts(epoch_secs());
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 /// `260814` — the stamp task ids carried before they carried a project.
 ///
 /// Nothing allocates with it any more; ids number in their project's space.
 /// Kept because `cmd_migrate::is_dated` and every id written before
 /// 2026-08-17 still have its shape in them, and because the date an id used to
 /// encode is a thing a reader may still want to compute.
+///
+/// **UTC on purpose, and not to be "fixed" alongside the display dates.** An id
+/// is durable and the store is shared across machines: with executors and
+/// `--on <machine>` in play, two seats in different zones allocating at the same
+/// instant would mint different prefixes for it, and every seat's ids would jump
+/// at its own local midnight rather than all at once. A rendered date answers
+/// "when did this happen, to me"; an id answers "which task", and the second
+/// question has no reader whose clock it should follow.
 #[allow(dead_code)]
 pub fn today_stamp() -> String {
     let (y, m, d, ..) = parts(epoch_secs());
     format!("{:02}{:02}{:02}", y % 100, m, d)
+}
+
+/// Seconds east of UTC at a given instant, from the platform's own zone data.
+///
+/// This is the whole cost of "store in UTC, render local", and it is the one
+/// thing `std::time` will not tell you. The three answers on offer were: parse
+/// `/etc/localtime` ourselves (TZif v2, transition tables, a POSIX `TZ` rule
+/// parser for dates past the last transition — a few hundred lines to maintain
+/// for a two-digit answer), shell out to `date +%z` (a fork and an exec in a
+/// binary a session hook runs and every panel re-execs, and it can only give
+/// *today's* offset), or take a second dependency and stop claiming one.
+///
+/// `localtime_r` is the fourth, and it beats all three: no spawn, no dependency,
+/// no table parser, and — unlike a cached `date +%z` — it answers *per instant*,
+/// so a stamp from the far side of a DST change renders in the offset that was
+/// actually in force when it was written. Declared here rather than taken from
+/// `libc`, on the same argument `die_on_broken_pipe` makes in `main.rs`: this is
+/// a struct and two symbols, against a dependency the README promises not to add.
+///
+/// The `struct tm` layout is the one thing that could go wrong — `tm_gmtoff` is
+/// a BSD extension that macOS, glibc and musl all carry, but it sits behind nine
+/// `int`s whose padding we are asserting. So we do not assert it: `localtime_r`
+/// fills in the broken-down local time as well as the offset, and we check that
+/// the two agree by running the offset back through our own civil arithmetic. If
+/// the layout is wrong the fields are garbage, the check fails, and we render
+/// UTC — which is exactly what this codebase did before, rather than an hour
+/// invented from a misread byte.
+fn local_offset(secs: i64) -> i64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: i64,
+        zone: usize,
+    }
+    extern "C" {
+        fn tzset();
+        fn localtime_r(clock: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+
+    // glibc's `localtime_r` is documented not to call `tzset` — it is the whole
+    // difference between it and `localtime` — so `TZ` would go unread on Linux
+    // without this. Once, because glibc's `tzset` re-stats the zone file on
+    // every call and this is on the path of every line the panel draws.
+    static TZ: std::sync::Once = std::sync::Once::new();
+    TZ.call_once(|| unsafe { tzset() });
+
+    let mut tm = Tm::default();
+    let clock = secs;
+    if unsafe { localtime_r(&clock, &mut tm) }.is_null() {
+        return 0;
+    }
+    let got = (
+        tm.year as i64 + 1900,
+        tm.mon as i64 + 1,
+        tm.mday as i64,
+        tm.hour as i64,
+        tm.min as i64,
+        tm.sec as i64,
+    );
+    if got == parts(secs + tm.gmtoff) {
+        tm.gmtoff
+    } else {
+        0
+    }
+}
+
+/// True for the two shapes a stored dated line can carry: `2026-08-14` and
+/// `2026-08-14T16:22:51Z`.
+///
+/// Both, for ever. Every line written before 2026-08-17 stored a bare UTC *date*
+/// and the hour is simply gone — there is nothing to convert it from — so a
+/// reader that accepted only the new shape would stop seeing the entire history
+/// it exists to show.
+pub fn is_stamp(s: &str) -> bool {
+    let ymd = |s: &str| s.len() == 10 && s.bytes().all(|c| c.is_ascii_digit() || c == b'-');
+    ymd(s) || (s.len() == 20 && s.ends_with('Z') && s.as_bytes()[10] == b'T' && ymd(&s[..10]))
+}
+
+/// A stored stamp as the reader's own calendar has it: `2026-08-17T01:15:23Z`
+/// in Berlin is `2026-08-17`, not the `2026-08-16` its UTC half reads.
+///
+/// A bare date comes back untouched — see [`is_stamp`] — and so does anything
+/// that is not a stamp at all, because a renderer's job here is to convert what
+/// it recognises and pass on what it does not.
+pub fn local_ymd(stamp: &str) -> String {
+    if stamp.len() != 20 || !is_stamp(stamp) {
+        return stamp.to_string();
+    }
+    let at = epoch_of(stamp);
+    ymd_at(at, local_offset(at))
+}
+
+/// The date an instant falls on, `offset` seconds east of UTC. Split out from
+/// [`local_ymd`] so the arithmetic that actually moves the date across midnight
+/// can be tested against a zone we choose, rather than against wherever the
+/// machine running the tests happens to be.
+fn ymd_at(secs: i64, offset: i64) -> String {
+    let (y, m, d, ..) = parts(secs + offset);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// The inverse of `civil_from_days`: (year, month, day) -> days since epoch.
@@ -798,5 +908,68 @@ mod tests {
         assert_eq!(first_sentence("one working tree per agent is not yet"), "one working tree per agent is not yet");
         assert_eq!(first_sentence("A decision.  "), "A decision.");
         assert_eq!(first_sentence(""), "");
+    }
+
+    /// The reported night, as arithmetic. Four decisions taken at 01:15 CEST
+    /// came back stamped with the previous day, because 01:15 CEST is 23:15 UTC
+    /// and the UTC date is what was written down. The offset is passed in
+    /// rather than read from the machine so that this asserts the crossing
+    /// itself, on every machine, rather than agreeing with wherever it runs.
+    #[test]
+    fn an_instant_before_utc_midnight_is_already_tomorrow_further_east() {
+        let at = epoch_of("2026-08-16T23:15:00Z");
+        assert_eq!(ymd_at(at, 0), "2026-08-16", "the instant as it is stored");
+        assert_eq!(ymd_at(at, 2 * 3600), "2026-08-17", "01:15 in Berlin, the night this was reported");
+        assert_eq!(ymd_at(at, -7 * 3600), "2026-08-16", "16:15 the previous afternoon in California");
+
+        // And the other edge: early UTC is still yesterday to the west.
+        let dawn = epoch_of("2026-08-17T04:00:00Z");
+        assert_eq!(ymd_at(dawn, -7 * 3600), "2026-08-16", "21:00 the evening before");
+        assert_eq!(ymd_at(dawn, 2 * 3600), "2026-08-17");
+    }
+
+    /// Both shapes, for ever. Every line written before 2026-08-17 stored a
+    /// bare UTC date with the hour already discarded, so a reader that took
+    /// only the new shape would stop seeing the history it exists to show —
+    /// and one that tried to convert it would invent an hour it never had.
+    #[test]
+    fn a_date_stored_before_the_hour_was_kept_is_shown_exactly_as_it_stands() {
+        assert!(is_stamp("2026-08-16"));
+        assert!(is_stamp("2026-08-16T23:15:00Z"));
+        assert!(!is_stamp("2026-08-16T23:15:00"), "an instant with no zone is not one of ours");
+        assert!(!is_stamp("blocked:"));
+        assert!(!is_stamp(""));
+
+        assert_eq!(local_ymd("2026-08-16"), "2026-08-16", "no hour to convert from");
+        assert_eq!(local_ymd("blocked:"), "blocked:", "not a stamp, not our business");
+        assert_eq!(local_ymd("2026-08-16T23:15:00Z").len(), 10, "an instant renders as a date");
+    }
+
+    /// The one thing here we do not compute is the offset, and `local_offset`
+    /// gets it out of a `struct tm` whose layout it is asserting — nine `int`s
+    /// and the padding after them. It checks its own reading and falls back to
+    /// UTC when the check fails, which means a wrong layout costs nothing but
+    /// also *says* nothing: zero is a plausible offset.
+    ///
+    /// So this asks the platform the same question by a route that shares no
+    /// code with ours. Shelling out is what the running binary must not do —
+    /// it is a fork on the path of every line the panel draws — and it is
+    /// exactly right in a test, which runs once and can afford the truth.
+    #[test]
+    fn the_offset_we_read_out_of_libc_is_the_one_the_system_reports() {
+        let out = match std::process::Command::new("date").arg("+%z").output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            // No `date` on the box is not a claim about this code.
+            _ => return,
+        };
+        let (sign, hhmm) = out.split_at(1);
+        let hh: i64 = hhmm[..2].parse().expect("+HHMM");
+        let mm: i64 = hhmm[2..4].parse().expect("+HHMM");
+        let want = (hh * 3600 + mm * 60) * if sign == "-" { -1 } else { 1 };
+        assert_eq!(
+            local_offset(epoch_secs()),
+            want,
+            "libc says one thing and `date {out}` says another — the tm layout is being misread"
+        );
     }
 }

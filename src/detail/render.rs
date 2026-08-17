@@ -175,6 +175,10 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         out.push(line(Style::Warn, format!("no task {id}")));
         return;
     };
+    // Decisions and the log are drawn out of the body as written, so the stamps
+    // in it are turned into this reader's dates once, here, rather than at each
+    // of the two places below that would otherwise each have to remember.
+    let t = &Task { body: crate::model::localise_dates(&t.body), ..t.clone() };
 
     let mut head = Line::default();
     head.push(Style::Dim, "task ");
@@ -303,10 +307,13 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
 }
 
 fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
-    let Some(p) = ctx.index.get(id).cloned() else {
+    let Some(mut p) = ctx.index.get(id).cloned() else {
         out.push(line(Style::Warn, format!("no project {id}")));
         return;
     };
+    // Same reason as `task_frame`: `## Decisions` is drawn from the body as
+    // written, and a project's is the one people read most.
+    p.body = crate::model::localise_dates(&p.body);
 
     let mut head = Line::default();
     head.push(Style::Dim, "project ");
@@ -525,6 +532,40 @@ mod tests {
             assert!(text.contains(needle), "missing {needle} from:\n{text}");
         }
         assert!(text.contains("handbook"), "and it is labelled:\n{text}");
+    }
+
+    /// The pane draws decisions and the log straight out of the body, so it is
+    /// the frame most likely to put a stored stamp in front of somebody. Both
+    /// blocks go through the same conversion, and a line written before the
+    /// hour was stored still draws.
+    #[test]
+    fn the_pane_draws_dates_and_never_the_stamp_underneath_them() {
+        let mut t = crate::model::Task::new("dates read as local", "wsp-013");
+        t.body = "## Decisions\n- 2026-08-16T23:15:00Z libc gives us the offset\n\n\
+                  ## Log\n- 2026-08-14 claimed by pane w2:p1\n\
+                  - 2026-08-16T23:15:00Z blocked: which offset source\n"
+            .into();
+        let ctx = Ctx {
+            tasks: vec![t],
+            index: Index::new(Vec::new()),
+            claims: Default::default(),
+            worked: Default::default(),
+            bindings: Default::default(),
+            panes: Vec::new(),
+            columns: Vec::new(),
+        };
+        let mut out = Vec::new();
+        task_frame(&ctx, "wsp-013", 100, &mut out);
+        let text: String = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>() + "\n")
+            .collect();
+
+        assert!(!text.contains("23:15:00Z"), "a stored stamp reached the pane:\n{text}");
+        assert!(text.contains("2026-08-14 claimed"), "an old line stands as it is:\n{text}");
+        let day = util::local_ymd("2026-08-16T23:15:00Z");
+        assert!(text.contains(&format!("{day} libc gives us the offset")), "decision:\n{text}");
+        assert!(text.contains(&format!("{day} blocked:")), "log:\n{text}");
     }
 
     /// A narrow pane must not wrap the menu into the frame above it: `fit`
