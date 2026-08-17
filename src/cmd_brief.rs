@@ -301,6 +301,16 @@ pub(crate) struct Brief {
     /// anything — the one thing the brief tells herdr rather than the reader.
     /// `None` when the question does not apply.
     pub looking: Option<bool>,
+    /// The `wsp checkout` tree this pane is standing in, when it is in one.
+    ///
+    /// Worth a line of a brief, which is the most expensive output wsp has —
+    /// every request of every session pays for it — because it is two facts an
+    /// agent cannot get from anywhere else and gets wrong in opposite
+    /// directions without: that the ordinary commit procedure does not apply
+    /// here, and that a commit in this tree is on a branch and has not reached
+    /// the trunk until it is landed. An agent that does not know the second one
+    /// leaves finished work sitting in a directory nobody reviews.
+    pub own_tree: Option<String>,
 
     // The session payload. Composed always, because composing it is a walk over
     // values already in hand and a `Brief` that meant different things in
@@ -486,6 +496,13 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         // no mandate is left alone: an agent that has to ask before it takes
         // anything is waiting on a person, not looking.
         looking: (mine.is_none() && b.mandate.is_some()).then(|| !open.is_empty()),
+        // A path rule rather than a question for git, so this stays free in the
+        // one command a session-start hook runs.
+        own_tree: b
+            .cwd
+            .as_deref()
+            .and_then(|c| crate::cmd_checkout::worktree_of(&util::expand(c)))
+            .and_then(|d| d.file_name().and_then(|s| s.to_str()).map(str::to_string)),
         under_mine: mine.map(|t| resolve::counts_under(tasks, &t.id).open).unwrap_or(0),
         parent: parent.cloned(),
         mine: mine.cloned(),
@@ -524,6 +541,7 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
         "here": r.near.iter().map(|s| s.json()).collect::<Vec<_>>(),
         "others": r.far.iter().map(|s| s.json()).collect::<Vec<_>>(),
         "rules": r.rules,
+        "tree": r.own_tree,
     });
     // The same reckoning as the text, and gated the same way — a `--json`
     // caller that grew the payload without asking for it would be the mode
@@ -689,6 +707,11 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             }
         }
         None => row("where", p.dim("no project resolved for this pane").to_string()),
+    }
+    // Said before the work rather than after it: what it changes is how you
+    // commit, and an agent reads a brief once and commits hours later.
+    if r.own_tree.is_some() {
+        row("tree", p.dim("your own — commit freely; `wsp land` puts it on the trunk").to_string());
     }
 
     // Standing direction, before anything about the work itself. An agent
@@ -1067,6 +1090,34 @@ mod tests {
         assert!(text.contains("nothing claimed"), "{text}");
         assert!(text.contains("wsp claim"), "and what to do about it:\n{text}");
         assert!(r.looking.is_none(), "no mandate, so this pane is not going looking");
+    }
+
+    /// One line, and only for the pane it is true of.
+    ///
+    /// A brief is the most expensive output wsp has — a session-start hook runs
+    /// it, and every request of every session pays for what it printed — so a
+    /// line has to earn its place against that. This one carries two facts an
+    /// agent can get nowhere else and gets wrong in opposite directions
+    /// without: that the commit procedure for a shared tree does not apply
+    /// here, and that a commit in this tree is on a branch and has not reached
+    /// the trunk until `wsp land`. Not knowing the second leaves finished work
+    /// in a directory nobody reviews, which is the failure this whole
+    /// arrangement would have introduced.
+    #[test]
+    fn a_pane_in_a_tree_of_its_own_is_told_so_and_one_in_the_trunk_is_not() {
+        let mut b = briefing();
+        b.cwd = Some("/home/ed/claude/wsp/.worktrees/t-001/src".into());
+        let r = compose(&b);
+        assert_eq!(r.own_tree.as_deref(), Some("t-001"));
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("wsp land"), "an agent was not told how to get its work out:\n{text}");
+
+        let r = compose(&briefing());
+        assert!(r.own_tree.is_none(), "the trunk is not a tree of its own");
+        assert!(
+            !brief_lines(&r, &plain(), Depth::Normal).join("\n").contains("wsp land"),
+            "every brief in the shared tree pays for a line about a tree it is not in"
+        );
     }
 
     /// Who can reach the files under your hands goes first and in the colour
