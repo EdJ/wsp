@@ -72,6 +72,39 @@ const BOOL_FLAGS: &[&str] = &[
     "govern", "remove",
 ];
 
+/// Flags that keep their meaning inside a command's payload.
+///
+/// Everything here is either a question about the invocation itself
+/// (`--help`, `--version`) or a dial on how the answer is printed and
+/// recorded. None of them is ever the thing being said, which is what makes
+/// them safe to go on reading after [`LITERAL_AFTER`] has stopped flag
+/// parsing: `wsp note 028 "…" --json` still prints JSON, while `-ui` and
+/// `--parent …` reach the command as the text and the tag edits they are.
+const GLOBAL_FLAGS: &[&str] = &["json", "help", "version", "no-commit", "terse", "quiet", "verbose"];
+
+/// Commands whose arguments stop being flags once they have their subject, and
+/// how many positionals that subject takes.
+///
+/// This is the seam that `Args` was missing. Flag parsing is one function
+/// shared by forty verbs, so it could not know that the token after
+/// `wsp note 028` is prose rather than a flag — and prose in this store is
+/// mostly *about* the CLI, so it begins with `--parent` or `-p` about as often
+/// as not. Same defect from the other end: `wsp tag <id> +dsp -ui` is the
+/// removal syntax the help documents, and `-ui` was read as a flag named `ui`,
+/// added `dsp` and exited 0 having silently dropped the removal.
+///
+/// Five commands are listed and no more. Each takes an id and then a payload
+/// that is the user's own vocabulary — free prose, or `+tag`/`-tag` — and none
+/// of them owns a flag of its own beyond the global ones above, so nothing is
+/// lost by stopping. `add`, `find`, `flag` and `say` take prose too but carry
+/// real flags after it (`wsp add "…" -p wsp`, `wsp flag <id> --seen`), so they
+/// keep ordinary parsing and lean on the whitespace rule in [`Args::scan`].
+///
+/// `--` still ends flag parsing everywhere, and is still the answer for the
+/// case no rule can reach: a payload that is a single flag-shaped word on a
+/// command that owns that flag.
+const LITERAL_AFTER: &[(&str, usize)] = &[("note", 1), ("block", 1), ("decide", 1), ("rename", 1), ("tag", 1)];
+
 pub struct Args {
     pub cmd: String,
     pub rest: Vec<String>,
@@ -80,11 +113,39 @@ pub struct Args {
 
 impl Args {
     fn parse(argv: Vec<String>) -> Args {
+        // Twice, because the rule depends on the command and the command is
+        // itself the first thing the scan finds. The first pass is only ever
+        // read for `cmd`: a leading flag may swallow a token that the strict
+        // pass hands back as a positional, but neither pass can turn a
+        // different token into the verb — the verb is the first bare word
+        // either way.
+        let cmd = Args::scan(&argv, None).cmd;
+        let literal_after = LITERAL_AFTER.iter().find(|(c, _)| *c == cmd).map(|(_, n)| *n);
+        Args::scan(&argv, literal_after)
+    }
+
+    /// One pass over argv. `literal_after`, when set, is how many positionals
+    /// this command parses normally before the rest of the line is its payload.
+    fn scan(argv: &[String], literal_after: Option<usize>) -> Args {
         let mut positional: Vec<String> = Vec::new();
         let mut flags: HashMap<String, Vec<String>> = HashMap::new();
         let mut i = 0;
         while i < argv.len() {
             let a = argv[i].clone();
+            // The command counts as one of the positionals collected, so the
+            // payload of a `LITERAL_AFTER` command starts once we hold it and
+            // its subject.
+            let past_subject = literal_after.is_some_and(|n| positional.len() > n);
+            // Is this token a flag, or is it payload? A flag name never has a
+            // space in it, whatever the rest of the token holds — so a quoted
+            // sentence arriving whole is prose even on a command that parses
+            // flags here, which is the shape this bites most often. Past its
+            // subject, a listed command reads only the flags that mean the
+            // same thing inside a payload as outside one.
+            let is_flag = |name: &str| {
+                !name.contains(char::is_whitespace) && (!past_subject || GLOBAL_FLAGS.contains(&name))
+            };
+
             if let Some(body) = a.strip_prefix("--") {
                 if body.is_empty() {
                     // `--` ends flag parsing
@@ -95,6 +156,11 @@ impl Args {
                     Some((n, v)) => (n.to_string(), Some(v.to_string())),
                     None => (body.to_string(), None),
                 };
+                if !is_flag(&name) {
+                    positional.push(a);
+                    i += 1;
+                    continue;
+                }
                 let entry = flags.entry(name.clone()).or_default();
                 if let Some(v) = inline {
                     entry.push(v);
@@ -108,6 +174,11 @@ impl Args {
                 }
             } else if a.len() >= 2 && a.starts_with('-') && !a[1..].starts_with(|c: char| c.is_ascii_digit()) {
                 let name = expand_short(&a[1..]);
+                if !is_flag(&name) {
+                    positional.push(a);
+                    i += 1;
+                    continue;
+                }
                 let entry = flags.entry(name.clone()).or_default();
                 if BOOL_FLAGS.contains(&name.as_str()) {
                     entry.push("true".into());
@@ -553,6 +624,9 @@ and a task filed nowhere is `inbox-NNN` until `wsp mv -p` files it — the one
 place an id changes, and it is recorded so the old one still resolves.
 Ids accept a bare suffix (003) or a unique title substring; a suffix that names
 more than one task now lists them rather than answering "no such task".
+Text that starts with a flag is text: `wsp note <id> "--parent is add-only"` and
+`wsp tag <id> +dsp -ui` both mean what they say. `--` still ends flag parsing,
+for the one case that needs it — a payload that is a single flag-shaped word.
 Every command takes --json. Set WSP_HOME to relocate the store.
 --terse, or WSP_TERSE=1 for a whole session, leaves out what you already have:
 the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
@@ -660,6 +734,113 @@ mod tests {
         // …but the flag still wins over an explicit off.
         assert!(super::Args::synth("brief", &[], &[("terse", "true")]).terse());
         std::env::remove_var("WSP_TERSE");
+    }
+
+    /// What the user typed has to reach the command they typed it at.
+    ///
+    /// Two tasks, one defect, from opposite ends. `wsp note 028 "--parent
+    /// exists only on wsp add"` answered with the usage line: `Args::parse`
+    /// took the leading `--parent` for a flag and the prose was gone. And
+    /// `wsp tag <id> +dsp -ui` — the removal syntax the help documents — added
+    /// `dsp`, dropped the `-ui` into a flag named `ui`, and exited 0.
+    ///
+    /// Both are the parser deciding what a token means without knowing which
+    /// command it is parsing for, so both are asserted here, on the parser,
+    /// rather than through the commands they were reported on.
+    #[test]
+    fn a_payload_that_looks_like_a_flag_still_reaches_its_command() {
+        use super::Args;
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+
+        // The prose end. Free text in this store is mostly *about* the CLI, so
+        // it begins with a flag about as often as not.
+        let a = parse(&["note", "028", "--parent exists only on wsp add"]);
+        assert_eq!(a.cmd, "note");
+        assert_eq!(a.text(1), "--parent exists only on wsp add");
+        assert!(!a.has("parent"), "the prose was read as a flag");
+
+        for verb in ["block", "decide", "rename"] {
+            let a = parse(&[verb, "028", "-p is not a thing on this command"]);
+            assert_eq!(a.text(1), "-p is not a thing on this command", "{verb}");
+            assert!(!a.has("project"), "{verb} lost its payload to a flag");
+        }
+
+        // `add` keeps ordinary parsing — its flags come *after* the title —
+        // so what saves it is that no flag name has a space in it.
+        let a = parse(&["add", "--parent exists only on wsp add", "-p", "wsp"]);
+        assert_eq!(a.rest, vec!["--parent exists only on wsp add"]);
+        assert_eq!(a.get("project").as_deref(), Some("wsp"));
+
+        // The tag end, in the exact shape the help documents.
+        let a = parse(&["tag", "wsp-055", "+dsp", "-ui"]);
+        assert_eq!(a.rest, vec!["wsp-055", "+dsp", "-ui"]);
+        assert!(!a.has("ui"), "the removal was eaten by the flag parser");
+        // And the removal-only shape, which used to fail loudly instead.
+        assert_eq!(parse(&["tag", "wsp-055", "-tmp"]).rest, vec!["wsp-055", "-tmp"]);
+        // `--` was the workaround and stays the escape hatch for the case no
+        // rule can reach: a payload that is one flag-shaped word.
+        assert_eq!(parse(&["tag", "wsp-055", "--", "-tmp"]).rest, vec!["wsp-055", "-tmp"]);
+    }
+
+    /// The other half of the same change: nothing that used to parse may stop.
+    ///
+    /// Stopping flag parsing at a command's payload is only safe because the
+    /// five commands that do it own no flags of their own, and because the
+    /// ones that do — `add`, `find`, `flag`, `spawn` — were left alone. This
+    /// is that claim, written down.
+    #[test]
+    fn the_flags_that_are_flags_still_parse() {
+        use super::Args;
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+
+        // Globals go on meaning what they mean inside a payload, on both sides
+        // of the subject.
+        let a = parse(&["note", "028", "the tail is right", "--json"]);
+        assert!(a.json() && a.text(1) == "the tail is right");
+        let a = parse(&["note", "--json", "028", "the tail is right"]);
+        assert!(a.json() && a.text(1) == "the tail is right");
+        assert!(parse(&["tag", "028", "+dsp", "--json"]).json());
+
+        // Commands that carry flags after their prose keep them.
+        let a = parse(&["add", "Retune the early reflections", "-p", "verb", "-t", "dsp", "--prio", "high"]);
+        assert_eq!(a.rest, vec!["Retune the early reflections"]);
+        assert_eq!(a.get("project").as_deref(), Some("verb"));
+        assert_eq!(a.get("tag").as_deref(), Some("dsp"));
+        assert_eq!(a.get("prio").as_deref(), Some("high"));
+        let a = parse(&["find", "reverb", "-p", "wsp", "--all"]);
+        assert_eq!(a.rest, vec!["reverb"]);
+        assert!(a.has("all") && a.get("project").as_deref() == Some("wsp"));
+        let a = parse(&["flag", "028", "why this stopped", "--seen"]);
+        assert!(a.has("seen") && a.text(1) == "why this stopped");
+
+        // A value may hold spaces — it is the *name* that never does.
+        assert_eq!(parse(&["project", "add", "verb", "--name=Reverb Lab"]).get("name").as_deref(), Some("Reverb Lab"));
+        assert_eq!(parse(&["project", "add", "verb", "--name", "Reverb Lab"]).get("name").as_deref(), Some("Reverb Lab"));
+        assert_eq!(parse(&["govern", "wsp", "--tell", "come and look at this"]).get("tell").as_deref(), Some("come and look at this"));
+
+        // `mv --parent` is the flag the prose above is *about*, on the command
+        // that really owns it.
+        assert_eq!(parse(&["mv", "028", "--parent", "014"]).get("parent").as_deref(), Some("014"));
+
+        // The verb is found the same way whatever leads the line — the first
+        // pass exists only to answer this.
+        assert_eq!(parse(&["-p", "wsp", "ls"]).cmd, "ls");
+        assert_eq!(parse(&["--json", "note", "028", "text"]).cmd, "note");
+    }
+
+    /// A rule that names a command nobody dispatches is a rule that does
+    /// nothing, and it would do nothing silently — the payload would go on
+    /// being parsed as flags with the table looking correct. Same check the
+    /// help gets, for the same reason.
+    #[test]
+    fn every_command_whose_payload_is_literal_is_a_command() {
+        let arms = dispatch();
+        for (cmd, _) in super::LITERAL_AFTER {
+            assert!(
+                arms.iter().any(|names| names.iter().any(|n| n == cmd)),
+                "`{cmd}` is in LITERAL_AFTER but nothing dispatches it"
+            );
+        }
     }
 
     /// The storyboard is the offline surface, and the gate in front of dispatch

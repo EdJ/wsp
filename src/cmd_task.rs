@@ -978,25 +978,55 @@ fn label(project: &Option<String>) -> String {
     project.clone().unwrap_or_else(|| "the inbox".into())
 }
 
+/// `wsp tag <id> +dsp -ui` — adjust tags, in the vocabulary the help documents.
+///
+/// The `-ui` half of that line used to be eaten by the flag parser: it reached
+/// `Args` as a flag named `ui`, never arrived in `rest`, and the `+dsp` in the
+/// same line supplied the positional that made the command look like it had
+/// been given everything. It added the tag, said so, and exited 0 having
+/// silently dropped the removal. [`crate::LITERAL_AFTER`] is where that is
+/// fixed, once, for this command and for the prose ones it shares the defect
+/// with.
+///
+/// The second half is here: a removal that names a tag the task does not carry
+/// leaves on stderr and exits 1. It is not a write error and nothing is rolled
+/// back — the additions in the same line stand — but a tag that stays on a
+/// task, on a command that reported success, is a tag nobody can see the
+/// reason for. Saying so is cheap; the silence is what cost three attempts.
 pub fn tag(store: &Store, args: &Args) -> i32 {
     let changes: Vec<String> = args.rest.iter().skip(1).cloned().collect();
     if changes.is_empty() {
         eprintln!("usage: wsp tag <id> +dsp -ui");
         return 2;
     }
-    mutate(store, args, "tagged", |t| {
+    let mut absent: Vec<String> = Vec::new();
+    let code = mutate(store, args, "tagged", |t| {
         for c in &changes {
             if let Some(add) = c.strip_prefix('+') {
                 if !add.is_empty() && !t.tags.iter().any(|x| x == add) {
                     t.tags.push(add.to_string());
                 }
             } else if let Some(rm) = c.strip_prefix('-') {
+                if !t.tags.iter().any(|x| x == rm) {
+                    absent.push(rm.to_string());
+                }
                 t.tags.retain(|x| x != rm);
             } else if !t.tags.iter().any(|x| x == c) {
                 t.tags.push(c.clone());
             }
         }
-    })
+    });
+    if code != 0 {
+        return code;
+    }
+    if !absent.is_empty() {
+        eprintln!(
+            "wsp: nothing to remove — no {} on this task",
+            absent.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(" or ")
+        );
+        return 1;
+    }
+    0
 }
 
 /// Change a task's priority after it exists.
@@ -1745,6 +1775,29 @@ mod tests {
         // Written down, because a backlog whose order changes with no record
         // is one nobody can read a week later.
         assert!(t.body.contains("priority normal → high"), "the log should carry it: {}", t.body);
+    }
+
+    /// A tag that was asked to go and did not, on a command that exited 0, is
+    /// a tag nobody can see the reason for. The parser is what used to drop
+    /// the removal; this is the floor under it — the command itself refuses to
+    /// report success for a removal it could not make.
+    #[test]
+    fn a_removal_that_removed_nothing_does_not_exit_zero() {
+        let store = scratch("tag-absent");
+        let mut t = task_with(&store, "verb-012", "normal");
+        t.tags = vec!["rust".into(), "tmp".into()];
+        store.save_task(&t).unwrap();
+
+        // The tag is there: removal is a removal, and quiet.
+        assert_eq!(tag(&store, &Args::synth("tag", &["012", "-tmp"], &[])), 0);
+        assert_eq!(store.find_task("012").expect("the task").tags, vec!["rust".to_string()]);
+
+        // It is not there any more, and now the same line is a lie if it says
+        // nothing. The additions beside it still stand — this is a report, not
+        // a rollback.
+        assert_eq!(tag(&store, &Args::synth("tag", &["012", "+dsp", "-tmp"], &[])), 1);
+        let t = store.find_task("012").expect("the task");
+        assert!(t.tags.iter().any(|x| x == "dsp"), "the add in the same line should hold: {:?}", t.tags);
     }
 
     /// Setting the level it already has is not a change. `mutate` cannot tell
