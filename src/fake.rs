@@ -191,6 +191,14 @@ pub enum Verb {
     Start,
     /// Give the agent a sentence to act on. `agent.prompt`.
     Tell,
+    /// Press submit on a sentence that arrived and was not taken.
+    /// `agent.send_keys`.
+    ///
+    /// Its own verb rather than [`Verb::Send`], which is typing at whatever is
+    /// in a pane: this one is addressed to the agent, and a recording that
+    /// could not tell the two apart could not show that a handover needed
+    /// rescuing.
+    Nudge,
     /// What is happening in one seat. `agent.get`.
     Ask,
     /// Every seat there is. `pane.list`, `workspace.list`, `agent.list`.
@@ -237,6 +245,7 @@ impl Verb {
             Verb::Open => "open",
             Verb::Start => "start",
             Verb::Tell => "tell",
+            Verb::Nudge => "nudge",
             Verb::Ask => "ask",
             Verb::Census => "census",
             Verb::Look => "look",
@@ -264,6 +273,7 @@ impl Verb {
             "workspace.create" => Verb::Open,
             "agent.start" => Verb::Start,
             "agent.prompt" => Verb::Tell,
+            "agent.send_keys" => Verb::Nudge,
             "agent.get" => Verb::Ask,
             "pane.list" | "workspace.list" | "agent.list" | "pane.get" => Verb::Census,
             "pane.layout" => Verb::Look,
@@ -443,6 +453,15 @@ pub struct Stage {
     /// `agent.prompt` refuses in and the one a real herdr passes through in
     /// half a second whether you wanted it to or not.
     pub settle: bool,
+    /// Whether a prompt the agent accepts actually starts a turn.
+    ///
+    /// `true` is herdr's happy path and the default. `false` is
+    /// robustness-035: `agent.prompt` answers `ok`, the sentence sits in the
+    /// composer unsent and the agent stays [`State::Idle`] — which is what
+    /// `wsp spawn` reported as a success for a night, and what nothing could
+    /// reproduce without a socket that could lie in this particular way. A
+    /// `send_keys` still rescues it, exactly as pressing return by hand did.
+    pub takes: bool,
     /// How many `agent.get` reads answer with a record that **names no agent**
     /// after `agent.start`, before detection catches up.
     ///
@@ -506,6 +525,7 @@ impl Default for Stage {
             spots: Vec::new(),
             quiet: Quiet::No,
             settle: true,
+            takes: true,
             unnamed: 2,
             launching: 0,
             area: Rect { x: 0, y: 0, w: 120, h: 40 },
@@ -1431,7 +1451,48 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
                     format!("agent {seat} is {} and will not take a prompt", spot.state.as_str()),
                 ));
             }
+            // A prompt that is taken starts a turn, and a stage that says
+            // otherwise is robustness-035 on a socket: the call is accepted, the
+            // sentence sits in the composer and the agent stays idle. The fake
+            // could not express that failure before, which is why nothing here
+            // ever noticed `spawn` reporting a handover it had not confirmed.
+            let takes = stage.takes;
+            if takes {
+                if let Some(spot) = stage.find_mut(&seat) {
+                    spot.state = State::Working;
+                }
+                events.push(Event::Moved(seat.clone(), State::Working));
+            }
+            let spot = stage.find(&seat).expect("the seat answered a moment ago");
             json!({ "type": "agent_prompted", "agent": agent_json(spot) })
+        }
+
+        // The recovery for the above, and the reason [`Place::nudge`] exists:
+        // press submit on a work order that arrived and was not taken. Whatever
+        // keys are asked for, what the fake models is the one that was ever
+        // sent — a return into an agent waiting on one starts the turn the
+        // prompt should have.
+        "agent.send_keys" => {
+            let seat = Seat::new(sget("target"));
+            let keys: Vec<String> = params
+                .get("keys")
+                .and_then(|k| k.as_array())
+                .map(|k| k.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            record(inner, Asked { verb, seat: Some(seat.clone()), said: keys.join(" ") });
+            let Some(spot) = stage.find(&seat) else {
+                return Err((NO_AGENT.into(), format!("agent target {seat} not found")));
+            };
+            if spot.agent.kind.is_empty() {
+                return Err((NO_AGENT.into(), format!("agent target {seat} not found")));
+            }
+            if spot.state == State::Idle {
+                if let Some(spot) = stage.find_mut(&seat) {
+                    spot.state = State::Working;
+                }
+                events.push(Event::Moved(seat.clone(), State::Working));
+            }
+            json!({ "type": "ok" })
         }
 
         "agent.get" => {
@@ -1772,6 +1833,9 @@ pub fn stage_from_json(v: &Value) -> Stage {
     if let Some(b) = v.get("settle").and_then(|b| b.as_bool()) {
         stage.settle = b;
     }
+    if let Some(b) = v.get("takes").and_then(|b| b.as_bool()) {
+        stage.takes = b;
+    }
     stage.quiet = match v.get("quiet").and_then(|q| q.as_str()).unwrap_or("") {
         "hangs-up" | "hangs_up" => Quiet::HangsUp,
         "never" => Quiet::Never,
@@ -1828,6 +1892,7 @@ fn num(v: &Value, key: &str, or: u32) -> u32 {
 pub fn stage_to_json(stage: &Stage) -> Value {
     json!({
         "settle": stage.settle,
+        "takes": stage.takes,
         "quiet": match stage.quiet {
             Quiet::No => "no",
             Quiet::HangsUp => "hangs-up",
@@ -2173,6 +2238,41 @@ mod tests {
         assert_eq!(told.said, "go");
         assert_eq!(told.seat, Some(Seat::new(&seat)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **robustness-035, on a socket.** A prompt herdr accepts and Claude Code
+    /// never takes: `ok` on the wire, the sentence in the composer, the agent
+    /// idle in front of it. Every reading `wsp spawn` had said the handover went
+    /// well, and for one night it printed so.
+    ///
+    /// The rescue is the second half and is what was run by hand four times in
+    /// one burst: a return, addressed to the agent, and the turn starts. Both
+    /// halves are here because a fake that could only model the happy path is
+    /// what let the defect live — nothing in the tree could express the failure,
+    /// so nothing in the tree could fail on it.
+    #[test]
+    fn a_prompt_the_agent_never_takes_leaves_it_idle_until_something_presses_return() {
+        let env = util::isolated("fake-unsent");
+        let mut stage = Stage::of(vec![Spot::agent("w3M:p1", "claude", "robustness-035", State::Idle)]);
+        stage.takes = false;
+        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
+        let seat = "w3M:p1";
+
+        call(&fake, "agent.prompt", json!({ "target": seat, "text": "you have been claimed" }))
+            .expect("the call is accepted, which is the whole trouble");
+        let got = call(&fake, "agent.get", json!({ "target": seat })).expect("a reading");
+        assert_eq!(got["agent"]["agent_status"], json!("idle"), "the failure cannot be modelled");
+
+        call(&fake, "agent.send_keys", json!({ "target": seat, "keys": ["enter"] }))
+            .expect("the recovery Ed ran by hand");
+        let got = call(&fake, "agent.get", json!({ "target": seat })).expect("a reading");
+        assert_eq!(got["agent"]["agent_status"], json!("working"), "the return did nothing");
+
+        assert!(
+            fake.verbs().contains(&Verb::Nudge),
+            "a submit was recorded as though it were the sentence: {:?}",
+            fake.verbs()
+        );
     }
 
     /// The subscribe stream, which is the half neither port could test before:

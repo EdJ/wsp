@@ -695,10 +695,12 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 
 /// Where wsp puts work.
 ///
-/// Eight methods. Every one of them is a clause of the sentence at the top of
+/// Nine methods. Every one of them is a clause of the sentence at the top of
 /// this file, and nothing in any signature names a pane, a window, a tab or a
 /// terminal. [`Place::here`] is the eighth and is the one clause read from the
 /// inside: *give me a handle* is two directions, and it was one for a while.
+/// [`Place::nudge`] is the ninth and the only one with a body here, because it
+/// is the only one a backend is entitled not to have.
 ///
 /// Object-safe deliberately: `Remote` is a decorator holding a
 /// `Box<dyn Place>`, and a backend is chosen at runtime rather than compiled
@@ -751,7 +753,39 @@ pub trait Place {
     /// there. Not "send keystrokes": a backend with no terminal has no
     /// keystrokes, and a backend with one should use its own submit rather than
     /// a sleep long enough for a TUI to finish pasting.
+    ///
+    /// `Ok` is *delivered*, and it is not *taken*. The backend accepted the
+    /// call; whether the agent started a turn on it is [`Place::state`]'s
+    /// question and [`Place::nudge`] is what to do about the answer.
     fn tell(&self, seat: &Seat, text: &str) -> Result<()>;
+
+    /// Submit whatever is sitting unsent in the agent's input.
+    ///
+    /// The one verb here that exists because another verb cannot keep a promise
+    /// it looks like it makes. On a backend that reaches an agent by typing at
+    /// it, the sentence and the submit are two separate things arriving at a TUI
+    /// that is still finishing the first, and the second is dropped: the work
+    /// order sits in the composer, the agent reads `idle`, and every reading wsp
+    /// has says the spawn went well. Measured through robustness-035: four of
+    /// six agents in one burst, then three of three in a quiet moment, then
+    /// three of three again on the bare socket with no wsp in the call — so it
+    /// is the backend's failure and herdr 0.8.0's own wait between the text and
+    /// the Enter narrowed the window rather than closing it. A return pressed
+    /// afterwards started the turn in 0.15s every time.
+    ///
+    /// It presses submit and says nothing about what is being submitted, which
+    /// is what keeps it from being a keystroke API: there is no key in the
+    /// signature and no second use for it. A caller has to have sent something
+    /// and watched it not be taken to have any business here.
+    ///
+    /// [`Refusal::Unsupported`] by default, because a backend where this cannot
+    /// happen has nothing to implement. A supervisor writes the prompt into a
+    /// pipe the agent is reading — there is no half-arrived state to rescue, and
+    /// a caller that gets this answer should say the turn never started rather
+    /// than go on pressing.
+    fn nudge(&self, _seat: &Seat) -> Result<()> {
+        Err(Refusal::Unsupported("submit a prompt that arrived and was not taken"))
+    }
 
     /// End whatever agent is in a seat, and let the seat go.
     ///

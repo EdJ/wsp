@@ -525,6 +525,20 @@ impl Place for Herdr<'_> {
             .map_err(|e| refusal(seat, &e))
     }
 
+    /// `agent.send_keys enter`, which is the recovery that was run by hand every
+    /// time this failed.
+    ///
+    /// Addressed to the agent rather than to the pane, and that is the whole
+    /// choice here: `pane.send_text "\r"` would type a return at whatever is in
+    /// the pane now, and the case this is reached in is one where wsp's picture
+    /// of the seat has already been shown to be optimistic. An agent target that
+    /// no longer names an agent is refused by herdr, which is the answer wanted.
+    fn nudge(&self, seat: &Seat) -> Result<()> {
+        herdr::call("agent.send_keys", json!({ "target": seat.as_str(), "keys": ["enter"] }))
+            .map(|_| ())
+            .map_err(|e| refusal(seat, &e))
+    }
+
     /// Take the seat's pane away, which is the only thing herdr has that ends
     /// an agent — and, when the seat is a workspace's last pane, ends the
     /// workspace too. See the module docs for what was measured.

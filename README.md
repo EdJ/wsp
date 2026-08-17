@@ -2656,6 +2656,7 @@ wsp sandbox --fake --run "wsp wip"        # …or one command against that state
 
 ```json
 { "settle": false,
+  "takes": true,
   "quiet": "no",
   "seats": [
     { "agent": "claude", "name": "t-260816-080", "state": "working", "label": "robustness/080" },
@@ -2668,7 +2669,10 @@ what it was and pushes exactly the events that change would have raised, which
 is how the daemon's event path is driven. `quiet` is the state nothing else can
 produce: `hangs-up` answers a connection by dropping it, `never` holds it open
 and says nothing, and the difference between those two clocks is where
-`Err`-is-not-an-empty-list lives.
+`Err`-is-not-an-empty-list lives. `takes: false` is robustness-035 on a socket:
+`agent.prompt` answers `ok`, the sentence sits in the composer unsent and the
+agent stays idle — the failure a spawn used to report as a success, and one a
+`send_keys` rescues exactly as pressing return by hand did.
 
 **The fake is for wsp's reaction to a state; the herdr sandbox stays the
 contract check against real behaviour.** A fake that is wrong about herdr makes

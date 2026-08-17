@@ -220,6 +220,33 @@ struct Patience<'a> {
     /// backend's, and live in `place_herdr` — this is only how long the caller
     /// is prepared to wait.
     ready: Duration,
+    /// How long a turn has to start, once the work order has been sent.
+    ///
+    /// **Measured against a live herdr 0.8.0 and a live Claude Code on
+    /// 2026-08-18**, three runs of the loop below in a workspace of its own: the
+    /// prompt was accepted and left sitting in the composer every time, and a
+    /// return pressed at 5.1s started the turn in **0.15s**. So the number this
+    /// has to be bigger than is not how long an agent takes to answer, it is how
+    /// long Claude Code takes to *draw the composer that can be submitted into*
+    /// — pressed at 2.0s, before the TUI had replaced the shell on screen, the
+    /// return was swallowed exactly as the first one had been, and the seat sat
+    /// idle for the twenty seconds that followed.
+    ///
+    /// Five seconds is above the widest reading of that window and below the
+    /// point where a spawn feels stuck. It is paid on every spawn while herdr's
+    /// own submit keeps failing, which on that evening was every spawn there
+    /// was.
+    taken: Duration,
+    /// How many times to press submit again on a work order that arrived and
+    /// was not taken.
+    ///
+    /// Bounded because pressing it is not free — a submit into an agent that
+    /// *is* working goes in as an empty line — and because a second failure is
+    /// evidence about the seat rather than about the keystroke. Two because a
+    /// press can be lost the same way the first submit was: one is what the
+    /// measurement above needed, and the spare is for the case where the
+    /// composer was still a tenth of a second away.
+    nudges: u32,
     /// How often to ask.
     poll: Duration,
     /// How long a seat has to go on looking empty before that is a death rather
@@ -258,6 +285,8 @@ impl Default for Patience<'static> {
     fn default() -> Patience<'static> {
         Patience {
             ready: Duration::from_millis(30_000),
+            taken: Duration::from_millis(5_000),
+            nudges: 2,
             poll: Duration::from_millis(150),
             gone: Duration::from_millis(2_000),
             clock: &util::Wall,
@@ -325,6 +354,94 @@ fn wait_ready(
         }
         if now() >= deadline {
             return Err(format!("{kind} started but never became ready for input"));
+        }
+        wait.clock.rest(wait.poll);
+    }
+}
+
+/// Hand over the work order, and come back only when a turn has started on it.
+///
+/// **The defect this is the whole of, and it fails open, which is why it was
+/// expensive.** `tell` returns `Ok` when the backend accepted the call, and
+/// `spawn` reported success on the send. What was actually happening on a
+/// terminal backend is that the sentence arrived in Claude Code's composer and
+/// the Enter after it was swallowed: an agent sitting idle in front of a work
+/// order it has never been shown, holding a claim, and reported as a healthy
+/// spawn. Ed found it by watching a pane; nothing else could have. Four of six
+/// agents in one burst on 2026-08-17, three of three in a quiet moment that
+/// night with the machine idle and nobody at the keyboard, after herdr 0.8.0
+/// had already put a wait between its own text and its own Enter.
+///
+/// **It is not wsp's, and that is why nothing wsp could do to its own call
+/// fixed it.** Reproduced on 2026-08-18 with no wsp in the picture at all — a
+/// workspace, `agent.start`, `agent.prompt` on the raw socket — three runs,
+/// three sentences left sitting in the composer with the agent idle, read back
+/// off the screen. What wsp owns is the half after that: noticing, and saying
+/// so.
+///
+/// So the readiness wait is not the fix and was never missing: [`wait_ready`]
+/// runs first and asks `will_take_a_prompt`, which is herdr's optimistic
+/// signal and goes true before the composer can take a submission. Waiting
+/// longer only widens the window it is wrong in. **The only thing that settles
+/// it is the agent leaving idle**, which is a fact about the agent rather than
+/// a promise about the call.
+///
+/// Then the loop is what was run by hand: press submit again, look again,
+/// bounded, and fail loudly rather than print a success. `Unsupported` from
+/// [`Place::nudge`] ends it at once — a backend with nothing to press has
+/// nothing to try — and is still a failure, because the turn did not start
+/// either way. That case is `wsp spawn --on <machine>` into a session nobody
+/// had logged in, which reported three lines of success on 2026-08-17 for an
+/// agent that could never take a turn.
+///
+/// [`State::Working`] and nothing softer is what counts as taken. `Unknown` is
+/// what herdr's `blocked` and `done` arrive as (`place_herdr::of_status`), and
+/// an absence is not a fact — the rule the rest of this file is built on. The
+/// cost of that strictness is the one false alarm available here: an agent that
+/// takes the order, finishes the whole turn inside [`Patience::taken`] and is
+/// idle again by the first look. A work order whose first act is reading a
+/// brief does not, and a spawn wrongly called failed is recoverable in a way
+/// that a spawn wrongly called succeeded is not.
+fn hand_over(
+    place: &dyn Place,
+    how: &dyn agent_commands::Kind,
+    spawn: &agent_commands::Spawn,
+    text: &str,
+    wait: &Patience,
+) -> Result<(), String> {
+    let seat = spawn.seat;
+    how.tell(place, seat, text).map_err(|e| e.to_string())?;
+    let mut pressed = 0;
+    while !took_it(place, seat, wait) {
+        if pressed == wait.nudges {
+            return Err(format!("the work order is sitting in {seat} unsent"));
+        }
+        match place.nudge(seat) {
+            Ok(()) => pressed += 1,
+            Err(Refusal::Unsupported(_)) => {
+                return Err(format!("{seat} took the work order and started nothing"))
+            }
+            Err(e) => return Err(format!("{seat} did not take the work order: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a turn started inside [`Patience::taken`].
+///
+/// The same shape as [`wait_ready`]'s loop and deliberately not folded into it:
+/// that one waits for an agent to become *able* to be told something, this one
+/// waits for evidence that it *was*. They read the same call and mean opposite
+/// things by an idle agent.
+fn took_it(place: &dyn Place, seat: &Seat, wait: &Patience) -> bool {
+    let now = || wait.clock.now();
+    let deadline = now() + wait.taken;
+    loop {
+        if let Ok(State::Working) = place.state(seat) {
+            return true;
+        }
+        if now() >= deadline {
+            return false;
         }
         wait.clock.rest(wait.poll);
     }
@@ -575,6 +692,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // for raised hands and cannot read one.
     let mut started: Option<String> = None;
     let mut told = false;
+    let mut ordered = false;
     if args.has("agent") || governing.is_some() {
         let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
         let name = work.task.clone().or_else(|| work.project.clone()).unwrap_or_default();
@@ -608,15 +726,16 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                     (None, None) => None,
                 };
                 if let Some(text) = order {
+                    ordered = true;
                     // Through the kind rather than through the port. Readiness
                     // is established above, and *how* a sentence reaches an
                     // agent of this kind — its own channel, or the backend
                     // typing at it — is the one decision this file must not
                     // make; see `agent_commands`.
-                    match how.tell(place, &seat, &text) {
+                    match hand_over(place, how, &spawn, &text, &Patience::default()) {
                         Ok(()) => told = true,
                         Err(e) => {
-                            eprintln!("wsp: agent started but not told: {e}");
+                            eprintln!("wsp: agent started but not working on it: {e}");
                             unreached(how, place, &spawn);
                         }
                     }
@@ -685,6 +804,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // An agent asked for and not started is a failure however well the seat
     // went: the caller wanted somebody working, and there is nobody.
     if (args.has("agent") || governing.is_some()) && started.is_none() {
+        return 1;
+    }
+    // And a work order that started no turn is the same failure one step later,
+    // which is robustness-035 and is the reason this line exists. The seat is
+    // open, the claim is written and the agent is alive — all of it true, none
+    // of it work — so an exit code is the only thing left that a queue spawning
+    // unattended can read. Saying so in the status is what stops a governor
+    // concluding the night is under way.
+    if ordered && !told {
         return 1;
     }
     0
@@ -1195,6 +1323,12 @@ mod tests {
     /// only moves when the wait rests. Nothing here sleeps.
     const GRACE: Duration = Duration::from_millis(30);
     const READY: Duration = Duration::from_millis(2_000);
+    /// Ten polls to start a turn in, and two presses. Small because the clock is
+    /// the test's: what these buy is arithmetic a reader can check in their
+    /// head, so a bound below is a statement about the loop rather than about
+    /// the machine it ran on.
+    const TAKEN: Duration = Duration::from_millis(10);
+    const PRESSES: u32 = 2;
 
     fn waiting_on(
         place: &Reads,
@@ -1203,7 +1337,14 @@ mod tests {
         clock: &util::Dial,
     ) -> Result<(), String> {
         let spawn = agent_commands::Spawn { full: false, name: "t-260817-010", seat };
-        let wait = Patience { ready: READY, poll: STEP, gone: GRACE, clock };
+        let wait = Patience {
+            ready: READY,
+            taken: TAKEN,
+            nudges: PRESSES,
+            poll: STEP,
+            gone: GRACE,
+            clock,
+        };
         wait_ready(place, how, &spawn, "claude", &wait)
     }
 
@@ -1297,6 +1438,187 @@ mod tests {
             waiting_on(&place, &alive, &Seat::new("w2C:p1"), &util::Dial::new()),
             Err("w2C:p1 is gone".into())
         );
+    }
+
+    /// A backend that takes a work order and then does what the night of
+    /// 2026-08-17 did: holds it in the composer until somebody presses return.
+    ///
+    /// `starts_after` is the number of presses it takes to start a turn —
+    /// `Some(0)` is a healthy handover, `None` is the seat nothing rescues, and
+    /// `Some(1)` is every failure Ed recovered by hand. The counter is the
+    /// assertion that matters twice over: a loop that presses when it did not
+    /// need to is typing into somebody's work, and one that presses for ever is
+    /// the silence this task was filed about wearing a different face.
+    struct Composer {
+        starts_after: Option<u32>,
+        can_press: bool,
+        pressed: std::cell::Cell<u32>,
+        heard: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Composer {
+        fn of(starts_after: Option<u32>, can_press: bool) -> Composer {
+            Composer {
+                starts_after,
+                can_press,
+                pressed: std::cell::Cell::new(0),
+                heard: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Place for Composer {
+        fn tell(&self, _: &Seat, text: &str) -> crate::place::Result<()> {
+            self.heard.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+        fn nudge(&self, _: &Seat) -> crate::place::Result<()> {
+            if !self.can_press {
+                return Err(Refusal::Unsupported("press submit"));
+            }
+            self.pressed.set(self.pressed.get() + 1);
+            Ok(())
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            Ok(match self.starts_after {
+                Some(n) if self.pressed.get() >= n => State::Working,
+                // Idle, which is the whole of the defect: the agent is well,
+                // it is waiting for input, and what it is waiting on is the
+                // work order it was already given.
+                _ => State::Idle,
+            })
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("a handover does not open seats")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("the agent is already running")
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a handover that fails leaves the agent standing")
+        }
+        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+            panic!("a handover is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("a handover does not subscribe")
+        }
+        fn here(&self) -> Option<Seat> {
+            panic!("a handover is about a seat it was handed")
+        }
+    }
+
+    /// A kind that says its sentence through the backend, which is what
+    /// `agent_commands::Claude` does and what makes the port's `tell` the one
+    /// under test.
+    struct Speaks;
+
+    impl agent_commands::Kind for Speaks {
+        fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> crate::place::Result<()> {
+            place.tell(seat, text)
+        }
+        fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
+            Vec::new()
+        }
+        fn address(
+            &self,
+            _: &dyn Place,
+            _: &agent_commands::Spawn,
+        ) -> Option<agent_commands::Address> {
+            None
+        }
+        fn running(&self, _: &agent_commands::Spawn) -> Option<bool> {
+            None
+        }
+    }
+
+    fn handing_over(place: &Composer, clock: &util::Dial) -> Result<(), String> {
+        let seat = Seat::new("w3M:p1");
+        let spawn = agent_commands::Spawn { full: false, name: "robustness-035", seat: &seat };
+        let wait = Patience {
+            ready: READY,
+            taken: TAKEN,
+            nudges: PRESSES,
+            poll: STEP,
+            gone: GRACE,
+            clock,
+        };
+        hand_over(place, &Speaks, &spawn, "you have been claimed onto robustness-035", &wait)
+    }
+
+    /// The healthy handover, and the assertion is that nothing else happens: an
+    /// agent that starts a turn is not typed at, and the sentence is not paid
+    /// for twice.
+    #[test]
+    fn a_work_order_the_agent_starts_on_is_not_pressed_again() {
+        let place = Composer::of(Some(0), true);
+        let dial = util::Dial::new();
+        assert_eq!(handing_over(&place, &dial), Ok(()));
+        assert_eq!(place.pressed.get(), 0, "return was pressed at an agent already working");
+        assert_eq!(place.heard.borrow().len(), 1, "the work order was sent more than once");
+        assert_eq!(dial.elapsed(), Duration::ZERO, "a spawn that went well waited for it");
+    }
+
+    /// **The failure this task is named for, and the recovery that closes it.**
+    ///
+    /// The sentence arrives, the submit is swallowed, the agent sits idle in
+    /// front of it. One press starts the turn — which is exactly what
+    /// `herdr agent send-keys <pane> enter` did by hand, four times in one
+    /// burst on 2026-08-17.
+    ///
+    /// The second assertion is the one that would be easy to lose: the retry is
+    /// a *submit* and never a second `tell`. Sending the work order again would
+    /// leave two copies of it in the composer, and the agent would read the
+    /// duplicate as something it had been told twice.
+    #[test]
+    fn a_work_order_left_sitting_in_the_composer_is_submitted_again() {
+        let place = Composer::of(Some(1), true);
+        let dial = util::Dial::new();
+        assert_eq!(handing_over(&place, &dial), Ok(()));
+        assert_eq!(place.pressed.get(), 1, "one press was enough by hand and should be here");
+        assert_eq!(place.heard.borrow().len(), 1, "the work order was sent twice over");
+        assert_eq!(dial.elapsed(), TAKEN, "one window of patience before pressing, and one only");
+    }
+
+    /// And when nothing rescues it, the spawn fails and says so.
+    ///
+    /// A claimed task in front of an idle agent is what this used to report as
+    /// success, so the assertion is on the `Err` rather than on the recovery:
+    /// the caller prints it, exits non-zero, and an unattended queue learns that
+    /// nothing has started. The press count is bounded arithmetic — three
+    /// windows and two presses — because a loop that goes on pressing is the
+    /// same silence with more typing in it.
+    #[test]
+    fn an_agent_that_never_takes_the_work_order_fails_the_spawn_rather_than_reporting_one() {
+        let place = Composer::of(None, true);
+        let dial = util::Dial::new();
+        assert_eq!(
+            handing_over(&place, &dial),
+            Err("the work order is sitting in w3M:p1 unsent".into())
+        );
+        assert_eq!(place.pressed.get(), PRESSES, "the press loop is not bounded");
+        assert_eq!(dial.elapsed(), TAKEN * (PRESSES + 1), "the wait is not bounded either");
+    }
+
+    /// A backend with nothing to press does not get pressed, and the spawn
+    /// still fails.
+    ///
+    /// The second instance from the same night: `wsp spawn --on` into a session
+    /// that was never logged in reported every line of success it has. There is
+    /// no keystroke that fixes that one, and the point of the answer is that the
+    /// caller stops rather than that it recovers — a turn that has not started
+    /// is a spawn that has not happened, whatever the backend can or cannot do
+    /// about it.
+    #[test]
+    fn a_backend_with_nothing_to_press_says_the_turn_never_started() {
+        let place = Composer::of(None, false);
+        let dial = util::Dial::new();
+        assert_eq!(
+            handing_over(&place, &dial),
+            Err("w3M:p1 took the work order and started nothing".into())
+        );
+        assert_eq!(place.pressed.get(), 0, "something was pressed on a backend with no keys");
+        assert_eq!(dial.elapsed(), TAKEN, "a backend that cannot be pressed was waited on twice");
     }
 
     /// A backend that only remembers what it was asked to open.
