@@ -78,6 +78,11 @@ pub(crate) use rows::pane_name;
 pub(crate) use render::{
     frame, glyph, legend, line, place, to_ansi, to_html, to_html_spans, Line, Style,
 };
+// The style tables, out to the renderer. `crate::draw` paints a cell to a
+// terminal through exactly these, so there is one answer to what `Accent` looks
+// like rather than one per surface.
+pub(crate) use render::ansi_of;
+pub(crate) use render::{INV as ANSI_INV, OFF as ANSI_OFF};
 // The live click mapping reaches `row_at` through `super::render` inside this
 // module; only the storyboard's tests need it from outside, so it is exported
 // for them alone rather than widening the surface for everyone.

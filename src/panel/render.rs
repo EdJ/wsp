@@ -29,9 +29,9 @@ pub(super) const DIMC: &str = "\x1b[2m";
 
 pub(super) const BOLD: &str = "\x1b[1m";
 
-pub(super) const INV: &str = "\x1b[7m";
+pub(crate) const INV: &str = "\x1b[7m";
 
-pub(super) const OFF: &str = "\x1b[0m";
+pub(crate) const OFF: &str = "\x1b[0m";
 
 /// How a run of text is drawn. Kept beside the text rather than baked into it:
 /// lines used to be built with the escapes already embedded, which is why
@@ -1131,7 +1131,10 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     lines
 }
 
-pub(super) fn ansi_of(style: Style) -> &'static str {
+/// The one style-to-escape table. `pub(crate)` because the renderer's terminal
+/// target ([`crate::draw::Ansi`]) paints through it too, and a second copy is
+/// how a colour comes to mean one thing in a pane and another in a storyboard.
+pub(crate) fn ansi_of(style: Style) -> &'static str {
     match style {
         Style::Plain => "",
         Style::Dim => DIMC,
@@ -1145,25 +1148,23 @@ pub(super) fn ansi_of(style: Style) -> &'static str {
 
 /// What the live panel prints.
 ///
-/// Inverse is re-asserted per span rather than wrapped around the row: every
-/// span ends with a reset, and a reset clears inverse too, so a single opening
-/// `INV` only ever highlighted a selected row up to its first styled run.
+/// The one-cell case of [`crate::draw::Ansi`], and delegating rather than
+/// repeating it is the point of t-260816-092: a pane wsp is standing in is a
+/// spec of one pane at the origin, so there is one positioning loop and one
+/// inverse rule instead of two that agree until somebody edits one of them.
 pub(crate) fn to_ansi(frame: &[Line], w: usize, h: usize) -> String {
-    let mut out = String::from("\x1b[H\x1b[2J");
-    for (i, l) in frame.iter().take(h).enumerate() {
-        out.push_str(&format!("\x1b[{};1H", i + 1));
-        let mut l = l.clone();
-        l.fit(w);
-        for s in &l.spans {
-            if l.selected {
-                out.push_str(INV);
-            }
-            out.push_str(ansi_of(s.style));
-            out.push_str(&s.text);
-            out.push_str(OFF);
-        }
-    }
-    out
+    use crate::arrange::{Body, Content, Rect, Slot};
+    use crate::draw::{Ansi, Cell, Target};
+
+    let cell = Cell {
+        slot: Slot::new("self"),
+        label: String::new(),
+        rect: Rect { x: 0, y: 0, w: w as u32, h: h as u32 },
+        body: Body::Rendered(Content::new("self")),
+    };
+    let mut out = Ansi::fresh();
+    out.rendered(&cell, &frame.to_vec());
+    out.finish()
 }
 
 pub(super) fn class_of(style: Style) -> &'static str {

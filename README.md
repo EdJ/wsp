@@ -2419,6 +2419,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
 | `src/place_herdr.rs` | that port over herdr: the shell race, the launch window, the retype |
 | `src/arrange.rs` | the arrange-panes port: a desired set of panes, and the reconciler under it |
+| `src/draw.rs` | the renderer: one spec and a view, drawn to a terminal or to a block of text |
 | `src/fake.rs` | a backend that answers that socket out of a state we choose — `wsp sandbox --fake` |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh |

@@ -20,6 +20,7 @@ mod cmd_task;
 mod cmd_verify;
 mod daemon;
 mod detail;
+mod draw;
 mod fake;
 mod fm;
 mod herdr;
