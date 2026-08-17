@@ -706,14 +706,24 @@ pub fn colour_enabled() -> bool {
 /// take over the screen".
 pub fn stdout_is_tty() -> bool {
     // Not a perfect isatty, but avoids pulling libc in for one call.
-    unsafe { is_tty() }
+    unsafe { is_tty(1) }
 }
 
-unsafe fn is_tty() -> bool {
+/// Whether a command told to read stdin has anything to read.
+///
+/// A terminal answers `read` by waiting, so a `-` typed with nothing piped in
+/// is not an empty note — it is a command that has stopped, with no output, in
+/// a pane whose keystrokes are now going somewhere nobody can see. Refusing it
+/// is the only answer that says what happened.
+pub fn stdin_is_tty() -> bool {
+    unsafe { is_tty(0) }
+}
+
+unsafe fn is_tty(fd: i32) -> bool {
     extern "C" {
         fn isatty(fd: i32) -> i32;
     }
-    isatty(1) == 1
+    isatty(fd) == 1
 }
 
 pub struct Paint {

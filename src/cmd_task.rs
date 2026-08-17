@@ -662,13 +662,100 @@ pub fn block(store: &Store, args: &Args) -> i32 {
     })
 }
 
-pub fn note(store: &Store, args: &Args) -> i32 {
-    let text = args.text(1);
-    if text.trim().is_empty() {
-        eprintln!("usage: wsp note <id> \"text\"");
-        return 2;
+/// Is this payload naming a stream to read the prose from, rather than being
+/// the prose?
+///
+/// `wsp edit <id> --overview -` is the idiom this store teaches for prose: it
+/// is in the handbook, in the brief's rules, and in most tasks written here. So
+/// an agent with a paragraph to log generalises it and writes `wsp note <id>
+/// --from -`. Until this, `note` had no stdin form and took the whole line as
+/// its text — it exited 0, printed the ordinary receipt, and recorded a log
+/// entry whose entire body was `-`. On 2026-08-17 that destroyed
+/// `robustness-068`'s review note in full, and the agent found out by re-reading
+/// its own log. A verb that refuses is a verb you learn; this one succeeded.
+///
+/// So the idiom is answered rather than refused, in both spellings `edit`
+/// accepts. `--from` arrives here as a *positional* because `note` and `decide`
+/// stop parsing flags after their subject (`LITERAL_AFTER` in `main.rs`) — the
+/// rule that keeps `wsp note 028 "--parent only exists on add"` intact. The two
+/// rules pull against each other and this is where they meet.
+///
+/// Only a payload that is *entirely* a source counts. Prose here is mostly
+/// about the CLI, so a note that merely begins with `--from` is a sentence
+/// somebody meant, and `--` is still the escape hatch under everything.
+fn payload_source(payload: &[String]) -> Option<String> {
+    match payload {
+        // A lone `-`, and `--from` with nothing usable after it: both name the
+        // stream, the second because `--from` is not worth an editor session
+        // nobody asked for. Same reading as `prose_source` gives `edit`.
+        [one] if one == "-" || one == "--from" => Some("-".into()),
+        [one] => one.strip_prefix("--from=").map(str::to_string),
+        [flag, path] if flag == "--from" => Some(path.clone()),
+        _ => None,
     }
-    mutate(store, args, "note", |t| t.log(text.trim()))
+}
+
+/// One entry is one line, so text that arrives on several becomes one.
+///
+/// Not tidying: the `## Log` section is read line-by-line by everything that
+/// reads it — `brief` shows the last few *lines* as the last few entries,
+/// `blocked_question` scans for one, `localise_dates` rewrites the stamp at the
+/// head of each. A forty-line survey pasted in whole is forty entries to all of
+/// them, and it would push every other entry out of the brief that every
+/// session on the task pays for. Folding keeps every word and costs the
+/// paragraph breaks; the alternative costs the reader.
+fn fold(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The prose for a log entry or a decision: the rest of the line, or the stream
+/// it names. `Err` is the exit code, with the reason already on stderr.
+fn prose_payload(args: &Args, usage: &str) -> Result<(String, Option<String>), i32> {
+    let Some(src) = payload_source(args.rest.get(1..).unwrap_or_default()) else {
+        let text = fold(&args.text(1));
+        if text.is_empty() {
+            eprintln!("usage: {usage}");
+            return Err(2);
+        }
+        return Ok((text, None));
+    };
+    // Named the way the rest of the CLI names a path — a receipt that says
+    // `~/notes/survey.md` is one the reader recognises.
+    let named = if src == "-" { "stdin".to_string() } else { util::contract(&util::expand(&src)) };
+    if src == "-" && util::stdin_is_tty() {
+        // Reading a terminal is not an empty note, it is a command that stops
+        // and says nothing while it swallows the keys. The one failure worse
+        // than the silent one this task is about.
+        eprintln!("wsp: nothing is piped in — `-` reads the text from a stream");
+        return Err(2);
+    }
+    let text = match read_source(&src) {
+        Ok(raw) => fold(&raw),
+        Err(e) => {
+            eprintln!("wsp: cannot read {named}: {e}");
+            return Err(1);
+        }
+    };
+    if text.is_empty() {
+        // The whole failure, in one condition: an empty stream is what a bare
+        // `-` used to mean, and recording it is how the note went missing. An
+        // error costs a retry; success costs the prose.
+        eprintln!("wsp: nothing on {named} — nothing recorded");
+        return Err(2);
+    }
+    Ok((text, Some(named)))
+}
+
+pub fn note(store: &Store, args: &Args) -> i32 {
+    let (text, from) = match prose_payload(args, "wsp note <id> \"text\"   (or `-` to read it from stdin)") {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    // What came off a stream nobody watched, said back. The receipt for the
+    // typed form is the text itself, on the terminal above; for this one it is
+    // this line or nothing at all.
+    let said = from.map(|src| format!("{} characters from {src} — {}", text.len(), util::truncate(&text, 48)));
+    mutate_saying(store, args, "note", said.as_deref(), |t| t.log(&text))
 }
 
 /// `wsp decide <id> "…"` — record what was settled, on a task or a project.
@@ -684,20 +771,26 @@ pub fn note(store: &Store, args: &Args) -> i32 {
 /// turns out wrong is superseded by a later one saying so, which is the honest
 /// record — the reasoning that was live at the time is what a reader three
 /// months on needs, not a tidied conclusion.
+///
+/// It reads its prose the same way `note` does — see [`payload_source`]. The
+/// two are one act at different heights and an agent that has learned `-` on
+/// one will type it on the other; a verb that answered `-` with a decision
+/// whose whole text was `-` would be the same defect one file along.
 pub fn decide(store: &Store, args: &Args) -> i32 {
-    let text = args.text(1);
-    if text.trim().is_empty() {
-        eprintln!("usage: wsp decide <task|project> \"what was settled, and why\"");
-        return 2;
-    }
+    const USAGE: &str = "wsp decide <task|project> \"what was settled, and why\"   (or `-` for stdin)";
+    let (text, from) = match prose_payload(args, USAGE) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp decide <task|project> \"what was settled, and why\"");
+        eprintln!("usage: {USAGE}");
         return 2;
     };
 
     if store.find_task(&needle).is_some() {
-        return mutate(store, args, "decided", |t| {
-            crate::model::append_dated(&mut t.body, "Decisions", text.trim())
+        let said = from.map(|src| format!("{} characters from {src}", text.len()));
+        return mutate_saying(store, args, "decided", said.as_deref(), |t| {
+            crate::model::append_dated(&mut t.body, "Decisions", &text)
         });
     }
 
@@ -706,19 +799,19 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no task or project matching `{needle}`");
         return 1;
     };
-    crate::model::append_dated(&mut p.body, "Decisions", text.trim());
+    crate::model::append_dated(&mut p.body, "Decisions", &text);
     if let Err(e) = store.save_project(&p) {
         eprintln!("wsp: write failed: {e}");
         return 1;
     }
-    store.log_event("project-decided", json!({ "id": p.id, "text": text.trim() }));
-    store.git_commit(&format!("wsp: decide {} — {}", p.id, util::truncate(text.trim(), 60)));
+    store.log_event("project-decided", json!({ "id": p.id, "text": text }));
+    store.git_commit(&format!("wsp: decide {} — {}", p.id, util::truncate(&text, 60)));
 
     if args.json() {
         println!("{}", json!({ "project": p.id, "decisions": crate::model::decisions(&p.body).len() }));
     } else {
         let paint = Paint::new();
-        println!("{} {}  {}", paint.cyan("◆"), paint.bold(&p.id), util::truncate(text.trim(), 60));
+        println!("{} {}  {}", paint.cyan("◆"), paint.bold(&p.id), util::truncate(&text, 60));
     }
     0
 }
@@ -1986,4 +2079,109 @@ mod tests {
         assert_eq!(p.held, 0);
     }
 
+    fn parse(line: &[&str]) -> Args {
+        Args::parse(line.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    fn scratch_file(name: &str, text: &str) -> String {
+        let p = std::env::temp_dir().join(format!("wsp-{name}-{}.md", std::process::id()));
+        std::fs::write(&p, text).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    fn log_of(store: &Store, id: &str) -> String {
+        store.find_task(id).expect("the task").section("Log").unwrap_or_default()
+    }
+
+    /// The whole defect, from the line that caused it.
+    ///
+    /// `wsp note <id> --from -` is what an agent writes after learning
+    /// `wsp edit <id> --overview -`, and it used to record a log entry whose
+    /// entire body was `-`. Asserted on the recogniser rather than through
+    /// `note`, because the failing spellings include stdin and a test that
+    /// reads stdin either blocks or reads the harness's.
+    #[test]
+    fn the_payload_that_ate_a_review_note_is_read_as_a_stream() {
+        let one = |s: &str| vec![s.to_string()];
+        for shape in ["-", "--from"] {
+            assert_eq!(payload_source(&one(shape)), Some("-".into()), "`{shape}` names stdin");
+        }
+        // `--from` reaches `note` as a positional — it stops parsing flags
+        // after its subject — so both halves arrive as payload.
+        let a = parse(&["note", "047", "--from", "-"]);
+        assert!(!a.has("from"), "the parser must leave the payload alone");
+        assert_eq!(payload_source(&a.rest[1..]), Some("-".into()));
+        assert_eq!(payload_source(&a.rest[..]), None, "the id is not a source");
+
+        for from in [vec!["--from".to_string(), "notes.md".to_string()], one("--from=notes.md")] {
+            assert_eq!(payload_source(&from), Some("notes.md".into()));
+        }
+    }
+
+    /// …and the other half: prose that begins like a source is prose.
+    ///
+    /// Notes in this store are mostly *about* the CLI, so they begin with a
+    /// flag about as often as not. A payload counts as a source only when it is
+    /// entirely one.
+    #[test]
+    fn a_note_that_only_begins_like_a_source_is_still_recorded_whole() {
+        let store = scratch("note-prose");
+        task_with(&store, "t-260815-047", "normal");
+
+        let said = "--from - is the shape that ate a review note";
+        assert_eq!(note(&store, &parse(&["note", "047", said])), 0);
+        assert!(log_of(&store, "047").contains(said), "{}", log_of(&store, "047"));
+    }
+
+    /// A note read from a stream is the note, not the dash — and it is one
+    /// entry, because every reader of `## Log` reads it a line at a time.
+    #[test]
+    fn a_note_read_from_a_stream_lands_whole_and_on_one_line() {
+        let store = scratch("note-stream");
+        task_with(&store, "t-260815-047", "normal");
+
+        let path = scratch_file("survey", "Eighteen tests against the live store.\n\nThree renamed this machine's w1.\n");
+        assert_eq!(note(&store, &parse(&["note", "047", "--from", &path])), 0);
+
+        let log = log_of(&store, "047");
+        assert_eq!(log.lines().filter(|l| !l.trim().is_empty()).count(), 1, "one note, one entry: {log}");
+        assert!(log.contains("Eighteen tests") && log.contains("renamed this machine's w1"), "{log}");
+        assert!(!log.trim_end().ends_with(" -"), "the dash is what this task is about: {log}");
+    }
+
+    /// Nothing to record is refused, out loud.
+    ///
+    /// This is the condition that turns the silent loss into an error: an empty
+    /// stream is exactly what a bare `-` used to mean, and a log entry saying
+    /// nothing is indistinguishable from the note that went missing.
+    #[test]
+    fn a_note_from_an_empty_stream_is_refused_rather_than_recorded() {
+        let store = scratch("note-empty");
+        task_with(&store, "t-260815-047", "normal");
+
+        let path = scratch_file("empty", "\n  \n");
+        assert_eq!(note(&store, &parse(&["note", "047", "--from", &path])), 2);
+        assert!(log_of(&store, "047").trim().is_empty(), "nothing may be recorded");
+
+        // A source that is not there is a mistake worth reporting, not an
+        // empty note either.
+        assert_eq!(note(&store, &parse(&["note", "047", "--from", "/nowhere/at/all.md"])), 1);
+        assert!(log_of(&store, "047").trim().is_empty());
+    }
+
+    /// `decide` takes prose the same way, for the same reason: an agent that
+    /// has learned `-` on one of them will type it on the other.
+    #[test]
+    fn a_decision_can_be_read_from_a_stream_too() {
+        let store = scratch("decide-stream");
+        task_with(&store, "t-260815-047", "normal");
+
+        let path = scratch_file("decision", "Store UTC, render local.\nThe instant is the record.\n");
+        assert_eq!(decide(&store, &parse(&["decide", "047", "--from", &path])), 0);
+
+        let t = store.find_task("047").expect("the task");
+        let d = t.section("Decisions").unwrap_or_default();
+        assert_eq!(d.lines().filter(|l| !l.trim().is_empty()).count(), 1, "{d}");
+        assert!(d.contains("Store UTC, render local. The instant is the record."), "{d}");
+    }
 }

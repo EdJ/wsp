@@ -1052,7 +1052,7 @@ five on a project:
 | `## Details` | working material — criteria, links, whatever the work needs |
 | `## Handbook` | *projects only* — what an arriving agent is told; see below |
 | `## Decisions` | what was settled and now binds; `wsp decide` writes it |
-| `## Log` | dated, append-only; `wsp note` writes it, nothing edits it |
+| `## Log` | dated, append-only, one entry per line; `wsp note` writes it, nothing edits it |
 
 Both dated sections store the *instant*, in UTC — `- 2026-08-16T23:15:00Z …` —
 and every command that shows one converts it to the reader's own date, so a

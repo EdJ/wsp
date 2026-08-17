@@ -520,6 +520,8 @@ fn help() {
   wsp block <id> "reason"           park it, and say why
   wsp decide <task|proj> "…"      record what was settled, and why
   wsp note <id> "text"              append to the log
+  wsp note <id> - | --from FILE     …or from stdin, or a file; one entry is one
+                                    line, so what arrives on several is folded
   wsp edit <id> [--overview|--details|--decisions]  prose, in $EDITOR
   wsp edit <id> --overview --from F|-    …or from a file, or stdin
   wsp rename <id> "title"           retitle it; the old title goes in the log
