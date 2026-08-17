@@ -330,10 +330,23 @@ fn ssh_args(m: &Machine, sock: &std::path::Path, control: &std::path::Path) -> V
         s("-o"), s("ServerAliveInterval=15"),
         s("-o"), s("ServerAliveCountMax=3"),
         // One authenticated connection, reused by anything else ssh'ing to this
-        // machine while we hold it. No `ControlPersist`: the master should be
-        // exactly as alive as this process, so "is the tunnel up" has one
-        // answer and killing us is enough to make it false.
+        // machine while we hold it. The master should be exactly as alive as
+        // this process, so "is the tunnel up" has one answer and killing us is
+        // enough to make it false.
+        //
+        // `ControlPersist=no` is spelled out rather than left to the default,
+        // and it is not a fallback like the two above: the moment the user puts
+        // `ControlPersist` in the `Host` block — which the README tells them to,
+        // because every other ssh to an executor wants a warm connection — this
+        // ssh forks into the background the instant it is started and the
+        // foreground process exits 0. The forward is up and working; the
+        // supervisor sees a child that died successfully, calls the machine
+        // offline, backs off, and starts another one on top of it. Seen on the
+        // first real executor, 2026-08-17, as `offline · ssh exited 0` against a
+        // tunnel that was carrying traffic. -N is what makes it certain: with no
+        // session to wait for, backgrounding is immediate.
         s("-o"), s("ControlMaster=auto"),
+        s("-o"), s("ControlPersist=no"),
         s("-o"), format!("ControlPath={}", control.display()),
         // The whole mechanism, in one flag.
         s("-L"), format!("{}:{}", sock.display(), backend_at(m)),
@@ -441,7 +454,10 @@ mod tests {
             "the local socket first, the far machine's own path second: {args:?}",
         );
         assert_eq!(args.last().unwrap(), "mac-mini", "the Host alias, and it goes last");
-        assert!(!args.iter().any(|a| a.contains("ControlPersist")), "the master dies with us");
+        assert!(
+            args.contains(&"ControlPersist=no".to_string()),
+            "the master dies with us, and saying nothing here lets ~/.ssh/config say otherwise: {args:?}",
+        );
     }
 
     /// A machine record that does not say where its backend listens still
