@@ -46,7 +46,8 @@
 //!
 //! Reading is not here either. `pane.list`, `workspace.list`, `agent.list`,
 //! `agent.get`, `pane.read` and `events.subscribe` are the observe half, whose
-//! seam is `panel::Snapshot` and whose task is t-260816-059. [`Place::census`]
+//! seam is [`crate::live`] — `panel::Snapshot` was that seam when this was
+//! written, and now sits behind it, one view among three. [`Place::census`]
 //! and [`Place::watch`] are the two places the two halves touch, and they are
 //! here rather than there because a thing that starts agents is the only thing
 //! that can be asked what it started.
