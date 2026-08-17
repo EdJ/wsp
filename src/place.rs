@@ -209,12 +209,11 @@
 //!   sentence. With a backend the question is answered by the backend existing,
 //!   and unreachability is a [`Refusal::Unreachable`] from the call that wanted
 //!   it, which arrives at the same moment the guard would have.
-//! - **`focus`** *was* absent, and is not any more: it came back as
-//!   [`Order::show`] when `spawn` migrated, for the reason recorded there. This
-//!   line stays because the argument that removed it was sound and the argument
-//!   that brought it back is narrower than it looks — `show` is a fact about
-//!   *placing* work, and every other verb about what a screen looks like is
-//!   still the arrange-panes port's.
+//! - **`focus`.** Still absent, and the argument that removed it still holds
+//!   (decision on t-260817-008): it belongs to the arrange-panes port. What is
+//!   here is [`Order::show`], which is scaffolding rather than a verb — `spawn`
+//!   has nowhere else to say `--no-focus` until `arrange` has an implementor.
+//!   The removal condition is on the field and is not restated here.
 //! - **`stop`** *was* absent, on the grounds that wsp had never despawned
 //!   anything, and the trigger named for adding it was the first TTY-less
 //!   backend. That was late rather than wrong: the caller was already there and
@@ -336,19 +335,39 @@ pub struct Order {
     /// Whether to put the new seat in front of the person — where there is a
     /// person and a front.
     ///
-    /// **This is the refutation this file asked for.** `focus` was pushed to the
-    /// arrange-panes port on the grounds that `workspace.focus` is one of its
-    /// ten, with a note that it was the most debatable line here. Migrating
-    /// `spawn` refuted it: `wsp spawn --no-focus` is a statement about *how the
-    /// work is placed*, made in the same breath as placing it and before there
-    /// is any seat to arrange — and a seat cannot be arranged before it exists,
-    /// so a port without this cannot express the flag at all without the caller
-    /// holding both ports and sequencing them.
+    /// **Scaffolding, with a removal condition. It is not part of this port's
+    /// shape and must not be reasoned from.** Focus belongs to the arrange-panes
+    /// port ([`crate::arrange`], "Focus"), and the decision on t-260817-008
+    /// settled that it stays there: focus is a state that can be applied
+    /// headlessly, and a port every backend must implement without a screen
+    /// cannot carry a statement about what a person is looking at.
+    ///
+    /// This field exists anyway because today it is the only way `spawn` can
+    /// express `--no-focus`. A seat cannot be arranged before it exists, and
+    /// there is no spec to declare the arrangement into — `arrange` has no
+    /// implementor and `cmd_spawn.rs` holds one port. Without this field the
+    /// flag could not be said at all.
+    ///
+    /// **The removal is not "delete this field", and that is why the trigger is
+    /// written here rather than left to be noticed.** Something has to sequence a
+    /// spawn that both places work and declares an arrangement, and nothing does.
+    /// So the acceptance test for removal is: **`spawn` declares focus into a
+    /// [`crate::arrange::Spec`]** — `arrange` has an implementor, `cmd_spawn`
+    /// holds both ports, and `--no-focus` becomes one line of desired state
+    /// applied once instead of a call sequenced after another. On that day this
+    /// field goes and `cmd_spawn::order` loses its `show` argument. Until then it
+    /// stays, and no second caller is added to it.
+    ///
+    /// Writing the trigger down is the whole point: this field was justified once
+    /// as permanent, `arrange` recorded the opposite as settled, and both files
+    /// read as closed. Scaffolding with no stated trigger is how that happened.
     ///
     /// It is not herdr's `focus` parameter wearing a different name: what wsp
     /// means is *do not drag the screen away from what somebody is reading*, and
     /// a backend with no screen honours it by ignoring it. `false` by default,
-    /// so a seat opened by something with no opinion does not steal attention.
+    /// so a seat opened by something with no opinion does not steal attention —
+    /// which is the same rule read from the other end, and stays true wherever
+    /// the flag ends up living.
     pub show: bool,
 }
 

@@ -659,7 +659,10 @@ mod tests {
         assert_eq!(o.label, "robustness/004 · a title");
         assert_eq!(o.cwd.as_deref(), Some("~/claude/wsp"), "expanded by the backend, not here");
         assert_eq!(o.on.as_deref(), Some("mb2"));
-        assert!(!o.show, "--no-focus is a statement about placing the work");
+        // `show` is the one thing here that is scaffolding rather than shape:
+        // until `arrange` has an implementor there is no spec to declare focus
+        // into, so this is where `--no-focus` has to be said. See `Order::show`.
+        assert!(!o.show, "--no-focus has nowhere else to be said yet");
         assert_eq!(o.env.get("WSP_TASK").map(String::as_str), Some("t-260817-004"));
         assert_eq!(o.env.get("WSP_PROJECT").map(String::as_str), Some("robustness"));
 

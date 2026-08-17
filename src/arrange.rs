@@ -84,7 +84,7 @@
 //! leave, and which is irreducibly about a terminal. Keeping them apart is what
 //! lets a non-terminal renderer implement seven of the eight and refuse one.
 //!
-//! # Focus: 081's most debatable line, confirmed
+//! # Focus: 081's most debatable line, confirmed and then settled
 //!
 //! `place.rs` pushed `focus` here, on the grounds that `workspace.focus` is one
 //! of these ten, and called it the most debatable line in the file. It is right,
@@ -100,8 +100,19 @@
 //! that price is not paid at all: focus is not an extra call bolted onto the end
 //! of spawn, it is [`Spec::focus`] — one line of the desired state, stated with
 //! everything else and applied once. Declaring the destination is strictly
-//! better than sequencing two calls and hoping the gap is short. So: confirmed,
-//! and `place.rs` needs no change.
+//! better than sequencing two calls and hoping the gap is short. Which is also
+//! why nothing should reach for focus to *drive* anything: a state applied once
+//! is honest about being a destination, whereas a call sequenced mid-operation
+//! moves a person's screen to get something done and reads to them as the screen
+//! misbehaving (decision of 2026-08-17).
+//!
+//! This section once ended *"and `place.rs` needs no change"*, which stopped
+//! being true when `spawn` migrated and `place.rs` grew `Order::show`. Settled on
+//! t-260817-008: this port keeps the question and the argument above stands, and
+//! `Order::show` is scaffolding held by the *other* port only for as long as this
+//! one has no implementor to declare into. Its removal condition is written where
+//! the field is defined, and it is this port's arrival that fires it. Do not read
+//! that field as a second opinion about where focus lives; there is one.
 //!
 //! # The one place the two ports touch
 //!
