@@ -7,8 +7,10 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -59,16 +61,58 @@ pub(crate) fn stty(args: &[&str]) {
     }
 }
 
+/// How wide and how tall the pane is, asked of the terminal itself.
+///
+/// This ran `stty size` in a child process, and the `draw` below calls it on
+/// every pass of the loop — five forks a second in every panel, for ever,
+/// whether or not anything on screen had changed. Measured 2026-08-17 against
+/// the live machine: a *background* panel burned 12 ms of CPU a second doing
+/// nothing, 59% of its on-CPU samples in this one call site, plus ~2.4 ms a
+/// call in the `stty` child, which no panel's `ps` time shows at all.
+///
+/// `TIOCGWINSZ` is where `stty` reads it from, so this is the same answer with
+/// no process in it — checked against `stty size` on a pty sized 137×41, and
+/// timed beside it in one process: microseconds where the fork was
+/// milliseconds. Declared here rather than taken from
+/// `libc` for the reason `die_on_broken_pipe` in `main` gives: a struct and a
+/// constant against a dependency the README promises not to add. Two things in
+/// the declaration are load-bearing. `ioctl` must be variadic as C declares it,
+/// because on Apple silicon a variadic argument is passed on the stack and a
+/// fixed one in a register. And the request number is per-platform — the BSDs
+/// encode direction and struct size into it, Linux numbers its ioctls flat.
+///
+/// The fd is opened once and kept, because with the process gone the open is
+/// what the call costs: opening and closing `/dev/tty` measured 50× the ioctl
+/// through it. A panel already holds one open for its whole life — see
+/// [`spawn_input`] — and a binary that never draws never opens it at all. A
+/// held fd still sees a resize: the size is the terminal's, not the fd's.
 pub(crate) fn term_size() -> (usize, usize) {
-    if let Ok(tty) = File::open("/dev/tty") {
-        if let Ok(out) = Command::new("stty").arg("size").stdin(Stdio::from(tty)).output() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            let mut it = s.split_whitespace();
-            if let (Some(r), Some(c)) = (it.next(), it.next()) {
-                if let (Ok(r), Ok(c)) = (r.parse::<usize>(), c.parse::<usize>()) {
-                    return (c.max(16), r.max(6));
-                }
-            }
+    #[repr(C)]
+    struct Winsize {
+        rows: u16,
+        cols: u16,
+        xpixel: u16,
+        ypixel: u16,
+    }
+    extern "C" {
+        fn ioctl(fd: i32, request: std::os::raw::c_ulong, ...) -> i32;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
+
+    static TTY: OnceLock<Option<File>> = OnceLock::new();
+    if let Some(tty) = TTY.get_or_init(|| File::open("/dev/tty").ok()) {
+        let mut ws = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
+        // The kernel writes the four shorts it is defined over into `ws`, which
+        // outlives the call; nothing else is read or written through the fd.
+        let asked = unsafe { ioctl(tty.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut Winsize) };
+        // A terminal that does not know its size answers zero rather than
+        // failing — a pty nobody has sized yet is the usual way to see it — so
+        // that is as much a miss as an error, and takes the same fallback.
+        if asked == 0 && ws.cols > 0 && ws.rows > 0 {
+            return ((ws.cols as usize).max(16), (ws.rows as usize).max(6));
         }
     }
     (26, 40)
@@ -522,10 +566,10 @@ pub(super) fn event_loop(
     // `&mut` on the view because the frame is where the tree's scroll offset
     // is decided, and the view keeps it: the click handler two branches below
     // has to read the offset the pane in front of the reader is drawn with.
-    // Answers the size it drew at, which is the only place the pane is measured:
-    // `term_size` shells out to `stty`, so asking a second time to find out
-    // whether the pane has changed shape would double that for every panel on
-    // the machine, five times a second.
+    // Answers the size it drew at, and that is the size the tick decides shape
+    // from: a second measurement between the frame and that decision can
+    // disagree with the frame — mid-drag it will — and then a sidebar's rows
+    // are in front of the reader with a page's width, or the reverse.
     let draw = |ui: &Ui, view: &mut View, last: &mut String| -> (usize, usize) {
         let (w, h) = term_size();
         let painted = to_ansi(&frame(ui, view, w, h), w, h);
@@ -805,9 +849,9 @@ pub(super) fn event_loop(
                 // it measures; this is the part it cannot, because a page and a
                 // sidebar do not have the same rows in them. See [`View::wide`].
                 //
-                // Read off the last frame rather than measured here: `term_size`
-                // shells out, and this arm runs five times a second in every
-                // panel on the machine.
+                // Read off the last frame rather than measured here, so the
+                // shape and the frame in front of the reader agree — see the
+                // `draw` closure.
                 let was = view.wide;
                 view.fit_to_pane(drawn_size.0);
                 if view.wide != was {
@@ -1221,5 +1265,24 @@ mod tests {
         assert!(!creates(&argv(&["tag", "t-001", "--", "+dsp"])));
         assert!(!creates(&argv(&["pin", "trance", "-w", "w0"])));
         assert!(!creates(&argv(&[])));
+    }
+
+    /// Measuring the pane costs no process.
+    ///
+    /// `draw` asks for the size on every pass of a 200 ms loop, so whatever
+    /// this function costs is paid five times a second, by every panel on the
+    /// machine, for as long as they are open. As `stty size` that was 12 ms of
+    /// CPU a second in a panel that was doing nothing and 59% of its on-CPU
+    /// samples. A frame drawn from a spawned `stty` looks exactly like a frame
+    /// drawn from `TIOCGWINSZ`, which is why the guard is a test and not a
+    /// comment: nothing on screen would tell anyone it had come back.
+    #[test]
+    fn measuring_the_pane_spawns_no_process() {
+        let after = SRC.split("fn term_size()").nth(1).expect("term_size was renamed");
+        let body = &after[..after.find("\n}\n").expect("term_size has no end")];
+        assert!(
+            !body.contains("Command::new"),
+            "term_size spawns a process again, five times a second in every panel",
+        );
     }
 }
