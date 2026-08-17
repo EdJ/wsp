@@ -268,7 +268,13 @@ impl Briefing {
             mandate: cmd_mandate::current(store, env.workspace_id.as_deref()),
             governors: store.governors(),
             rules: rules(store),
-            pane: env.pane_id,
+            // The seat, through `my_pane`'s one reading of it, so that this
+            // answers for an agent a supervisor is hosting as well as one in a
+            // pane. Everything downstream keys on it — what this seat holds,
+            // whether it is the governing one — and a headless agent that read
+            // no seat opened believing it held nothing, which is the whole of
+            // what a `SessionStart` brief exists to prevent.
+            pane: cmd_agent::my_pane(),
             workspace: env.workspace_id,
             cwd: std::env::current_dir().ok().map(|c| util::contract(&c)),
             world,

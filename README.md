@@ -1528,11 +1528,23 @@ project, the task it holds, what is already settled, what to take next and who
 else is standing in the tree. A subagent is skipped — it shares its parent's
 pane and therefore its parent's claim, and needs neither.
 
-**`SessionEnd` is deliberately not wired.** A claim outlives the pane that made
-it, which is the design; and `/clear` ends a session without ending the work.
-Releasing there would drop a claim mid-task every time you cleared the screen,
-and would take away the one signal `wsp wip` exists to give — a task underway
-with nobody on it.
+**`SessionEnd` never releases a claim**, and that has not changed now that it is
+wired. A claim outlives the pane that made it, which is the design; and `/clear`
+ends a session without ending the work. Releasing there would drop a claim
+mid-task every time you cleared the screen, and would take away the one signal
+`wsp wip` exists to give — a task underway with nobody on it. What the hook does
+say is that the *agent* has stopped, which is a fact about a process and is
+`wsp despawn`'s business rather than the claim's.
+
+The other five entries — `SessionEnd`, `UserPromptSubmit`, `Stop`,
+`StopFailure`, `PermissionRequest`, `Elicitation` — are how an agent hosted with
+no terminal says what it is doing, and they are what `--headless` above is
+watching. In a session that is not in a wsp seat, which is every session in a
+herdr pane, each costs one `sh` that reads a variable and exits; the guard is
+the first line of `wsp-session.sh`. If you already have the older
+`wsp-session.sh start` entry, the snippet's `SessionStart` **replaces** it rather
+than joining it — two entries print the brief twice, and a brief is ~3,300
+tokens on every request of the session.
 
 The **permissions** half matters as much as the hook. Create, claim, note,
 decide, flag and move through the workflow are pre-allowed, because a store an
@@ -2110,6 +2122,46 @@ than being typed into the pane, which is what `c` still does: `c` speaks to
 agents herdr did not start and may not consider ready, and pays for it with two
 writes and a sleep between them. Here the readiness is established, so there is
 nothing to guess at.
+
+### An agent with no terminal
+
+```sh
+wsp spawn 033 --agent --headless   # …hosted by a supervisor: no pane, no PTY
+wsp despawn 033 --headless         # end it the same way, on the same backend
+```
+
+`--headless` places the work on `src/place_super.rs` instead of herdr: wsp forks
+the agent itself, hands it a pipe, and learns what it is doing from the hooks it
+fires. Nothing about the command above it changes — same order, same claim, same
+work order — which is the port earning itself.
+
+What you get is an agent you can **start, tell, observe and stop**. What you do
+not get is one you can **sit down in front of**: no permission prompts, no input
+box, nothing to attach to. That is a different way of working rather than the
+same one with less scenery, and it is asked for with a flag instead of inferred.
+
+The reason to want one is that its state is *announced* rather than read off a
+screen. Claude Code fires `SessionStart` when it is up, `UserPromptSubmit` when
+a turn begins, `Stop` when it ends, `SessionEnd` when it goes — measured, one
+run: ready at 870ms, a turn's start seen 45ms after the work order was written,
+and a `SessionEnd` fired 100ms after the agent was killed. Under herdr the same
+facts are inferred by matching a regex against the **spinner glyph** in a
+terminal title, from a manifest versioned by hand against Claude Code releases,
+which on 2026-08-17 reported this project's own governor seat as working while it
+sat waiting for a person.
+
+Three readings follow from holding the pid rather than watching a pane: an agent
+that has stopped is `gone` rather than indistinguishable from a shell nobody is
+in, the launch window ends when the agent says so rather than after three seconds
+of looking idle, and `start` returns when the agent exists with nothing to wait
+for. `src/place_super.rs` carries the measurements and the boundary.
+
+Two things it will not do. A seat on another machine is refused rather than
+faked — a hook cannot fire into a socket on a different host, so a remote Claude
+Code is a Claude Code this backend cannot see. And an unattended agent has
+nobody to ask: a tool call that needs permission is **denied**, not queued, and
+the agent reports itself blocked. Settle what a headless agent may do before you
+give it work that needs it.
 
 ### Ending it
 
@@ -2781,6 +2833,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
 | `src/place_herdr.rs` | that port over herdr: the shell race, the launch window, the retype |
+| `src/place_super.rs` | that port with no terminal at all: a forked agent, and its own hooks as the eyes |
 | `src/agent_commands.rs` | the other axis: per-kind flags, the handle wsp mints for an agent, and how it is told |
 | `src/arrange.rs` | the arrange-panes port: a desired set of panes, and the reconciler under it |
 | `src/draw.rs` | the renderer: one spec and a view, drawn to a terminal or to a block of text |

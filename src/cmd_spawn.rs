@@ -409,7 +409,27 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
     // this and printed a herdr sentence for a herdr fact; a backend that is not
     // answering now says so from the call that wanted it, which arrives at the
     // same moment and names what it stopped.
-    place_work(&Herdr::new(), store, args)
+    place_work(backend(args).as_ref(), store, args)
+}
+
+/// Which backend places this work: a terminal, or a supervisor with none.
+///
+/// The flag is the whole of the choice and there is deliberately no inference
+/// behind it. What `--headless` buys is an agent that can be started, told,
+/// observed and stopped with no terminal anywhere; what it costs is the one
+/// thing a supervisor cannot give you, which is an agent you can **sit down in
+/// front of** — no permission prompts, no input box, no attaching. That is a
+/// decision about how you mean to work with this agent rather than a detail of
+/// where it runs, so it is asked rather than guessed.
+///
+/// Everything below this line is backend-agnostic already, which is the port
+/// earning itself: `place_work` was written against `&dyn Place` and needed no
+/// change to grow a second implementor.
+fn backend(args: &Args) -> Box<dyn Place> {
+    match args.has("headless") {
+        true => Box::new(crate::place_super::Supervisor::new()),
+        false => Box::new(Herdr::new()),
+    }
 }
 
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
@@ -674,8 +694,17 @@ fn workspace_of(seat: &Seat) -> Option<String> {
 /// knows what is in it. What ending it costs is the session, not the work — the
 /// files in the tree are untouched — and the state it would refuse on is the one
 /// a wedged agent reads as, which is when you most want this.
+///
+/// `--headless` names the backend, the same flag the spawn was placed with, and
+/// **wsp does not know which one a seat belongs to** — a claim records a
+/// workspace, a binding records a seat id, and neither says what issued it.
+/// Asking is the honest version of that gap: the alternative is to try one
+/// backend and then the other, which turns "no such seat" into "no such seat
+/// anywhere" and makes a stopped agent indistinguishable from a mistyped id.
+/// Which record should carry it is the state-model half of the translation
+/// layer (the binds note on robustness-061), and is not decided here.
 pub fn despawn(store: &Store, args: &Args) -> i32 {
-    end_work(&Herdr::new(), store, args, cmd_agent::my_pane().as_deref())
+    end_work(backend(args).as_ref(), store, args, cmd_agent::my_pane().as_deref())
 }
 
 /// Which seat a despawn is about: the one named, or the one holding the task.

@@ -2,6 +2,7 @@
   "_comment": "Merge these two keys into ~/.claude/settings.json by hand. This is a snippet, not a file to copy over the top: settings.json already holds your model, theme, plugins and herdr's own SessionStart entry, and replacing it would take those with it. The hooks array takes a second entry beside herdr's; it is not a replacement for it.",
 
   "_comment_executor": "On an executor there is no checkout, so wsp-session.sh is copied to ~/.claude/hooks/ beside herdr's own and the command below points there instead. The permissions are not optional over there: nobody is sitting at that machine to answer a prompt, and an agent that stops at one stops until somebody notices in the panel.",
+  "_hooks_comment": "SessionStart is the brief and is owed to every session. The other five are how a headless agent — one `wsp spawn --headless` is hosting, with no terminal at all — says what it is doing: UserPromptSubmit and Stop bracket a turn, PermissionRequest and Elicitation mean a person is needed, SessionEnd means it has gone. They cost one `sh` and exit in a session that is not in a wsp seat, which is every session in a herdr pane, so wiring them all is safe. See src/place_super.rs for what each one is read as.",
 
   "hooks": {
     "SessionStart": [
@@ -10,7 +11,79 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' start",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' SessionEnd",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' Stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' StopFailure",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' PermissionRequest",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Elicitation": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/Users/edjames/claude/wsp/claude-code/wsp-session.sh' Elicitation",
             "timeout": 5
           }
         ]

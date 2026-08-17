@@ -36,6 +36,7 @@ mod overlap;
 mod panel;
 mod place;
 mod place_herdr;
+mod place_super;
 mod resolve;
 mod story;
 mod store;
@@ -49,6 +50,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
     "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "no-tree", "terse", "seen", "full",
+    // `spawn --headless <task>`, whose positional is a task id.
+    "headless",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm",
@@ -339,6 +342,12 @@ fn main() {
         "peek" => cmd_agent::peek(&store, &args),
         "sync" => cmd_agent::sync_once(&store, &args),
         "hook" => cmd_agent::hook(&store, &args),
+        // Not `hook`, deliberately, and the two are not variants of one thing.
+        // That one is herdr's plugin channel — a multiplexer saying a pane
+        // exited — and it ends in a full `sync` over the socket. This is an
+        // agent saying what *it* is doing, from inside its own hook, several
+        // times a turn, and it must touch nothing but its own seat's file.
+        "report" => place_super::report(&args),
         "doctor" => cmd_agent::doctor(&store, &args),
         "adopt" => cmd_agent::adopt(&store, &args),
         "migrate" => cmd_migrate::run(&store, &args),
@@ -512,6 +521,8 @@ fn help() {
   wsp sync [--force]                push tokens to herdr once
   wsp daemon [-v]                   events + refresh loop (herdr [[startup]])
   wsp hook <event>                  herdr event-hook entrypoint
+  wsp report <hook>                 a headless agent's Claude Code hook, saying
+                                    what it is doing; silent outside a seat
   wsp doctor                        integrity check
   wsp say "…" [--clear]             say where you have got to, on your pane
   wsp flag <id> ["why"]             raise a hand on a task — at the seat that

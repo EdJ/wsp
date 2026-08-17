@@ -82,7 +82,13 @@ impl Here {
                 (Some(_), true) => herdr::workspaces().unwrap_or_default(),
                 _ => Vec::new(),
             },
-            pane: env.pane_id,
+            // The seat, through the one reading of it, rather than herdr's
+            // variable directly. A binding is keyed on a seat and a
+            // supervisor's seats are not panes, so an agent hosted with no
+            // terminal resolved to no binding at all: measured 2026-08-17, a
+            // headless spawn whose `SessionStart` brief said "nothing claimed"
+            // about the task the same command had just claimed for it.
+            pane: my_pane(),
             workspace: env.workspace_id,
             cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
         }
@@ -183,8 +189,29 @@ fn pane_id(args: &Args) -> Option<String> {
 /// No socket is opened: [`Herdr::here`] reads what herdr set before this process
 /// existed, which is a rule of the port and not an optimisation. Constructing
 /// the backend costs four durations and a clock reference.
+///
+/// # Which backend is this process standing in
+///
+/// Two backends can seat an agent and each has its own name for the seat it
+/// hands its occupant — `HERDR_PANE_ID` for a pane, `place::SEAT_ENV` for a
+/// supervisor. Neither adapter is allowed to read the other's:
+/// `place_herdr::here` says why in as many words, and the mirror image holds —
+/// two answers to *which seat is this* is a way to be in two seats, and under
+/// herdr a stale `WSP_SEAT_ID` would bind a task to a pane that backend never
+/// issued.
+///
+/// So the choice is made here, one level up, and it is made by **which name the
+/// seat arrived under** rather than by asking anything. A process started by a
+/// supervisor has the supervisor's variable and nothing else; a shell in a pane
+/// has herdr's. The order matters only for the case that should not exist —
+/// both set — and the supervisor wins it because it is the backend that forked
+/// this process, whatever multiplexer the shell it came from was in.
 pub(crate) fn my_pane() -> Option<String> {
-    Herdr::new().here().map(|s| s.to_string())
+    let seat = match crate::place_super::Supervisor::new().here() {
+        Some(s) => Some(s),
+        None => Herdr::new().here(),
+    };
+    seat.map(|s| s.to_string())
 }
 
 /// The width every label wsp writes is cut to — the 44 characters `sync`
@@ -1759,7 +1786,8 @@ pub(crate) struct Whereabouts {
     /// For the label of the workspace this pane stands in, which is both a
     /// link in the chain and how a claim is matched to a workspace.
     pub workspaces: Vec<herdr::Workspace>,
-    /// This pane and its workspace, as herdr's environment names them.
+    /// The seat this process is standing in, and the workspace herdr's
+    /// environment names — the second of which only a multiplexer has.
     pub pane: Option<String>,
     pub workspace: Option<String>,
     /// The process's own directory rather than the pane's: herdr reports the
@@ -1780,7 +1808,7 @@ impl Whereabouts {
                 (Some(_), true) => herdr::workspaces().unwrap_or_default(),
                 _ => Vec::new(),
             },
-            pane: env.pane_id,
+            pane: my_pane(),
             workspace: env.workspace_id,
             cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
         }
