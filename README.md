@@ -2054,8 +2054,18 @@ wsp spawn t-260815-033             # a workspace, rooted where the work lives
 wsp spawn t-260815-033 --agent     # …with an agent started in it and told
 wsp spawn -p wsp --agent           # a project, no task, nothing to tell it
 wsp spawn 033 --agent --kind codex # any agent kind herdr knows
-wsp spawn 033 --agent --no-focus   # do not drag the screen over to it
+wsp spawn 033 --agent --focus      # …and go there, which it otherwise will not
 ```
+
+**A spawn does not move the screen.** The seat is created, the agent is started
+in it and told what it holds, and whatever you were reading stays in front of
+you; `--focus` is how you ask to be taken there. It read the other way round
+until 2026-08-17 — focus unless `--no-focus` — which is fine for the one you
+typed and wrong for the queue, and the queue is the caller that runs `spawn`
+overnight fifteen times. herdr's own `workspace.create` defaults `focus` to
+false; this was wsp opting in. `--no-focus` still parses and now names the
+default. The pane is unaffected: an agent still gets a tty and a pane, because
+`agent.start` needs one, and the pane was never the complaint.
 
 It is a CLI verb before it is a key. The gesture used to exist only as `O` in
 the panel, which meant a script could not do it and neither could an agent —

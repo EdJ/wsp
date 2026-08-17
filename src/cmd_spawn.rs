@@ -493,7 +493,19 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         _ => cwd,
     };
 
-    let order = order(&work, cwd.as_deref(), on.as_deref(), !args.has("no-focus"));
+    // Focus is asked for, never assumed. This line used to read
+    // `!args.has("no-focus")`, so every spawn dragged the screen onto the new
+    // seat unless the caller thought to say otherwise — and `spawn` is run by
+    // the queue at least as often as by hand, which meant a batch starting
+    // overnight took the screen off whatever a person was reading. herdr's
+    // `workspace.create` defaults `focus` to false and wsp was opting in; the
+    // doc on [`Order::show`] already said `false` by default, so the port
+    // stated the rule and this line contradicted it.
+    //
+    // `--no-focus` is still parsed (`main::BOOL_FLAGS`) and now asks for what
+    // already happens: dropping it outright would make an old invocation swallow
+    // the id after it rather than fail, which is a worse way to learn.
+    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"));
     let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
@@ -948,8 +960,8 @@ mod tests {
         assert_eq!(o.on.as_deref(), Some("mb2"));
         // `show` is the one thing here that is scaffolding rather than shape:
         // until `arrange` has an implementor there is no spec to declare focus
-        // into, so this is where `--no-focus` has to be said. See `Order::show`.
-        assert!(!o.show, "--no-focus has nowhere else to be said yet");
+        // into, so this is where `--focus` has to be said. See `Order::show`.
+        assert!(!o.show, "--focus has nowhere else to be said yet");
         assert_eq!(o.env.get("WSP_TASK").map(String::as_str), Some("t-260817-004"));
         assert_eq!(o.env.get("WSP_PROJECT").map(String::as_str), Some("robustness"));
 
@@ -1365,14 +1377,14 @@ mod tests {
             cwd
         };
 
-        let cwd = opened(Args::synth("spawn", &["t-1"], &[("no-focus", "true")]));
+        let cwd = opened(Args::synth("spawn", &["t-1"], &[]));
         assert!(
             cwd.ends_with(".worktrees/t-1"),
             "a task seat was opened in the shared trunk: {cwd}"
         );
         assert!(std::path::Path::new(&cwd).join(".git").exists(), "{cwd} is not a checkout");
 
-        let cwd = opened(Args::synth("spawn", &[], &[("project", "robustness"), ("no-focus", "true")]));
+        let cwd = opened(Args::synth("spawn", &[], &[("project", "robustness")]));
         assert_eq!(
             util::real(&cwd),
             util::real(&root.display().to_string()),
@@ -1388,10 +1400,41 @@ mod tests {
         let code = place_work(
             &place,
             &store,
-            &Args::synth("spawn", &["t-1"], &[("govern", "true"), ("no-focus", "true")]),
+            &Args::synth("spawn", &["t-1"], &[("govern", "true")]),
         );
         assert_eq!(code, 2, "--govern on a task was accepted");
         assert!(place.0.borrow().is_empty(), "it opened a workspace before refusing");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A spawn leaves the screen where it was unless somebody asked for it.
+    ///
+    /// This line read `!args.has("no-focus")` until 2026-08-17, so the screen
+    /// moved onto every new seat unless the caller remembered to say otherwise —
+    /// and `spawn` is run by the queue as much as by hand, which made a batch
+    /// started overnight a sequence of jumps away from whatever was being read.
+    /// herdr's `workspace.create` defaults `focus` to false and [`Order::show`]
+    /// says the same, so the flip is wsp stopping opting in rather than a new
+    /// rule. `--no-focus` still parses, and now names the default.
+    #[test]
+    fn a_spawn_leaves_the_screen_where_it_was_unless_asked() {
+        let _guard = no_backend();
+        let store = seat("focus");
+        store.save_project(&Project::new("robustness")).unwrap();
+
+        let shown = |flags: &[(&str, &str)]| {
+            let mut f = vec![("project", "robustness")];
+            f.extend_from_slice(flags);
+            let place = Opens(std::cell::RefCell::new(Vec::new()));
+            place_work(&place, &store, &Args::synth("spawn", &[], &f));
+            let show = place.0.borrow().first().map(|o| o.show);
+            show.expect("nothing was opened")
+        };
+
+        assert!(!shown(&[]), "a spawn with no opinion took the screen");
+        assert!(shown(&[("focus", "true")]), "--focus asked and was not obeyed");
+        assert!(!shown(&[("no-focus", "true")]), "--no-focus asks for what already happens");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }

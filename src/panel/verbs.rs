@@ -1602,8 +1602,15 @@ fn spawn(target: &Target, ui: &mut Ui, agent: bool) -> Effect {
             return Effect::None;
         }
     };
-    if agent {
-        argv.push("--agent".into());
+    // The one place the two keys differ beyond the agent, and it is the reason
+    // `spawn` no longer focuses on its own: `O` is somebody asking for a
+    // workspace to stand in and a key that opened one somewhere off-screen would
+    // read as having done nothing, while `S` is somebody handing work over and
+    // then carrying on reading the panel. Said here rather than defaulted in the
+    // CLI, because the CLI's other caller is the queue and it wants neither.
+    match agent {
+        true => argv.push("--agent".into()),
+        false => argv.push("--focus".into()),
     }
     let note = match agent {
         true => format!("starting an agent on {what}…"),

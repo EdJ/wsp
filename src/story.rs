@@ -3155,7 +3155,8 @@ mod tests {
     }
 
     /// `O` and `S` are one command with one flag between them, and the flag is
-    /// the whole difference between a place to work and a colleague. The panel
+    /// the whole difference between a place to work and a colleague — and with
+    /// it, whether the screen goes there. The panel
     /// works out neither the title nor the root: `wsp spawn` resolves both from
     /// the store, which is what stopped `O` opening a workspace in the panel's
     /// own directory for every task under a project whose root is its parent's.
@@ -3167,7 +3168,10 @@ mod tests {
 
         on_target(&mut ui, panel::Target::Task("t-003".into()));
         match press(&mut ui, &mut view, 'O') {
-            panel::Effect::Spawn { argv, .. } => assert_eq!(argv, ["spawn", "t-003"]),
+            // `--focus` because `O` is a person asking to be put somewhere:
+            // `spawn` itself no longer moves the screen, and a key that opened a
+            // workspace out of sight would read as having done nothing.
+            panel::Effect::Spawn { argv, .. } => assert_eq!(argv, ["spawn", "t-003", "--focus"]),
             _ => panic!("O on a task opens a workspace for it"),
         }
         match press(&mut ui, &mut view, 'S') {

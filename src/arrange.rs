@@ -93,7 +93,7 @@
 //! Focus is a statement about *what a person is looking at*. It is meaningless
 //! to a supervisor with no screen, so a port that must be implementable without
 //! one cannot carry it. `workspace.create`'s `focus` flag and `wsp spawn
-//! --no-focus` look like part of placing work only because herdr creates and
+//! --focus` look like part of placing work only because herdr creates and
 //! shows in one call.
 //!
 //! 081 priced the split at one extra call and a possible flicker. Under a spec

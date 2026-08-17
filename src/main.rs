@@ -49,7 +49,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "no-tree", "terse", "seen", "full",
+    "help", "version", "no-commit", "closed", "here", "agent", "focus", "no-tree", "terse", "seen", "full",
+    // `spawn --no-focus` is what focus not being asked for is now called, and it
+    // is kept here rather than deleted so an invocation that still says it —
+    // a script, a shell history, the README as it was — parses as a flag
+    // instead of eating the task id after it.
+    "no-focus",
     // `spawn --headless <task>`, whose positional is a task id.
     "headless",
     // `verify` takes paths as positionals, so every flag it owns has to be
@@ -473,7 +478,7 @@ fn help() {
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
                                     open a workspace on it, claim it there, and
-                                    start an agent in it; --no-focus to stay put,
+                                    start an agent in it; --focus to go there,
                                     --on to run it on another machine, --full to
                                     start it with sub-agents, workflows and the
                                     MCP servers it is otherwise spawned without

@@ -255,7 +255,7 @@
 //! - **`focus`.** Still absent, and the argument that removed it still holds
 //!   (decision on t-260817-008): it belongs to the arrange-panes port. What is
 //!   here is [`Order::show`], which is scaffolding rather than a verb — `spawn`
-//!   has nowhere else to say `--no-focus` until `arrange` has an implementor.
+//!   has nowhere else to say `--focus` until `arrange` has an implementor.
 //!   The removal condition is on the field and is not restated here.
 //! - **`stop`** *was* absent, on the grounds that wsp had never despawned
 //!   anything, and the trigger named for adding it was the first TTY-less
@@ -493,7 +493,7 @@ pub struct Order {
     /// cannot carry a statement about what a person is looking at.
     ///
     /// This field exists anyway because today it is the only way `spawn` can
-    /// express `--no-focus`. A seat cannot be arranged before it exists, and
+    /// express `--focus`. A seat cannot be arranged before it exists, and
     /// there is no spec to declare the arrangement into — `arrange` has no
     /// implementor and `cmd_spawn.rs` holds one port. Without this field the
     /// flag could not be said at all.
@@ -503,7 +503,7 @@ pub struct Order {
     /// spawn that both places work and declares an arrangement, and nothing does.
     /// So the acceptance test for removal is: **`spawn` declares focus into a
     /// [`crate::arrange::Spec`]** — `arrange` has an implementor, `cmd_spawn`
-    /// holds both ports, and `--no-focus` becomes one line of desired state
+    /// holds both ports, and `--focus` becomes one line of desired state
     /// applied once instead of a call sequenced after another. On that day this
     /// field goes and `cmd_spawn::order` loses its `show` argument. Until then it
     /// stays, and no second caller is added to it.
