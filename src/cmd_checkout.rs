@@ -257,12 +257,14 @@ pub(crate) struct Stale {
 
 /// The trees under `root` that are finished with, and the reason each is.
 ///
-/// Reported rather than removed, and reported by `wsp doctor` rather than by a
-/// cleanup step at the end of a piece of work. That is the shape the evidence
-/// asks for: `git worktree list` held four abandoned trees on 2026-08-16 and
-/// three more on the day before, ~132M of them, and nobody was careless — a
-/// procedure run by hand at the end of a long piece of work is a procedure that
-/// gets abandoned halfway when something more interesting happens.
+/// The looking half: it reads and never touches anything, and [`sweep`] acts on
+/// the part of what it finds that is sure enough to act on. This is what `wsp
+/// doctor` reports, rather than a cleanup step at the end of a piece of work,
+/// because that is the shape the evidence asks for: `git worktree list` held
+/// four abandoned trees on 2026-08-16 and three more on the day before, ~132M of
+/// them, and nobody was careless — a procedure run by hand at the end of a long
+/// piece of work is a procedure that gets abandoned halfway when something more
+/// interesting happens.
 ///
 /// `closed` is asked of the store by the caller rather than read here, because
 /// the two reasons are different in kind and only one of them is git's: a tree
