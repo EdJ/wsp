@@ -1,7 +1,7 @@
 //! Small helpers: time without chrono, path expansion, terminal colour.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The instance we are talking to, as environment for anything we spawn.
 ///
@@ -76,6 +76,117 @@ pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The clock a wait is measured on, handed to whatever waits rather than read
+/// by it.
+///
+/// **Written by flaky tests rather than by taste, twice.** A loop that polls
+/// something until it is ready reads two things from the world: what time it is,
+/// and how to do nothing until the next look. A test of such a loop that lets it
+/// read both from the machine is not testing the rule, it is testing the
+/// machine's load — and this repository has four agents building in it at once
+/// by design, so the machine's load is never the quiet number the test was
+/// written against. `wsp install` is gated on `wsp verify --release`, which
+/// means a timing test fails exactly when several agents are working, which is
+/// exactly when somebody needs to install (robustness-054).
+///
+/// Both halves have to be handed over, and that is the correction to the first
+/// attempt (robustness-041, which handed over `now` alone). A test that drives
+/// the clock but leaves a real `sleep` in the loop still spends real seconds, so
+/// it gets shortened until it is fast, and a shortened window under load is the
+/// same flake wearing a smaller number. Here `rest` *is* what advances the
+/// clock: waiting is the only thing in a poll loop that takes time, so a fake
+/// clock that moves on `rest` and nowhere else makes elapsed time exactly the
+/// waiting the loop chose to do, and every assertion about it arithmetic.
+///
+/// The honest thing this loses is that a real ask takes real time too, so a
+/// deadline reached on the wall clock arrives a little sooner than one reached
+/// by counting polls. That is a fact about a slow backend and not about the
+/// rule, and no test here asserts it. Production is [`Wall`] and reads the
+/// machine, as it must.
+pub trait Clock {
+    /// What time it is.
+    fn now(&self) -> Instant;
+    /// Do nothing until the next look.
+    fn rest(&self, d: Duration);
+}
+
+/// The machine's own clock, and a thread that really sleeps. What every caller
+/// outside a test uses.
+pub struct Wall;
+
+impl Clock for Wall {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn rest(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+/// A clock the test winds, and the world's other timed events with it.
+///
+/// Nothing sleeps: `rest` moves the hands and returns, so a loop that polls for
+/// five seconds costs nothing and can be checked at its real durations rather
+/// than at a hundredth of them. What used to be a `sleep` on a second thread —
+/// *the shell turns up eighty milliseconds in* — is [`Dial::at`], a thing that
+/// happens when the clock reaches it, which is the same sentence with the race
+/// taken out.
+///
+/// Single-threaded by construction ([`std::cell`] rather than a mutex), because
+/// the point is that the waiting loop and the events it is waiting for are no
+/// longer racing. The socket under a fake backend is still real; only the clock
+/// is not.
+#[cfg(test)]
+pub struct Dial<'a> {
+    at: std::cell::Cell<Instant>,
+    began: Instant,
+    due: std::cell::RefCell<Vec<(Duration, Box<dyn Fn() + 'a>)>>,
+}
+
+#[cfg(test)]
+impl<'a> Dial<'a> {
+    pub fn new() -> Dial<'a> {
+        let began = Instant::now();
+        Dial { at: std::cell::Cell::new(began), began, due: std::cell::RefCell::new(Vec::new()) }
+    }
+
+    /// Something happens this far in. Used for the half of a race a test is not
+    /// driving: a backend that relents, a shell that arrives.
+    pub fn at(self, when: Duration, then: impl Fn() + 'a) -> Dial<'a> {
+        self.due.borrow_mut().push((when, Box::new(then)));
+        self
+    }
+
+    /// How far the clock has been wound, which is how long the wait took.
+    pub fn elapsed(&self) -> Duration {
+        self.at.get().saturating_duration_since(self.began)
+    }
+}
+
+#[cfg(test)]
+impl Clock for Dial<'_> {
+    fn now(&self) -> Instant {
+        self.at.get()
+    }
+
+    fn rest(&self, d: Duration) {
+        self.at.set(self.at.get() + d);
+        let reached = self.elapsed();
+        // Taken out of the list before any of them runs, so a callback is free
+        // to touch the dial and none of them fires twice.
+        let ripe: Vec<_> = {
+            let mut due = self.due.borrow_mut();
+            let (ripe, rest) =
+                std::mem::take(&mut *due).into_iter().partition(|(w, _)| *w <= reached);
+            *due = rest;
+            ripe
+        };
+        for (_, then) in ripe {
+            then();
+        }
+    }
 }
 
 pub fn epoch_secs() -> i64 {

@@ -123,21 +123,22 @@
 // because a trait method a backend has never had to answer is a guess.
 #![allow(dead_code)]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::herdr;
 use crate::place::{Agent, Event, Order, Place, Refusal, Result, Seat, Seated, State};
-use crate::util;
+use crate::util::{self, Clock};
 
 /// herdr as a place to put work.
 ///
-/// The three durations are fields rather than constants because they are the
+/// The four durations are fields rather than constants because they are the
 /// only interesting thing about `start`: every one of them was set by a failure,
 /// and a test that had to sit through five real seconds to check the shell race
-/// is a test nobody runs. [`Herdr::new`] is what the CLI uses.
-pub struct Herdr {
+/// is a test nobody runs. The clock beside them is why a test no longer has to
+/// sit through any of it. [`Herdr::new`] is what the CLI uses.
+pub struct Herdr<'a> {
     /// How long a brand-new pane gets to grow a shell before `agent_pane_busy`
     /// stops being a race and starts being a failure.
     pub shell: Duration,
@@ -147,10 +148,19 @@ pub struct Herdr {
     pub retype: Duration,
     /// How often to look while waiting.
     pub poll: Duration,
+    /// What time it is, and how to wait for the next look.
+    ///
+    /// Shortening the four durations above made the tests fast; it did not make
+    /// them honest, and `a_pane_with_no_shell_yet_is_retried_and_nothing_else_is`
+    /// failed once in four `wsp verify` runs on a busy machine because a 400ms
+    /// window and an 80ms sleep on another thread were racing the scheduler.
+    /// [`util::Clock`] carries the argument; here it is enough that every wait
+    /// below goes through this and nothing in this file reads the machine.
+    pub clock: &'a dyn Clock,
 }
 
-impl Default for Herdr {
-    fn default() -> Herdr {
+impl Default for Herdr<'static> {
+    fn default() -> Herdr<'static> {
         Herdr {
             // A cold Claude Code measured four seconds to readiness on this
             // machine; herdr's own default for the same wait is thirty.
@@ -158,12 +168,13 @@ impl Default for Herdr {
             appear: Duration::from_millis(30_000),
             retype: Duration::from_millis(6_000),
             poll: Duration::from_millis(150),
+            clock: &util::Wall,
         }
     }
 }
 
-impl Herdr {
-    pub fn new() -> Herdr {
+impl Herdr<'static> {
+    pub fn new() -> Herdr<'static> {
         Herdr::default()
     }
 }
@@ -326,15 +337,15 @@ fn launch(place: &Herdr, seat: &Seat, agent: &Agent) -> Result<()> {
         // puts exactly the bytes on the socket that it always did.
         params["args"] = json!(agent.args);
     }
-    let deadline = Instant::now() + place.shell;
+    let deadline = place.clock.now() + place.shell;
     loop {
         match herdr::call_for("agent.start", params.clone(), SLOW) {
             Ok(_) => return Ok(()),
             Err(e) => {
-                if !e.to_string().contains(PANE_BUSY) || Instant::now() >= deadline {
+                if !e.to_string().contains(PANE_BUSY) || place.clock.now() >= deadline {
                     return Err(refusal(seat, &e));
                 }
-                std::thread::sleep(place.poll);
+                place.clock.rest(place.poll);
             }
         }
     }
@@ -398,7 +409,7 @@ fn events_of(name: &str, data: &Value) -> Vec<Event> {
     }
 }
 
-impl Place for Herdr {
+impl Place for Herdr<'_> {
     fn open(&self, order: &Order) -> Result<Seat> {
         let mut env = serde_json::Map::new();
         for (k, v) in &order.env {
@@ -459,14 +470,14 @@ impl Place for Herdr {
     /// case where herdr says nothing of the sort.
     fn start(&self, seat: &Seat, agent: &Agent) -> Result<()> {
         launch(self, seat, agent)?;
-        let began = Instant::now();
+        let began = self.clock.now();
         let mut retyped = false;
         loop {
             let seen = look(seat)?;
             if seen.as_ref().is_some_and(|p| !p.agent.trim().is_empty()) {
                 return Ok(());
             }
-            let waited = began.elapsed();
+            let waited = self.clock.now().saturating_duration_since(began);
             if waited >= self.appear {
                 return Err(Refusal::Backend(format!(
                     "nothing that looks like {} appeared in {seat}",
@@ -482,7 +493,7 @@ impl Place for Herdr {
                 );
                 launch(self, seat, agent)?;
             }
-            std::thread::sleep(self.poll);
+            self.clock.rest(self.poll);
         }
     }
 
@@ -555,6 +566,7 @@ impl Place for Herdr {
 mod tests {
     use super::*;
     use crate::fake::{Fake, Quiet, Snub, Spot, Stage, Verb};
+    use crate::util::Dial;
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
@@ -574,10 +586,38 @@ mod tests {
         (fake, dir)
     }
 
-    fn brisk() -> Herdr {
+    /// The adapter with its four windows shortened and a clock the test winds.
+    ///
+    /// The numbers are a hundredth of the real ones because the durations they
+    /// stand in for were chosen against a live herdr, and reading `400` next to
+    /// `5_000` says *this is that window, scaled* in a way a made-up `40` would
+    /// not. They cost nothing either way now: nothing below sleeps, so these are
+    /// arithmetic rather than a bill.
+    fn brisk<'a, 'b: 'a>(clock: &'a Dial<'b>) -> Herdr<'a> {
         Herdr { shell: Duration::from_millis(400), retype: Duration::from_millis(150),
-                appear: Duration::from_millis(800), poll: Duration::from_millis(20) }
+                appear: Duration::from_millis(800), poll: Duration::from_millis(20),
+                clock }
     }
+
+    /// How many polls a window of this length allows, and therefore how many
+    /// asks it costs: the first one is free, and each one after it is bought
+    /// with a poll's wait.
+    fn asks_in(window: Duration, poll: Duration) -> usize {
+        1 + (window.as_millis() / poll.as_millis()) as usize
+    }
+
+    /// How often the fake was asked to do something.
+    fn times(fake: &Fake, verb: Verb) -> usize {
+        fake.verbs().iter().filter(|v| **v == verb).count()
+    }
+
+    /// How long to wait for an event that has already been pushed down a socket
+    /// on this machine.
+    ///
+    /// A hang-guard rather than a measurement, and generous on purpose: it is
+    /// only ever paid by a test that is already failing, so there is nothing to
+    /// buy by keeping it tight and a flake to buy by it (robustness-054).
+    const DELIVERY: Duration = Duration::from_secs(10);
 
     /// `spawn`'s order, driven end to end through the port: open a seat, start
     /// an agent, find it will not take a prompt yet, and only then tell it
@@ -595,7 +635,8 @@ mod tests {
         // wanted it to or not.
         stage.settle = false;
         let (fake, dir) = bound("order", stage);
-        let place = brisk();
+        let dial = Dial::new();
+        let place = brisk(&dial);
 
         let seat = place
             .open(&Order {
@@ -652,7 +693,8 @@ mod tests {
         let mut stage = Stage::new();
         stage.settle = false;
         let (fake, dir) = bound("launching", stage);
-        let place = brisk();
+        let dial = Dial::new();
+        let place = brisk(&dial);
 
         let seat = place.open(&Order { label: "robustness/010".into(), ..Order::default() })
             .expect("a seat");
@@ -695,7 +737,8 @@ mod tests {
                 Spot::agent("w2:p1", "claude", "t-2", State::Working).labelled("robustness/094"),
             ]),
         );
-        let place = brisk();
+        let dial = Dial::new();
+        let place = brisk(&dial);
         let seat = Seat::new("w1:p1");
 
         place.stop(&seat).expect("the seat was there");
@@ -750,39 +793,73 @@ mod tests {
         assert_eq!(row(json!({ "agent": "claude", "agent_status": "working" })), State::Working);
     }
 
-    /// The shell race, at a hundredth of its real length. `agent.start` into a
-    /// pane ten milliseconds old is refused with `agent_pane_busy` as a matter
-    /// of course, so the refusal is retried while it is that one — and giving up
-    /// on it is a failure with herdr's own words in it rather than a hang.
+    /// The shell race. `agent.start` into a pane ten milliseconds old is refused
+    /// with `agent_pane_busy` as a matter of course, so the refusal is retried
+    /// while it is that one — and giving up on it is a failure with herdr's own
+    /// words in it rather than a hang.
+    ///
+    /// **This is the test robustness-054 is named for**, and what it used to do
+    /// was measure the machine: `Instant::now()` around the call, a `sleep(80ms)`
+    /// on a scoped thread standing in for the shell arriving, and a 400ms window
+    /// racing both. It failed once in four consecutive `wsp verify` runs on
+    /// 2026-08-17 with three other agents building — and `wsp install` is gated
+    /// on `wsp verify --release`, so it blocked the install exactly when the
+    /// machine was busy, which is exactly when several agents are working.
+    ///
+    /// The three cases below are now arithmetic, because the adapter's clock is
+    /// a parameter and [`Dial`] is what winds it. The shell arriving is a thing
+    /// that happens at a time rather than a thread that sleeps for one, so
+    /// nothing is racing anything: the socket is still real and only the clock
+    /// is not. Each case gets a dial of its own, since what is being asserted
+    /// about each is how long *that* wait was.
     #[test]
     fn a_pane_with_no_shell_yet_is_retried_and_nothing_else_is() {
         let _env = util::env_lock();
         let (fake, dir) = bound("busy", Stage::new());
-        let place = brisk();
         let agent = Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new() };
 
-        let seat = place.open(&Order::default()).expect("a seat");
+        // Opening a seat waits for nothing, so this dial never moves.
+        let dial = Dial::new();
+        let seat = brisk(&dial).open(&Order::default()).expect("a seat");
         fake.refuses(Verb::Start, Snub::Busy);
-        let began = Instant::now();
+
+        // A shell that never arrives. The window is spent to the millisecond and
+        // then the refusal is passed on in herdr's own words.
+        let dial = Dial::new();
+        let place = brisk(&dial);
+        fake.forget();
         let err = place.start(&seat, &agent).expect_err("a shell that never arrived");
-        assert!(began.elapsed() >= place.shell, "it gave up before it had waited");
         assert!(matches!(&err, Refusal::Backend(m) if m.contains("agent_pane_busy")), "{err}");
+        assert_eq!(dial.elapsed(), place.shell, "it gave up somewhere other than the window's end");
+        assert_eq!(
+            times(&fake, Verb::Start),
+            asks_in(place.shell, place.poll),
+            "one ask, and then one per poll for as long as the window was open"
+        );
 
         // The same refusal, relenting inside the window, is the case this is
         // for: a brand-new pane whose shell turns up.
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(Duration::from_millis(80));
-                fake.relents(Verb::Start);
-            });
-            place.start(&seat, &agent).expect("the shell arrived and the retry caught it");
-        });
+        const ARRIVES: Duration = Duration::from_millis(80);
+        let dial = Dial::new().at(ARRIVES, || fake.relents(Verb::Start));
+        let place = brisk(&dial);
+        fake.forget();
+        place.start(&seat, &agent).expect("the shell arrived and the retry caught it");
+        assert_eq!(
+            times(&fake, Verb::Start),
+            asks_in(ARRIVES, place.poll),
+            "it stopped retrying at the poll the shell turned up on, and not a poll later"
+        );
 
-        // Anything that is not that refusal is a real failure, immediately.
+        // Anything that is not that refusal is a real failure, immediately —
+        // which is now the strongest of the three: not *sooner than the window*
+        // but without waiting at all.
         fake.refuses(Verb::Start, Snub::Backend("unknown agent kind `nonesuch`".into()));
-        let began = Instant::now();
+        let dial = Dial::new();
+        let place = brisk(&dial);
+        fake.forget();
         let err = place.start(&seat, &agent).expect_err("a refusal that is not the race");
-        assert!(began.elapsed() < place.shell, "a real refusal was retried: {err}");
+        assert_eq!(dial.elapsed(), Duration::ZERO, "a real refusal was waited on: {err}");
+        assert_eq!(times(&fake, Verb::Start), 1, "a real refusal was retried: {err}");
 
         std::env::remove_var("HERDR_SOCKET_PATH");
         let _ = std::fs::remove_dir_all(&dir);
@@ -795,7 +872,8 @@ mod tests {
     fn a_backend_that_did_not_answer_is_unreachable_rather_than_a_refusal() {
         let _env = util::env_lock();
         let (fake, dir) = bound("quiet", Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]));
-        let place = brisk();
+        let dial = Dial::new();
+        let place = brisk(&dial);
         let seat = Seat::new("w1:p1");
         assert_eq!(place.state(&seat).unwrap(), State::Idle);
 
@@ -903,13 +981,15 @@ mod tests {
         std::thread::spawn(move || {
             let _ = Herdr::new().watch(&mut |e| tx.send(e).is_ok());
         });
-        // The stream has to be up before the change, or this asserts nothing.
-        std::thread::sleep(Duration::from_millis(150));
+        // The stream has to be up before the change, or this asserts nothing —
+        // and the fake's own register is what says so. A sleep long enough to be
+        // right on a quiet machine is the flake robustness-054 was filed for.
+        assert!(fake.watched(), "wsp's subscriber never reached the backend");
 
         let seat = Seat::new("w1:p1");
         fake.stops(&seat);
         let mut heard = Vec::new();
-        while let Ok(e) = rx.recv_timeout(Duration::from_secs(2)) {
+        while let Ok(e) = rx.recv_timeout(DELIVERY) {
             let done = matches!(e, Event::Stopped(_));
             heard.push(e);
             if done {
@@ -919,7 +999,7 @@ mod tests {
         assert!(heard.contains(&Event::Stopped(seat.clone())), "{heard:?}");
 
         fake.closes(&seat);
-        let closed = rx.recv_timeout(Duration::from_secs(2)).expect("no close arrived");
+        let closed = rx.recv_timeout(DELIVERY).expect("no close arrived");
         assert_eq!(closed, Event::Closed(seat));
 
         std::env::remove_var("HERDR_SOCKET_PATH");

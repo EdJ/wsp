@@ -34,7 +34,7 @@ use crate::place::{Agent, Order, Place, Refusal, Seat, State};
 use crate::place_herdr::Herdr;
 use crate::resolve::Index;
 use crate::store::Store;
-use crate::util::{self, Paint};
+use crate::util::{self, Clock, Paint};
 use crate::Args;
 
 /// How an agent came by the work it is being told about — and it is the one
@@ -230,7 +230,7 @@ struct Patience<'a> {
     /// ever paid by a spawn that has genuinely failed, because one reading of a
     /// live agent clears it.
     gone: Duration,
-    /// What time it is.
+    /// What time it is, and how to wait for the next look.
     ///
     /// Handed in rather than read, and this line was written by a flaky test
     /// rather than by taste. The throttle below is *per elapsed second* — ask
@@ -245,7 +245,13 @@ struct Patience<'a> {
     /// exact arithmetic instead of a guess about scheduling. The same seam the
     /// handbook asks for everywhere else: what value would have to be passed in
     /// for this to be testable?
-    now: &'a dyn Fn() -> Instant,
+    ///
+    /// It carries the sleep as well as the reading, which is robustness-054's
+    /// correction: a test that drove the clock and left the sleep behind still
+    /// had to set `poll` to zero to be fast, so the loop under test was not the
+    /// loop that runs. [`util::Clock`] holds the whole argument, and
+    /// `place_herdr::Herdr` waits through the same one.
+    clock: &'a dyn Clock,
 }
 
 impl Default for Patience<'static> {
@@ -254,7 +260,7 @@ impl Default for Patience<'static> {
             ready: Duration::from_millis(30_000),
             poll: Duration::from_millis(150),
             gone: Duration::from_millis(2_000),
-            now: &Instant::now,
+            clock: &util::Wall,
         }
     }
 }
@@ -292,7 +298,7 @@ fn wait_ready(
     wait: &Patience,
 ) -> Result<(), String> {
     let seat = spawn.seat;
-    let now = wait.now;
+    let now = || wait.clock.now();
     let deadline = now() + wait.ready;
     let mut empty_since: Option<Instant> = None;
     loop {
@@ -320,7 +326,7 @@ fn wait_ready(
         if now() >= deadline {
             return Err(format!("{kind} started but never became ready for input"));
         }
-        std::thread::sleep(wait.poll);
+        wait.clock.rest(wait.poll);
     }
 }
 
@@ -1027,24 +1033,20 @@ mod tests {
         }
     }
 
-    /// A backend reading off a script, one answer per poll, holding the last
-    /// one for ever after.
+    /// A backend reading off a script, one answer per poll, holding the last one
+    /// for ever after.
     ///
     /// The script is the whole point: what killed t-260817-010 was a *sequence*
     /// of readings rather than any single one, and a fake that can only be put
     /// in a state cannot express "empty, and then not".
-    /// A backend reading off a script, one answer per poll, holding the last one
-    /// for ever after — and the clock the waiting is measured on.
     ///
-    /// The clock is here rather than beside it because *a poll is what takes
-    /// time*: one reading is one round trip to a backend, so time advancing by a
-    /// step per `state` call is the honest model and it makes every assertion
-    /// below arithmetic rather than a race. [`STEP`] is what one poll costs.
+    /// It holds no clock. Time is [`util::Dial`]'s, wound by the wait's own
+    /// `rest` and by nothing else — which is the honest model, because waiting
+    /// is the only thing in a poll loop that takes any. [`STEP`] is what one
+    /// poll costs.
     struct Reads {
         script: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<State>>>,
         last: std::cell::RefCell<crate::place::Result<State>>,
-        clock: std::cell::Cell<Instant>,
-        began: Instant,
     }
 
     /// What one poll costs on the tests' clock.
@@ -1052,28 +1054,17 @@ mod tests {
 
     impl Reads {
         fn of(script: Vec<crate::place::Result<State>>) -> Reads {
-            let began = Instant::now();
             Reads {
                 last: std::cell::RefCell::new(
                     script.last().cloned().unwrap_or(Ok(State::Unknown)),
                 ),
                 script: std::cell::RefCell::new(script.into()),
-                clock: std::cell::Cell::new(began),
-                began,
             }
-        }
-        fn now(&self) -> Instant {
-            self.clock.get()
-        }
-        /// How far the clock has been driven, which is how long the wait took.
-        fn elapsed(&self) -> Duration {
-            self.clock.get().saturating_duration_since(self.began)
         }
     }
 
     impl Place for Reads {
         fn state(&self, _: &Seat) -> crate::place::Result<State> {
-            self.clock.set(self.clock.get() + STEP);
             match self.script.borrow_mut().pop_front() {
                 Some(s) => s,
                 None => self.last.borrow().clone(),
@@ -1124,8 +1115,7 @@ mod tests {
     }
 
     /// A grace of thirty polls and a deadline of two thousand, on a clock that
-    /// only moves when something asks the backend a question. Nothing here
-    /// sleeps.
+    /// only moves when the wait rests. Nothing here sleeps.
     const GRACE: Duration = Duration::from_millis(30);
     const READY: Duration = Duration::from_millis(2_000);
 
@@ -1133,14 +1123,10 @@ mod tests {
         place: &Reads,
         how: &dyn agent_commands::Kind,
         seat: &Seat,
+        clock: &util::Dial,
     ) -> Result<(), String> {
         let spawn = agent_commands::Spawn { full: false, name: "t-260817-010", seat };
-        let wait = Patience {
-            ready: READY,
-            poll: Duration::ZERO,
-            gone: GRACE,
-            now: &|| place.now(),
-        };
+        let wait = Patience { ready: READY, poll: STEP, gone: GRACE, clock };
         wait_ready(place, how, &spawn, "claude", &wait)
     }
 
@@ -1162,19 +1148,20 @@ mod tests {
     /// passing alone and failing under the full suite, because the throttle is
     /// per elapsed second and three other agents building beside it stretched
     /// two hundred polls over enough time for one more. The clock the wait reads
-    /// is now a parameter and [`Reads`] drives it one [`STEP`] per poll, so the
-    /// answer below is arithmetic: two hundred polls of one millisecond, asked
-    /// every thirty, is six.
+    /// is now a parameter and the wait's own `rest` drives it one [`STEP`] per
+    /// poll, so the answer below is arithmetic: two hundred polls of one
+    /// millisecond, asked every thirty, is six.
     #[test]
     fn a_seat_the_backend_cannot_see_does_not_end_a_spawn_whose_agent_is_alive() {
         let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
         let place = Reads::of(
             std::iter::repeat_with(|| Ok(State::Empty))
                 .take(200)
                 .chain([Ok(State::Starting), Ok(State::Idle)])
                 .collect(),
         );
-        assert_eq!(waiting_on(&place, &alive, &Seat::new("w2C:p1")), Ok(()));
+        assert_eq!(waiting_on(&place, &alive, &Seat::new("w2C:p1"), &dial), Ok(()));
         assert_eq!(alive.1.get(), 6, "once per grace over two hundred polls, and no oftener");
     }
 
@@ -1187,18 +1174,20 @@ mod tests {
     #[test]
     fn an_agent_that_never_started_is_reported_without_waiting_out_the_deadline() {
         let dead = Says(Some(false), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
         let place = Reads::of(vec![Ok(State::Empty)]);
         assert_eq!(
-            waiting_on(&place, &dead, &Seat::new("w2C:p1")),
+            waiting_on(&place, &dead, &Seat::new("w2C:p1"), &dial),
             Err("claude started and then stopped in w2C:p1".into())
         );
         assert_eq!(dead.1.get(), 1, "one question, asked once the grace was up");
-        assert!(place.elapsed() < READY, "waited out the whole deadline to say so");
-        assert!(place.elapsed() >= GRACE, "gave up before a launch has had time to finish");
+        assert!(dial.elapsed() < READY, "waited out the whole deadline to say so");
+        assert!(dial.elapsed() >= GRACE, "gave up before a launch has had time to finish");
         // A kind with no runtime to ask is not thereby immortal: the seat has
         // still been empty for longer than a launch takes.
         let mute = Says(None, std::cell::Cell::new(0));
-        assert!(waiting_on(&Reads::of(vec![Ok(State::Empty)]), &mute, &Seat::new("w2C:p1")).is_err());
+        let place = Reads::of(vec![Ok(State::Empty)]);
+        assert!(waiting_on(&place, &mute, &Seat::new("w2C:p1"), &util::Dial::new()).is_err());
     }
 
     /// One empty reading between two live ones is a gap in what the backend can
@@ -1217,7 +1206,7 @@ mod tests {
             Ok(State::Starting),
             Ok(State::Idle),
         ]);
-        assert_eq!(waiting_on(&place, &never, &Seat::new("w2C:p1")), Ok(()));
+        assert_eq!(waiting_on(&place, &never, &Seat::new("w2C:p1"), &util::Dial::new()), Ok(()));
         assert_eq!(never.1.get(), 0, "a subprocess was run for a single blink");
     }
 
@@ -1228,7 +1217,7 @@ mod tests {
         let alive = Says(Some(true), std::cell::Cell::new(0));
         let place = Reads::of(vec![Err(Refusal::NoSeat(Seat::new("w2C:p1")))]);
         assert_eq!(
-            waiting_on(&place, &alive, &Seat::new("w2C:p1")),
+            waiting_on(&place, &alive, &Seat::new("w2C:p1"), &util::Dial::new()),
             Err("w2C:p1 is gone".into())
         );
     }

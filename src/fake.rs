@@ -1114,6 +1114,32 @@ impl Fake {
         });
     }
 
+    /// Wait until somebody is listening to the stream, and say whether anybody
+    /// turned up.
+    ///
+    /// **The only honest form of the sentence a subscriber test has to say
+    /// first.** A watcher that subscribes after the change learns nothing at
+    /// all, so a test that changes the state has to know its own subscriber is
+    /// registered — and what it used to do was `sleep(150ms)` and hope, which is
+    /// right on a quiet machine and a flake on a busy one (robustness-054, the
+    /// same fault as the shell race and one file over).
+    ///
+    /// So it asks the fake's own register, which is exactly the thing
+    /// [`Fake::raise`] delivers to: the answer is a fact rather than an
+    /// allowance. The bound is a hang-guard and not a measurement — it is there
+    /// so a broken subscribe fails the test instead of wedging the suite, and a
+    /// machine slow enough to reach it has already failed the assertion that
+    /// follows.
+    pub fn watched(&self) -> bool {
+        for _ in 0..2_000 {
+            if !self.inner.watchers.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
     /// Push what happened to whoever is listening.
     fn raise(&self, stage: &Stage, events: &[Event]) {
         let mut lines: Vec<(String, Value)> = Vec::new();
@@ -1851,6 +1877,11 @@ mod tests {
     use crate::util;
 
 
+    /// How long to wait for an event already pushed down a socket on this
+    /// machine. A hang-guard rather than a measurement, and generous on purpose:
+    /// it is only ever paid by a test that is already failing.
+    const DELIVERY: Duration = Duration::from_secs(10);
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-fake-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1860,7 +1891,10 @@ mod tests {
 
     fn call(fake: &Fake, method: &str, params: Value) -> Result<Value, String> {
         let mut s = UnixStream::connect(fake.path()).map_err(|e| e.to_string())?;
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // A hang-guard rather than a measurement, on the same argument as
+        // [`DELIVERY`]: nothing here is asserting that the fake is fast, and a
+        // tight bound on a loaded machine is a flake for nothing.
+        s.set_read_timeout(Some(DELIVERY)).unwrap();
         let req = json!({ "id": "t1", "method": method, "params": params });
         s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
         s.flush().unwrap();
@@ -2154,17 +2188,19 @@ mod tests {
         });
         // The stream has to be up before the change, or the test is asserting
         // nothing: a watcher that subscribes afterwards learns nothing at all,
-        // which is the failure mode the daemon lives with.
-        std::thread::sleep(Duration::from_millis(150));
+        // which is the failure mode the daemon lives with. Asked of the register
+        // the event will be delivered to rather than slept for — see
+        // [`Fake::watched`].
+        assert!(fake.watched(), "the subscriber never reached the fake");
 
         let seat = Seat::new("w1:p1");
         fake.moves(&seat, State::Working);
-        let (name, data) = rx.recv_timeout(Duration::from_secs(2)).expect("no event arrived");
+        let (name, data) = rx.recv_timeout(DELIVERY).expect("no event arrived");
         assert_eq!(name, "pane_updated", "the stream renames dots to underscores");
         assert_eq!(data["pane"]["agent_status"], "working");
 
         fake.closes(&seat);
-        let (name, data) = rx.recv_timeout(Duration::from_secs(2)).expect("no close arrived");
+        let (name, data) = rx.recv_timeout(DELIVERY).expect("no close arrived");
         assert_eq!(name, "pane_closed");
         assert_eq!(data["pane_id"], "w1:p1");
 

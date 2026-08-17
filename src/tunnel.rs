@@ -41,6 +41,19 @@ const PROBE: Duration = Duration::from_secs(2);
 /// flat at a minute for that second reason.
 const BACKOFF: [u64; 5] = [2, 5, 15, 30, 60];
 
+/// How long to wait after this many consecutive failures — the curve, on its
+/// own, with no clock in it.
+///
+/// Separate from [`Tunnel::backoff`] for one reason: the curve is the thing
+/// worth asserting and reading a clock to check it is what made the assertion
+/// approximate. The test used to bracket `backoff` with two `Instant::now()`
+/// calls and truncate the difference to whole seconds, so a scheduler gap of a
+/// second between two adjacent statements read as a wrong answer — the fault
+/// robustness-054 was filed for, in its cheapest form. Here it is arithmetic.
+fn wait_after(failures: usize) -> Duration {
+    Duration::from_secs(BACKOFF[failures.min(BACKOFF.len() - 1)])
+}
+
 struct Tunnel {
     child: Option<Child>,
     /// Consecutive failures, indexing [`BACKOFF`].
@@ -61,9 +74,8 @@ impl Tunnel {
     }
 
     fn backoff(&mut self) {
-        let wait = BACKOFF[self.failures.min(BACKOFF.len() - 1)];
+        self.next_try = Some(Instant::now() + wait_after(self.failures));
         self.failures += 1;
-        self.next_try = Some(Instant::now() + Duration::from_secs(wait));
     }
 
     fn may_try(&self) -> bool {
@@ -355,20 +367,25 @@ mod tests {
     /// dialled every tick for a week, and one that has just come back must not
     /// wait five minutes to be noticed — so the wait grows and then stops
     /// growing.
+    ///
+    /// Asked of [`wait_after`] rather than of a `next_try` measured against a
+    /// clock read a moment earlier: the curve is what is being asserted, and
+    /// the reading only ever added a way for the answer to be wrong on a busy
+    /// machine.
     #[test]
     fn the_backoff_grows_and_then_holds_at_a_minute() {
+        let waits: Vec<u64> = (0..8).map(|n| wait_after(n).as_secs()).collect();
+        assert_eq!(waits, [2, 5, 15, 30, 60, 60, 60, 60]);
+
+        // And that the tunnel spends it: nothing is tried until the wait it was
+        // just given has passed.
         let mut t = Tunnel::new();
         assert!(t.may_try(), "a tunnel nobody has tried yet is tried now");
-
-        let mut waits = Vec::new();
-        for _ in 0..8 {
-            let before = Instant::now();
+        for n in 0..8 {
             t.backoff();
-            let wait = t.next_try.unwrap().duration_since(before).as_secs();
-            waits.push(wait);
             assert!(!t.may_try(), "and it is not tried again until then");
+            assert_eq!(t.failures, n + 1, "a failure that was not counted is a wait not grown");
         }
-        assert_eq!(waits, [2, 5, 15, 30, 60, 60, 60, 60]);
     }
 
     /// A success clears the debt. Otherwise a machine that flapped this
