@@ -236,6 +236,14 @@
 //! assumes herdr's *shape* of id does not — so nothing here parses one, and
 //! `herdr::split_host` stays the one place the `@` suffix means anything.
 //!
+//! So is a machine's address. `Machine::backend_at` is the port's word for
+//! *where this machine's backend listens*, and it is opaque for the same reason
+//! an id is: herdr's is a unix socket path, and something reached over TCP would
+//! write a host and a port in the same field without a line of wsp changing.
+//! Nothing outside an adapter reads it — the model stores it, `tunnel.rs` hands
+//! it to `ssh -L` because a unix socket on both ends is already herdr's dialect,
+//! and `place_herdr::mirrored_socket` is what an empty one means.
+//!
 //! The `@` suffix belongs to the `Remote` decorator (decision on t-260816-060):
 //! it holds the connections, strips the machine on the way out and qualifies
 //! ids on the way in, and the backend underneath goes on believing it talks to

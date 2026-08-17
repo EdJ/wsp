@@ -2011,13 +2011,20 @@ the design had gone wrong somewhere.
 **The far herdr socket is an absolute path on the far machine.** `ssh -L` does
 not expand `~` on the remote side, so wsp records the path rather than
 discovering it — asking the machine for its `$HOME` would put a blocking round
-trip, to a machine that may be down, inside the daemon's tick. It defaults to
-this machine's own herdr socket, which is right while the machines mirror each
-other and is exactly what a Linux box breaks:
+trip, to a machine that may be down, inside the daemon's tick. `wsp machine add`
+writes down this machine's own herdr socket, which is right while the machines
+mirror each other and is exactly what a Linux box breaks:
 
 ```sh
-wsp machine set mb2 herdr_sock=/home/ed/.config/herdr/herdr.sock
+wsp machine set mb2 backend_at=/home/ed/.config/herdr/herdr.sock
 ```
+
+The field is `backend_at` and not `herdr_sock` because a machine record says
+where its *backend* listens, in whatever words that backend uses — a socket
+path for herdr, a host and a port for something reached over TCP. wsp carries
+the string and does not read it; the adapter in `src/place_herdr.rs` is the only
+thing that knows it names a file, and supplies the mirrored default when the
+record leaves it out.
 
 **The shim has to qualify ids.** herdr on the executor numbers its panes from
 zero too, so `HERDR_PANE_ID` over there is `w0:p3` and means a different pane on

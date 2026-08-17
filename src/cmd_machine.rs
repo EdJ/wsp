@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::herdr;
 use crate::model::{valid_machine_name, Machine, Task};
+use crate::place_herdr;
 use crate::store::{MachineLive, Store};
 use crate::util::{self, Paint};
 use crate::Args;
@@ -96,6 +97,13 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     }
 
     let mut m = Machine::new(&name, &ssh);
+    // Written down here rather than defaulted in the model, and here rather
+    // than left empty for the tunnel to fill in: a command is allowed to know
+    // which backend it is adding a machine for, and a record that says where it
+    // forwards is one a person can correct with `set` before the first dial.
+    // The empty case still works — see `tunnel::backend_at` — it just cannot be
+    // read out of the file.
+    m.backend_at = place_herdr::mirrored_socket();
     m.os = args.get("os").unwrap_or_default();
     m.arch = args.get("arch").unwrap_or_default();
     if let Some(note) = args.get("note") {
@@ -124,7 +132,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     println!("  {}", p.dim(&format!("needs: a `Host {}` block in ~/.ssh/config, and herdr server running there", m.ssh)));
     // The mirrored-path assumption, said out loud at the moment it is made
     // rather than discovered as a tunnel that will not come up.
-    println!("  {}", p.dim(&format!("forwards {} — wsp machine set {} herdr_sock=… if that is not where it is", m.herdr_sock, m.name)));
+    println!("  {}", p.dim(&format!("forwards {} — wsp machine set {} backend_at=… if that is not where it is", m.backend_at, m.name)));
     0
 }
 
@@ -354,7 +362,15 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     println!("{}  {}{}", p.bold(&m.name), state, if note.is_empty() { String::new() } else { format!("  {}", p.dim(&note)) });
     println!();
     println!("ssh       {}", m.ssh);
-    println!("herdr     {}", m.herdr_sock);
+    // A record written by hand can leave this out, and then what the tunnel
+    // will actually forward to is the backend's own default. Printed as such
+    // rather than left blank: this is the field a machine that will not come up
+    // is usually wrong about, and a blank line here would send you looking for
+    // the answer somewhere there isn't one.
+    match m.backend_at.is_empty() {
+        true => println!("backend   {}", p.dim(&format!("{} — the backend's default", place_herdr::mirrored_socket()))),
+        false => println!("backend   {}", m.backend_at),
+    }
     let box_line = [m.os.as_str(), m.arch.as_str()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
     if !box_line.is_empty() {
         println!("box       {box_line}");
@@ -386,7 +402,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
 pub fn set(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp machine set <name> ssh=… herdr_sock=… os=… arch=… status=active|retired");
+        eprintln!("usage: wsp machine set <name> ssh=… backend_at=… os=… arch=… status=active|retired");
         return 2;
     };
     let Some(mut m) = find(store, &needle) else {
@@ -402,7 +418,14 @@ pub fn set(store: &Store, args: &Args) -> i32 {
         };
         match k {
             "ssh" => m.ssh = v.to_string(),
-            "herdr_sock" => m.herdr_sock = v.to_string(),
+            "backend_at" => m.backend_at = v.to_string(),
+            // One release of a name nobody but this repository ever typed, kept
+            // because it is in the README's executor section and the error it
+            // would otherwise get names every field except the one you meant.
+            "herdr_sock" => {
+                eprintln!("wsp: `herdr_sock` is now `backend_at` — a machine records where its backend listens, whichever backend that is");
+                return 2;
+            }
             "os" => m.os = v.to_string(),
             "arch" => m.arch = v.to_string(),
             "status" => match v {
@@ -413,7 +436,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                 }
             },
             other => {
-                eprintln!("wsp: machines have no `{other}` — ssh, herdr_sock, os, arch, status");
+                eprintln!("wsp: machines have no `{other}` — ssh, backend_at, os, arch, status");
                 return 2;
             }
         }
@@ -721,7 +744,7 @@ fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
         "ssh": m.ssh,
         "os": m.os,
         "arch": m.arch,
-        "herdr_sock": m.herdr_sock,
+        "backend_at": m.backend_at,
         "status": m.status,
         "added": m.added,
         "live": live.map(|l| l.to_value()),

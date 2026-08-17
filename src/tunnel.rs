@@ -277,6 +277,24 @@ fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<
     c.spawn()
 }
 
+/// The far end of the forward: what the machine's record says, or the backend's
+/// own default when it says nothing.
+///
+/// The default is the adapter's and not the model's, which is the whole of
+/// t-260816-064 — a durable record has no business computing a herdr path. This
+/// file is entitled to ask for it, because an `ssh -L` between two unix sockets
+/// is already a sentence in herdr's dialect and not the port's.
+///
+/// Empty is a record written by hand, and it must not become an empty far side:
+/// `ssh -L /s/mb2.sock:` is answered with `Bad local forwarding specification`,
+/// the same unexplained refusal [`SUN_PATH_MAX`] exists to get in front of.
+fn backend_at(m: &Machine) -> String {
+    match m.backend_at.is_empty() {
+        true => crate::place_herdr::mirrored_socket(),
+        false => m.backend_at.clone(),
+    }
+}
+
 /// The ssh we hold open, and why each flag is on it.
 fn ssh_args(m: &Machine, sock: &std::path::Path, control: &std::path::Path) -> Vec<String> {
     let s = |x: &str| x.to_string();
@@ -306,7 +324,7 @@ fn ssh_args(m: &Machine, sock: &std::path::Path, control: &std::path::Path) -> V
         s("-o"), s("ControlMaster=auto"),
         s("-o"), format!("ControlPath={}", control.display()),
         // The whole mechanism, in one flag.
-        s("-L"), format!("{}:{}", sock.display(), m.herdr_sock),
+        s("-L"), format!("{}:{}", sock.display(), backend_at(m)),
         m.ssh.clone(),
     ]
 }
@@ -392,7 +410,7 @@ mod tests {
     #[test]
     fn the_forward_is_the_command_and_the_two_flags_that_must_be_on_it() {
         let mut m = Machine::new("mb2", "mac-mini");
-        m.herdr_sock = "/Users/ed/.config/herdr/herdr.sock".into();
+        m.backend_at = "/Users/ed/.config/herdr/herdr.sock".into();
         let args = ssh_args(
             &m,
             std::path::Path::new("/s/sock/mb2.sock"),
@@ -407,6 +425,26 @@ mod tests {
         );
         assert_eq!(args.last().unwrap(), "mac-mini", "the Host alias, and it goes last");
         assert!(!args.iter().any(|a| a.contains("ControlPersist")), "the master dies with us");
+    }
+
+    /// A machine record that does not say where its backend listens still
+    /// forwards somewhere.
+    ///
+    /// The field stopped being defaulted in the model with t-260816-064, so
+    /// "empty" is now a shape that reaches this file — a record written by hand
+    /// with nothing but an `ssh:` line. The failure it must not become is an
+    /// empty far side: ssh answers `-L /s/mb2.sock:` with `Bad local forwarding
+    /// specification`, which reads as a bug in something wsp built.
+    #[test]
+    fn a_machine_that_does_not_say_where_its_backend_listens_still_forwards_to_one() {
+        let m = Machine::new("mb2", "mac-mini");
+        assert!(m.backend_at.is_empty(), "a bare record carries no address");
+
+        let args = ssh_args(&m, std::path::Path::new("/s/sock/mb2.sock"), std::path::Path::new("/s/cm"));
+        let forward = args.iter().find(|a| a.starts_with("/s/sock/mb2.sock:")).expect("a forward");
+        let far = forward.strip_prefix("/s/sock/mb2.sock:").unwrap();
+        assert!(!far.is_empty(), "an empty far side is a forwarding spec ssh refuses");
+        assert!(far.starts_with('/'), "and `~` is not expanded on the far side: {far}");
     }
 
     /// The limit that is not ours and does not announce itself. ssh answers a

@@ -447,7 +447,7 @@ fn help() {
                                     a Host alias from ~/.ssh/config, not an address
   wsp machine ls|machines           what exists, and whether it is answering
   wsp machine show <name>           ssh target, tunnel, last seen, why not
-  wsp machine set <name> k=v…       ssh/herdr_sock/os/arch/status
+  wsp machine set <name> k=v…       ssh/backend_at/os/arch/status
   wsp machine rm <name> [--force]   retire it; --force removes the record
 
 {plumbing}

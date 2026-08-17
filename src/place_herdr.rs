@@ -168,6 +168,25 @@ impl Herdr {
     }
 }
 
+/// Where this machine's herdr listens, as the default for a machine whose
+/// record does not say.
+///
+/// The mirrored-path assumption, and this is the one place it is made. It is
+/// right for a Mac driving a Mac with the same username — which is what exists
+/// — and wrong for the Linux box, which is why `Machine::backend_at` is
+/// writable and why being wrong shows up as a tunnel that will not come up
+/// rather than as anything subtler.
+///
+/// It lives here because interpreting a machine's backend address is the
+/// adapter's job and nobody else's: `place.rs` carries the string, the model
+/// stores it, and only this file knows that herdr's is a filesystem path and
+/// that a second machine's is likely to be the same one as ours. It was in
+/// `model.rs` until t-260816-064, where it was the durable entities reaching
+/// for a concrete backend.
+pub fn mirrored_socket() -> String {
+    herdr::socket_path().to_string_lossy().into_owned()
+}
+
 /// The calls that wait on something outside herdr get longer than [`herdr::call`]'s
 /// three seconds: `workspace.create` starts a shell, and `agent.prompt` is
 /// answered by the agent rather than by the server.
