@@ -1027,7 +1027,7 @@ pub(super) fn task_rows(
         let needs_you = crate::cmd_govern::needs_a_person(
             a.as_ref().map(|a| a.state == "idle").unwrap_or(false),
             t.status() == Status::Doing,
-            a.as_ref().map(|a| a.seat).unwrap_or(false),
+            a.as_ref().map(|a| a.seat.is_some()).unwrap_or(false),
         );
         task_sort_key(t, a.is_some(), needs_you)
     });
@@ -1060,7 +1060,7 @@ pub(super) fn task_rows(
         let needs_you = crate::cmd_govern::needs_a_person(
             a.as_ref().map(|a| a.state == "idle").unwrap_or(false),
             t.status() == Status::Doing,
-            a.as_ref().map(|a| a.seat).unwrap_or(false),
+            a.as_ref().map(|a| a.seat.is_some()).unwrap_or(false),
         );
         rows.push(Row::Task {
             id: t.id.clone(),
@@ -1103,7 +1103,7 @@ pub(super) fn task_rows(
                 // The task is right here, so the row can say what the pane is
                 // waiting for rather than only whether it is running — which
                 // is the whole of the difference between `←` and `?`.
-                state: agent_state(&a.state, Some(t.status()), a.seat),
+                state: agent_state(&a.state, Some(t.status()), a.seat.is_some()),
                 agent: a.clone(),
                 depth: depth + sub + 1,
                 census: None,
@@ -1289,7 +1289,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let as_ref = |a: &AgentRef, project: Option<String>| AgentRef {
         task: bound_task_of_pane(&a.pane),
         project,
-        seat: crate::cmd_govern::governs(&snap.governors, &a.workspace).is_some(),
+        seat: crate::cmd_govern::governs(&snap.governors, &a.workspace),
         ..a.clone()
     };
 
@@ -1413,7 +1413,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             // rule exists for as an agent that had stalled.
             let row = as_ref(a, direction.clone());
             census.push((
-                agent_state(&a.state, holds.map(|t| t.status()), row.seat),
+                agent_state(&a.state, holds.map(|t| t.status()), row.seat.is_some()),
                 Census {
                     // Where it stands, before where it is aimed: a pane holding
                     // a task is placed by that task's project, and only one
@@ -1610,7 +1610,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                         // Shells, every one of them — nothing is bound here, so
                         // there is no task to read a state off and the row
                         // draws `▫` regardless.
-                        state: agent_state(&a.state, None, a.seat),
+                        state: agent_state(&a.state, None, a.seat.is_some()),
                         agent: a.clone(),
                         depth: depth + 1,
                         census: None,
@@ -1655,13 +1655,16 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         if !folded {
             for a in homeless {
                 let title = a.where_();
-                let state = agent_state(&a.state, None, a.seat);
+                let state = agent_state(&a.state, None, a.seat.is_some());
                 rows.push(Row::Agent { agent: a, title, depth: 1, state, census: None });
             }
         }
     }
 
-    census.sort_by(|(a, _, ar), (b, _, br)| a.cmp(b).then(ar.where_().cmp(&br.where_())));
+    // By the name the row draws, not the one the pane wears: a custodian's row
+    // is drawn under its post and a list ordered by anything else is a list
+    // whose order is invisible to the person reading it.
+    census.sort_by(|(a, _, ar), (b, _, br)| a.cmp(b).then(ar.census_name().cmp(&br.census_name())));
 
     // The agents, either way round.
     //
@@ -1686,7 +1689,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             for i in group {
                 let (state, c, a) = &census[i];
                 list.push(Row::Agent {
-                    title: a.where_(),
+                    title: a.census_name(),
                     agent: a.clone(),
                     depth: 1,
                     state: *state,
@@ -1760,7 +1763,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                 for i in group {
                     let (state, c, a) = &census[i];
                     rows.push(Row::Agent {
-                        title: a.where_(),
+                        title: a.census_name(),
                         agent: a.clone(),
                         depth: 1,
                         state: *state,

@@ -101,7 +101,8 @@ pub(crate) struct AgentRef {
     ///
     /// The store's half of the row, like `task` above.
     pub(crate) project: Option<String>,
-    /// Whether this pane's workspace holds a coordinating seat — `wsp govern`.
+    /// The project this pane's workspace is the custodian of — `wsp govern` —
+    /// and `None` for every ordinary agent, which is nearly all of them.
     ///
     /// The store's half again, and it is here rather than being looked up where
     /// it is read because it changes one existing judgement rather than adding
@@ -109,13 +110,45 @@ pub(crate) struct AgentRef {
     /// unless it is a seat, which is idle between the agents it is sequencing.
     /// See [`crate::cmd_govern::needs_a_person`], which is where that sentence
     /// is enforced for every surface at once.
-    pub(crate) seat: bool,
+    ///
+    /// Which project rather than whether: the same shape `wsp wip`'s row keeps,
+    /// and for the same reason — the row that draws a custodian has to name the
+    /// post, and a `bool` sends every reader back to `governs` for an answer the
+    /// join already had. See [`AgentRef::census_name`].
+    pub(crate) seat: Option<String>,
 }
 
 impl AgentRef {
     /// What to call it — see [`pane_name`].
     pub(crate) fn where_(&self) -> String {
         pane_name(&self.label, &self.title, &self.workspace_label)
+    }
+
+    /// The same name with the post in front of it, for a pane that holds one.
+    ///
+    /// A custodian's pane is named `governor · wsp` by [`crate::cmd_govern`]
+    /// and wears the sentence alone from its first `wsp say` onwards: a said
+    /// sentence is scoped by the **task** the pane holds, and a governor holds
+    /// none, so the row in the census lost the one fact that placed it while
+    /// every worker beside it kept theirs.
+    ///
+    /// Put back where the row is drawn rather than written into the label, on
+    /// two grounds. The scope is a fact about the pane and not part of what the
+    /// agent said, so the label stays the agent's own words; and `wsp say` is a
+    /// verb agents run all day, which would have to ask who governs what on
+    /// every call to say it there.
+    ///
+    /// A pane that has not said anything yet already wears the post as its
+    /// label, and is left alone — `governor · wsp · governor · wsp` is the same
+    /// fact twice.
+    pub(crate) fn census_name(&self) -> String {
+        let said = self.where_();
+        match &self.seat {
+            Some(project) if !crate::cmd_govern::is_governor_label(&said) => {
+                format!("{} · {said}", crate::cmd_govern::governor_of(project))
+            }
+            _ => said,
+        }
     }
 }
 
@@ -217,7 +250,7 @@ pub(crate) fn read() -> Live {
                 kind: p.agent.clone(),
                 task: None,
                 project: None,
-                seat: false,
+                seat: None,
             })
             .collect(),
     }

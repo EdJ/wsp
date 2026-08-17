@@ -1474,6 +1474,41 @@ mod tests {
         assert!(text.contains("governor") && text.contains("verb"), "{text}");
     }
 
+    /// The same fact one surface further down: a custodian's row in the census
+    /// says the post it is speaking from.
+    ///
+    /// Ed, 2026-08-17. Every worker in the dock reads `data/024 · what it said`
+    /// and the governor read as the sentence alone — because `wsp say` scopes a
+    /// sentence by the **task** the pane holds, and the one agent whose identity
+    /// is a position rather than a piece of work holds none. The seat row in the
+    /// tree above was already right; this is the row at the foot, which is read
+    /// on its own and had nothing on it to say whose voice it was.
+    #[test]
+    fn a_governors_row_in_the_census_says_the_post_it_speaks_from() {
+        let mut w = seated_world();
+        // What the pane wears from its first `wsp say` onwards, which is what
+        // `cmd_agent::say` writes for a pane holding no task: the sentence, and
+        // nothing in front of it.
+        if let Some(p) = w.panes.iter_mut().find(|p| p.pane == "w2:p1") {
+            p.label = "restarted after herdr died; 02 is next".into();
+        }
+        // The whole census, so the assertion is about what the row says rather
+        // than about which five of them the foot had room for.
+        let (mut ui, _view) = showing(&w, &[Key::Char('w')]);
+        let at = ui.rows_for_target(&panel::Target::Pane("w2:p1".into()));
+        assert_eq!(at.len(), 1, "the custodian is in the census once");
+        ui.select_for_test(at[0]);
+        let row = panel::render_row_for_test(&ui, at[0], W).text();
+        assert!(row.contains("governor · wsp"), "a bare sentence again: {row}");
+        assert!(row.contains("restarted"), "and what it said is still the news: {row}");
+
+        // A worker beside it is untouched: it already carried its scope, and
+        // this must not put a second one in front of it.
+        let worker = ui.rows_for_target(&panel::Target::Pane("w1:p1".into()));
+        let row = panel::render_row_for_test(&ui, worker[0], W).text();
+        assert!(!row.contains("governor"), "an ordinary agent wearing a post: {row}");
+    }
+
     /// Vacancies draw once, at the top. Filled slots draw wherever they sit.
     ///
     /// Ed's rule, and the two states earn their space differently: a filled slot
