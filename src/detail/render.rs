@@ -336,7 +336,12 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
 
     // A project's prose, same as a task's — it is the same machinery now, and
     // a project is the natural home for "what is this and why".
-    for name in ["Overview", "Details", "Decisions"] {
+    //
+    // The vocabulary rather than a literal copy of it: this was the fourth copy
+    // of the task list, and it is the one that would have gone stale silently
+    // when `Handbook` landed — a section written through the CLI and simply
+    // absent from the pane, with nothing failing.
+    for name in crate::model::PROJECT_PROSE {
         if let Some(text) = p.section(name) {
             out.push(Line::default());
             out.push(heading(&name.to_lowercase()));

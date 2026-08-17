@@ -444,7 +444,7 @@ pub fn has_prose(body: &str) -> bool {
     PROSE.iter().any(|s| section_of(body, s).is_some())
 }
 
-/// The sections a person writes: [`SECTIONS`] without `Log`.
+/// The sections a person writes on a **task**.
 ///
 /// The list exists so that "which sections can be edited" is answered in one
 /// place. It used to be answered in three, by three literals, and the third —
@@ -455,12 +455,36 @@ pub fn has_prose(body: &str) -> bool {
 ///
 /// `Log` is not here. It is append-only, `wsp note` is how you add to it, and
 /// editing history in place is how history stops being evidence.
+///
+/// `Handbook` is not here either, and that is the one place the two vocabularies
+/// part: a handbook is what a project tells everybody who arrives, and a task
+/// has no such thing. Offered on a task it would put an empty heading in the
+/// combined edit buffer of every task in the store, for a section nobody could
+/// sensibly fill.
 pub const PROSE: [&str; 3] = ["Overview", "Details", "Decisions"];
+
+/// The sections a person writes on a **project**: [`PROSE`] plus `Handbook`.
+///
+/// Two lists rather than one because the kinds genuinely differ, and one list
+/// with a "not for tasks" rule beside it would be the same drift by another
+/// name. Everything that renders or edits a project's prose reads this — the
+/// detail pane included, which was carrying a fourth literal copy of the task
+/// list and would otherwise have gone stale the moment this landed.
+pub const PROJECT_PROSE: [&str; 4] = ["Overview", "Details", "Handbook", "Decisions"];
 
 /// The headings a task or project body carries, in the order they are written.
 ///
 /// `Overview` is what the thing is — written once, read to re-enter it later.
 /// `Details` is working material: criteria, links, whatever the work needs.
+/// `Handbook` is a project's standing answer to "I have just arrived here":
+/// what the work is for, how it is done, and — the part that keeps it short —
+/// *where the code's own documentation lives and what is in it*. A technical
+/// map of a tree does not belong here. It belongs in the tree, versioned with
+/// the code it describes, reviewed in the same diff, and put in front of
+/// whoever changes that code; the same content held here drifts the moment
+/// somebody refactors and nothing makes them look at it. So the handbook names
+/// that file and says what it holds, and an agent that needs the map goes and
+/// reads it. Projects only — see [`PROJECT_PROSE`].
 /// `Decisions` is what was settled and now binds: dated, append-only, and not
 /// to be edited, because a decision that can be quietly rewritten is not a
 /// record of anything.
@@ -470,7 +494,7 @@ pub const PROSE: [&str; 3] = ["Overview", "Details", "Decisions"];
 /// been; a decision is a constraint on where it can go, which is worth reading
 /// before the history rather than after it — and it keeps `Log` last, which is
 /// what lets [`Task::log`] go on appending to the end of the body.
-pub const SECTIONS: [&str; 4] = ["Overview", "Details", "Decisions", "Log"];
+pub const SECTIONS: [&str; 5] = ["Overview", "Details", "Handbook", "Decisions", "Log"];
 
 /// Append a dated line under `## <section>`, adding the section if it is not
 /// there. Written through [`set_section_in`], so the body comes back in
@@ -930,13 +954,26 @@ mod tests {
     }
 
     /// `Log` is append-only and belongs to `wsp note`, so it is not offered to
-    /// an editor. Everything else in the vocabulary is, and the two lists must
-    /// not drift — `edit_prose` naming its own pair is what let `--decisions`
-    /// fall through and overwrite `Overview`.
+    /// an editor. Everything else in the vocabulary is, and the lists must not
+    /// drift — `edit_prose` naming its own pair is what let `--decisions` fall
+    /// through and overwrite `Overview`.
+    ///
+    /// A project's list is the whole body minus the log; a task's is that minus
+    /// `Handbook`, which is the one section only a project has. Stated as two
+    /// assertions over `SECTIONS` rather than two literals, so adding a section
+    /// cannot leave one of them behind.
     #[test]
     fn the_editable_sections_are_the_body_minus_the_log() {
         let editable: Vec<&str> = SECTIONS.iter().copied().filter(|s| *s != "Log").collect();
-        assert_eq!(PROSE.to_vec(), editable);
-        assert!(!PROSE.contains(&"Log"));
+        assert_eq!(PROJECT_PROSE.to_vec(), editable);
+        assert_eq!(
+            PROSE.to_vec(),
+            editable.iter().copied().filter(|s| *s != "Handbook").collect::<Vec<_>>(),
+        );
+        assert!(!PROSE.contains(&"Log") && !PROJECT_PROSE.contains(&"Log"));
+        // Order is the order a body is written in, so the two agree wherever
+        // they overlap — a section list that sorted differently would rewrite
+        // every body it touched.
+        assert!(PROSE.iter().all(|s| PROJECT_PROSE.contains(s)));
     }
 }

@@ -934,12 +934,14 @@ constants and `Style` values the rows draw with, so it cannot drift.
 ## What a task or project file holds
 
 Frontmatter is a contract — `id`, `status`, `schema` — and every field in it has
-a command that sets it correctly. The body is yours, and carries four sections:
+a command that sets it correctly. The body is yours, and carries four sections —
+five on a project:
 
 | Section | For |
 |---|---|
 | `## Overview` | what the task is, written once, read to re-enter it |
 | `## Details` | working material — criteria, links, whatever the work needs |
+| `## Handbook` | *projects only* — what an arriving agent is told; see below |
 | `## Decisions` | what was settled and now binds; `wsp decide` writes it |
 | `## Log` | dated, append-only; `wsp note` writes it, nothing edits it |
 
@@ -958,6 +960,33 @@ the same sentence, at the height it applies.
 It is not a file beside the code, either. `ARCHITECTURE.md` and its kind stay in
 the repo, because they describe the implementation and travel with it. A
 decision is about the *work*, and work lives in the store.
+
+`## Handbook` is where that line gets drawn explicitly, and it is a project
+section because a task has no equivalent — `wsp edit <task> --handbook` is a
+typo and is refused as one. It holds what somebody arriving on this project is
+told: what the work is for, the conventions that are conventions of the *work*
+rather than of the code, and — the part that keeps it short — **a pointer to the
+repository's own documentation, naming what is in it**. It does not hold a map
+of the tree. That belongs in the tree, versioned with the code, reviewed in the
+same diff, and put in front of whoever changes it; the same content kept here
+drifts the moment somebody refactors and nothing makes them look at it.
+
+```sh
+wsp project edit wsp --handbook -        # from stdin, like any other prose
+wsp project show wsp                     # one line: how many, and how to read it
+wsp project show wsp --handbook          # as written
+```
+
+Abridged by default in `show` for the reason the decisions block is: it is
+written to be injected once at the top of a session, where the model re-reads it
+for free, and `project show` is a command an agent runs several times a session.
+Printing it into each of those is the multiplication the mode below exists to
+remove.
+
+It is inherited down the project chain the way tags and decisions are. `wsp`
+says where the code's documentation lives and how to build here; `robustness`
+adds what is true of `robustness`; neither has to repeat the other, and an agent
+claimed onto `robustness` is handed both, root first.
 
 Dated and append-only, like the log, and for the same reason: there is no `wsp
 undecide`. A decision that turns out wrong is superseded by a later one saying
@@ -1163,6 +1192,7 @@ this binary — the user's to write, versioned with the tasks they talk about.
 
 ```sh
 wsp brief            # one call, for a session-start hook
+wsp brief --session  # …and the work itself. The hook's call; see below
 wsp brief --json
 ```
 
@@ -1207,6 +1237,54 @@ one piece of work.
 It never fails. An empty store, a herdr that is not answering, a pane belonging
 to no project: each of those is a shorter brief, not an error. A hook that
 errors on a fresh machine is a hook people delete.
+
+### The session payload
+
+```sh
+wsp brief --session
+```
+
+An agent that arrived holding only a task *title* went and fetched the rest.
+Measured across the two agents spawned on 2026-08-16: nineteen `wsp show` calls,
+14,450 tokens, rebuilding context the session that spawned it already had — and
+because every request re-reads the whole context, arriving over requests 4–16
+meant paying for it another ~86 times.
+
+So the hook hands it over instead. `--session` adds, after the roster and before
+the rules:
+
+```
+overview <the claimed task's own prose, as written>
+settled  <what the task has already decided>
+log      <the tail of its log — where direction dropped on it later arrives>
+binds    <the parent's decisions: direction lands on a parent>
+names    <the siblings its prose mentions by id, with title and status>
+read     <the handbook, down the project chain, root first>
+```
+
+Measured on this repo, on a real task: plain `wsp brief` is ~700 tokens and the
+payload is ~3,300 — ~1,150 of it the handbook, which is constant per project,
+and the rest the task. Against 14,450 fetched late, that is roughly 4:1 in
+favour, and it removes nineteen round-trips as well, each of which is itself a
+full context re-read.
+
+**The same arithmetic is why plain `wsp brief` must not grow.** It is run
+constantly, mid-session, by every agent and by whoever is coordinating — so a
+thousand tokens added to the default is a thousand tokens times every call in
+every session on the machine. That is the whole reason this is a mode the hook
+passes rather than a better default, and there is a test asserting that none of
+the payload appears without it.
+
+`names` answers *what is `t-260816-060`* with a title and a status and nothing
+more. Answering it with the whole task would be the fetching this replaces, done
+eagerly, for every id rather than the one that mattered.
+
+The work order changes with it. `wsp spawn --agent` claims *before* it starts
+the agent, so by the time the agent is told what it is holding, its hook has
+already run with the claim in place — and the sentence stops asking for a brief
+it has. The panel's `f` hands work to an agent that has been running since
+before the claim existed, so that one is still asked to fetch, once, with
+`--session`. The duplicate is gone by construction rather than by remembering.
 
 ### Looking at a pane
 

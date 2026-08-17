@@ -340,10 +340,15 @@ pub(super) fn tell_released(a: &AgentRef, task: &str) -> Option<Tell> {
 /// Tell an agent about a task it has just been handed. The sentence itself is
 /// [`crate::cmd_spawn::claimed_text`], which is also what an agent `spawn` has
 /// just started hears — one work order, however it was handed over.
+///
+/// `Running` because this agent has been sitting in that pane since before the
+/// claim existed: its session-start brief was a brief about holding nothing, so
+/// unlike a spawned agent it does have to go and fetch. `spawn`'s case is the
+/// other arm, and the difference is the whole reason the case is named.
 pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
     Tell {
         pane: a.pane.clone(),
-        text: Some(crate::cmd_spawn::claimed_text(task)),
+        text: Some(crate::cmd_spawn::claimed_text(task, crate::cmd_spawn::Handover::Running)),
         note: format!("{} → {task}", a.where_),
         clear: clear_command(&a.kind),
     }

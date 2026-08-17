@@ -1011,6 +1011,11 @@ pub struct Prose {
     pub id: String,
     pub body: String,
     pub path: std::path::PathBuf,
+    /// Which sections this kind offers an editor — [`crate::model::PROSE`] for a
+    /// task, [`crate::model::PROJECT_PROSE`] for a project. Carried on the item
+    /// rather than looked up from `what`, so the one function that writes prose
+    /// never has to know which kinds exist.
+    pub sections: &'static [&'static str],
 }
 
 pub fn edit(store: &Store, args: &Args) -> i32 {
@@ -1030,6 +1035,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
             id: t.id.clone(),
             body: t.body.clone(),
             path: store.task_path(&t.id),
+            sections: &crate::model::PROSE,
         },
     )
 }
@@ -1097,13 +1103,13 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         .flag_names()
         .into_iter()
         .filter(|f| {
-            !KNOWN.contains(f) && !crate::model::PROSE.iter().any(|s| s.to_lowercase() == *f)
+            !KNOWN.contains(f) && !item.sections.iter().any(|s| s.to_lowercase() == *f)
         })
         .collect();
     if let Some(f) = unknown.first() {
         eprintln!(
             "wsp: unknown flag `--{f}` — sections are {}",
-            crate::model::PROSE
+            item.sections
                 .iter()
                 .map(|s| format!("--{}", s.to_lowercase()))
                 .collect::<Vec<_>>()
@@ -1114,7 +1120,7 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
 
     // Two sections at once has no meaning: each names a different buffer, and
     // silently preferring the first would write one and drop the other.
-    let named: Vec<&str> = crate::model::PROSE
+    let named: Vec<&str> = item.sections
         .iter()
         .copied()
         .filter(|s| args.has(&s.to_lowercase()))
@@ -1132,7 +1138,7 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         Some(sec) => crate::model::section_of(&item.body, sec).unwrap_or_default(),
         None => {
             let mut b = String::new();
-            for sec in crate::model::PROSE {
+            for sec in item.sections {
                 b.push_str(&format!("## {sec}\n"));
                 let text = crate::model::section_of(&item.body, sec).unwrap_or_default();
                 if !text.trim().is_empty() {
@@ -1250,7 +1256,7 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
             // touched. Only `--from`/stdin can produce the second case, and it
             // is the one an agent hits.
             let loose = crate::model::section_of(&after, "").unwrap_or_default();
-            let present: Vec<&str> = crate::model::PROSE
+            let present: Vec<&str> = item.sections
                 .iter()
                 .copied()
                 .filter(|s| crate::model::has_section(&after, s))
@@ -1261,7 +1267,7 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
                 // guess, it is losing the only thing the user actually wrote.
                 crate::model::set_section_in(&mut body, "Overview", after.trim());
             } else {
-                for name in crate::model::PROSE {
+                for name in item.sections.iter().copied() {
                     let mut text = crate::model::section_of(&after, name).unwrap_or_default();
                     // Prose above the first heading belongs to Overview — that
                     // is where someone who deleted the heading and kept typing

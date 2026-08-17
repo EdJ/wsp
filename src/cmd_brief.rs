@@ -42,6 +42,72 @@ const MAX_RULES: usize = 120;
 /// rarely the oldest.
 const MAX_DECISIONS: usize = 4;
 
+/// How much of the brief a caller wants. One axis with three points rather than
+/// two flags that can disagree.
+///
+/// `Normal` is what a person, or an agent mid-session, gets from `wsp brief`,
+/// and the standing rule about it is that **it does not grow**. It is run
+/// constantly — by every agent, and by the coordinating seat several times an
+/// hour — so a thousand tokens added here is a thousand tokens times every call
+/// in every session on the machine.
+///
+/// `Terse` is `Normal` minus what the caller says it already has.
+///
+/// `Session` is the payload, and the only caller entitled to it is the
+/// `SessionStart` hook. Every request in a session re-reads its whole context,
+/// so a token present at request 0 is paid by every request after it — which
+/// sounds like a reason to inject nothing, and is in fact the reason to inject
+/// *this*. Measured on t-260816-096: an agent that arrived with a task title
+/// spent 14,450 tokens over requests 4–16 rebuilding context the spawning
+/// session already had, and then carried it for the remaining ~86 requests
+/// anyway. Handing it over at request 0 costs about half that and removes the
+/// round-trips. The same arithmetic run backwards is why `Normal` must not
+/// grow, and why this is a separate mode rather than a better default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Depth {
+    Session,
+    Normal,
+    Terse,
+}
+
+impl Depth {
+    fn of(args: &Args) -> Depth {
+        match (args.has("session"), args.terse()) {
+            // `--session` wins over `--terse`. They are contradictory and the
+            // hook is the one that passes `--session`, so a `WSP_TERSE` left in
+            // the environment must not quietly strip the payload it exists to
+            // deliver.
+            (true, _) => Depth::Session,
+            (false, true) => Depth::Terse,
+            (false, false) => Depth::Normal,
+        }
+    }
+    fn session(self) -> bool {
+        self == Depth::Session
+    }
+}
+
+/// The claimed task's own prose, whole. Capped only because nothing else bounds
+/// it, and the cap names what it dropped for the reason [`MAX_RULES`] does — a
+/// briefing that stops mid-overview reads exactly like an overview that stops
+/// there.
+const MAX_TASK_LINES: usize = 120;
+/// The handbook, over the whole project chain.
+const MAX_HANDBOOK_LINES: usize = 120;
+/// Decisions on the parent, most recent last. The parent is where direction
+/// lands, so these are the constraints on the piece in hand.
+const MAX_PARENT_DECISIONS: usize = 6;
+/// Siblings named by id in what is injected above. Title and status only: the
+/// question they answer is "what is t-260816-060", and answering it with the
+/// whole task would be the fetching this replaces, done eagerly.
+const MAX_REFS: usize = 8;
+/// The tail of the task's log. Short on purpose — most of a log is status
+/// churn, at about eight tokens a line — but not zero, because direction handed
+/// to a task after it was written arrives here and nowhere else. The log line
+/// on this very task carried the file list that saved its agent the 28,000
+/// tokens of searching the task exists to remove.
+const MAX_LOG: usize = 4;
+
 /// The protocol an agent works to, kept in the store rather than in this
 /// binary. It is the user's to write, versioned with the tasks it talks about,
 /// and readable by anything that can read a file — none of which is true of a
@@ -116,6 +182,43 @@ pub fn commit_help(store: &Store, args: &Args) -> i32 {
             );
             1
         }
+    }
+}
+
+/// Task ids written into a chunk of prose — `t-260816-096`, and nothing else.
+///
+/// Scanned rather than declared. A task names its siblings by writing them into
+/// its overview — "independent of t-260817-002", "read t-260816-096's overview
+/// first" — and that is the reference an arriving agent goes and looks up. The
+/// `refs` frontmatter field is a different thing holding paths, and reading it
+/// as this would inject the wrong list.
+fn mentioned(text: &str, out: &mut Vec<String>) {
+    let b = text.as_bytes();
+    let digits = |from: usize, n: usize| {
+        from + n <= b.len() && b[from..from + n].iter().all(u8::is_ascii_digit)
+    };
+    let mut i = 0;
+    while i + 4 < b.len() {
+        // Mid-word is not a reference: `t-` inside `wsp-t-260816-096` is, but
+        // inside `output-260816-096` it is not, and the boundary is what tells
+        // them apart.
+        let boundary = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        if !(boundary && b[i] == b't' && b[i + 1] == b'-' && digits(i + 2, 6) && b[i + 8] == b'-') {
+            i += 1;
+            continue;
+        }
+        // One to four digits of sequence, however wide the day's ids ran.
+        let mut end = i + 9;
+        while end < b.len() && b[end].is_ascii_digit() && end - (i + 9) < 4 {
+            end += 1;
+        }
+        if end > i + 9 {
+            let id = text[i..end].to_string();
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        i = end;
     }
 }
 
@@ -198,6 +301,23 @@ pub(crate) struct Brief {
     /// anything — the one thing the brief tells herdr rather than the reader.
     /// `None` when the question does not apply.
     pub looking: Option<bool>,
+
+    // The session payload. Composed always, because composing it is a walk over
+    // values already in hand and a `Brief` that meant different things in
+    // different modes would be two structs; rendered only under
+    // [`Depth::Session`], which is where the cost actually is.
+    /// `## Handbook` down the project chain, root first, as `(project, text)`.
+    /// Inherited the way tags and decisions are: `wsp` says how work is done in
+    /// this tree and where the code's own documentation lives, `robustness`
+    /// adds what is true of `robustness`, and neither has to repeat the other.
+    pub handbook: Vec<(String, String)>,
+    /// Decisions on the parent — where direction lands — oldest first.
+    pub parent_decided: Vec<(String, String)>,
+    /// The tail of the claimed task's log, oldest first.
+    pub mine_log: Vec<String>,
+    /// Siblings named by id in the payload above, with what they are and how
+    /// far along they got.
+    pub refs: Vec<Task>,
 }
 
 /// Work out the whole brief. Pure: everything it reads is in `b`.
@@ -300,7 +420,64 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     let far_shown = named.len().min(MAX_OTHERS);
     let hidden = named.len() - far_shown + quiet;
 
+    // The whole chain's handbooks, general to specific. Empty sections are
+    // simply absent — a project with nothing to say is not a heading with
+    // nothing under it.
+    let handbook: Vec<(String, String)> = path
+        .iter()
+        .filter_map(|id| index.get(id))
+        .filter_map(|proj| {
+            crate::model::section_of(&proj.body, "Handbook").map(|t| (proj.id.clone(), t))
+        })
+        .collect();
+
+    let parent: Option<&Task> = mine
+        .and_then(|t| t.parent.as_ref())
+        .and_then(|id| tasks.iter().find(|x| &x.id == id));
+
+    let parent_decided: Vec<(String, String)> =
+        parent.map(|p| crate::model::decisions(&p.body)).unwrap_or_default();
+
+    let mine_log: Vec<String> = mine
+        .and_then(|t| crate::model::section_of(&t.body, "Log"))
+        .map(|log| {
+            let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+            lines
+                .iter()
+                .skip(lines.len().saturating_sub(MAX_LOG))
+                .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Every id the payload mentions, looked up once. The task itself and its
+    // parent are already spelled out above, so naming them again here would be
+    // the same rows twice.
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(t) = mine {
+        mentioned(&t.title, &mut ids);
+        mentioned(&t.body, &mut ids);
+    }
+    for (_, what) in &parent_decided {
+        mentioned(what, &mut ids);
+    }
+    let refs: Vec<Task> = ids
+        .iter()
+        .filter(|id| Some(id.as_str()) != mine.map(|t| t.id.as_str()))
+        .filter(|id| Some(id.as_str()) != parent.map(|t| t.id.as_str()))
+        // An id that resolves to nothing is dropped rather than reported. It is
+        // usually a task that has been removed, or one from another store, and
+        // a line saying so would be noise in the one place noise is expensive.
+        .filter_map(|id| tasks.iter().find(|t| &t.id == id))
+        .take(MAX_REFS)
+        .cloned()
+        .collect();
+
     Brief {
+        handbook,
+        parent_decided,
+        mine_log,
+        refs,
         // A briefing under a mandate, with nothing in hand, *is* an agent going
         // looking: the mandate is the permission and the list below is the
         // backlog, so this session's next move is to pick something out of it.
@@ -310,10 +487,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         // anything is waiting on a person, not looking.
         looking: (mine.is_none() && b.mandate.is_some()).then(|| !open.is_empty()),
         under_mine: mine.map(|t| resolve::counts_under(tasks, &t.id).open).unwrap_or(0),
-        parent: mine
-            .and_then(|t| t.parent.as_ref())
-            .and_then(|id| tasks.iter().find(|x| &x.id == id))
-            .cloned(),
+        parent: parent.cloned(),
         mine: mine.cloned(),
         open: open
             .iter()
@@ -335,8 +509,8 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     }
 }
 
-fn brief_json(b: &Briefing, r: &Brief) -> serde_json::Value {
-    json!({
+fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
+    let mut v = json!({
         "project": r.project,
         "path": r.path,
         "tags": r.tags,
@@ -350,11 +524,155 @@ fn brief_json(b: &Briefing, r: &Brief) -> serde_json::Value {
         "here": r.near.iter().map(|s| s.json()).collect::<Vec<_>>(),
         "others": r.far.iter().map(|s| s.json()).collect::<Vec<_>>(),
         "rules": r.rules,
-    })
+    });
+    // The same reckoning as the text, and gated the same way — a `--json`
+    // caller that grew the payload without asking for it would be the mode
+    // split defeated through the other door.
+    if depth.session() {
+        v["handbook"] = r
+            .handbook
+            .iter()
+            .map(|(proj, text)| json!({ "project": proj, "text": text }))
+            .collect::<Vec<_>>()
+            .into();
+        v["binds"] = r
+            .parent_decided
+            .iter()
+            .map(|(w, t)| json!({ "date": w, "text": t }))
+            .collect::<Vec<_>>()
+            .into();
+        v["names"] = r.refs.iter().map(|t| t.json()).collect::<Vec<_>>().into();
+        v["body"] = r.mine.as_ref().map(|t| t.body.clone()).into();
+    }
+    v
+}
+
+/// A block of prose under a label, wrapped in nothing and capped at `max`.
+///
+/// Never trimmed quietly. Prose that stops at a line limit reads exactly like
+/// prose that was written that short, and the difference is whatever the reader
+/// is about to go and re-derive — the same failure [`MAX_RULES`] is written
+/// against, and the cost of getting it wrong here is a whole session working
+/// from half an overview.
+fn block(out: &mut Vec<String>, p: &Paint, label: &str, text: &str, max: usize, more: &str) {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    for (i, l) in lines.iter().take(max).enumerate() {
+        out.push(format!(
+            "{} {}",
+            p.dim(&util::pad(if i == 0 { label } else { "" }, 6)),
+            l
+        ));
+    }
+    if lines.len() > max {
+        out.push(format!(
+            "{} {}",
+            p.dim(&util::pad("", 6)),
+            p.dim(&format!("({} more lines — {more})", lines.len() - max))
+        ));
+    }
+}
+
+/// What the session-start hook adds, and nothing else ever gets.
+///
+/// The order is the order it is needed in: the work in hand, what it hangs
+/// under, what it names, and last the standing reading for this project. An
+/// agent that reads only the first block can still start.
+fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    if let Some(t) = &r.mine {
+        // The task's own statement of itself. This is the single thing an
+        // arriving agent fetched first and most expensively, and it is already
+        // in the hand of whoever spawned it.
+        for sec in ["Overview", "Details"] {
+            if let Some(text) = crate::model::section_of(&t.body, sec) {
+                out.push(String::new());
+                block(&mut out, p, &sec.to_lowercase(), &text, MAX_TASK_LINES, &format!("wsp show {}", t.id));
+            }
+        }
+        let own = crate::model::decisions(&t.body);
+        if !own.is_empty() {
+            out.push(String::new());
+            for (i, (when, what)) in own.iter().enumerate() {
+                out.push(format!(
+                    "{} {} {what}",
+                    p.dim(&util::pad(if i == 0 { "settled" } else { "" }, 6)),
+                    p.dim(when)
+                ));
+            }
+        }
+        if !r.mine_log.is_empty() {
+            out.push(String::new());
+            for (i, l) in r.mine_log.iter().enumerate() {
+                out.push(format!(
+                    "{} {}",
+                    p.dim(&util::pad(if i == 0 { "log" } else { "" }, 6)),
+                    p.dim(l)
+                ));
+            }
+        }
+    }
+
+    // The parent's decisions. Direction lands on a parent and the work happens
+    // a sub-task at a time, so these are the constraints on the piece in hand
+    // and they are not written down anywhere the piece itself can see.
+    if !r.parent_decided.is_empty() {
+        let dropped = r.parent_decided.len().saturating_sub(MAX_PARENT_DECISIONS);
+        out.push(String::new());
+        for (i, (when, what)) in r.parent_decided.iter().skip(dropped).enumerate() {
+            out.push(format!(
+                "{} {} {what}",
+                p.dim(&util::pad(if i == 0 { "binds" } else { "" }, 6)),
+                p.dim(when)
+            ));
+        }
+        if dropped > 0 {
+            let id = r.parent.as_ref().map(|t| t.id.as_str()).unwrap_or("");
+            out.push(format!(
+                "{} {}",
+                p.dim(&util::pad("", 6)),
+                p.dim(&format!("{dropped} earlier · wsp show {id}"))
+            ));
+        }
+    }
+
+    // What the prose above names. Enough to know which of these is worth
+    // opening, and no more — answering "what is t-260816-060" with the whole of
+    // t-260816-060 would be the fetching this replaces, done eagerly and for
+    // every id rather than the one that mattered.
+    for (i, t) in r.refs.iter().enumerate() {
+        if i == 0 {
+            out.push(String::new());
+        }
+        out.push(format!(
+            "{} {}  {} {}",
+            p.dim(&util::pad(if i == 0 { "names" } else { "" }, 6)),
+            p.dim(&t.id),
+            p.dim(&util::pad(t.status().as_str(), 7)),
+            util::truncate(&t.title, 52)
+        ));
+    }
+
+    // The handbook, last, and the whole chain of it. It is the part that is the
+    // same for every agent in this project rather than particular to this task,
+    // which is why it reads after the work rather than before it — and why it
+    // is a pointer to the repository's own documentation rather than a copy of
+    // it.
+    let mut left = MAX_HANDBOOK_LINES;
+    for (proj, text) in &r.handbook {
+        if left == 0 {
+            break;
+        }
+        out.push(String::new());
+        block(&mut out, p, "read", text, left, &format!("wsp project show {proj} --handbook"));
+        left = left.saturating_sub(text.lines().count());
+    }
+    out
 }
 
 /// The brief as text, one line per element and nothing printed.
-fn brief_lines(r: &Brief, p: &Paint, terse: bool) -> Vec<String> {
+fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
+    let terse = depth == Depth::Terse;
     let mut out: Vec<String> = Vec::new();
     let mut row = |label: &str, body: String| out.push(format!("{} {}", p.dim(&util::pad(label, 6)), body));
 
@@ -502,6 +820,13 @@ fn brief_lines(r: &Brief, p: &Paint, terse: bool) -> Vec<String> {
         );
     }
 
+    // The payload, between the roster and the rules: after everything that says
+    // where this is and who else is here, before the standing text that is the
+    // same in every session on the machine.
+    if depth.session() {
+        out.extend(session_lines(r, p));
+    }
+
     // The rules, last and in full — unless the caller says it has them.
     //
     // This is the block `--terse` exists for. It is the same text in every
@@ -533,6 +858,7 @@ fn brief_lines(r: &Brief, p: &Paint, terse: bool) -> Vec<String> {
 pub fn brief(store: &Store, args: &Args) -> i32 {
     let b = Briefing::live(store, args);
     let r = compose(&b);
+    let depth = Depth::of(args);
 
     // Before the rendering because it is a fact about the pane, not about how
     // the brief is printed: `--json` looks the same to herdr as a person does.
@@ -541,9 +867,12 @@ pub fn brief(store: &Store, args: &Args) -> i32 {
     }
 
     match args.json() {
-        true => println!("{}", serde_json::to_string_pretty(&brief_json(&b, &r)).unwrap_or_default()),
+        true => println!(
+            "{}",
+            serde_json::to_string_pretty(&brief_json(&b, &r, depth)).unwrap_or_default()
+        ),
         false => {
-            for l in brief_lines(&r, &Paint::new(), args.terse()) {
+            for l in brief_lines(&r, &Paint::new(), depth) {
                 println!("{l}");
             }
         }
@@ -644,7 +973,7 @@ mod tests {
         child.project = Some("robustness".into());
         assert_eq!(compose(&child).path, ["wsp", "robustness"].map(String::from).to_vec(), "root first");
 
-        let text = brief_lines(&r, &plain(), true).join("\n");
+        let text = brief_lines(&r, &plain(), Depth::Terse).join("\n");
         let line = |needle: &str| text.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle} in:\n{text}"));
         assert!(line("where") < line("mandate"), "direction after the place it applies to");
         assert!(line("mandate") < line("you"), "…and before the work under it");
@@ -678,7 +1007,7 @@ mod tests {
         assert!(r.path.is_empty());
         assert!(r.decided.is_empty(), "no project, so no decisions bind");
 
-        let text = brief_lines(&r, &plain(), true).join("\n");
+        let text = brief_lines(&r, &plain(), Depth::Terse).join("\n");
         assert!(text.contains("no project resolved for this pane"), "{text}");
         // With no project the backlog is the inbox, which is what unfiled work
         // is: work nobody has said where it belongs.
@@ -699,7 +1028,7 @@ mod tests {
         assert!(r.far.is_empty());
         assert_eq!(r.hidden, 0);
 
-        let text = brief_lines(&r, &plain(), true).join("\n");
+        let text = brief_lines(&r, &plain(), Depth::Terse).join("\n");
         assert!(text.contains("the task in hand"), "the claim is the store's:\n{text}");
         assert!(text.contains("next up"), "and so is the backlog:\n{text}");
         assert!(
@@ -730,7 +1059,7 @@ mod tests {
             cwd: None,
         };
         let r = compose(&b);
-        let out = brief_lines(&r, &plain(), false);
+        let out = brief_lines(&r, &plain(), Depth::Normal);
         assert!(!out.is_empty(), "silence is not a briefing");
 
         let text = out.join("\n");
@@ -753,7 +1082,7 @@ mod tests {
         assert_eq!(r.hidden, 1, "the shell in ~/music is a count, not a name");
         assert!(r.others.is_empty(), "…and it holds nothing, so it is not named");
 
-        let text = brief_lines(&r, &plain(), true).join("\n");
+        let text = brief_lines(&r, &plain(), Depth::Terse).join("\n");
         assert!(text.contains("same tree"), "how close it is, said out loud:\n{text}");
         assert!(text.contains("1 more · wsp overlap"), "{text}");
     }
@@ -768,14 +1097,14 @@ mod tests {
         b.world.bindings.remove("w1:p1");
         let r = compose(&b);
         assert_eq!(r.looking, Some(true), "under a mandate, with work to find");
-        assert!(brief_lines(&r, &plain(), true).join("\n").contains("wsp claim it"), "the next move, named");
+        assert!(brief_lines(&r, &plain(), Depth::Terse).join("\n").contains("wsp claim it"), "the next move, named");
 
         // Nothing to find is still looking — and says the mandate is done
         // rather than going quiet.
         b.world.tasks.retain(|t| !t.status().is_open() || t.project.is_none());
         let r = compose(&b);
         assert_eq!(r.looking, Some(false));
-        assert!(brief_lines(&r, &plain(), true).join("\n").contains("the mandate is done"));
+        assert!(brief_lines(&r, &plain(), Depth::Terse).join("\n").contains("the mandate is done"));
 
         // And with no mandate the pane is not looking at all.
         b.mandate = None;
@@ -788,8 +1117,8 @@ mod tests {
     #[test]
     fn terse_names_the_rules_it_dropped() {
         let r = compose(&briefing());
-        let full = brief_lines(&r, &plain(), false).join("\n");
-        let terse = brief_lines(&r, &plain(), true).join("\n");
+        let full = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        let terse = brief_lines(&r, &plain(), Depth::Terse).join("\n");
 
         assert!(full.contains("commit through your own index"));
         assert!(!terse.contains("commit through your own index"));
@@ -799,8 +1128,183 @@ mod tests {
         // to have omitted.
         let mut b = briefing();
         b.rules = None;
-        let text = brief_lines(&compose(&b), &plain(), true).join("\n");
+        let text = brief_lines(&compose(&b), &plain(), Depth::Terse).join("\n");
         assert!(!text.contains("rules omitted"), "{text}");
+    }
+
+    /// A briefing with everything the session payload is made of: a claimed
+    /// task carrying prose, a decision and a log; a parent carrying direction;
+    /// a sibling named by id in that prose; and a handbook at two levels of the
+    /// project chain.
+    fn with_work() -> Briefing {
+        let mut b = briefing();
+        b.project = Some("robustness".into());
+
+        let mut wsp = Project::new("wsp");
+        wsp.roots = vec!["/home/ed/claude/wsp".into()];
+        wsp.tags = vec!["rust".into()];
+        wsp.body = "## Decisions\n- 2026-08-16 the store is the only writer\n\n\
+                    ## Handbook\nthe code's own map is architecture.md at the root\n"
+            .into();
+        let mut robust = Project::new("robustness");
+        robust.parent = Some("wsp".into());
+        robust.body = "## Handbook\nnothing lands here without a test\n".into();
+        b.world.index = crate::resolve::Index::new(vec![wsp, robust]);
+        // A realistically shaped id, because that is what the scanner reads:
+        // store-allocated ids are always `t-YYMMDD-NNN`, and a scanner loose
+        // enough to match `t-003` would pull `t-12` out of a version number.
+        b.world.tasks.push(task("t-260815-007", "the sibling it leans on", Some("wsp"), "todo"));
+
+        for t in b.world.tasks.iter_mut() {
+            match t.id.as_str() {
+                "t-001" => {
+                    t.parent = Some("t-004".into());
+                    t.body = "## Overview\nthe shape of it, which leans on t-260815-007 \
+                              and on t-260815-999 that nobody kept\n\n\
+                              ## Decisions\n- 2026-08-17 do the small half first\n\n\
+                              ## Log\n- 2026-08-17 claimed by pane w1:p1\n"
+                        .into();
+                }
+                "t-004" => {
+                    t.body = "## Decisions\n- 2026-08-16 measure it, do not assume it\n".into();
+                }
+                _ => {}
+            }
+        }
+        b
+    }
+
+    /// The rule the whole mode exists to keep: **plain `wsp brief` does not
+    /// grow**. It is run constantly, mid-session, by every agent and by the
+    /// coordinating seat, so anything added to it is paid by every call in
+    /// every session on the machine — which is the same arithmetic that makes
+    /// the payload worth injecting once at the top, run backwards.
+    ///
+    /// Asserted as a size relation rather than by naming strings, because the
+    /// failure this guards against is somebody deciding a useful line belongs
+    /// in the default after all.
+    #[test]
+    fn the_payload_is_the_session_mode_and_plain_brief_does_not_grow() {
+        let r = compose(&with_work());
+        let text = |d| brief_lines(&r, &plain(), d).join("\n");
+        let (session, normal, terse) =
+            (text(Depth::Session), text(Depth::Normal), text(Depth::Terse));
+
+        assert!(session.len() > normal.len(), "the payload is what --session adds");
+
+        // Every block of the payload, absent from the default and present in
+        // the session brief.
+        for needle in [
+            "the shape of it",              // the task's own overview
+            "do the small half first",      // what it has already settled
+            "measure it, do not assume it", // what its parent binds it to
+            "t-260815-007",                 // the sibling its prose names
+            "architecture.md",              // the handbook's pointer at the code
+            "nothing lands here without a test",
+        ] {
+            assert!(session.contains(needle), "missing from --session: {needle}\n{session}");
+            assert!(!normal.contains(needle), "leaked into plain brief: {needle}\n{normal}");
+            assert!(!terse.contains(needle), "leaked into --terse: {needle}\n{terse}");
+        }
+
+        // What the default already said, it still says. A mode that added
+        // context by moving it would be a regression wearing a saving's
+        // clothes.
+        for needle in ["the task in hand", "next up", "same tree"] {
+            assert!(normal.contains(needle), "{normal}");
+            assert!(session.contains(needle), "{session}");
+        }
+    }
+
+    /// A handbook is inherited the way tags and decisions are, and read root
+    /// first: `wsp` says where the code's own documentation lives, `robustness`
+    /// adds what is true of `robustness`, and neither repeats the other.
+    ///
+    /// The pointer rather than the map is the point. A technical description of
+    /// a tree belongs in the tree, versioned with the code and reviewed in the
+    /// same diff; held here it drifts the moment somebody refactors, and it
+    /// would be re-read by every request of every session for the sake of the
+    /// fraction of it any one task needs.
+    #[test]
+    fn the_handbook_is_inherited_down_the_chain_and_points_at_the_repository() {
+        let r = compose(&with_work());
+        assert_eq!(
+            r.handbook.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            ["wsp", "robustness"],
+            "general before particular"
+        );
+
+        // A project with nothing to say is absent, not an empty heading.
+        let mut b = with_work();
+        let mut bare = Project::new("robustness");
+        bare.parent = Some("wsp".into());
+        let keep = b.world.index.get("wsp").cloned().unwrap();
+        b.world.index = crate::resolve::Index::new(vec![keep, bare]);
+        assert_eq!(compose(&b).handbook.len(), 1);
+    }
+
+    /// The siblings a task names are the ones written into its prose, and the
+    /// answer given is title and status — enough to know which is worth
+    /// opening. Answering with the whole task would be the fetching this
+    /// replaces, done eagerly and for every id rather than the one that
+    /// mattered.
+    #[test]
+    fn the_ids_a_task_mentions_are_looked_up_once_and_answered_briefly() {
+        let r = compose(&with_work());
+        let ids: Vec<&str> = r.refs.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["t-260815-007"], "named in the prose, and it resolves");
+
+        // t-999 is in the same sentence and resolves to nothing — a removed
+        // task, or one from another store. Dropped rather than reported: a line
+        // saying so would be noise in the one place noise is expensive.
+        assert!(!ids.contains(&"t-260815-999"));
+        // The task itself and its parent are spelled out above in full, so
+        // naming them again here would be the same rows twice.
+        assert!(!ids.contains(&"t-001") && !ids.contains(&"t-004"));
+
+        // One row, and it carries the title — enough to tell whether this is
+        // the sibling worth opening. `t-260815-999` still appears in the
+        // overview, because the overview is printed as it was written; what it
+        // does not get is a row promising there is something there to read.
+        let session = brief_lines(&r, &plain(), Depth::Session).join("\n");
+        let named: Vec<&str> = session.lines().filter(|l| l.starts_with("names")).collect();
+        assert_eq!(named.len(), 1, "{session}");
+        assert!(named[0].contains("the sibling it leans on"), "{session}");
+        assert!(!named[0].contains("t-260815-999"), "{session}");
+    }
+
+    /// The id scanner, on the shapes that actually turn up in prose. A false
+    /// positive costs a row nobody wanted; a false negative costs the lookup
+    /// this mode exists to save.
+    #[test]
+    fn task_ids_are_read_out_of_prose_and_only_at_a_word_boundary() {
+        let mut got = Vec::new();
+        mentioned(
+            "under t-260816-096, see t-260817-001 and t-260817-001 again. \
+             not output-260816-096, not t-26081-1, not t-260816-, (t-260816-0002).",
+            &mut got,
+        );
+        assert_eq!(got, ["t-260816-096", "t-260817-001", "t-260816-0002"], "{got:?}");
+
+        // Punctuation and line ends are boundaries; the middle of a word is
+        // not.
+        let mut edge = Vec::new();
+        mentioned("t-260815-003\n[t-260815-004] wspt-260815-005", &mut edge);
+        assert_eq!(edge, ["t-260815-003", "t-260815-004"], "{edge:?}");
+    }
+
+    /// Nothing claimed is a shorter payload, not an empty one: the handbook is
+    /// the project's and stands whether or not this pane is holding anything.
+    #[test]
+    fn a_session_with_nothing_claimed_still_gets_the_handbook() {
+        let mut b = with_work();
+        b.world.bindings.remove("w1:p1");
+        let r = compose(&b);
+        assert!(r.mine.is_none() && r.refs.is_empty() && r.mine_log.is_empty());
+
+        let session = brief_lines(&r, &plain(), Depth::Session).join("\n");
+        assert!(session.contains("architecture.md"), "{session}");
+        assert!(!session.contains("the shape of it"), "no task, so no task prose:\n{session}");
     }
 
     /// The json is the same reckoning as the text, not a second one — and it
@@ -809,7 +1313,7 @@ mod tests {
     fn the_json_is_the_same_brief() {
         let b = briefing();
         let r = compose(&b);
-        let v = brief_json(&b, &r);
+        let v = brief_json(&b, &r, Depth::Normal);
         assert_eq!(v["project"], json!("wsp"));
         assert_eq!(v["path"], json!(["wsp"]));
         assert_eq!(v["mandate"], json!("wsp"));

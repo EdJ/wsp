@@ -364,7 +364,10 @@ fn help() {
   wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…
   wsp project ls|projects [--tag T] list projects
   wsp tree                          hierarchy with open counts
-  wsp project show <id> [--decisions]  brief, tags, roots, tasks, agents
+  wsp project show <id> [--decisions] [--handbook]  brief, tags, roots, tasks
+  wsp project edit <id> --handbook -   what an arriving agent is told: what the
+                                    work is for, and which file in the repo
+                                    holds the map of the code
   wsp project set <id> k=v…         name/parent/status/brief/tags/roots
   wsp project rm <id> [--force]     remove; --force orphans what it held
 
@@ -392,6 +395,10 @@ fn help() {
 
 {agents}
   wsp brief                         what this pane is for, and who else is working
+  wsp brief --session               …and the work itself: the task's prose, what
+                                    binds it, what it names, the handbook. The
+                                    SessionStart hook's call — paid once at the
+                                    top of a session, not on every brief after
   wsp commit-help                   how to commit in a tree somebody else is in
   wsp verify [<path>…] [--check] [--release] [--rm]
                                     build and test your change in a tree of your

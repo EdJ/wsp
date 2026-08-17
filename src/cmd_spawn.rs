@@ -11,9 +11,12 @@
 //!
 //! The order matters and is the whole design: **workspace, claim, agent,
 //! sentence**. The claim has to land before the agent starts, because a Claude
-//! Code session runs `wsp brief` from its `SessionStart` hook and reads the
-//! claim on the way in. Started first, it would open knowing nothing and the
-//! sentence would be the only thing it ever heard about the work.
+//! Code session runs `wsp brief --session` from its `SessionStart` hook and
+//! reads the claim on the way in. Started first, it would open knowing nothing
+//! and the sentence would be the only thing it ever heard about the work.
+//!
+//! That order is also what lets the sentence stop asking for a brief: see
+//! [`Handover`].
 
 use std::time::{Duration, Instant};
 
@@ -26,20 +29,47 @@ use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
 
+/// How an agent came by the work it is being told about — and it is the one
+/// thing that changes what the work order should say.
+///
+/// [`Handover::Spawned`] is `spawn`'s case. The order is workspace, claim,
+/// agent, sentence, so by the time this is said the agent's `SessionStart` hook
+/// has already run `wsp brief --session` *with the claim in place*: the task,
+/// what binds it, and what to read are sitting at the top of its context. A
+/// sentence asking it to fetch that again costs a round-trip, and a round-trip
+/// at request 1 is a full context re-read — measured at ~35K on
+/// t-260816-096, against ~700 for the duplicated text itself.
+///
+/// [`Handover::Running`] is the panel's. That agent's session began before the
+/// claim existed, so its brief is a brief about holding nothing. It has to
+/// fetch, and one `--session` call is the whole payload in one round-trip
+/// rather than the dozen `wsp show` calls it would otherwise make.
+///
+/// The duplication is therefore disposed of by construction rather than by
+/// remembering — the caller that knows the hook has run is the caller that
+/// stops asking.
+#[derive(Clone, Copy)]
+pub enum Handover {
+    Spawned,
+    Running,
+}
+
 /// What an agent is told about work it has just been handed.
 ///
-/// `wsp brief` rather than the id alone: the brief is what a session gets on
-/// the way in, so an agent handed work mid-session lands in the same place it
-/// would have started from — its project, its claim, the decisions that bind
-/// it, and who else is in the tree. A fresh agent has had it from the hook
-/// already; asking again costs a second and covers the machine where the hook
-/// was never installed.
-///
-/// One sentence, defined once: the panel says this to an agent it claims a task
-/// onto, and `spawn` says it to the agent it just started. Two wordings would
-/// be two contracts.
-pub fn claimed_text(task: &str) -> String {
-    format!("You have been claimed onto {task}. Please run `wsp brief`, then begin work on the task when you're ready.")
+/// One definition, two cases: the panel says this to an agent it claims a task
+/// onto, and `spawn` says it to the agent it just started. Two wordings written
+/// in two places would be two contracts.
+pub fn claimed_text(task: &str, how: Handover) -> String {
+    match how {
+        Handover::Spawned => format!(
+            "You have been claimed onto {task}. Your brief is already above — the task, \
+             what binds it, and what to read. Begin work when you're ready."
+        ),
+        Handover::Running => format!(
+            "You have been claimed onto {task}. Please run `wsp brief --session`, then begin \
+             work on the task when you're ready."
+        ),
+    }
 }
 
 /// Open a workspace for a piece of work, rooted where that work lives.
@@ -370,7 +400,7 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
                     // a burst of keystrokes for a paste.
                     match herdr::call_for(
                         "agent.prompt",
-                        json!({ "target": pane, "text": claimed_text(t) }),
+                        json!({ "target": pane, "text": claimed_text(t, Handover::Spawned) }),
                         Duration::from_secs(10),
                     ) {
                         Ok(_) => told = true,
@@ -514,14 +544,25 @@ mod tests {
         assert_eq!(Index::new(vec![a, b]).root_of("a"), None);
     }
 
-    /// The sentence an agent is handed work with has one definition. The panel
-    /// says it to an agent it claims a task onto and `spawn` says it to the
-    /// agent it just started, and an agent that heard a different sentence
-    /// depending on which door it came through is two contracts.
+    /// The sentence an agent is handed work with has one definition and two
+    /// cases, and the case is decided by whether the hook has already run with
+    /// this claim in place.
+    ///
+    /// A spawned agent's has: `spawn` claims before it starts the agent, so the
+    /// payload is at the top of its context and asking for it again is a wasted
+    /// round-trip — which at request 1 is a full context re-read, ~35K on the
+    /// measurement that prompted this, against ~700 for the duplicated text.
+    /// An agent the panel hands work to has been running since before the claim
+    /// existed, so it genuinely has to fetch, and `--session` makes that one
+    /// call rather than a dozen `wsp show`s.
     #[test]
-    fn the_work_order_names_the_task_and_the_brief() {
-        let s = claimed_text("t-260815-033");
-        assert!(s.contains("t-260815-033"));
-        assert!(s.contains("wsp brief"), "the brief is how it finds everything else");
+    fn only_the_agent_whose_hook_missed_the_claim_is_asked_to_fetch() {
+        let spawned = claimed_text("t-260815-033", Handover::Spawned);
+        assert!(spawned.contains("t-260815-033"));
+        assert!(!spawned.contains("wsp brief"), "the hook has already injected it: {spawned}");
+
+        let running = claimed_text("t-260815-033", Handover::Running);
+        assert!(running.contains("t-260815-033"));
+        assert!(running.contains("wsp brief --session"), "the whole payload in one call: {running}");
     }
 }

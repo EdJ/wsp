@@ -250,7 +250,7 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
 
 pub fn show(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp project show <id> [--decisions]");
+        eprintln!("usage: wsp project show <id> [--decisions] [--handbook]");
         return 2;
     };
     let index = Index::new(store.projects());
@@ -345,6 +345,35 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // The handbook, named rather than printed — and this is the one place the
+    // default is *not* "show the prose". It is written to be injected once at
+    // the top of a session, where it is paid for once and re-read by the model
+    // for free; `project show` is the command an agent runs several times a
+    // session, and printing the same block into each of those is the exact
+    // multiplication this whole line of work exists to remove. So: one line
+    // saying it is there and how big, and `--handbook` for the caller who
+    // actually wants to read it.
+    if let Some(text) = crate::model::section_of(&proj.body, "Handbook") {
+        println!("\n{}", p.dim("HANDBOOK"));
+        if args.has("handbook") {
+            println!("{}", text.trim_end());
+        } else {
+            println!(
+                "  {}",
+                p.dim(&format!(
+                    "{} lines · wsp project show {} --handbook",
+                    text.lines().count(),
+                    proj.id
+                ))
+            );
+        }
+    } else if args.has("handbook") {
+        // Asked for by name and not there. Silence would read as an empty
+        // handbook rather than a project that has never had one written, and
+        // the two want different things done about them.
+        println!("\n{}", p.dim(&format!("no handbook — wsp project edit {} --handbook -", proj.id)));
+    }
+
     if !mine.is_empty() {
         println!("\n{}", p.dim("OPEN TASKS"));
         for t in &mine {
@@ -369,6 +398,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // 4,104 tokens to 1,058 for every caller rather than the ones who ask.
     let mut rest = proj.body.clone();
     crate::model::set_section_in(&mut rest, "Decisions", "");
+    crate::model::set_section_in(&mut rest, "Handbook", "");
     if !rest.trim().is_empty() {
         println!("\n{}", rest.trim());
     }
@@ -446,7 +476,9 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
 /// `wsp project set`, so there is nothing here an editor needs to reach.
 pub fn edit(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp project edit <id> [--overview | --details | --decisions | --raw]");
+        eprintln!(
+            "usage: wsp project edit <id> [--overview | --details | --handbook | --decisions | --raw]"
+        );
         return 2;
     };
     let index = Index::new(store.projects());
@@ -462,6 +494,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
             id: p.id.clone(),
             body: p.body.clone(),
             path: store.projects_dir().join(format!("{}.md", p.id)),
+            sections: &crate::model::PROJECT_PROSE,
         },
     )
 }
@@ -566,6 +599,7 @@ pub fn project_json(p: &Project, index: &Index) -> serde_json::Value {
         "roots": p.roots,
         "status": p.status,
         "brief": p.brief,
+        "handbook": crate::model::section_of(&p.body, "Handbook"),
     })
 }
 
@@ -624,5 +658,54 @@ mod tests {
         assert_eq!(parent_of("alpha"), Some("delta".into()));
         assert_eq!(set(&["set", "alpha", "parent=none"]), 0, "and back out again");
         assert_eq!(parent_of("alpha"), None);
+    }
+
+    /// `Handbook` is the one section a project has and a task does not, and the
+    /// vocabulary is per-kind so that neither answer has to be remembered.
+    ///
+    /// A task offered it would put an empty heading in the combined edit buffer
+    /// of every task in the store, for a section nobody could sensibly fill —
+    /// so `wsp edit <task> --handbook` is a typo, and a typo that this command
+    /// guesses at costs whatever prose was already there.
+    #[test]
+    fn a_handbook_is_a_project_section_and_a_task_flag_is_a_typo() {
+        let store = scratch("handbook");
+        proj(&store, "alpha", None);
+        let mut t = crate::model::Task::new("something", "t-260817-001");
+        t.body = "## Overview\nthe prose that must survive a typo\n".into();
+        store.save_task(&t).unwrap();
+
+        let src = store.root.join("hb.md");
+        crate::store::write_atomic(&src, "the map of the code is architecture.md at the root\n").unwrap();
+        let from = src.display().to_string();
+
+        assert_eq!(
+            edit(&store, &Args::synth("project", &["edit", "alpha"], &[("handbook", "true"), ("from", &from)])),
+            0
+        );
+        let body = store.project("alpha").unwrap().body;
+        assert_eq!(
+            crate::model::section_of(&body, "Handbook").as_deref(),
+            Some("the map of the code is architecture.md at the root"),
+        );
+        // Written as a section the schema knows, so it survives a round trip
+        // rather than being folded into `Overview` as a stray.
+        assert!(crate::model::stray_sections(&body).is_empty(), "{body}");
+
+        // The same flag on a task is refused, and refused before anything is
+        // written — this is the failure that made `edit` refuse unknown flags
+        // in the first place.
+        assert_eq!(
+            crate::cmd_task::edit(
+                &store,
+                &Args::synth("edit", &["t-260817-001"], &[("handbook", "true"), ("from", &from)])
+            ),
+            2
+        );
+        let after = store.task("t-260817-001").unwrap().body;
+        assert!(after.contains("the prose that must survive a typo"), "{after}");
+        assert!(!after.contains("architecture.md"), "{after}");
+
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 }

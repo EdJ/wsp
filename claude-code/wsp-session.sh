@@ -29,7 +29,17 @@ case "$action" in
     # stdout from a SessionStart hook is added to the session's context. This
     # is the whole integration: an agent opens knowing its project, the task it
     # holds, what is settled, what is next, and who else is in the tree.
-    wsp brief 2>/dev/null || true
+    #
+    # `--session` is the payload mode, and this hook is what it was added for.
+    # Every request in a session re-reads the whole context, so a token here is
+    # paid by every request that follows — which is exactly why the context an
+    # agent would otherwise go and *fetch* belongs here rather than in its
+    # fourth request. Measured on t-260816-096: 14,450 tokens of `wsp show`
+    # arriving over requests 4–16 and then carried for another ~86 anyway.
+    #
+    # Plain `wsp brief` stays the smaller thing an agent types mid-session.
+    # Do not swap this for `--session` there, and do not make it the default.
+    wsp brief --session 2>/dev/null || true
     ;;
   end)
     # Deliberately nothing. A claim outlives the pane that made it — that is
