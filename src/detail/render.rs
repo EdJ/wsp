@@ -491,6 +491,42 @@ mod tests {
         assert!(text.contains("d details"), "details is the one off screen: {text}");
     }
 
+    /// A project's prose is drawn from the project vocabulary, so a section
+    /// added there appears here without anybody remembering to come and add it.
+    ///
+    /// This frame carried a fourth literal copy of the *task* section list, and
+    /// it is the copy that would have gone stale silently: a `## Handbook`
+    /// written through the CLI, present in the file, absent from the pane, with
+    /// nothing failing and nobody told.
+    #[test]
+    fn a_project_draws_every_section_the_project_vocabulary_names() {
+        let mut p = crate::model::Project::new("wsp");
+        p.body = "## Overview\nthe control plane\n\n\
+                  ## Handbook\nthe map of the code is architecture.md\n\n\
+                  ## Decisions\n- 2026-08-16 the store is the only writer\n"
+            .into();
+        let ctx = Ctx {
+            tasks: Vec::new(),
+            index: Index::new(vec![p]),
+            claims: Default::default(),
+            worked: Default::default(),
+            bindings: Default::default(),
+            panes: Vec::new(),
+            columns: Vec::new(),
+        };
+        let mut out = Vec::new();
+        project_frame(&ctx, "wsp", 100, &mut out);
+        let text: String = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>() + "\n")
+            .collect();
+
+        for needle in ["the control plane", "architecture.md", "the store is the only writer"] {
+            assert!(text.contains(needle), "missing {needle} from:\n{text}");
+        }
+        assert!(text.contains("handbook"), "and it is labelled:\n{text}");
+    }
+
     /// A narrow pane must not wrap the menu into the frame above it: `fit`
     /// pads and truncates, and the footer is one line by construction.
     #[test]
