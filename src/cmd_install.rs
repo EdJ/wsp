@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::cmd_verify::{agent_key, build_dir, git, toplevel};
+use crate::cmd_verify::{agent_key, git, toplevel};
 use crate::store::Store;
 use crate::util;
 use crate::Args;
@@ -448,10 +448,14 @@ struct Source {
 /// Where the binary to install comes from, in the order worth trying.
 ///
 /// A named path first, then this agent's `wsp verify` tree — which is a build
-/// at HEAD plus this agent's own patch and nothing else, so it is both the
-/// warm one and the only one whose contents anybody can account for. The shared
-/// checkout's `target/release` is last and says so: it is whatever the tree
-/// happened to hold at build time, including half of somebody else's edit.
+/// at HEAD plus this agent's own patch and nothing else, so it is both the warm
+/// one and the only one whose contents anybody can account for.
+///
+/// The `target/release` beside you is last, and how much that is worth now
+/// depends on which tree you are standing in. In a per-task checkout it is your
+/// own build of your own tree: accountable, just not pinned to HEAD. In the
+/// trunk it is whatever the tree happened to hold at build time, including half
+/// of somebody else's edit, and that is the one worth a warning.
 fn source(store: &Store, args: &Args) -> Result<Source, String> {
     if let Some(named) = args.rest.first() {
         let p = util::real(named);
@@ -468,14 +472,25 @@ fn source(store: &Store, args: &Args) -> Result<Source, String> {
         format!("{} is not in a git repository — name the binary to install", util::contract(&cwd))
     })?;
 
-    let dir = build_dir(store, &repo, &agent_key());
-    let mine = dir.join("target/release/wsp");
+    // Asked of `verify` rather than worked out here. Computing it locally meant
+    // computing it from the tree this is standing in, and inside a per-task
+    // checkout that is not the trunk — so this looked for a release build under
+    // a name `verify` never writes, found nothing, and fell through to the
+    // shared `target/release` while reporting it as shared.
+    let sc = crate::cmd_verify::scratch(store, &repo, &agent_key());
+    let mine = sc.target.join("release/wsp");
     if mine.is_file() {
-        return Ok(Source { path: mine, tree: Some(dir.join("tree")), origin: "verify" });
+        return Ok(Source { path: mine, tree: Some(sc.tree), origin: "verify" });
     }
-    let shared = repo.join("target/release/wsp");
-    if shared.is_file() {
-        return Ok(Source { path: shared, tree: Some(repo), origin: "shared" });
+    let beside = repo.join("target/release/wsp");
+    if beside.is_file() {
+        // "Everybody is editing this tree" stopped being true of every tree
+        // when `wsp checkout` arrived: in a per-task checkout the release build
+        // beside you is your own, and warning about somebody else's edits in it
+        // is a warning that is wrong in the alarming direction — which is the
+        // kind `cmd_checkout` argues gets ignored along with the true ones.
+        let origin = if sc.checkout.is_some() { "own" } else { "shared" };
+        return Ok(Source { path: beside, tree: Some(repo), origin });
     }
     Err(format!(
         "nothing built to install — `wsp verify --release` builds it at {}",
@@ -554,6 +569,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 util::duration_human(util::epoch_secs() - (ours.built / 1_000_000_000) as i64),
                 match origin {
                     "verify" => ", in this agent's verify tree",
+                    "own" => ", in this agent's checkout",
                     "shared" => ", in the shared checkout",
                     _ => "",
                 }

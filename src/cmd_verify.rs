@@ -26,28 +26,68 @@
 //! so there is no exported variable for `worktree add` to pick up, whether or
 //! not the caller is halfway through the commit procedure with one set.
 //!
-//! # A build tree per *agent*, not per build
+//! # The scratch tree belongs to the checkout, not to the agent
 //!
-//! The standing rule since 2026-08-15 is a detached worktree per build, and it
-//! works — seven commits in one day, nothing false caught, nothing true missed.
-//! What it costs is a cold build every time: measured on this machine, `cargo
-//! check` 14s cold against 1–4s warm, and a release build 1m01s cold. And it
-//! leaks, because a cleanup step at the end of a long piece of work is a step
-//! that gets abandoned when something more interesting happens — `git worktree
-//! list` held four stale ones on the day this was written.
+//! The standing rule from 2026-08-15 was a detached worktree per build, keyed
+//! on the workspace and kept, with `CARGO_TARGET_DIR` beside it — one tree per
+//! agent to leak rather than one per commit. That argument assumed the agent
+//! had nowhere else of its own. Since [`crate::cmd_checkout`] it has: a pane
+//! opened on a task stands in `<trunk>/.worktrees/<task>`, where nobody else's
+//! half-finished work can appear.
 //!
-//! So the tree is keyed on the agent and kept. `CARGO_TARGET_DIR` sits beside
-//! it and persists, which is where the warmth actually lives; the tree is reset
-//! to HEAD and re-patched on each run, so only what you changed rebuilds. One
-//! tree per agent to leak rather than one per commit, and `--rm` to drop it.
+//! Keyed on the workspace, the tree then leaked in the one direction the
+//! keying was supposed to stop. A workspace is stable while it exists, which is
+//! what made it the right key — but it lasts only as long as the agent in it,
+//! and every `wsp spawn` opens a new one. So "one agent, many tasks, one warm
+//! tree" was never what happened: measured 2026-08-17,
+//! `~/.local/state/wsp/build` held **9.6G in 30 trees**, one per agent that had
+//! ever run this command, every one of them cold on its first build and none of
+//! them ever removed. A cleanup step nobody runs is the lesson of every leak on
+//! t-260815-022, and this was one more.
 //!
-//! # What this deliberately does not need
+//! So inside a checkout the scratch goes *under the checkout*, at
+//! `target/wsp-verify`, and takes its target directory with it. It dies with
+//! the tree it belongs to: `wsp checkout --rm` and `--sweep` already remove the
+//! whole directory, so there is no second thing to remember and no second thing
+//! to leak. No task, no tree — the rule `checkout` states, now true of the
+//! build as well. What was unbounded is now one per live task.
 //!
-//! You keep editing in the shared checkout. The pane's cwd stays under the
-//! declared root, so `wsp where`, the panel and `overlap` all go on working,
-//! and the `project_for_cwd` prerequisite recorded on t-260815-022 does not
-//! apply — that is about the tree you *work* in, and a tree you only build in
-//! never has a pane standing in it.
+//! # Why it does *not* share the checkout's `target/`, which is the obvious idea
+//!
+//! Because the warmth lives in the target directory and not in the tree, the
+//! obvious saving is to point both trees at one `CARGO_TARGET_DIR` — the
+//! checkout's own — so that an agent's `cargo test` and this command warm each
+//! other and the 295M is not duplicated. It was measured on 2026-08-17 before
+//! being believed, and it has to be thrown away.
+//!
+//! The encouraging half is real: two trees against one target directory do not
+//! thrash. The second builds in **0.04s** where the first took 9.7s, and
+//! alternating rebuilds only what genuinely differs — `cargo test` 13s against
+//! 39s cold.
+//!
+//! The disqualifying half is that cargo records the dependencies of a unit as
+//! *absolute paths*, in `target/debug/.fingerprint/<unit>/dep-*`, and judges
+//! freshness by their mtimes. Build the scratch tree and that file comes to
+//! read `…/target/wsp-verify/tree/src/cmd_verify.rs`. The next `cargo test` in
+//! the **checkout** then asks whether the scratch tree has changed, gets no for
+//! an answer, prints `Fresh wsp v0.1.0`, and reruns the old binary. Observed
+//! here, not reasoned about: this module was edited, `cargo test` reported 482
+//! passing, and the test that had just been added was not among them — the
+//! compiled binary still held the previous run's test names.
+//!
+//! That is a green build for source that was never compiled, in the agent's own
+//! tree, arriving silently. It is the exact failure the top of this file
+//! describes, reintroduced by the fix for it, and it costs more than the 295M
+//! it saves. So the trees get a target directory each, and the saving here is
+//! from *bounding* the number of them rather than from sharing one.
+//!
+//! # Outside a checkout, nothing changes
+//!
+//! The trunk is still shared — the coordination seat stands there, and so does
+//! any bare shell — so an agent building there still gets a tree of its own
+//! under `WSP_STATE`, keyed on the workspace, exactly as before. That is where
+//! the original argument still holds, and it is the only place left where it
+//! does.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -127,22 +167,116 @@ pub fn agent_key() -> String {
     }
 }
 
-/// Where this agent's build tree lives, under the state directory rather than
-/// the store: it is machine-local, it is large, and it is not worth committing.
-/// Under `WSP_STATE` rather than a fixed path so a sandbox
-/// (see t-260816-056) gets its own and does not warm — or corrupt — the real
-/// one.
+/// Where an agent standing in the *trunk* keeps its build tree: under the state
+/// directory rather than the store, because it is machine-local, it is large,
+/// and it is not worth committing. Under `WSP_STATE` rather than a fixed path
+/// so a sandbox (see t-260816-056) gets its own and does not warm — or corrupt
+/// — the real one.
 ///
-/// Named for the *repository* and keyed on the agent, and `repo` has to be the
-/// trunk for that to hold. Once an agent edits in `<root>/.worktrees/<task>`,
-/// the directory it is standing in is named for the task — so naming the build
-/// tree after it turned this back into one tree per piece of work, cold on
-/// every new task and one more thing to leak, which is the arrangement the
-/// header above argues against. Measured 2026-08-17: a cold `cargo check` in a
-/// fresh tree is 10s against 1–4s warm, and 295M of target output.
+/// Named for the repository and keyed on the agent. `repo` has to be the trunk
+/// for the name to mean anything, which is why [`scratch`] resolves it rather
+/// than passing whatever tree the caller is standing in.
 pub(crate) fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     store.state.join("build").join(format!("{}-{}", util::slugify(name), key))
+}
+
+/// Remove the build trees under the state directory that no live workspace
+/// owns, and say which went.
+///
+/// The residue of keying on the workspace. Those trees outlived the workspaces
+/// that named them, so no agent alive can name one to remove it — 9.6G in 30 of
+/// them on 2026-08-17 — and the arrangement that made them is gone.
+///
+/// `live` is the workspace ids herdr reported, and `None` is herdr not
+/// answering. That distinction is the whole guard, and it is the same one
+/// [`crate::cmd_agent::may_reap`] makes for the same reason: silence is not
+/// evidence that the work stopped. A herdr that is down, or slow, reports
+/// nothing, which looks exactly like a machine with no agents on it — and this
+/// would then delete the tree every running agent is mid-build in. So `None`
+/// removes nothing at all, and an empty list is only believed when herdr said
+/// it.
+///
+/// Passed in rather than read here so the judgement can be tested without a
+/// live herdr, which is the one thing that would make it untestable and it is
+/// the only thing here worth testing.
+///
+/// Directories only. A stale `git worktree` registration left behind is pruned
+/// by [`ensure_tree`] or by `checkout` the next time either touches the
+/// repository, and pruning it here would mean guessing which repository each
+/// tree came from.
+fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<String> {
+    let Some(live) = live else { return Vec::new() };
+    let root = store.state.join("build");
+    let Ok(entries) = std::fs::read_dir(&root) else { return Vec::new() };
+    let mut gone = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_dir() || path == mine {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        // `<repo>-<workspace>`, and the repository name can hold a dash, so the
+        // key is the tail rather than the second field.
+        if live.iter().any(|ws| name.ends_with(&format!("-{}", util::slugify(ws)))) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            gone.push(util::contract(&path));
+        }
+    }
+    gone.sort();
+    gone
+}
+
+/// Everything one run of `verify` needs a place for.
+///
+/// Resolved once and passed around, because the two arrangements differ in more
+/// than one path and a caller that worked out three of them separately would be
+/// able to get two right and one wrong. `wsp install` looks for the release
+/// build this produced, and used to compute the directory itself — from the
+/// tree it was standing in rather than the trunk, so inside a checkout it
+/// looked somewhere `verify` had never written.
+pub(crate) struct Scratch {
+    /// Holds the private index, the patch, and `tree`. What `--rm` removes.
+    pub dir: PathBuf,
+    /// The source tree that gets built: HEAD, reset and re-patched every run.
+    pub tree: PathBuf,
+    /// `CARGO_TARGET_DIR`, always inside `dir` and never shared with the tree
+    /// the agent edits in — see the header for the measurement that settled
+    /// that, and what sharing it silently did to `cargo test`.
+    pub target: PathBuf,
+    /// The checkout it belongs to, or `None` for the trunk. The caller wants
+    /// the distinction to say which arrangement it is looking at.
+    pub checkout: Option<PathBuf>,
+}
+
+/// Which of the two arrangements applies, and where each part goes.
+///
+/// The test is the path rule and not a git question: a per-task checkout is
+/// exactly a tree whose own root is the `<trunk>/.worktrees/<task>` that
+/// [`crate::cmd_checkout::worktree_of`] names. Asking git which worktree owns a
+/// path costs a process, and the layout is ours to define, so the answer is
+/// already in the path — the same bargain `overlap` makes for the same reason.
+pub(crate) fn scratch(store: &Store, repo: &Path, key: &str) -> Scratch {
+    if crate::cmd_checkout::worktree_of(repo).as_deref() == Some(repo) {
+        // Under `target/` rather than a dotted directory of its own: it is
+        // build output, it is already gitignored in every cargo project, and
+        // putting it there keeps `git status` in the checkout clean — which
+        // matters more than tidiness, because `checkout --sweep` refuses to
+        // remove a tree with anything uncommitted in it, and a scratch
+        // directory git could see would make every tree permanently unsweepable.
+        let dir = repo.join("target").join("wsp-verify");
+        return Scratch {
+            tree: dir.join("tree"),
+            target: dir.join("target"),
+            dir,
+            checkout: Some(repo.to_path_buf()),
+        };
+    }
+    let named_for = crate::cmd_checkout::trunk(repo).unwrap_or_else(|| repo.to_path_buf());
+    let dir = build_dir(store, &named_for, key);
+    Scratch { tree: dir.join("tree"), target: dir.join("target"), dir, checkout: None }
 }
 
 /// The paths whose change is under test, as `git add` pathspecs.
@@ -208,11 +342,19 @@ fn changed_files(repo: &Path) -> Vec<String> {
 /// easiest thing for a diff-based patch to miss — and missing it fails in the
 /// worst direction, with a green build for a change that does not compile.
 /// `scratch` is this command's own working directory — the private index, the
-/// patch, the build tree. It is normally under `WSP_STATE` and so nowhere near
-/// the repository, but nothing guarantees that: a sandbox pointed at a state
-/// directory inside the tree would otherwise have `git add -A` stage verify's
-/// own index into the patch it is building, which is a change that then fails
-/// to apply against HEAD for reasons no one could read.
+/// patch, the build tree. Inside a checkout it is under the tree by design, and
+/// a sandbox pointed at a state directory in the tree puts it there by accident;
+/// either way `git add -A` would otherwise stage verify's own index into the
+/// patch it is building, which is a change that then fails to apply against HEAD
+/// for reasons no one could read.
+///
+/// The exclusion is asked for only when git cannot already see it, and that is
+/// not an optimisation. An `:(exclude)` pathspec under an ignored directory
+/// reads to `git add` as an ignored path named on purpose, so it refuses the
+/// whole command — `error: the following paths are ignored ... target`. The
+/// checkout arrangement puts the scratch under `target/`, which every cargo
+/// project ignores, so the guard against staging it is exactly what made it
+/// impossible to stage anything.
 fn build_patch(
     repo: &Path,
     cwd: &Path,
@@ -245,7 +387,12 @@ fn build_patch(
     if paths.is_empty() {
         let mut argv: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
         if let Ok(rel) = scratch.strip_prefix(repo) {
-            argv.push(format!(":(exclude){}", rel.display()));
+            let rel = rel.display().to_string();
+            // `check-ignore` exits 0 when the path is ignored, which is `git`
+            // returning `Some` here.
+            if git(repo, &["check-ignore", "-q", "--", &rel]).is_none() {
+                argv.push(format!(":(exclude){rel}"));
+            }
         }
         let argv: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         check(run(repo, &argv)?, "add")?;
@@ -326,12 +473,10 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     };
 
     let key = agent_key();
-    // The trunk names it; `repo` goes on being the tree under your hands, which
-    // is where the patch comes from and where the worktree is added.
-    let named_for = crate::cmd_checkout::trunk(&repo).unwrap_or_else(|| repo.clone());
-    let dir = build_dir(store, &named_for, &key);
-    let tree = dir.join("tree");
-    let target = dir.join("target");
+    // `repo` goes on being the tree under your hands, which is where the patch
+    // comes from and where the worktree is added; `scratch` decides where the
+    // build goes from what kind of tree that is.
+    let Scratch { dir, tree, target, checkout } = scratch(store, &repo, &key);
 
     // `--rm` before anything else: the point of it is a tree you can drop when
     // it has gone wrong, and needing a working repository to drop it would be
@@ -341,12 +486,40 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         let _ = git(&repo, &["worktree", "remove", "--force", &tree.display().to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = git(&repo, &["worktree", "prune"]);
-        if json_out {
-            println!("{}", json!({"removed": existed, "path": util::contract(&dir)}));
-        } else if existed {
-            println!("removed {}", util::contract(&dir));
+        // `--all` is for the residue rather than for this run: the trees the
+        // per-workspace keying left behind, 9.6G on this machine and reachable
+        // by no other command, since the workspaces that owned them are gone.
+        // Only under the state directory, and never a checkout's — a checkout's
+        // belongs to a tree somebody may be standing in, and goes when that
+        // does.
+        let residue = if args.has("all") {
+            let live: Option<Vec<String>> =
+                crate::herdr::workspaces().ok().map(|w| w.into_iter().map(|x| x.id).collect());
+            clear_build_dirs(store, live.as_deref(), &dir)
         } else {
-            println!("no build tree for {key}");
+            Vec::new()
+        };
+        if json_out {
+            println!(
+                "{}",
+                json!({"removed": existed, "path": util::contract(&dir), "also": residue.len()})
+            );
+        } else {
+            if existed {
+                println!("removed {}", util::contract(&dir));
+            } else {
+                // Named by what owns it, which is the checkout inside one and
+                // the agent outside — otherwise "no build tree for w20" reads
+                // as a claim about the agent in the one arrangement where the
+                // agent is not what the tree is keyed on.
+                match &checkout {
+                    Some(c) => println!("no build tree in {}", util::contract(c)),
+                    None => println!("no build tree for {key}"),
+                }
+            }
+            if !residue.is_empty() {
+                println!("removed {} left by earlier workspaces", residue.len());
+            }
         }
         return 0;
     }
@@ -470,6 +643,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 "files": files,
                 "left_out": left_out,
                 "tree": util::contract(&tree),
+                "checkout": checkout.as_deref().map(util::contract),
                 "patch": util::contract(&patch_path),
                 "seconds": (secs * 10.0).round() / 10.0,
                 "output": tail.join("\n"),
@@ -496,7 +670,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-verify-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -535,7 +709,7 @@ mod tests {
     /// exported still gets its own staging read correctly.
     #[test]
     fn a_caller_holding_a_private_index_still_gets_its_own_diff() {
-        let dir = scratch("index");
+        let dir = scratch_dir("index");
         repo(&dir);
         std::fs::write(dir.join("kept.txt"), "one\ntwo\n").unwrap();
 
@@ -559,7 +733,7 @@ mod tests {
     /// silently leaves it out goes green for a change that does not compile.
     #[test]
     fn a_file_git_has_never_seen_is_still_under_test() {
-        let dir = scratch("untracked");
+        let dir = scratch_dir("untracked");
         repo(&dir);
         std::fs::write(dir.join("new.rs"), "fn f() {}\n").unwrap();
 
@@ -583,7 +757,7 @@ mod tests {
     /// that changed" is not the same question as "what I changed".
     #[test]
     fn naming_paths_leaves_the_other_agents_work_out_of_it() {
-        let dir = scratch("paths");
+        let dir = scratch_dir("paths");
         repo(&dir);
         std::fs::write(dir.join("mine.txt"), "mine\n").unwrap();
         std::fs::write(dir.join("theirs.txt"), "theirs\n").unwrap();
@@ -605,7 +779,7 @@ mod tests {
     /// beside what was taken.
     #[test]
     fn what_you_left_out_is_reported_next_to_what_you_named() {
-        let dir = scratch("leftout");
+        let dir = scratch_dir("leftout");
         repo(&dir);
         std::fs::write(dir.join("mine.txt"), "mine\n").unwrap();
         std::fs::write(dir.join("forgot.txt"), "also mine\n").unwrap();
@@ -645,16 +819,124 @@ mod tests {
         assert_ne!(a, b, "two agents shared one build tree");
         assert!(a.starts_with("/tmp/state/build"), "the build tree escaped WSP_STATE: {a:?}");
 
-        // One agent's two tasks share one tree, which is the whole point of
-        // keying on the agent — and is why `verify` passes the trunk rather
-        // than the worktree it is standing in. Naming this after the directory
-        // under your hands makes it one tree per task again: cold on every
-        // task, and one more thing to leave behind. What resolves the trunk is
-        // tested where it lives, in `cmd_checkout`.
+        // The trunk names it, so an agent that moves task keeps the tree it
+        // warmed. What resolves the trunk is tested where it lives, in
+        // `cmd_checkout`.
         assert_eq!(
             a,
             build_dir(&store, Path::new("/Users/x/claude/wsp"), "w1"),
             "one agent, two tasks, two build trees"
         );
+    }
+
+    /// The saving this command was rebuilt for: an agent standing in its own
+    /// checkout builds *inside* it, so the build goes when the tree does and
+    /// what was unbounded becomes one per live task.
+    #[test]
+    fn inside_a_checkout_the_build_goes_in_the_checkout_and_dies_with_it() {
+        let store = Store::at(PathBuf::from("/tmp/store"), PathBuf::from("/tmp/state"));
+        let checkout = PathBuf::from("/Users/x/claude/wsp/.worktrees/robustness-046");
+
+        let sc = scratch(&store, &checkout, "w1");
+        assert_eq!(sc.checkout.as_deref(), Some(checkout.as_path()));
+        for p in [&sc.dir, &sc.tree, &sc.target] {
+            assert!(p.starts_with(&checkout), "{p:?} outlives the tree it belongs to");
+            // Under `target/`, which every cargo project already gitignores. A
+            // scratch directory git could see would make the checkout
+            // permanently dirty, and `checkout --sweep` refuses to remove a
+            // dirty tree — so the leak this closes would come straight back.
+            assert!(p.starts_with(checkout.join("target")), "{p:?} is not gitignored");
+        }
+    }
+
+    /// The measurement that settled the shape, asserted so it cannot be
+    /// quietly undone. Pointing both trees at one `CARGO_TARGET_DIR` is the
+    /// obvious saving and it is wrong: cargo records a unit's dependencies as
+    /// absolute paths and judges freshness by their mtimes, so a build in the
+    /// scratch tree leaves the *checkout's* fingerprint pointing at the scratch
+    /// tree's sources. The agent's next `cargo test` then asks whether the
+    /// scratch tree changed, prints `Fresh`, and reruns the old binary —
+    /// observed here on 2026-08-17, a green 482 tests for source that had never
+    /// been compiled. A wrong green is what this whole command exists to stop.
+    #[test]
+    fn the_scratch_never_builds_into_the_tree_the_agent_edits_in() {
+        let store = Store::at(PathBuf::from("/tmp/store"), PathBuf::from("/tmp/state"));
+        let checkout = PathBuf::from("/Users/x/claude/wsp/.worktrees/robustness-046");
+        let sc = scratch(&store, &checkout, "w1");
+        assert_ne!(
+            sc.target,
+            checkout.join("target"),
+            "the scratch shares the checkout's target dir — `cargo test` there now lies"
+        );
+        assert_eq!(sc.target, sc.dir.join("target"), "the scratch built somewhere it does not own");
+    }
+
+    /// The trunk is still shared — the coordination seat stands there — so the
+    /// original argument still holds there, and only there.
+    #[test]
+    fn in_the_trunk_an_agent_still_builds_in_a_tree_of_its_own() {
+        let store = Store::at(PathBuf::from("/tmp/store"), PathBuf::from("/tmp/state"));
+        let sc = scratch(&store, Path::new("/tmp/not-a-checkout"), "w1");
+        assert_eq!(sc.checkout, None);
+        assert!(
+            sc.target.starts_with("/tmp/state/build"),
+            "the trunk's build escaped WSP_STATE: {:?}",
+            sc.target
+        );
+        assert_eq!(sc.target, sc.dir.join("target"), "the trunk shares its target dir");
+    }
+
+    /// The residue of keying on the workspace, and the only command that can
+    /// reach it: the workspaces that named those trees are gone, so no agent
+    /// alive can name one. 9.6G across 30 of them, measured 2026-08-17.
+    ///
+    /// A live workspace keeps its tree. The name is `<repo>-<workspace>` and a
+    /// repository name may hold a dash, so the match is on the tail — `wsp-w2x`
+    /// and `my-wsp-w2x` are both workspace `w2x`, and neither is workspace `2x`.
+    #[test]
+    fn a_tree_is_cleared_when_its_workspace_is_gone_and_kept_while_it_is_not() {
+        let dir = scratch_dir("residue");
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let build = store.state.join("build");
+        for t in ["wsp-w2x", "wsp-w2y", "my-wsp-w2z"] {
+            std::fs::create_dir_all(build.join(t).join("tree")).unwrap();
+        }
+        let live = vec!["w2y".to_string(), "w2z".to_string()];
+
+        let gone = clear_build_dirs(&store, Some(&live), Path::new("/nowhere"));
+        assert_eq!(gone.len(), 1, "the wrong trees went: {gone:?}");
+        assert!(!build.join("wsp-w2x").exists(), "a tree nobody can name was left behind");
+        assert!(build.join("wsp-w2y").exists(), "a live agent lost the tree it was building in");
+        assert!(build.join("my-wsp-w2z").exists(), "the workspace was matched as part of the repo");
+
+        // Nothing to clear is not an error: `--rm --all` is a thing you run
+        // without first checking whether there is anything to run it on.
+        assert!(clear_build_dirs(&store, Some(&live), Path::new("/nowhere")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one line standing between a herdr that is down and every running
+    /// agent losing the tree it is mid-build in. A herdr that cannot be reached
+    /// reports no workspaces, which looks exactly like a machine with nothing
+    /// running on it — so `None` removes nothing, and an empty list is believed
+    /// only because herdr said it. The same judgement `may_reap` makes, and for
+    /// the same reason.
+    #[test]
+    fn a_herdr_that_did_not_answer_is_not_a_machine_with_no_agents_on_it() {
+        let dir = scratch_dir("silence");
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let build = store.state.join("build");
+        std::fs::create_dir_all(build.join("wsp-w2x").join("tree")).unwrap();
+
+        assert!(
+            clear_build_dirs(&store, None, Path::new("/nowhere")).is_empty(),
+            "silence from herdr was read as nothing running"
+        );
+        assert!(build.join("wsp-w2x").exists(), "a tree went on herdr saying nothing");
+
+        // Said, and meant: an empty answer from a herdr that answered is a
+        // machine with no agents on it, and its trees are residue.
+        assert_eq!(clear_build_dirs(&store, Some(&[]), Path::new("/nowhere")).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

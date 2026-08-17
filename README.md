@@ -2404,10 +2404,28 @@ add` rather than `git diff HEAD`, so a file git has never seen is still under
 test — a new module is the commonest thing an agent adds and the easiest thing
 for a diff to miss.
 
-The tree is keyed on the *agent*, not the build, and kept: `CARGO_TARGET_DIR`
-sits beside it and persists, so only what you changed rebuilds. Measured on this
-repository, 25s cold and 7s warm, of which ~5s is the test run. One tree per
-agent to leak rather than one per commit, and `--rm` to drop it.
+The tree is kept rather than made per build: `CARGO_TARGET_DIR` sits beside it
+and persists, so only what you changed rebuilds. Measured on this repository,
+25s cold and 7s warm, of which ~5s is the test run.
+
+Where it is kept is decided by where you are standing. In a per-task checkout it
+goes *inside* it, at `target/wsp-verify`, and is removed by the `wsp checkout
+--rm` and `--sweep` that remove the tree — one live task, one build, and nothing
+extra to remember. Keyed on the workspace instead, as it was until 2026-08-17,
+it outlived every workspace that named it: 9.6G in 30 trees no agent alive could
+name. `wsp verify --rm --all` clears that residue, and keeps any tree whose
+workspace herdr still reports — silence from herdr removes nothing, the same
+judgement `reconcile --reap` makes. In the trunk, which is still shared, an
+agent still gets a tree of its own under `WSP_STATE`.
+
+It does **not** build into the checkout's own `target/`, which is the obvious
+saving and was measured before being believed. Cargo records a unit's
+dependencies as absolute paths and judges freshness by their mtimes, so a build
+in the scratch tree leaves the checkout's fingerprint pointing at the scratch
+tree's sources — after which `cargo test` in your own tree prints `Fresh` and
+reruns the old binary. Observed on 2026-08-17: 482 tests green for source that
+had never been compiled. A target directory each, and the saving comes from
+bounding how many there are rather than from sharing one.
 
 It also prints what changed that you did **not** name. Naming paths keeps the
 other agent's work out of your build, which is the point — and it lets you leave

@@ -442,10 +442,11 @@ fn help() {
   wsp land [<id>]                   rebase it onto the trunk and fast-forward the
                                     trunk onto it; prints what actually moved.
                                     The tree stays — landing is not finishing
-  wsp verify [<path>…] [--check] [--release] [--rm]
-                                    build and test your change in a tree of your
-                                    own, at HEAD — the only build whose result
-                                    means anything while somebody else is here
+  wsp verify [<path>…] [--check] [--release] [--rm [--all]]
+                                    build and test your change at HEAD, in a
+                                    scratch tree inside your checkout that goes
+                                    when it does; --rm --all also clears the
+                                    trees older workspaces left behind
   wsp install [<path>] [--why "…"] [-n] [--force] [--to PATH]
                                     put that build at ~/.local/bin/wsp, one
                                     install at a time — the one file nothing can
