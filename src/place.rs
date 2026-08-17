@@ -139,21 +139,64 @@
 //!
 //! # How an agent says which one it is
 //!
-//! This is the half of "give me a handle" that nobody had written down, and it
-//! is where a TTY-less backend breaks first.
+//! This is the half of "give me a handle" that nobody had written down, it is
+//! where a TTY-less backend breaks first, and it is settled here (decision on
+//! robustness-040) — after both of the ways out that were filed turned out not
+//! to exist on the only backend there is.
 //!
-//! Every agent-side verb — `wsp claim`, `wsp say`, `wsp release` — identifies
-//! its own seat by reading `HERDR_PANE_ID` out of the environment
-//! (`cmd_agent.rs:164`, `herdr.rs:574`). With no pane there is no
-//! `HERDR_PANE_ID`, and the agent cannot say who it is. So the handle has to
-//! travel in both directions: wsp gets a [`Seat`] back from [`Place::open`],
-//! and whatever runs in that seat must find the same string in its environment
-//! under [`SEAT_ENV`].
+//! Every agent-side verb — `wsp claim`, `wsp say`, `wsp release` — has to name
+//! the seat it is standing in, and reads `HERDR_PANE_ID` to do it
+//! (`cmd_agent::my_pane`). The port's first answer was that wsp would put the
+//! seat's own name into [`Order::env`] under [`SEAT_ENV`] and any backend would
+//! carry it. **herdr cannot.** `workspace.create` takes the environment and
+//! *returns* the pane id, so the name does not exist until after the only moment
+//! it could have been put there.
 //!
-//! This costs one entry. `cmd_spawn::order` already fills an env map with
-//! `WSP_PROJECT`, `WSP_TASK` and the store's own variables, and this joins
-//! them — for a backend that can carry it. `place_herdr` records why herdr
-//! cannot, which is the open half of this.
+//! The two ways out that were written down both fail, and why they fail is the
+//! part worth keeping:
+//!
+//! - **wsp mints the seat** and hands it down in the environment. robustness-044
+//!   did exactly this one level in — minting the agent's name rather than
+//!   discovering it — but what made that work was `claude -n`: the backend
+//!   *accepts* the minted name. `workspace.create` has no such parameter
+//!   (checked against `herdr api schema --json`, protocol 17: `label`, `cwd`,
+//!   `env`, `focus`) and answers with an id of its own. So a minted seat would
+//!   have to be translated back to a pane id on every call and on every census
+//!   row, from a table that has to survive a restart — for an id herdr already
+//!   delivers. herdr's own place to hang such a table is pane metadata, which
+//!   the port deleted as write-only and which expires in 24h anyway. **Minting
+//!   pays where the backend takes the minted id, and buys a translation table
+//!   where it does not.**
+//! - **The agent asks the backend** which seat it is in. herdr has one method
+//!   that could answer and it answers a different question. Measured 2026-08-17
+//!   against herdr 0.7.5, called from a shell in `w31:p1`: `pane.current` with
+//!   no params replied `w1:pJ` — the **focused** pane, in another workspace, on
+//!   somebody else's work. Its only parameter is `caller_pane_id`, which is the
+//!   answer being asked for. A socket connection carries no identity, so this
+//!   option does not exist here; and had it existed it would be a mechanism that
+//!   works only while a human happens to be looking at it, which the focus
+//!   decision of 2026-08-17 rules out on its own.
+//!
+//! What is left is what herdr already does, said in the port's words: **the
+//! backend delivers the seat to whatever runs in it, and the adapter says under
+//! what name.** [`Place::here`] is that reading, and it is the one place that
+//! knows. herdr's name is `HERDR_PANE_ID`; a backend with no convention of its
+//! own uses [`SEAT_ENV`], which a supervisor can set without difficulty because
+//! it mints the seat and *then* forks — it has the name in hand at the moment
+//! the child's environment is fixed. herdr's peculiarity is that one call makes
+//! the seat and the shell together, and that is what nothing else has to repeat.
+//!
+//! So [`Order::env`] carries what wsp wants the agent to know and not the seat,
+//! and the direction of the requirement is reversed: the port asks the backend
+//! *which seat is this*, rather than telling it what to call one.
+//!
+//! **The answer must be local**, which is a stronger rule than the signature.
+//! [`Place::here`] returns an `Option` and cannot refuse, because a backend that
+//! would have to ask the network which seat it is in has not delivered the
+//! handle: every agent-side verb would pay a round trip, and a failed ask would
+//! be indistinguishable from a shell nobody spawned. `None` here is the ordinary
+//! truthful answer — a person's own terminal — rather than [`State::Unknown`]'s
+//! absence of a fact.
 //!
 //! # Two verbs, because the claim goes between them
 //!
@@ -257,18 +300,39 @@
 
 use std::collections::BTreeMap;
 
-/// The environment variable a seat's occupant finds its own handle in.
+/// The environment variable a seat's occupant finds its own handle in, for a
+/// backend that has no name of its own for it.
 ///
-/// The replacement for `HERDR_PANE_ID`. See the module docs — an agent that
-/// cannot name its own seat cannot claim, say or release, and a backend with no
-/// panes has no pane id to lend it.
+/// **Not a thing wsp writes.** The module docs say why the arrow points the
+/// other way: the backend puts this in the seat's environment, because the
+/// backend is the only party that knows the seat's name at the moment the
+/// environment is fixed. herdr has its own name for the same string and
+/// `place_herdr` reads that instead; this is the convention for a supervisor or
+/// a runtime arriving without one, so that not every new backend invents a
+/// variable and every adapter has to learn it.
 ///
-/// Nothing sets this yet, and the herdr adapter cannot: the environment is fixed
-/// by the call that creates the seat, so the seat's name does not exist until
-/// after the only moment it could have been put there. `place_herdr` records
-/// what that leaves open — either wsp mints the seat itself, or an agent asks
-/// the backend which seat it is in — and it is a decision, not an oversight.
-pub const SEAT_ENV: &str = "WSP_SEAT";
+/// `WSP_SEAT_ID` rather than `WSP_SEAT` because **`WSP_SEAT` is taken, and by
+/// the other sense of the word.** `executor/wsp` reads it as the ssh Host alias
+/// of the seat *machine* — the one you sit at — and refuses to run without it,
+/// and the README's install tells you to set it in every shell an agent might
+/// run in. On an executor the two would be one variable in one environment with
+/// a pane id on one side and a host alias on the other, and whichever won the
+/// other would be silently wrong: the shim would ssh to `w0:p3`, or an agent
+/// would claim a seat called `seat-mini`. Renaming the const was one line
+/// because nothing read it yet; renaming the shim's would have been every
+/// executor's shell profile.
+pub const SEAT_ENV: &str = "WSP_SEAT_ID";
+
+/// [`SEAT_ENV`], read — the whole of what a backend with no convention of its
+/// own has to do to implement [`Place::here`].
+///
+/// Here rather than in each adapter so that the fallback is one reading and one
+/// name. An empty value is nothing: a seat's environment can only be *overridden*
+/// on the wire (see [`shed_env`]), so an empty string is what a stripped variable
+/// looks like, and it must not be mistaken for a seat called "".
+pub fn seat_from_env() -> Option<Seat> {
+    std::env::var(SEAT_ENV).ok().filter(|s| !s.is_empty()).map(Seat::new)
+}
 
 /// The marker that turns a spawned Claude Code into somebody else's child, and
 /// the one variable measured to break a spawn outright.
@@ -406,7 +470,11 @@ pub struct Order {
     /// herdr is wherever it would have opened a shell.
     pub cwd: Option<String>,
     /// Handed to whatever runs in the seat. wsp puts `WSP_PROJECT`, `WSP_TASK`
-    /// and the store's own variables here; the backend adds [`SEAT_ENV`].
+    /// and the store's own variables here.
+    ///
+    /// The seat's own name is **not** among them and cannot be: wsp does not
+    /// know it yet. That is [`Place::here`]'s half, and the module docs carry
+    /// the argument.
     pub env: BTreeMap<String, String>,
     /// Which machine, when it is not this one.
     ///
@@ -627,9 +695,10 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 
 /// Where wsp puts work.
 ///
-/// Seven methods. Every one of them is a clause of the sentence at the top of
+/// Eight methods. Every one of them is a clause of the sentence at the top of
 /// this file, and nothing in any signature names a pane, a window, a tab or a
-/// terminal.
+/// terminal. [`Place::here`] is the eighth and is the one clause read from the
+/// inside: *give me a handle* is two directions, and it was one for a while.
 ///
 /// Object-safe deliberately: `Remote` is a decorator holding a
 /// `Box<dyn Place>`, and a backend is chosen at runtime rather than compiled
@@ -641,10 +710,29 @@ pub trait Place {
     /// the claim is written between [`Place::open`] and [`Place::start`], and
     /// an agent that starts first opens knowing nothing.
     ///
-    /// The seat must carry [`Order::env`] plus [`SEAT_ENV`] to whatever runs in
-    /// it, and must be findable by the returned [`Seat`] after the backend has
-    /// restarted.
+    /// The seat must carry [`Order::env`] to whatever runs in it, must be
+    /// findable by the returned [`Seat`] after the backend has restarted, and
+    /// must leave its occupant able to answer [`Place::here`] with the same
+    /// string this returned.
     fn open(&self, order: &Order) -> Result<Seat>;
+
+    /// Which seat *this* process is standing in, if any.
+    ///
+    /// The handle's other direction, and the only verb here that is not about
+    /// somebody else: every agent-side command — `wsp claim`, `wsp say`,
+    /// `wsp release`, `wsp despawn`'s refusal to end the seat it is running in —
+    /// is downstream of this one reading.
+    ///
+    /// Answered from what the backend arranged before the process started, never
+    /// by asking it. The module docs carry both halves of that: why herdr cannot
+    /// be asked, and why a backend that had to be is one that has not delivered
+    /// the handle. [`seat_from_env`] is the whole implementation for a backend
+    /// with no name of its own for the seat.
+    ///
+    /// `None` is a real answer — a shell a person opened, a cron job, a build —
+    /// and every caller already has a path for it, because `wsp` has always been
+    /// runnable from a terminal that is nobody's seat.
+    fn here(&self) -> Option<Seat>;
 
     /// Start an agent in a seat.
     ///
@@ -793,6 +881,43 @@ mod tests {
         assert!(!State::Unknown.is_running(), "not knowing is not evidence of work");
         for running in [State::Starting, State::Idle, State::Working] {
             assert!(running.is_running(), "{running:?}");
+        }
+    }
+
+    /// The seat's variable and the executor shim's are two different facts and
+    /// must not be one name.
+    ///
+    /// `executor/wsp` refuses to run without `WSP_SEAT`, where it means the ssh
+    /// Host alias of the seat machine, and the install tells you to set it in
+    /// every shell an agent might run in. A seat id under the same name would
+    /// make one of the two silently wrong in that shell — the shim ssh-ing to
+    /// `w0:p3`, or an agent claiming a seat called `seat-mini`. This is the whole
+    /// of the guard, because it is a fact about a name rather than about code.
+    #[test]
+    fn the_seats_variable_does_not_collide_with_the_executor_shims() {
+        assert_ne!(SEAT_ENV, "WSP_SEAT", "executor/wsp reads that as an ssh Host alias");
+        assert!(SEAT_ENV.starts_with("WSP_"), "it is wsp's contract with the backend");
+    }
+
+    /// An emptied variable is not a seat, and there is no other way to spell a
+    /// strip on the wire.
+    ///
+    /// [`shed_env`] says why: a seat's environment is an override-only map, so
+    /// anything removed arrives as `""`. A backend that empties [`SEAT_ENV`]
+    /// rather than omitting it must not leave every agent-side verb claiming a
+    /// seat with no name.
+    #[test]
+    fn an_emptied_seat_variable_is_not_a_seat_called_nothing() {
+        let _env = crate::util::env_lock();
+        let saved = std::env::var(SEAT_ENV).ok();
+        std::env::set_var(SEAT_ENV, "");
+        assert_eq!(seat_from_env(), None, "an override is what a strip looks like");
+        std::env::set_var(SEAT_ENV, "sup-7");
+        assert_eq!(seat_from_env(), Some(Seat::new("sup-7")));
+        std::env::remove_var(SEAT_ENV);
+        assert_eq!(seat_from_env(), None, "a shell nobody spawned is in no seat");
+        if let Some(v) = saved {
+            std::env::set_var(SEAT_ENV, v);
         }
     }
 

@@ -6,6 +6,8 @@ use serde_json::json;
 use crate::cmd_govern;
 use crate::herdr;
 use crate::model::{Status, Task};
+use crate::place::Place;
+use crate::place_herdr::Herdr;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::sync;
@@ -168,13 +170,21 @@ fn pane_id(args: &Args) -> Option<String> {
 
 /// Which seat this process is standing in, or none.
 ///
-/// The one reading of it, so there is one place to change when a seat stops
-/// being a herdr pane: `place::SEAT_ENV` is the replacement and nothing sets it
-/// yet (`place_herdr` records why herdr cannot). Every agent-side verb — `claim`,
-/// `say`, `release` — is downstream of this, and so is `despawn`'s refusal to
-/// end the seat it is running in.
+/// The one reading of it, and it is now the port's rather than herdr's:
+/// `place::Place::here` is the verb, and which variable carries the answer is
+/// the adapter's business. Every agent-side verb — `claim`, `say`, `release` —
+/// is downstream of this, and so is `despawn`'s refusal to end the seat it is
+/// running in.
+///
+/// A `String` because that is what the callers below hold — a claim's `pane`,
+/// a binding's key, the `--pane` a person types are all the same string, and
+/// converting them all is `place::Seat`'s own migration rather than this one's.
+///
+/// No socket is opened: [`Herdr::here`] reads what herdr set before this process
+/// existed, which is a rule of the port and not an optimisation. Constructing
+/// the backend costs four durations and a clock reference.
 pub(crate) fn my_pane() -> Option<String> {
-    herdr::Env::read().pane_id
+    Herdr::new().here().map(|s| s.to_string())
 }
 
 /// The width every label wsp writes is cut to — the 44 characters `sync`

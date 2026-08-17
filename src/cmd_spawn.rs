@@ -1088,6 +1088,9 @@ mod tests {
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
             panic!("waiting does not subscribe")
         }
+        fn here(&self) -> Option<Seat> {
+            panic!("waiting is about a seat it was handed")
+        }
     }
 
     /// A kind with a fixed answer about whether its agent is alive, which counts
@@ -1248,6 +1251,9 @@ mod tests {
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
             panic!("spawn does not wait for anything")
         }
+        fn here(&self) -> Option<Seat> {
+            panic!("spawn opens a seat rather than asking which one it is in")
+        }
     }
 
     /// The whole of t-260815-022, at the one line where it happens.
@@ -1377,6 +1383,11 @@ mod tests {
         }
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
             panic!("despawn does not wait for anything")
+        }
+        // Which seat this is arrives as an argument to `end_work`, deliberately:
+        // see `a_despawn_will_not_end_the_seat_it_is_running_in`.
+        fn here(&self) -> Option<Seat> {
+            panic!("despawn is told which seat it is running in")
         }
     }
 

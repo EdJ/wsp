@@ -24,24 +24,31 @@
 //! Until then this adapter is exactly as durable as today's code, which is to
 //! say: a claim survives a restart and a binding does not.
 //!
-//! # `WSP_SEAT` cannot be delivered by this backend, and that is a finding
+//! # herdr's name for the seat an occupant is in is `HERDR_PANE_ID`
 //!
-//! `place.rs` requires that whatever runs in a seat finds the seat's own name in
-//! its environment under [`crate::place::SEAT_ENV`], because an agent that
-//! cannot name its own seat cannot claim, say or release. **herdr cannot do
-//! this.** The environment is fixed by `workspace.create`, and the pane id that
-//! call returns does not exist until it has returned — so there is no moment at
-//! which wsp knows the seat and can still put it in the shell's environment.
+//! [`Place::here`] is the port's *which seat is this process in*, and this
+//! adapter's whole answer is `HERDR_PANE_ID`. herdr sets it per pane, every
+//! agent-side verb has always read it, and this is now the one place that knows
+//! that — which is the point: the reading was at a call site
+//! (`cmd_agent::my_pane`) and is behind the port.
 //!
-//! herdr solves its own version by setting `HERDR_PANE_ID` itself, per pane,
-//! which is why every agent-side verb reads that today. A backend that cannot
-//! set a variable per seat leaves two options and both are wsp's to choose:
-//! **wsp mints the seat** and passes it down in `Order::env` (making [`Seat`]
-//! wsp's name for a place rather than the backend's), or the agent asks the
-//! backend which seat it is standing in. The first is cheaper and would let
-//! `WSP_SEAT` land with `t-260816-064`'s rename; neither is decided here, and
-//! this adapter goes on reading `HERDR_PANE_ID` because nothing has migrated off
-//! it yet.
+//! It reads rather than asks, and the alternative was measured rather than
+//! assumed. `pane.current` is the only method that could answer *who am I*, and
+//! it answers *what is focused*: called with no params from a shell in `w31:p1`
+//! on 2026-08-17 against herdr 0.7.5, it replied `w1:pJ` — another workspace,
+//! somebody else's work. Its one parameter is `caller_pane_id`, which is the
+//! answer being asked for, so a socket connection carries no identity here at
+//! all. `place.rs` has the rest of the argument, including why an id wsp minted
+//! for itself would have been a translation table rather than a handle.
+//!
+//! **The `@machine` suffix is not added here and that is deliberate.** An id
+//! arriving from an executor is already qualified: `executor/wsp` rewrites
+//! `HERDR_PANE_ID` to `w0:p3@mb2` before forwarding it over ssh, because that
+//! shim is the only thing that knows which machine it is standing on. A seat read
+//! out of the environment on the seat machine itself is a local pane and bare,
+//! exactly as [`Herdr::open`] returns one. So this is the same string wsp has
+//! always used, and the suffix goes on staying `Order::on`'s business at `open`
+//! and the shim's everywhere else.
 //!
 //! # The three things this fixes rather than ports
 //!
@@ -438,6 +445,21 @@ impl Place for Herdr<'_> {
             Some(m) => format!("{bare}@{m}"),
             None => bare.to_string(),
         }))
+    }
+
+    /// `HERDR_PANE_ID`, which herdr put there when it made the pane.
+    ///
+    /// Through [`herdr::Env`] rather than [`std::env`] because that is where the
+    /// plugin fallback lives: a wsp run as a herdr plugin command has no pane
+    /// variable and gets its pane out of `HERDR_PLUGIN_EVENT_JSON` instead. Both
+    /// are herdr telling us where we are stood, and the difference is herdr's.
+    ///
+    /// [`crate::place::seat_from_env`] is not consulted, even as a fallback. Two
+    /// answers to *which seat is this* is a way to be in two seats: under herdr a
+    /// stale `WSP_SEAT_ID` inherited from somewhere would name a pane this
+    /// backend never issued, and `wsp claim` would bind a task to it in silence.
+    fn here(&self) -> Option<Seat> {
+        herdr::Env::read().pane_id.filter(|s| !s.is_empty()).map(Seat::new)
     }
 
     /// Returns when the agent exists, which herdr does not tell us and has to be
@@ -1004,5 +1026,42 @@ mod tests {
 
         std::env::remove_var("HERDR_SOCKET_PATH");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The seat an agent is standing in is the one herdr put in its environment,
+    /// and no other name will do.
+    ///
+    /// Three readings, and the third is the one worth the test. A stale
+    /// `WSP_SEAT_ID` — the port's name for a backend that has no name of its
+    /// own — must not be believed here: it would name a pane this herdr never
+    /// issued, and `wsp claim` would bind a task to it without a word, which is
+    /// the phantom binding this codebase has spent the most time on.
+    ///
+    /// No socket, either. Nothing in this test binds a fake, and if `here` ever
+    /// grows a call it will fail here rather than in an agent's pane — which is
+    /// the port's rule that the answer must be local, made mechanical.
+    #[test]
+    fn an_agent_reads_its_own_seat_from_what_herdr_set_and_from_nothing_else() {
+        let _env = crate::util::env_lock();
+        let place = Herdr::new();
+
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_PLUGIN_EVENT_JSON");
+        std::env::set_var(crate::place::SEAT_ENV, "sup-7");
+        assert_eq!(place.here(), None, "a seat name from another backend was believed");
+
+        std::env::set_var("HERDR_PANE_ID", "w31:p1");
+        assert_eq!(place.here(), Some(Seat::new("w31:p1")));
+
+        // The shim qualifies before forwarding, so an executor's id arrives
+        // already carrying its machine and is passed through whole.
+        std::env::set_var("HERDR_PANE_ID", "w0:p3@mb2");
+        assert_eq!(place.here(), Some(Seat::new("w0:p3@mb2")), "the suffix is not ours to touch");
+
+        std::env::set_var("HERDR_PANE_ID", "");
+        assert_eq!(place.here(), None, "an emptied variable is not a seat called nothing");
+
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var(crate::place::SEAT_ENV);
     }
 }

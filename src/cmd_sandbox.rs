@@ -185,8 +185,17 @@ const KEEP: &[&str] = &["HERDR_SOCKET_PATH", "HERDR_BIN"];
 /// `GIT_INDEX_FILE` goes for the same reason it goes in `verify`: an agent
 /// halfway through `wsp commit-help` has one exported, and a `git` command in
 /// here would stage into their commit.
+///
+/// [`crate::place::SEAT_ENV`] is named because it is the same fact under a
+/// prefix this rule does not cover: it is what a backend that is not herdr calls
+/// the caller's pane id, and a phantom binding made through it would be the
+/// identical bug. Nothing sets it today — herdr's name for the seat is
+/// `HERDR_PANE_ID` — so this is inert, and it is here because the moment to
+/// write it down is before the first backend that does.
 fn forgettable(key: &str) -> bool {
-    key == "GIT_INDEX_FILE" || (key.starts_with("HERDR_") && !KEEP.contains(&key))
+    key == "GIT_INDEX_FILE"
+        || key == crate::place::SEAT_ENV
+        || (key.starts_with("HERDR_") && !KEEP.contains(&key))
 }
 
 /// The same rule, against this process's actual environment: what a caller

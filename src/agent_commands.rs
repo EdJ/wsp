@@ -931,6 +931,9 @@ mod tests {
         fn watch(&self, _: &mut dyn FnMut(Event) -> bool) -> Result<()> {
             panic!("telling an agent does not wait")
         }
+        fn here(&self) -> Option<Seat> {
+            panic!("telling an agent is about the seat it is in, not ours")
+        }
     }
 
     /// Until the channel exists, every kind delivers the way the backend can —
