@@ -80,10 +80,20 @@
 //!    not parse the field; it does now, and a census reads its seats from one
 //!    call and its states from the other.
 //!
-//! A third, smaller: `agent.start` returns *before* the agent exists — its
-//! reply names no agent and carries `launch_pending: true` — so `Place::start`'s
-//! "returns when the agent exists" is a promise its herdr adapter has to keep
-//! for it, and does, by waiting.
+//! A third: `agent.start` returns *before* the agent exists — its reply names
+//! no agent and carries `launch_pending: true` — so `Place::start`'s "returns
+//! when the agent exists" is a promise its herdr adapter has to keep for it, and
+//! does, by waiting.
+//!
+//! And a fourth, which is t-260817-010 and which this fake **missed** until
+//! 2026-08-17 because it modelled that reply and not the reads after it. For
+//! roughly the next six tenths of a second `agent.get` answers the same way: a
+//! record that exists and names nothing. The adapter was waiting for a record
+//! rather than for an agent, so it returned inside that window and the caller
+//! read the very same record as a seat that had emptied — a live Claude Code,
+//! declared dead, three spawns out of three. [`Stage::unnamed`] is that window,
+//! and it is on by default: a fake that skips the hard part of a launch agrees
+//! with whatever the code does.
 //!
 //! # Behind a socket, and what that costs
 //!
@@ -433,6 +443,29 @@ pub struct Stage {
     /// `agent.prompt` refuses in and the one a real herdr passes through in
     /// half a second whether you wanted it to or not.
     pub settle: bool,
+    /// How many `agent.get` reads answer with a record that **names no agent**
+    /// after `agent.start`, before detection catches up.
+    ///
+    /// The window this fake used to skip, and skipping it is what let
+    /// t-260817-010 live in `place_herdr::start` for as long as it did. Recorded
+    /// against herdr 0.7.5 in a sandbox on 2026-08-17, polling `agent.get` every
+    /// 150ms from the moment `agent.start` was sent: at 70ms and at 210ms the
+    /// reply is a record carrying `launch_pending: true`, `agent_status:
+    /// "unknown"` and the name wsp asked for, with **no `agent` field at all**;
+    /// `"agent": "claude"` first appears at 620ms.
+    ///
+    /// So there are three readings across a launch and not two — nothing, then
+    /// something with no name, then a named agent still coming up — and the
+    /// middle one is indistinguishable from an empty seat to everything in wsp
+    /// that reads it. Two is the default because two is what was recorded, and
+    /// because a default of nought is the fake agreeing with the bug.
+    pub unnamed: u32,
+    /// What is left of [`Stage::unnamed`] for the agent most recently started.
+    ///
+    /// One counter for the whole stage rather than one per seat: a launch window
+    /// is three tenths of a second long and nothing starts two agents inside
+    /// one. If something ever does, this is the line to grow.
+    launching: u32,
     /// The screen the panes are laid out in. Nothing reads it but the layout
     /// arithmetic.
     pub area: Rect,
@@ -473,6 +506,8 @@ impl Default for Stage {
             spots: Vec::new(),
             quiet: Quiet::No,
             settle: true,
+            unnamed: 2,
+            launching: 0,
             area: Rect { x: 0, y: 0, w: 120, h: 40 },
             focused: None,
             refuse: BTreeMap::new(),
@@ -673,6 +708,30 @@ fn pane_json(spot: &Spot) -> Value {
 /// `launch_pending` once it will take a prompt. Neither is ever sent false, and
 /// that asymmetry is load-bearing, and reading it wrong is what
 /// `place_herdr::state_of_agent` was repaired to stop doing.
+/// The same agent, in the first reading after `agent.start` — before herdr can
+/// say what is in the pane.
+///
+/// A transcript, and the shape is the whole point: the record *exists*, so a
+/// caller waiting for one is satisfied by it, and it names nothing, so the same
+/// caller reading its state is told the seat is empty. See [`Stage::unnamed`]
+/// for the recording and `place_herdr::start` for what that cost.
+fn launching_json(spot: &Spot) -> Value {
+    let mut v = pane_json(spot);
+    if let Some(o) = v.as_object_mut() {
+        // Absent rather than empty, because that is what herdr sends and
+        // because `herdr::parse_pane` reading a missing field as `""` is
+        // precisely the step that turns this into an empty seat.
+        o.remove("agent");
+        o.remove("agent_session");
+    }
+    v["agent_status"] = json!("unknown");
+    v["launch_pending"] = json!(true);
+    if !spot.agent.name.is_empty() {
+        v["name"] = json!(spot.agent.name);
+    }
+    v
+}
+
 fn agent_json(spot: &Spot) -> Value {
     let (agent, status, ready) = of_state(spot);
     let mut v = pane_json(spot);
@@ -1270,6 +1329,8 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             let Some(before) = stage.find(&seat).cloned() else {
                 return Err(no_pane(seat.as_str()));
             };
+            // The detection lag starts here and is counted down by `agent.get`.
+            stage.launching = stage.unnamed;
             let Some(spot) = stage.find_mut(&seat) else {
                 return Err(no_pane(seat.as_str()));
             };
@@ -1337,11 +1398,16 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
         "agent.get" => {
             let seat = Seat::new(sget("target"));
             record(inner, Asked { verb, seat: Some(seat.clone()), said: String::new() });
+            let launching = stage.launching > 0;
+            stage.launching = stage.launching.saturating_sub(1);
             match stage.find(&seat) {
                 // Recorded: a pane with no agent answers `agent_not_found`,
                 // exactly as a pane that does not exist does. A caller cannot
                 // tell an empty seat from a missing one this way, which is why
                 // `place::Place::state` is a different question from a census.
+                Some(spot) if !spot.agent.kind.is_empty() && launching => {
+                    json!({ "type": "agent_info", "agent": launching_json(spot) })
+                }
                 Some(spot) if !spot.agent.kind.is_empty() => {
                     json!({ "type": "agent_info", "agent": agent_json(spot) })
                 }

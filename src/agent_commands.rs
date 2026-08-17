@@ -180,6 +180,26 @@ pub trait Kind {
     /// about it; this one chooses between that and whatever the agent itself
     /// offers, and typing at a terminal is only the fallback.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<()>;
+
+    /// Whether the agent wsp started here is running, as its **own** runtime
+    /// sees it — `None` where the kind has no runtime to ask.
+    ///
+    /// The second opinion, and the only interesting thing about it is who is
+    /// being asked. Every other reading of a live agent in wsp comes from the
+    /// backend, so a backend that cannot see one has the last word on whether it
+    /// exists; this asks the thing that *is* the agent. No `&dyn Place` in the
+    /// signature says so, and that is deliberate rather than economical: an
+    /// answer that needed the backend would be worth nothing here.
+    ///
+    /// It can rescue and it must not condemn, which is the rule
+    /// [`crate::cmd_spawn`] applies and the reason this returns three answers
+    /// rather than two. A session's registry entry is written a moment *after*
+    /// the agent starts — measured on 2026-08-17, `wsp spawn`'s own recovery
+    /// sentence stayed silent through the first two seconds of a live launch
+    /// because of it — so `Some(false)` early in a launch is as likely to mean
+    /// "not yet" as "never". Corroborating a seat that has already read empty
+    /// for a while is what it is good for.
+    fn running(&self, spawn: &Spawn) -> Option<bool>;
 }
 
 /// What is about to be started, as much of it as a kind is allowed to know.
@@ -256,6 +276,12 @@ impl Kind for Plain {
 
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<()> {
         place.tell(seat, text)
+    }
+
+    /// Nothing to ask. An agent wsp knows nothing about beyond its name is one
+    /// whose backend is the only witness there is.
+    fn running(&self, _spawn: &Spawn) -> Option<bool> {
+        None
     }
 }
 
@@ -395,6 +421,33 @@ impl Kind for Claude {
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<()> {
         place.tell(seat, text)
     }
+
+    /// The census, asked about the handle wsp minted — which is why minting had
+    /// to land first.
+    ///
+    /// Three `?`s and each is a different "cannot say": nothing to build a
+    /// handle from, and `claude` neither on the `PATH` nor answering. None of
+    /// them is `Some(false)`, because this is read as evidence that an agent is
+    /// gone and a listing wsp failed to take is evidence of nothing.
+    ///
+    /// [`Kind::address`] resolves the same handle and then falls back to
+    /// [`pick`]; this deliberately does not. `pick`'s fallback is *one live
+    /// session in this tree*, and the seat being asked about here is by
+    /// construction one whose agent the backend has lost sight of — so the tree
+    /// is this repository, three colleagues are usually standing in it, and a
+    /// probable answer to "is mine alive" is worse than no answer.
+    fn running(&self, spawn: &Spawn) -> Option<bool> {
+        let handle = mint(spawn.name, spawn.seat)?;
+        Some(answers_to(&listing().ok()?, &handle))
+    }
+}
+
+/// Whether any live session goes by this name.
+///
+/// A line of its own so the order above can be argued about in a test without
+/// shelling out, which is the same seam [`resolve`] is split on.
+fn answers_to(live: &[Live], handle: &str) -> bool {
+    live.iter().any(|s| s.name == handle)
 }
 
 /// One row of `claude agents --json`.
@@ -809,6 +862,36 @@ mod tests {
         let argv = of("claude").args(&spawn(false, "", &nowhere));
         assert!(!argv.contains(&"-n".to_string()), "nothing to name it after: {argv:?}");
         assert_eq!(argv, TRIM, "an unnameable agent is still a trimmed one");
+    }
+
+    /// **The second opinion t-260817-010 needed.** A minted handle on the
+    /// runtime's own census answers "is this agent alive" without a pane, a
+    /// render or a backend.
+    ///
+    /// The two rows that matter are the two the lookup cannot use: an agent
+    /// alone under a name nobody else answers to, and a *third* agent in a tree
+    /// two colleagues are already standing in — where [`pick`] correctly refuses
+    /// and a minted name is still exact. That is the seat this is asked about, by
+    /// construction: one whose agent the backend has lost sight of.
+    #[test]
+    fn a_minted_handle_is_matched_against_the_runtimes_own_census_and_nothing_else() {
+        let mut live = parse_listing(CAPTURE);
+        live.push(Live {
+            session: "d28a4237-8811-42ef-b89e-34ffc2d0df9f".into(),
+            name: "t-260817-010-w2C:p1".into(),
+            cwd: "/Users/edjames/claude/wsp".into(),
+            status: "idle".into(),
+        });
+        assert!(answers_to(&live, "t-260817-010-w2C:p1"));
+        // The seat is what makes it exact. The same task in a different seat is
+        // a different agent, and saying otherwise would keep a spawn waiting on
+        // an agent that is somebody else's.
+        assert!(!answers_to(&live, "t-260817-010-w2D:p1"));
+        assert!(!answers_to(&live, "t-260817-010"), "the task id alone is not a handle");
+        assert!(!answers_to(&[], "t-260817-010-w2C:p1"), "a listing wsp could not take");
+        // And a kind with no runtime says nothing rather than no.
+        let seat = Seat::new("w2C:p1");
+        assert_eq!(of("codex").running(&spawn(false, "t-260817-010", &seat)), None);
     }
 
     /// A backend that records what it was asked, so the fallback can be caught

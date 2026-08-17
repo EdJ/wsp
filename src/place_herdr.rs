@@ -432,12 +432,38 @@ impl Place for Herdr {
     /// Returns when the agent exists, which herdr does not tell us and has to be
     /// waited for. Not when it will take a prompt: those are different moments,
     /// three seconds apart, and conflating them is the `agent_not_ready` bug.
+    ///
+    /// **What "exists" means is the whole of t-260817-010, and it was wrong
+    /// here.** This waited for `agent.get` to answer with a record at all, and
+    /// during the launch window it answers with a record that names nothing:
+    /// `launch_pending: true`, `agent_status: "unknown"`, and no `agent` field —
+    /// recorded 70ms after `agent.start` in a sandbox on 2026-08-17, with the
+    /// name arriving at 620ms. `parse_pane` reads the missing field as `""`, so
+    /// [`state_of_agent`] calls that record [`State::Empty`], and a caller that
+    /// polls readiness the moment this returns is told the agent it just started
+    /// has stopped. Three of three sandbox spawns failed that way in under two
+    /// and a half seconds, with a live Claude Code in the pane.
+    ///
+    /// So the wait is for a **named** agent, which is what the promise above
+    /// always meant. The distinction is not decoration: an empty `agent` field is
+    /// also what a plain shell looks like, and the two are told apart by nothing
+    /// but `launch_pending`.
+    ///
+    /// Which is also why the retype is now held off while that flag is set.
+    /// Before, this returned before the retype could ever apply to the launch
+    /// window; now that it waits through it, clearing the line and typing
+    /// `claude` again at six seconds would be typing into a Claude Code that
+    /// herdr has told us it is in the middle of starting — the exact harm the
+    /// retype's own rule was written to avoid. `launch_pending` is herdr saying
+    /// *I have one coming up*, so the eaten-keystroke case it exists for is the
+    /// case where herdr says nothing of the sort.
     fn start(&self, seat: &Seat, agent: &Agent) -> Result<()> {
         launch(self, seat, agent)?;
         let began = Instant::now();
         let mut retyped = false;
         loop {
-            if look(seat)?.is_some() {
+            let seen = look(seat)?;
+            if seen.as_ref().is_some_and(|p| !p.agent.trim().is_empty()) {
                 return Ok(());
             }
             let waited = began.elapsed();
@@ -447,7 +473,8 @@ impl Place for Herdr {
                     agent.kind
                 )));
             }
-            if !retyped && waited >= self.retype {
+            let coming_up = seen.and_then(|p| p.launch_pending).unwrap_or(false);
+            if !retyped && !coming_up && waited >= self.retype {
                 retyped = true;
                 let _ = herdr::call(
                     "pane.send_text",
@@ -596,6 +623,50 @@ mod tests {
         let told = fake.asked().into_iter().find(|a| a.verb == Verb::Tell && a.said == "go");
         assert_eq!(told.map(|a| a.seat), Some(Some(seat.clone())), "the sentence reached the seat");
         assert!(fake.verbs().starts_with(&[Verb::Open, Verb::Start]), "{:?}", fake.verbs());
+
+        std::env::remove_var("HERDR_SOCKET_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **t-260817-010.** An agent that has been started and not yet detected is
+    /// not a seat that emptied, and `start` must not come back until the
+    /// difference can be seen.
+    ///
+    /// The failure this pins was not subtle once it was found and was invisible
+    /// until then, because both halves are honest on their own: `agent.get`
+    /// answers with a record the moment the launch begins, and that record names
+    /// nothing. `start` waited for *a record*, so it returned inside the window;
+    /// `cmd_spawn::wait_ready` then read the same record as [`State::Empty`] and
+    /// reported that a live Claude Code had started and stopped. Three of three
+    /// sandbox spawns died that way in under two and a half seconds on
+    /// 2026-08-17, with the agent sitting idle in the pane the whole time.
+    ///
+    /// So the assertion is the one thing the caller is entitled to: from the
+    /// moment `start` returns, the seat never reads empty. `Stage::unnamed`
+    /// carries the recording that makes this a real window rather than a
+    /// hypothesis — and with it at nought, which is what the fake used to do,
+    /// this test passes against the broken code.
+    #[test]
+    fn an_agent_that_is_not_detected_yet_is_never_read_as_a_seat_that_emptied() {
+        let _env = util::env_lock();
+        let mut stage = Stage::new();
+        stage.settle = false;
+        let (fake, dir) = bound("launching", stage);
+        let place = brisk();
+
+        let seat = place.open(&Order { label: "robustness/010".into(), ..Order::default() })
+            .expect("a seat");
+        // While the launch window is open the seat reads empty, and that is
+        // herdr's answer rather than the fake's invention: a record with no
+        // agent named in it.
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new() })
+            .expect("an agent");
+        assert_eq!(
+            place.state(&seat).unwrap(),
+            State::Starting,
+            "start came back before the agent was detectable"
+        );
+        assert!(fake.stage().unnamed > 0, "a stage that skips the window cannot catch this");
 
         std::env::remove_var("HERDR_SOCKET_PATH");
         let _ = std::fs::remove_dir_all(&dir);

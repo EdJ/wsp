@@ -152,43 +152,103 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
 /// which is a better list than one kept here and left to go stale.
 const DEFAULT_KIND: &str = "claude";
 
-/// How long to give the agent to become ready for input, having started.
+/// How long the caller is prepared to wait, in three numbers.
 ///
-/// A cold Claude Code measured four seconds to readiness on this machine; herdr's
-/// own default for the same wait is thirty. What "started" means, what has to be
-/// retried to get there and how long any of it takes are the backend's, and live
-/// in `place_herdr` — this is only how long the caller is prepared to wait.
-const READY_MS: u64 = 30_000;
-const POLL_MS: u64 = 150;
+/// A struct rather than three constants for the reason `place_herdr::Herdr`
+/// gives about its own: every one of these was set by a failure, and a test that
+/// has to sit through two real seconds to check what happens after two seconds
+/// is a test nobody runs. [`Patience::default`] is what the CLI uses.
+struct Patience {
+    /// How long to give the agent to become ready for input, having started.
+    ///
+    /// A cold Claude Code measured four seconds to readiness on this machine;
+    /// herdr's own default for the same wait is thirty. What "started" means,
+    /// what has to be retried to get there and how long any of it takes are the
+    /// backend's, and live in `place_herdr` — this is only how long the caller
+    /// is prepared to wait.
+    ready: Duration,
+    /// How often to ask.
+    poll: Duration,
+    /// How long a seat has to go on looking empty before that is a death rather
+    /// than a gap in what the backend can see.
+    ///
+    /// Two seconds is three times the longest gap measured — 620ms from
+    /// `agent.start` to a named agent, recorded on 2026-08-17 — and it is only
+    /// ever paid by a spawn that has genuinely failed, because one reading of a
+    /// live agent clears it.
+    gone: Duration,
+}
+
+impl Default for Patience {
+    fn default() -> Patience {
+        Patience {
+            ready: Duration::from_millis(30_000),
+            poll: Duration::from_millis(150),
+            gone: Duration::from_millis(2_000),
+        }
+    }
+}
 
 /// Wait until the agent in a seat will take a sentence.
 ///
-/// **Not until it is idle**, which is the trap this walked into: herdr reports
-/// `agent_status: idle` while an agent is still drawing its banner, and refuses
-/// a prompt in that window. `will_take_a_prompt` is the port's single answer to
-/// the question every `state == "idle"` caller is actually asking, so this is
-/// the one reading and there is nothing left here to get wrong.
+/// **Not until it is idle**, which is the first trap this walked into: herdr
+/// reports `agent_status: idle` while an agent is still drawing its banner, and
+/// refuses a prompt in that window. `will_take_a_prompt` is the port's single
+/// answer to the question every `state == "idle"` caller is actually asking, so
+/// this is the one reading and there is nothing left here to get wrong.
 ///
-/// A refusal is not a verdict while there is time left — a backend that did not
-/// answer this poll may answer the next — but a seat that has gone empty is: the
-/// agent existed when `start` returned, so nothing in it now means it has
-/// stopped, and waiting out the deadline would report the wrong failure thirty
-/// seconds late.
-fn wait_ready(place: &dyn Place, seat: &Seat, kind: &str) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_millis(READY_MS);
+/// **An empty seat is not a death, which is the second, and it cost a night.**
+/// This used to return on the first empty reading, arguing that the agent
+/// existed when `start` returned so nothing in it now meant it had stopped. Both
+/// halves of that were wrong at once: `start` was coming back inside the launch
+/// window (see `place_herdr::start`), and even with that fixed, one blind read
+/// from one backend is a thin thing to end somebody's spawn on. It failed open
+/// every time — a claimed task, a live agent, and no work order — and it was
+/// only ever caught by a person watching the pane.
+///
+/// So an absence has to persist for [`GONE_MS`], and the kind gets a veto. The
+/// asymmetry in [`agent_commands::Kind::running`] is the point: it can say *this
+/// agent is alive, keep waiting* and it cannot say *it is dead, stop now*,
+/// because its registry is written a moment after the agent starts and "not yet"
+/// and "never" look identical there. What that buys is a spawn that survives a
+/// backend which cannot see, and still fails in two seconds rather than thirty
+/// when the start really did fail.
+fn wait_ready(
+    place: &dyn Place,
+    how: &dyn agent_commands::Kind,
+    spawn: &agent_commands::Spawn,
+    kind: &str,
+    wait: &Patience,
+) -> Result<(), String> {
+    let seat = spawn.seat;
+    let deadline = Instant::now() + wait.ready;
+    let mut empty_since: Option<Instant> = None;
     loop {
         match place.state(seat) {
             Ok(s) if s.will_take_a_prompt() => return Ok(()),
             Ok(State::Empty) | Ok(State::Gone) => {
-                return Err(format!("{kind} started and then stopped in {seat}"))
+                let since = *empty_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= wait.gone {
+                    match how.running(spawn) {
+                        // Alive, and the backend simply cannot see it. Start the
+                        // clock again rather than clearing it, so the runtime is
+                        // asked once per `gone` and not once per poll.
+                        Some(true) => empty_since = Some(Instant::now()),
+                        _ => return Err(format!("{kind} started and then stopped in {seat}")),
+                    }
+                }
             }
+            // The seat itself, rather than what is in it. Nothing is coming back
+            // from a pane that has been closed.
             Err(Refusal::NoSeat(_)) => return Err(format!("{seat} is gone")),
-            Ok(_) | Err(_) => {}
+            // A refusal is not a verdict while there is time left: a backend that
+            // did not answer this poll may answer the next.
+            Ok(_) | Err(_) => empty_since = None,
         }
         if Instant::now() >= deadline {
             return Err(format!("{kind} started but never became ready for input"));
         }
-        std::thread::sleep(Duration::from_millis(POLL_MS));
+        std::thread::sleep(wait.poll);
     }
 }
 
@@ -375,7 +435,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // has to do to make the first one true — retry a shell that is not ready,
         // clear a half-typed line — happens on its side of the seam now.
         match place.start(&seat, &agent).map_err(|e| e.to_string())
-            .and_then(|()| wait_ready(place, &seat, &kind))
+            .and_then(|()| wait_ready(place, how, &spawn, &kind, &Patience::default()))
         {
             Ok(()) => {
                 started = Some(kind.clone());
@@ -775,6 +835,176 @@ mod tests {
                 "non-ASCII in a work order, which is what t-260817-004 was: {text}"
             );
         }
+    }
+
+    /// A backend reading off a script, one answer per poll, holding the last
+    /// one for ever after.
+    ///
+    /// The script is the whole point: what killed t-260817-010 was a *sequence*
+    /// of readings rather than any single one, and a fake that can only be put
+    /// in a state cannot express "empty, and then not".
+    struct Reads {
+        script: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<State>>>,
+        last: std::cell::RefCell<crate::place::Result<State>>,
+    }
+
+    impl Reads {
+        fn of(script: Vec<crate::place::Result<State>>) -> Reads {
+            Reads {
+                last: std::cell::RefCell::new(
+                    script.last().cloned().unwrap_or(Ok(State::Unknown)),
+                ),
+                script: std::cell::RefCell::new(script.into()),
+            }
+        }
+    }
+
+    impl Place for Reads {
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            match self.script.borrow_mut().pop_front() {
+                Some(s) => s,
+                None => self.last.borrow().clone(),
+            }
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("waiting does not open seats")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("waiting does not start agents")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<()> {
+            panic!("waiting does not talk to agents")
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("waiting does not end seats")
+        }
+        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+            panic!("waiting is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("waiting does not subscribe")
+        }
+    }
+
+    /// A kind with a fixed answer about whether its agent is alive, which counts
+    /// how often it was asked.
+    ///
+    /// Counted because the cost of asking is a subprocess: the rule is once per
+    /// `gone` and not once per poll, and a rule about frequency is not checked
+    /// by a test that only looks at the answer.
+    struct Says(Option<bool>, std::cell::Cell<u32>);
+
+    impl agent_commands::Kind for Says {
+        fn running(&self, _: &agent_commands::Spawn) -> Option<bool> {
+            self.1.set(self.1.get() + 1);
+            self.0
+        }
+        fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
+            Vec::new()
+        }
+        fn address(&self, _: &dyn Place, _: &Seat) -> Option<String> {
+            None
+        }
+        fn tell(&self, _: &dyn Place, _: &Seat, _: &str) -> crate::place::Result<()> {
+            panic!("readiness does not deliver work orders")
+        }
+    }
+
+    fn brisk() -> Patience {
+        Patience {
+            ready: Duration::from_millis(2_000),
+            poll: Duration::from_millis(1),
+            gone: Duration::from_millis(30),
+        }
+    }
+
+    fn waiting_on(
+        place: &dyn Place,
+        how: &dyn agent_commands::Kind,
+        seat: &Seat,
+    ) -> Result<(), String> {
+        let spawn = agent_commands::Spawn { full: false, name: "t-260817-010", seat };
+        wait_ready(place, how, &spawn, "claude", &brisk())
+    }
+
+    /// **The failure this task is named for, at the moment it is decided.** A
+    /// backend that cannot see a live agent must not end its spawn.
+    ///
+    /// The script is what was recorded on 2026-08-17: `start` returns, and the
+    /// seat reads empty for a stretch because herdr's detection has not caught
+    /// up with the agent sitting in it. The old rule returned on the first of
+    /// those readings, so the work order was never sent and a claimed task sat
+    /// in front of an idle agent until somebody noticed.
+    ///
+    /// Both halves of the new rule are asserted here: the wait survives the
+    /// blind stretch, and the runtime is asked about it — once, not once per
+    /// poll, because asking is a subprocess.
+    #[test]
+    fn a_seat_the_backend_cannot_see_does_not_end_a_spawn_whose_agent_is_alive() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let place = Reads::of(
+            std::iter::repeat_with(|| Ok(State::Empty))
+                .take(200)
+                .chain([Ok(State::Starting), Ok(State::Idle)])
+                .collect(),
+        );
+        assert_eq!(waiting_on(&place, &alive, &Seat::new("w2C:p1")), Ok(()));
+        assert!(alive.1.get() >= 1, "the agent's own runtime was never asked");
+        assert!(alive.1.get() <= 8, "asked {} times in 200 polls", alive.1.get());
+    }
+
+    /// And the other side of it: a spawn that really did fail still fails, and
+    /// does not wait out the deadline to say so.
+    ///
+    /// This is what the fast verdict was for and why it is kept rather than
+    /// replaced by patience. Thirty seconds of silence in front of a person who
+    /// has just typed `wsp spawn` is its own kind of wrong answer.
+    #[test]
+    fn an_agent_that_never_started_is_reported_without_waiting_out_the_deadline() {
+        let dead = Says(Some(false), std::cell::Cell::new(0));
+        let place = Reads::of(vec![Ok(State::Empty)]);
+        let began = Instant::now();
+        assert_eq!(
+            waiting_on(&place, &dead, &Seat::new("w2C:p1")),
+            Err("claude started and then stopped in w2C:p1".into())
+        );
+        assert!(began.elapsed() < brisk().ready, "waited out the whole deadline to say so");
+        // A kind with no runtime to ask is not thereby immortal: the seat has
+        // still been empty for longer than a launch takes.
+        let mute = Says(None, std::cell::Cell::new(0));
+        assert!(waiting_on(&Reads::of(vec![Ok(State::Empty)]), &mute, &Seat::new("w2C:p1")).is_err());
+    }
+
+    /// One empty reading between two live ones is a gap in what the backend can
+    /// see, and nothing is asked about it.
+    ///
+    /// The cheap half of the rule, and the one that does the most work: a single
+    /// dropout costs nothing at all, so the expensive question is only reached by
+    /// a seat that has looked empty for two seconds together.
+    #[test]
+    fn a_single_dropout_between_two_live_readings_is_not_worth_asking_about() {
+        let never = Says(Some(false), std::cell::Cell::new(0));
+        let place = Reads::of(vec![
+            Ok(State::Starting),
+            Ok(State::Empty),
+            Err(Refusal::Unreachable("socket".into())),
+            Ok(State::Starting),
+            Ok(State::Idle),
+        ]);
+        assert_eq!(waiting_on(&place, &never, &Seat::new("w2C:p1")), Ok(()));
+        assert_eq!(never.1.get(), 0, "a subprocess was run for a single blink");
+    }
+
+    /// A seat that is gone is not a seat whose agent is quiet, and no amount of
+    /// patience will make a closed pane answer.
+    #[test]
+    fn a_pane_that_has_been_closed_is_said_plainly_and_at_once() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let place = Reads::of(vec![Err(Refusal::NoSeat(Seat::new("w2C:p1")))]);
+        assert_eq!(
+            waiting_on(&place, &alive, &Seat::new("w2C:p1")),
+            Err("w2C:p1 is gone".into())
+        );
     }
 
     /// A backend that only remembers what it was asked to open.
