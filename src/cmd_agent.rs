@@ -184,15 +184,16 @@ pub(crate) fn my_pane() -> Option<String> {
 const LABEL_MAX: usize = 44;
 
 /// What you would type to mean this task, with the project it is in:
-/// `render/109`. The panel's `ident_of` shortens the same id for the same
-/// reason — eleven of a task id's thirteen characters are the same on every
-/// row, and the suffix is the half `wsp show 109` resolves.
+/// `render/109` — which is the whole id, written with a slash. The panel's
+/// `ident_of` splits the same id in the same place and for the same reason:
+/// the number is what `wsp show 109` resolves, and the prefix is what says
+/// which project it is numbered within.
 ///
-/// Always the bare suffix here, never the dated form the panel falls back to
-/// when two open tasks share it. A label is read at a glance in a column of
-/// other labels, and it is followed by the title, which is what settles a
-/// collision; `render/109 · …` beside `render/109 · …` is two agents whose
-/// work you can still tell apart.
+/// Both halves, always. The panel can drop the prefix because a row sits under
+/// a node that spells the project out; a label has nothing above it, and it is
+/// read at a glance in a column of other labels — `render/109` beside
+/// `robustness/109` is two agents told apart before the title is reached,
+/// where `109` beside `109` is not.
 pub fn task_scope(task: &Task) -> String {
     let ident = task.id.rsplit('-').next().unwrap_or(&task.id);
     match &task.project {

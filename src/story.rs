@@ -829,7 +829,7 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .key(Key::Char('i'))
-            .scene("Showing ids", "i puts the id in front of each title — the thing you type at a shell, next to the thing you read. Off by default because thirteen characters of `t-260815-004` on every row is most of a narrow pane, and only the last three of them differ. The suffix is what `wsp start 004` resolves, so the suffix is what shows, unless another open task shares it and the date is what separates them."),
+            .scene("Showing ids", "i puts the id in front of each title — the thing you type at a shell, next to the thing you read. Off by default because most of an id is the project it is in, and the row is already sitting under that project's node. So the number alone is what shows: it is all `wsp start 003` needs, and all that separates the row from its siblings, since tasks are numbered inside their own project. The prefix comes back wherever the row is drawn away from that node — a flat list, a search, a dock — because there it is the half that says which task this is."),
     );
 
     out.push(

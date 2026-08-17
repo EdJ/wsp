@@ -963,33 +963,38 @@ pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, 
     )
 }
 
-/// What you would type to mean this task, and no more of it than you have to.
+/// What you would type to mean this task, minus whatever the row's place in
+/// the tree has already said. `under` is the project the row is drawn beneath —
+/// `None` for the inbox, and `None` for any surface that is not a tree.
 ///
-/// The suffix is what the CLI resolves — `wsp start 004` — so the suffix is
-/// what the panel shows, unless another open task shares it, in which case the
-/// prefix is the part that separates them and the whole thing has to be typed
-/// anyway. Under dated ids the shared part was the date and was identical on
-/// nearly every row, which is what made showing it wasteful; under per-project
-/// ids it is the project, and a pane usually holds one — so the full id is
-/// shorter than it was and appears more often, both of which are improvements.
-fn ident_of(tasks: &[Task], task: &Task) -> String {
-    let full = || task.id.clone();
+/// This has always dropped the half of an id that every row repeats and kept
+/// the half that separates them; what changed is which half that is. Under
+/// dated ids (`t-260815-022`) the repeated part was the date — the same on
+/// nearly every row in the panel, so dropping it was right everywhere. Under
+/// per-project ids the repeated part is the project, and it is repeated only
+/// among the rows beneath one node: there `010` is the whole of what
+/// distinguishes the row, because numbering is per project and the prefix is
+/// spelled out on the node above it. Away from that node — a flat list, a
+/// search, a dock, a task shown under some other project — the prefix is the
+/// fact you need, so it stays.
+///
+/// The bare suffix is not always unique across the store, so `wsp start 010`
+/// may name two. That is [`crate::store::Found::Ambiguous`]'s job and it
+/// answers with the candidates; the alternative was showing the full id on
+/// nearly every low-numbered row, flickering back to short as unrelated
+/// projects gained and finished work — noise about other projects on a row
+/// that is not about them.
+fn ident_of(task: &Task, under: Option<&str>) -> String {
     // A bare suffix resolves against *open* tasks only, so a finished one has
     // to be named in full — showing `014` for a task `wsp show 014` cannot
     // find would be worse than showing nothing.
     if !task.status().is_open() {
-        return full();
+        return task.id.clone();
     }
-    let suffix = task.id.rsplit('-').next().unwrap_or(&task.id);
-    let taken = tasks
-        .iter()
-        .filter(|t| t.status().is_open() && t.id != task.id)
-        .any(|t| t.id.rsplit('-').next() == Some(suffix));
-    if taken {
-        full()
-    } else {
-        suffix.to_string()
+    if task.project.as_deref() != under {
+        return task.id.clone();
     }
+    task.id.rsplit('-').next().unwrap_or(&task.id).to_string()
 }
 
 /// Rows for the tasks of one project — or, when `project` is `None`, the tasks
@@ -1085,7 +1090,7 @@ pub(super) fn task_rows(
             // children are all done should say so rather than fall silent
             // because `A` is off.
             under: resolve::counts_under(tasks, &t.id),
-            ident: view.ids.then(|| ident_of(tasks, t)),
+            ident: view.ids.then(|| ident_of(t, project)),
             flagged: false,
         });
         // The pane working it hangs beneath, so the join is visible and the
@@ -2420,4 +2425,66 @@ pub(super) fn hotkeys(ui: &Ui) -> Vec<Option<u8>> {
         out[i] = Some(n);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, project: Option<&str>, status: &str) -> Task {
+        let mut t = Task::new("one working tree per task", id);
+        t.project = project.map(|s| s.to_string());
+        t.status_raw = status.to_string();
+        t
+    }
+
+    /// The node above the row already spells the project out, and a number is
+    /// unique within one — so the prefix on the row is the same word twice.
+    #[test]
+    fn a_task_drawn_under_its_own_project_is_named_by_its_number_alone() {
+        let t = task("robustness-010", Some("robustness"), "todo");
+        assert_eq!(ident_of(&t, Some("robustness")), "010");
+    }
+
+    /// The half that says *which* project, on every surface that has not
+    /// already said it: a subtree view, a search, a dock, a flag from
+    /// elsewhere. `None` covers the flat surfaces, which know no context and
+    /// so must show the prefix.
+    #[test]
+    fn a_task_drawn_anywhere_else_carries_the_project_it_belongs_to() {
+        let t = task("robustness-010", Some("robustness"), "todo");
+        assert_eq!(ident_of(&t, Some("render")), "robustness-010");
+        assert_eq!(ident_of(&t, None), "robustness-010");
+    }
+
+    /// The inbox is a node like any other, and the tasks under it share the
+    /// `inbox-` prefix with each other and with nothing else on screen.
+    #[test]
+    fn an_unfiled_task_is_named_by_its_number_under_the_inbox() {
+        assert_eq!(ident_of(&task("inbox-004", None, "todo"), None), "004");
+    }
+
+    /// A bare number resolves against open tasks only, so this is not a
+    /// shortening — it is an id that names nothing. Which project it was in is
+    /// then the only handle left on it.
+    #[test]
+    fn a_finished_task_is_named_in_full_because_its_number_resolves_to_nothing() {
+        let t = task("render-014", Some("render"), "done");
+        assert_eq!(ident_of(&t, Some("render")), "render-014");
+    }
+
+    /// Two projects both reach `010`, and both rows say `010` — under
+    /// different nodes, which is what separates them. The old rule read the
+    /// whole store for this collision and lengthened both rows; that made a
+    /// row's own text depend on work in projects it has nothing to do with,
+    /// and change when that work finished.
+    #[test]
+    fn a_number_two_projects_both_reached_stays_short_in_both() {
+        let (a, b) = (
+            task("render-010", Some("render"), "todo"),
+            task("robustness-010", Some("robustness"), "todo"),
+        );
+        assert_eq!(ident_of(&a, Some("render")), "010");
+        assert_eq!(ident_of(&b, Some("robustness")), "010");
+    }
 }
