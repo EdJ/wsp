@@ -83,20 +83,63 @@
 //!   reason that verb takes a description of the spawn rather than a bare flag
 //!   when it grows.
 //!
-//! Two unverified leads on addressing, both from `claude --help` and neither run
-//! live, because spawning a Claude Code to test them was outside what this
-//! session was permitted: `-n, --name <name>` sets a session's display name, and
-//! `--session-id <uuid>` fixes its id. If `-n` populates the `name` field of the
-//! listing, wsp can **mint** the handle at `agent.start` — `place.rs`'s "wsp
-//! mints the seat" move, one entry in [`Kind::args`] — and the lookup below
-//! stops being needed at all.
+//! # Minting, which is what the lookup turned out to be a fallback for
+//!
+//! The lead above — `-n, --name <name>` from `claude --help`, unrun when this
+//! file was written — was run on 2026-08-17 against Claude Code 2.1.233, and it
+//! holds: [`mint`] is now what names a spawned agent and the lookup below is
+//! what answers for agents wsp did not start. The registry those measurements
+//! read is `~/.claude/sessions/<pid>.json`, which is the same census
+//! `claude agents --json` prints.
+//!
+//! What made it worth doing was not the flag working. It was the *reason* the
+//! derived name cannot be relied on, and that reason was nearly missed, because
+//! by the time this ran t-260815-022 had given every task a worktree named after
+//! it and Claude Code's own derived name had quietly become **almost right**:
+//!
+//! - A derived name is `<basename of cwd>-<two hex digits>`, stamped
+//!   `"nameSource":"derived"`. Standing in `…/.worktrees/t-260817-014`, an agent
+//!   calls itself `t-260817-014-f6` with nobody asking it to. So the task id was
+//!   already the prefix, and minting looked redundant.
+//! - **The suffix is not stable.** Two sessions started in one directory,
+//!   seconds apart, were `nametest-45` and `nametest-4d`. So the handle is still
+//!   unknowable until after the agent exists, which is the whole of what the
+//!   lookup was for — a name that is 90% predictable buys nothing, because the
+//!   10% is the part you have to address it by.
+//! - And the prefix agrees with the task id only because a *path convention*
+//!   another task owns says so. wsp would be inferring its addressing scheme
+//!   from the shape of somebody else's directory name, and t-260815-022 is free
+//!   to rename those trees tomorrow without knowing it had broken this.
+//!
+//! An explicit `-n` overrides derivation completely and leaves `nameSource`
+//! unset, so the two are distinguishable after the fact as well as before.
+//!
+//! # Why the seat is in the handle
+//!
+//! The one thing derivation does that a task id alone does not: **Claude Code
+//! does not enforce unique names.** Two sessions started as `-n dupe-probe` both
+//! took it, with no error and no uniquifying suffix, and a duplicate name is
+//! ambiguous to address — which is the failure [`pick`] already refuses to
+//! commit. The random suffix is derivation's answer to that, and minting a bare
+//! task id would throw it away: `spawn --force` onto a task whose previous agent
+//! is still idle is two live sessions called `t-260817-014`.
+//!
+//! So the handle is the task **and** the seat, and neither half is decoration.
+//! The task id is what a person reads; the seat is what makes it unique, because
+//! herdr issues at most one live agent per pane. Both are in wsp's hand *before*
+//! [`Place::start`] is called — the port splits `open` from `start` precisely so
+//! that the seat exists before the agent does — and both are on the census row
+//! afterwards, so [`Kind::address`] can recompute the same string it minted
+//! rather than storing it anywhere.
+//!
+//! `--session-id <uuid>`, the other lead, remains unrun and is now unneeded.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-use crate::place::{Place, Refusal, Result, Seat};
+use crate::place::{Place, Refusal, Result, Seat, Seated};
 use crate::util;
 
 /// How wsp talks to one sort of agent.
@@ -111,11 +154,12 @@ use crate::util;
 pub trait Kind {
     /// The flags an agent of this kind is started with.
     ///
-    /// `full` is the way back from any trim. A trim is a capability change, so
-    /// there has to be one and it has to be a flag rather than an edit: the
-    /// agent that needs the design MCP server to draw an artefact is a real
-    /// spawn on this backlog rather than a hypothetical.
-    fn args(&self, full: bool) -> Vec<String>;
+    /// Takes a description of the spawn rather than the bare `full` flag it
+    /// started as, which the module docs predicted would happen the first time
+    /// this verb needed to know anything about *which* spawn it was arguing
+    /// about. Minting the handle is that first time: `-n` is not a constant,
+    /// it is a function of the task and the seat.
+    fn args(&self, spawn: &Spawn) -> Vec<String>;
 
     /// What this agent's own runtime calls the agent in this seat, if it can be
     /// found out.
@@ -136,6 +180,46 @@ pub trait Kind {
     /// about it; this one chooses between that and whatever the agent itself
     /// offers, and typing at a terminal is only the fallback.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<()>;
+}
+
+/// What is about to be started, as much of it as a kind is allowed to know.
+///
+/// Three fields and no store, no `Args`, no task: a kind decides flags, and a
+/// kind that could read the task would start deciding other things. `full` was
+/// the whole of this parameter before minting needed the other two.
+///
+/// `name` is the task or project id — the same string [`crate::place::Agent`]
+/// carries for the backend's own naming — and `seat` is where it is about to be
+/// started. Both are already in the caller's hand at that moment; see the
+/// module docs for why the pair is the handle rather than either alone.
+pub struct Spawn<'a> {
+    /// Keep the whole preamble: the way back from [`TRIM`].
+    pub full: bool,
+    pub name: &'a str,
+    pub seat: &'a Seat,
+}
+
+/// The handle wsp will address this agent by, decided before it exists.
+///
+/// Deterministic, and that is the entire point — the same inputs give the same
+/// string at `agent.start`, at a failed spawn's recovery sentence, and to
+/// anything later that wants to send on the session channel without asking who
+/// is there first. The module docs carry the argument for the shape; the shape
+/// is `<task>-<seat>`, which is deliberately the same `<prefix>-<suffix>`
+/// spelling Claude Code derives for itself, with a suffix that means something.
+///
+/// `None` only when there is nothing to build one from. An empty half is
+/// dropped rather than spelled as an empty string, because `t-260817-014-` and
+/// `-w2J:p1` are both names somebody would have to explain.
+pub fn mint(name: &str, seat: &Seat) -> Option<String> {
+    let parts: Vec<&str> = [name.trim(), seat.as_str().trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    match parts.is_empty() {
+        true => None,
+        false => Some(parts.join("-")),
+    }
 }
 
 /// The kind a `--kind` names, or [`Plain`] for one this file has nothing to say
@@ -162,7 +246,7 @@ pub fn of(kind: &str) -> &'static dyn Kind {
 pub struct Plain;
 
 impl Kind for Plain {
-    fn args(&self, _full: bool) -> Vec<String> {
+    fn args(&self, _spawn: &Spawn) -> Vec<String> {
         Vec::new()
     }
 
@@ -251,16 +335,53 @@ pub struct Claude;
 const TRIM: &[&str] = &["--strict-mcp-config", "--disallowedTools", "Agent", "Workflow"];
 
 impl Kind for Claude {
-    fn args(&self, full: bool) -> Vec<String> {
-        match full {
+    /// The trim, and the name.
+    ///
+    /// `-n` is outside the `full` arm on purpose. [`TRIM`] is a capability
+    /// change and `--full` is the way back from it; a handle is not a
+    /// capability, and an agent started with `--full` still has to be
+    /// addressable. Naming it costs two argv entries and nothing per request.
+    ///
+    /// **It goes last, and that it is safe there was measured rather than
+    /// assumed.** `--disallowedTools` takes a *space*-separated list, so the
+    /// trim ends in two bare words and a flag appended after them is a fair
+    /// question: `… --disallowedTools Agent Workflow -n <handle>` could as
+    /// easily have denied a tool called `-n`. Run against Claude Code 2.1.233
+    /// on 2026-08-17, that exact argv gave a session named `<handle>` which
+    /// answered that it has no `Workflow` and does have `Bash` — the name
+    /// lands, the trim still bites, and neither ate the other.
+    ///
+    /// If a flag that takes a value is ever added to [`TRIM`], this is the line
+    /// to re-check rather than the one to reorder around.
+    fn args(&self, spawn: &Spawn) -> Vec<String> {
+        let mut argv: Vec<String> = match spawn.full {
             true => Vec::new(),
             false => TRIM.iter().map(|s| (*s).to_string()).collect(),
+        };
+        if let Some(handle) = mint(spawn.name, spawn.seat) {
+            argv.push("-n".into());
+            argv.push(handle);
         }
+        argv
     }
 
+    /// What wsp called it, confirmed alive — or, for an agent wsp did not start,
+    /// what the runtime called it.
+    ///
+    /// The mint is tried first and it is still *checked* against the listing,
+    /// which is not a wasted call. This is asked on the failure path, where the
+    /// open question is whether the agent that would not take a work order is
+    /// even running: an unconfirmed handle would put "it is reachable as X" on
+    /// stderr for a session that never started, and the trait's rule is that a
+    /// wrong handle is worse than none.
+    ///
+    /// What minting buys here is that the answer is **exact** where [`pick`] can
+    /// only be probable. `pick` needs herdr to have seen the session id — which
+    /// is the whole of t-260817-010, and it often has not — and then falls back
+    /// to whoever is alone in the tree. A minted name is matched against itself.
     fn address(&self, place: &dyn Place, seat: &Seat) -> Option<String> {
         let row = place.census().ok()?.into_iter().find(|s| &s.seat == seat)?;
-        pick(&listing().ok()?, &row.session, &row.cwd)
+        resolve(&listing().ok()?, &row)
     }
 
     /// Typed at the terminal, because there is nothing else yet.
@@ -290,6 +411,23 @@ pub struct Live {
     pub name: String,
     pub cwd: String,
     pub status: String,
+}
+
+/// The handle for one seated agent, given the runtime's whole census.
+///
+/// Split from [`Kind::address`] for the reason the handbook gives about seams:
+/// `address` has to shell out for the listing, so anything decided inside it is
+/// decided where no test can reach. What is interesting is the *order*, and the
+/// order is here, taking the listing as an argument like [`pick`] does.
+///
+/// Minted first, and only if the runtime confirms a session by that name. Then
+/// [`pick`], unchanged, for every agent wsp did not start — a person's own
+/// `claude` in a pane, an agent from before this shipped, one restarted by hand.
+/// That path is byte-identical to what it was, which is why demoting it is a
+/// cheap change rather than a risky one.
+fn resolve(live: &[Live], row: &Seated) -> Option<String> {
+    let minted = mint(&row.agent.name, &row.seat).filter(|h| live.iter().any(|s| &s.name == h));
+    minted.or_else(|| pick(live, &row.session, &row.cwd))
 }
 
 /// Which live session is the one in this seat.
@@ -527,6 +665,66 @@ mod tests {
         assert_eq!(pick(&parse_listing("[]"), "s-1", "/tmp"), None);
     }
 
+    /// A seat, as the backend reports one, for arguing about [`resolve`].
+    fn seated(seat: &str, task: &str, session: &str, cwd: &str) -> Seated {
+        Seated {
+            seat: Seat::new(seat),
+            agent: Agent { kind: "claude".into(), name: task.into(), ..Agent::default() },
+            session: session.into(),
+            cwd: cwd.into(),
+            ..Seated::default()
+        }
+    }
+
+    /// The name wsp minted wins over the name the runtime would be searched for,
+    /// and it wins in exactly the case the lookup cannot answer.
+    ///
+    /// The seat here is in `/Users/edjames/claude/wsp` with two other agents, and
+    /// its session id is empty — which is t-260817-010's blind spot, herdr
+    /// unable to see a live agent without a rendered pane. `pick` has nothing to
+    /// go on and correctly refuses. A minted handle is matched against itself
+    /// and needs neither.
+    #[test]
+    fn a_minted_handle_answers_where_the_lookup_has_to_give_up() {
+        let mut live = parse_listing(CAPTURE);
+        live.push(Live {
+            session: "d28a4237-8811-42ef-b89e-34ffc2d0df9f".into(),
+            name: "t-260817-014-w2J:p1".into(),
+            cwd: "/Users/edjames/claude/wsp".into(),
+            status: "busy".into(),
+        });
+        let row = seated("w2J:p1", "t-260817-014", "", "/Users/edjames/claude/wsp");
+        assert_eq!(pick(&live, &row.session, &row.cwd), None, "three agents in one tree");
+        assert_eq!(resolve(&live, &row).as_deref(), Some("t-260817-014-w2J:p1"));
+    }
+
+    /// An agent wsp did not start is still found the way it always was.
+    ///
+    /// The demotion has to be a demotion and not a replacement: `wsp-f3` was
+    /// never minted by anything, and the pair below is the one t-260817-011
+    /// recorded as underivable. It still resolves.
+    #[test]
+    fn an_agent_wsp_did_not_name_falls_back_to_the_census_lookup() {
+        let live = parse_listing(CAPTURE);
+        let row = seated("w1:p1", "t-260817-011", "7a188ba8-7ca6-4743-921f-35fcc7079c11", "");
+        assert_eq!(resolve(&live, &row).as_deref(), Some("wsp-f3"), "the lookup still answers");
+    }
+
+    /// A handle wsp minted for an agent that is not running is not offered.
+    ///
+    /// This is the whole reason `resolve` checks the listing instead of trusting
+    /// its own arithmetic. It is asked on the failure path, where "the agent
+    /// never started" is a live possibility — and `recovery` would otherwise
+    /// print "it is reachable as t-260817-014-w2J:p1" about nothing at all.
+    #[test]
+    fn a_name_wsp_minted_for_an_agent_that_never_started_is_not_reported_as_reachable() {
+        let live = parse_listing(CAPTURE);
+        let row = seated("w2J:p1", "t-260817-014", "", "/Users/edjames/claude/wsp");
+        assert_eq!(resolve(&live, &row), None, "minted, and nothing answers to it");
+        // The seat being empty of everything is the same answer, not a panic.
+        assert_eq!(resolve(&[], &row), None);
+    }
+
     /// The trim moved and did not change, and it is still Claude Code's alone.
     ///
     /// Asserted as names rather than as a count, because the point of a denylist
@@ -535,9 +733,15 @@ mod tests {
     /// and `Bash` appearing here would be the bad change — the measurement that
     /// prompted the trim found agents doing all their reading through `sed` at
     /// ~28K, and a trim that pushes work into Bash costs more than it saves.
+    /// A spawn description, so the tests below argue about one thing each.
+    fn spawn<'a>(full: bool, name: &'a str, seat: &'a Seat) -> Spawn<'a> {
+        Spawn { full, name, seat }
+    }
+
     #[test]
     fn a_spawned_claude_is_not_given_the_two_tools_it_is_told_not_to_use() {
-        let trim = of("claude").args(false);
+        let seat = Seat::new("w2J:p1");
+        let trim = of("claude").args(&spawn(false, "t-1", &seat));
         assert!(trim.contains(&"--strict-mcp-config".to_string()), "{trim:?}");
         assert!(trim.contains(&"--disallowedTools".to_string()), "{trim:?}");
         assert!(trim.contains(&"Agent".to_string()), "sub-agents are what blew the budget: {trim:?}");
@@ -556,11 +760,55 @@ mod tests {
     /// buys a workspace with a shell in it and no agent.
     #[test]
     fn the_trim_is_claude_codes_alone_and_one_flag_undoes_it() {
-        assert!(of("claude").args(true).is_empty(), "--full is the way back");
-        assert!(of("codex").args(false).is_empty(), "not codex's spelling");
-        assert!(of("gemini").args(false).is_empty());
-        assert!(of("nonesuch").args(false).is_empty(), "an unknown kind is herdr's to refuse");
-        assert!(of("").args(false).is_empty());
+        let seat = Seat::new("w2J:p1");
+        assert_eq!(
+            of("claude").args(&spawn(true, "t-1", &seat)),
+            vec!["-n", "t-1-w2J:p1"],
+            "--full is the way back from the trim, and from nothing else"
+        );
+        for kind in ["codex", "gemini", "nonesuch", ""] {
+            assert!(
+                of(kind).args(&spawn(false, "t-1", &seat)).is_empty(),
+                "{kind} has no notion of a handle and gets no flags of wsp's"
+            );
+        }
+    }
+
+    /// **The change this task exists for.** wsp names the agent; it does not
+    /// wait to be told what the agent called itself.
+    ///
+    /// Both halves are asserted because both are load-bearing. The task id is
+    /// what a person reads off a failed spawn, and the seat is what stops two
+    /// agents on one task from answering to one name — Claude Code accepts a
+    /// duplicate `-n` in silence, which is measured in the module docs.
+    #[test]
+    fn wsp_names_a_claude_after_the_task_and_the_seat_it_is_started_in() {
+        let seat = Seat::new("w2J:p1");
+        let argv = of("claude").args(&spawn(false, "t-260817-014", &seat));
+        let at = argv.iter().position(|a| a == "-n").unwrap_or_else(|| panic!("unnamed: {argv:?}"));
+        assert_eq!(argv.get(at + 1).map(String::as_str), Some("t-260817-014-w2J:p1"));
+        // And it is the same string the recovery path will recompute, from a
+        // census row rather than from anything wsp had to remember.
+        assert_eq!(mint("t-260817-014", &seat).as_deref(), Some("t-260817-014-w2J:p1"));
+    }
+
+    /// A handle is built from what there is, and never from nothing.
+    ///
+    /// The empty cases are real: `spawn` on a project passes the project id and
+    /// `unwrap_or_default`s to `""` when there is neither, and a `Seated` the
+    /// backend could only half read has an empty agent name. `-n ""` would set
+    /// a session's display name to the empty string, which is worse than
+    /// letting it derive one.
+    #[test]
+    fn a_handle_with_no_halves_is_not_minted_and_no_flag_is_passed() {
+        assert_eq!(mint("t-1", &Seat::new("")).as_deref(), Some("t-1"));
+        assert_eq!(mint("", &Seat::new("w1:p1")).as_deref(), Some("w1:p1"));
+        assert_eq!(mint("  ", &Seat::new("  ")), None);
+        assert_eq!(mint("", &Seat::new("")), None);
+        let nowhere = Seat::new("");
+        let argv = of("claude").args(&spawn(false, "", &nowhere));
+        assert!(!argv.contains(&"-n".to_string()), "nothing to name it after: {argv:?}");
+        assert_eq!(argv, TRIM, "an unnameable agent is still a trimmed one");
     }
 
     /// A backend that records what it was asked, so the fallback can be caught

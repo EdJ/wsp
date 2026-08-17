@@ -363,7 +363,13 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
         let name = work.task.clone().or_else(|| work.project.clone()).unwrap_or_default();
         let how = agent_commands::of(&kind);
-        let agent = Agent { kind: kind.clone(), name, args: how.args(args.has("full")) };
+        // The seat is passed in because the agent is named after it, and it can
+        // be passed in because `open` has happened above: the port splits opening
+        // a seat from starting an agent in it, so wsp holds the seat before
+        // there is anything sitting there to ask. That ordering is what makes
+        // the handle knowable in advance rather than discovered afterwards.
+        let spawn = agent_commands::Spawn { full: args.has("full"), name: &name, seat: &seat };
+        let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Whatever a backend
         // has to do to make the first one true — retry a shell that is not ready,
