@@ -20,6 +20,7 @@ mod cmd_task;
 mod cmd_verify;
 mod daemon;
 mod detail;
+mod fake;
 mod fm;
 mod herdr;
 mod input;
@@ -47,7 +48,7 @@ const BOOL_FLAGS: &[&str] = &[
     // And for `install`, whose positional is the binary to install.
     "dry-run",
     // Same for `sandbox`, whose positional is a sandbox name.
-    "keep", "seed",
+    "keep", "seed", "fake",
 ];
 
 pub struct Args {
@@ -413,6 +414,10 @@ fn help() {
                                     store and state — and the exports to use it;
                                     inside it `wsp` is the binary you ran
   wsp sandbox --run "cmd" [--keep]  …or run one thing in it and take it down
+  wsp sandbox --fake [--stage F]    …or with no herdr at all: a backend that
+                                    answers the socket out of a state you write
+                                    down, so wsp can be driven through the ones
+                                    a real herdr cannot be put in
   wsp sandbox ls|rm [<name>] [--all]  what is up, and how to drop it
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]

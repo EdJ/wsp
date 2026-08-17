@@ -2200,6 +2200,54 @@ something this can do. `--seed` copies the store — projects and tasks, so `ls`
 machine state, because a claim names a workspace id that exists in nobody's
 herdr but the live one.
 
+#### `--fake`, for the states a herdr cannot be put in
+
+That residue is the whole argument for the other kind of sandbox. A herdr that
+comes up in 0.1s is not slow; what it cannot do is *be in a state you choose*,
+and every expensive bug in this store was a state — an empty pane list reaping
+every binding, a `pane.exited` cascade, a machine that stops answering mid-tick,
+pane ids reissued across a restart, twenty-two workspaces and four agents.
+
+`wsp sandbox --fake` replaces the one component that has to be real with one
+that does not. `src/fake.rs` binds the same socket and answers the same
+protocol out of a state written down in a file, so the daemon, the panel, the
+storyboard and every command run against it unchanged — nothing downstream can
+tell, which is the point.
+
+```sh
+wsp sandbox --fake --stage seats.json     # up in 0.0s; prints the same exports
+wsp sandbox --fake --run "wsp wip"        # …or one command against that state
+```
+
+```json
+{ "settle": false,
+  "quiet": "no",
+  "seats": [
+    { "agent": "claude", "name": "t-260816-080", "state": "working", "label": "robustness/080" },
+    { "state": "empty", "label": "a shell somebody opened" } ] }
+```
+
+The six states are `place.rs`'s — empty, starting, idle, working, gone,
+unknown — and the file is live: edit it and the fake diffs the world against
+what it was and pushes exactly the events that change would have raised, which
+is how the daemon's event path is driven. `quiet` is the state nothing else can
+produce: `hangs-up` answers a connection by dropping it, `never` holds it open
+and says nothing, and the difference between those two clocks is where
+`Err`-is-not-an-empty-list lives.
+
+**The fake is for wsp's reaction to a state; the herdr sandbox stays the
+contract check against real behaviour.** A fake that is wrong about herdr makes
+tests green on a lie, silently and for ever, so its replies are *generated* from
+the state through one mapping function rather than hand-written, and everything
+it asserts about herdr was recorded from a live one. Writing it that way caught
+two things `place.rs` had wrong on the first run: `State::of_herdr` decides an
+agent is starting from `interactive_ready == Some(false)`, which herdr never
+sends — for 3.3 measured seconds it sends the field *absent* with
+`launch_pending: true` — so the port maps the launch window to `idle` and would
+hand a work order to a pane still drawing its banner; and the claim that a
+listing cannot carry `interactive_ready` is true of `pane.list` and false of
+`agent.list`, which carries the same record `agent.get` does.
+
 #### A sandbox's herdr starts the plugins, and they are global
 
 This was got wrong first, and the way it was got wrong is worth more than the
@@ -2339,6 +2387,9 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/model.rs` | `Project`, `Task`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
+| `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
+| `src/arrange.rs` | the arrange-panes port: a desired set of panes, and the reconciler under it |
+| `src/fake.rs` | a backend that answers that socket out of a state we choose — `wsp sandbox --fake` |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh |
 | `src/input.rs` | terminal bytes → keys: the escape-sequence parser |

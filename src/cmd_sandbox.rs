@@ -38,10 +38,30 @@
 //! shells out to, and for `herdr-plugin/run.sh`, which checks `WSP_BIN` before
 //! `~/.local/bin/wsp`.
 //!
+//! # …or no herdr at all
+//!
+//! `--fake` swaps the one part of the instance that has to be real for one that
+//! does not: [`crate::fake`] answers the same socket out of a state written
+//! down in a file. Everything else is unchanged — same store, same state, same
+//! `wsp` shim — because the value of it is precisely that nothing downstream
+//! can tell.
+//!
+//! It is for the states a live herdr cannot be put in, which is most of the
+//! ones that have cost this store anything: a machine that stops answering
+//! mid-tick, an agent stuck in its launch window, twenty-two workspaces, a
+//! pane list that goes empty. A herdr you can start in 0.1s is not the problem
+//! and never was.
+//!
+//! The division stays explicit: **the fake is for wsp's reaction to a state,
+//! and the herdr sandbox stays the contract check against real behaviour**. A
+//! fake that is wrong about herdr makes tests green on a lie, so anything
+//! asserting what herdr *does* is recorded from a live one — see the module
+//! docs there, including the two things it found the port had wrong.
+//!
 //! # What a sandbox is not
 //!
 //! Its herdr starts empty, and manufacturing twenty-two workspaces is not a
-//! thing this can do. `--seed` copies the store — projects and tasks, so `ls`,
+//! thing this can do. (`--fake` can, which is the point of it.) `--seed` copies the store — projects and tasks, so `ls`,
 //! `tree`, `show` and the panel have something to draw — and deliberately not
 //! the machine state, because a claim names a workspace id that exists in
 //! nobody's herdr but the live one. When what you need is this machine's actual
@@ -552,11 +572,108 @@ pub fn sandbox(store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(|s| s.as_str()) {
         Some("rm" | "remove" | "stop") => rm(store, args),
         Some("ls" | "list") => ls(store, args),
+        Some("serve") => serve(args),
         Some(other) => {
             eprintln!("wsp sandbox: unknown subcommand `{other}` — try `ls` or `rm`");
             2
         }
         None => up(store, args),
+    }
+}
+
+/// `wsp sandbox serve` — be the fake, on a socket, until something kills us.
+///
+/// Not a second command surface, which is why it is a subcommand of the one
+/// that already means *an isolated instance*: `--fake` spawns this, and nobody
+/// is expected to type it. It exists as a verb at all because the fake has to
+/// outlive the process that asked for it, exactly as the herdr session does.
+fn serve(args: &Args) -> i32 {
+    let Some(socket) = args.get("socket") else {
+        eprintln!("wsp sandbox serve: --socket <path> is what it binds");
+        return 2;
+    };
+    let stage = args.get("stage").map(PathBuf::from);
+    match crate::fake::serve_forever(Path::new(&socket), stage.as_deref()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("wsp: cannot serve a fake on {socket}: {e}");
+            1
+        }
+    }
+}
+
+/// The socket a fake sandbox binds, and the marker that it is one.
+///
+/// Inside the sandbox directory rather than under `~/.config/herdr`, because
+/// there is no herdr here to own it — which is also what makes it a reliable
+/// answer to "is this sandbox a fake" for `ls`.
+fn fake_socket(dir: &Path) -> PathBuf {
+    dir.join("herdr.sock")
+}
+
+/// The stage a fake starts from, and goes on watching.
+fn stage_file(dir: &Path) -> PathBuf {
+    dir.join("stage.json")
+}
+
+/// The process that will be the fake, and the environment it gets.
+///
+/// Split out for the same reason [`child`] is: what a spawned process is handed
+/// is the thing that has gone wrong before, and the only honest check is the
+/// command itself rather than what we meant by it.
+fn fake_command(sb: &Sandbox, stage: &Path) -> Command {
+    let socket = fake_socket(&sb.dir);
+    let mut c = Command::new(&sb.bin);
+    c.args(["sandbox", "serve"])
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--stage")
+        .arg(stage)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for k in forget_keys() {
+        c.env_remove(k);
+    }
+    for (k, v) in sb.store_env() {
+        c.env(k, v);
+    }
+    c.env("HERDR_SESSION", &sb.name);
+    c.env("HERDR_SOCKET_PATH", &socket);
+    c
+}
+
+/// Start the fake and wait until its socket answers.
+///
+/// The wait is the same question `start_session` asks and for the same reason —
+/// a socket file appearing is not the same as something answering on it — but
+/// the deadline is short, because there is no process to boot here and nothing
+/// to be patient about. A fake that has not answered in two seconds is not
+/// coming.
+///
+/// `HERDR_SESSION` is put back into the child's environment on purpose, having
+/// just been stripped with the rest of the caller's. It is not a claim that
+/// there is a herdr session: it is the one handle `stop_session` and
+/// `sandbox ls` have for "which sandbox does this process belong to", and a
+/// second mechanism for the same question is how a stray ends up invisible to
+/// both — which is the defect t-260816-076 was opened for.
+fn start_fake(sb: &Sandbox, stage: &Path) -> Result<PathBuf, String> {
+    let socket = fake_socket(&sb.dir);
+    fake_command(sb, stage).spawn().map_err(|e| format!("cannot start the fake: {e}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            return Ok(socket);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the fake did not answer on {} — is `{}` the binary you meant?",
+                util::contract(&socket),
+                util::contract(&sb.bin)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -587,8 +704,31 @@ fn up(store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
+    // A fake instead of a herdr: everything above this line is the same
+    // instance — the store, the state, the `wsp` shim — and the only thing that
+    // changes is what is answering the socket. That is the whole claim of
+    // t-260816-080, and it is why this is a flag rather than a command.
+    let fake = args.has("fake");
+    let stage = stage_file(&sb.dir);
+    if fake {
+        if let Some(given) = args.get("stage") {
+            let from = util::expand(&given);
+            if let Err(e) = std::fs::copy(&from, &stage) {
+                eprintln!("wsp: cannot read the stage at {}: {e}", util::contract(&from));
+                return 1;
+            }
+        } else if let Err(e) = std::fs::write(&stage, "{\n  \"seats\": []\n}\n") {
+            eprintln!("wsp: cannot write {}: {e}", util::contract(&stage));
+            return 1;
+        }
+    }
+
     let started = Instant::now();
-    match start_session(&sb) {
+    let brought_up = match fake {
+        true => start_fake(&sb, &stage),
+        false => start_session(&sb),
+    };
+    match brought_up {
         Ok(sock) => sb.socket = sock,
         Err(e) => {
             eprintln!("wsp: {e}");
@@ -629,6 +769,8 @@ fn up(store: &Store, args: &Args) -> i32 {
                 "state": sb.state.display().to_string(),
                 "bin": sb.bin.display().to_string(),
                 "seeded": seed.is_some(),
+                "fake": fake,
+                "stage": fake.then(|| stage.display().to_string()).unwrap_or_default(),
                 "env": sb.env().into_iter().collect::<std::collections::BTreeMap<_, _>>(),
                 "unset": forget_keys(),
                 "seconds": (up_secs * 10.0).round() / 10.0,
@@ -638,7 +780,15 @@ fn up(store: &Store, args: &Args) -> i32 {
     }
 
     println!("{} {}", p.dim("sandbox"), p.bold(&sb.name));
-    println!("{} {} {}", p.dim("herdr  "), util::contract(&sb.socket), p.dim(&format!("(up in {up_secs:.1}s, empty)")));
+    println!(
+        "{} {} {}",
+        p.dim(if fake { "fake   " } else { "herdr  " }),
+        util::contract(&sb.socket),
+        p.dim(&format!("(up in {up_secs:.1}s, empty)"))
+    );
+    if fake {
+        println!("{} {} {}", p.dim("stage  "), util::contract(&stage), p.dim("(edit it; the fake pushes what changed)"));
+    }
     println!(
         "{} {} {}",
         p.dim("store  "),
@@ -663,7 +813,12 @@ fn up(store: &Store, args: &Args) -> i32 {
     }
     println!();
     println!("{} wsp <anything> — `wsp` here is the binary above", p.dim("then   "));
-    println!("{} herdr --session {}", p.dim("attach "), sb.name);
+    // A fake has nothing to attach to, and saying so is better than printing a
+    // herdr command that would open the caller's own session.
+    match fake {
+        true => println!("{} nothing to attach to — it is a state, not a terminal", p.dim("attach ")),
+        false => println!("{} herdr --session {}", p.dim("attach "), sb.name),
+    }
     println!("{} wsp sandbox rm {}", p.dim("finish "), sb.name);
     0
 }
@@ -797,10 +952,20 @@ fn ls(store: &Store, args: &Args) -> i32 {
         .iter()
         .map(|n| {
             let s = live.iter().find(|(m, _, _)| m == n);
+            // A fake has no herdr session to be found in, so its socket is the
+            // only thing that says it exists — and without this the row would
+            // read "N process(es), no session" in red, which is what a *stray*
+            // looks like. The one state this list exists to make loud must not
+            // be the one a working fake sandbox reports.
+            let fake = fake_socket(&root.join(n)).exists();
             json!({
                 "name": n,
                 "running": s.map(|(_, r, _)| *r).unwrap_or(false),
-                "socket": s.map(|(_, _, sock)| sock.display().to_string()).unwrap_or_default(),
+                "fake": fake,
+                "socket": match fake {
+                    true => util::contract(&fake_socket(&root.join(n))),
+                    false => s.map(|(_, _, sock)| sock.display().to_string()).unwrap_or_default(),
+                },
                 "dir": util::contract(&root.join(n)),
                 "orphan": !root.join(n).is_dir(),
                 "processes": running.iter().find(|(m, _)| m == n).map(|(_, c)| *c).unwrap_or(0),
@@ -818,19 +983,23 @@ fn ls(store: &Store, args: &Args) -> i32 {
     }
     for r in &rows {
         let name = r["name"].as_str().unwrap_or("");
+        let fake = r["fake"].as_bool() == Some(true);
         let state = if r["orphan"].as_bool() == Some(true) {
             p.yellow("no directory")
         } else if r["running"].as_bool() == Some(true) {
             p.green("up")
+        } else if fake {
+            p.green("up (fake)")
         } else {
             p.dim("herdr stopped")
         };
         // The process count is loud when the session is gone, because that is
-        // the state nothing else on this line would tell you about.
-        let procs = match (r["processes"].as_u64().unwrap_or(0), r["running"].as_bool()) {
-            (0, _) => String::new(),
-            (n, Some(true)) => p.dim(&format!("{n} process(es)")),
-            (n, _) => p.red(&format!("{n} process(es), no session")),
+        // the state nothing else on this line would tell you about — and a fake
+        // is exactly that shape and is not that thing.
+        let procs = match (r["processes"].as_u64().unwrap_or(0), r["running"].as_bool(), fake) {
+            (0, _, _) => String::new(),
+            (n, Some(true), _) | (n, _, true) => p.dim(&format!("{n} process(es)")),
+            (n, _, _) => p.red(&format!("{n} process(es), no session")),
         };
         println!("{:<24} {:<16} {:<22} {}", name, state, procs, p.dim(r["dir"].as_str().unwrap_or("")));
     }
@@ -1093,6 +1262,53 @@ mod tests {
             vec![901],
             "the teardown was about to kill itself or the shell that asked for it"
         );
+    }
+
+    /// A fake is a *process this sandbox started*, and everything that has ever
+    /// leaked out of a sandbox leaked because a spawned process was handed the
+    /// wrong environment. So it is checked the same way the `--run` child is:
+    /// against the command itself.
+    ///
+    /// Two things have to be true and one of them looks wrong at first glance.
+    /// The store and socket must point inside the sandbox — a fake serving the
+    /// sandbox's socket with the live store is the pair from t-260816-076. And
+    /// `HERDR_SESSION` must be *put back* after the caller's `HERDR_` variables
+    /// are stripped, because it is the only handle `stop_session` has: without
+    /// it the fake outlives the teardown and `sandbox ls` cannot see it either.
+    #[test]
+    fn the_fake_a_sandbox_starts_is_reapable_and_points_at_nothing_live() {
+        let dir = scratch("fake-env");
+        let sb = sandbox_at(&dir, "wsp-w1");
+        let c = fake_command(&sb, &stage_file(&sb.dir));
+        let env: std::collections::HashMap<String, Option<String>> = c
+            .get_envs()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .collect();
+
+        assert_eq!(
+            env.get("HERDR_SESSION").cloned().flatten().as_deref(),
+            Some("wsp-w1"),
+            "the fake cannot be reaped: nothing on it says which sandbox it belongs to"
+        );
+        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE"] {
+            let v = env.get(key).cloned().flatten().unwrap_or_default();
+            assert!(
+                v.starts_with(&sb.dir.display().to_string()),
+                "{key}={v} escapes the sandbox — a fake on the live store is the 076 pair"
+            );
+        }
+        assert_eq!(
+            env.get("HERDR_PANE_ID").cloned().flatten(),
+            None,
+            "the fake inherited the caller's pane"
+        );
+        // …and it serves inside its own directory, so `sandbox ls` can tell a
+        // fake from a stray by looking rather than by remembering.
+        assert!(fake_socket(&sb.dir).starts_with(&sb.dir));
+        assert!(stage_file(&sb.dir).starts_with(&sb.dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A sandbox with no store is a `wsp` that exits 2 on every command, so
