@@ -390,6 +390,118 @@ fn overtaken(built: u64, live_at: u64, live: Option<&Record>, ours: &Built) -> b
     }
 }
 
+// ---- what is live, asked of the file itself -----------------------------
+
+/// A binary's own account of what it was built from — the stamp `build.rs`
+/// compiles in, read back out of `wsp --version`.
+///
+/// Asked by running it, rather than by reading the record beside it or the
+/// tree it came out of. Those two describe an *install*, and both stop being
+/// true the moment somebody copies a binary about with `install -m 755`, which
+/// is how every install before `wsp install` existed was made. The stamp
+/// travels with the bytes, so this is the one question that stays answerable.
+struct Stamp {
+    /// Empty when the binary answered without one: built outside a checkout,
+    /// or built before `build.rs` existed.
+    commit: String,
+    dirty: bool,
+}
+
+/// `wsp 0.1.0 (c52f3c8+dirty)` → `Stamp`. `None` if it did not answer at all.
+fn ask(bin: &Path) -> Option<Stamp> {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let inner = text
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(inner, _)| inner.trim().to_string())
+        .unwrap_or_default();
+    let (commit, dirty) = match inner.split_once('+') {
+        Some((c, flag)) => (c.to_string(), flag.trim() == "dirty"),
+        None => (inner, false),
+    };
+    Some(Stamp { commit, dirty })
+}
+
+/// What `doctor` says about the binary every pane re-execs into.
+///
+/// Notes rather than problems, all of them, and the reason is the same one
+/// `herdr_health` gives for not calling a machine without herdr broken: being
+/// a few commits behind is the ordinary state of an installed binary between
+/// one deliberate install and the next, and a check that shows red every hour
+/// of every day is a check that gets skipped along with the ones that mean
+/// something. What is wanted here is not an alarm. It is that "is the thing I
+/// am looking at the thing I just committed" has an answer at all — the one
+/// question that would have closed 2026-08-16 in a minute rather than five
+/// hours.
+///
+/// `roots` is what the projects declare, which is why this lives where
+/// `doctor` can call it: the commit in the binary is a bare hash until some
+/// repository on this machine recognises it, and wsp knows which repositories
+/// those are because somebody wrote them down. The first root that has the
+/// commit is the one it was built in — a hash nothing here has ever seen is a
+/// binary from another machine, which is a fact and not a fault.
+pub fn health(roots: &[PathBuf], notes: &mut Vec<String>) {
+    let dst = default_dest();
+    let where_ = util::contract(&dst);
+    if !dst.is_file() {
+        notes.push(format!("nothing installed at {where_}"));
+        return;
+    }
+    let Some(stamp) = ask(&dst) else {
+        notes.push(format!("the wsp at {where_} would not answer `--version`"));
+        return;
+    };
+    notes.push(against(&stamp, roots));
+}
+
+/// The sentence itself, given a stamp and the repositories that might know it.
+fn against(stamp: &Stamp, roots: &[PathBuf]) -> String {
+    if stamp.commit.is_empty() {
+        return "installed wsp does not say what it was built from — it predates the build stamp, and one `wsp install` makes it answerable".to_string();
+    }
+
+    // ", built from a dirty tree…" is the half worth saying whether or not any
+    // root recognises the commit: a hash names a tree everybody can read, and
+    // dirt names a tree only one agent ever saw.
+    let dirt = match stamp.dirty {
+        true => ", built from a dirty tree, so it carries work nobody has committed",
+        false => "",
+    };
+    let known = roots
+        .iter()
+        .find(|r| git(r, &["cat-file", "-e", &format!("{}^{{commit}}", stamp.commit)]).is_some());
+    let Some(root) = known else {
+        return format!("installed wsp is {}, which no declared root has{dirt}", stamp.commit);
+    };
+    // One call for both directions. Behind is the ordinary case; ahead means
+    // the binary was built from a commit this checkout's HEAD has not got —
+    // an unlanded branch, or a tree that has been reset since.
+    let counts = git(root, &["rev-list", "--left-right", "--count", &format!("HEAD...{}", stamp.commit)])
+        .unwrap_or_default();
+    let mut fields = counts.split_whitespace().map(|n| n.parse::<u64>().unwrap_or(0));
+    let (behind, ahead) = (fields.next().unwrap_or(0), fields.next().unwrap_or(0));
+    let repo = util::contract(root);
+    let standing = match (behind, ahead) {
+        (0, 0) => format!("HEAD in {repo}"),
+        (0, a) => format!("{a} commit(s) {repo}'s HEAD has not got"),
+        (b, 0) => format!("{b} commit(s) behind HEAD in {repo}"),
+        (b, a) => format!("{b} commit(s) behind HEAD in {repo}, and {a} it has not got"),
+    };
+    let fix = match behind > 0 || stamp.dirty {
+        true => " — `wsp verify --release` then `wsp install`",
+        false => "",
+    };
+    format!("installed wsp is {} — {standing}{dirt}{fix}", stamp.commit)
+}
+
 // ---- the copy ----------------------------------------------------------
 
 /// Put `bytes` at `dst` and prove they arrived.
@@ -1015,6 +1127,101 @@ mod tests {
         // …and the record survives it, so the next install still knows who was
         // here before.
         assert_eq!(history(&dst).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A binary that answers `--version` with a hash, and one that does not.
+    ///
+    /// Asked by running the file, which is the whole claim: the record beside
+    /// a binary describes an install and stops being true the moment somebody
+    /// copies the bytes somewhere else, and the stamp does not.
+    #[test]
+    fn what_a_binary_carries_is_asked_of_the_binary() {
+        let dir = scratch("stamp");
+        let fake = |name: &str, says: &str| {
+            let p = dir.join(name);
+            fs::write(&p, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+
+        let s = ask(&fake("dirty", "wsp 0.1.0 (c52f3c8+dirty)")).expect("it did not answer");
+        assert_eq!(s.commit, "c52f3c8");
+        assert!(s.dirty, "the +dirty half was dropped, which is the half that matters");
+
+        let s = ask(&fake("clean", "wsp 0.1.0 (c52f3c8)")).expect("it did not answer");
+        assert_eq!((s.commit.as_str(), s.dirty), ("c52f3c8", false));
+
+        // Every wsp installed before `build.rs` existed. It answers, and what
+        // it says is that it cannot say — which is a different thing from a
+        // binary that will not run, and is reported differently.
+        let s = ask(&fake("old", "wsp 0.1.0")).expect("an unstamped binary should still answer");
+        assert!(s.commit.is_empty());
+        assert!(
+            against(&s, &[]).contains("predates the build stamp"),
+            "{}",
+            against(&s, &[])
+        );
+
+        assert!(ask(&dir.join("absent")).is_none(), "a binary that is not there answered");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The question the whole task is about: is what is installed what was
+    /// last committed. A hash on its own cannot say — it needs a repository
+    /// that recognises it, which is why `doctor` passes in the roots the
+    /// projects declare rather than this hunting for checkouts.
+    #[test]
+    fn an_installed_binary_is_placed_against_the_head_of_the_tree_that_knows_it() {
+        let dir = scratch("standing");
+        let repo = dir.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "--quiet", "-b", "master"]);
+        let commit = |n: &str| {
+            fs::write(repo.join("f.txt"), format!("{n}\n")).unwrap();
+            run(&["add", "f.txt"]);
+            run(&["commit", "--quiet", "-m", n]);
+            git(&repo, &["rev-parse", "--short", "HEAD"]).unwrap().trim().to_string()
+        };
+        let first = commit("one");
+        let roots = vec![repo.clone()];
+
+        let stamp = |c: &str, dirty: bool| Stamp { commit: c.to_string(), dirty };
+        let at_head = against(&stamp(&first, false), &roots);
+        assert!(at_head.contains("HEAD"), "{at_head}");
+        assert!(!at_head.contains("behind"), "a binary at HEAD was reported as behind: {at_head}");
+
+        commit("two");
+        let behind = against(&stamp(&first, false), &roots);
+        assert!(behind.contains("1 commit(s) behind HEAD"), "{behind}");
+        assert!(behind.contains(&util::contract(&repo)), "it did not say which tree: {behind}");
+
+        // Dirt is the load-bearing half: the five hours on 2026-08-16 went on a
+        // binary carrying two finished features that no commit held, and a
+        // hash describes everything about a build except that.
+        let dirty = against(&stamp(&first, true), &roots);
+        assert!(dirty.contains("nobody has committed"), "{dirty}");
+
+        // A commit no checkout here has ever seen — a binary from another
+        // machine. A fact, not a fault, and never dressed up as a comparison
+        // that was not made.
+        let elsewhere = against(&stamp("0a2c9e2", false), &roots);
+        assert!(elsewhere.contains("no declared root has"), "{elsewhere}");
+        assert!(!elsewhere.contains("behind"), "{elsewhere}");
         let _ = fs::remove_dir_all(&dir);
     }
 

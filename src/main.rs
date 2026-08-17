@@ -46,6 +46,30 @@ mod util;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The short commit this binary was built from, or empty when the tree it was
+/// built in was not a git checkout. `build.rs` carries the argument for why
+/// these exist at all.
+pub const COMMIT: &str = env!("WSP_COMMIT");
+
+/// Whether that tree held work no commit does. `+dirty` is the load-bearing
+/// half of the stamp: a commit hash describes everything about a build except
+/// the patch sitting on top of it, and the patch is what goes missing.
+pub const DIRTY: bool = matches!(env!("WSP_DIRTY").as_bytes(), b"1");
+
+/// `0.1.0`, `0.1.0 (c52f3c8)`, or `0.1.0 (c52f3c8+dirty)`.
+///
+/// Printed by `--version` and by the help, which is the version string most
+/// people actually see — an agent that runs `wsp help` to find a verb should
+/// not have to run a second command to learn whether the binary answering is
+/// the one somebody just installed.
+pub fn version() -> String {
+    match (COMMIT.is_empty(), DIRTY) {
+        (true, _) => VERSION.to_string(),
+        (false, false) => format!("{VERSION} ({COMMIT})"),
+        (false, true) => format!("{VERSION} ({COMMIT}+dirty)"),
+    }
+}
+
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
@@ -347,7 +371,7 @@ fn main() {
     let args = Args::parse(argv);
 
     if args.has("version") || args.cmd == "version" {
-        println!("wsp {VERSION}");
+        println!("wsp {}", version());
         return;
     }
     if args.cmd.is_empty() || args.cmd == "help" || args.has("help") {
@@ -464,7 +488,7 @@ fn help() {
     let p = util::Paint::new();
     let h = |s: &str| p.bold(s);
     println!(
-        r#"{name} {VERSION} — workspace and task control plane for herdr
+        r#"{name} {version} — workspace and task control plane for herdr
 
 {projects}
   wsp init                          create the store at ~/wsp
@@ -631,6 +655,7 @@ Every command takes --json. Set WSP_HOME to relocate the store.
 --terse, or WSP_TERSE=1 for a whole session, leaves out what you already have:
 the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
         name = h("wsp"),
+        version = version(),
         projects = h("PROJECTS"),
         tasks = h("TASKS"),
         agents = h("AGENTS"),
@@ -709,6 +734,36 @@ mod tests {
         let missing: Vec<&Vec<String>> =
             arms.iter().filter(|names| !names.iter().any(|n| named(n))).collect();
         assert!(missing.is_empty(), "verbs the help never mentions: {missing:?}");
+    }
+
+    /// A stamp nothing checks is a stamp that can quietly stop being taken,
+    /// which is this task's own history: it was marked done once with no
+    /// `build.rs` in the tree at all, and `wsp --version` went on saying
+    /// `0.1.0` for a day with nobody able to tell from the output that
+    /// anything was missing. So the test is not that the string has the right
+    /// shape — it is that when this is built where it is developed, in a
+    /// checkout, the build actually put a commit in it.
+    ///
+    /// Guarded on the tree being a checkout, because a build from an unpacked
+    /// tarball is allowed to have no stamp, and `build.rs` says so.
+    #[test]
+    fn a_binary_built_in_a_checkout_knows_which_commit_it_is() {
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(["rev-parse", "--short", "HEAD"])
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let Some(head) = head.filter(|h| !h.is_empty()) else { return };
+
+        assert_eq!(super::COMMIT, head, "the build stamped a commit the tree does not have");
+        let v = super::version();
+        assert!(v.starts_with(super::VERSION), "{v}");
+        assert!(v.contains(&format!("({head}")), "the version does not carry the commit: {v}");
+        assert_eq!(v.contains("+dirty"), super::DIRTY, "the dirt flag and the string disagree: {v}");
     }
 
     /// The flag is the whole point and the variable is how a session sets it

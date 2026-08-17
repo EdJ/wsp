@@ -2866,6 +2866,11 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // And the binary those trees were built into, which is the one file none
+    // of the checks above can see: the stamp travels in the bytes, so it is
+    // asked of the installed wsp rather than worked out from a tree.
+    crate::cmd_install::health(&seen, &mut notes);
+
     for t in &tasks {
         if let Some(proj) = &t.project {
             if index.get(proj).is_none() {

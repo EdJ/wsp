@@ -2470,6 +2470,7 @@ spot of the check we were relying on at the time.
 | `wsp doctor` | a shared index holding something older than HEAD, in any declared project root | a shared index holding something *newer* — staged work is indistinguishable from staged work |
 | `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one |
 | `wsp install` | a second install while one is in flight, and a build older than what is already live | what the live binary *contains*, if somebody installed it by hand — the record beside it describes wsp's own installs and admits when it no longer matches |
+| `wsp --version`, and `wsp doctor` against it | which commit is live, however it got there, and whether it carries work no commit holds | what that work *was* — `+dirty` names no files, and the tree it came out of may be gone |
 
 ### The index nobody looks at
 
@@ -2779,12 +2780,28 @@ What it does not do is build, and it does not decide *when*. Installing is timed
 around the other agents being idle, and that is a judgement no lock replaces;
 the lock is for the case where two people made it at once.
 
-What it still cannot answer is what the *live* binary contains. The record
-describes what wsp put there and says so plainly when the file no longer matches
-it — every install before this command was a hand-run `install -m 755`, which
-writes nothing down. The commit stamped into the binary itself is
-`t-260816-050`; until that ships, "which of these three commits is live" is
-answered by the record beside the file rather than by the file.
+What the live binary contains, it now says itself. `build.rs` stamps the commit
+in and `wsp --version` prints it — `wsp 0.1.0 (c52f3c8+dirty)`, where the `+`
+half is the load-bearing one: a hash describes everything about a build except
+the patch sitting on top of it, and the patch is what goes missing. `wsp doctor`
+puts that stamp against the HEAD of whichever declared root recognises the
+commit, and says the honest thing:
+
+    · installed wsp is c52f3c8 — 3 commit(s) behind HEAD in ~/claude/wsp
+      — `wsp verify --release` then `wsp install`
+
+A note rather than a problem, always. Being a few commits behind is the ordinary
+state of an installed binary between one deliberate install and the next, and a
+check that shows red every hour of every day gets skipped along with the ones
+that mean something. The point is not the version string; it is that "is the
+thing I am looking at the thing I just committed" has an answer, which is the
+one check that would have closed 2026-08-16 in a minute rather than five hours.
+
+The stamp travels in the bytes, so a binary copied to another machine by hand
+still answers. The record beside the file keeps what only it knows — who
+installed it, when, and why — and still admits when the file no longer matches
+it, because every install before this command was a hand-run `install -m 755`,
+which writes nothing down.
 
 ### `wsp checkout`, because the tree itself was the shared thing
 
@@ -2853,7 +2870,8 @@ possible before the fact; saying it out loud is what makes it work.
 
 | File | Responsibility |
 |---|---|
-| `src/main.rs` | argument parsing, dispatch, help |
+| `build.rs` | the commit and the dirt of the tree it was built in, stamped into the binary |
+| `src/main.rs` | argument parsing, dispatch, help, the version string |
 | `src/store.rs` | atomic writes, `O_EXCL` id allocation, git, state, hooks |
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, status/priority vocabulary |
