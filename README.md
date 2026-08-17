@@ -84,6 +84,7 @@ next one to sweep up, because now nothing will.
 ```sh
 wsp add "Port the reverb fix" -p trance --prio high
 wsp ls                      # open tasks for the project you're standing in
+wsp find tuning             # …and the ones a word is in, title or prose
 wsp inbox                   # tasks with no project
 wsp start 003               # ids accept a bare suffix or a title substring
 wsp block 003 "waiting on the tuning table decision"
@@ -140,7 +141,8 @@ It must never go back to `layout.apply`: herdr rebuilds the whole tree from
 that call and every pane in it gets a fresh terminal, which takes down any
 agent running in the workspace.
 
-Keys: `j`/`k` move, `←`/`→` fold, `↵` opens the row in the detail pane (and
+Keys: `j`/`k` move, `←`/`→` fold, `/` narrows the tree to what a word is in,
+`↵` opens the row in the detail pane (and
 closes it again), `esc` closes it, `Z` opens the whole tree in a tab of its own
 and closes it again, `E` pops the row's file out into an editor tab, `1`-`9`
 jump straight to an agent, `A` shows finished tasks, `R` narrows to what needs
@@ -240,10 +242,10 @@ the rows it exists for. Like the key map, it takes those rows out of the tree's
 and gives them back when you press `F` again.
 
 `q` and `esc` both mean "put away what is in front of me": the key map first,
-then the detail pane. Neither quits the panel — it is installed furniture in
-every workspace, so losing one to a stray keystroke costs a reinstall and buys
-nothing. `ctrl-c` still quits, and `wsp panel uninstall` is the deliberate way
-out.
+then a search, then the detail pane. Neither quits the panel — it is installed
+furniture in every workspace, so losing one to a stray keystroke costs a
+reinstall and buys nothing. `ctrl-c` still quits, and `wsp panel uninstall` is
+the deliberate way out.
 
 `?` docks the key map under the tree, and `?` or `esc` puts it away — a footer
 line fits four of the two dozen keys, which is worse than showing none, because
@@ -254,6 +256,75 @@ it is up**: the cursor keeps its row and every key still does what the map says
 it does, so you can read `b` and press it on the task you were already looking
 at. The tree simply has fewer rows to work with, and never lets the map push
 the cursor off the bottom of them.
+
+### Finding one task in three hundred
+
+Ed, on the day the store passed two hundred and seventy-six tasks across
+thirty-one projects: *"I'm struggling to find issues in this list now we have
+literally hundreds."* `/` in the panel and `wsp find` at a shell are the two
+halves of the answer, and they are the same search.
+
+```sh
+wsp find tuning              # the project you're standing in, and under it
+wsp find "tuning table" -a   # …or the whole store, finished work included
+```
+
+It looks in the **title, the id and the prose**. The prose is not an extra:
+most of what separates one task from another here is written under the title
+rather than in it — a house style with 73,854 tokens of evidence behind it — so
+a search over titles alone would answer confidently and wrongly. What you type
+is one phrase matched whole, not words matched separately: `find tuning table`
+means those two words in that order.
+
+Ids are searched because an id is on the row you are reading, and since one
+carries its project — `render-048` — a project's slug finds its work as a side
+effect of that rather than as a rule of its own.
+
+A `grep` over the tasks every command already reads, and it stays that way. No
+ranking, no scoring, no index — at this size an index buys nothing measurable
+and costs a second source of truth to keep current, which is the one thing this
+store must not grow.
+
+`wsp find` is scoped to the project you are standing in, because hits from
+`vst` while you are working in `robustness` are noise. The half that makes a
+default scope safe is what it says when it finds nothing: how many matches are
+somewhere else, how many are finished, or how many are in the archive — and
+which key widens it. A scope you cannot see past is a dead end, and a dead end
+is what sends somebody back to reading the whole list. Every hit carries its
+status and its project, and a hit whose *title* does not hold the phrase
+carries the line of prose that put it there.
+
+The list stops at twenty and says how many more there are — a short word over a
+store this size answers with a hundred rows, and most of what runs this is an
+agent paying for every one of them in context for the rest of the session. The
+count in the header is the whole answer either way, so a phrase that was too
+broad says so before you have read a line of it. `--full` prints all of them,
+and `--json` is never capped.
+
+In the panel, `/` narrows the tree on every keystroke — the answer is the tree
+itself rather than something you get after pressing return — and the footer
+counts what is left. There is no scope: the panel is the whole tree, which is
+the point, since the test this was written against is finding a task from one
+word of it without knowing which project it is in. `↵` stops the typing and
+leaves the filter on, so `s`, `c`, `S` and the rest go on meaning what they
+mean on the rows it found; `esc` clears it; `/` again opens holding the phrase,
+so a search is widened with a backspace rather than retyped.
+
+While it is up, folds and the six-task cap are set aside — a search whose
+answer is behind a fold is a search that says there is nothing — and nothing is
+*unfolded*, so the tree comes back exactly as you left it. Seats, shells, the
+`no project` group and a project's own counts go with them: those are questions
+about places and people, and this one is about work. The strip and the agents
+at the foot stay, because they are the census and a census that went quiet
+under a filter is one you learn to distrust.
+
+The filter is the one thing in the view the panels do not share. Folds, `A`,
+`R`, `w` and the cursor all travel, so the panel you switch into is showing
+what the one you left was showing; a search does not, because it is a question
+asked a second ago rather than a mode you settle into — and the key that
+answers it is often `S`, which sends you to another workspace, where a tree
+narrowed to a phrase you typed somewhere else would read as a panel that had
+broken.
 
 ### How the tree scrolls
 

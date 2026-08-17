@@ -298,6 +298,7 @@ fn main() {
 
         "add" | "new" => cmd_task::add(&store, &args),
         "ls" | "list" => cmd_task::list(&store, &args),
+        "find" | "search" => cmd_task::find(&store, &args),
         "inbox" => cmd_task::inbox(&store, &args),
         "show" | "cat" => cmd_task::show(&store, &args),
         "decide" => cmd_task::decide(&store, &args),
@@ -396,6 +397,13 @@ fn help() {
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]
   wsp add "title" --parent <id>     a sub-task, filed where its parent is
   wsp ls [-p proj] [-t tag] [-s status] [--all]
+  wsp find <text> [-p proj] [--all] [--full]
+                                    every task the words are in — the title or
+                                    the prose; the project you are in unless
+                                    --all, and it says when the answer is
+                                    somewhere you did not look. Stops at 20
+                                    hits and says how many more; --full for
+                                    all of them
   wsp inbox                         tasks with no project
   wsp show <id>                     full task, including notes
   wsp start|review|reopen <id>      move through the workflow

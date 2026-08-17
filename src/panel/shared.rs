@@ -10,6 +10,19 @@
 //! which detail pane *this* workspace has open, and `land_on` is a one-shot.
 //! Carrying any of those across would be worse than the reset it is fixing.
 //!
+//! `filter` — what `/` narrows the tree to — is the fourth, and it is the one
+//! that had to be argued rather than being obvious. It looks like `A` and `R`:
+//! it changes which rows exist, which is this file's whole test. What separates
+//! it is how long it lives. Those two are switches somebody sets and works
+//! under for an afternoon; a search is a question asked a second ago and
+//! answered by the next keypress, and the key that answers it is often `S` or
+//! `c` — which sends the keyboard to another workspace, where a tree narrowed
+//! to a phrase you typed somewhere else, about work you have just handed on,
+//! is not the panel you left. It is four keystrokes to ask again and `esc` to
+//! be rid of, so the cost of getting this wrong is asymmetric: a search that
+//! does not travel costs a retype, and one that does costs a panel that looks
+//! broken in twenty-one places at once.
+//!
 //! `scroll` *is* carried, which it was not at first and should have been. The
 //! tree has a scroll offset of its own now, and the cursor no longer says where
 //! it sits: the same row can be at the top of one pane and at the foot of
@@ -435,6 +448,32 @@ mod tests {
         ] {
             assert_eq!(target_from_json(&target_to_json(&t)), t, "{t:?} did not survive");
         }
+    }
+
+    /// The search stays in the pane it was typed in — the one field of `View`
+    /// that changes which rows exist and is deliberately left behind. The
+    /// argument is at the top of this file; this is the assertion that keeps it
+    /// from being quietly reversed by somebody adding "the missing field".
+    #[test]
+    fn a_search_does_not_follow_you_to_another_panel() {
+        let mut v = View::default();
+        v.filter = "tuning".into();
+        let shared = Shared::of(&v, Target::Task("verb-006".into()));
+        assert!(!rendered(&shared).contains("tuning"), "the phrase was written to the file");
+
+        let mut fresh = View::default();
+        Shared::from_json(&shared.to_json()).apply(&mut fresh);
+        assert!(fresh.filter.is_empty(), "the search travelled");
+
+        // And adopting somebody else's view does not clear a search of your
+        // own: this panel is the one being typed in, and a fold arriving from
+        // next door must not take the tree back out from under it.
+        let mut mine = View::default();
+        mine.filter = "tuning".into();
+        Shared::from_json(&Shared::of(&view_with(&["audio"], false), Target::Nothing).to_json())
+            .apply(&mut mine);
+        assert_eq!(mine.filter, "tuning");
+        assert!(mine.collapsed.contains("audio"), "the rest of the view still travels");
     }
 
     /// A missing or unreadable file is the first run, not an error.

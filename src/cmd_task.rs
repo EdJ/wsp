@@ -199,6 +199,185 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// `wsp find <text>` — the store's finding aid.
+///
+/// Ed, 2026-08-17: *"I'm struggling to find issues in this list now we have
+/// literally hundreds."* Two hundred and seventy-six tasks across thirty-one
+/// projects, and until this the only way to look for one you half-remembered
+/// was `wsp ls` with a project filter, and reading.
+///
+/// A `grep` over the tasks the store has already read, and deliberately
+/// nothing more. No ranking, no scoring, no index: at this size an index would
+/// buy nothing measurable and cost a second source of truth to keep current,
+/// which is the one thing this store must not grow. If it ever needs one it
+/// has stopped being basic.
+///
+/// Scoped the way [`list`] is — the project you are standing in, `--all` to
+/// widen — because a search from inside `robustness` that answers with `vst`
+/// is noise. The half that makes a scope safe is the line at the bottom: when
+/// the scope has nothing and the store does, it says how many and what to
+/// type. A default scope you cannot see past is a dead end, and a dead end is
+/// what sends somebody back to reading the whole list.
+pub fn find(store: &Store, args: &Args) -> i32 {
+    let needle = args.text(0);
+    let needle = needle.trim();
+    if needle.is_empty() {
+        eprintln!("usage: wsp find <text> [-p project] [-s status] [--all]");
+        return 2;
+    }
+
+    let index = Index::new(store.projects());
+    let scope = if args.has("all") && !args.has("project") {
+        None
+    } else {
+        match current_project(store, args, &index) {
+            Ok(p) => p,
+            Err(code) => return code,
+        }
+    };
+
+    let hits: Vec<Task> = filtered(store, args, &index, scope.clone())
+        .into_iter()
+        .filter(|t| t.matches(needle))
+        .collect();
+
+    if args.json() {
+        let out: Vec<_> = hits.iter().map(|t| t.json()).collect();
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return 0;
+    }
+
+    let p = Paint::new();
+    if hits.is_empty() {
+        println!("{}", p.dim(&nothing(store, &index, args, scope.as_deref(), needle)));
+        return 0;
+    }
+
+    let where_ = match &scope {
+        Some(s) => format!(" in {s}"),
+        None => String::new(),
+    };
+    println!("{}", p.dim(&format!("{} matching \"{needle}\"{where_}", hits.len())));
+
+    // A short word over a store this size answers with a hundred rows, and
+    // most of what runs this is an agent that pays for every one of them in
+    // context on every request afterwards. So the list stops, and says it has.
+    // The order is the same one `ls` uses — what is in flight first — so what
+    // is cut is the tail of the backlog rather than an arbitrary slice.
+    //
+    // The count above is the *whole* answer either way, which is what makes a
+    // cut list honest: you can see that the phrase was too broad before you
+    // have read a line of it. `--json` is uncapped, because a caller parsing
+    // this is not reading it.
+    let shown = match args.has("full") {
+        true => hits.len(),
+        false => hits.len().min(FIND_MAX),
+    };
+    print_hits(&hits[..shown], needle, &p);
+    if shown < hits.len() {
+        println!(
+            "{}",
+            p.dim(&format!("  … {} more · wsp find {} --full", hits.len() - shown, quoted(needle)))
+        );
+    }
+    0
+}
+
+/// Hits printed before the list says how many it is not printing. Twenty is
+/// most of a terminal once the prose lines are counted, and past that a search
+/// is telling you to narrow the phrase rather than to scroll.
+const FIND_MAX: usize = 20;
+
+/// The phrase as it would have to be typed back. A suggested command that has
+/// to be edited before it runs is one nobody runs.
+fn quoted(needle: &str) -> String {
+    match needle.contains(char::is_whitespace) {
+        true => format!("\"{needle}\""),
+        false => needle.to_string(),
+    }
+}
+
+/// What to say when the search found nothing, which is the answer a scoped
+/// search most often owes an explanation for.
+///
+/// The scope is a default nobody typed, so "no" on its own is a dead end: it
+/// reads as "that task does not exist" when what it means is "not here". So
+/// this looks once more, without the scope and without the status filter, and
+/// says which of the two was in the way — and then, when the store genuinely
+/// has nothing, whether the archive does. `--all` widens both at once, so both
+/// halves point at the same key.
+///
+/// Only when nothing was found: three passes over the tasks already in memory,
+/// on a search that has otherwise printed a blank.
+///
+/// An explicit `-s` or `-t` is left alone. Those are filters somebody typed and
+/// can see; guessing at them would produce a sentence about `--all` that is not
+/// true of what `--all` would do with the flags still on.
+fn nothing(store: &Store, index: &Index, args: &Args, scope: Option<&str>, needle: &str) -> String {
+    let matched: Vec<Task> = store.tasks().into_iter().filter(|t| t.matches(needle)).collect();
+    let narrowed = args.has("status") || args.has("tag");
+    let typed = quoted(needle);
+    if !narrowed {
+        let ids = scope.map(|s| index.subtree(s));
+        let inside = |t: &Task| match &ids {
+            Some(ids) => t.project.as_ref().map(|p| ids.contains(p)).unwrap_or(false),
+            None => true,
+        };
+        let elsewhere = matched.iter().filter(|t| !inside(t)).count();
+        if let (Some(s), 1..) = (scope, elsewhere) {
+            return format!(
+                "nothing matching \"{needle}\" in {s} — {elsewhere} elsewhere · wsp find {typed} --all"
+            );
+        }
+        let finished = matched.iter().filter(|t| inside(t) && !t.status().is_open()).count();
+        if finished > 0 {
+            return format!(
+                "nothing open matching \"{needle}\" — {finished} finished · wsp find {typed} --all"
+            );
+        }
+    }
+    // Nothing live at all. A task can still be in the archive, which is where
+    // `done` work goes after thirty days — and "I know I wrote that down" is
+    // exactly the search that ends there.
+    match store.archived_tasks().iter().filter(|t| t.matches(needle)).count() {
+        0 => format!("nothing matching \"{needle}\""),
+        n => format!("nothing matching \"{needle}\" — {n} in the archive"),
+    }
+}
+
+/// A hit list is not a tree: the rows come from wherever they come from, so
+/// each carries its project, and none is indented under a parent that may not
+/// be in the list at all.
+///
+/// The second line is the whole reason prose is searched. A row whose title
+/// says nothing about what you typed looks like a mistake until it shows the
+/// line that put it there — and that line is usually the answer to "which of
+/// these is the one", which is the actual question a search is asked.
+fn print_hits(hits: &[Task], needle: &str, p: &Paint) {
+    let idw = hits.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
+    for t in hits {
+        let st = match t.status() {
+            Status::Doing => p.cyan(&util::pad("doing", 8)),
+            Status::Blocked => p.red(&util::pad("blocked", 8)),
+            Status::Review => p.yellow(&util::pad("review", 8)),
+            other => p.dim(&util::pad(other.as_str(), 8)),
+        };
+        println!(
+            "  {} {} {} {}{}",
+            p.dim(&util::pad(&t.id, idw)),
+            st,
+            paint_prio(p, t.priority()),
+            util::truncate(&t.title, 62),
+            p.dim(&format!("  [{}]", t.project.clone().unwrap_or_else(|| "inbox".into())))
+        );
+        if !t.title.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()) {
+            if let Some(line) = t.prose_line(needle, 70) {
+                println!("  {}{}", " ".repeat(idw + 1), p.dim(&line));
+            }
+        }
+    }
+}
+
 pub fn inbox(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
     let mut tasks: Vec<Task> = store
@@ -1499,6 +1678,51 @@ mod tests {
         t.priority_raw = level.into();
         store.save_task(&t).unwrap();
         t
+    }
+
+    /// A scope nobody typed has to be able to say what it hid.
+    ///
+    /// `find` defaults to the project you are standing in, which is right —
+    /// hits from `vst` while you are working in `robustness` are noise. But the
+    /// person searching did not choose that scope and cannot see it, so "no"
+    /// on its own reads as "that task does not exist" when it means "not here".
+    /// A finding aid that can send you away empty from a store which holds the
+    /// answer is the dead end this whole task was filed about.
+    #[test]
+    fn a_search_that_found_nothing_here_says_where_it_is() {
+        let store = scratch("find-nothing");
+        for id in ["wsp", "verb"] {
+            store.save_project(&crate::model::Project::new(id)).unwrap();
+        }
+        let mut t = Task::new("Retune the early reflections", "verb-001");
+        t.project = Some("verb".into());
+        t.status_raw = "done".into();
+        t.body = "## Overview\nThe reverb tail is right and the first 40 ms is not.\n".into();
+        store.save_task(&t).unwrap();
+
+        let index = Index::new(store.projects());
+        let args = Args::synth("find", &["reverb"], &[]);
+
+        let said = nothing(&store, &index, &args, Some("wsp"), "reverb");
+        assert!(said.contains("1 elsewhere"), "{said}");
+        assert!(said.contains("--all"), "it has to say which key widens it: {said}");
+
+        // In scope but finished. `--all` is the same answer, so it is the same
+        // sentence — what changes is which of the two defaults was in the way.
+        let said = nothing(&store, &index, &args, Some("verb"), "reverb");
+        assert!(said.contains("nothing open"), "{said}");
+        assert!(said.contains("1 finished") && said.contains("--all"), "{said}");
+        // …and it is only a guess worth making with no `-s` or `-t` on the
+        // line. Those are filters somebody typed and can see, and `--all` does
+        // not take them off, so a sentence about `--all` would not be true.
+        let narrowed = Args::synth("find", &["reverb"], &[("status", "doing")]);
+        assert!(!nothing(&store, &index, &narrowed, Some("verb"), "reverb").contains("finished"));
+
+        // Gone from the list entirely, which is where a task you half-remember
+        // most often is: retired, and still the one you meant.
+        store.archive_task(&t).unwrap();
+        let said = nothing(&store, &index, &args, None, "reverb");
+        assert!(said.contains("1 in the archive"), "{said}");
     }
 
     /// The floor this verb exists for: a level set at `add` used to be the

@@ -828,6 +828,27 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .key(Key::Char('/'))
+            .type_in("tuning")
+            .scene(
+                "Finding it by one word",
+                "`/` narrows the tree to the tasks a phrase is in, and narrows it on every keystroke — the answer is the tree itself rather than something you get after pressing return. Here two tasks in two different projects, found without knowing either. That is the whole requirement: with two hundred and seventy-six tasks across thirty-one projects, the list stopped being something anybody could read down. Folds and the six-task cap are set aside while it is up, because a search whose answer is behind a fold is a search that says there is nothing — and nothing is *unfolded*, so the tree comes back exactly as you left it. Seats, shells and the counts on a project row go with them: those are questions about places and people, and this one is about work.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .key(Key::Char('/'))
+            .type_in("plate")
+            .key(Key::Enter)
+            .scene(
+                "…including the word that is only in the prose",
+                "Nothing in this title mentions a plate; the line that put the row here is in the task's overview. Most of what distinguishes one task from another in this store is written under the title rather than in it, so a search over titles alone would answer confidently and wrongly — which is worse than not searching. `↵` stops the typing and leaves the filter on, so every key goes on meaning what it means and the hits are rows you can `s`, `c` or `S`. The footer wears the phrase for as long as it is up, and `esc` puts the tree back.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
             .key(Key::Char('i'))
             .scene("Showing ids", "i puts the id in front of each title — the thing you type at a shell, next to the thing you read. Off by default because most of an id is the project it is in, and the row is already sitting under that project's node. So the number alone is what shows: it is all `wsp start 003` needs, and all that separates the row from its siblings, since tasks are numbered inside their own project. The prefix comes back wherever the row is drawn away from that node — a flat list, a search, a dock — because there it is the half that says which task this is."),
     );
@@ -2276,6 +2297,136 @@ mod tests {
         let tree = ui.rows_for_test() - ui.dock_for_test();
         let (_, at, _) = seen.iter().find(|(d, _, _)| *d == 1).expect("no 1");
         assert!(*at >= tree, "the first digit belongs to the pinned section");
+    }
+
+    /// The whole of what `/` is for, stated as the test Ed set: find a task
+    /// from one word of it, from the panel, without knowing which project it
+    /// is in. Here one word reaches two tasks in two different projects, and
+    /// takes everything else off the tree.
+    #[test]
+    fn one_word_finds_the_work_wherever_it_is_filed() {
+        let w = world();
+        let (ui, _) = showing(&w, &[Key::Char('/')]);
+        let all = ui.rows_for_test();
+
+        let (ui, _) = showing(&w, &keyed("/tuning"));
+        let titles: Vec<String> =
+            (0..ui.rows_for_test()).map(|i| panel::render_row_for_test(&ui, i, W).text()).collect();
+        let tree: Vec<&String> = titles.iter().take(ui.rows_for_test() - ui.dock_for_test()).collect();
+
+        assert!(ui.rows_for_test() < all, "the tree did not narrow at all");
+        assert!(
+            tree.iter().any(|l| l.contains("Apply reverb fixes")),
+            "the hit in trance is missing: {tree:#?}"
+        );
+        assert!(
+            tree.iter().any(|l| l.contains("Waiting on the tuning tab")),
+            "the hit in verb is missing: {tree:#?}"
+        );
+        // And nothing that is not a hit or a branch on the way to one. `wsp`
+        // is the fixture's biggest project and holds none of them.
+        assert!(!tree.iter().any(|l| l.contains("Panel work item")), "{tree:#?}");
+        assert!(!tree.iter().any(|l| l.contains("Buy new monitor")), "{tree:#?}");
+    }
+
+    /// A search over titles alone would answer confidently and wrongly. Most of
+    /// what separates one task from another here is written under the title:
+    /// this fixture's `verb` task says nothing about a plate, and its overview
+    /// is where the comparison against one is written down.
+    #[test]
+    fn a_word_only_the_prose_holds_still_puts_the_row_on_the_tree() {
+        let w = world();
+        let (ui, _) = showing(&w, &keyed("/plate"));
+        let tree: Vec<String> = (0..ui.rows_for_test() - ui.dock_for_test())
+            .map(|i| panel::render_row_for_test(&ui, i, W).text())
+            .collect();
+        assert!(tree.iter().any(|l| l.contains("Retune the early")), "{tree:#?}");
+        assert!(!tree.iter().any(|l| l.contains("Ship the release")), "{tree:#?}");
+    }
+
+    /// A search whose answer is behind a fold is a search that says there is
+    /// nothing. So folds are set aside while one is up — and *set aside*, not
+    /// undone: the tree comes back exactly as it was left, because a fold is a
+    /// decision somebody made about a branch and a search is a question about
+    /// four rows.
+    #[test]
+    fn a_search_reaches_into_a_folded_branch_and_leaves_the_fold_alone() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        // Folded the way a person folds it, on the row they are standing on.
+        d.to_project("audio").key(Key::Char('h'));
+        let drawn = |d: &Driver| -> Vec<String> {
+            (0..d.ui.rows_for_test())
+                .map(|i| panel::render_row_for_test(&d.ui, i, W).text())
+                .collect()
+        };
+        let folded = drawn(&d);
+        assert!(!folded.iter().any(|l| l.contains("Apply reverb fixes")), "{folded:#?}");
+
+        d.key(Key::Char('/')).type_in("tuning");
+        let found = drawn(&d);
+        assert!(found.iter().any(|l| l.contains("Apply reverb fixes")), "{found:#?}");
+
+        // …and `esc` gives the folded tree back, rather than the one the search
+        // was drawing: the fold was never spent to answer the search.
+        d.key(Key::Esc);
+        assert_eq!(drawn(&d), folded, "the tree did not come back as it was left");
+    }
+
+    /// A filter that hides most of the store has to say it is on. `A` and `R`
+    /// each wear a word in the footer for that reason and this is the one that
+    /// hides the most — a tree narrowed to two rows with nothing to say why is
+    /// a panel that reads as an empty backlog.
+    #[test]
+    fn the_search_says_so_in_the_footer_until_it_is_cleared() {
+        let w = world();
+        let foot = |ui: &panel::Ui, view: &mut panel::View| panel::frame(ui, view, W, H)[H - 2].text();
+
+        let (ui, mut view) = showing(&w, &keyed("/tuning"));
+        assert!(foot(&ui, &mut view).contains("/tuning"), "{}", foot(&ui, &mut view));
+
+        // `esc` in the browse chain clears it — after the key map and before
+        // the detail pane, because it is the thing most in front of you.
+        let (ui, mut view) = showing(&w, &[&keyed("/tuning")[..], &[Key::Enter, Key::Esc]].concat());
+        assert!(!foot(&ui, &mut view).contains("/tuning"), "{}", foot(&ui, &mut view));
+    }
+
+    /// A search that matches nothing draws an empty tree, which looks exactly
+    /// like a panel that has broken — and it happens on the way to every hit,
+    /// because a word is typed one letter at a time.
+    #[test]
+    fn a_search_that_matches_nothing_says_which_it_is() {
+        let w = world();
+        let (ui, mut view) = showing(&w, &keyed("/kalimba"));
+        let frame = panel::frame(&ui, &mut view, W, H);
+        let text: Vec<String> = frame.iter().map(|l| l.text()).collect();
+        assert!(text.iter().any(|l| l.contains("nothing matches")), "{text:#?}");
+        assert!(text.iter().any(|l| l.contains("esc clears")), "{text:#?}");
+    }
+
+    /// `/` then the phrase, as a keyboard would send it.
+    fn keyed(s: &str) -> Vec<Key> {
+        s.chars().map(Key::Char).collect()
+    }
+
+    /// The agents view and a search are the same kind of pair as the agents
+    /// view and `R`: one switch from either side. A search left on under a
+    /// list of panes it has not touched is a footer describing a tree that is
+    /// not on screen.
+    #[test]
+    fn the_agents_view_and_a_search_each_put_the_other_away() {
+        let w = world();
+        let foot = |ui: &panel::Ui, view: &mut panel::View| panel::frame(ui, view, W, H)[H - 2].text();
+
+        let (ui, mut view) = showing(&w, &[&keyed("/tuning")[..], &[Key::Enter, Key::Char('w')]].concat());
+        let f = foot(&ui, &mut view);
+        assert!(f.contains("agents") && !f.contains("/tuning"), "{f}");
+
+        // And the other way: `/` pressed in the agents view means the tree.
+        let (ui, mut view) =
+            showing(&w, &[&[Key::Char('w')][..], &keyed("/tuning"), &[Key::Enter]].concat());
+        let f = foot(&ui, &mut view);
+        assert!(f.contains("/tuning") && !f.contains("agents"), "{f}");
     }
 
     /// Two switches, one state. A filter left on under a view that does not use

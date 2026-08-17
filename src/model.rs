@@ -629,6 +629,87 @@ impl Task {
         section_of(&self.body, name)
     }
 
+    /// Whether a half-remembered phrase is anywhere in this task: its title,
+    /// its id, or its prose.
+    ///
+    /// The prose is not an extra — it is where most of what distinguishes one
+    /// task from another lives. Titles here run to a clause; the paragraph
+    /// under `## Overview` is what says which reverb, which pane, which of the
+    /// four things called "sync". A search over titles alone would answer
+    /// confidently and wrongly, which is worse than not searching.
+    ///
+    /// One phrase, matched whole, rather than words matched separately.
+    /// `wsp find tuning table` means the two words in that order, which is how
+    /// a phrase you half-remember comes back to you. Splitting them would make
+    /// this a query language with an implied `AND` nobody typed, and the word
+    /// Ed used was "basic".
+    ///
+    /// Case-folded ASCII-only, like the tag picker: the store's vocabulary is
+    /// English and a `to_lowercase` per task per keystroke is the panel's live
+    /// filter paying for Turkish dotless i.
+    pub fn matches(&self, needle: &str) -> bool {
+        let n = needle.trim().to_ascii_lowercase();
+        if n.is_empty() {
+            return true;
+        }
+        self.title.to_ascii_lowercase().contains(&n)
+            || self.id.to_ascii_lowercase().contains(&n)
+            || self.body.to_ascii_lowercase().contains(&n)
+    }
+
+    /// The prose that put this row in the list, for a hit whose title does not
+    /// say why it is one.
+    ///
+    /// A list of titles that match nothing you typed is a list you have to open
+    /// one by one. This is the sentence the search actually landed in, which is
+    /// usually the whole of the answer to "which of these is the one".
+    ///
+    /// A window around the match rather than the head of the line, and that is
+    /// the whole of what is fiddly here. Prose in this store is hard-wrapped at
+    /// about eighty columns, so the phrase is as likely to be at the end of the
+    /// line as the start — printing the first seventy characters cut off the
+    /// word the reader typed on four of the first five hits it was tried on.
+    /// The window slides just far enough, and only to a space, so it opens on a
+    /// word rather than mid-syllable.
+    pub fn prose_line(&self, needle: &str, width: usize) -> Option<String> {
+        let n = needle.trim().to_ascii_lowercase();
+        if n.is_empty() {
+            return None;
+        }
+        let line = self
+            .body
+            .lines()
+            .map(|l| l.trim_start_matches(['#', '-', '*', ' ']).trim_end())
+            .find(|l| l.to_ascii_lowercase().contains(&n))?;
+
+        let chars: Vec<char> = line.chars().collect();
+        if chars.len() <= width {
+            return Some(line.to_string());
+        }
+        // Where the match sits, in characters rather than bytes: the window is
+        // measured in what a terminal draws.
+        let at = line.to_ascii_lowercase().find(&n).unwrap_or(0);
+        let at = line[..at].chars().count();
+        // Room for the match and a little of what leads into it. `end` first,
+        // so a match near the end of the line pulls the window rather than
+        // being clipped by it.
+        let end = (at + n.chars().count() + width / 3).min(chars.len());
+        let mut start = end.saturating_sub(width);
+        if start > 0 {
+            // To the next space, so the snippet opens on a whole word.
+            start += chars[start..at.max(start)].iter().position(|c| *c == ' ').map_or(0, |i| i + 1);
+        }
+        let mut out = String::new();
+        if start > 0 {
+            out.push('…');
+        }
+        out.extend(chars[start..end].iter());
+        if end < chars.len() {
+            out.push('…');
+        }
+        Some(out)
+    }
+
     pub fn from_doc(doc: &Doc, fallback_id: &str) -> Task {
         Task {
             id: doc.opt("id").unwrap_or_else(|| fallback_id.to_string()),
@@ -827,6 +908,56 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reason a search over titles alone would have been a waste of the
+    /// afternoon: the title says "basic search" and everything that tells you
+    /// which search, and why, is in the paragraph under it.
+    #[test]
+    fn a_word_only_the_prose_holds_still_finds_the_task() {
+        let mut t = Task::new("basic search", "wsp-032");
+        t.body = "## Overview\nEd is struggling to find issues in a list of\n\
+literally hundreds.\n"
+            .into();
+
+        assert!(t.matches("hundreds"), "the prose is searched, not only the title");
+        assert!(t.matches("BASIC"), "case is not something anyone remembers");
+        assert!(t.matches("wsp-032"), "the id is searchable — it is on the row you read");
+        assert!(!t.matches("kalimba"));
+        // Two words are one phrase in that order, not two searches joined by an
+        // `AND` nobody typed.
+        assert!(t.matches("find issues"));
+        assert!(!t.matches("issues find"));
+        // An empty needle is not a filter. The panel holds one while `/` is
+        // open and nothing has been typed yet, and the tree must be whole.
+        assert!(t.matches("  "));
+    }
+
+    /// Prose here is hard-wrapped at about eighty columns, so the word you
+    /// typed is as likely to be at the end of its line as the start. A snippet
+    /// taken from the head of the line cut the match off four hits out of five
+    /// — a second line under the row that does not contain the search term
+    /// reads as the wrong task, which is exactly the doubt this is meant to
+    /// settle.
+    #[test]
+    fn the_snippet_shows_the_word_you_typed() {
+        let mut t = Task::new("One working tree per agent", "robustness-010");
+        t.body = "## Overview\nThe tree is reset to HEAD and patched with that agent's own diff \
+before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
+            .into();
+
+        let snip = t.prose_line("persistent", 40).expect("a line to show");
+        assert!(snip.contains("persistent"), "the snippet lost the match: {snip:?}");
+        assert!(snip.chars().count() <= 42, "one line, not the paragraph: {snip:?}");
+        assert!(snip.starts_with('…'), "a window that has slid says so: {snip:?}");
+        assert!(!snip.contains("  "), "it opens on a word: {snip:?}");
+
+        // A line that fits is left alone — no ellipsis on either end, and no
+        // window arithmetic to get wrong.
+        let mut short = Task::new("t", "x-001");
+        short.body = "## Overview\nthe tail is right\n".into();
+        assert_eq!(short.prose_line("tail", 40).as_deref(), Some("the tail is right"));
+        assert_eq!(short.prose_line("nothing here", 40), None);
+    }
 
     #[test]
     fn a_decision_lands_in_its_own_section_before_the_log() {

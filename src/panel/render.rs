@@ -913,6 +913,13 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         lines.push(line(Style::Dim, "  nobody is running"));
         lines.push(line(Style::Dim, "  w for the work"));
     }
+    // A search that matches nothing is the commonest empty tree of the three,
+    // because it happens while somebody is still typing the word.
+    if tree_len == 0 && !ui.filter.is_empty() {
+        lines.push(Line::default());
+        lines.push(line(Style::Dim, &format!("  nothing matches \"{}\"", ui.filter)));
+        lines.push(line(Style::Dim, "  ⌫ widens · esc clears"));
+    }
 
     // The tree: one row to a line, every line the width of the pane. A wide
     // pane is a wide row — which is the whole of what a fullscreen panel is,
@@ -1015,6 +1022,15 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "+done");
     }
+    // The search, wearing the key that set it. Loudest of the three markers
+    // because it is the one that hides the most: a phrase left on can take the
+    // tree down to two rows, and a panel showing two rows with nothing to say
+    // why is one you stop trusting. Truncated to what is left of the line —
+    // the phrase is up in the footer to be recognised, not read.
+    if !ui.filter.is_empty() {
+        foot.push(Style::Plain, "  ");
+        foot.push(Style::Accent, format!("/{}", util::truncate(&ui.filter, 16)));
+    }
     // A filter left on silently reads as an empty backlog, and the panel is
     // furniture you stop looking at. So it says so, every frame it is up.
     if ui.review_only {
@@ -1069,6 +1085,33 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             let mut l = Line::default();
             l.push(Style::Accent, util::truncate(verb.hint(), w.saturating_sub(4)));
             l.push(Style::Dim, "  ↵");
+            l
+        }
+        // The search shares that line for the same reason, and says how much of
+        // the tree is left: the count is the whole feedback loop — you type a
+        // letter, three hundred becomes forty, another letter, forty becomes
+        // four, and that is when you stop typing and start looking.
+        Mode::Find { buffer } => {
+            let mut l = Line::default();
+            l.push(Style::Accent, "find> ");
+            let hint = match ui.rows.iter().filter(|r| matches!(r, super::rows::Row::Task { .. })).count() {
+                0 if buffer.is_empty() => String::new(),
+                0 => "  none".to_string(),
+                1 => "  1 task".to_string(),
+                n => format!("  {n} tasks"),
+            };
+            let room = w.saturating_sub(l.width() + 1 + hint.chars().count());
+            let shown: String = if buffer.chars().count() > room {
+                buffer.chars().skip(buffer.chars().count() - room).collect()
+            } else {
+                buffer.clone()
+            };
+            l.push(Style::Plain, shown);
+            l.push(Style::Accent, "▌");
+            if w > l.width() + hint.chars().count() {
+                l.pad(w.saturating_sub(l.width() + hint.chars().count()));
+                l.push(Style::Dim, hint);
+            }
             l
         }
         // The filter and the hint share the line the prompt uses, because they

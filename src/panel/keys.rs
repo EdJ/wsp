@@ -91,6 +91,19 @@ pub(crate) struct View {
     /// is; this answers who is on it and which of them has stopped — the
     /// question herdr's own sidebar exists for, asked without leaving the panel.
     pub(super) agents: bool,
+    /// Narrow the tree to the tasks a phrase is in — the title, the id or the
+    /// prose. Empty is off.
+    ///
+    /// The one filter that is not a mode you settle into: `A`, `R` and `w` are
+    /// pressed once and worked under, and this is a question you asked a second
+    /// ago and are about to answer. That is also why it is the one thing in
+    /// [`View`] the panels do not share — see `super::shared`.
+    ///
+    /// While it is up the folds and the six-task cap are ignored, because a
+    /// search whose answer is behind a fold is a search that says there is
+    /// nothing. Nothing is unfolded: the folds are left exactly as they were
+    /// and come back the moment the filter goes.
+    pub(super) filter: String,
     /// Put each task's id in front of its title. Off by default: the tree is
     /// for reading, and thirteen characters of id on every row is most of a
     /// narrow pane. On when you are about to type one at a shell.
@@ -187,6 +200,17 @@ pub(crate) enum Mode {
     /// `↵` — which is what makes toggling safe to explore, and why a fumble
     /// that ends where it started costs no log line, no event and no commit.
     Tags(Tags),
+    /// Typing a phrase, with the tree narrowing to it on every keystroke.
+    ///
+    /// A mode rather than a prompt because the answer is the tree itself: a
+    /// prompt collects a value and *then* does something, and what makes a
+    /// search worth having is watching two hundred and seventy-six rows become
+    /// four while you are still typing. `↵` is only the moment you stop typing
+    /// and start pressing keys at what you found — the filter stays on, and
+    /// every verb goes on meaning what it means.
+    Find {
+        buffer: String,
+    },
     /// A raised hand, over the tree, waiting to be answered.
     ///
     /// The one mode nobody asked for: every other is entered by a key, and this
@@ -494,6 +518,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
             "look",
             vec![
                 ("↵ esc", "open it, close it"),
+                ("/", "find: any word, anywhere"),
                 ("F", "the title in full, docked"),
                 ("Z", "the whole tree, in a tab"),
                 ("E", "edit in a tab"),
@@ -623,6 +648,62 @@ pub(super) fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut bu
             Effect::Run { argv, escalate: None, then: None }
         }
         _ => Effect::None,
+    }
+}
+
+/// Typing a search. Every printable key narrows the tree, `q` included — the
+/// same bargain the prompt and the tag picker make.
+///
+/// Every edit asks for a refetch, which is what makes the tree the answer
+/// rather than something you get after pressing return. It costs a rebuild per
+/// keystroke, at the same price `A` and `R` pay for a press: the store is read
+/// whole by every command here, and a person types at ten keys a second.
+///
+/// `esc` clears the filter rather than putting back whatever was there before.
+/// One way out, and it is the same one `esc` has in [`Mode::Browse`] while a
+/// filter is up — a search you abandon is a search that leaves no tree behind
+/// it.
+pub(super) fn find_key(k: Key, ui: &mut Ui, view: &mut View, mut buffer: String) -> Effect {
+    match k {
+        Key::Esc | Key::Interrupt => {
+            view.mode = Mode::Browse;
+            view.filter.clear();
+            say(ui, "the whole tree");
+            Effect::Refetch
+        }
+        Key::Enter => {
+            view.mode = Mode::Browse;
+            if view.filter.is_empty() {
+                say(ui, "nothing typed");
+                return Effect::None;
+            }
+            // What the tree is now, said once on the way out: from here the
+            // footer carries it, and the reader is looking at rows again
+            // rather than at what they typed.
+            say(ui, format!("showing what matches \"{}\" · esc clears", view.filter));
+            Effect::None
+        }
+        Key::Backspace | Key::KillLine | Key::Char(_) => {
+            match k {
+                Key::Backspace => {
+                    buffer.pop();
+                }
+                Key::KillLine => buffer.clear(),
+                Key::Char(c) => buffer.push(c),
+                _ => {}
+            }
+            view.filter = buffer.clone();
+            view.mode = Mode::Find { buffer };
+            // The rows under the cursor have just changed. The cursor is kept
+            // by identity across a rebuild, so it stays on its row for as long
+            // as the row is still a hit and falls to the nearest one when it
+            // stops being — which is what typing into a list should feel like.
+            Effect::Refetch
+        }
+        _ => {
+            view.mode = Mode::Find { buffer };
+            Effect::None
+        }
     }
 }
 
@@ -1066,6 +1147,10 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Mode::Tags(t) => {
                 view.mode = Mode::Tags(t.clone());
                 tags_key(k, ui, view, t)
+            }
+            Mode::Find { buffer } => {
+                view.mode = Mode::Find { buffer: buffer.clone() };
+                find_key(k, ui, view, buffer)
             }
             Mode::Card(card) => {
                 view.mode = Mode::Card(card.clone());

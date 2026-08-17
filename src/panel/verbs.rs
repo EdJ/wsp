@@ -1027,6 +1027,15 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             view.help = false;
             Effect::None
         }
+        // Then the search. It is the thing most in front of you — a tree with
+        // four rows in it where there were three hundred — and the one filter
+        // whose whole life is measured in seconds, so it is the first of them
+        // this chain gives back.
+        Key::Char('q') | Key::Esc if !view.filter.is_empty() => {
+            view.filter.clear();
+            say(ui, "the whole tree");
+            Effect::Refetch
+        }
         Key::Char('q') | Key::Esc if view.showing.is_some() => Effect::CloseView,
         // …and in the tab `Z` opened, the panel itself is what is in front of
         // you, so the same keys close that. It is not installed furniture —
@@ -1155,6 +1164,11 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 // only` over a list of panes, and a tree that comes back
                 // narrowed when you turn the view off.
                 view.review_only = false;
+                // A search goes for the same reason and a stronger one: it is
+                // a question about work, and this view has no work in it to
+                // narrow. It would sit in the footer over a list of panes it
+                // had not touched.
+                view.filter.clear();
             }
             say(ui, if view.agents { "the agents" } else { "the work" });
             Effect::Refetch
@@ -1172,6 +1186,22 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             view.ids = !view.ids;
             say(ui, if view.ids { "showing ids" } else { "hiding ids" });
             Effect::Refetch
+        }
+        // The finding aid. Two hundred and seventy-six tasks across thirty-one
+        // projects is past what anybody scrolls: Ed's words were "I'm
+        // struggling to find issues in this list now we have literally
+        // hundreds". `/` because that is the key this is in everything else,
+        // and it opens holding whatever is already filtered so a search can be
+        // widened by a backspace instead of retyped.
+        Key::Char('/') => {
+            // Asked in the agents view it means the tree, the same way `R`
+            // does: this is a question about work, and that view holds none.
+            let back = std::mem::take(&mut view.agents);
+            view.mode = Mode::Find { buffer: view.filter.clone() };
+            match back {
+                true => Effect::Refetch,
+                false => Effect::None,
+            }
         }
         Key::Char('r') => Effect::Sync,
         // A row is one line wide and a title is not. `↵` has always been the

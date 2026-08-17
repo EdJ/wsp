@@ -570,6 +570,10 @@ pub(crate) struct Ui {
     pub(super) vocabulary: Vec<String>,
     pub(super) show_done: bool,
     pub(super) review_only: bool,
+    /// What the tree is narrowed to, so the footer can say so. A search that
+    /// does not announce itself is a panel that looks like an empty backlog —
+    /// the same reason `+done` and `review only` are down there.
+    pub(super) filter: String,
     /// The agents are in place of the tree.
     pub(super) agents: bool,
 }
@@ -1020,6 +1024,7 @@ pub(super) fn task_rows(
                 view.show_done || t.status().is_open()
             }
         })
+        .filter(|t| t.matches(&view.filter))
         .cloned()
         .collect();
     mine.sort_by_key(|t| {
@@ -1043,7 +1048,11 @@ pub(super) fn task_rows(
     // a column that has to hold thirty projects. A pane wide enough to draw the
     // tree in columns has no such shortage — it was made big to be read whole —
     // so there the branch is all of itself, and `⋯` never comes up.
-    let cap = match view.expanded.contains(key) || view.wide {
+    //
+    // A search has no such shortage either: what it draws is already the few
+    // rows somebody asked for, and a seventh hit rolled into `⋯` is the finding
+    // aid hiding the thing it was asked to find.
+    let cap = match view.expanded.contains(key) || view.wide || !view.filter.is_empty() {
         true => tops,
         false => tops.min(MAX_TASKS_PER_PROJECT),
     };
@@ -1230,15 +1239,23 @@ fn uncap(view: &mut View, snap: &Snapshot, task: &str) -> bool {
     view.expanded.insert(t.project.clone().unwrap_or_else(|| INBOX_KEY.to_string()))
 }
 
-/// The filters that would leave it out: `A` for work that is finished, `R` for
-/// work that is not at review. Both say so in the footer, which is what makes
-/// them safe to turn off from here — the tree changing under you is explained
-/// on the line beneath it.
+/// The filters that would leave it out: `/` for a phrase it does not hold, `A`
+/// for work that is finished, `R` for work that is not at review. All three say
+/// so in the footer, which is what makes them safe to turn off from here — the
+/// tree changing under you is explained on the line beneath it.
+///
+/// Each is undone only when it is actually the one in the way, which is what
+/// makes undoing all three in one step honest: a task that is at review and
+/// simply does not hold the phrase costs the phrase and nothing else.
 fn unfilter(view: &mut View, snap: &Snapshot, task: &str) -> bool {
     let Some(t) = snap.tasks.iter().find(|t| t.id == task) else {
         return false;
     };
     let mut moved = false;
+    if !t.matches(&view.filter) {
+        view.filter.clear();
+        moved = true;
+    }
     if view.review_only && t.status() != Status::Review {
         view.review_only = false;
         moved = true;
@@ -1253,7 +1270,18 @@ fn unfilter(view: &mut View, snap: &Snapshot, task: &str) -> bool {
 pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let index = Index::new(snap.projects.clone());
     let tasks = snap.tasks.clone();
-    let counts = resolve::counts_by_project(&index, &tasks);
+    // Rolled up over what the tree is *about*, which under a search is the
+    // hits and nothing else. A project row reading `105 ▸10 ■5` beside the two
+    // rows a search left under it is the tree describing a tree that is not
+    // there — the same rule `review_only` follows one field down.
+    let counts = match view.filter.is_empty() {
+        true => resolve::counts_by_project(&index, &tasks),
+        false => {
+            let hits: Vec<Task> =
+                tasks.iter().filter(|t| t.matches(&view.filter)).cloned().collect();
+            resolve::counts_by_project(&index, &hits)
+        }
+    };
     let bindings = &snap.bindings;
     let pins = &snap.pins;
 
@@ -1463,6 +1491,22 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // broken on exactly the projects it exists to reveal.
     let interesting = |id: &str| -> bool {
         let c = counts.get(id).copied().unwrap_or_default();
+        // Under a search a branch earns its row by holding a hit, and by
+        // nothing else — not by having an agent in it, not by being empty, not
+        // by being the project you just made. Every one of those rules exists
+        // to keep a row reachable in the tree you browse; in the tree a search
+        // leaves behind they are thirty projects of noise around four answers.
+        //
+        // First, so it decides before the exemptions below it can. `counts` is
+        // already the hits and only the hits, so what is left to ask is which
+        // of them the other two filters would have drawn.
+        if !view.filter.is_empty() {
+            return match (view.review_only, view.show_done) {
+                (true, _) => c.review > 0,
+                (false, true) => c.open + c.done > 0,
+                (false, false) => c.open > 0,
+            };
+        }
         // Under the review filter a branch earns its row only by holding
         // something at review. A project row with nothing beneath it is the
         // whole tree pretending the filter did nothing.
@@ -1497,6 +1541,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let inbox_open = tasks.iter().filter(|t| t.project.is_none() && t.status().is_open()).count();
     let inbox_any = tasks.iter().any(|t| {
         t.project.is_none()
+            && t.matches(&view.filter)
             && if view.review_only {
                 t.status() == Status::Review
             } else {
@@ -1504,7 +1549,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             }
     });
     if inbox_any {
-        let folded = view.collapsed.contains(INBOX_KEY);
+        // A fold is not an answer to a question you have just asked. While a
+        // search is up every branch that holds a hit is open — otherwise the
+        // panel says "here" and then declines to show you, which is the dead
+        // end the whole thing is for. Nothing is *unfolded*: `collapsed` is
+        // untouched, so the tree comes back exactly as you left it.
+        let folded = view.collapsed.contains(INBOX_KEY) && view.filter.is_empty();
         rows.push(Row::Section {
             key: INBOX_KEY.to_string(),
             label: "inbox".into(),
@@ -1535,7 +1585,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             if !interesting(&p.id) {
                 continue;
             }
-            let is_collapsed = view.collapsed.contains(&p.id);
+            // Folds are set aside while a search is up — see the inbox above.
+            let is_collapsed = view.collapsed.contains(&p.id) && view.filter.is_empty();
             rows.push(Row::Project {
                 id: p.id.clone(),
                 name: p.name.clone(),
@@ -1552,10 +1603,14 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                     }
                 },
                 collapsed: is_collapsed,
-                // Zero under the filter for the same reason as the counts:
+                // Zero under either filter for the same reason as the counts:
                 // three agents at work is true and is not what this view is
                 // answering. One question at a time.
-                live: if view.review_only { 0 } else { live.get(&p.id).copied().unwrap_or(0) },
+                live: if view.review_only || !view.filter.is_empty() {
+                    0
+                } else {
+                    live.get(&p.id).copied().unwrap_or(0)
+                },
                 prose: crate::model::has_prose(&p.body),
             });
             if is_collapsed {
@@ -1566,8 +1621,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             // above its work — because that is what it is: answerable for all
             // of it, and not one item in the list. Left out under the review
             // filter for the same reason the live count is zeroed there; a
-            // position is not a piece of work at review.
-            if !view.review_only {
+            // position is not a piece of work at review — and out of a search
+            // for the same reason again: a seat is not a task, and cannot be
+            // one of the things a phrase was looking for.
+            if !view.review_only && view.filter.is_empty() {
                 if let Some((occupant, elsewhere)) = seats.get(&p.id) {
                     rows.push(Row::Seat {
                         project: p.id.clone(),
@@ -1597,7 +1654,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             // After the children, and capped: a project whose root everything
             // shares collects a lot of these, and they must not push its own
             // subtree off the screen.
-            if let Some(ps) = loose.get(&p.id) {
+            // Not under a search: a shell is a place, not a piece of work, and
+            // a search is a question about work. Same judgement as the review
+            // filter makes about both pane groups, one block down.
+            if let Some(ps) = loose.get(&p.id).filter(|_| view.filter.is_empty()) {
                 let key = format!("{}/panes", p.id);
                 let shown = if view.expanded.contains(&key) {
                     ps.len()
@@ -1644,7 +1704,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // Both pane groups go under the review filter. Neither is work waiting on
     // you — they are terminals — and leaving them is the filter answering a
     // question nobody asked while hiding half the answer to the one they did.
-    if !homeless.is_empty() && !view.review_only {
+    if !homeless.is_empty() && !view.review_only && view.filter.is_empty() {
         let folded = view.collapsed.contains(NOPROJECT_KEY);
         rows.push(Row::Section {
             key: NOPROJECT_KEY.to_string(),
@@ -1825,6 +1885,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         vocabulary: vocabulary(snap),
         show_done: view.show_done,
         review_only: view.review_only,
+        filter: view.filter.clone(),
     }
 }
 
