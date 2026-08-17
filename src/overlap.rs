@@ -411,6 +411,40 @@ mod tests {
         assert!(out[0].relation.is_near());
     }
 
+    /// The arrangement `wsp checkout` creates, and the one this file would get
+    /// exactly backwards without knowing about it.
+    ///
+    /// Those trees live *under* the project root — they have to, or nothing
+    /// here resolves them to a project at all — so by prefix alone an agent in
+    /// `.worktrees/t-2` is standing inside the trunk and inside every sibling
+    /// tree's parent. It is standing in none of them: its files are its own and
+    /// a commit from either side cannot reach the other. Warning about it is
+    /// worse than saying nothing, because a report worth reading is one where
+    /// every line is a pane that can actually take your work.
+    #[test]
+    fn two_agents_in_two_worktrees_of_one_repository_are_not_in_each_others_way() {
+        let w = world(vec![
+            pane("a", "w1", "/home/ed/claude/wsp/.worktrees/t-1"),
+            pane("b", "w2", "/home/ed/claude/wsp/.worktrees/t-2/src"),
+            pane("c", "w3", "/home/ed/claude/wsp"),
+        ]);
+
+        for (me, them) in [("a", "b"), ("a", "c"), ("c", "a")] {
+            let out = standing_beside(&w, me, None);
+            let it = out.iter().find(|s| s.pane == them).expect("pane missing");
+            assert_eq!(it.relation, Relation::SameRepo, "{me} was told {them} could reach it");
+            assert!(!it.relation.is_near(), "{them} was reported as a warning to {me}");
+        }
+
+        // Two panes in one tree are as close as ever: the trees isolate agents
+        // from each other and not a pane from its own workspace's other panes.
+        let together = world(vec![
+            pane("a", "w1", "/home/ed/claude/wsp/.worktrees/t-1"),
+            pane("b", "w1", "/home/ed/claude/wsp/.worktrees/t-1/src"),
+        ]);
+        assert_eq!(standing_beside(&together, "a", None)[0].relation, Relation::SameCwd);
+    }
+
     #[test]
     fn a_different_checkout_is_elsewhere() {
         let w = world(vec![

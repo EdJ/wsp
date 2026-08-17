@@ -194,6 +194,44 @@ pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
     Some(util::contract(&dir))
 }
 
+/// The trees under `root` that are finished with, and the reason each is.
+///
+/// Reported rather than removed, and reported by `wsp doctor` rather than by a
+/// cleanup step at the end of a piece of work. That is the shape the evidence
+/// asks for: `git worktree list` held four abandoned trees on 2026-08-16 and
+/// three more on the day before, ~132M of them, and nobody was careless — a
+/// procedure run by hand at the end of a long piece of work is a procedure that
+/// gets abandoned halfway when something more interesting happens. `land`
+/// removes the tree it landed, so what this finds is what `land` never saw.
+///
+/// `closed` is asked of the store by the caller rather than read here, because
+/// the two reasons are different in kind and only one of them is git's: a tree
+/// whose task is done is finished even if it has uncommitted work in it, and
+/// that is a fact about the work rather than about the checkout.
+pub(crate) fn stale(root: &Path, closed: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
+    let Some(trunk) = trunk(root) else { return Vec::new() };
+    let Some(branch) = trunk_branch(&trunk) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(trunk.join(WORKTREES)) else { return Vec::new() };
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for e in entries.flatten() {
+        let dir = e.path();
+        if !dir.join(".git").exists() {
+            continue;
+        }
+        let Some(task) = dir.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if closed(&task) {
+            out.push((task, "the task is closed".into()));
+        } else if !dirty(&dir) && ahead(root, &branch, &task).is_empty() {
+            out.push((task, format!("nothing uncommitted and nothing {branch} has not got")));
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Whether a tree has anything uncommitted, tracked or not.
 fn dirty(dir: &Path) -> bool {
     git(dir, &["status", "--porcelain", "--untracked-files=all"])
@@ -565,6 +603,43 @@ mod tests {
         git_ok(&dir, &["worktree", "remove", &wt.display().to_string()]).unwrap();
         assert!(ensure(&dir, &wt, "t-3", "master").unwrap(), "the tree was not remade");
         assert!(wt.join("wip.txt").exists(), "the work left on the branch did not come back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The leak this arrangement adds, found by something that runs anyway.
+    ///
+    /// Every version of the per-worktree rule so far has leaked trees, and none
+    /// of the leaks was carelessness — a cleanup step at the end of a long
+    /// piece of work is a step that gets abandoned when something more
+    /// interesting happens. So the tell is a tree with nothing in it that the
+    /// trunk has not already got, and a tree with real work in it is left
+    /// alone however long it has stood there.
+    #[test]
+    fn a_tree_with_nothing_left_in_it_is_reported_and_one_with_work_is_not() {
+        let dir = scratch("stale");
+        repo(&dir);
+        let never_closed = |_: &str| false;
+
+        let idle = checkout_dir(&dir, "t-idle");
+        ensure(&dir, &idle, "t-idle", "master").unwrap();
+        let busy = checkout_dir(&dir, "t-busy");
+        ensure(&dir, &busy, "t-busy", "master").unwrap();
+        std::fs::write(busy.join("wip.txt"), "wip\n").unwrap();
+        run(&busy, &["add", "wip.txt"]);
+        run(&busy, &["commit", "--quiet", "-m", "wip"]);
+
+        let found = stale(&dir, &never_closed);
+        assert_eq!(found.len(), 1, "wrong trees named: {found:?}");
+        assert_eq!(found[0].0, "t-idle");
+
+        // Uncommitted work counts as work: a tree is not litter because git has
+        // not been told about what is in it yet.
+        std::fs::write(idle.join("scratch.txt"), "not yet\n").unwrap();
+        assert!(stale(&dir, &never_closed).is_empty(), "a tree with unsaved work was called finished");
+
+        // A closed task ends its tree whatever is in it — the work is over, and
+        // the tree outliving it is the leak.
+        assert_eq!(stale(&dir, &|id: &str| id == "t-busy")[0].0, "t-busy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

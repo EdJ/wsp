@@ -2501,6 +2501,20 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
                 continue;
             }
             seen.push(root.clone());
+            // A tree per task leaks the same way a tree per build did, and for
+            // the same reason: `land` drops the one it landed, and what is left
+            // is every tree `land` never saw. A note rather than a problem —
+            // nothing is broken, it is disk — and never removed from here,
+            // because a directory somebody is standing in is not litter.
+            let closed = |id: &str| {
+                tasks.iter().find(|t| t.id == id).map(|t| !t.status().is_open()).unwrap_or(false)
+            };
+            for (task, why) in crate::cmd_checkout::stale(&root, &closed) {
+                notes.push(format!(
+                    "{}: the tree for {task} is finished with — {why} — `wsp checkout {task} --rm`",
+                    util::contract(&root)
+                ));
+            }
             match tree_index_loss(&root) {
                 Some(lost) if lost > 0 => {
                     problems.push(format!(
