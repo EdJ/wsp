@@ -1377,6 +1377,24 @@ mod tests {
         panel::collect(snap, view)
     }
 
+    /// What the row above `i` stands for, as the cursor moving up would find
+    /// it: past the lines that belong to the row above *them* — where a
+    /// project's work lives, what an agent is waiting for — none of which the
+    /// cursor can stand on. Asking for `i - 1` instead makes every test about
+    /// what is under what fail the day a row gains a second line.
+    fn above(ui: &panel::Ui, i: usize) -> panel::Target {
+        let mut probe = ui.clone();
+        let mut at = i;
+        while at > 0 {
+            at -= 1;
+            probe.select_for_test(at);
+            if probe.selected_kind() != panel::RowKind::Detail {
+                break;
+            }
+        }
+        probe.selected_target()
+    }
+
     /// A slot is drawn under the project it belongs to, wherever its occupant
     /// happens to be standing.
     ///
@@ -1398,9 +1416,7 @@ mod tests {
 
         let rows = ui.rows_for_target(&panel::Target::Seat("wsp".into()));
         assert_eq!(rows.len(), 1, "the slot is drawn once");
-        let mut probe = ui.clone();
-        probe.select_for_test(rows[0] - 1);
-        assert_eq!(probe.selected_target(), panel::Target::Project("wsp".into()));
+        assert_eq!(above(&ui, rows[0]), panel::Target::Project("wsp".into()));
         // And the occupant's own placement is `verb`, which is where it would
         // have been drawn by the tree's ordinary rules.
         assert!(
@@ -1427,9 +1443,7 @@ mod tests {
         let rows: Vec<usize> = ui.rows_for_target(&panel::Target::Seat("wsp".into()));
         assert_eq!(rows.len(), 1, "one position, one row");
         // Directly under its project: the row above it is `wsp` itself.
-        let mut probe = ui.clone();
-        probe.select_for_test(rows[0] - 1);
-        assert_eq!(probe.selected_target(), panel::Target::Project("wsp".into()));
+        assert_eq!(above(&ui, rows[0]), panel::Target::Project("wsp".into()));
 
         // The occupant is not drawn a second time in the tree as a worker on
         // the task it holds. It is still in the census at the foot, which is a

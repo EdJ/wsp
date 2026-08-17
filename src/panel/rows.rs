@@ -293,7 +293,8 @@ pub(super) enum Row {
     Group { project: Option<String>, depth: usize, n: usize },
     /// A line that belongs to the row above it. The cursor never lands on one
     /// and no digit addresses one: it is the second and third line of one
-    /// agent, in the view that has the room to spend three lines on one.
+    /// agent in the view that has the room to spend three on one, and the
+    /// second line of a project in the tree.
     ///
     /// A row rather than extra lines inside one, because the frame maps screen
     /// rows to row indices one for one — a row that drew two lines would put
@@ -479,6 +480,21 @@ pub(super) enum Detail {
     Standing { state: AgentState, pane: String, held: Option<String>, direction: Option<String> },
     /// The task in its hands, drawn the way the tree draws a task.
     Holding { status: Status, title: String },
+    /// Where a project's work lives on disk, under the project's own row.
+    ///
+    /// The one fact about a project the tree could not say: the row draws a
+    /// slug, and `~/claude/vst` and `~/git/Easter` are the same word to it.
+    /// Everything else on the panel resolves through a root — which project a
+    /// pane is standing in, where `spawn` puts a worktree — so a slug whose
+    /// directory you have to go and look up is the row you distrust.
+    ///
+    /// The project's *own* root and never the inherited one [`root_of`] would
+    /// answer with. `render` and `data` are two halves of `wsp`'s checkout and
+    /// declare nothing themselves; drawing the path they inherit would put the
+    /// same line under all three, in the place a row is least read.
+    ///
+    /// [`root_of`]: crate::resolve::Index::root_of
+    Root { path: String, depth: usize },
 }
 
 impl Row {
@@ -521,8 +537,8 @@ pub(crate) enum RowKind {
     /// A project heading over a run of agents in the agents view. Never
     /// selected, like [`RowKind::Detail`].
     Group,
-    /// A line under an agent in the agents view. Never selected, so a driver
-    /// that hunts for one has gone wrong.
+    /// A line belonging to the row above it. Never selected, so a driver that
+    /// hunts for one has gone wrong.
     Detail,
     /// A raised hand in the section at the foot. It answers as a task, so a
     /// driver that wants the flag rather than the task it points at has to ask
@@ -1617,6 +1633,22 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                 continue;
             }
 
+            // Where its work lives, when the project says so itself. Under the
+            // name because it is the same node still — the project's row,
+            // continued — and so above the seat, which is the first thing that
+            // is genuinely *under* the project rather than part of it.
+            //
+            // Only while the branch is open, which is what keeps a fold worth
+            // pressing: `H` on thirty-one projects has to leave thirty-one
+            // rows, not fifty. Out of a search and out of the review filter for
+            // the reason the seat below gives — a directory is not a piece of
+            // work, and neither of those views is asking about anything else.
+            if !view.review_only && view.filter.is_empty() {
+                if let Some(root) = p.roots.first() {
+                    rows.push(Row::Detail(Detail::Root { path: root.clone(), depth }));
+                }
+            }
+
             // The custodial slot, first of everything under the project and
             // above its work — because that is what it is: answerable for all
             // of it, and not one item in the list. Left out under the review
@@ -2074,6 +2106,28 @@ pub(super) fn vocabulary(snap: &Snapshot) -> Vec<String> {
     out.into_iter().map(|(_, t)| t.to_string()).collect()
 }
 
+/// A path cut to `w` columns, from the front.
+///
+/// The other way round for a path than for a title. Every root in this store
+/// begins `~/claude/` or `~/git/`, so the head is the half that separates
+/// nothing: `~/claude/grainc…` and `~/claude/grainl…` are two projects that
+/// read as one, where `…/graincloud` is unmistakable. Whole components go, so
+/// what is left is still a path and not a word cut in the middle.
+fn path_fit(path: &str, w: usize) -> String {
+    if path.chars().count() <= w {
+        return path.to_string();
+    }
+    // Left to right, so the first boundary that fits is the longest tail that
+    // does.
+    for (i, _) in path.char_indices().filter(|(_, c)| *c == '/') {
+        if path[i..].chars().count() + 1 <= w {
+            return format!("…{}", &path[i..]);
+        }
+    }
+    // One component wider than the pane, and no boundary left to cut on.
+    util::truncate(path, w)
+}
+
 pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
     let mut l = Line::default();
     match row {
@@ -2357,6 +2411,19 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.push(Style::Plain, " ");
             l.push(Style::Muted, util::truncate(title, w.saturating_sub(8).max(4)));
         }
+        // Started where the project's name is — past the caret and its space —
+        // so the two lines read as one node. Stepping it in like a child would
+        // put it in the column the project's tasks are in, which is the column
+        // that means "held by".
+        //
+        // No mark in front of it: a path announces itself, and a glyph
+        // reserved to say "this is a directory" is a column off every row of
+        // the tree to repeat what `~/` already said.
+        Row::Detail(Detail::Root { path, depth }) => {
+            let at = depth + 2;
+            l.pad(at);
+            l.push(Style::Dim, path_fit(path, w.saturating_sub(at).max(4)));
+        }
         // The sentence first, because the sentence is the news. The task's own
         // title is one row up in the tree with a `▲` on it, and the pane that
         // raised it is on the right where the agents section keeps its right-
@@ -2436,6 +2503,9 @@ pub(super) fn full_text(row: &Row) -> String {
         // cursor here.
         Row::Detail(Detail::Standing { state, pane, .. }) => format!("{} · {pane}", word(*state)),
         Row::Detail(Detail::Holding { title, .. }) => title.clone(),
+        // In full, which is the point of asking: the row is where the path is
+        // cut to a sidebar's width.
+        Row::Detail(Detail::Root { path, .. }) => path.clone(),
     }
 }
 
@@ -2500,6 +2570,102 @@ mod tests {
         t.project = project.map(|s| s.to_string());
         t.status_raw = status.to_string();
         t
+    }
+
+    fn project(id: &str, parent: Option<&str>, root: &str) -> crate::model::Project {
+        let mut p = crate::model::Project::new(id);
+        p.parent = parent.map(|s| s.to_string());
+        p.roots = match root.is_empty() {
+            true => vec![],
+            false => vec![root.to_string()],
+        };
+        p
+    }
+
+    /// `wsp` with a checkout of its own and `render` beneath it with none —
+    /// the shape the store actually has, and the one the rule about inherited
+    /// roots is about.
+    fn tree() -> Snapshot {
+        Snapshot {
+            projects: vec![project("wsp", None, "~/claude/wsp"), project("render", Some("wsp"), "")],
+            tasks: vec![task("render-001", Some("render"), "todo")],
+            bindings: Default::default(),
+            pins: Default::default(),
+            mandates: Default::default(),
+            claims: Default::default(),
+            flags: Default::default(),
+            governors: Default::default(),
+            panes: vec![],
+        }
+    }
+
+    /// Every path in the tree, in the order the rows are in.
+    fn paths(ui: &Ui) -> Vec<String> {
+        ui.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Detail(Detail::Root { path, .. }) => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The row draws a slug, and a slug is not a place. Everything else on the
+    /// panel resolves through a root — which project a pane is standing in,
+    /// where a worktree is cut — so the directory is the fact that turns the
+    /// name into somewhere you can go.
+    #[test]
+    fn a_project_says_where_its_work_lives_under_its_own_name() {
+        let ui = collect(&tree(), &View::default());
+        let at = ui.rows.iter().position(|r| matches!(r, Row::Project { id, .. } if id == "wsp"));
+        let at = at.expect("the project row went missing");
+        match &ui.rows[at + 1] {
+            Row::Detail(Detail::Root { path, .. }) => assert_eq!(path, "~/claude/wsp"),
+            other => panic!("the directory is not the line under the name: {other:?}"),
+        }
+    }
+
+    /// Its own root, never the one it inherits. `render` and `data` are two
+    /// halves of `wsp`'s checkout and declare nothing themselves — drawing
+    /// what [`crate::resolve::Index::root_of`] answers with would put
+    /// `~/claude/wsp` under all three, which is the same path down a column in
+    /// the place a row is least read.
+    #[test]
+    fn a_project_working_in_its_parents_checkout_does_not_repeat_the_path() {
+        assert_eq!(paths(&collect(&tree(), &View::default())), ["~/claude/wsp"]);
+    }
+
+    /// Folding is what reduces a project to one line, and thirty-one projects
+    /// is why the key exists. A path that survived the fold would make `H`
+    /// worth half of what it is worth.
+    #[test]
+    fn folding_a_project_takes_its_directory_with_it() {
+        let mut view = View::default();
+        view.collapsed.insert("wsp".to_string());
+        assert!(paths(&collect(&tree(), &view)).is_empty());
+    }
+
+    /// The same judgement the seat under it makes: a directory is not a piece
+    /// of work, and neither view is asking about anything else. A search that
+    /// answered with a row per project would bury the one row it was asked
+    /// for.
+    #[test]
+    fn a_search_and_the_review_filter_are_questions_about_work_alone() {
+        let searching = View { filter: "reverb".into(), ..Default::default() };
+        assert!(paths(&collect(&tree(), &searching)).is_empty());
+        let reviewing = View { review_only: true, ..Default::default() };
+        assert!(paths(&collect(&tree(), &reviewing)).is_empty());
+    }
+
+    /// Cut from the front, where a title is cut from the back. Every root here
+    /// begins `~/claude/` or `~/git/`, so the head is the half that separates
+    /// nothing — and the cut lands on a separator, so what is left is still a
+    /// path rather than a word broken in the middle.
+    #[test]
+    fn a_path_too_wide_for_the_pane_keeps_the_end_that_names_it() {
+        assert_eq!(path_fit("~/claude/wsp", 20), "~/claude/wsp");
+        assert_eq!(path_fit("~/git/DaisyPatchSm_MultiFx", 22), "…/DaisyPatchSm_MultiFx");
+        assert_eq!(path_fit("~/claude/graincloud", 14), "…/graincloud");
     }
 
     /// The node above the row already spells the project out, and a number is

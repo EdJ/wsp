@@ -108,6 +108,10 @@ in. Tasks belonging to no project get an `inbox` heading at the top; shells
 belonging to no project get a `no project` group at the foot, and the agents get
 a section of their own, pinned under a rule at the very bottom.
 
+An open project says where its work lives on the line under its name, when it
+declares a root of its own — a slug is not a place, and everything else on the
+panel resolves through that directory.
+
 Panes come from `pane.list`, not `agent.list`. Most panes are a shell nobody is
 driving, and a shell sitting in a project is a fact about that project — the
 earlier version asked for agents only and so could see one pane out of
