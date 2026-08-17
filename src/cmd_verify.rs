@@ -132,6 +132,14 @@ pub fn agent_key() -> String {
 /// Under `WSP_STATE` rather than a fixed path so a sandbox
 /// (see t-260816-056) gets its own and does not warm — or corrupt — the real
 /// one.
+///
+/// Named for the *repository* and keyed on the agent, and `repo` has to be the
+/// trunk for that to hold. Once an agent edits in `<root>/.worktrees/<task>`,
+/// the directory it is standing in is named for the task — so naming the build
+/// tree after it turned this back into one tree per piece of work, cold on
+/// every new task and one more thing to leak, which is the arrangement the
+/// header above argues against. Measured 2026-08-17: a cold `cargo check` in a
+/// fresh tree is 10s against 1–4s warm, and 295M of target output.
 pub(crate) fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     store.state.join("build").join(format!("{}-{}", util::slugify(name), key))
@@ -318,7 +326,10 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     };
 
     let key = agent_key();
-    let dir = build_dir(store, &repo, &key);
+    // The trunk names it; `repo` goes on being the tree under your hands, which
+    // is where the patch comes from and where the worktree is added.
+    let named_for = crate::cmd_checkout::trunk(&repo).unwrap_or_else(|| repo.clone());
+    let dir = build_dir(store, &named_for, &key);
     let tree = dir.join("tree");
     let target = dir.join("target");
 
@@ -633,5 +644,17 @@ mod tests {
         let b = build_dir(&store, Path::new("/Users/x/claude/wsp"), "w2");
         assert_ne!(a, b, "two agents shared one build tree");
         assert!(a.starts_with("/tmp/state/build"), "the build tree escaped WSP_STATE: {a:?}");
+
+        // One agent's two tasks share one tree, which is the whole point of
+        // keying on the agent — and is why `verify` passes the trunk rather
+        // than the worktree it is standing in. Naming this after the directory
+        // under your hands makes it one tree per task again: cold on every
+        // task, and one more thing to leave behind. What resolves the trunk is
+        // tested where it lives, in `cmd_checkout`.
+        assert_eq!(
+            a,
+            build_dir(&store, Path::new("/Users/x/claude/wsp"), "w1"),
+            "one agent, two tasks, two build trees"
+        );
     }
 }
