@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  herdr server on an executor, headless and under launchd.
+
+  Copy to ~/Library/LaunchAgents/com.herdr.server.plist on the far machine and
+  load it into the *GUI* session, not the ssh session that copied it:
+
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.herdr.server.plist
+
+  gui/$UID is what makes this survive the ssh session that started it, and it is
+  also the only domain from which Claude Code can reach the login keychain it
+  authenticated against. See the Machines section of wsp's README.
+
+  Four strings are this machine's and yours is not this one:
+
+    /Users/edjames                the home directory, three times below
+    WSP_SEAT                      the seat's ssh Host alias, as this machine reaches it
+    WSP_MACHINE                   this machine's name in the seat's store
+    WSP_SEAT_BIN                  the seat's wsp — see below
+
+  The wsp variables are here rather than in a shell profile because the executor
+  has no shell profile that an agent reliably passes through: herdr starts the
+  pane, the pane starts the agent, and this job's environment is what all of them
+  inherit. `launchctl setenv` would do the same for the whole session, but it is
+  a command someone has to remember to run again after a reboot and this is a
+  file that is already being copied.
+
+  PATH is spelled out for the same reason. ~/.local/bin is not on the PATH of a
+  login shell on macOS — path_helper builds it from /etc/paths — so herdr, the
+  wsp shim and claude are all invisible to an agent unless it is put there. It
+  goes first: the shim must win over any real wsp that ever lands on this
+  machine. path_helper appends what it finds rather than replacing it, so this
+  survives the login shell each pane runs.
+
+  WSP_SEAT_BIN is expanded by the *seat's* shell, not this one, which is why it
+  is written with a literal $HOME. The seat's ~/.local/bin is not on a
+  non-interactive PATH there either, and `ssh seat wsp` fails with "command not
+  found" about a command that plainly exists.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.herdr.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/edjames/.local/bin/herdr</string>
+    <string>server</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart a crash, but let `herdr server stop` and `herdr update`'s handoff
+       stay stopped: both exit 0, and a job that came back from under them would
+       be a worse bug than a server that is down. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Not a background job: it holds ptys for interactive agents and must not be
+       throttled to background CPU and I/O priority. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/edjames/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>WSP_SEAT</key>
+    <string>macbook-pro-tilhrende-ed</string>
+    <key>WSP_MACHINE</key>
+    <string>eds-macbook-i5</string>
+    <key>WSP_SEAT_BIN</key>
+    <string>$HOME/.local/bin/wsp</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/edjames/.config/herdr/herdr-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/edjames/.config/herdr/herdr-launchd.log</string>
+</dict>
+</plist>

@@ -2150,16 +2150,26 @@ machine's wsp back over the same connection.
 
 ### What is actually running
 
-On the executor, three things, none of them ours:
+On the executor, four things, and only two of them are ours:
 
 - `herdr server`, headless, under launchd or systemd so it outlives the ssh
   session that started it and comes back after a reboot
-- sshd
-- the `wsp` shim, from `executor/wsp` in this repository
+- sshd — and, in the other direction, an ssh *out* to the seat for every wsp
+  verb an agent over there runs
+- Claude Code, authenticated, with its `SessionStart` hooks
+- two files: the `wsp` shim from `executor/wsp`, and a copy of
+  `claude-code/wsp-session.sh` for that hook to call
+
+Both of ours are shell scripts that hold no state and read none, which is the
+property that matters: there is nothing over there to keep in sync, nothing to
+migrate and nothing to hot-patch when you ship a fix to wsp itself. The one
+thing that has to be true is that the seat's binary and the executor's copies of
+those two scripts agree about the shim's contract, and that contract is three
+environment variables that have not changed since it was written.
 
 On the seat, inside the `wsp daemon` you are already running: one ssh per
 machine, holding `-L <local.sock>:<remote herdr.sock>` open. That is the whole
-of it. Nothing long-lived of ours runs on the executor at all.
+of it. No process of ours is long-lived on the executor at all.
 
 ### How one wsp talks to two herdrs
 
@@ -2224,23 +2234,47 @@ slow panel.
 
 ### Making a machine an executor
 
+Both machines are involved, and the traffic goes both ways: the seat ssh's out
+to hold the tunnel, and every wsp verb an agent over there runs ssh's back. So
+each machine needs Remote Login on and the *other's* public key authorised. A
+one-directional reading of this is the first thing that fails, and it fails as
+`wsp: command not found` rather than as anything that mentions keys.
+
 On the far machine:
 
-1. `tailscale up`, and confirm `tailscale status` shows a **direct** path.
-2. Enable Remote Login (macOS) or sshd (Linux), and authorise the seat's key.
-3. Install herdr and run `herdr server` headless under launchd or systemd.
-4. Put `executor/wsp` on PATH ahead of anything else called `wsp`, and set
-   `WSP_SEAT` and `WSP_MACHINE` for every shell an agent might run in — a
-   `launchctl setenv` on macOS, or the profile the herdr server inherits.
-5. Install Claude Code, authenticate it, and add the `SessionStart` hook from
-   `claude-code/`. It needs no change: it finds the shim and the shim finds the
-   seat.
+1. `tailscale up`, and confirm `tailscale ping <seat>` shows a **direct** path
+   and not a DERP relay.
+2. Enable Remote Login (macOS) or sshd (Linux), and authorise the seat's key —
+   and the seat's, this machine's.
+3. Install herdr. Then copy `executor/herdr-server.plist` to
+   `~/Library/LaunchAgents/com.herdr.server.plist`, change the four strings its
+   header names, and load it into the session you are *not* in:
+
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.herdr.server.plist
+
+   `gui/$UID` rather than `system/`, because the login session is where the
+   login keychain is and Claude Code authenticated against it.
+4. Copy `executor/wsp` to `~/.local/bin/wsp`. Its three variables come from the
+   plist in step 3, which is where this step went: herdr starts the pane, the
+   pane starts the agent, and that job's environment is what both inherit.
+   `launchctl setenv` does the same for the whole login session, and is one more
+   thing to remember after a reboot.
+5. Install Claude Code and sign in. Then `herdr integration install claude`,
+   copy `claude-code/wsp-session.sh` to `~/.claude/hooks/`, and merge
+   `claude-code/settings.snippet.json` into the `~/.claude/settings.json` that
+   left behind — beside herdr's own entry, not over it.
 
 On the seat:
 
 6. A `Host` block in `~/.ssh/config` pointing at the MagicDNS name, with
-   `ControlMaster auto` and `ControlPersist` so the connection is cheap to
-   reuse.
+   `ControlMaster auto`, a `ControlPath` and `ControlPersist`, so that the
+   connection is cheap to reuse. The executor wants the mirror image of that
+   block pointing back here, and wants it more: the tunnel is opened once and
+   the shim is opened by every command an agent runs. Measured on the first
+   pair, `wsp ls` from the executor is ~0.4s cold and ~0.2s warm, against 0.02s
+   for the same `wsp ls` on the seat — so a remote verb is two orders of
+   magnitude dearer than a local one however warm the connection, and that is
+   the number to have in mind before adding one to a hook.
 7. `wsp machine add mb2 <that Host alias>`.
 
 The daemon takes it from there: it dials, holds the tunnel up, retries with
@@ -2279,9 +2313,24 @@ the remote shell — `wsp say "two words"` would otherwise arrive as two — and
 passes stdin through, which `wsp edit --overview -` needs.
 
 **The seat's `wsp` must be on a non-interactive PATH.** `ssh host wsp` runs a
-non-login shell, and `~/.local/bin` is often not on it. Set `WSP_SEAT_BIN` to
-the absolute path if `wsp brief` on the executor comes back "command not found"
-about a command that plainly exists.
+non-login shell, and `~/.local/bin` is often not on it. On macOS it is not on a
+*login* shell's either — `path_helper` builds `PATH` from `/etc/paths`, and
+nothing in `~/.zshrc` runs for a shell nobody typed into. So set `WSP_SEAT_BIN`
+to the absolute path, and write it with a literal `$HOME`: the string is
+expanded by the seat's shell and not by the executor's. The symptom is
+`wsp: command not found` about a command that plainly exists, and it caught both
+directions of the first pair on the same afternoon.
+
+**Nobody is standing next to it.** The executor has no one at the keyboard, and
+a Claude Code that wants an answer will wait for ever without ever having
+started: the folder-trust question comes *before* the session, so the first
+agent on a new machine sits at a dialog with no hook run, no brief printed and
+nothing on screen to say what it is holding. Open Claude Code by hand once, in
+the directory agents will run in, and answer it. The permission prompts after
+that are what the allow list in `claude-code/settings.snippet.json` is for — and
+when one does come up anyway it is answerable from here, because the pane is in
+the panel like any other: `herdr pane send-keys` over ssh, or `herdr --remote`
+for a real client attached to that server.
 
 ### What is deliberately not here
 
@@ -2289,7 +2338,11 @@ about a command that plainly exists.
   Either the agent pushes git→git or the executor works in a worktree, and if
   worktrees win they are built first. Nothing here assumes an answer: the
   executor is handed a cwd and an agent, and how that tree got there is that
-  decision's business.
+  decision's business. Until it is decided, `wsp spawn --on` still works and
+  still says the wrong thing: the cwd it asks for is a path on the seat, herdr
+  opens `$HOME` when that path is not on the far machine, and the line wsp
+  prints is the one it asked for rather than the one it got. An agent over
+  there today is a shell in a home directory that can reach the store.
 - **Host-qualified roots.** A project root is a path in the store and `~`
   expands on the seat. Correct while paths mirror; the Linux box is what forces
   the change, and the machines file is where it will hang.
