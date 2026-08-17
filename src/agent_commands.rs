@@ -74,9 +74,16 @@
 //!   focus decision forbids rendering one. `claude agents --json` answers
 //!   liveness and `idle`/`busy` per session with no pane involved at all, which
 //!   is a per-kind reading of exactly the sort this trait is for.
-//! - **t-260817-006, environment hygiene.** `CLAUDE_CODE_*` leaking into a
-//!   spawned pane disables its transcript. Which variables a kind must not
-//!   inherit is a fact about that kind.
+//! - ~~**t-260817-006, environment hygiene.**~~ Refuted, and worth keeping as
+//!   the one prediction on this list that was wrong. The guess was that which
+//!   variables a kind must not inherit is a fact about that kind. It is not:
+//!   what leaks is `CLAUDE_CODE_CHILD_SESSION` and the rest of the *caller's*
+//!   session identity, which is wrong to pass on whatever is about to be
+//!   started in the seat — including a bare shell, which has no kind at all.
+//!   The rule went to [`crate::place::shed`], beside `SEAT_ENV`, where it is
+//!   asked once per seat rather than once per agent. A kind-shaped question and
+//!   a spawn-shaped one look alike from here; the test is whether the answer
+//!   changes when nothing is started.
 //! - **t-260816-068, `--resume`.** Recording a session id against a task so an
 //!   agent can be picked up again. The same field this file already reads.
 //! - **t-260816-088, `--model` and `--effort`.** More of [`Kind::args`], and the
