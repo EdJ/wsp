@@ -301,6 +301,39 @@ fn named_after_task(label: &str, task: &Task) -> bool {
     label.trim().starts_with(&format!("{} ·", task_scope(task)))
 }
 
+/// What [`name_bound`] should rename a bound pane to, or `None` to leave the
+/// name it is wearing.
+///
+/// The bug this exists to stop: `name_bound` used to rename whenever the label
+/// differed from [`task_label`], and a sentence differs from the title by
+/// construction — so every `reconcile` erased every agent's `wsp say`, on every
+/// daemon start, silently. The status line each agent keeps for everyone else's
+/// benefit was destroyed by a maintenance verb, and the cost lands on a person,
+/// who has to interrupt an agent to ask what it is doing. That is the exact cost
+/// `wsp say` was built to remove.
+///
+/// So the question is [`named_after_task`]'s, not equality's: *is this a name of
+/// ours for this task*. That is the same question [`unname_after_task`] already
+/// asks at the other end of the pair, and asking it here is what makes the two
+/// halves of the mechanism agree. `name_bound` still does the whole job it was
+/// written for — a pane wearing `claude`, or a name from before any of this
+/// existed, or nothing, carries no scope and is renamed.
+///
+/// The trade: a pane wearing the *old* title after `wsp edit --title` also
+/// carries the right scope, so reconcile no longer refreshes it. It cannot be
+/// told from a sentence — one field holds both, which is the argument for moving
+/// `say` off the label entirely (t-260816-083). It is the cheaper half of the
+/// trade: the workspace below is untouched and still takes the new title, and a
+/// workspace is where "what is this work" is read; the pane answers "what is
+/// happening in there now", and a sentence is a better answer to that than a
+/// title. `claim` and `wsp say --clear` both write the new title back.
+fn pane_rename(pane_label: &str, task: &Task) -> Option<String> {
+    if named_after_task(pane_label, task) {
+        return None;
+    }
+    task_label(task)
+}
+
 /// Take the task's name back off the pane and the workspace that held it.
 ///
 /// The other half of [`name_after_task`], and the reason it is needed: a claim
@@ -1415,19 +1448,19 @@ fn name_bound(
     let tasks = store.tasks();
     let mut named = 0;
     for (pane_id, b) in store.bindings() {
-        let Some(label) = b
+        let Some(task) = b
             .get("task_id")
             .and_then(|t| t.as_str())
             .and_then(|id| tasks.iter().find(|t| t.id == id))
-            .and_then(task_label)
         else {
             continue;
         };
+        let Some(label) = task_label(task) else { continue };
         let Some(pane) = panes.iter().find(|p| p.pane_id == pane_id) else { continue };
 
         let mut touched = false;
-        if pane.label != label {
-            touched |= herdr::rename_pane(&pane.pane_id, &label).is_ok();
+        if let Some(name) = pane_rename(&pane.label, task) {
+            touched |= herdr::rename_pane(&pane.pane_id, &name).is_ok();
         }
         // A workspace nobody named reads back as the agent or the folder, so
         // the comparison can never say "already right" — it says "not the task
@@ -3006,6 +3039,34 @@ mod tests {
         // different project is a different piece of work.
         let elsewhere = Task::new("same ident, no project", "t-260816-047");
         assert!(!named_after_task(&task_label(&t).unwrap(), &elsewhere));
+    }
+
+    /// The defect: `reconcile` renamed on any label that differed from the
+    /// title, and a sentence always differs — so a routine maintenance verb
+    /// wiped every agent's `wsp say`, silently, and the panel went back to
+    /// reading as a row of titles nobody had said anything about.
+    #[test]
+    fn reconcile_leaves_a_sentence_where_the_agent_put_it() {
+        let mut t = Task::new("The three-module partition: core records", "t-260816-083");
+        t.project = Some("robustness".into());
+
+        // What an agent is saying right now. Reconcile has no business here:
+        // the sentence is newer than anything reconcile knows.
+        let said = said_label(&t, "reading place.rs for what the port owes say").unwrap();
+        assert_eq!(pane_rename(&said, &t), None);
+
+        // The name the claim wrote, and still wearing it. Nothing to do.
+        assert_eq!(pane_rename(&task_label(&t).unwrap(), &t), None);
+
+        // The cases name_bound exists for, all intact: a pane from before any
+        // of this, one whose claim-time rename was dropped on a slow socket,
+        // and one still wearing the task it was moved off.
+        assert_eq!(pane_rename("claude", &t), task_label(&t));
+        assert_eq!(pane_rename("", &t), task_label(&t));
+        let mut old = Task::new("something else entirely", "t-260816-030");
+        old.project = Some("robustness".into());
+        let stale = said_label(&old, "still on the old one").unwrap();
+        assert_eq!(pane_rename(&stale, &t), task_label(&t));
     }
 
     /// The subtraction that separates a loaded index from an agent halfway
