@@ -21,6 +21,16 @@ use serde_json::{json, Value};
 use crate::util;
 
 pub fn socket_path() -> PathBuf {
+    // A test that reads this without saying where is pointed at the live herdr
+    // — a server, with somebody's windows in it. Three tests in `cmd_govern`
+    // were renaming this machine's `w1` on every run. The argument, and the
+    // guard that ends it, are in [`crate::util::isolated`]; this compiles out
+    // of the binary entirely.
+    #[cfg(test)]
+    assert!(
+        std::env::var_os("HERDR_SOCKET_PATH").is_some(),
+        "a test reached for the live herdr — take crate::util::isolated() instead"
+    );
     match std::env::var_os("HERDR_SOCKET_PATH") {
         Some(v) => PathBuf::from(v),
         None => util::home().join(".config/herdr/herdr.sock"),
@@ -732,19 +742,14 @@ mod tests {
     /// route everything asked about its workspace to this machine.
     #[test]
     fn two_machines_come_back_as_one_list_with_the_far_one_saying_so() {
-        let _env = util::env_lock();
-        let root = std::env::temp_dir().join(format!("wsp-fan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let state = root.join("state");
-        std::fs::create_dir_all(state.join("sock")).unwrap();
-        std::fs::create_dir_all(root.join("wsp/machines")).unwrap();
-        std::env::set_var("WSP_HOME", root.join("wsp"));
-        std::env::set_var("WSP_STATE", &state);
+        let env = util::isolated("herdr-fanout");
+        let state = env.state();
+        std::fs::create_dir_all(env.home().join("machines")).unwrap();
 
         // mb2 exists and the daemon last saw it answering. Both halves are
         // needed: the fan-out asks the store what exists and state what is up.
         std::fs::write(
-            root.join("wsp/machines/mb2.md"),
+            env.home().join("machines/mb2.md"),
             "---\nname: mb2\nssh: mb2\nstatus: active\n---\n",
         )
         .unwrap();
@@ -791,11 +796,6 @@ mod tests {
         // This machine failing *is* an error: there is nothing to work with.
         std::env::set_var("HERDR_SOCKET_PATH", state.join("nothing-here.sock"));
         assert!(panes().is_err());
-
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        std::env::remove_var("WSP_STATE");
-        std::env::remove_var("WSP_HOME");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The end of the wire, with a real socket at the end of it.
@@ -809,13 +809,9 @@ mod tests {
     /// One test, because it sets `WSP_STATE` for the process.
     #[test]
     fn a_qualified_id_arrives_at_that_machines_socket_and_nowhere_else() {
-        let _env = util::env_lock();
-        let state = std::env::temp_dir().join(format!("wsp-route-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(state.join("sock")).unwrap();
-        std::env::set_var("WSP_STATE", &state);
+        let env = util::isolated("herdr-route");
 
-        let sock = state.join("sock").join("mb2.sock");
+        let sock = env.state().join("sock").join("mb2.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -841,8 +837,5 @@ mod tests {
         // a path nobody typed.
         let err = call("agent.get", json!({ "target": "w0:p3@gpu" })).expect_err("no tunnel to gpu");
         assert!(err.to_string().contains("gpu: no tunnel"), "{err}");
-
-        std::env::remove_var("WSP_STATE");
-        let _ = std::fs::remove_dir_all(&state);
     }
 }

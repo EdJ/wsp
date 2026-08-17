@@ -69,6 +69,11 @@ fn store_env_from(
 /// a real failure. `herdr.rs` and `fake.rs` each kept a mutex of their own for
 /// this, which protects a module from itself and not from the module next door —
 /// and there are three of them now. One process-wide resource, one lock.
+///
+/// Taken bare only for the variables nothing else knows how to set up — a seat
+/// id, a session marker, a credential the shed is being asked about. A test that
+/// can reach a store or a herdr wants [`isolated`], which takes this lock and
+/// points all three of the pointing-variables at something of its own.
 #[cfg(test)]
 pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -76,6 +81,101 @@ pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A store nobody else is using, a backend that does not exist, and this
+/// process pointed at both for as long as the guard lives. What a test takes
+/// instead of [`env_lock`] when anything under it can reach a
+/// [`crate::store::Store`] or a herdr.
+///
+/// **Written by two tests that failed because a machine was added to the real
+/// store**, and neither of them was about machines (robustness-068).
+/// `Store::open()` falls back to `~/wsp` when `WSP_HOME` is unset, so a test
+/// that reaches a store reaches the developer's own — and `herdr::panes()` fans
+/// out over `store.machines()`, so a test that stood up a fake backend and
+/// asserted the one pane in it began asserting that pane *plus whatever was
+/// running on eds-macbook-i5*, over a tunnel, from a test named after a fake.
+/// Nothing in the code had changed. `wsp install` is gated on
+/// `wsp verify --release`, which is how a laptop being switched on came to block
+/// an install.
+///
+/// The fix belongs here rather than in `fanout()`, which is correct as written:
+/// fanning out is what it is for, and a production path taught to notice tests
+/// is a production path that behaves differently in the one place nobody is
+/// watching. `Store::open` and [`crate::herdr::socket_path`] each carry a
+/// `#[cfg(test)]` assertion that this guard has been taken — a line that
+/// compiles out of the binary, so no shipped path can tell, and that turns
+/// "somebody remembered" into "it will not run".
+///
+/// **All three variables, or none of it works.** `WSP_HOME` alone leaves state
+/// at `~/.local/state/wsp`, which is where the machine liveness the fan-out
+/// filters on is read from, so half an isolation still reads the real machine
+/// list (robustness-011 is open on that asymmetry). And the socket is not a
+/// third nicety: `HERDR_SOCKET_PATH` unset means the **live herdr**, which is a
+/// server that gets written to. The three `cmd_govern` tests were renaming this
+/// machine's `w1` on every `cargo test` — the failure that file's module doc
+/// records as measured the hard way, still running. So the default here is a
+/// path inside the temp directory that nothing ever binds: a test that wants a
+/// backend stands one up and points the variable at it, and a test that does not
+/// gets a refused connection instead of somebody's window.
+///
+/// It holds [`ENV`] because these are process-wide, so an isolated test is no
+/// isolation at all from the test next door halfway through setting its own —
+/// which also means **one guard per test**: taking a second on the same thread
+/// waits for the first to be dropped, forever. And it puts everything back on
+/// drop rather than at the end of the test body, because a test that fails while
+/// holding them leaves the process pointed at a store and a socket that no
+/// longer exist, and the test that runs next is the one that looks broken.
+#[cfg(test)]
+pub struct Isolated {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    dir: PathBuf,
+}
+
+#[cfg(test)]
+pub fn isolated(name: &str) -> Isolated {
+    let lock = env_lock();
+    let dir = std::env::temp_dir().join(format!("wsp-t-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("wsp")).unwrap();
+    // `sock` because a store's socket paths are read straight off state, so a
+    // test that binds one is otherwise creating this directory itself.
+    std::fs::create_dir_all(dir.join("state/sock")).unwrap();
+    std::env::set_var("WSP_HOME", dir.join("wsp"));
+    std::env::set_var("WSP_STATE", dir.join("state"));
+    std::env::set_var("HERDR_SOCKET_PATH", dir.join("no-backend.sock"));
+    Isolated { _lock: lock, dir }
+}
+
+#[cfg(test)]
+impl Isolated {
+    /// The store — `WSP_HOME`. Empty, and a test that wants a task in it writes
+    /// one.
+    pub fn home(&self) -> PathBuf {
+        self.dir.join("wsp")
+    }
+
+    /// The machine state beside it — `WSP_STATE`.
+    pub fn state(&self) -> PathBuf {
+        self.dir.join("state")
+    }
+
+    /// Somewhere to put what a test needs and the store does not: a socket to
+    /// bind, a git repository to stand a checkout in. Under the same directory,
+    /// so it goes away with everything else.
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Isolated {
+    fn drop(&mut self) {
+        for key in ["WSP_HOME", "WSP_STATE", "HERDR_SOCKET_PATH"] {
+            std::env::remove_var(key);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// The clock a wait is measured on, handed to whatever waits rather than read

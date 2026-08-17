@@ -161,6 +161,18 @@ impl MachineLive {
 
 impl Store {
     pub fn open() -> Store {
+        // The default store is the developer's own, at `~/wsp`, and a test that
+        // opens it is reading whoever is working today — which is how two tests
+        // of a fake herdr backend came to fail on a laptop being switched on.
+        // The argument, and the helper, are in [`crate::util::isolated`];
+        // this is the line that makes a test that reads the live store
+        // impossible to write by accident rather than merely discouraged. It
+        // compiles out of the binary entirely, so no shipped path can tell.
+        #[cfg(test)]
+        assert!(
+            std::env::var_os("WSP_HOME").is_some() && std::env::var_os("WSP_STATE").is_some(),
+            "a test opened the live store — take crate::util::isolated() instead"
+        );
         let root = match std::env::var_os("WSP_HOME") {
             Some(v) => PathBuf::from(v),
             None => util::home().join("wsp"),

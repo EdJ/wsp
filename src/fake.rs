@@ -1996,11 +1996,10 @@ mod tests {
     /// `agent.start` and by nothing else, which is what these two readings say.
     #[test]
     fn a_stage_of_agents_that_are_already_up_never_enters_the_launch_window() {
-        let _env = util::env_lock();
-        let dir = scratch("already-up");
+        let env = util::isolated("fake-already-up");
         let stage = Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]);
         assert!(stage.unnamed > 0, "the window is off, and this asserts nothing");
-        let fake = Fake::bind(dir.join("herdr.sock"), stage).unwrap();
+        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
         let (k, v) = fake.socket_env();
         std::env::set_var(k, v);
 
@@ -2024,9 +2023,6 @@ mod tests {
             State::Empty,
             "which wsp reads as an empty seat, and that is the whole of t-260817-010"
         );
-
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Which readings can tell a starting agent from an idle one, recorded
@@ -2077,8 +2073,7 @@ mod tests {
     /// that is working, one that has gone and a shell with nobody in it.
     #[test]
     fn wsps_own_client_reads_a_state_no_herdr_could_be_put_in() {
-        let _env = util::env_lock();
-        let dir = scratch("client");
+        let env = util::isolated("fake-client");
         let stage = Stage::of(vec![
             Spot::agent("w1:p1", "claude", "t-1", State::Starting).labelled("one").on("w1", "w1:t1"),
             Spot::agent("w1:p2", "claude", "t-2", State::Working).labelled("two").on("w1", "w1:t1"),
@@ -2088,7 +2083,7 @@ mod tests {
                 .on("w2", "w2:t1"),
             Spot::empty("w2:p2").labelled("a shell").on("w2", "w2:t1"),
         ]);
-        let fake = Fake::bind(dir.join("herdr.sock"), stage).unwrap();
+        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
         let (k, v) = fake.socket_env();
         std::env::set_var(k, v);
 
@@ -2111,9 +2106,6 @@ mod tests {
         // an answer to.
         let agents = herdr::agents().expect("the fake answered");
         assert_eq!(agents.len(), 2, "a gone agent was listed as a live one");
-
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Silence, in both its forms, is not an empty list. This is t-260816-058's
@@ -2121,10 +2113,9 @@ mod tests {
     /// task exists for, since a live herdr cannot be asked to stop answering.
     #[test]
     fn a_backend_that_is_not_answering_is_an_error_and_never_an_empty_list() {
-        let _env = util::env_lock();
-        let dir = scratch("quiet");
+        let env = util::isolated("fake-quiet");
         let fake = Fake::bind(
-            dir.join("herdr.sock"),
+            env.path("herdr.sock"),
             Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]),
         )
         .unwrap();
@@ -2140,9 +2131,6 @@ mod tests {
 
         fake.goes(Quiet::No);
         assert_eq!(herdr::panes().expect("answering again").len(), 1);
-
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The order `spawn` depends on, driven end to end: open a seat, start an
@@ -2193,10 +2181,9 @@ mod tests {
     /// dots-to-underscores rename are exercised rather than assumed.
     #[test]
     fn a_state_change_reaches_a_watcher_that_was_already_listening() {
-        let _env = util::env_lock();
-        let dir = scratch("watch");
+        let env = util::isolated("fake-watch");
         let fake = Fake::bind(
-            dir.join("herdr.sock"),
+            env.path("herdr.sock"),
             Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]),
         )
         .unwrap();
@@ -2226,9 +2213,6 @@ mod tests {
         let (name, data) = rx.recv_timeout(DELIVERY).expect("no close arrived");
         assert_eq!(name, "pane_closed");
         assert_eq!(data["pane_id"], "w1:p1");
-
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One entry missing its `pane_id` refuses **every other entry with it**,
@@ -2238,9 +2222,8 @@ mod tests {
     /// both of them look arbitrary.
     #[test]
     fn one_per_pane_subscription_refuses_the_whole_list() {
-        let _env = util::env_lock();
-        let dir = scratch("subs");
-        let fake = Fake::bind(dir.join("herdr.sock"), Stage::new()).unwrap();
+        let env = util::isolated("fake-subs");
+        let fake = Fake::bind(env.path("herdr.sock"), Stage::new()).unwrap();
         let (k, v) = fake.socket_env();
         std::env::set_var(k, v);
 
@@ -2252,9 +2235,6 @@ mod tests {
         // subscribes per pane for those three and globally for the rest.
         assert!(subscription_error(&[json!({ "type": "pane.agent_status_changed", "pane_id": "w1:p1" })]).is_none());
         assert!(subscription_error(&[json!({ "type": "nonesuch.event" })]).is_some());
-
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The split arithmetic, recorded: **the target keeps the ratio and the new

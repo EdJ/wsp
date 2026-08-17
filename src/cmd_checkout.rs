@@ -805,11 +805,17 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wsp-co-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A directory to stand a repository in, and an empty store beside it:
+    /// [`checkout_dir`] resolves a task's former ids out of the *ambient*
+    /// store, so every test here reads whatever the developer has renamed
+    /// today unless it is pointed somewhere else. See
+    /// [`crate::util::isolated`], and note that one test takes one — a
+    /// second on the same thread waits for the first.
+    fn scratch(name: &str) -> (util::Isolated, PathBuf) {
+        let env = util::isolated(&format!("co-{name}"));
+        let dir = env.path("repo");
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (env, dir)
     }
 
     fn run(dir: &Path, args: &[&str]) {
@@ -838,7 +844,7 @@ mod tests {
     /// reaches the trunk, and nothing else does.
     #[test]
     fn work_committed_in_a_tree_of_its_own_lands_on_the_trunk() {
-        let dir = scratch("land");
+        let (_env, dir) = scratch("land");
         repo(&dir);
 
         let wt = checkout_dir(&dir, "t-1");
@@ -860,7 +866,6 @@ mod tests {
             git(&dir, &["log", "--format=%s", "-1"]).unwrap().contains("mine"),
             "the trunk is not at the landed commit"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A tree is a checkout, so the trunk's uncommitted work is not in it. This
@@ -868,7 +873,7 @@ mod tests {
     /// in one tree cannot see the other tree's files at all.
     #[test]
     fn another_agents_uncommitted_work_is_not_in_this_tree() {
-        let dir = scratch("isolated");
+        let (_env, dir) = scratch("isolated");
         repo(&dir);
         std::fs::write(dir.join("theirs.txt"), "theirs\n").unwrap();
 
@@ -876,14 +881,13 @@ mod tests {
         ensure(&dir, &wt, "t-2", "master").unwrap();
         assert!(!wt.join("theirs.txt").exists(), "another agent's file was in this tree");
         assert!(!dirty(&wt), "a fresh tree was already dirty");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Coming back to a task finds the commits it left, rather than a fresh
     /// branch — an agent releases a task and picks it up again all the time.
     #[test]
     fn coming_back_to_a_task_finds_the_branch_it_left() {
-        let dir = scratch("resume");
+        let (_env, dir) = scratch("resume");
         repo(&dir);
         let wt = checkout_dir(&dir, "t-3");
         ensure(&dir, &wt, "t-3", "master").unwrap();
@@ -894,7 +898,6 @@ mod tests {
         git_ok(&dir, &["worktree", "remove", &wt.display().to_string()]).unwrap();
         assert!(ensure(&dir, &wt, "t-3", "master").unwrap(), "the tree was not remade");
         assert!(wt.join("wip.txt").exists(), "the work left on the branch did not come back");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The leak this arrangement adds, found by something that runs anyway.
@@ -907,7 +910,7 @@ mod tests {
     /// alone however long it has stood there.
     #[test]
     fn a_tree_with_nothing_left_in_it_is_reported_and_one_with_work_is_not() {
-        let dir = scratch("stale");
+        let (_env, dir) = scratch("stale");
         repo(&dir);
         let never_closed = |_: &str| false;
 
@@ -934,7 +937,6 @@ mod tests {
         let closed = stale(&dir, &|id: &str| id == "t-busy");
         assert_eq!(closed[0].task, "t-busy");
         assert_eq!(closed[0].why, Why::Closed, "a closed task's tree was named for the wrong reason");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn names(found: &[Stale]) -> Vec<&str> {
@@ -951,7 +953,7 @@ mod tests {
     /// thing to do rather than a rebuild.
     #[test]
     fn a_landed_tree_is_still_standing_and_lands_again() {
-        let dir = scratch("relanding");
+        let (_env, dir) = scratch("relanding");
         repo(&dir);
         let wt = checkout_dir(&dir, "t-6");
         ensure(&dir, &wt, "t-6", "master").unwrap();
@@ -969,7 +971,6 @@ mod tests {
             assert!(ahead(&dir, "master", "t-6").is_empty(), "the branch is still ahead after landing");
             assert!(dir.join(format!("{n}.txt")).exists(), "{n} did not reach the trunk");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The sweep is the acting half of the report, and it is narrower on
@@ -977,7 +978,7 @@ mod tests {
     /// nobody in it would be lost with it.
     #[test]
     fn the_sweep_takes_a_closed_tasks_tree_and_leaves_everything_it_cannot_prove() {
-        let dir = scratch("sweep");
+        let (_env, dir) = scratch("sweep");
         repo(&dir);
 
         // Four trees, one reason each to be here.
@@ -1004,7 +1005,6 @@ mod tests {
         let kept: Vec<&str> = out.kept.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(kept, ["t-held", "t-messy"], "a skipped tree went unreported: {:?}", out.kept);
         assert!(out.kept[1].1.contains("uncommitted"), "the reason did not name the work at risk");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A swept tree is recoverable and an unswept one has to be: the branch
@@ -1012,7 +1012,7 @@ mod tests {
     /// commits again — and the branch is only kept when it holds some.
     #[test]
     fn the_sweep_keeps_the_branch_when_it_still_holds_work() {
-        let dir = scratch("sweep-branch");
+        let (_env, dir) = scratch("sweep-branch");
         repo(&dir);
         let wt = checkout_dir(&dir, "t-7");
         ensure(&dir, &wt, "t-7", "master").unwrap();
@@ -1026,7 +1026,6 @@ mod tests {
 
         ensure(&dir, &wt, "t-7", "master").unwrap();
         assert!(wt.join("unlanded.txt").exists(), "reopening the task did not get the work back");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The seam `spawn` opens a workspace through. A task gets a tree; a root
@@ -1034,7 +1033,7 @@ mod tests {
     /// spawning into a project that is not under git goes on working.
     #[test]
     fn a_spawn_onto_a_task_is_given_a_tree_and_a_spawn_into_nothing_is_not() {
-        let dir = scratch("spawn");
+        let (env, dir) = scratch("spawn");
         repo(&dir);
         let root = dir.display().to_string();
 
@@ -1042,11 +1041,9 @@ mod tests {
         assert!(placed.ends_with(".worktrees/t-5"), "opened somewhere else: {placed}");
         assert!(checkout_dir(&dir, "t-5").join(".git").exists(), "the path is not a checkout");
 
-        let bare = scratch("spawn-bare");
+        let bare = env.path("bare");
+        std::fs::create_dir_all(&bare).unwrap();
         assert_eq!(tree_for(&bare.display().to_string(), "t-5"), None, "a directory git does not know");
-
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&bare);
     }
 
     /// `overlap` asks this about every pane herdr reports, so it has to be a
@@ -1054,6 +1051,9 @@ mod tests {
     /// the root is *not* inside the trunk, however much the prefix says so.
     #[test]
     fn a_worktree_under_the_root_is_a_tree_of_its_own() {
+        // Paths only, and it still needs a store of its own: `checkout_dir`
+        // asks one which ids `t-1` used to have.
+        let _env = util::isolated("co-worktree-of");
         let root = Path::new("/Users/x/claude/wsp");
         assert_eq!(worktree_of(root), None, "the trunk is not a worktree");
         assert_eq!(worktree_of(&root.join("src/main.rs")), None);
@@ -1076,13 +1076,12 @@ mod tests {
     /// inside a worktree as readily as from the trunk itself.
     #[test]
     fn the_trunk_is_found_from_inside_a_worktree() {
-        let dir = scratch("trunk");
+        let (_env, dir) = scratch("trunk");
         repo(&dir);
         let wt = checkout_dir(&dir, "t-4");
         ensure(&dir, &wt, "t-4", "master").unwrap();
         assert_eq!(trunk(&wt).map(|p| util::real(&p.display().to_string())), Some(util::real(&dir.display().to_string())));
         assert_eq!(trunk_branch(&dir).as_deref(), Some("master"));
         assert_eq!(trunk_branch(&wt).as_deref(), Some("t-4"), "a tree is on its own branch");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

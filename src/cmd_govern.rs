@@ -849,7 +849,7 @@ mod tests {
     /// is the project's, and it stays there empty.
     #[test]
     fn one_agent_holds_one_governorship_and_taking_another_hands_it_back() {
-        let store = store("one");
+        let (_env, store) = store("one");
         take(&store, "robustness", "w1", "w1:p1");
         assert_eq!(governs(&store.governors(), "w1").as_deref(), Some("robustness"));
 
@@ -866,12 +866,16 @@ mod tests {
         assert_eq!(governs(&store.governors(), "w3"), None);
     }
 
-    fn store(tag: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("wsp-govern-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = Store::at(root.clone(), root.join("state"));
+    /// A store of its own — **and the process pointed at it**, which is the half
+    /// that passing a store in does not buy. `take` renames the seat's
+    /// workspace, and that goes through `herdr::panes`, which fans out over
+    /// whatever machines the *ambient* store names. See
+    /// [`crate::util::isolated`].
+    fn store(tag: &str) -> (util::Isolated, Store) {
+        let env = util::isolated(&format!("govern-{tag}"));
+        let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
-        store
+        (env, store)
     }
 
     /// The property this task turns on, as an assertion: **the slot outlives
@@ -884,7 +888,7 @@ mod tests {
     /// half must go on being exact — and a row that still exists to be filled.
     #[test]
     fn standing_down_empties_the_seat_and_leaves_it_standing() {
-        let store = store("vacate");
+        let (_env, store) = store("vacate");
         take(&store, "wsp", "w1", "w1:p1");
         assert!(seat_for(&store.governors(), &tree(), Some("wsp")).is_some());
 
@@ -914,7 +918,7 @@ mod tests {
     /// should be typed on purpose.
     #[test]
     fn removing_a_seat_takes_the_position_off_the_project() {
-        let store = store("remove");
+        let (_env, store) = store("remove");
         take(&store, "wsp", "w1", "w1:p1");
         assert!(store.clear_governor("wsp"));
         assert!(slots(&store.governors()).is_empty(), "no position, not an empty one");

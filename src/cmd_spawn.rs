@@ -1471,10 +1471,13 @@ mod tests {
     /// re-syncs on its way out, and this machine has a live herdr with real
     /// workspaces in it. A socket path that answers nothing makes every call fail
     /// at once rather than pushing a fixture's metadata onto somebody's pane.
-    fn no_backend() -> std::sync::MutexGuard<'static, ()> {
-        let lock = util::env_lock();
+    /// An empty store comes with it, on the same argument one step further out:
+    /// a store these tests did not write is a store somebody else did, and
+    /// `place_work` reads one — see [`crate::util::isolated`].
+    fn no_backend() -> util::Isolated {
+        let env = util::isolated("spawn-no-backend");
         std::env::set_var("HERDR_SOCKET_PATH", "/nonexistent/wsp-despawn-tests.sock");
-        lock
+        env
     }
 
     /// **The decision this task was opened for.** A seat that will not close

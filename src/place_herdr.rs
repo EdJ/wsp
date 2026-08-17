@@ -589,23 +589,18 @@ mod tests {
     use super::*;
     use crate::fake::{Fake, Quiet, Snub, Spot, Stage, Verb};
     use crate::util::Dial;
-    use std::path::PathBuf;
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wsp-adapter-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     /// A fake bound at the socket wsp's own client reads, so every test below
-    /// goes over the wire rather than round it.
-    fn bound(name: &str, stage: Stage) -> (Fake, PathBuf) {
-        let dir = scratch(name);
-        let fake = Fake::bind(dir.join("herdr.sock"), stage).unwrap();
+    /// goes over the wire rather than round it — and an empty store beside it,
+    /// because `census` goes through `herdr::panes`, which fans out over the
+    /// machines the store names. Held for as long as the guard is: see
+    /// [`crate::util::isolated`].
+    fn bound(name: &str, stage: Stage) -> (Fake, util::Isolated) {
+        let env = util::isolated(&format!("adapter-{name}"));
+        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
         let (k, v) = fake.socket_env();
         std::env::set_var(k, v);
-        (fake, dir)
+        (fake, env)
     }
 
     /// The adapter with its four windows shortened and a clock the test winds.
@@ -651,12 +646,11 @@ mod tests {
     /// never heard of a workspace.
     #[test]
     fn the_order_a_spawn_places_is_open_start_wait_tell() {
-        let _env = util::env_lock();
         let mut stage = Stage::new();
         // The window a live herdr passes through in half a second whether you
         // wanted it to or not.
         stage.settle = false;
-        let (fake, dir) = bound("order", stage);
+        let (fake, _env) = bound("order", stage);
         let dial = Dial::new();
         let place = brisk(&dial);
 
@@ -687,8 +681,6 @@ mod tests {
         assert_eq!(told.map(|a| a.seat), Some(Some(seat.clone())), "the sentence reached the seat");
         assert!(fake.verbs().starts_with(&[Verb::Open, Verb::Start]), "{:?}", fake.verbs());
 
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **t-260817-010.** An agent that has been started and not yet detected is
@@ -711,10 +703,9 @@ mod tests {
     /// this test passes against the broken code.
     #[test]
     fn an_agent_that_is_not_detected_yet_is_never_read_as_a_seat_that_emptied() {
-        let _env = util::env_lock();
         let mut stage = Stage::new();
         stage.settle = false;
-        let (fake, dir) = bound("launching", stage);
+        let (fake, _env) = bound("launching", stage);
         let dial = Dial::new();
         let place = brisk(&dial);
 
@@ -732,8 +723,6 @@ mod tests {
         );
         assert!(fake.stage().unnamed > 0, "a stage that skips the window cannot catch this");
 
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Ending a seat, and ending one that has already gone.
@@ -751,8 +740,7 @@ mod tests {
     /// fake has no processes to kill.
     #[test]
     fn a_seat_that_is_ended_is_gone_and_ending_it_twice_is_not_a_failure() {
-        let _env = util::env_lock();
-        let (fake, dir) = bound(
+        let (fake, _env) = bound(
             "stop",
             Stage::of(vec![
                 Spot::agent("w1:p1", "claude", "t-1", State::Idle).labelled("robustness/095"),
@@ -772,8 +760,6 @@ mod tests {
         assert_eq!(place.stop(&seat), Err(Refusal::NoSeat(seat.clone())), "already gone");
         assert_eq!(place.state(&seat), Err(Refusal::NoSeat(seat)));
 
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The bug this adapter exists to stop porting faithfully.
@@ -836,8 +822,7 @@ mod tests {
     /// about each is how long *that* wait was.
     #[test]
     fn a_pane_with_no_shell_yet_is_retried_and_nothing_else_is() {
-        let _env = util::env_lock();
-        let (fake, dir) = bound("busy", Stage::new());
+        let (fake, _env) = bound("busy", Stage::new());
         let agent = Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new() };
 
         // Opening a seat waits for nothing, so this dial never moves.
@@ -883,8 +868,6 @@ mod tests {
         assert_eq!(dial.elapsed(), Duration::ZERO, "a real refusal was waited on: {err}");
         assert_eq!(times(&fake, Verb::Start), 1, "a real refusal was retried: {err}");
 
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `available()` was a question asked in advance about a socket. This is what
@@ -892,8 +875,7 @@ mod tests {
     /// verb, in both of the ways a backend goes quiet.
     #[test]
     fn a_backend_that_did_not_answer_is_unreachable_rather_than_a_refusal() {
-        let _env = util::env_lock();
-        let (fake, dir) = bound("quiet", Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]));
+        let (fake, _env) = bound("quiet", Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]));
         let dial = Dial::new();
         let place = brisk(&dial);
         let seat = Seat::new("w1:p1");
@@ -914,8 +896,6 @@ mod tests {
         fake.goes(Quiet::No);
         assert_eq!(place.state(&Seat::new("nosuch")), Err(Refusal::NoSeat(Seat::new("nosuch"))));
 
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The listing asymmetry, corrected: a census reads its seats from the call
@@ -926,8 +906,7 @@ mod tests {
     /// working, one that has gone, and a shell nobody is in.
     #[test]
     fn a_census_has_the_empty_seats_and_the_states_a_pane_row_cannot_carry() {
-        let _env = util::env_lock();
-        let (_fake, dir) = bound(
+        let (_fake, _env) = bound(
             "census",
             Stage::of(vec![
                 Spot::agent("w1:p1", "claude", "t-1", State::Starting).labelled("one"),
@@ -951,8 +930,6 @@ mod tests {
         assert_eq!(shell.cwd, "/tmp");
         assert_eq!(shell.agent.kind, "");
 
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// "Tell me when it stops" is the clause no poll carries, and this is the
@@ -996,8 +973,7 @@ mod tests {
     /// watcher that was already listening hears the seat it is waiting on stop.
     #[test]
     fn a_watcher_hears_what_the_backend_did_without_being_asked() {
-        let _env = util::env_lock();
-        let (fake, dir) = bound("watch", Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]));
+        let (fake, _env) = bound("watch", Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]));
 
         let (tx, rx) = std::sync::mpsc::channel::<Event>();
         std::thread::spawn(move || {
@@ -1024,8 +1000,6 @@ mod tests {
         let closed = rx.recv_timeout(DELIVERY).expect("no close arrived");
         assert_eq!(closed, Event::Closed(seat));
 
-        std::env::remove_var("HERDR_SOCKET_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The seat an agent is standing in is the one herdr put in its environment,

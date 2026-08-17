@@ -470,6 +470,10 @@ mod tests {
     /// specification`, which reads as a bug in something wsp built.
     #[test]
     fn a_machine_that_does_not_say_where_its_backend_listens_still_forwards_to_one() {
+        // The default far side is *this* machine's socket path, so the test
+        // reads one — and reading the real one would be this assertion resting
+        // on how the developer's herdr happens to be configured.
+        let _env = crate::util::isolated("tunnel-default-far-side");
         let m = Machine::new("mb2", "mac-mini");
         assert!(m.backend_at.is_empty(), "a bare record carries no address");
 
