@@ -2373,6 +2373,135 @@ mod tests {
         assert_eq!(drawn(&d), folded, "the tree did not come back as it was left");
     }
 
+    /// Which projects the tree is currently drawing, folded or not — the row
+    /// existing is the question, since a project inside a folded one has no row
+    /// at all.
+    fn drawn_projects(d: &mut Driver) -> Vec<String> {
+        let at = d.ui.selected_index();
+        let mut out = Vec::new();
+        for i in 0..d.ui.rows_for_test() {
+            d.ui.select_for_test(i);
+            if let panel::Target::Project(id) = d.ui.selected_target() {
+                out.push(id);
+            }
+        }
+        d.ui.select_for_test(at);
+        out
+    }
+
+    /// `h` folds one row, and the store is thirty-one projects: getting back to
+    /// a tree you can read a branch at a time is the walk `H` is for. What it
+    /// leaves is the top of the tree and nothing hanging off it.
+    #[test]
+    fn folding_the_whole_tree_leaves_the_top_of_it_and_nothing_under_it() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.key(Key::Char('H'));
+
+        assert!(drawn_tasks(&mut d).is_empty(), "{:?}", drawn_tasks(&mut d));
+        let projects = drawn_projects(&mut d);
+        assert!(projects.contains(&"audio".to_string()), "{projects:?}");
+        assert!(projects.contains(&"meta".to_string()), "{projects:?}");
+        assert!(
+            !projects.contains(&"vst".to_string()),
+            "a project inside a folded one is still drawn: {projects:?}"
+        );
+    }
+
+    /// And `L` reaches folds it cannot see. It clears the set rather than
+    /// walking the rows, which is what makes it the one of the two that is
+    /// exact: a branch shut by hand before `H` — and so hidden inside it after
+    /// — comes back with everything else.
+    #[test]
+    fn unfolding_the_whole_tree_reaches_the_folds_that_are_out_of_sight() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.to_project("vst").key(Key::Char('h'));
+        assert!(!drawn_tasks(&mut d).contains(&"t-001".to_string()), "the fold already shows it");
+
+        d.keys(&[Key::Char('H'), Key::Char('L')]);
+        assert!(
+            drawn_tasks(&mut d).contains(&"t-001".to_string()),
+            "a fold made before `H` outlived `L`",
+        );
+    }
+
+    /// `<` reads the branch off wherever the cursor is standing, rather than
+    /// asking for a walk up to the heading first. Here the cursor is on a task
+    /// in `tooling`, and what folds is `tooling`'s — the project inside it, with
+    /// all of its work.
+    ///
+    /// The task the cursor is on stays: folding what is *in* a branch is not
+    /// folding the branch, which is `h` and one key along.
+    #[test]
+    fn a_branch_is_the_one_the_cursor_is_standing_in() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.to_task("t-005").key(Key::Char('<'));
+
+        let tasks = drawn_tasks(&mut d);
+        assert!(tasks.contains(&"t-005".to_string()), "the row it was pressed on went: {tasks:?}");
+        assert!(
+            !tasks.iter().any(|id| id.starts_with("t-1")),
+            "the project inside it kept its work on screen: {tasks:?}",
+        );
+        assert!(
+            drawn_projects(&mut d).contains(&"wsp".to_string()),
+            "and that project's own row went with it",
+        );
+    }
+
+    /// One press each way, at any depth. This is what decides that `<` shuts
+    /// the head's children and stops: the rows below them are off the screen
+    /// either way, and leaving their folds alone is what leaves `>` something
+    /// to open. Fold `audio` and the whole of `vst`, `trance` and `verb` goes
+    /// with it — and comes back on the next keystroke rather than the third.
+    #[test]
+    fn a_branch_folded_by_one_press_comes_back_in_one() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.to_project("audio").key(Key::Char('<'));
+
+        let projects = drawn_projects(&mut d);
+        assert!(projects.contains(&"vst".to_string()), "the head folded itself too: {projects:?}");
+        assert!(!projects.contains(&"trance".to_string()), "{projects:?}");
+        assert!(!drawn_tasks(&mut d).contains(&"t-001".to_string()), "two levels down is drawn");
+
+        d.key(Key::Char('>'));
+        assert!(drawn_projects(&mut d).contains(&"trance".to_string()), "one press back was not enough");
+        assert!(drawn_tasks(&mut d).contains(&"t-001".to_string()), "one press back was not enough");
+    }
+
+    /// The fold keys stay live inside a pick, like the ones they are the plural
+    /// of: a pick is a hunt for one project among thirty, and `H` is the tree
+    /// out of the way. What it must not do is answer the pick — `<`, `>`, `H`
+    /// and `L` change what is on screen and nothing in the store, and `↵` still
+    /// takes the row it lands on afterwards.
+    #[test]
+    fn folding_the_tree_is_still_folding_it_while_a_pick_is_up() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let rows = ui.rows_for_target(&panel::Target::Task("t-001".into()));
+        ui.select_for_test(rows[0]);
+
+        assert!(matches!(panel::apply_key(Key::Char('m'), &mut ui, &mut view), panel::Effect::None));
+        assert!(matches!(
+            panel::apply_key(Key::Char('H'), &mut ui, &mut view),
+            panel::Effect::Refetch
+        ));
+        panel::refetch_into(&mut ui, &w, &mut view);
+
+        let rows = ui.rows_for_target(&panel::Target::Project("meta".into()));
+        ui.select_for_test(rows[0]);
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["mv", "t-001", "-p", "meta", "--parent", "none"]);
+            }
+            _ => panic!("the pick stopped taking the row it lands on"),
+        }
+    }
+
     /// A filter that hides most of the store has to say it is on. `A` and `R`
     /// each wear a word in the footer for that reason and this is the one that
     /// hides the most — a tree narrowed to two rows with nothing to say why is
@@ -4844,3 +4973,4 @@ mod tests {
     }
 
 }
+

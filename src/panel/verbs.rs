@@ -1053,6 +1053,16 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         Key::Up | Key::Char('k') => move_or_fold(Key::Up, ui, view),
         Key::Left | Key::Char('h') => move_or_fold(Key::Left, ui, view),
         Key::Right | Key::Char('l') => move_or_fold(Key::Right, ui, view),
+        // The same two keys over more than one row, and the three scopes read
+        // in the order the map lists them: a row, the branch it is standing in,
+        // the lot. `<` and `>` because they are the arrows `←` and `→` said
+        // louder, which is exactly what they do — and what they save is the
+        // walk: thirty-one projects, nested, is a lot of rows to fold one at a
+        // time to get back to a tree you can read.
+        Key::Char('<') => super::keys::fold_branch(true, ui, view),
+        Key::Char('>') => super::keys::fold_branch(false, ui, view),
+        Key::Char('H') => super::keys::fold_tree(true, ui, view),
+        Key::Char('L') => super::keys::fold_tree(false, ui, view),
         Key::Char('g') | Key::Home => {
             // The first row that takes the cursor, which in the agents view is
             // not the first line: a project heading stands over the first run.

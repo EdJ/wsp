@@ -150,6 +150,16 @@ reviewing, `w` shows the agents instead of the work, `W` puts the tree back with
 the cursor on the task an agent is holding, `i` shows ids, `x` lowers a flag an
 agent has raised, `r` syncs, `?` opens the key map.
 
+Folding comes at three scopes, because thirty-one projects is more than a tree
+you fold a row at a time. `←`/`→` take the row; `<`/`>` take the branch the
+cursor is standing *in*, which on a task means the project holding it, so
+neither key asks you to walk up to a heading first; `H`/`L` take the lot. `<`
+shuts the branch's children and leaves the row it was pressed on open — closing
+that is `h`, and a branch shut over its own contents is one `>` could no longer
+read, since both keys work off the rows on screen. That is also the one place
+the pair is not exact: `L` clears the folds outright and so reaches the ones it
+cannot see, where `H` can only fold what is drawn.
+
 ### The strip, and the agents view
 
 The top line carries one mark per running agent, and the same marks are the

@@ -535,6 +535,8 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
             vec![
                 ("j k ↑ ↓", "up, down"),
                 ("h l ← →", "fold, unfold"),
+                ("< >", "…and all inside it"),
+                ("H L", "…the whole tree"),
                 ("g G ⇱ ⇲", "first, last row"),
                 ("1-9", "jump to a terminal"),
             ],
@@ -739,6 +741,14 @@ pub(super) fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effe
                 Effect::None
             }
         },
+        // Folding by more than a row stays live too, and earns its place here
+        // more than anywhere: a pick is a hunt for one project among thirty,
+        // and `H` then `>` is that hunt with the whole tree out of the way and
+        // one branch opened onto.
+        Key::Char('<') => fold_branch(true, ui, view),
+        Key::Char('>') => fold_branch(false, ui, view),
+        Key::Char('H') => fold_tree(true, ui, view),
+        Key::Char('L') => fold_tree(false, ui, view),
         // Movement and folding stay live inside the pick.
         Key::Up | Key::Down | Key::Left | Key::Right | Key::Char('j') | Key::Char('k')
         | Key::Char('h') | Key::Char('l') => {
@@ -985,6 +995,189 @@ pub(super) fn move_or_fold(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         },
         _ => Effect::None,
     }
+}
+
+/// The key a row folds under, when it folds at all — a project, or one of the
+/// headings that is not a project. The same pair [`move_or_fold`] acts on, and
+/// deliberately read off the row rather than off the store: what the fold keys
+/// below can name is what the tree is currently drawing.
+fn fold_key(row: &Row) -> Option<&String> {
+    match row {
+        Row::Project { id, .. } => Some(id),
+        Row::Section { key, .. } => Some(key),
+        _ => None,
+    }
+}
+
+/// What to call that branch in the footer: the word the row is drawn with,
+/// which for a section is not the key it folds under — the inbox folds under
+/// `(inbox)`, and a message naming it that is the panel talking about its own
+/// insides.
+fn fold_label(row: &Row) -> &str {
+    match row {
+        Row::Section { label, .. } => label,
+        _ => fold_key(row).map(String::as_str).unwrap_or_default(),
+    }
+}
+
+/// How far in a row is drawn, which is what says where a branch stops.
+///
+/// A section heading carries no depth of its own and is one of the two rows a
+/// branch can start at, so it answers 0 — everything it holds is drawn at 1,
+/// and the next heading along ends it. `None` is a row that belongs to the one
+/// above it, and those are stepped over rather than taken for the end of
+/// anything, for the same reason [`step`] steps over them.
+fn depth_of(row: &Row) -> Option<usize> {
+    match row {
+        Row::Section { .. } => Some(0),
+        Row::Project { depth, .. }
+        | Row::Task { depth, .. }
+        | Row::More { depth, .. }
+        | Row::Agent { depth, .. }
+        | Row::Group { depth, .. }
+        | Row::Seat { depth, .. } => Some(*depth),
+        _ => None,
+    }
+}
+
+/// The row a branch hangs from: this one if it folds, and otherwise the
+/// nearest row above it that does.
+///
+/// Standing on a task in `render` is standing *in* `render`, and a key that
+/// refused there would be asking for a walk up to the heading it can work out
+/// for itself — which is the walk `<` and `>` exist to save. Read by depth
+/// rather than by counting rows back, because a task's own sub-tasks sit
+/// between it and its project.
+fn branch_head(rows: &[Row], from: usize) -> Option<usize> {
+    if fold_key(rows.get(from)?).is_some() {
+        return Some(from);
+    }
+    let mut depth = depth_of(rows.get(from)?)?;
+    for i in (0..from).rev() {
+        let Some(above) = depth_of(&rows[i]) else { continue };
+        if above < depth {
+            depth = above;
+            if fold_key(&rows[i]).is_some() {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// The branch the cursor is standing in: the row it hangs from, and the range
+/// of rows drawn inside it.
+fn branch(rows: &[Row], from: usize, end: usize) -> Option<(usize, std::ops::Range<usize>)> {
+    let head = branch_head(rows, from)?;
+    let depth = depth_of(&rows[head])?;
+    let mut last = head + 1;
+    for i in head + 1..end {
+        match depth_of(&rows[i]) {
+            Some(d) if d > depth => last = i + 1,
+            Some(_) => break,
+            None => {}
+        }
+    }
+    Some((head, head + 1..last))
+}
+
+/// One row folded, and folded the way `h` folds it: shut, and with the cap back
+/// on the list inside it. A branch that came out of a fold still showing its
+/// fortieth task would be a fold that half-remembered what it had put away.
+fn fold_one(view: &mut View, key: &str) -> bool {
+    let capped = view.expanded.remove(key);
+    view.collapsed.insert(key.to_string()) || capped
+}
+
+/// `<` and `>`: everything inside the branch the cursor is standing in, in one
+/// press.
+///
+/// Both work off the rows on screen, and between them that settles two things
+/// that would otherwise look arbitrary.
+///
+/// `<` leaves the head row open, because shutting it as well is `h` — and
+/// because a branch closed over its own contents is one `>` can no longer read:
+/// the rows it would have to name are the ones the fold just took away, so a
+/// press would take a press per level to undo. `<` then `h` is "tidy this, then
+/// put it away", and `l` brings it back tidied.
+///
+/// And `<` folds the head's *children* rather than every fold under it. Shutting
+/// a child takes everything below it off the screen too, so the tree looks the
+/// same either way; what differs is what is remembered, and remembering less is
+/// what lets `>` put the whole branch back in one press. A fold nobody can see
+/// is a fold nobody asked for.
+pub(super) fn fold_branch(fold: bool, ui: &mut Ui, view: &mut View) -> Effect {
+    // The dock is its own list, pinned under a rule, and a branch in the tree
+    // does not run into it.
+    let end = match ui.sel < ui.tree_len() {
+        true => ui.tree_len(),
+        false => ui.rows.len(),
+    };
+    let Some((head, inside)) = branch(&ui.rows, ui.sel, end) else {
+        say(ui, "nothing there to fold");
+        return Effect::None;
+    };
+    let key = fold_key(&ui.rows[head]).cloned().unwrap_or_default();
+    let name = fold_label(&ui.rows[head]).to_string();
+    let depth = depth_of(&ui.rows[head]).unwrap_or(0);
+    // Opening takes the head with it: `>` on a branch that is shut has to open
+    // the thing you are pointing at, or there is nothing inside it to open.
+    let mut moved = !fold && view.collapsed.remove(&key);
+    for i in inside {
+        if fold && depth_of(&ui.rows[i]) != Some(depth + 1) {
+            continue;
+        }
+        let Some(k) = fold_key(&ui.rows[i]).cloned() else { continue };
+        let did = match fold {
+            true => fold_one(view, &k),
+            false => view.collapsed.remove(&k),
+        };
+        moved = moved || did;
+    }
+    if !moved {
+        // Both the branch that holds nothing that folds and the one already
+        // folded, said as the one thing they amount to: this key has nothing
+        // left to do here.
+        say(ui, format!("nothing left to {} in {name}", if fold { "fold" } else { "open" }));
+        return Effect::None;
+    }
+    say(
+        ui,
+        match fold {
+            true => format!("folded everything in {name}"),
+            false => format!("opened everything in {name}"),
+        },
+    );
+    Effect::Refetch
+}
+
+/// `H` and `L`: every fold on the panel, shut or open.
+///
+/// Unfolding is exact and folding is not, and the difference is what each has
+/// to work from. Unfolded is the empty set, so `L` clears it and nothing has to
+/// be enumerated; folding can only name the rows that are drawn, and a branch
+/// left open *inside* one that was already shut is not one of them. What is on
+/// the screen folds, which is what the key is for, and the fold underneath is
+/// still there if you go back down to it — the alternative is this reducer
+/// holding a second copy of the project tree to walk, which is the store's
+/// answer to a question about the view.
+pub(super) fn fold_tree(fold: bool, ui: &mut Ui, view: &mut View) -> Effect {
+    let mut moved = false;
+    if fold {
+        let keys: Vec<String> = ui.rows.iter().filter_map(fold_key).cloned().collect();
+        for k in keys {
+            moved = fold_one(view, &k) || moved;
+        }
+    } else {
+        moved = !view.collapsed.is_empty();
+        view.collapsed.clear();
+    }
+    if !moved {
+        say(ui, format!("the tree is already {}", if fold { "folded" } else { "open" }));
+        return Effect::None;
+    }
+    say(ui, if fold { "the whole tree, folded" } else { "the whole tree, open" });
+    Effect::Refetch
 }
 
 /// The reducer. Deliberately free of I/O — it moves the cursor, changes the
