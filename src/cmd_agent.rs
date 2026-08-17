@@ -1756,7 +1756,27 @@ fn name_bound(
     named
 }
 
+/// Put work down: this pane's, or the named task's wherever it is held.
+///
+/// The id form exists because the bare form used to swallow one. `wsp release
+/// render-040` unbound *this* pane and printed `released w1X:p1`, which is a
+/// pane id and the word "released" — close enough to success to walk away
+/// from, while the claim it actually ended was the one the caller was standing
+/// in. Every other verb in this CLI takes an id, so the token was typed in good
+/// faith and dropped on the floor.
+///
+/// A task rather than a pane, because a claim is the thing being ended and a
+/// pane is only where one usually sits. Claims outlive panes, so the id form
+/// also reaches the case the pane form cannot: a claim left standing by a
+/// workspace that is gone.
 pub fn release(store: &Store, args: &Args) -> i32 {
+    match args.rest.first().cloned() {
+        Some(needle) => release_task(store, args, &needle),
+        None => release_here(store, args),
+    }
+}
+
+fn release_here(store: &Store, args: &Args) -> i32 {
     let Some(pane) = pane_id(args) else {
         eprintln!("wsp: no pane — pass --pane or run inside herdr");
         return 2;
@@ -1770,6 +1790,106 @@ pub fn release(store: &Store, args: &Args) -> i32 {
         println!("nothing bound to {pane}");
     }
     0
+}
+
+/// `wsp release <id>`: end that task's claim, whoever is holding it.
+///
+/// Two targets are refused rather than ranked. `--pane` names one seat and an
+/// id names whatever seat holds a task; a line carrying both is a person who
+/// believes one of them is being read, and picking either is how this command
+/// earned its defect in the first place.
+///
+/// Not guarded by `--force` the way `claim` is. Stealing work is silent damage
+/// — the other agent goes on editing files for a task the store says is yours —
+/// while releasing one is a claim ending, which is what the caller typed the
+/// task's id to ask for, and a re-claim undoes it.
+fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
+    if let Some(pane) = args.get("pane") {
+        eprintln!("wsp: name a task or a pane, not both");
+        eprintln!("  wsp release {needle}          the claim on that task, wherever it is");
+        eprintln!("  wsp release --pane {pane}   whatever that pane is holding");
+        return 2;
+    }
+    let t = match store.task_or_why(needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+
+    // Every pane bound to it, not the first: two bindings on one task is a
+    // state `claim` works to prevent and `reconcile` can still leave behind
+    // after a herdr restart, and releasing half of it would leave the task
+    // looking held by a pane that no longer has a claim to stand on.
+    let panes = store.panes_for_task(&t.id);
+    for pane in &panes {
+        if store.clear_binding(pane) {
+            unname_after_task(store, pane, &t.id);
+        }
+    }
+
+    // The claim is read before `hand_off` clears it: `where` is the only part
+    // of this the caller cannot already see, and a released claim leaves
+    // nothing behind that says where it had been.
+    let where_held = store.claims().get(&t.id).map(|c| claim_where(c));
+    if where_held.is_some() {
+        end_claim(store, &t.id);
+    }
+    if !panes.is_empty() || where_held.is_some() {
+        let mut cache = sync::Cache::default();
+        let _ = sync::sync(store, &mut cache, true);
+    }
+
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "task": t.id,
+                "released": !panes.is_empty() || where_held.is_some(),
+                "panes": panes,
+                "claim": where_held,
+            })
+        );
+    } else if !panes.is_empty() {
+        println!("released {} from {}", t.id, panes.join(", "));
+    } else if let Some(where_held) = where_held {
+        // A claim with no pane under it is the ordinary aftermath of a herdr
+        // restart, and saying so is the difference between "that worked" and
+        // "did it find the right thing?".
+        println!("released {} — the claim in {where_held}, with no pane bound", t.id);
+    } else {
+        println!("nothing holds {}", t.id);
+    }
+    0
+}
+
+/// Where a claim says the work is, for one line of output.
+fn claim_where(claim: &serde_json::Value) -> String {
+    let get = |k: &str| claim.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let (label, id) = (get("workspace_label"), get("workspace_id"));
+    match (label.is_empty(), id.is_empty()) {
+        (false, _) => label.to_string(),
+        (true, false) => id.to_string(),
+        (true, true) => "somewhere it did not record".to_string(),
+    }
+}
+
+/// End the durable claim on a task, and commit the trace of it.
+///
+/// Shared by both forms of `release`, which differ only in how they find the
+/// task: a released claim has to leave the same record whichever end it was
+/// asked for.
+fn end_claim(store: &Store, task_id: &str) {
+    // Releasing is a decision, so it clears the durable claim too — unlike a
+    // pane exiting, which is only ever an accident of process lifetime and must
+    // leave the intent standing. It ends the same way a migration does, and
+    // leaves the same record behind.
+    hand_off(store, task_id, None, "release");
+    // `hand_off` writes the release into the task's log, and until commits were
+    // scoped to what a command wrote, that line waited for some later command
+    // to sweep it up — under that command's message. It belongs to this one.
+    store.git_commit(&format!("wsp: release {task_id}"));
 }
 
 /// Drop a pane's binding and, with it, the claim it stood for.
@@ -1790,16 +1910,7 @@ pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) 
             // is still readable: `unname_after_task` needs the title to know
             // whether the label it is looking at is one we wrote.
             unname_after_task(store, pane, task_id);
-            // Releasing is a decision, so it clears the durable claim too —
-            // unlike a pane exiting, which is only ever an accident of process
-            // lifetime and must leave the intent standing. It ends the same way
-            // a migration does, and leaves the same record behind.
-            hand_off(store, task_id, None, "release");
-            // `hand_off` writes the release into the task's log, and until
-            // commits were scoped to what a command wrote, that line waited
-            // for some later command to sweep it up — under that command's
-            // message. It belongs to this one.
-            store.git_commit(&format!("wsp: release {task_id}"));
+            end_claim(store, task_id);
         }
         let mut cache = sync::Cache::default();
         let _ = sync::sync(store, &mut cache, true);
@@ -4196,5 +4307,62 @@ mod tests {
 
         let learned = sessions_learned(&store, seen.into_iter());
         assert_eq!(learned, vec![("w1:p1".to_string(), "309b2e2c".to_string())]);
+    }
+
+    /// A store on disk with one pane holding one task.
+    ///
+    /// The cases below stop before anything reaches herdr on purpose: a real
+    /// herdr is usually up on the machine running these tests, and `sync`
+    /// writes metadata to whatever it finds there. What is under test is which
+    /// claim the command *selects*, which is decided before any of that.
+    fn holding(tag: &str, pane: &str, task: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        store.ensure_dirs().unwrap();
+        for id in [task, "probe-040"] {
+            store.save_task(&Task::new("Retune the early reflections", id)).unwrap();
+        }
+        store.set_binding(pane, json!({ "task_id": task, "pane_id": pane }));
+        store.set_claim(task, json!({ "workspace_id": "w1", "claimed_at": util::now_iso() }));
+        store
+    }
+
+    /// The defect, at the line that decides it. `wsp release probe-040` used to
+    /// drop the id on the floor and unbind the calling pane, then print
+    /// `released w1:p1` — a word and a pane id that read enough like success to
+    /// move on from, while the claim it ended was the one you were holding.
+    #[test]
+    fn a_release_that_names_a_task_never_ends_the_callers_own_claim() {
+        let store = holding("release-names-a-task", "w1:p1", "batch-043");
+
+        // Named, unheld, and this pane is where the command was typed.
+        let code = release(&store, &Args::synth("release", &["probe-040"], &[]));
+        assert_eq!(code, 0, "asking for a claim that is not there is not an error");
+        assert_eq!(
+            store.bindings().get("w1:p1").and_then(|b| b["task_id"].as_str()),
+            Some("batch-043"),
+            "the caller's own claim is not what `release <id>` was asked about"
+        );
+        assert!(store.claims().contains_key("batch-043"));
+
+        // An id that names nothing stops before it touches anything at all,
+        // rather than falling back to this pane — the fallback *is* the bug.
+        let code = release(&store, &Args::synth("release", &["nosuch-999"], &[]));
+        assert_eq!(code, 1);
+        assert!(store.bindings().contains_key("w1:p1"));
+    }
+
+    /// Two targets on one line, refused rather than ranked: `--pane` names a
+    /// seat and an id names whatever seat holds a task, and choosing between
+    /// them silently is how this command earned its defect.
+    #[test]
+    fn a_release_given_both_a_task_and_a_pane_does_neither() {
+        let store = holding("release-two-targets", "w1:p1", "batch-043");
+
+        let args = Args::synth("release", &["probe-040"], &[("pane", "w1:p1")]);
+        assert_eq!(release(&store, &args), 2);
+        assert!(store.bindings().contains_key("w1:p1"), "a refusal costs nothing");
+        assert!(store.claims().contains_key("batch-043"));
     }
 }

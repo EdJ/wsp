@@ -595,6 +595,8 @@ fn help() {
                                     agent in it, the seat taken, and a custodial
                                     work order rather than a claim
   wsp release                       unbind this pane, leaving whatever is in it
+  wsp release <id>                  …or end that task's claim, wherever it is
+                                    held — including a claim no pane is under
   wsp pin <proj> [-w ws]            pin a workspace to a project
   wsp pin --top [-w ws]             pin it outside the tree entirely
   wsp unpin [-w ws]                 take the pin off again
