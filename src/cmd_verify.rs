@@ -81,7 +81,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// The same, when the output is not wanted but the failure is. Returns git's
 /// stderr on failure, because "what did git say" is the whole diagnostic.
-fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
+pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)

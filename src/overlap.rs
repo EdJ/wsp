@@ -43,6 +43,11 @@ pub(crate) enum Relation {
     /// Different directories under the same declared project root — sibling
     /// corners of one checkout. Still one git tree, so still one commit.
     SameRoot,
+    /// Two working trees of one repository: a `wsp checkout` tree each, or one
+    /// of those and the trunk. The same commits to land and the same branch
+    /// space, and no shared files at all — so this is where the warning stops
+    /// and the context begins.
+    SameRepo,
     /// The same project, reached some other way: a pin, a label, a second root.
     /// Shared work, but not shared files.
     SameProject,
@@ -66,6 +71,7 @@ impl Relation {
             // has to cover it.
             Relation::SameCwd => "same tree",
             Relation::SameRoot => "same checkout",
+            Relation::SameRepo => "separate tree",
             Relation::SameProject => "same project",
             Relation::Elsewhere => "elsewhere",
         }
@@ -206,8 +212,21 @@ fn shared_depth(a: &str, b: &str) -> usize {
     a.components().zip(b.components()).take_while(|(x, y)| x == y).count()
 }
 
+/// Whether two directories are in one working tree, which is the same question
+/// as whether either can overwrite what the other is editing.
+///
+/// Containment is the rule and a `wsp checkout` tree is the exception to it.
+/// Those trees are nested under the project root — they have to be, or nothing
+/// here resolves them to a project — so `<root>/.worktrees/t-1` reads as inside
+/// `<root>` by prefix while being a checkout of its own, with none of the
+/// trunk's uncommitted work in it and none of its own in the trunk. Warning
+/// about that pane is worse than saying nothing: this report is only worth
+/// reading if every line on it is a pane that can actually reach your files.
 fn same_tree(a: &str, b: &str) -> bool {
     let (a, b) = (util::real(a), util::real(b));
+    if crate::cmd_checkout::worktree_of(&a) != crate::cmd_checkout::worktree_of(&b) {
+        return false;
+    }
     a.starts_with(&b) || b.starts_with(&a)
 }
 
@@ -268,9 +287,18 @@ pub(crate) fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<
 
         let task = task_of(&p.pane_id).cloned();
         let project = project_of(p);
-        let relation = if !my_cwd.is_empty() && !p.cwd.is_empty() && same_tree(&my_cwd, &p.cwd) {
+        // Same root is asked twice, because under one declared root there are
+        // now two arrangements that look identical to a prefix match and mean
+        // opposite things: two corners of one checkout, where a commit takes
+        // whatever both of you touched, and two checkouts, where it cannot.
+        let same_root = my_root.is_some() && my_root == root_for(&w.index, &p.cwd);
+        let separate_trees = crate::cmd_checkout::worktree_of(&util::real(&my_cwd))
+            != crate::cmd_checkout::worktree_of(&util::real(&p.cwd));
+        let relation = if same_root && separate_trees {
+            Relation::SameRepo
+        } else if !my_cwd.is_empty() && !p.cwd.is_empty() && same_tree(&my_cwd, &p.cwd) {
             Relation::SameCwd
-        } else if my_root.is_some() && my_root == root_for(&w.index, &p.cwd) {
+        } else if same_root {
             Relation::SameRoot
         } else if project.is_some() && project == my_project {
             Relation::SameProject

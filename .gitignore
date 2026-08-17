@@ -1,1 +1,4 @@
 target/
+# One working tree per agent, made by `wsp checkout`. Nested under the root so
+# project resolution still places a pane standing in one; see src/cmd_checkout.rs.
+.worktrees/

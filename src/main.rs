@@ -11,6 +11,7 @@ mod agent_commands;
 mod arrange;
 mod cmd_agent;
 mod cmd_brief;
+mod cmd_checkout;
 mod cmd_install;
 mod cmd_machine;
 mod cmd_mandate;
@@ -310,6 +311,8 @@ fn main() {
         "brief" => cmd_brief::brief(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
+        "checkout" => cmd_checkout::checkout(&store, &args),
+        "land" => cmd_checkout::land(&store, &args),
         "install" => cmd_install::install(&store, &args),
         "sandbox" => cmd_sandbox::sandbox(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
@@ -406,6 +409,13 @@ fn help() {
                                     SessionStart hook's call — paid once at the
                                     top of a session, not on every brief after
   wsp commit-help                   how to commit in a tree somebody else is in
+  wsp checkout [<id>] [--rm]        a working tree of your own for the task in
+                                    hand, under .worktrees/, on its own branch —
+                                    nobody else's edits are in it and yours are
+                                    in nobody else's commit
+  wsp land [<id>] [--keep]          rebase it onto the trunk and fast-forward the
+                                    trunk onto it, then drop the tree; prints
+                                    what actually moved
   wsp verify [<path>…] [--check] [--release] [--rm]
                                     build and test your change in a tree of your
                                     own, at HEAD — the only build whose result

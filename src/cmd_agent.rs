@@ -1613,7 +1613,7 @@ pub(crate) struct Located {
     pub task: Option<Task>,
 }
 
-fn locate(w: &Whereabouts) -> Located {
+pub(crate) fn locate(w: &Whereabouts) -> Located {
     let task = w
         .pane
         .as_ref()
