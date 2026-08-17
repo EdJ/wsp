@@ -164,11 +164,11 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         // other token here describes work — measured on the live seat, the
         // sidebar said `scope=robustness/078` and nothing at all about the two
         // governorships that window was actually holding.
-        let seat = crate::cmd_govern::governed_by(&governors, &ws.id);
+        let seat = crate::cmd_govern::governs(&governors, &ws.id);
 
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("proj", proj.clone()),
-            ("seat", Some(seat.join("·")).filter(|s| !s.is_empty())),
+            ("seat", seat.clone()),
             ("tags", tags),
             ("todo", nonzero(c.open)),
             ("doing", nonzero(c.doing)),
@@ -190,14 +190,23 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
     let mut pane_count = 0;
     for a in &agents {
         let t = task_for_pane(&a.pane_id);
+        // A custodian holds no task, so every token below was absent and the
+        // sidebar had nothing whatever to draw for the one agent answerable for
+        // the whole project — measured 2026-08-17, after the seat released the
+        // task it had borrowed. What it is doing is the position, so that is
+        // what it reports, and `scope` falls back to it for the same reason: the
+        // ten columns a narrow sidebar keeps for "which piece of work is this"
+        // are better spent on `wsp` than on nothing.
+        let seat = crate::cmd_govern::governs(&governors, &a.workspace_id);
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("task", t.map(|t| util::truncate(&t.title, 44))),
             ("taskid", t.map(|t| t.id.clone())),
+            ("seat", seat.clone()),
             // `render/109`: which piece of work this is, in the ten columns a
             // narrow sidebar has for it, and what you would type to open it.
             // The pane's label leads with the same thing — this is for a row
             // that would rather carry it on its own.
-            ("scope", t.map(crate::cmd_agent::task_scope)),
+            ("scope", t.map(crate::cmd_agent::task_scope).or_else(|| seat.clone())),
             ("tstatus", t.map(|t| t.status().as_str().to_string())),
         ];
         let fingerprint = tokens

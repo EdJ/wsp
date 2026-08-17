@@ -1720,7 +1720,7 @@ loudest row on the panel was the one that never meant anything. Now it reads:
 
 ```
 PROJECT   TASK                                    PANE     STATE
-robustness  build a design artefact                w1:p6   idle     ▣ seat · robustness
+wsp         (holding nothing, which is the job)       w1:p6   idle     ▣ governor · wsp
 wsp         the seam under the panel               w2:p1   idle     ← needs you
 ```
 
@@ -1777,19 +1777,31 @@ and tasks, and affordable only because it is a slot: no status of its own, no
 prose, nothing to finish. What it adds to the model is one edge that did not
 exist. Claims are agent-to-task; this is **agent-to-project**.
 
+**One agent, one governorship.** This reverses what the verb above was built
+for. A night coordinating `robustness` while answering for `wsp` above it is one
+agent and not two — true of that night, and still the wrong model, because it
+leaves two questions unanswerable in principle: which row draws an agent that is
+in two positions, and what a vacancy looks like when the same occupant fills
+both. Taking a second slot hands the first back, the way claiming a second task
+hands off the first, and the slot it leaves stays on its project, empty. Who
+covers `wsp` while the `robustness` governor is busy is the chain's question,
+and its answer is a different agent.
+
 **It has a place.** The slot draws in the tree directly under the project it
 belongs to, above that project's work, and its occupant is drawn there *instead
-of* under whatever task it borrowed — position is what a tree means. One
-workspace holding two slots draws under both, which is two positions filled by
-one agent. In herdr the workspace is named after the position rather than after
-the task, and a claim will not write over that name.
+of* under whatever task it borrowed — position is what a tree means. In herdr
+the workspace *and the pane* are named after the position rather than after the
+task, and neither a claim nor a release will write over that name: releasing a
+borrowed claim used to leave the panel drawing the governor as `unassigned`,
+which is the one word that is not merely unhelpful but false — a governor
+holding no task is the most assigned thing on the panel.
 
 ```
   ▾ wsp                       8 ●2
-     ▣ Verb UI             seat
+     ▣ governor · wsp    w1:p6
      · ! Panel work item number 5
   ▾ verb                3 ▸1 ■1 ●2
-     ▣ seat · empty
+     ▣ governor · verb   empty
 ```
 
 **It is addressable.** `T` on the row, or `wsp govern <project> --tell "…"` from
@@ -1804,6 +1816,15 @@ slot and leave it standing; `--remove` is the separate decision that a project
 has no governor. An empty slot is a row you can stand on and fill, which is the
 one state of a position no other surface in wsp could show at all.
 
+**A vacancy draws once, at the top; a governor draws wherever it sits.** The two
+states earn their space differently. A filled slot is a fact about who
+coordinates what, and it is worth a row however deep it is. A vacancy is an
+*affordance* — an invitation to put somebody there — and one per level of a deep
+tree is clutter that hides the governors that exist, so it is drawn only where no
+slot above it is filled. A governor per level is a real arrangement and not the
+expected one. `wsp govern` is unaffected and lists every slot either way:
+somebody who typed it is asking for exactly that.
+
 **And a custodian is told a different job.** `wsp spawn -p <proj> --govern`
 takes the slot before it starts the agent — so the agent's `SessionStart` hook
 runs `wsp brief` with the slot already in place — and then hands over the
@@ -1816,9 +1837,9 @@ back into an agent working somebody else's task.
 
 The record is keyed on the **project**, which is the one place this differs
 from the pins, mandates and claims beside it. Those are facts about a workspace
-and there can be many per project; there is at most one seat per project, and
-every reader asks *who governs this?* rather than *what does this workspace
-govern*. It is state rather than store for the same reason a claim is: the
+and there can be many per project; there is one seat per project and one seat
+per agent, and every reader asks *who governs this?* rather than *what does this
+workspace govern*. It is state rather than store for the same reason a claim is: the
 hierarchy is committed and durable, and the agent sitting in it is neither.
 
 ## Moving between tasks

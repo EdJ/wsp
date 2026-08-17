@@ -270,8 +270,7 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
     }
 }
 
-/// The same world with a custodian in `wsp`'s seat, and an empty seat on
-/// `verb`.
+/// The same world with a governor in `wsp`'s slot, and an empty one on `verb`.
 ///
 /// Both halves on purpose. A filled slot is what the position looks like when
 /// it is working, and an empty one is the case every other surface in wsp
@@ -284,6 +283,14 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
 /// rather than as a stalled worker under `verb`.
 fn seated_world() -> Snapshot {
     let mut s = world();
+    // herdr's own name for the pane, which `wsp govern` writes: a governor's
+    // pane is named after the position, because the position is the work in it.
+    // It carries no `▣` — every surface of wsp's draws that in its own first
+    // column, and a label with one came out as `▣ ▣ governor · wsp` in the
+    // census at the foot.
+    if let Some(p) = s.panes.iter_mut().find(|p| p.pane == "w2:p1") {
+        p.label = crate::cmd_govern::governor_of("wsp");
+    }
     s.governors.insert(
         "wsp".to_string(),
         json!({ "workspace": "w2", "pane": "w2:p1", "host": crate::util::hostname() }),
@@ -735,7 +742,7 @@ fn scenes() -> Vec<Scene> {
             .to_seat("wsp")
             .scene(
                 "A governor, in its place",
-                "A project can have a custodial seat, and the agent in it is answerable for everything beneath \u{2014} it sequences what runs next, writes the direction an arriving agent needs, reviews finished work against the code, and holds the record. It is not claimed onto a task and should not be: the row is drawn under the project it answers for, directly beneath it and above the work, rather than under whatever task it had picked up to have somewhere to stand. That was the whole complaint this came from \u{2014} a governor of `wsp` appearing in the tree as an agent working a task three branches away. The mark is `\u{25a3}` wherever a seat is drawn, and the same agent in the census at the foot draws it too: an idle custodian is between the agents it started, which is most of the night, and none of that idleness is you being the blocker.",
+                "A project can have a governor, and the agent in it is answerable for everything beneath \u{2014} it sequences what runs next, writes the direction an arriving agent needs, reviews finished work against the code, and holds the record. It is not claimed onto a task and should not be, so the row names the *position* and the project rather than the work: a governor holding no task is the most assigned thing on the panel, and every earlier version of this row went looking for a task and drew `unassigned`. It is drawn under the project it answers for, directly beneath it and above the work, rather than under whatever task it had picked up to have somewhere to stand \u{2014} which was the whole complaint this came from, a governor of `wsp` appearing in the tree as an agent working a task three branches away. One agent holds one governorship; the pane on the right is where `\u{21b5}` goes. The mark is `\u{25a3}` wherever a governor is drawn, and the same agent in the census at the foot draws it too: it is idle between the agents it started, which is most of the night, and none of that idleness is you being the blocker.",
             ),
     );
 
@@ -744,7 +751,7 @@ fn scenes() -> Vec<Scene> {
             .to_seat("verb")
             .scene(
                 "The seat outlives whoever was in it",
-                "`verb`'s seat is empty \u{2014} stood down, or its workspace closed \u{2014} and the row is still here. That is the point of a slot: the position belongs to the project and an agent fills it, so a night ending does not take the post down with the agent, and there is somewhere to stand when you want to fill it again. `wsp spawn -p verb --govern` opens a workspace, seats an agent in it and hands it the custodial work order rather than a claim. On a seat that has somebody in it, `T` says something to them \u{2014} addressed to the position, so it reaches whoever is in it when the sentence lands rather than the pane the agent started in.",
+                "`verb`'s governor is empty \u{2014} stood down, or its workspace closed \u{2014} and the row is still here. That is the point of a slot: the position belongs to the project and an agent fills it, so a night ending does not take the post down with the agent, and there is somewhere to stand when you want to fill it again. `wsp spawn -p verb --govern` opens a workspace, seats an agent in it and hands it the custodial work order rather than a claim. A vacancy draws only where no governor above it is filled: it is an invitation, and one per level of a deep tree would bury the governors that exist. On a slot that has somebody in it, `T` says something to them \u{2014} addressed to the position, so it reaches whoever is in it when the sentence lands rather than the pane the agent started in.",
             ),
     );
 
@@ -1349,6 +1356,38 @@ mod tests {
         panel::collect(snap, view)
     }
 
+    /// A slot is drawn under the project it belongs to, wherever its occupant
+    /// happens to be standing.
+    ///
+    /// The two are routinely different and that is the point: this custodian's
+    /// pane resolves to `verb`, because `verb` is where the work it was last
+    /// reading lives, and the slot is `wsp`'s. A tree that placed the row by
+    /// the occupant would put the governor of `wsp` under `verb` — which is
+    /// the arrangement Ed was looking at when he said he could not see a
+    /// governor at all.
+    #[test]
+    fn a_slot_draws_under_its_own_project_and_not_under_its_occupant() {
+        let mut w = world();
+        w.governors.insert(
+            "wsp".to_string(),
+            json!({ "workspace": "w2", "pane": "w2:p1", "host": crate::util::hostname() }),
+        );
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+
+        let rows = ui.rows_for_target(&panel::Target::Seat("wsp".into()));
+        assert_eq!(rows.len(), 1, "the slot is drawn once");
+        let mut probe = ui.clone();
+        probe.select_for_test(rows[0] - 1);
+        assert_eq!(probe.selected_target(), panel::Target::Project("wsp".into()));
+        // And the occupant's own placement is `verb`, which is where it would
+        // have been drawn by the tree's ordinary rules.
+        assert!(
+            ui.census_for_test().iter().any(|(_, a)| a.pane == "w2:p1"),
+            "the occupant is still an agent on the machine"
+        );
+    }
+
     /// The place, which is what the whole task turns on: a governor of `wsp`
     /// draws under `wsp`.
     ///
@@ -1402,6 +1441,77 @@ mod tests {
         assert_eq!(rows.len(), 1, "the position went with the agent");
         ui.select_for_test(rows[0]);
         assert_eq!(ui.selected_kind(), panel::RowKind::Seat, "and the cursor can reach it");
+    }
+
+    /// What the row says is what the agent **is**, not what it holds.
+    ///
+    /// Both of the wrong answers came from asking the occupant for a task and
+    /// finding none: `▣ unassigned` while the custodian's borrowed claim was
+    /// released, then `▣ seat · empty`. A governor holding no task is the most
+    /// assigned thing on the panel, so the row names the position — and names
+    /// the project, which is the one fact a slot has whether or not anybody is
+    /// sitting in it.
+    #[test]
+    fn a_seat_row_names_the_position_and_never_the_claim() {
+        let mut w = seated_world();
+        // The custodian with nothing in its hands: no claim, and a pane herdr
+        // has nothing better to call than the word `claim` left behind.
+        w.bindings.remove("w2:p1");
+        if let Some(p) = w.panes.iter_mut().find(|p| p.pane == "w2:p1") {
+            p.label = "unassigned".into();
+        }
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        let rows = ui.rows_for_target(&panel::Target::Seat("wsp".into()));
+        let text = panel::full_text_for_test(&ui, rows[0]);
+        assert!(text.contains("governor"), "the row does not say what it is: {text}");
+        assert!(text.contains("wsp"), "…or which project it is answerable for: {text}");
+        assert!(!text.contains("unassigned"), "it went looking for a task again: {text}");
+
+        // And the empty one says the same thing about the same project.
+        let empty = ui.rows_for_target(&panel::Target::Seat("verb".into()));
+        let text = panel::full_text_for_test(&ui, empty[0]);
+        assert!(text.contains("governor") && text.contains("verb"), "{text}");
+    }
+
+    /// Vacancies draw once, at the top. Filled slots draw wherever they sit.
+    ///
+    /// Ed's rule, and the two states earn their space differently: a filled slot
+    /// is a fact about who coordinates what, and a vacancy is an invitation. One
+    /// invitation per level of a deep tree is clutter that hides the filled rows
+    /// — so a vacancy under a slot that somebody is actually in does not draw at
+    /// all, and nesting stays supported without being advertised at every node.
+    #[test]
+    fn a_vacancy_under_an_occupied_slot_does_not_draw() {
+        let mut w = seated_world();
+        // `trance` sits under `vst`, which sits under `audio`: a vacancy three
+        // levels down with nothing above it draws, because there is nobody
+        // above it to be the invitation instead.
+        w.governors.insert("trance".to_string(), json!({ "vacated": "2026-08-17T04:00:00Z" }));
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        assert_eq!(ui.rows_for_target(&panel::Target::Seat("trance".into())).len(), 1);
+
+        // Now put somebody in `vst` above it. The filled row draws and the
+        // vacancy beneath it stops.
+        w.governors.insert(
+            "vst".to_string(),
+            json!({ "workspace": "w1", "pane": "w1:p1", "host": crate::util::hostname() }),
+        );
+        let ui = ui_of(&w, &view);
+        assert_eq!(ui.rows_for_target(&panel::Target::Seat("vst".into())).len(), 1, "the governor");
+        assert!(
+            ui.rows_for_target(&panel::Target::Seat("trance".into())).is_empty(),
+            "the vacancy under it is clutter"
+        );
+        // A *filled* slot under a filled slot still draws: a nested governor is
+        // a real arrangement, and this rule is about invitations only.
+        w.governors.insert(
+            "trance".to_string(),
+            json!({ "workspace": "w3", "pane": "w3:p1", "host": crate::util::hostname() }),
+        );
+        let ui = ui_of(&w, &view);
+        assert_eq!(ui.rows_for_target(&panel::Target::Seat("trance".into())).len(), 1);
     }
 
     /// The row that was wrong all night, on the surface a person actually looks

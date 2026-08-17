@@ -1397,7 +1397,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // and the whole failure this position was built out of is a governor
         // that picked up a task to have somewhere to stand.
         Key::Char('f') if matches!(target, Target::Seat(_)) => {
-            say(ui, "a seat is not looking for work — T talks to it");
+            say(ui, "a governor is not looking for work — T talks to it");
             Effect::None
         }
         Key::Char('f') => match ui.rows.get(ui.sel).and_then(|r| r.agent()).cloned() {
@@ -1425,7 +1425,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Effect::None
             }
             _ => {
-                say(ui, "T talks to a project's seat — aim at one");
+                say(ui, "T talks to a project's governor — aim at one");
                 Effect::None
             }
         },

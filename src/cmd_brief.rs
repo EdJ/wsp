@@ -316,20 +316,20 @@ pub(crate) struct Brief {
     /// thousands of times a night for a fact that is always the same.
     pub seat: Option<(cmd_govern::Seat, bool)>,
 
-    /// The projects this pane's workspace is the custodian of, in id order.
+    /// The project this pane's workspace is the governor of, if it is one.
     ///
     /// The second half of the seat, and a different question from it. `seat`
     /// above answers *who coordinates the work in front of me* by walking up
-    /// from this pane's project; this answers *what am I responsible for*, and
+    /// from this pane's project; this answers *what am I answerable for*, and
     /// the two disagree exactly when they should — a workspace holding the
-    /// `wsp` slot while standing in `robustness` is answerable for both, and
-    /// only this line knows it.
+    /// `wsp` slot while standing in `robustness` reads the first as its own
+    /// seat and only this one as its job.
     ///
-    /// Empty for every ordinary agent, which is every agent nearly all of the
-    /// time, and an empty vector draws nothing at all. That is the same
-    /// bargain `seat` makes and it matters for the same reason: this is the
-    /// output every request of every session pays for.
-    pub custodian: Vec<String>,
+    /// `None` for every ordinary agent, which is every agent nearly all of the
+    /// time, and draws nothing at all. That is the same bargain `seat` makes
+    /// and it matters for the same reason: this is the output every request of
+    /// every session pays for.
+    pub custodian: Option<String>,
 
     /// The `wsp checkout` tree this pane is standing in, when it is in one.
     ///
@@ -533,8 +533,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         custodian: b
             .workspace
             .as_deref()
-            .map(|ws| cmd_govern::governed_by(&b.governors, ws))
-            .unwrap_or_default(),
+            .and_then(|ws| cmd_govern::governs(&b.governors, ws)),
         // A path rule rather than a question for git, so this stays free in the
         // one command a session-start hook runs.
         own_tree: b
@@ -779,12 +778,12 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // workspace holds, where the seat line can only name the nearest, which for
     // an agent answering for `wsp` while standing in `robustness` is the wrong
     // half of its job.
-    if !r.custodian.is_empty() {
+    if let Some(proj) = &r.custodian {
         row(
             "seat",
             format!(
                 "{}  {}",
-                p.bold(&r.custodian.join(" ")),
+                p.bold(&format!("governor of {proj}")),
                 p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
             ),
         );
@@ -824,7 +823,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         // it to go and claim something, which is the one instruction that would
         // take the position apart — the seat that borrowed a task to stand on
         // is exactly what t-260817-021 was filed about.
-        None if !r.custodian.is_empty() => row(
+        None if r.custodian.is_some() => row(
             "you",
             p.dim("holding nothing, which is the job — the work below is for the agents you start")
                 .to_string(),
@@ -1123,22 +1122,19 @@ mod tests {
     #[test]
     fn a_custodian_is_told_what_it_is_answerable_for_rather_than_to_go_and_claim() {
         let mut b = briefing();
-        // In the slot for `wsp` *and* for `robustness`, from one window, which
-        // is the case a seat line walking up the chain cannot say: it would
-        // name the nearest and stop.
-        for proj in ["wsp", "robustness"] {
-            b.governors.insert(
-                proj.into(),
-                json!({ "workspace": "w1", "host": util::hostname() }),
-            );
-        }
+        // The governor of `wsp` — the project, where this pane happens to be
+        // standing in `robustness` under it. The seat line walks up from where
+        // it stands; this line says what it answers for, and only it can.
+        b.governors.insert("wsp".into(), json!({ "workspace": "w1", "host": util::hostname() }));
+        b.project = Some("robustness".into());
         // Holding nothing, which is what a custodian holds.
         b.world.bindings.clear();
+        b.world.claims.clear();
 
         let r = compose(&b);
-        assert_eq!(r.custodian, ["robustness", "wsp"].map(String::from).to_vec());
+        assert_eq!(r.custodian.as_deref(), Some("wsp"));
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
-        assert!(text.contains("robustness wsp"), "both positions, not the nearest: {text}");
+        assert!(text.contains("governor of wsp"), "what it is, in the words a person uses: {text}");
         assert!(text.contains("wsp flag --seat"), "its inbox: {text}");
         assert!(!text.contains("wsp claim <id>"), "a custodian was sent to claim work: {text}");
     }

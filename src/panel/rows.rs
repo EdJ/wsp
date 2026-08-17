@@ -1284,7 +1284,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let as_ref = |a: &AgentRef, project: Option<String>| AgentRef {
         task: bound_task_of_pane(&a.pane),
         project,
-        seat: !crate::cmd_govern::governed_by(&snap.governors, &a.workspace).is_empty(),
+        seat: crate::cmd_govern::governs(&snap.governors, &a.workspace).is_some(),
         ..a.clone()
     };
 
@@ -1310,6 +1310,32 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                 (slot.project.clone(), (occupant, slot.elsewhere()))
             })
             .collect();
+    // Which of those the tree draws, which is not all of them.
+    //
+    // **A filled slot draws wherever it sits; a vacant one draws only where
+    // there is no slot above it.** Ed's rule, 2026-08-17, and the reasoning is
+    // that the two states earn their space differently. A filled slot is a fact
+    // about who is coordinating what, and it is worth a row however deep it is.
+    // A vacancy is an *affordance* — an invitation to put somebody there — and
+    // one per level down a deep tree is clutter that makes the filled ones
+    // harder to find. Drawn once at the top it still says the mechanism exists
+    // and how to use it, which is all a vacancy has to say. A governor per
+    // level is not going to be the normal arrangement, though a nested one is a
+    // real one and stays supported.
+    //
+    // `wsp govern` is deliberately not filtered this way: somebody who typed it
+    // is asking for exactly the roster, empty rows included. This is a rule
+    // about the tree.
+    let seats: std::collections::BTreeMap<String, (Option<AgentRef>, bool)> = seats
+        .iter()
+        .filter(|(project, (occupant, elsewhere))| {
+            occupant.is_some()
+                || *elsewhere
+                || !index.ancestors(project).iter().any(|up| seats.contains_key(up))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
     // The panes that are drawn *as* a seat, and are therefore not drawn again
     // as workers. A custodian that borrowed a task to have somewhere to stand
     // used to appear under that task, three branches from the project it was
@@ -2153,12 +2179,24 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
-        // The position, said as `seat` and then as whoever is in it. The word
-        // comes first and never moves, because the row has to read the same
-        // whether it is occupied or not — a slot that only said `seat` when it
-        // was empty would be a different row every time somebody sat down, and
-        // the one thing this is for is being the same place tomorrow.
-        Row::Seat { agent, state, elsewhere, depth, .. } => {
+        // What the agent in it **is**, and never what it holds.
+        //
+        // Ed, 2026-08-17, on the two things this row said before: `▣
+        // unassigned` while the custodian's borrowed claim was released, and
+        // then `▣ seat · empty` — *a custodian holding no task is not
+        // unassigned and not empty; it is the governor of its project, which is
+        // the most assigned thing on the panel.* Both readings came of asking
+        // the occupant what task it had and finding none, when the question a
+        // slot answers is what the position is.
+        //
+        // So the words are [`crate::cmd_govern::governor_of`]'s, the project is
+        // always named — it is the one fact a slot has whether anybody is in it
+        // or not, and the one an agent's own name can never supply — and the
+        // right-hand column carries the occupant, which is the part that
+        // changes. The project is repeated from the row above on purpose: this
+        // row is read on its own in the focus dock and in `F`, and a row that
+        // means nothing away from its neighbour is a row that means nothing.
+        Row::Seat { project, agent, state, elsewhere, depth } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
                 None => l.push(Style::Plain, " "),
@@ -2168,21 +2206,24 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             let (st, _) = state.mark();
             l.push(if agent.is_some() { st } else { Style::Dim }, glyph::SEAT);
             l.push(Style::Plain, " ");
-            let avail = w.saturating_sub(*depth + 4).max(4);
+            // The pane, because it is the only thing here the row does not
+            // already say and it is where `↵` goes. `empty` is an invitation
+            // rather than a description — it is the one state of a position a
+            // person can do something about.
+            let mut right = Line::default();
             match (agent, *elsewhere) {
-                (Some(a), _) => {
-                    let mut right = Line::default();
-                    right.push(Style::Dim, "seat");
-                    l.push(state.ink(), util::truncate(&a.where_(), avail.saturating_sub(5)));
-                    l.pad(w.saturating_sub(l.width() + right.width()).max(1));
-                    l.spans.extend(right.spans);
-                }
-                // Empty, and worth a whole row saying so: a vacancy is the one
-                // state of a position that somebody can act on, and it is
-                // invisible everywhere else in wsp.
-                (None, false) => l.push(Style::Muted, util::truncate("seat · empty", avail)),
-                (None, true) => l.push(Style::Muted, util::truncate("seat · on another machine", avail)),
+                (Some(a), _) => right.push(Style::Dim, util::truncate(&a.pane, 10)),
+                (None, false) => right.push(Style::Muted, "empty"),
+                (None, true) => right.push(Style::Dim, "elsewhere"),
             }
+            let ink = match agent {
+                Some(_) => state.ink(),
+                None => Style::Muted,
+            };
+            let avail = w.saturating_sub(*depth + 5 + right.width()).max(4);
+            l.push(ink, util::truncate(&crate::cmd_govern::governor_of(project), avail));
+            l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+            l.spans.extend(right.spans);
         }
         Row::Agent { agent, title, depth, state, census } => {
             match num {
@@ -2307,10 +2348,13 @@ pub(super) fn full_text(row: &Row) -> String {
             }
         }
         // Both halves, because the whole point of the row is that they are
-        // separable: which position this is, and who is in it today.
+        // separable: which position this is, and who is in it today. The pane
+        // rather than its name, for the reason the row itself gives — an
+        // occupant's *name* is about the work it holds, and a governor holds
+        // none, so `unassigned` is what asking for one gets you.
         Row::Seat { project, agent, .. } => match agent {
-            Some(a) => format!("{project} seat · {}", a.where_()),
-            None => format!("{project} seat · empty"),
+            Some(a) => format!("{} · {}", crate::cmd_govern::governor_of(project), a.pane),
+            None => format!("{} · empty", crate::cmd_govern::governor_of(project)),
         },
         Row::Agent { agent, title, .. } => {
             // The title is the pane's name, which is what the row draws. What

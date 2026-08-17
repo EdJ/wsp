@@ -237,7 +237,7 @@ fn said_label(task: &Task, said: &str) -> Option<String> {
 /// confidently, that it is still on the thing it just handed back. This says
 /// the one fact that is certainly true about it, and it is the fact you are
 /// reading that list to find: nobody has given this agent anything.
-const UNASSIGNED_LABEL: &str = "unassigned";
+pub(crate) const UNASSIGNED_LABEL: &str = "unassigned";
 
 /// A label for a pane holding no task, which is the only kind that has to be
 /// checked for a name of ours.
@@ -274,7 +274,7 @@ fn plain_label(said: &str) -> Option<String> {
 ///
 /// The one name it will not write over is a seat's. A workspace holding a
 /// custodial slot is named after the position — see
-/// [`cmd_govern::seat_label`] — and a custodian that claims a task to read it
+/// [`cmd_govern::governor_of`] — and a custodian that claims a task to read it
 /// would otherwise rename its own room after the task and leave the sidebar
 /// saying what t-260817-021 was filed about: `robustness/078`, with nothing
 /// anywhere saying seat. The pane still takes the task's name, because a pane
@@ -287,7 +287,7 @@ fn name_after_task(pane: &str, workspace: &str, task: &Task, ws_label: &str) -> 
     if !pane.is_empty() {
         let _ = herdr::rename_pane(pane, &label);
     }
-    if workspace.is_empty() || cmd_govern::is_seat_label(ws_label) {
+    if workspace.is_empty() || cmd_govern::is_governor_label(ws_label) {
         return None;
     }
     herdr::rename_workspace(workspace, &label).ok().map(|_| label)
@@ -362,6 +362,14 @@ fn pane_rename(pane_label: &str, task: &Task) -> Option<String> {
 /// names an unnamed one after what is standing in it, which is true again the
 /// moment the task stops being.
 ///
+/// **Unless the pane is a governor's**, which is the one agent for which
+/// "unassigned" is not merely unhelpful but false. Ed, 2026-08-17, looking at
+/// this exact label after a custodian released the task it had borrowed: a
+/// custodian holding no task is the most assigned thing on the panel — it holds
+/// a project. The word above is right for a *worker* that has put its task
+/// down, and the question is which of the two this pane is, so it is asked here
+/// rather than answered once for both.
+///
 /// The workspace waits on the last binding in it. Two agents in one tree are
 /// rare and one of them finishing is not a reason to unname the room they are
 /// both standing in.
@@ -374,7 +382,11 @@ fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
     let Some(p) = panes.iter().find(|p| p.pane_id == pane) else { return };
 
     if named_after_task(&p.label, &task) {
-        let _ = herdr::rename_pane(pane, UNASSIGNED_LABEL);
+        let governs = cmd_govern::governs(&store.governors(), &p.workspace_id);
+        let _ = match &governs {
+            Some(project) => herdr::rename_pane(pane, &cmd_govern::governor_of(project)),
+            None => herdr::rename_pane(pane, UNASSIGNED_LABEL),
+        };
     }
     if p.workspace_id.is_empty() {
         return;
@@ -616,7 +628,7 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
 fn addressed(store: &Store, task: &Task) -> String {
     let index = Index::new(store.projects());
     match cmd_govern::seat_for(&store.governors(), &index, task.project.as_deref()) {
-        Some(s) => format!("raised to the {} seat · {} · x there lowers it", s.project, s.workspace),
+        Some(s) => format!("raised to the {} governor · {} · x there lowers it", s.project, s.workspace),
         None => "raised on every panel · x there lowers it".into(),
     }
 }
@@ -625,6 +637,13 @@ fn addressed(store: &Store, task: &Task) -> String {
 /// raised hand looks like.
 fn glyph_flag() -> &'static str {
     crate::panel::glyph::FLAG
+}
+
+/// And the panel's mark for a governor's slot, borrowed for the same reason.
+/// The words come from [`cmd_govern::governor_of`], which carries no mark of its
+/// own — a label goes to herdr, which has no column to put one in.
+fn glyph_seat() -> &'static str {
+    crate::panel::glyph::SEAT
 }
 
 /// `wsp flag` with nothing to raise: what is already up.
@@ -653,13 +672,12 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     let governors = store.governors();
     let mine = herdr::Env::read()
         .workspace_id
-        .map(|ws| cmd_govern::governed_by(&governors, &ws))
-        .unwrap_or_default();
+        .and_then(|ws| cmd_govern::governs(&governors, &ws));
     let only_mine = args.has("seat");
     // Asked for an inbox from a pane that has no seat. Said plainly, because
     // "nothing raised for you" and "you are not the seat" look identical from
     // an empty list, and only one of them is worth acting on.
-    if only_mine && mine.is_empty() {
+    if only_mine && mine.is_none() {
         println!("{}", p.dim("this workspace is nobody's seat — wsp flag alone shows them all"));
         return 0;
     }
@@ -670,7 +688,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         let seat = task
             .as_ref()
             .and_then(|t| cmd_govern::seat_for(&governors, &index, t.project.as_deref()));
-        let held_here = seat.as_ref().map(|s| mine.contains(&s.project)).unwrap_or(false);
+        let held_here = seat.as_ref().map(|s| mine.as_deref() == Some(s.project.as_str())).unwrap_or(false);
         if only_mine && !held_here {
             continue;
         }
@@ -699,8 +717,8 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         // and already reads as "this is yours" to the person looking at it.
         if let Some(s) = &seat {
             second.push(match held_here {
-                true => format!("▣ yours · {}", s.project),
-                false => format!("▣ {} seat · {}", s.project, s.workspace),
+                true => format!("{} yours · {}", glyph_seat(), s.project),
+                false => format!("{} {} · {}", glyph_seat(), cmd_govern::governor_of(&s.project), s.workspace),
             });
         }
         if !second.is_empty() {
@@ -1589,7 +1607,7 @@ fn name_bound(
         // start, so this is where a nightly custodian would silently lose it.
         if workspaces
             .iter()
-            .any(|w| w.id == pane.workspace_id && w.label != label && !cmd_govern::is_seat_label(&w.label))
+            .any(|w| w.id == pane.workspace_id && w.label != label && !cmd_govern::is_governor_label(&w.label))
         {
             touched |= herdr::rename_workspace(&pane.workspace_id, &label).is_ok();
         }
@@ -1929,9 +1947,9 @@ struct WipRow {
     workspace: String,
     state: String,
     needs_you: bool,
-    /// The projects this pane's workspace is the seat for. Empty for every
-    /// ordinary agent, which is every agent most of the time.
-    seat: Vec<String>,
+    /// The project this pane's workspace is the governor of, if any — which is
+    /// no project for every ordinary agent, and that is nearly all of them.
+    seat: Option<String>,
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
@@ -1965,8 +1983,8 @@ fn wip_rows(w: &Wip) -> Vec<WipRow> {
 
         let idle = a.agent_status == "idle";
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
-        let seat = cmd_govern::governed_by(&w.governors, &a.workspace_id);
-        let needs_you = cmd_govern::needs_a_person(idle, doing, !seat.is_empty());
+        let seat = cmd_govern::governs(&w.governors, &a.workspace_id);
+        let needs_you = cmd_govern::needs_a_person(idle, doing, seat.is_some());
 
         rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),
@@ -2045,10 +2063,10 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             // A seat says so instead of saying it needs you. The two can never
             // both be true — [`cmd_govern::needs_a_person`] is what makes them
             // exclusive — and the column is the same width either way.
-            let flag = match (r.seat.is_empty(), r.needs_you) {
-                (false, _) => p.cyan(&format!("▣ seat · {}", r.seat.join(" "))),
-                (true, true) => p.yellow("← needs you"),
-                (true, false) => String::new(),
+            let flag = match (&r.seat, r.needs_you) {
+                (Some(proj), _) => p.cyan(&format!("{} {}", glyph_seat(), cmd_govern::governor_of(proj))),
+                (None, true) => p.yellow("← needs you"),
+                (None, false) => String::new(),
             };
             out.push(format!(
                 "{}  {}  {}  {} {}",
@@ -3482,10 +3500,10 @@ mod tests {
         );
         let row = wip_rows(&w).into_iter().find(|r| r.pane == "w2:p1").unwrap();
         assert!(!row.needs_you, "a seat waiting on its agents is not a person being the blocker");
-        assert_eq!(row.seat, ["wsp"], "and the row says which project it is the seat for");
+        assert_eq!(row.seat.as_deref(), Some("wsp"), "and the row says which project it governs");
 
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
-        assert!(text.contains("seat · wsp"), "{text}");
+        assert!(text.contains("governor · wsp"), "{text}");
         assert!(!text.contains("needs you"), "nobody else here has stopped:\n{text}");
     }
 
