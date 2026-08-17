@@ -139,7 +139,7 @@ impl Store {
         };
         let state = match std::env::var_os("WSP_STATE") {
             Some(v) => PathBuf::from(v),
-            None => util::home().join(".local/state/wsp"),
+            None => Store::default_state(),
         };
         Store::at(root, state)
     }
@@ -916,6 +916,42 @@ impl Store {
         );
     }
 
+    // ---- the daemon marker ------------------------------------------------
+    //
+    // Which process is *the* daemon for this store. It lives beside the
+    // bindings and not in `~/wsp`, because the pair of daemons that must not
+    // coexist is the pair pointed at one state directory: a sandbox sets
+    // `WSP_STATE` and gets its own marker, its own bindings and its own right
+    // to a daemon. The argument for what a second one does about it is in
+    // [`crate::daemon`].
+
+    /// The pid that last claimed this store, and when it said so.
+    pub fn daemon_holder(&self) -> Option<(u32, String)> {
+        let v = self.read_json("daemon.json");
+        let pid = v.get("pid").and_then(|x| x.as_u64())? as u32;
+        let since = v.get("since").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        Some((pid, since))
+    }
+
+    /// Claim it. Last writer wins, deliberately: two daemons starting in the
+    /// same millisecond both read an empty marker, and the one that does not
+    /// end up in it stands down at its next tick rather than needing to have
+    /// been stopped here.
+    pub fn set_daemon_holder(&self, pid: u32) {
+        let since = util::now_iso();
+        self.update_json("daemon.json", |m| {
+            m.insert("pid".into(), json!(pid));
+            m.insert("since".into(), json!(since));
+        });
+    }
+
+    /// Where a store with nothing said about it keeps its state. The daemon
+    /// needs it to read another process's environment the way [`Store::open`]
+    /// read its own — a `wsp daemon` with no `WSP_STATE` is on this one.
+    pub fn default_state() -> PathBuf {
+        util::home().join(".local/state/wsp")
+    }
+
     /// pane_id -> binding object
     pub fn bindings(&self) -> BTreeMap<String, Value> {
         match self.read_json("bindings.json") {
@@ -1497,6 +1533,35 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The daemon marker is state and not work: a daemon starting must not look
+    /// to every panel on the machine like something changed in the store, or
+    /// every herdr restart would repaint twenty-two of them for nothing. And it
+    /// keys on the state directory, which is what makes a sandbox's daemon and
+    /// the live one two daemons rather than a fight — the argument is in
+    /// [`crate::daemon`].
+    #[test]
+    fn the_daemon_marker_says_which_process_holds_which_store() {
+        let store = scratch("daemon-marker");
+        assert_eq!(store.daemon_holder(), None, "an unclaimed store names nobody");
+        let before = store.fingerprint();
+
+        store.set_daemon_holder(22121);
+        assert_eq!(store.fingerprint(), before, "a daemon starting is not a change to the work");
+        let (pid, since) = store.daemon_holder().expect("the store was claimed");
+        assert_eq!(pid, 22121);
+        assert!(since.starts_with("20"), "no timestamp to say how long it has held it: {since:?}");
+
+        // Taking it over is a write of the same shape — the previous holder is
+        // replaced, not appended to, because there is only ever one.
+        store.set_daemon_holder(88994);
+        assert_eq!(store.daemon_holder().map(|(p, _)| p), Some(88994));
+
+        // A second store on the same machine has its own, which is how `wsp
+        // sandbox` gets a daemon of its own without either of them noticing.
+        let sandbox = scratch("daemon-marker-sb");
+        assert_eq!(sandbox.daemon_holder(), None, "two stores shared one marker");
+    }
 
     /// A hand raised is state, and the panel's refetch is gated on a
     /// fingerprint that walks `projects/` and `tasks/` — so the stamp is what

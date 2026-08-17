@@ -2867,7 +2867,19 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
 
     section_damage(store, args, &tasks, &index.projects, &mut problems, &mut notes);
 
-    herdr_health(&Probe::live(), &bindings, &mut problems, &mut notes);
+    let probe = Probe::live();
+    herdr_health(&probe, &bindings, &mut problems, &mut notes);
+    // Whether the machine has the one daemon it should have. The probe is passed
+    // because a machine with no herdr on it wants no daemon either, and a check
+    // that said "no daemon running" there is a check that gets ignored along
+    // with the ones that mean something.
+    crate::daemon::health(
+        store.daemon_holder().map(|(pid, _)| pid),
+        crate::daemon::running(&store.state).as_deref(),
+        matches!(probe, Probe::Up(_)),
+        &mut problems,
+        &mut notes,
+    );
 
     if args.json() {
         println!("{}", json!({ "problems": problems, "notes": notes }));

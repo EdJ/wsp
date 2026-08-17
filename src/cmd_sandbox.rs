@@ -362,7 +362,12 @@ fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
 /// one's. `ppid` comes back in the same call so the ancestors of this process
 /// can be ruled out of anything we are about to kill — a shell whose command
 /// line happens to mention the session is not a child of it.
-fn processes() -> Vec<(u32, u32, String)> {
+///
+/// Shared with [`crate::daemon`], which asks the same output the same two
+/// questions — what is running, and which store its environment points it at —
+/// and would otherwise keep a second copy of the parsing that was already
+/// silently wrong once (see [`ps_line`]).
+pub(crate) fn processes() -> Vec<(u32, u32, String)> {
     let Ok(out) = Command::new("ps").args(["-A", "-E", "-o", "pid=,ppid=,command="]).output() else {
         return Vec::new();
     };
@@ -402,8 +407,10 @@ fn session_children(name: &str) -> Vec<u32> {
 }
 
 /// This process and everything above it, so nothing we are standing on can end
-/// up in a list of things to kill.
-fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
+/// up in a list of things to kill — or, for [`crate::daemon`], in a list of
+/// daemons we are about to say are running: the shell that typed `wsp doctor`
+/// has `wsp doctor` on its command line and its parent has whatever started it.
+pub(crate) fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
     let mut out: Vec<u32> = vec![std::process::id()];
     // Bounded by the list itself, so a cycle cannot spin.
     for _ in 0..all.len() {

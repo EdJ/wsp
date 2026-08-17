@@ -1,9 +1,14 @@
 //! The only long-lived piece: herdr events + store polling -> token refresh.
 //!
+//! "The only" is now enforced rather than assumed — one daemon per store, and
+//! the argument for how a second one is turned away is under *one daemon per
+//! store* below.
+//!
 //! Deliberately dependency-free. One thread blocks on the event stream and
 //! feeds a channel; the main loop coalesces bursts (herdr emits
 //! `workspace_focused` on every sidebar hover) and refreshes TTLs on a timer.
 
+use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -211,6 +216,213 @@ fn misdirected(
     ))
 }
 
+// ---- one daemon per store ---------------------------------------------------
+//
+// Two of these ran for forty-two hours and nothing noticed (t-260817-052). One
+// was started by hand on the 15th with `-v`, survived herdr's death still
+// retrying its socket, and was still there when herdr came back and its
+// `[[startup]]` hook started a second. So the trigger is not carelessness: it is
+// any crash or restart, and the hand-started daemon that outlives the terminal
+// it was typed in is the ordinary way to get one.
+//
+// Both then do everything twice against one store and one herdr: push tokens,
+// refresh TTLs, and reap. `sync` reaps bindings against the pane list herdr
+// answers with, and t-260816-015 is the record of what one wrong reap costs.
+// The loser of any race is silent, which is why forty-two hours passed.
+//
+// # Refuse, not take over
+//
+// The case that will actually happen is a marker a crash left behind, and that
+// case is not a contest at all — the pid in it is not there any more, and the
+// answer is to take it. Once liveness is checked, the only case left is a
+// *verified live* daemon on this store, and for that one there is no scenario
+// where the newcomer is the more correct process:
+//
+// - A newcomer pointed at the wrong herdr or an unnamed store is already
+//   refused, earlier and for a sharper reason — see `misdirected`.
+// - An incumbent running old code already replaces itself; see `reload`.
+//
+// What taking over would add is killing a working process on the strength of a
+// file, and one real regression: a person who types `wsp daemon -v` to watch it
+// for a minute would displace the machine's daemon and leave nothing behind when
+// they hit Ctrl-C. So the newcomer refuses and says which pid holds it, which is
+// also the house answer everywhere else — `wsp claim` refuses a task a live
+// agent holds.
+//
+// It refuses only on *positive* evidence, though. An unreadable process list, or
+// a pid that is alive but is not a wsp daemon (numbers get reused), leaves the
+// marker no better than empty — and refusing on a marker we cannot corroborate
+// is how a machine ends up with no daemon at all and one line in a log nobody
+// reads. The failure this fixes is two daemons; the failure it must not create
+// is zero.
+
+/// What a starting daemon does about whoever the marker names.
+#[derive(Debug, PartialEq)]
+enum Claim {
+    /// Take the marker. Carries the pid being displaced in it, if there was
+    /// one, because "a daemon died here on Saturday" is worth one line.
+    Take(Option<u32>),
+    /// It already names us, which is what an exec-`reload` finds: the pid
+    /// survives the exec, so the new image must not read its own marker as a
+    /// rival and refuse — that would end the machine's daemon on the next
+    /// `wsp install`, quietly, which is a worse bug than the one being fixed.
+    Keep,
+    /// A daemon for this store is running and answering. Say which.
+    Refuse(u32),
+}
+
+/// `live` is every `wsp daemon` for this store that is actually running, or
+/// `None` when we could not find out. Passed in rather than looked up, so the
+/// decision is testable without a machine that has daemons on it.
+fn claim(holder: Option<u32>, me: u32, live: Option<&[u32]>) -> Claim {
+    match holder {
+        Some(h) if h == me => Claim::Keep,
+        Some(h) if live.is_some_and(|l| l.contains(&h)) => Claim::Refuse(h),
+        Some(h) => Claim::Take(Some(h)),
+        None => Claim::Take(None),
+    }
+}
+
+/// Where a daemon already running stands, as of the marker.
+#[derive(Debug, PartialEq)]
+enum Standing {
+    /// The marker is ours. The ordinary answer, every tick.
+    Ours,
+    /// Somebody else holds it now. Two daemons start in the same instant, both
+    /// read an empty marker, both write, and one of them is this: the one that
+    /// is not in the marker stands down, so the invariant holds even when the
+    /// start-time check could not see the other coming.
+    Lost(u32),
+    /// Nothing holds it. The state directory went away under us — a `wsp init`,
+    /// a sandbox teardown — and an unmarked daemon is one `doctor` would go on
+    /// reporting as a stray for ever. Claim it again.
+    Unmarked,
+}
+
+fn standing(holder: Option<u32>, me: u32) -> Standing {
+    match holder {
+        Some(h) if h == me => Standing::Ours,
+        Some(h) => Standing::Lost(h),
+        None => Standing::Unmarked,
+    }
+}
+
+/// Is this `ps -E` line's *command* `wsp daemon`?
+///
+/// The command only. `ps -E` appends the environment to the command in one
+/// field, and every agent's shell carries a `_=` or a `WSP_*` mentioning wsp —
+/// so a match anywhere in the line would count panes as daemons. The command is
+/// the words before the first `KEY=value`, which is where argv stops.
+fn is_daemon(rest: &str) -> bool {
+    let mut words = rest.split_whitespace().take_while(|w| !is_env_word(w));
+    let argv0 = words.next().unwrap_or("");
+    let exe = argv0.rsplit('/').next().unwrap_or("");
+    // `-v` and anything after it are somebody's flags, not our business.
+    exe == "wsp" && words.next() == Some("daemon")
+}
+
+fn is_env_word(w: &str) -> bool {
+    let Some((key, _)) = w.split_once('=') else { return false };
+    !key.is_empty()
+        && key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Is it pointed at *this* store's state, the way [`Store::open`] would read it?
+///
+/// The one filter that matters: `wsp sandbox` runs a daemon of its own with
+/// `WSP_STATE` set, and a check that called that a second daemon would cry wolf
+/// on a machine where sandboxes are the normal way to test a change.
+fn for_store(rest: &str, state: &Path) -> bool {
+    match rest.split_whitespace().find_map(|w| w.strip_prefix("WSP_STATE=")) {
+        Some(v) => Path::new(v) == state,
+        None => state == Store::default_state(),
+    }
+}
+
+/// Every `wsp daemon` on this machine pointed at `state`, or `None` when the
+/// process list could not be read at all — which no caller may read as "none",
+/// because a machine with no processes on it is a machine that cannot answer.
+pub(crate) fn running(state: &Path) -> Option<Vec<u32>> {
+    let all = crate::cmd_sandbox::processes();
+    if all.is_empty() {
+        return None;
+    }
+    // Never ourselves or anything we are standing on: `wsp doctor` run from a
+    // shell has that shell above it, and the shell's line carries our command.
+    let mine = crate::cmd_sandbox::ancestors(&all);
+    Some(
+        all.iter()
+            .filter(|(pid, _, _)| !mine.contains(pid))
+            .filter(|(_, _, rest)| is_daemon(rest) && for_store(rest, state))
+            .map(|(pid, _, _)| *pid)
+            .collect(),
+    )
+}
+
+/// What `doctor` says about the daemon: that there is one, that there are two,
+/// or that there is none.
+///
+/// The noticing half of t-260817-052, and the half that works on a machine
+/// where nothing has been restarted since: the marker is only written by a
+/// daemon new enough to write one, so `running` is what is asked, and the marker
+/// is only used to say which of them is the one that claimed the store.
+///
+/// `None` for `running` says nothing at all, deliberately. A `ps` that will not
+/// answer is not evidence of an empty machine, and "no daemon running" is a line
+/// that would send somebody to start a second one.
+pub(crate) fn health(
+    holder: Option<u32>,
+    running: Option<&[u32]>,
+    herdr_up: bool,
+    problems: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    let Some(running) = running else { return };
+    let list = |pids: &[u32]| {
+        pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+    };
+    match running {
+        [] => {
+            // Only where it means something is missing. A machine with no herdr
+            // is a machine wsp works on and does not need a daemon for, and
+            // `herdr_health` has already said so in its own words.
+            if herdr_up {
+                notes.push(
+                    "no wsp daemon running — tokens and TTLs will not refresh (`wsp daemon`)".into(),
+                );
+            }
+        }
+        [one] => match holder == Some(*one) {
+            true => notes.push(format!("daemon up, pid {one}")),
+            // An image from before the marker existed, so nothing yet stops a
+            // second one joining it. Not a problem — one daemon is the right
+            // number — and nothing to do either: the reload path re-enters
+            // `run`, so it claims the store the next time anybody installs.
+            false => notes.push(format!(
+                "daemon up as pid {one}, from before the single-daemon marker — it claims the store on its next reload or restart"
+            )),
+        },
+        many => {
+            problems.push(format!(
+                "{} wsp daemons are running against this store (pids {}) — they push tokens, refresh TTLs and reap bindings twice against one herdr, and the loser of any race is silent",
+                many.len(),
+                list(many)
+            ));
+            let strays: Vec<u32> = many.iter().copied().filter(|p| Some(*p) != holder).collect();
+            problems.push(match holder {
+                Some(h) if many.contains(&h) => format!(
+                    "  pid {h} is the one that claimed the store — `kill {}`",
+                    list(&strays)
+                ),
+                _ => format!(
+                    "  none of them claimed the store, so they all predate the guard — `kill` all but one, and the survivor claims it on its next start"
+                ),
+            });
+        }
+    }
+}
+
 pub fn run(store: &Store, verbose: bool) -> i32 {
     if let Some(why) = misdirected(
         std::env::var("HERDR_SESSION").ok().as_deref(),
@@ -224,6 +436,46 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     if !herdr::available() {
         eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
         return 1;
+    }
+
+    // Third gate, and after the other two on purpose: a daemon that is going to
+    // refuse for a sharper reason should never have written itself into the
+    // marker, and one with no herdr to talk to is not the daemon this store
+    // wants to be holding it.
+    let me = std::process::id();
+    let holder = store.daemon_holder();
+    match claim(holder.as_ref().map(|(p, _)| *p), me, running(&store.state).as_deref()) {
+        Claim::Refuse(pid) => {
+            let up = match holder.as_ref().map(|(_, since)| since.as_str()) {
+                Some(s) if !s.is_empty() => {
+                    format!(", up {}", crate::util::duration_human(crate::util::since(s)))
+                }
+                _ => String::new(),
+            };
+            eprintln!("wsp: a wsp daemon for this store is already running as pid {pid}{up}");
+            eprintln!(
+                "wsp: two of them reap and refresh twice against one herdr — `kill {pid}` first if this one is meant to replace it"
+            );
+            // Not a failure. What the caller wanted — a daemon on this store —
+            // is what is running, and herdr's `[[startup]]` hook gets a plugin
+            // that did its job on every restart rather than one that looks
+            // broken on all but the first.
+            return 0;
+        }
+        Claim::Take(displaced) => {
+            if let (Some(pid), Some((_, since))) = (displaced, holder.as_ref()) {
+                eprintln!(
+                    "wsp daemon: taking over from pid {pid}, which is gone{}",
+                    match since.is_empty() {
+                        true => String::new(),
+                        false => format!(" (it claimed this store {since})"),
+                    }
+                );
+            }
+            store.set_daemon_holder(me);
+        }
+        // An exec-`reload`: same pid, same marker, nothing to write.
+        Claim::Keep => {}
     }
 
     let (tx, rx) = mpsc::channel::<()>();
@@ -294,10 +546,30 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             while rx.try_recv().is_ok() {}
         }
 
-        // Here, at the top, because it is the one point in the loop where
-        // nothing is half-done: no sync in flight, no store lock held, the
-        // debounce already drained. Everything below this line either finishes
-        // or is not started.
+        // Both of the next two checks are here, at the top, because it is the
+        // one point in the loop where nothing is half-done: no sync in flight,
+        // no store lock held, the debounce already drained. Everything below
+        // this line either finishes or is not started.
+        //
+        // Standing down comes before reloading: a daemon that is no longer the
+        // one for this store should end, not exec a fresh image of itself into
+        // the same argument.
+        match standing(store.daemon_holder().map(|(p, _)| p), me) {
+            Standing::Ours => {}
+            Standing::Unmarked => store.set_daemon_holder(me),
+            Standing::Lost(other) => {
+                // The tunnels for the same reason the reload path shuts them
+                // down: an `ssh -L` we leave behind holds the socket the daemon
+                // that replaced us needs to bind.
+                tunnels.shutdown();
+                // Always said, not only when verbose. A process that ends on
+                // purpose owes the log the reason, or the next person to look
+                // finds a daemon that simply stopped.
+                eprintln!("wsp daemon: pid {other} holds this store now — standing down");
+                return 0;
+            }
+        }
+
         if let Some(stamp) = changed(started_as, crate::util::exe_stamp()) {
             // The tunnels first, and before the `exec`. An `ssh -L` we leave
             // behind goes on holding the socket it bound, and the daemon that
@@ -440,6 +712,156 @@ mod tests {
             misdirected(Some("wsp-w1"), Some(sock), None, None)
                 .is_some_and(|m| m.contains("herdr session `wsp-w1`")),
             "the refusal stopped saying which session it was about"
+        );
+    }
+
+    /// The marker a crash leaves behind must never be the reason a machine has
+    /// no daemon. This is the case t-260817-052 says will happen most: herdr
+    /// died, its daemon did not, and the pid in the marker is not there any more
+    /// — or, on the 15th's numbers coming round again, is something else
+    /// entirely wearing that pid.
+    #[test]
+    fn a_marker_left_by_a_dead_daemon_does_not_stop_the_next_one() {
+        // Nothing running, marker from Saturday.
+        assert_eq!(claim(Some(22121), 88994, Some(&[])), Claim::Take(Some(22121)));
+        // Alive, but somebody else's process on a reused number.
+        assert_eq!(claim(Some(22121), 88994, Some(&[70001])), Claim::Take(Some(22121)));
+        // No marker at all: the first daemon on a fresh store.
+        assert_eq!(claim(None, 88994, Some(&[])), Claim::Take(None));
+
+        // And the case we cannot corroborate. `ps` not answering leaves the
+        // marker worth no more than an empty one — refusing on it would trade
+        // two daemons for none, which is the worse of the two failures because
+        // nothing on screen would say so.
+        assert_eq!(
+            claim(Some(22121), 88994, None),
+            Claim::Take(Some(22121)),
+            "refused on a marker nothing could confirm, leaving the store with no daemon"
+        );
+    }
+
+    /// The one case that is a real contest, and the house answer to it. The
+    /// incumbent is running and answering, so the newcomer is not more correct
+    /// than it: a newcomer on the wrong herdr was refused earlier by
+    /// `misdirected`, and an incumbent on an old binary replaces itself.
+    #[test]
+    fn a_second_daemon_on_a_store_a_live_one_holds_refuses_and_says_which_pid() {
+        assert_eq!(claim(Some(22121), 88994, Some(&[22121])), Claim::Refuse(22121));
+        assert_eq!(claim(Some(22121), 88994, Some(&[70001, 22121])), Claim::Refuse(22121));
+    }
+
+    /// `reload` execs, so the pid survives it and the new image reads a marker
+    /// holding its own number. Refusing there would end the machine's daemon on
+    /// the next `wsp install` — every pane re-execs and the daemon quietly does
+    /// not come back — which is a worse bug than the one the marker is for.
+    #[test]
+    fn a_daemon_that_reloaded_into_a_new_image_does_not_refuse_itself() {
+        assert_eq!(claim(Some(88994), 88994, Some(&[])), Claim::Keep);
+        assert_eq!(claim(Some(88994), 88994, Some(&[88994])), Claim::Keep);
+        assert_eq!(standing(Some(88994), 88994), Standing::Ours);
+    }
+
+    /// Two daemons starting in the same instant both read an empty marker and
+    /// both write it, so the start-time check cannot be the only one. Whoever is
+    /// not in the marker afterwards ends, which is the same guarantee arrived at
+    /// from the other side — and a marker that has gone entirely is claimed
+    /// again rather than left for `doctor` to report as a stray for ever.
+    #[test]
+    fn the_daemon_the_marker_does_not_name_stands_down_at_its_next_tick() {
+        assert_eq!(standing(Some(22121), 88994), Standing::Lost(22121));
+        assert_eq!(standing(None, 88994), Standing::Unmarked);
+    }
+
+    /// What counts as a daemon in a `ps -E` line, where the environment is
+    /// appended to the command in one field. Matching anywhere in the line would
+    /// count every agent's shell, because an agent's environment mentions wsp
+    /// several times over.
+    #[test]
+    fn only_a_process_whose_command_is_wsp_daemon_is_a_daemon() {
+        assert!(is_daemon("/Users/e/.local/bin/wsp daemon PATH=/usr/bin HOME=/Users/e"));
+        assert!(is_daemon("wsp daemon"));
+        // Flags are somebody's business and not ours: `-v` is how the daemon
+        // found on the 15th had been started.
+        assert!(is_daemon("/Users/e/.local/bin/wsp daemon -v HERDR_SESSION=default"));
+
+        assert!(!is_daemon("/Users/e/.local/bin/wsp panel PATH=/usr/bin"));
+        assert!(!is_daemon("wsp"));
+        assert!(!is_daemon(""));
+        // A shell that ran a wsp command, and whose environment says so. `_` is
+        // set by every interactive shell to the last command it ran.
+        assert!(!is_daemon("-zsh _=/Users/e/.local/bin/wsp WSP_DAEMON=1"));
+        assert!(!is_daemon("tail -f daemon.log PATH=/usr/bin"));
+        // Something else called wsp: the name has to be the whole leaf.
+        assert!(!is_daemon("/usr/bin/notwsp daemon"));
+    }
+
+    /// A sandbox runs a daemon of its own, deliberately, with `WSP_STATE` set —
+    /// so a check that counted it would cry wolf on a machine where sandboxes
+    /// are how a change gets tested (t-260816-076 is why they exist). The store
+    /// is read out of the environment exactly as `Store::open` reads it: told, or
+    /// the default.
+    #[test]
+    fn a_daemon_counts_only_against_the_store_it_is_pointed_at() {
+        let live = Store::default_state();
+        let sandbox = std::path::PathBuf::from("/tmp/wsp-sb/state");
+
+        let plain = "wsp daemon PATH=/usr/bin";
+        let told = format!("wsp daemon WSP_HOME=/tmp/wsp-sb/wsp WSP_STATE={}", sandbox.display());
+
+        assert!(for_store(plain, &live), "the ordinary daemon was not counted against the live store");
+        assert!(!for_store(plain, &sandbox));
+        assert!(for_store(&told, &sandbox));
+        assert!(!for_store(&told, &live), "a sandbox's daemon was counted against the live store");
+
+        // A key that ends in ours is not ours.
+        assert!(for_store("wsp daemon OLD_WSP_STATE=/tmp/elsewhere", &live));
+    }
+
+    /// What `doctor` says, and the two things it must not say: that a machine
+    /// whose `ps` would not answer has no daemon, and that a machine with one
+    /// daemon has a problem.
+    #[test]
+    fn doctor_calls_two_daemons_a_problem_and_one_a_note() {
+        let check = |holder: Option<u32>, running: Option<&[u32]>, herdr_up: bool| {
+            let (mut p, mut n) = (Vec::new(), Vec::new());
+            health(holder, running, herdr_up, &mut p, &mut n);
+            (p, n)
+        };
+
+        // The forty-two hours, as they would have read on the 17th.
+        let (problems, _) = check(Some(88994), Some(&[22121, 88994]), true);
+        assert!(!problems.is_empty(), "two daemons passed the integrity check");
+        assert!(
+            problems[0].contains("22121") && problems[0].contains("88994"),
+            "the problem did not say which pids: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("kill 22121") && !p.contains("kill 88994")),
+            "doctor did not name the stray, or offered to kill the one holding the store: {problems:?}"
+        );
+
+        // The same two before either of them could write a marker, which is
+        // every machine until it next restarts.
+        let (problems, _) = check(None, Some(&[22121, 88994]), true);
+        assert_eq!(problems.len(), 2, "two daemons went unreported for want of a marker");
+
+        // One is the whole point, and is not a problem however it is marked.
+        for holder in [Some(88994), None, Some(22121)] {
+            let (problems, notes) = check(holder, Some(&[88994]), true);
+            assert!(problems.is_empty(), "one daemon reported as a fault: {problems:?}");
+            assert_eq!(notes.len(), 1, "one daemon said more than one line about itself");
+        }
+
+        // None, and whether that is worth saying. A machine with no herdr on it
+        // is a machine wsp works on and does not want a daemon for.
+        assert_eq!(check(None, Some(&[]), true).1.len(), 1, "a herdr with no daemon went unsaid");
+        assert!(check(None, Some(&[]), false).1.is_empty(), "a machine with no herdr was told to run a daemon");
+
+        // And the answer we do not have. `ps` refusing is not an empty machine.
+        let (problems, notes) = check(Some(88994), None, true);
+        assert!(
+            problems.is_empty() && notes.is_empty(),
+            "doctor pronounced on a process list it could not read: {problems:?} {notes:?}"
         );
     }
 
