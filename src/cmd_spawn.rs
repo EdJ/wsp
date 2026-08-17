@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::cmd_agent;
-use crate::herdr;
+use crate::place::{Agent, Order, Place, Refusal, Seat, State};
+use crate::place_herdr::Herdr;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -72,62 +73,37 @@ pub fn claimed_text(task: &str, how: Handover) -> String {
     }
 }
 
-/// Open a workspace for a piece of work, rooted where that work lives.
+/// The order `spawn` places: what to call the seat, where the work lives, and
+/// what whatever runs there should know without having to infer it.
 ///
-/// `WSP_PROJECT` and `WSP_TASK` go into the workspace environment, so every
-/// pane inside it knows what it is for without anyone having to infer it from
-/// a path. herdr does not persist env across a restart, which is why the
-/// durable answer is a claim rather than this — but for the life of the
-/// session it is exact, and exactness is what the cwd heuristic lacks.
+/// `WSP_PROJECT` and `WSP_TASK` go into the environment, so every pane inside
+/// the seat knows what it is for without anyone having to read it off a path.
+/// herdr does not persist env across a restart, which is why the durable answer
+/// is a claim rather than this — but for the life of the session it is exact,
+/// and exactness is what the cwd heuristic lacks.
 ///
-/// Returns the workspace and the pane it opened with — the latter is what
-/// `claim` needs, since a claim speaks in panes and knows nothing about
-/// workspaces.
-pub fn open_workspace(
-    label: &str,
-    cwd: Option<&str>,
-    project: Option<&str>,
-    task: Option<&str>,
-    focus: bool,
-    machine: Option<&str>,
-) -> Result<(String, String), String> {
-    // The store first, then what this workspace is for — the latter wins if
-    // someone has both, which is right: it is more specific.
-    let mut env = util::store_env();
-    if let Some(p) = project {
-        env.insert("WSP_PROJECT".into(), json!(p));
+/// A pure function of what `spawn` resolved, so what an agent is handed can be
+/// asserted without a backend to hand it to.
+fn order(work: &Work, cwd: Option<&str>, on: Option<&str>, show: bool) -> Order {
+    // The store first, then what this seat is for — the latter wins if someone
+    // has both, which is right: it is more specific.
+    let mut env: std::collections::BTreeMap<String, String> = util::store_env()
+        .into_iter()
+        .filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string())))
+        .collect();
+    if let Some(p) = &work.project {
+        env.insert("WSP_PROJECT".into(), p.clone());
     }
-    if let Some(t) = task {
-        env.insert("WSP_TASK".into(), json!(t));
+    if let Some(t) = &work.task {
+        env.insert("WSP_TASK".into(), t.clone());
     }
-    let mut params = json!({ "label": label, "env": env, "focus": focus });
-    if let Some(c) = cwd {
-        params["cwd"] = json!(util::expand(c).display().to_string());
+    Order {
+        label: work.label.clone(),
+        cwd: cwd.map(|c| c.to_string()),
+        env,
+        on: on.map(|m| m.to_string()),
+        show,
     }
-    // The one herdr call with nothing in it to route on: a workspace that does
-    // not exist yet has no id to say where it should be. So the machine is
-    // named, and this is the only place in `spawn` where it has to be —
-    // everything after this is addressed by the pane id below, which comes back
-    // already qualified and routes itself.
-    let r = herdr::call_on(machine, "workspace.create", params, Duration::from_secs(10))
-        .map_err(|e| e.to_string())?;
-    let id = |outer: &str, inner: &str| -> Result<String, String> {
-        let bare = r
-            .get(outer)
-            .and_then(|w| w.get(inner))
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| format!("workspace.create returned no {inner}"))?;
-        // Qualified here, at the door, like everything else arriving from a far
-        // herdr — which has never heard of `@mb2` and answers with its own bare
-        // id. An id that went into a claim unqualified would name *this*
-        // machine's workspace, and the claim would be about a workspace on the
-        // wrong box for as long as it lived.
-        Ok(match machine {
-            Some(m) => format!("{bare}@{m}"),
-            None => bare.to_string(),
-        })
-    };
-    Ok((id("workspace", "workspace_id")?, id("root_pane", "pane_id")?))
 }
 
 /// Where a spawn is going: this machine unless `--on` says otherwise.
@@ -262,99 +238,41 @@ fn preamble(kind: &str, full: bool) -> Vec<String> {
     }
 }
 
-/// How long to give the new workspace's shell before deciding it is never
-/// coming, and how long to give the agent after it. A cold Claude Code measured
-/// four seconds to readiness on this machine; herdr's own default for the same
-/// wait is thirty.
-const SHELL_MS: u64 = 5_000;
+/// How long to give the agent to become ready for input, having started.
+///
+/// A cold Claude Code measured four seconds to readiness on this machine; herdr's
+/// own default for the same wait is thirty. What "started" means, what has to be
+/// retried to get there and how long any of it takes are the backend's, and live
+/// in `place_herdr` — this is only how long the caller is prepared to wait.
 const READY_MS: u64 = 30_000;
-/// If nothing has appeared in the pane by here, the command that was typed did
-/// not survive being typed.
-const RETYPE_MS: u64 = 6_000;
 const POLL_MS: u64 = 150;
 
-/// The agent herdr sees in this pane, if it sees one.
-fn agent_of(pane: &str) -> Option<serde_json::Value> {
-    herdr::call("agent.get", json!({ "target": pane })).ok()?.get("agent").cloned()
-}
-
-/// Whether the agent in this pane will accept a prompt yet.
+/// Wait until the agent in a seat will take a sentence.
 ///
-/// **Not** whether it is idle, which is the trap this walked into. herdr reports
-/// `agent_status: idle` while the agent is still starting — `launch_pending` is
-/// true and `interactive_ready` is absent — and `agent.prompt` refuses in that
-/// window with `agent_not_ready`. Waiting for `idle` therefore returned in half
-/// a second, every time, and the work order went into a pane that was still
-/// drawing its banner. `interactive_ready` is the field that means what `idle`
-/// looks like it means.
-fn ready(pane: &str) -> bool {
-    agent_of(pane)
-        .and_then(|a| a.get("interactive_ready").and_then(|r| r.as_bool()))
-        .unwrap_or(false)
-}
-
-/// Type the agent's name at the pane's shell prompt.
+/// **Not until it is idle**, which is the trap this walked into: herdr reports
+/// `agent_status: idle` while an agent is still drawing its banner, and refuses
+/// a prompt in that window. `will_take_a_prompt` is the port's single answer to
+/// the question every `state == "idle"` caller is actually asking, so this is
+/// the one reading and there is nothing left here to get wrong.
 ///
-/// Retried while herdr says the pane has no shell to type at. `agent.start`
-/// refuses a pane whose shell has not finished starting — `agent_pane_busy`,
-/// "not an available shell" — and the pane here is a workspace's root pane,
-/// measured at ten milliseconds old. So the first attempt lands inside that
-/// window as a matter of course, and only a refusal that is not that one is a
-/// real failure.
-/// `args` is what herdr appends to the command line it types, and is omitted
-/// from the call entirely when there is nothing to say — so an untrimmed spawn
-/// puts exactly the bytes on the socket that it always did.
-fn launch(pane: &str, kind: &str, name: &str, args: &[String]) -> Result<(), String> {
-    let mut params = json!({ "pane_id": pane, "kind": kind, "name": name });
-    if !args.is_empty() {
-        params["args"] = json!(args);
-    }
-    let deadline = Instant::now() + Duration::from_millis(SHELL_MS);
+/// A refusal is not a verdict while there is time left — a backend that did not
+/// answer this poll may answer the next — but a seat that has gone empty is: the
+/// agent existed when `start` returned, so nothing in it now means it has
+/// stopped, and waiting out the deadline would report the wrong failure thirty
+/// seconds late.
+fn wait_ready(place: &dyn Place, seat: &Seat, kind: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_millis(READY_MS);
     loop {
-        match herdr::call("agent.start", params.clone()) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.contains("agent_pane_busy") || Instant::now() >= deadline {
-                    return Err(msg);
-                }
-                std::thread::sleep(Duration::from_millis(POLL_MS));
+        match place.state(seat) {
+            Ok(s) if s.will_take_a_prompt() => return Ok(()),
+            Ok(State::Empty) | Ok(State::Gone) => {
+                return Err(format!("{kind} started and then stopped in {seat}"))
             }
+            Err(Refusal::NoSeat(_)) => return Err(format!("{seat} is gone")),
+            Ok(_) | Err(_) => {}
         }
-    }
-}
-
-/// Start an agent in a pane and wait until it will take a sentence.
-///
-/// Typed twice if nothing appears at all. herdr types the agent's name at the
-/// prompt and a shell that is not quite ready eats the front of it — the
-/// observed failure was ` mclaude`, `command not found`, and a minute of
-/// waiting for an agent that was never going to exist. `ctrl-u` clears whatever
-/// landed on the line before typing again.
-///
-/// It retypes only while herdr can see no agent in the pane at all. A slow
-/// start is the other reason for the wait to run on, and typing `claude` at a
-/// Claude Code that is merely still booting would leave the word sitting in its
-/// input box for somebody to find later.
-fn start_agent(pane: &str, kind: &str, name: &str, args: &[String]) -> Result<(), String> {
-    launch(pane, kind, name, args)?;
-    let began = Instant::now();
-    let mut retyped = false;
-    loop {
-        if ready(pane) {
-            return Ok(());
-        }
-        let waited = began.elapsed();
-        if waited >= Duration::from_millis(READY_MS) {
-            return Err(match agent_of(pane) {
-                Some(_) => format!("{kind} started but never became ready for input"),
-                None => format!("nothing that looks like {kind} appeared in {pane}"),
-            });
-        }
-        if !retyped && waited >= Duration::from_millis(RETYPE_MS) && agent_of(pane).is_none() {
-            retyped = true;
-            let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": "\x15" }));
-            launch(pane, kind, name, args)?;
+        if Instant::now() >= deadline {
+            return Err(format!("{kind} started but never became ready for input"));
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
     }
@@ -410,10 +328,14 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
 }
 
 pub fn spawn(store: &Store, args: &Args) -> i32 {
-    if !herdr::available() {
-        eprintln!("wsp: no herdr socket");
-        return 1;
-    }
+    // No pre-flight question about a socket. `herdr::available()` used to guard
+    // this and printed a herdr sentence for a herdr fact; a backend that is not
+    // answering now says so from the call that wanted it, which arrives at the
+    // same moment and names what it stopped.
+    place_work(&Herdr::new(), store, args)
+}
+
+fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
     let work = match resolve(store, args, &index) {
@@ -440,14 +362,8 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         .get("cwd")
         .or_else(|| work.project.as_deref().and_then(|p| index.root_of(p)));
 
-    let (ws, pane) = match open_workspace(
-        &work.label,
-        cwd.as_deref(),
-        work.project.as_deref(),
-        work.task.as_deref(),
-        !args.has("no-focus"),
-        on.as_deref(),
-    ) {
+    let order = order(&work, cwd.as_deref(), on.as_deref(), !args.has("no-focus"));
+    let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("wsp: {e}");
@@ -464,7 +380,10 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
     // has a shell in it to tidy up after a refusal is a worse trade.
     let claimed = match &work.task {
         Some(t) => {
-            let mut flags: Vec<(&str, &str)> = vec![("pane", pane.as_str())];
+            // The seat, under the name the claim still calls it. `claim --pane`
+            // is `cmd_agent`'s vocabulary and migrating it is its own task; the
+            // string is the same string either way.
+            let mut flags: Vec<(&str, &str)> = vec![("pane", seat.as_str())];
             if args.has("force") {
                 flags.push(("force", "true"));
             }
@@ -476,7 +395,7 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         None => false,
     };
     if work.task.is_some() && !claimed {
-        eprintln!("wsp: opened {ws} — but the claim was refused, so no agent was started");
+        eprintln!("wsp: opened {seat} — but the claim was refused, so no agent was started");
         return 1;
     }
 
@@ -485,30 +404,31 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
     if args.has("agent") {
         let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
         let name = work.task.clone().or_else(|| work.project.clone()).unwrap_or_default();
-        let trim = preamble(&kind, args.has("full"));
-        match start_agent(&pane, &kind, &name, &trim) {
+        let agent = Agent { kind: kind.clone(), name, args: preamble(&kind, args.has("full")) };
+        // Two waits, and they are different questions: `start` comes back when
+        // the agent exists, `wait_ready` when it will listen. Whatever a backend
+        // has to do to make the first one true — retry a shell that is not ready,
+        // clear a half-typed line — happens on its side of the seam now.
+        match place.start(&seat, &agent).map_err(|e| e.to_string())
+            .and_then(|()| wait_ready(place, &seat, &kind))
+        {
             Ok(()) => {
                 started = Some(kind.clone());
                 // Only a task gives an agent something to be told. A project
-                // workspace is a place to work, not an instruction, and `f` in
-                // the panel is the key that turns one into the other.
+                // seat is a place to work, not an instruction, and `f` in the
+                // panel is the key that turns one into the other.
                 if let Some(t) = &work.task {
-                    // `agent.prompt` rather than typing into the pane: the
-                    // start above has already established the agent is ready
-                    // for input, and this is herdr's own submit — it does not
-                    // depend on a sleep being long enough for a TUI that takes
-                    // a burst of keystrokes for a paste.
-                    match herdr::call_for(
-                        "agent.prompt",
-                        json!({ "target": pane, "text": claimed_text(t, Handover::Spawned) }),
-                        Duration::from_secs(10),
-                    ) {
-                        Ok(_) => told = true,
+                    // `tell` rather than typing into the pane: readiness is
+                    // established above, and a backend's own submit does not
+                    // depend on a sleep being long enough for a TUI that takes a
+                    // burst of keystrokes for a paste.
+                    match place.tell(&seat, &claimed_text(t, Handover::Spawned)) {
+                        Ok(()) => told = true,
                         Err(e) => eprintln!("wsp: agent started but not told: {e}"),
                     }
                 }
             }
-            Err(e) => eprintln!("wsp: {kind} did not start in {pane}: {e}"),
+            Err(e) => eprintln!("wsp: {kind} did not start in {seat}: {e}"),
         }
     }
 
@@ -516,8 +436,12 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         println!(
             "{}",
             json!({
-                "workspace": ws,
-                "pane": pane,
+                // One handle where there were two. A herdr seat is the pane id
+                // this printed as `pane` before, so a caller doing
+                // `wsp release --pane $(...)` reads the same string out of a
+                // different key; what has gone is `workspace`, which was herdr's
+                // second id and is not something the port hands back.
+                "seat": seat.as_str(),
                 "task": work.task,
                 "project": work.project,
                 "cwd": cwd,
@@ -527,8 +451,8 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         );
     } else {
         let what = match &started {
-            Some(kind) => format!("{kind} in {ws}"),
-            None => format!("a terminal in {ws}"),
+            Some(kind) => format!("{kind} in {seat}"),
+            None => format!("a terminal in {seat}"),
         };
         println!("  {}", p.dim(&format!("opened {what}{}", match &cwd {
             Some(c) => format!(" · {}", util::contract(&util::expand(c))),
@@ -538,8 +462,8 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
             println!("  {}", p.dim("told it what it is holding"));
         }
     }
-    // An agent asked for and not started is a failure however well the
-    // workspace went: the caller wanted somebody working, and there is nobody.
+    // An agent asked for and not started is a failure however well the seat
+    // went: the caller wanted somebody working, and there is nobody.
     if args.has("agent") && started.is_none() {
         return 1;
     }
@@ -611,6 +535,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
     use crate::model::Project;
+
+    /// What a seat is opened with, which is the whole of what `spawn` says to a
+    /// backend before anything is running in it.
+    ///
+    /// `WSP_PROJECT` and `WSP_TASK` are the part that matters and the part
+    /// nothing else can supply: herdr does not persist an environment across a
+    /// restart, so this is exact for the life of the session and the claim is
+    /// what is durable. A seat opened without them leaves every pane inside it
+    /// inferring what it is for from a path.
+    #[test]
+    fn a_seat_is_opened_knowing_what_it_is_for() {
+        let work = Work {
+            task: Some("t-260817-004".into()),
+            project: Some("robustness".into()),
+            label: "robustness/004 · a title".into(),
+        };
+        let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false);
+        assert_eq!(o.label, "robustness/004 · a title");
+        assert_eq!(o.cwd.as_deref(), Some("~/claude/wsp"), "expanded by the backend, not here");
+        assert_eq!(o.on.as_deref(), Some("mb2"));
+        assert!(!o.show, "--no-focus is a statement about placing the work");
+        assert_eq!(o.env.get("WSP_TASK").map(String::as_str), Some("t-260817-004"));
+        assert_eq!(o.env.get("WSP_PROJECT").map(String::as_str), Some("robustness"));
+
+        // A project spawn has no task, and says so by absence rather than by an
+        // empty string somebody downstream has to test for.
+        let proj = Work { task: None, project: Some("robustness".into()), label: "robustness".into() };
+        let o = order(&proj, None, None, true);
+        assert!(o.env.get("WSP_TASK").is_none());
+        assert!(o.on.is_none());
+        assert!(o.show);
+    }
 
     /// The two sub-projects the backlog is split into have no checkout of
     /// their own — `wsp/render` and `wsp/data` are two halves of one tree. A

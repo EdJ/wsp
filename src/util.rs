@@ -21,10 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `HERDR_SOCKET_PATH` is set in *every* live herdr pane — herdr puts it there
 /// itself, which is also why propagating it is pointless for an ordinary spawn:
 /// whichever herdr creates the workspace tells its panes where it is. What it
-/// is not is portable. `open_workspace` sends this map to `workspace.create` on
-/// whichever machine the workspace is being made on, so an ordinary `wsp spawn
-/// --on <machine>` would bake *this* machine's socket path into a workspace on
-/// the executor — working by accident for as long as the two home layouts
+/// is not is portable. This map goes into a seat's environment on whichever
+/// machine that seat is being made on, so an ordinary `wsp spawn --on <machine>`
+/// would bake *this* machine's socket path into a workspace on the executor — working by accident for as long as the two home layouts
 /// match, failing silently the moment a username differs, and contradicting the
 /// qualify-and-route design the whole executor stack rests on.
 ///
@@ -60,6 +59,23 @@ fn store_env_from(
         carry("HERDR_SOCKET_PATH");
     }
     env
+}
+
+/// The lock every test that points wsp at a herdr takes.
+///
+/// `HERDR_SOCKET_PATH`, `WSP_HOME` and `WSP_STATE` are process-wide and cargo
+/// runs tests in threads, so two tests halfway through pointing the process at
+/// two different sockets is a flake that appears once a fortnight and is read as
+/// a real failure. `herdr.rs` and `fake.rs` each kept a mutex of their own for
+/// this, which protects a module from itself and not from the module next door —
+/// and there are three of them now. One process-wide resource, one lock.
+#[cfg(test)]
+pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`ENV`], surviving a test that panicked while holding it.
+#[cfg(test)]
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn epoch_secs() -> i64 {

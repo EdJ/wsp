@@ -29,6 +29,7 @@ mod model;
 mod overlap;
 mod panel;
 mod place;
+mod place_herdr;
 mod resolve;
 mod story;
 mod store;

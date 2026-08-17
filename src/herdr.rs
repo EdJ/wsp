@@ -179,14 +179,17 @@ fn send(
     params: Value,
     timeout: Duration,
 ) -> std::io::Result<Value> {
-    let mut s = connect_to(&socket_for(machine), Some(timeout)).map_err(|e| {
+    let path = socket_for(machine);
+    let mut s = connect_to(&path, Some(timeout)).map_err(|e| {
         // Named, because the bare errno is the wrong diagnosis. "No such file
         // or directory" on a path nobody typed reads as a broken install; what
         // it actually means is that the daemon is not holding a tunnel to that
-        // machine, which is a different thing to go and look at.
+        // machine, which is a different thing to go and look at. Here it means
+        // there is no server, which is the sentence `available()` used to print
+        // in advance and this now prints instead — so it says which socket.
         match &machine {
             Some(name) => std::io::Error::new(e.kind(), format!("{name}: no tunnel ({e})")),
-            None => e,
+            None => std::io::Error::new(e.kind(), format!("no socket at {} ({e})", path.display())),
         }
     })?;
     let req = json!({ "id": format!("wsp:{}", util::epoch_nanos()), "method": method, "params": params });
@@ -196,6 +199,17 @@ fn send(
     let mut reader = BufReader::new(s);
     let mut line = String::new();
     reader.read_line(&mut line)?;
+    if line.trim().is_empty() {
+        // A server that accepts the connection and hangs up. Left to serde this
+        // reads as "EOF while parsing a value at line 1 column 0", which is a
+        // sentence about a parser and not about what happened — and it is now
+        // the sentence a person sees when there is no backend, because
+        // `available()` was replaced by the first call saying so.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the server hung up without answering",
+        ));
+    }
     let v: Value = serde_json::from_str(line.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if let Some(err) = v.get("error") {
@@ -205,6 +219,19 @@ fn send(
         ));
     }
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Whether an error out of [`call`] is the server's answer or the absence of
+/// one.
+///
+/// The distinction is the whole of what `herdr::available()` used to be asked in
+/// advance, and it is answered here because this is the file that writes the
+/// string: [`send`] marks a reply carrying an `error` object and nothing else
+/// does, so a socket that was not there, a tunnel that is down, a timeout and a
+/// hang-up all answer `false`. `place_herdr` turns the two halves into
+/// [`crate::place::Refusal::Unreachable`] and everything else.
+pub fn answered(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Other && e.to_string().starts_with("herdr error:")
 }
 
 /// Mirrors herdr's wire payload; fields we don't read yet are kept so the
@@ -237,6 +264,16 @@ pub struct Pane {
     pub title: String,
     pub focused: bool,
     pub session_id: String,
+    /// What the agent was started as — `name` on herdr's `AgentInfo`, which is
+    /// the task or project id `spawn` passes to `agent.start`.
+    pub agent_name: String,
+    /// `interactive_ready`, as sent. **`None` is absence rather than false**:
+    /// herdr never sends `false`, and the two readings mean different things —
+    /// see [`crate::place_herdr::state_of_agent`], which is the only thing that
+    /// reads either of these.
+    pub interactive_ready: Option<bool>,
+    /// `launch_pending`, as sent, and the same rule about absence.
+    pub launch_pending: Option<bool>,
 }
 
 /// Stamp a machine onto an id, on the way in.
@@ -340,7 +377,15 @@ pub fn workspaces() -> std::io::Result<Vec<Workspace>> {
     everywhere(workspaces_on)
 }
 
-fn parse_pane(a: &Value) -> Pane {
+/// One row of `pane.list`, `agent.list` or `agent.get`.
+///
+/// The last three fields are on herdr's `AgentInfo` and on nothing else, so a
+/// `pane.list` row leaves them empty and absent. That asymmetry is between
+/// *panes and agents* rather than between one row and many — `agent.list`
+/// carries `interactive_ready` exactly as `agent.get` does (recorded, herdr
+/// 0.7.5, and pinned in `fake.rs`) — which is why [`agents`] can say whether an
+/// agent will take a prompt and [`panes`] cannot.
+pub fn parse_pane(a: &Value) -> Pane {
     Pane {
         pane_id: sget(a, "pane_id"),
         label: sget(a, "label"),
@@ -360,6 +405,9 @@ fn parse_pane(a: &Value) -> Pane {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string(),
+        agent_name: sget(a, "name"),
+        interactive_ready: a.get("interactive_ready").and_then(|r| r.as_bool()),
+        launch_pending: a.get("launch_pending").and_then(|r| r.as_bool()),
     }
 }
 
@@ -587,11 +635,6 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    /// `WSP_STATE` and `HERDR_SOCKET_PATH` are process-wide, and cargo runs
-    /// tests in threads. Everything below that reaches for either takes this
-    /// first, so two of them cannot be halfway through setting up at once.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A herdr that is not herdr: answers `n` connections with `reply`, having
     /// recorded what it was asked.
     fn stand_in(
@@ -689,7 +732,7 @@ mod tests {
     /// route everything asked about its workspace to this machine.
     #[test]
     fn two_machines_come_back_as_one_list_with_the_far_one_saying_so() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = util::env_lock();
         let root = std::env::temp_dir().join(format!("wsp-fan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let state = root.join("state");
@@ -766,7 +809,7 @@ mod tests {
     /// One test, because it sets `WSP_STATE` for the process.
     #[test]
     fn a_qualified_id_arrives_at_that_machines_socket_and_nowhere_else() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = util::env_lock();
         let state = std::env::temp_dir().join(format!("wsp-route-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(state.join("sock")).unwrap();

@@ -1,9 +1,10 @@
 //! The place-work port: what wsp asks of whatever is running its agents.
 //!
-//! Nothing calls this yet. It is the contract t-260816-081 was opened to
-//! write, and t-260816-061 is the task that moves the call sites onto it. Read
-//! it as the answer to one question: **when wsp puts an agent on a piece of
-//! work, what does it actually need from the thing underneath?**
+//! The contract t-260816-081 was opened to write. `wsp spawn` is on it —
+//! `place_herdr` is the first backend and the fake behind a socket is the
+//! second — and the rest of the call sites are t-260816-061's, still to move.
+//! Read it as the answer to one question: **when wsp puts an agent on a piece
+//! of work, what does it actually need from the thing underneath?**
 //!
 //! Ed's sentence, 2026-08-16, and the port is a transcription of it:
 //!
@@ -143,9 +144,10 @@
 //! and whatever runs in that seat must find the same string in its environment
 //! under [`SEAT_ENV`].
 //!
-//! This costs one entry. `open_workspace` already passes an env map through
-//! `workspace.create` — `WSP_PROJECT`, `WSP_TASK` and the store's own variables
-//! (`cmd_spawn.rs:66`) — and this joins them.
+//! This costs one entry. `cmd_spawn::order` already fills an env map with
+//! `WSP_PROJECT`, `WSP_TASK` and the store's own variables, and this joins
+//! them — for a backend that can carry it. `place_herdr` records why herdr
+//! cannot, which is the open half of this.
 //!
 //! # Two verbs, because the claim goes between them
 //!
@@ -167,13 +169,12 @@
 //!   sentence. With a backend the question is answered by the backend existing,
 //!   and unreachability is a [`Refusal::Unreachable`] from the call that wanted
 //!   it, which arrives at the same moment the guard would have.
-//! - **`focus`.** `workspace.create` takes it and `wsp spawn --no-focus` sets
-//!   it, so it looks like part of placing work. It is not: `workspace.focus` is
-//!   one of the arrange-panes ten, and the only argument for keeping it here is
-//!   that herdr's signature has it — which is the exact failure mode the parent
-//!   decision names. It costs the herdr adapter one extra call and a possible
-//!   flicker, which is the adapter's to hide. This is the most debatable line
-//!   in the file.
+//! - **`focus`** *was* absent, and is not any more: it came back as
+//!   [`Order::show`] when `spawn` migrated, for the reason recorded there. This
+//!   line stays because the argument that removed it was sound and the argument
+//!   that brought it back is narrower than it looks — `show` is a fact about
+//!   *placing* work, and every other verb about what a screen looks like is
+//!   still the arrange-panes port's.
 //! - **`stop`.** wsp has never despawned anything. Both `pane.close` call sites
 //!   close wsp's *own* panes — the detail view (`panel/verbs.rs:673`) and the
 //!   board (`755`) — and no call site closes a workspace or kills an agent. A
@@ -181,13 +182,13 @@
 //!   not in the trait. The trigger to add it is named rather than guessed: **a
 //!   supervisor that starts processes must be able to stop them**, so the first
 //!   TTY-less backend brings `stop` with it or leaks an agent per crash.
-//! - **retries and timeouts.** `start_agent` retries `agent_pane_busy` for five
-//!   seconds and retypes with a `ctrl-u` after six (`cmd_spawn.rs:176-230`)
-//!   because herdr types the agent's name at a shell prompt that may not be
-//!   ready. That is a herdr shell race and it belongs inside the herdr
-//!   adapter's [`Place::start`]. It is also the answer to the one loose end in
-//!   t-260816-078's measurement: the single `pane.send_text` outside `panel/`
-//!   and `detail/` is that retype, and it does not become an eighth port verb.
+//! - **retries and timeouts.** `spawn` used to retry `agent_pane_busy` for five
+//!   seconds and retype with a `ctrl-u` after six, because herdr types the
+//!   agent's name at a shell prompt that may not be ready. That is a herdr shell
+//!   race and it now sits inside `place_herdr`'s [`Place::start`]. It is also
+//!   the answer to the one loose end in t-260816-078's measurement: the single
+//!   `pane.send_text` outside `panel/` and `detail/` is that retype, and it did
+//!   not become an eighth port verb.
 //!
 //! # Ids are opaque, and that is load-bearing
 //!
@@ -215,6 +216,12 @@ use std::collections::BTreeMap;
 /// The replacement for `HERDR_PANE_ID`. See the module docs — an agent that
 /// cannot name its own seat cannot claim, say or release, and a backend with no
 /// panes has no pane id to lend it.
+///
+/// Nothing sets this yet, and the herdr adapter cannot: the environment is fixed
+/// by the call that creates the seat, so the seat's name does not exist until
+/// after the only moment it could have been put there. `place_herdr` records
+/// what that leaves open — either wsp mints the seat itself, or an agent asks
+/// the backend which seat it is in — and it is a decision, not an oversight.
 pub const SEAT_ENV: &str = "WSP_SEAT";
 
 /// A durable handle to somewhere an agent can run.
@@ -279,6 +286,23 @@ pub struct Order {
     /// that does not exist has no id to route on. The `Remote` decorator reads
     /// this and strips it; the backend beneath never sees it.
     pub on: Option<String>,
+    /// Whether to put the new seat in front of the person — where there is a
+    /// person and a front.
+    ///
+    /// **This is the refutation this file asked for.** `focus` was pushed to the
+    /// arrange-panes port on the grounds that `workspace.focus` is one of its
+    /// ten, with a note that it was the most debatable line here. Migrating
+    /// `spawn` refuted it: `wsp spawn --no-focus` is a statement about *how the
+    /// work is placed*, made in the same breath as placing it and before there
+    /// is any seat to arrange — and a seat cannot be arranged before it exists,
+    /// so a port without this cannot express the flag at all without the caller
+    /// holding both ports and sequencing them.
+    ///
+    /// It is not herdr's `focus` parameter wearing a different name: what wsp
+    /// means is *do not drag the screen away from what somebody is reading*, and
+    /// a backend with no screen honours it by ignoring it. `false` by default,
+    /// so a seat opened by something with no opinion does not steal attention.
+    pub show: bool,
 }
 
 /// Which agent to start, and what to call it.
@@ -316,9 +340,9 @@ pub struct Agent {
 ///   `agent_status: idle` while an agent is still coming up, and `agent.prompt`
 ///   refuses in that window with `agent_not_ready`. Waiting for "idle" returned
 ///   in half a second every time and the work order went into a pane still
-///   drawing its banner (`cmd_spawn.rs:162`). Every existing caller that tests
-///   `state == "idle"` before telling an agent something is one reading of this
-///   away from the same bug.
+///   drawing its banner. Every existing caller that tests `state == "idle"`
+///   before telling an agent something is one reading of this away from the
+///   same bug.
 /// - [`State::Unknown`] exists because **an absence is not a fact**. It is the
 ///   README's `·`, and it is the same rule as `sync`'s "`Err` is not an empty
 ///   list" and `reconcile`'s unreachable-is-not-empty: one `pane.list` that
@@ -341,9 +365,9 @@ pub enum State {
     /// herdr cannot distinguish this from [`State::Empty`] in a listing — an
     /// exited agent leaves a pane whose `agent` field is empty, which is what a
     /// plain shell looks like — so its adapter answers `Empty` from a census
-    /// and `Gone` from the event stream. A supervisor that watched a pid exit
-    /// answers it exactly, which is the point of writing the port in wsp's
-    /// vocabulary rather than herdr's.
+    /// and `Gone` from the event stream, where a released agent is named. A
+    /// supervisor that watched a pid exit answers it exactly, which is the point
+    /// of writing the port in wsp's vocabulary rather than herdr's.
     Gone,
     /// The backend did not say, or could not be asked.
     #[default]
@@ -374,34 +398,6 @@ impl State {
     /// Whether something is running here, whatever it is doing.
     pub fn is_running(&self) -> bool {
         matches!(self, State::Starting | State::Idle | State::Working)
-    }
-
-    /// herdr's reading, translated.
-    ///
-    /// Written here rather than in the adapter because the adapter does not
-    /// exist yet and this is the one part of the mapping that is a decision
-    /// rather than a rename. `agent` is herdr's agent name, empty when there is
-    /// none. `ready` is `interactive_ready` when the reading came from
-    /// `agent.get`, and `None` when it came from a listing, which does not
-    /// carry it.
-    ///
-    /// The asymmetry is real and is herdr's: **from a listing alone, starting
-    /// and idle are indistinguishable**. So a census answers `Idle` and the one
-    /// caller that must not be lied to — `spawn`, polling before it sends the
-    /// work order — asks about a single seat, where `interactive_ready` exists.
-    /// That is today's behaviour, now written down instead of implied.
-    pub fn of_herdr(agent: &str, status: &str, ready: Option<bool>) -> State {
-        if agent.trim().is_empty() {
-            return State::Empty;
-        }
-        if ready == Some(false) {
-            return State::Starting;
-        }
-        match status.trim() {
-            "working" => State::Working,
-            "idle" => State::Idle,
-            _ => State::Unknown,
-        }
     }
 }
 
@@ -448,9 +444,9 @@ pub enum Event {
 ///
 /// The point of naming these is that a caller should never match on a backend's
 /// error string. `agent_not_ready`, `agent_pane_busy` and `pane_not_found` are
-/// herdr's words for three of these, and `start_agent` matching on
-/// `agent_pane_busy` (`cmd_spawn.rs:189`) is the kind of coupling that survives
-/// a port unless the port has a word of its own.
+/// herdr's words for three of these, and `spawn` matching on `agent_pane_busy`
+/// is the kind of coupling that survives a port unless the port has a word of
+/// its own. It has one now, and the match is in `place_herdr` and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// No backend answered. This is what `herdr::available()` becomes: not a
@@ -525,8 +521,12 @@ pub trait Place {
     ///
     /// Separate from [`Place::census`] because `spawn` polls a single seat
     /// every 150ms for up to 30 seconds, and a census is a fan-out across every
-    /// reachable machine. One seat is also the only reading that can tell
-    /// [`State::Starting`] from [`State::Idle`].
+    /// reachable machine.
+    ///
+    /// It is also the reading a backend is expected to be exact about. herdr's
+    /// census can be exact too, but only because it asks twice — the asymmetry
+    /// is between the calls it has, not between one seat and many; see
+    /// `place_herdr`.
     fn state(&self, seat: &Seat) -> Result<State>;
 
     /// Every seat this backend has, and what is in it.
@@ -549,46 +549,39 @@ pub trait Place {
 mod tests {
     use super::*;
 
-    /// The `agent_not_ready` bug, as an assertion. herdr says `idle` while an
-    /// agent is still coming up, so the port's `Idle` has to mean what `idle`
-    /// looks like it means and nothing else.
+    /// The one question every caller of `state == "idle"` is actually asking,
+    /// and the two answers that cost the most.
+    ///
+    /// An agent still coming up is not idle, however loudly the backend says it
+    /// is — that is the `agent_not_ready` bug, and it is why [`State::Starting`]
+    /// exists. Silence is not a state either: `Unknown` is refused a prompt
+    /// because telling an agent we cannot see is how a work order lands in
+    /// somebody's shell.
+    ///
+    /// *How* a particular backend is read is the adapter's, and the reading that
+    /// used to live here now lives in `place_herdr`, next to the wire that
+    /// produces it — it was wrong about herdr twice while it was in this file,
+    /// and both times because it could be handed a shape herdr does not send.
     #[test]
-    fn an_agent_that_is_still_coming_up_is_not_idle() {
-        assert_eq!(State::of_herdr("claude", "idle", Some(false)), State::Starting);
-        assert_eq!(State::of_herdr("claude", "idle", Some(true)), State::Idle);
-        assert!(!State::Starting.will_take_a_prompt());
+    fn only_an_agent_known_to_be_idle_is_told_anything() {
         assert!(State::Idle.will_take_a_prompt());
+        for silent in [State::Starting, State::Unknown, State::Empty, State::Working, State::Gone] {
+            assert!(!silent.will_take_a_prompt(), "{silent:?} was told something");
+        }
+        assert_eq!(State::default(), State::Unknown, "an absence is not a fact");
     }
 
-    /// A listing cannot carry `interactive_ready`, so it answers with the state
-    /// that can lie — and the caller who must not be lied to asks about one
-    /// seat instead. Pinned here so that asymmetry is a decision rather than a
-    /// surprise.
+    /// A seat with nothing in it is not an agent that died, and neither of them
+    /// is running.
     #[test]
-    fn a_census_cannot_tell_starting_from_idle() {
-        assert_eq!(State::of_herdr("claude", "idle", None), State::Idle);
-    }
-
-    /// Silence is not a state. Every expensive bug in this store came from an
-    /// absence being read as a fact.
-    #[test]
-    fn a_backend_that_said_nothing_is_unknown_and_will_not_be_told_anything() {
-        assert_eq!(State::of_herdr("claude", "", None), State::Unknown);
-        assert_eq!(State::of_herdr("claude", "restarting", None), State::Unknown);
-        assert!(!State::Unknown.will_take_a_prompt());
-        assert_eq!(State::default(), State::Unknown);
-    }
-
-    /// A pane with no agent is a seat with nothing in it — not an agent that
-    /// died. herdr cannot tell them apart from a listing and says the honest
-    /// one.
-    #[test]
-    fn a_seat_with_nothing_in_it_is_empty_rather_than_gone() {
-        assert_eq!(State::of_herdr("", "idle", None), State::Empty);
-        assert_eq!(State::of_herdr("  ", "working", Some(true)), State::Empty);
+    fn a_seat_with_nothing_in_it_is_not_the_same_as_one_whose_agent_stopped() {
+        assert_ne!(State::Empty, State::Gone);
         assert!(!State::Empty.is_running());
         assert!(!State::Gone.is_running());
-        assert!(State::Starting.is_running());
+        assert!(!State::Unknown.is_running(), "not knowing is not evidence of work");
+        for running in [State::Starting, State::Idle, State::Working] {
+            assert!(running.is_running(), "{running:?}");
+        }
     }
 
     /// Nothing in the port reads an id. This is the closest a test can get:

@@ -44,44 +44,46 @@
 //! task asked for it this way round:
 //!
 //! - a wrong belief about herdr shows up as **one mapping function** that
-//!   `place::State::of_herdr` documents the inverse of, rather than as a
+//!   `place_herdr::state_of_agent` documents the inverse of, rather than as a
 //!   string in a fixture nobody re-reads;
 //! - a second backend that is not herdr is a second dialect over the same
 //!   state, which is what the seam is for.
 //!
-//! `of_state` and `State::of_herdr` are a round trip, and
+//! `of_state` and `place_herdr::state_of_agent` are a round trip, and
 //! [`tests::the_dialect_is_the_inverse_of_the_readings_wsp_makes`] holds them
 //! to it — including the one place the trip is lossy, which is herdr's blind
 //! spot and not ours.
 //!
 //! # What it found on the first run, which is the argument for it
 //!
-//! Writing the dialect as the inverse of `place::State::of_herdr` and asserting
+//! Writing the dialect as the inverse of the port's own reading and asserting
 //! the round trip failed immediately, and the failure was in the port rather
-//! than in the fake. Both of these are reported on t-260816-081 rather than
-//! fixed here — that is its file, and it is in review:
+//! than in the fake. Both were reported on t-260816-081 rather than fixed here,
+//! and both were **repaired on 2026-08-17 by t-260816-061**, which moved the
+//! reading into `place_herdr` as it migrated the first call site onto the port.
+//! They are kept here because the fake is what caught them and what holds them
+//! shut:
 //!
-//! 1. **`of_herdr` reads a value herdr never sends.** It decides an agent is
-//!    starting with `ready == Some(false)`. Recorded against a live Claude Code
+//! 1. **The port read a value herdr never sends.** It decided an agent was
+//!    starting from `ready == Some(false)`. Recorded against a live Claude Code
 //!    on 2026-08-17: for 3.3 seconds after `agent.start`, `agent.get` answers
 //!    `agent_status: "idle"`, `launch_pending: true` and **no
 //!    `interactive_ready` field at all**; then the two swap. Absence is the
-//!    signal and `false` never appears. So the port maps the launch window to
-//!    `Idle`, whose `will_take_a_prompt` says yes — which is the
-//!    `agent_not_ready` bug the port's own documentation exists to prevent.
-//!    `cmd_spawn::ready` reads the absence correctly today, so this breaks at
-//!    migration (t-260816-061) rather than now.
+//!    signal and `false` never appears. So the port mapped the launch window to
+//!    `Idle`, whose `will_take_a_prompt` says yes — the `agent_not_ready` bug
+//!    the port's own documentation exists to prevent. `place_herdr` now reads
+//!    `launch_pending`.
 //! 2. **The listing asymmetry is between panes and agents, not one and many.**
-//!    `place.rs` says a listing cannot carry `interactive_ready`. `pane.list`
-//!    cannot — its rows have no such field in the schema. `agent.list` carries
-//!    the same `AgentInfo` as `agent.get` and was recorded carrying
-//!    `interactive_ready: true`. wsp only fails to see it because
-//!    `herdr::Pane` does not parse the field.
+//!    `pane.list` rows have no `interactive_ready` in the schema. `agent.list`
+//!    carries the same `AgentInfo` as `agent.get` and was recorded carrying
+//!    `interactive_ready: true`. wsp failed to see it because `herdr::Pane` did
+//!    not parse the field; it does now, and a census reads its seats from one
+//!    call and its states from the other.
 //!
 //! A third, smaller: `agent.start` returns *before* the agent exists — its
 //! reply names no agent and carries `launch_pending: true` — so `Place::start`'s
 //! "returns when the agent exists" is a promise its herdr adapter has to keep
-//! for it.
+//! for it, and does, by waiting.
 //!
 //! # Behind a socket, and what that costs
 //!
@@ -99,6 +101,12 @@
 //! verb the caller meant. Only an in-process double can check that, and that is
 //! t-260816-061's to build if it is worth building. Recorded here rather than
 //! guessed at later.
+//!
+//! That question is answered for the *place-work* port and open for the other:
+//! its six verbs reach the wire as six distinguishable methods, so migrating
+//! `spawn` onto it needed no double at all — `place_herdr`'s tests drive wsp's
+//! own client against this fake. `arrange`'s `run`/`send` split is still the one
+//! thing a socket cannot see.
 //!
 //! [`Arrange::run`]: crate::arrange::Arrange::run
 //!
@@ -442,7 +450,7 @@ pub enum Snub {
     /// The agent is not in a state to be told anything. `agent_not_ready`.
     NotReady,
     /// The seat is not ready to have an agent started in it. `agent_pane_busy`
-    /// — the shell race `cmd_spawn::launch` retries for five seconds.
+    /// — the shell race `place_herdr::launch` retries for five seconds.
     Busy,
     /// The backend said no, in its own words.
     Backend(String),
@@ -568,13 +576,13 @@ impl Stage {
 /// The reading a herdr would give of a seat: what it calls the agent, its
 /// status, and whether it will take a prompt.
 ///
-/// The inverse of [`State::of_herdr`], and the one function in this file that
+/// The inverse of [`crate::place_herdr::state_of_agent`], and the one function in this file that
 /// is a *claim about herdr* rather than a translation. Every line of it was
 /// recorded from herdr 0.7.5 on 2026-08-17 except where marked:
 ///
 /// - a pane with no agent reports `agent_status: "unknown"` and carries **no
-///   `agent` field at all** — not `"idle"`, which is what a reader of
-///   `State::of_herdr` might assume from the order of its arms;
+///   `agent` field at all** — not `"idle"`, which is what a reader of the
+///   adapter's reading might assume from the order of its arms;
 /// - a plugin-reported agent comes back from `agent.get` with no
 ///   `interactive_ready` field, so its absence is not evidence of anything;
 /// - `Starting` is `agent_status: "idle"` with `launch_pending` true and
@@ -587,8 +595,8 @@ impl Stage {
 ///
 /// The `Starting` line is the one that cost something to get right, and it is
 /// why this function returns `Option<bool>` rather than `bool`: absence and
-/// `false` are different readings, herdr only ever sends the first, and
-/// `place::State::of_herdr` is written against the second. See
+/// `false` are different readings, herdr only ever sends the first, and the
+/// port was written against the second until this caught it. See
 /// [`tests::the_dialect_is_the_inverse_of_the_readings_wsp_makes`].
 fn of_state(spot: &Spot) -> (Option<&str>, &'static str, Option<bool>) {
     let name = match spot.agent.kind.trim() {
@@ -652,8 +660,8 @@ fn pane_json(spot: &Spot) -> Value {
 /// across a live launch: `launch_pending: true` with no `interactive_ready`
 /// while the agent comes up, then `interactive_ready: true` with no
 /// `launch_pending` once it will take a prompt. Neither is ever sent false, and
-/// that asymmetry is load-bearing — `cmd_spawn::ready` reads the absence
-/// correctly and `place::State::of_herdr` does not.
+/// that asymmetry is load-bearing, and reading it wrong is what
+/// `place_herdr::state_of_agent` was repaired to stop doing.
 fn agent_json(spot: &Spot) -> Value {
     let (agent, status, ready) = of_state(spot);
     let mut v = pane_json(spot);
@@ -1280,8 +1288,8 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             // named** — the name appears about three tenths of a second later.
             // So `Place::start`'s "returns when the agent exists" is not what
             // this backend does, and an adapter owes that wait to its caller.
-            // Nothing in wsp reads this reply (`cmd_spawn::launch` matches on
-            // `Ok(_)`), which is why the gap has never been felt.
+            // Nothing in wsp reads this reply (`place_herdr::launch` matches on
+            // `Ok(_)`); the adapter waits for the agent instead.
             let mut agent = agent_json(&before);
             agent["launch_pending"] = json!(true);
             agent["name"] = json!(sget("name"));
@@ -1763,11 +1771,8 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
 mod tests {
     use super::*;
     use crate::herdr;
+    use crate::util;
 
-    /// `HERDR_SOCKET_PATH` is process-wide and cargo runs tests in threads.
-    /// Everything below that points wsp's own client at a fake takes this
-    /// first — the same lock `herdr.rs`'s tests keep, for the same reason.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-fake-{name}-{}", std::process::id()));
@@ -1804,60 +1809,55 @@ mod tests {
     /// adapter answers `Empty` from a census and `Gone` from the event stream,
     /// and this is what forces that to stay true.
     ///
-    /// `Starting` is the finding, and it is worth reading twice.
-    /// `State::of_herdr` decides an agent is starting with
-    /// `if ready == Some(false)` — and **herdr never sends `false`**. Recorded
-    /// against a live Claude Code on 2026-08-17: for 3.3 seconds after
-    /// `agent.start`, `agent.get` answers `agent_status: "idle"` with
-    /// `launch_pending: true` and *no* `interactive_ready` field at all, and
-    /// then the fields swap — `interactive_ready: true`, no `launch_pending`.
-    /// Absence is the signal, in both directions.
+    /// `Starting` is the finding, and it is worth reading twice. The port
+    /// decided an agent was starting from `ready == Some(false)` — and **herdr
+    /// never sends `false`**. Recorded against a live Claude Code on 2026-08-17:
+    /// for 3.3 seconds after `agent.start`, `agent.get` answers
+    /// `agent_status: "idle"` with `launch_pending: true` and *no*
+    /// `interactive_ready` field at all, and then the fields swap —
+    /// `interactive_ready: true`, no `launch_pending`. Absence is the signal, in
+    /// both directions.
     ///
-    /// So the port's own translation maps the launch window to
+    /// So the port's own translation mapped the launch window to
     /// [`State::Idle`], whose `will_take_a_prompt` says yes, which is exactly
-    /// the bug `place.rs` names three paragraphs above the function that has
-    /// it: the work order goes into a pane still drawing its banner.
-    /// `cmd_spawn::ready` reads the absence correctly today, so nothing is
-    /// broken *yet* — it breaks when a call site migrates onto the port, which
-    /// is t-260816-061. Reported on t-260816-081 rather than fixed here: it is
-    /// that task's file and it is in review.
+    /// the bug `place.rs` names three paragraphs above the function that had it:
+    /// the work order goes into a pane still drawing its banner.
     ///
     /// The fake keeps herdr's answer rather than the convenient one. That is
     /// the whole discipline: a fake that sent `Some(false)` would make this
     /// test pass, the port look right, and the bug arrive in production.
+    ///
+    /// **Repaired 2026-08-17 by t-260816-061**, which is what this assertion
+    /// asked for in as many words: the reading moved out of `place.rs` and into
+    /// the herdr adapter, where it takes a parsed reply instead of three loose
+    /// arguments — so `Starting` now survives the trip, and there is no longer a
+    /// way to hand it a shape herdr does not send.
     #[test]
     fn the_dialect_is_the_inverse_of_the_readings_wsp_makes() {
-        for state in [State::Empty, State::Idle, State::Working, State::Unknown] {
+        let read = |spot: &Spot| crate::place_herdr::state_of_agent(&herdr::parse_pane(&agent_json(spot)));
+
+        for state in [State::Empty, State::Starting, State::Idle, State::Working, State::Unknown] {
             let spot = Spot::agent("s1", "claude", "t-1", state);
-            let (agent, status, ready) = of_state(&spot);
             assert_eq!(
-                State::of_herdr(agent.unwrap_or(""), status, ready),
+                read(&spot),
                 state,
                 "{state:?} does not survive the round trip through herdr's words"
             );
         }
 
         let gone = Spot::agent("s1", "claude", "t-1", State::Gone);
-        let (agent, status, ready) = of_state(&gone);
         assert_eq!(
-            State::of_herdr(agent.unwrap_or(""), status, ready),
+            read(&gone),
             State::Empty,
             "herdr's blind spot has been quietly fixed by the fake, which makes tests green on a lie"
         );
 
+        // The launch window is the one that mattered, and the absence is still
+        // the only thing marking it: nothing here was made to send a readiness
+        // herdr does not send.
         let starting = Spot::agent("s1", "claude", "t-1", State::Starting);
-        let (agent, status, ready) = of_state(&starting);
-        assert_eq!(ready, None, "herdr was made to send a readiness it does not send");
-        assert_eq!(
-            State::of_herdr(agent.unwrap_or(""), status, ready),
-            State::Idle,
-            "of_herdr has learned to read an absent interactive_ready — if this fails, the port \
-             has been fixed and this assertion should become Starting"
-        );
-        assert!(
-            State::Idle.will_take_a_prompt(),
-            "…and that is why it matters: the port would tell a caller to prompt a banner"
-        );
+        assert_eq!(of_state(&starting).2, None, "herdr was made to send a readiness it does not send");
+        assert!(!read(&starting).will_take_a_prompt(), "the port would tell a caller to prompt a banner");
     }
 
     /// Which readings can tell a starting agent from an idle one, recorded
@@ -1900,7 +1900,7 @@ mod tests {
         let v = pane_json(&Spot::empty("w1:p1").at("/tmp"));
         assert_eq!(v["agent_status"], "unknown");
         assert!(v.get("agent").is_none(), "an empty pane carried an agent field");
-        assert_eq!(State::of_herdr("", "unknown", None), State::Empty);
+        assert_eq!(crate::place_herdr::state_of_agent(&herdr::parse_pane(&v)), State::Empty);
     }
 
     /// The whole point of the thing: wsp's own client, over a real socket, and
@@ -1908,7 +1908,7 @@ mod tests {
     /// that is working, one that has gone and a shell with nobody in it.
     #[test]
     fn wsps_own_client_reads_a_state_no_herdr_could_be_put_in() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = util::env_lock();
         let dir = scratch("client");
         let stage = Stage::of(vec![
             Spot::agent("w1:p1", "claude", "t-1", State::Starting).labelled("one").on("w1", "w1:t1"),
@@ -1942,7 +1942,7 @@ mod tests {
     /// task exists for, since a live herdr cannot be asked to stop answering.
     #[test]
     fn a_backend_that_is_not_answering_is_an_error_and_never_an_empty_list() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = util::env_lock();
         let dir = scratch("quiet");
         let fake = Fake::bind(
             dir.join("herdr.sock"),
@@ -2014,7 +2014,7 @@ mod tests {
     /// dots-to-underscores rename are exercised rather than assumed.
     #[test]
     fn a_state_change_reaches_a_watcher_that_was_already_listening() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = util::env_lock();
         let dir = scratch("watch");
         let fake = Fake::bind(
             dir.join("herdr.sock"),
@@ -2057,7 +2057,7 @@ mod tests {
     /// both of them look arbitrary.
     #[test]
     fn one_per_pane_subscription_refuses_the_whole_list() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = util::env_lock();
         let dir = scratch("subs");
         let fake = Fake::bind(dir.join("herdr.sock"), Stage::new()).unwrap();
         let (k, v) = fake.socket_env();

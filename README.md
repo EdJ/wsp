@@ -1831,10 +1831,18 @@ happened to be standing.
 
 ### What "started" means, and what it does not
 
-`agent.start` does not wait for the agent. It answers immediately with
-`launch_pending: true` — it has typed `claude` at the shell and nothing more —
-and the wait herdr's own CLI does afterwards is client-side. Three things about
-that window cost an afternoon between them, and all three are load-bearing:
+`spawn` says `open`, `start`, then `tell`, and it says them to a *backend* —
+`src/place.rs` is the port and `src/place_herdr.rs` is herdr behind it. Two
+waits, and they are different questions: `start` returns when the agent exists,
+and only a state of `idle` in the port's sense means it will listen. What has to
+be retried to get there is the backend's business and is no longer written into
+the command.
+
+Which matters because `agent.start` does not wait for the agent. It answers
+immediately with `launch_pending: true` — it has typed `claude` at the shell and
+nothing more — and the wait herdr's own CLI does afterwards is client-side.
+Three things about that window cost an afternoon between them, all three are
+load-bearing, and all three now live in the adapter:
 
 - **A brand-new workspace has no shell yet.** `agent.start` ten milliseconds
   after `workspace.create` is refused with `agent_pane_busy`, "not an available
@@ -1852,10 +1860,11 @@ that window cost an afternoon between them, and all three are load-bearing:
   at a Claude Code that is merely still booting leaves the word in its input box
   for somebody to find later.
 
-The sentence goes through `agent.prompt` rather than being typed into the pane,
-which is what `c` still does: `c` speaks to agents herdr did not start and may
-not consider ready, and pays for it with two writes and a sleep between them.
-Here the readiness is established, so there is nothing to guess at.
+The sentence goes through the port's `tell` — `agent.prompt` under herdr — rather
+than being typed into the pane, which is what `c` still does: `c` speaks to
+agents herdr did not start and may not consider ready, and pays for it with two
+writes and a sleep between them. Here the readiness is established, so there is
+nothing to guess at.
 
 ## Machines
 
@@ -2240,13 +2249,14 @@ contract check against real behaviour.** A fake that is wrong about herdr makes
 tests green on a lie, silently and for ever, so its replies are *generated* from
 the state through one mapping function rather than hand-written, and everything
 it asserts about herdr was recorded from a live one. Writing it that way caught
-two things `place.rs` had wrong on the first run: `State::of_herdr` decides an
-agent is starting from `interactive_ready == Some(false)`, which herdr never
-sends — for 3.3 measured seconds it sends the field *absent* with
-`launch_pending: true` — so the port maps the launch window to `idle` and would
-hand a work order to a pane still drawing its banner; and the claim that a
-listing cannot carry `interactive_ready` is true of `pane.list` and false of
-`agent.list`, which carries the same record `agent.get` does.
+two things `place.rs` had wrong on the first run, both since repaired in
+`src/place_herdr.rs`: the port decided an agent was starting from
+`interactive_ready == Some(false)`, which herdr never sends — for 3.3 measured
+seconds it sends the field *absent* with `launch_pending: true` — so the launch
+window read as `idle` and a work order would have gone to a pane still drawing
+its banner; and the claim that a listing cannot carry `interactive_ready` is
+true of `pane.list` and false of `agent.list`, which carries the same record
+`agent.get` does.
 
 #### A sandbox's herdr starts the plugins, and they are global
 
@@ -2388,6 +2398,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
+| `src/place_herdr.rs` | that port over herdr: the shell race, the launch window, the retype |
 | `src/arrange.rs` | the arrange-panes port: a desired set of panes, and the reconciler under it |
 | `src/fake.rs` | a backend that answers that socket out of a state we choose — `wsp sandbox --fake` |
 | `src/sync.rs` | tasks + panes → metadata tokens |
