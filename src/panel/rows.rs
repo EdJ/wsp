@@ -78,6 +78,16 @@ pub(crate) enum AgentState {
     Asking,
     /// Stopped, on a task it has parked with a question written on it.
     Blocked,
+    /// In a project's slot: a custodian, between the agents it is sequencing.
+    ///
+    /// Third, and above `Spare`, because it is the one row here you are likely
+    /// to want to *address* rather than dispose of — the position a person
+    /// talks to. It is deliberately not `Asking`: a custodian is idle most of
+    /// the night by construction, and reading that as a stall is what drew the
+    /// busiest agent on the machine as stuck all night. That exception is
+    /// [`crate::cmd_govern::needs_a_person`]'s, and this is the same sentence
+    /// in a glyph.
+    Seated,
     /// Stopped, holding nothing. A person's worth of attention going spare.
     ///
     /// Above `Working` deliberately. Both the strip and the list are read for
@@ -100,6 +110,7 @@ impl AgentState {
         match self {
             AgentState::Asking => (Style::Warn, glyph::NEEDS_YOU),
             AgentState::Blocked => (Style::Query, glyph::QUESTION),
+            AgentState::Seated => (Style::Accent, glyph::SEAT),
             AgentState::Working => (Style::Accent, glyph::WORKING),
             AgentState::Spare => (Style::Muted, glyph::IDLE),
             AgentState::Quiet => (Style::Dim, glyph::QUIET),
@@ -134,10 +145,22 @@ pub(super) struct Census {
     pub(super) held: Option<String>,
 }
 
-/// Read the two halves together: what herdr says the pane is doing, and what
-/// the store says it is holding while it does it.
-pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>) -> AgentState {
+/// Read the three halves together: what herdr says the pane is doing, what the
+/// store says it is holding while it does it, and whether it is sitting in a
+/// project's slot.
+///
+/// The seat comes in because it changes what *stopped* means and nothing else.
+/// An agent that has stopped on a `doing` task is a person's problem; a
+/// custodian that has stopped is between the agents it started, which is its
+/// resting state. `wip` and the panel's `needs_you` learned that on
+/// t-260817-013 and the mark did not, so the surface a person actually looks at
+/// went on drawing the seat as `←` — the loudest row on the screen, meaning
+/// nothing, all night.
+pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>, seat: bool) -> AgentState {
     match herdr_state {
+        // A working custodian is working: it is reading a diff or writing a
+        // task up, and there is as little to do about it as about any other
+        // busy agent. The seat only decides what its *silence* means.
         "working" => AgentState::Working,
         // `done` is a third value herdr sends and nothing here knew about. It
         // is a turn ending rather than an agent leaving: 120s of the event
@@ -148,6 +171,7 @@ pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>) -> AgentStat
         // know" — would draw the one moment we know most about as the one we
         // know nothing about. Which the panel is now far likelier to sample,
         // since a status change is what it refetches on.
+        "idle" | "done" if seat => AgentState::Seated,
         "idle" | "done" => match holds {
             Some(Status::Blocked) => AgentState::Blocked,
             // A claim left on finished work is not work: the agent is free
@@ -275,6 +299,40 @@ pub(super) enum Row {
     /// rows to row indices one for one — a row that drew two lines would put
     /// every click below it on the wrong thing.
     Detail(Detail),
+    /// A project's custodial slot, drawn directly under the project it belongs
+    /// to — the third kind of node, by the decision of 2026-08-17 on
+    /// t-260817-021.
+    ///
+    /// It is a row and not an agent for the reason that decision turns on: the
+    /// slot is the project's and the agent is passing through. So an empty one
+    /// still draws, which is what makes a position visible enough to be filled,
+    /// and a full one draws *here* rather than under whatever task its occupant
+    /// borrowed to have somewhere to stand. Position is what a tree means, and
+    /// before this the governor of `wsp` appeared in the tree as an agent
+    /// working a task in `robustness`, three branches away from the thing it
+    /// was answerable for.
+    ///
+    /// One workspace holding two slots draws under both, because that is two
+    /// positions filled by one agent rather than one fact said twice — the
+    /// night this was written from was exactly that, `robustness` and `wsp`
+    /// from one window.
+    Seat {
+        project: String,
+        /// Whoever is in it now, resolved live from the runner rather than read
+        /// off the record: the recorded pane is where the agent *started*, and
+        /// a custodian cleared and restarted comes back on another pane in the
+        /// same workspace. `None` is a vacancy, and vacancies are drawn.
+        agent: Option<AgentRef>,
+        /// What the occupant is waiting for. Always [`AgentState::Seated`] when
+        /// it has stopped — the row that used to say `←` for a seat that was
+        /// doing exactly what a seat does.
+        state: AgentState,
+        /// Filled from another machine, where the workspace id means nothing
+        /// here. Drawn as held rather than as empty, so nobody sits down in a
+        /// position that is already taken.
+        elsewhere: bool,
+        depth: usize,
+    },
     /// A hand an agent has raised: this task, and why.
     ///
     /// It stands for a task and answers as one, so every verb already aimed at
@@ -438,6 +496,11 @@ impl Row {
     pub(super) fn agent(&self) -> Option<&AgentRef> {
         match self {
             Row::Agent { agent, .. } => Some(agent),
+            // A filled slot answers with its occupant, so `↵` and the digits go
+            // to that terminal like any other. What it does *not* do is answer
+            // as one — see [`target_of`] — which is what keeps the verbs that
+            // dispose of an agent's work off a position.
+            Row::Seat { agent, .. } => agent.as_ref(),
             _ => None,
         }
     }
@@ -453,6 +516,8 @@ pub(crate) enum RowKind {
     More,
     Section,
     Agent,
+    /// A project's custodial slot, filled or empty.
+    Seat,
     /// A project heading over a run of agents in the agents view. Never
     /// selected, like [`RowKind::Detail`].
     Group,
@@ -526,6 +591,11 @@ pub(crate) enum Target {
     Unattached,
     /// A pane to jump to, not a thing to edit.
     Pane(String),
+    /// A project's custodial slot — `wsp govern <project> --tell`, and the row
+    /// a person talks to the governor from. Named by the project rather than by
+    /// whoever is in it, which is the whole distinction: the same target
+    /// survives the agent being cleared, restarted or replaced.
+    Seat(String),
     /// The overflow row, which only ever opens.
     Overflow(String),
     #[default]
@@ -594,6 +664,11 @@ pub(super) fn target_of(row: &Row) -> Target {
         Row::Flag { card } => Target::Task(card.task.clone()),
         Row::More { key, .. } => Target::Overflow(key.clone()),
         Row::Agent { agent, .. } => Target::Pane(agent.pane.clone()),
+        // The slot, never its occupant — even when it has one. A seat row that
+        // answered as its pane would be the same agent under two identities,
+        // and every verb aimed at it would act on the agent that happens to be
+        // there rather than on the position, which is the thing that lasts.
+        Row::Seat { project, .. } => Target::Seat(project.clone()),
         Row::Section { key, .. } if key == NOPROJECT_KEY => Target::Unattached,
         Row::Section { key, .. } if key == AGENTS_KEY => Target::Unattached,
         Row::Section { key, .. } if key == INBOX_KEY => Target::Inbox,
@@ -684,6 +759,7 @@ impl Ui {
             Some(Row::More { .. }) => RowKind::More,
             Some(Row::Section { .. }) => RowKind::Section,
             Some(Row::Agent { .. }) => RowKind::Agent,
+            Some(Row::Seat { .. }) => RowKind::Seat,
             Some(Row::Group { .. }) => RowKind::Group,
             Some(Row::Detail(_)) => RowKind::Detail,
             Some(Row::Flag { .. }) => RowKind::Flag,
@@ -1020,7 +1096,7 @@ pub(super) fn task_rows(
                 // The task is right here, so the row can say what the pane is
                 // waiting for rather than only whether it is running — which
                 // is the whole of the difference between `←` and `?`.
-                state: agent_state(&a.state, Some(t.status())),
+                state: agent_state(&a.state, Some(t.status()), a.seat),
                 agent: a.clone(),
                 depth: depth + sub + 1,
                 census: None,
@@ -1210,11 +1286,42 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         ..a.clone()
     };
 
+    // The slots, joined to whoever is standing in them at this tick.
+    //
+    // The record names a workspace and this asks the runner who is in it now,
+    // which is the difference between a position and an address: an agent that
+    // was cleared and restarted comes back on a new pane in the same room and
+    // is the same custodian, and a room with nobody in it is a vacancy rather
+    // than a stale pane id. Built once, because the tree walk asks for it per
+    // project and this runs four times a second.
+    let seats: std::collections::BTreeMap<String, (Option<AgentRef>, bool)> =
+        crate::cmd_govern::slots(&snap.governors)
+            .into_iter()
+            .map(|slot| {
+                let occupant = slot.occupant.as_ref().and_then(|s| {
+                    panes
+                        .iter()
+                        .find(|a| a.pane == s.pane && a.agent)
+                        .or_else(|| panes.iter().find(|a| a.workspace == s.workspace && a.agent))
+                        .map(|a| as_ref(a, Some(slot.project.clone())))
+                });
+                (slot.project.clone(), (occupant, slot.elsewhere()))
+            })
+            .collect();
+    // The panes that are drawn *as* a seat, and are therefore not drawn again
+    // as workers. A custodian that borrowed a task to have somewhere to stand
+    // used to appear under that task, three branches from the project it was
+    // answerable for — which is the whole of what t-260817-021 was filed about.
+    // The pane rather than its workspace: a second agent working in the
+    // custodian's window is an ordinary agent and belongs under its own work.
+    let seated_panes: Vec<String> =
+        seats.values().filter_map(|(a, _)| a.as_ref().map(|a| a.pane.clone())).collect();
+
     // task id -> the pane claimed to it. No project: a pane holding a task is
     // not looking for one, and every verb that would ask refuses on the task
     // first.
     let agent_for_task = |task_id: &str| -> Option<AgentRef> {
-        panes.iter().find_map(|a| {
+        panes.iter().filter(|a| !seated_panes.contains(&a.pane)).find_map(|a| {
             (bound_task_of_pane(&a.pane).as_deref() == Some(task_id)).then(|| as_ref(a, None))
         })
     };
@@ -1267,8 +1374,13 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         // about a place, and the agents view is a list of people.
         if a.agent {
             let holds = bound.as_ref().and_then(|id| tasks.iter().find(|t| &t.id == id));
+            // The store's half of the row, joined *before* the state is read
+            // off it: `crate::live` leaves `seat` false because a runner cannot
+            // know it, and reading the raw pane here drew the one agent this
+            // rule exists for as an agent that had stalled.
+            let row = as_ref(a, direction.clone());
             census.push((
-                agent_state(&a.state, holds.map(|t| t.status())),
+                agent_state(&a.state, holds.map(|t| t.status()), row.seat),
                 Census {
                     // Where it stands, before where it is aimed: a pane holding
                     // a task is placed by that task's project, and only one
@@ -1285,7 +1397,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                         .filter(|c| !c.is_empty())
                         .map(|c| util::duration_human(util::since(c))),
                 },
-                as_ref(a, direction.clone()),
+                row,
             ));
         }
         match &r.project {
@@ -1326,6 +1438,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         }
         c.open > 0
             || live_by_project.contains_key(id)
+            // A project with a slot is never a quiet branch, filled or not. A
+            // position folded out of sight is one nobody fills, and the row is
+            // also the only way to reach the agent sitting in it.
+            || seats.contains_key(id)
             || (view.show_done && c.done > 0)
             // A project holding nothing at all is not a quiet branch. There is
             // no work behind the row to go and look at, so folding it away
@@ -1380,6 +1496,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         loose: &std::collections::BTreeMap<String, Vec<AgentRef>>,
         interesting: &dyn Fn(&str) -> bool,
         agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
+        seats: &std::collections::BTreeMap<String, (Option<AgentRef>, bool)>,
     ) {
         for p in index.children(parent) {
             if !interesting(&p.id) {
@@ -1412,12 +1529,32 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                 continue;
             }
 
+            // The custodial slot, first of everything under the project and
+            // above its work — because that is what it is: answerable for all
+            // of it, and not one item in the list. Left out under the review
+            // filter for the same reason the live count is zeroed there; a
+            // position is not a piece of work at review.
+            if !view.review_only {
+                if let Some((occupant, elsewhere)) = seats.get(&p.id) {
+                    rows.push(Row::Seat {
+                        project: p.id.clone(),
+                        state: occupant
+                            .as_ref()
+                            .map(|a| agent_state(&a.state, None, true))
+                            .unwrap_or(AgentState::Seated),
+                        agent: occupant.clone(),
+                        elsewhere: *elsewhere,
+                        depth: depth + 1,
+                    });
+                }
+            }
+
             // This project's own tasks, attention first.
             task_rows(tasks, Some(&p.id), depth + 1, view, index, agent_for_task, rows);
 
             walk(
                 index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, loose, interesting,
-                agent_for_task,
+                agent_for_task, seats,
             );
 
             // Then the panes that resolve here but are working on nothing
@@ -1440,7 +1577,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                         // Shells, every one of them — nothing is bound here, so
                         // there is no task to read a state off and the row
                         // draws `▫` regardless.
-                        state: agent_state(&a.state, None),
+                        state: agent_state(&a.state, None, a.seat),
                         agent: a.clone(),
                         depth: depth + 1,
                         census: None,
@@ -1465,6 +1602,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         &loose_by_project,
         &interesting,
         &agent_for_task,
+        &seats,
     );
 
     // Panes belonging to no project. Some are there because nothing resolved;
@@ -1484,7 +1622,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         if !folded {
             for a in homeless {
                 let title = a.where_();
-                let state = agent_state(&a.state, None);
+                let state = agent_state(&a.state, None, a.seat);
                 rows.push(Row::Agent { agent: a, title, depth: 1, state, census: None });
             }
         }
@@ -2013,6 +2151,37 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(w.saturating_sub(l.width() + right.width()).max(1));
             l.spans.extend(right.spans);
         }
+        // The position, said as `seat` and then as whoever is in it. The word
+        // comes first and never moves, because the row has to read the same
+        // whether it is occupied or not — a slot that only said `seat` when it
+        // was empty would be a different row every time somebody sat down, and
+        // the one thing this is for is being the same place tomorrow.
+        Row::Seat { agent, state, elsewhere, depth, .. } => {
+            match num {
+                Some(n) => l.push(Style::Dim, n.to_string()),
+                None => l.push(Style::Plain, " "),
+            }
+            l.pad(*depth);
+            l.push(Style::Plain, " ");
+            let (st, _) = state.mark();
+            l.push(if agent.is_some() { st } else { Style::Dim }, glyph::SEAT);
+            l.push(Style::Plain, " ");
+            let avail = w.saturating_sub(*depth + 4).max(4);
+            match (agent, *elsewhere) {
+                (Some(a), _) => {
+                    let mut right = Line::default();
+                    right.push(Style::Dim, "seat");
+                    l.push(state.ink(), util::truncate(&a.where_(), avail.saturating_sub(5)));
+                    l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+                    l.spans.extend(right.spans);
+                }
+                // Empty, and worth a whole row saying so: a vacancy is the one
+                // state of a position that somebody can act on, and it is
+                // invisible everywhere else in wsp.
+                (None, false) => l.push(Style::Muted, util::truncate("seat · empty", avail)),
+                (None, true) => l.push(Style::Muted, util::truncate("seat · on another machine", avail)),
+            }
+        }
         Row::Agent { agent, title, depth, state, census } => {
             match num {
                 Some(n) => l.push(Style::Dim, n.to_string()),
@@ -2135,6 +2304,12 @@ pub(super) fn full_text(row: &Row) -> String {
                 false => format!("{out} · {who}"),
             }
         }
+        // Both halves, because the whole point of the row is that they are
+        // separable: which position this is, and who is in it today.
+        Row::Seat { project, agent, .. } => match agent {
+            Some(a) => format!("{project} seat · {}", a.where_()),
+            None => format!("{project} seat · empty"),
+        },
         Row::Agent { agent, title, .. } => {
             // The title is the pane's name, which is what the row draws. What
             // it does not draw, and what a name alone will not tell you, is
@@ -2156,6 +2331,7 @@ pub(crate) fn word(state: AgentState) -> &'static str {
     match state {
         AgentState::Asking => "wants you",
         AgentState::Blocked => "blocked",
+        AgentState::Seated => "coordinating",
         AgentState::Spare => "spare",
         AgentState::Working => "working",
         AgentState::Quiet => "no word yet",

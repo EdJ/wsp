@@ -271,7 +271,15 @@ fn plain_label(said: &str) -> Option<String> {
 /// label became a task title — and the scope on the front hands it back: the
 /// label now leads with the project's own id, which is the first thing
 /// [`Index::project_for_label`] looks for.
-fn name_after_task(pane: &str, workspace: &str, task: &Task) -> Option<String> {
+///
+/// The one name it will not write over is a seat's. A workspace holding a
+/// custodial slot is named after the position — see
+/// [`cmd_govern::seat_label`] — and a custodian that claims a task to read it
+/// would otherwise rename its own room after the task and leave the sidebar
+/// saying what t-260817-021 was filed about: `robustness/078`, with nothing
+/// anywhere saying seat. The pane still takes the task's name, because a pane
+/// answers "what is happening in there now" and that is what is happening.
+fn name_after_task(pane: &str, workspace: &str, task: &Task, ws_label: &str) -> Option<String> {
     let label = task_label(task)?;
     if !herdr::available() {
         return None;
@@ -279,7 +287,7 @@ fn name_after_task(pane: &str, workspace: &str, task: &Task) -> Option<String> {
     if !pane.is_empty() {
         let _ = herdr::rename_pane(pane, &label);
     }
-    if workspace.is_empty() {
+    if workspace.is_empty() || cmd_govern::is_seat_label(ws_label) {
         return None;
     }
     herdr::rename_workspace(workspace, &label).ok().map(|_| label)
@@ -1122,7 +1130,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // written: the claim records the label the workspace is to be *found* by
     // when its id is gone, so it has to record the name it is about to have and
     // not the one it is losing.
-    let named = name_after_task(&pane, &workspace, &t);
+    let named = name_after_task(&pane, &workspace, &t, &ws_label);
 
     // One lock around the state files a claim touches, so a claim
     // arriving in the middle of this one cannot read a half-made state: a
@@ -1408,6 +1416,13 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
         // on the panel's tick — and behind the same `may_reap` guard as the
         // claims, because an empty answer from a machine that did not reply is
         // what once reaped every binding in the store.
+        //
+        // Vacated rather than removed. The occupancy is what the closed
+        // workspace disproves; the position is the project's and outlives every
+        // agent that ever sat in it — see [`cmd_govern::vacate`]. Before that
+        // distinction existed, a night ending took the governor off `wsp`
+        // entirely, and the morning had no way to tell "nobody is in the seat"
+        // from "this project never had one".
         for (project, g) in &governors {
             let get = |k: &str| g.get(k).and_then(|v| v.as_str()).unwrap_or("");
             if !get("host").is_empty() && get("host") != host {
@@ -1419,12 +1434,9 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
             if workspaces.iter().any(|w| w.id == get("workspace")) {
                 continue;
             }
-            store.clear_governor(project);
-            store.log_event(
-                "governor-cleared",
-                json!({ "project": project, "why": "workspace closed" }),
-            );
-            out.stood_down += 1;
+            if cmd_govern::vacate(store, project) {
+                out.stood_down += 1;
+            }
         }
 
         for (task_id, c) in &claims {
@@ -1565,8 +1577,14 @@ fn name_bound(
         }
         // A workspace nobody named reads back as the agent or the folder, so
         // the comparison can never say "already right" — it says "not the task
-        // title", which is the same answer and the one that matters.
-        if workspaces.iter().any(|w| w.id == pane.workspace_id && w.label != label) {
+        // title", which is the same answer and the one that matters. A seat's
+        // own name is the exception, for the reason [`name_after_task`] gives:
+        // the room belongs to the position, and reconcile runs on every daemon
+        // start, so this is where a nightly custodian would silently lose it.
+        if workspaces
+            .iter()
+            .any(|w| w.id == pane.workspace_id && w.label != label && !cmd_govern::is_seat_label(&w.label))
+        {
             touched |= herdr::rename_workspace(&pane.workspace_id, &label).is_ok();
         }
         if touched {

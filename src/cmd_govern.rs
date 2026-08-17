@@ -31,6 +31,44 @@
 //! is cleared and restarted in place is the same seat with a shorter memory,
 //! and the record should survive that even though the thread does not.
 //!
+//! # …and what it turned out to be, once a person had to talk to one
+//!
+//! The record above routes a raised hand and it is not a **position**. Ed,
+//! 2026-08-17, on holding two governorships from one workspace: *"I don't see
+//! you as governor, I still see you as robustness/078 — and you've not been
+//! moved to sit below the wsp line as I would expect."* The decision on
+//! t-260817-021 settles the shape:
+//!
+//! **A governor is a slot on a project, and the agent in it is a custodian
+//! rather than a claimant.** It is a third kind of node beside projects and
+//! tasks, and that is affordable only because it is a *slot* — no status of its
+//! own, no prose, no lifecycle, nothing to finish. What it adds to the model is
+//! one edge that did not exist: an agent can be assigned to a **project**.
+//! Every other assignment in wsp is agent-to-task.
+//!
+//! Three things follow, and each one is a thing a person can see:
+//!
+//! - **It has a place.** [`Slot`] is what the panel draws under the project it
+//!   belongs to — not under whatever task its occupant borrowed to have
+//!   somewhere to stand, because position is what a tree means.
+//! - **It is addressable.** `wsp govern <project> --tell` speaks to whoever is
+//!   in the slot now, and the panel's `T` is the same sentence from the row.
+//!   Addressing the *position*, never the pane: the pane the agent started in
+//!   is display only, and [`occupant`] asks the runner who is in that workspace
+//!   at the moment of speaking.
+//! - **It outlives its occupant.** A slot with nobody in it still draws, still
+//!   answers, and can be filled again. `--clear` vacates and leaves the slot
+//!   standing; `--remove` is the separate decision that this project has no
+//!   governor at all.
+//!
+//! **An agent assigned to a slot gets different instructions.** Not "you have
+//! been claimed onto t-260817-021, begin work" but "you are the custodian of
+//! this project": it sequences, directs, reviews and holds the record for
+//! everything beneath it, rather than finishing one piece of work and standing
+//! down. That sentence is [`crate::cmd_spawn::Handover::Custodian`], and the
+//! brief that arrives with it is the project's rather than a task's — see
+//! [`crate::cmd_brief`].
+//!
 //! # Per hierarchy, and the chain that makes absence cheap
 //!
 //! `wsp` has a seat; `robustness` has its own; a sub-project may have one. That
@@ -93,6 +131,65 @@ pub struct Seat {
     /// everything that must stay correct reads [`Seat::workspace`].
     pub pane: String,
     pub since: String,
+}
+
+/// A slot on a project: the position, and whoever is in it now.
+///
+/// [`Seat`] is the occupancy and this is the post. The difference is the whole
+/// of "it outlives its occupant": a slot whose agent has gone is a slot with
+/// `occupant: None`, which still has a project, a place in the tree and a row
+/// you can stand on — where before, the record was deleted and the position
+/// went with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    pub project: String,
+    /// Filled, on this machine. `None` covers both an empty slot and one held
+    /// from another host, which are the same thing from here: nobody you can
+    /// reach. `host` below says which.
+    pub occupant: Option<Seat>,
+    /// The machine the slot was last filled from, or empty for a vacant one.
+    /// Carried so a slot held on the laptop does not draw here as empty, which
+    /// would invite two agents into one position.
+    pub host: String,
+    /// When the slot was last filled, or vacated. One field, because what a
+    /// reader wants is "and how long has *that* been true".
+    pub since: String,
+}
+
+impl Slot {
+    /// Somebody is in it, here.
+    pub fn filled(&self) -> bool {
+        self.occupant.is_some()
+    }
+
+    /// Held from another machine — not ours to draw as empty and not ours to
+    /// speak to.
+    pub fn elsewhere(&self) -> bool {
+        self.occupant.is_none() && !self.host.is_empty() && self.host != util::hostname()
+    }
+}
+
+/// Every slot that exists, in project order — vacant ones included.
+///
+/// The display read, where [`seat_for`] is the routing one. Routing wants the
+/// nearest seat that can actually answer; a tree wants every position there is,
+/// because a post nobody is standing in is exactly the thing a person has to be
+/// able to see in order to fill it.
+pub fn slots(governors: &BTreeMap<String, Value>) -> Vec<Slot> {
+    governors
+        .iter()
+        .map(|(project, rec)| Slot {
+            occupant: seat_of(project, rec),
+            host: rec.get("host").and_then(Value::as_str).unwrap_or_default().to_string(),
+            since: rec
+                .get("since")
+                .or_else(|| rec.get("vacated"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            project: project.clone(),
+        })
+        .collect()
 }
 
 /// One record, if it belongs to this machine.
@@ -177,7 +274,139 @@ pub fn needs_a_person(idle: bool, doing: bool, seat: bool) -> bool {
     idle && doing && !seat
 }
 
-/// `wsp govern [<project>] [--clear]` — take the seat, report it, or stand down.
+/// Put a workspace in a project's slot, and say whom it displaced.
+///
+/// Taken by [`govern`] from a pane that is already sitting there, and by
+/// [`crate::cmd_spawn`] on behalf of a workspace it has just opened — which is
+/// the whole reason this is a function rather than four lines inside the
+/// command. A custodian spawned into a new workspace is the *normal* way a slot
+/// gets filled now, and that caller has no environment of its own to read.
+/// What herdr calls a workspace that holds one or more slots.
+///
+/// The sidebar is the other tree a person reads, and until this it described
+/// the seat by the task it had borrowed: measured 2026-08-17 on the live seat,
+/// `robustness/078 · build a design artefact fo…`, with nothing anywhere
+/// saying seat, `robustness` or `wsp`. A position that is invisible in the one
+/// place you look all day is a position in name only.
+///
+/// The mark leads so the name is recognisable as ours without matching text —
+/// see [`is_seat_label`], which is what stops a claim writing a task's title
+/// over it. Every project the workspace answers for, because one window holding
+/// two governorships is exactly the case this was written from.
+pub fn seat_label(projects: &[String]) -> String {
+    format!("{} seat · {}", crate::panel::glyph::SEAT, projects.join(" "))
+}
+
+/// Whether a name is one a seat put there.
+///
+/// The same question [`crate::cmd_agent`] asks about a task's name, and asked
+/// the same way: on the one part of the string nobody types by hand. A claim
+/// renames the workspace it lands in after the work, which is right for a
+/// worker and wrong for a custodian that has picked up a task to read it — the
+/// position is what the room is for, and the task is passing through.
+pub fn is_seat_label(label: &str) -> bool {
+    label.trim_start().starts_with(crate::panel::glyph::SEAT)
+}
+
+/// Put the seat's own name on the workspace, or take it back off.
+///
+/// Both directions in one function because they are one rule read from either
+/// end: a workspace holding slots is named after them, and one that has just
+/// given up its last is handed back to herdr, which names an unnamed workspace
+/// after whatever is standing in it. Only ever writes over a name of ours — a
+/// label somebody typed is theirs.
+fn rename_seat(store: &Store, workspace: &str) {
+    if workspace.is_empty() || !herdr::available() {
+        return;
+    }
+    let held = governed_by(&store.governors(), workspace);
+    if !held.is_empty() {
+        let _ = herdr::rename_workspace(workspace, &seat_label(&held));
+        return;
+    }
+    let wears_ours = herdr::workspaces()
+        .unwrap_or_default()
+        .iter()
+        .any(|w| w.id == workspace && is_seat_label(&w.label));
+    if wears_ours {
+        let _ = herdr::rename_workspace(workspace, "");
+    }
+}
+
+pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option<Seat> {
+    // Taking a seat somebody else is in is allowed and is said out loud. The
+    // alternative is a refusal on a record whose whole content is "an agent is
+    // sitting here", which goes stale every time a session ends without
+    // standing down — and a seat you cannot take back after a crash is worse
+    // than one that changes hands with a line of output.
+    let displaced = store
+        .governors()
+        .get(project)
+        .and_then(|rec| seat_of(project, rec))
+        .filter(|s| s.workspace != workspace);
+
+    store.set_governor(
+        project,
+        json!({
+            "workspace": workspace,
+            "pane": pane,
+            "host": util::hostname(),
+            "since": util::now_iso(),
+        }),
+    );
+    store.log_event("governor-set", json!({ "project": project, "workspace": workspace }));
+    rename_seat(store, workspace);
+    displaced
+}
+
+/// Empty a slot without taking it off the project.
+///
+/// The half of "it outlives its occupant" that a person can see. Every earlier
+/// version of standing down deleted the record, so a night that ended took the
+/// position down with the agent and the project woke up with no governor and no
+/// sign there had ever been one. What is dropped is the occupancy — workspace,
+/// pane, host — and what is kept is the post, which is the thing another agent
+/// can be put into tomorrow.
+///
+/// Also what `reconcile --reap` does to a slot whose workspace herdr has
+/// closed: the agent is gone, the position is not.
+pub fn vacate(store: &Store, project: &str) -> bool {
+    let governors = store.governors();
+    let Some(rec) = governors.get(project) else { return false };
+    // Already empty. Said as false so a caller can report what it actually
+    // changed rather than what it looked at.
+    if seat_of(project, rec).is_none() && rec.get("workspace").is_none() {
+        return false;
+    }
+    let was = rec.get("workspace").and_then(Value::as_str).unwrap_or_default().to_string();
+    store.set_governor(project, json!({ "vacated": util::now_iso() }));
+    store.log_event("governor-vacated", json!({ "project": project }));
+    // The room keeps the name of whatever it still answers for, and gets its
+    // own back when that is nothing.
+    rename_seat(store, &was);
+    true
+}
+
+/// The pane the slot's agent is in *now*, which is not the pane it started in.
+///
+/// The record names a workspace because that is the durable half, and the pane
+/// on it is display only — an agent cleared and restarted comes back on another
+/// pane in the same room. So anything that speaks to a slot asks the runner who
+/// is in that room at the moment of speaking, and a slot answered by nobody is
+/// a vacancy rather than a stale address.
+pub fn occupant(seat: &Seat) -> Option<herdr::Pane> {
+    let panes = herdr::panes().ok()?;
+    // The recorded pane first when it is still there and still has an agent —
+    // a workspace with two agents in it should keep answering as the one that
+    // took the seat rather than alternating with its neighbour.
+    panes
+        .iter()
+        .find(|p| p.pane_id == seat.pane && !p.agent.is_empty())
+        .or_else(|| panes.iter().find(|p| p.workspace_id == seat.workspace && !p.agent.is_empty()))
+        .cloned()
+}
+
+/// `wsp govern [<project>] [--clear|--remove|--tell "…"]`
 pub fn govern(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
@@ -185,7 +414,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     let workspace = args.get("workspace").or(env.workspace_id.clone());
     let governors = store.governors();
 
-    if args.has("clear") {
+    if args.has("clear") || args.has("remove") {
         return stand_down(store, &index, args, workspace.as_deref());
     }
 
@@ -201,28 +430,38 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no such project `{needle}`");
         return 1;
     };
+
+    // Speaking to the slot never takes it. A person naming a project and a
+    // sentence is talking to whoever is in the position, and the commonest
+    // mistake this shape could make — a typo in the sentence flag silently
+    // making the shell that typed it the governor — is worth one branch to
+    // rule out.
+    if args.has("tell") {
+        // `--tell` normally carries the sentence. It does not when the sentence
+        // begins with a dash — the flag parser reads that as the next flag —
+        // so the words after the project are taken as the sentence too, and a
+        // person who types the obvious thing is not answered with a parse.
+        let text = match args.get("tell") {
+            Some(t) if t != "true" => t,
+            _ => args.rest[1..].join(" "),
+        };
+        return tell(&governors, &proj.id, &text, args);
+    }
+
     let Some(ws) = workspace else {
         eprintln!("wsp: no workspace — pass -w, or run inside herdr");
         return 2;
     };
 
-    // Taking a seat somebody else is in is allowed and is said out loud. The
-    // alternative is a refusal on a record whose whole content is "an agent is
-    // sitting here", which goes stale every time a session ends without
-    // standing down — and a seat you cannot take back after a crash is worse
-    // than one that changes hands with a line of output.
-    let displaced = governors.get(&proj.id).and_then(|rec| seat_of(&proj.id, rec)).filter(|s| s.workspace != ws);
-
-    store.set_governor(
-        &proj.id,
-        json!({
-            "workspace": ws,
-            "pane": env.pane_id.clone().unwrap_or_default(),
-            "host": util::hostname(),
-            "since": util::now_iso(),
-        }),
-    );
-    store.log_event("governor-set", json!({ "project": proj.id, "workspace": ws }));
+    // The pane is the environment's only when the workspace is too. `-w` names
+    // a room this process is not standing in, and stamping the caller's own
+    // pane onto that record would point the despawn guard at a pane in another
+    // workspace entirely.
+    let pane = match args.get("workspace") {
+        Some(_) => String::new(),
+        None => env.pane_id.clone().unwrap_or_default(),
+    };
+    let displaced = take(store, &proj.id, &ws, &pane);
 
     if args.json() {
         println!(
@@ -239,15 +478,71 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// `wsp govern <project> --tell "…"` — a sentence for whoever is in the slot.
+///
+/// The surface the position was missing. A person has been directing the
+/// governor all night through a terminal that happens to contain it, and wsp
+/// knew nothing about any of it; this is that conversation addressed to the
+/// **post** instead of to a pane somebody had to find first.
+///
+/// Through [`crate::agent_commands`], because how a sentence reaches an agent
+/// is a fact about the agent's kind and not about herdr. And with no `/clear`
+/// in front of it, unlike every hand-over in `panel::verbs`: a work order is
+/// given to an agent that has just finished something else, where this is a
+/// word to one that is in the middle of a night's sequencing. Emptying the
+/// governor's context to speak to it would destroy the one thing the position
+/// exists to hold.
+fn tell(governors: &BTreeMap<String, Value>, project: &str, text: &str, args: &Args) -> i32 {
+    use crate::place::Seat as Pane;
+
+    let text = text.trim();
+    if text.is_empty() {
+        eprintln!("wsp: nothing to say");
+        return 2;
+    }
+    let Some(seat) = governors.get(project).and_then(|rec| seat_of(project, rec)) else {
+        eprintln!("wsp: no seat on `{project}` — wsp govern {project} fills it");
+        return 1;
+    };
+    let Some(pane) = occupant(&seat) else {
+        eprintln!("wsp: the {project} seat is empty — nobody is in {} to tell", seat.workspace);
+        return 1;
+    };
+
+    let place = crate::place_herdr::Herdr::new();
+    let how = crate::agent_commands::of(&pane.agent);
+    match how.tell(&place, &Pane::new(&pane.pane_id), text) {
+        Ok(()) => {
+            if args.json() {
+                println!("{}", json!({ "project": project, "pane": pane.pane_id, "told": true }));
+            } else {
+                println!("{}", Paint::new().dim(&format!("→ {} · {}", project, pane.pane_id)));
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("wsp: the {project} seat was not told: {e}");
+            1
+        }
+    }
+}
+
 /// `wsp govern --clear [<project>]` — this workspace stops being the seat.
 ///
 /// Bare, it stands down from everything this workspace holds, because a session
 /// ending does not end one seat at a time. Named, it gives up one and keeps the
 /// rest, which is how a seat that governs `wsp` and `robustness` hands the
 /// second one on.
+///
+/// `--clear` vacates and `--remove` takes the slot off the project, and the
+/// difference is which of the two facts changed. An agent standing down is a
+/// fact about the agent — the position is still the project's, still drawn,
+/// still fillable by the next one. Deciding a project needs no governor at all
+/// is a fact about the project, and it is rare enough to be worth typing.
 fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>) -> i32 {
     let p = Paint::new();
     let governors = store.governors();
+    let remove = args.has("remove");
     let held: Vec<String> = match args.rest.first() {
         Some(needle) => match index.find(needle) {
             Some(proj) => vec![proj.id.clone()],
@@ -265,17 +560,27 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
         },
     };
 
-    let cleared: Vec<String> = held.into_iter().filter(|proj| store.clear_governor(proj)).collect();
+    let cleared: Vec<String> = held
+        .into_iter()
+        .filter(|proj| match remove {
+            true => store.clear_governor(proj),
+            false => vacate(store, proj),
+        })
+        .collect();
     for proj in &cleared {
-        store.log_event("governor-cleared", json!({ "project": proj }));
+        if remove {
+            store.log_event("governor-cleared", json!({ "project": proj }));
+        }
     }
 
     if args.json() {
-        println!("{}", json!({ "cleared": cleared }));
+        println!("{}", json!({ "cleared": cleared, "removed": remove }));
     } else if cleared.is_empty() {
         println!("{}", p.dim("this workspace is nobody's seat"));
+    } else if remove {
+        println!("{} {}", p.dim("no seat any more on —"), cleared.join(" "));
     } else {
-        println!("{} {}", p.dim("stood down —"), cleared.join(" "));
+        println!("{} {}", p.dim("stood down, seat left open —"), cleared.join(" "));
     }
     0
 }
@@ -286,29 +591,42 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>) ->
     let governors = store.governors();
     let mine: Vec<String> = workspace.map(|ws| governed_by(&governors, ws)).unwrap_or_default();
 
+    let slots = slots(&governors);
+
     if args.json() {
-        let seats: Vec<Value> = governors
+        let seats: Vec<Value> = slots
             .iter()
-            .filter_map(|(proj, rec)| seat_of(proj, rec))
-            .map(|s| json!({ "project": s.project, "workspace": s.workspace, "pane": s.pane, "since": s.since }))
+            .map(|s| {
+                json!({
+                    "project": s.project,
+                    "workspace": s.occupant.as_ref().map(|o| o.workspace.clone()),
+                    "pane": s.occupant.as_ref().map(|o| o.pane.clone()),
+                    "filled": s.filled(),
+                    "host": s.host,
+                    "since": s.since,
+                })
+            })
             .collect();
         println!("{}", json!({ "workspace": workspace, "governs": mine, "seats": seats }));
         return 0;
     }
 
-    if governors.is_empty() {
+    if slots.is_empty() {
         println!("{}", p.dim("no seats — wsp govern <project> takes one"));
         return 0;
     }
-    for (proj, rec) in &governors {
-        let Some(s) = seat_of(proj, rec) else { continue };
-        let here = mine.contains(proj);
+    // Vacant slots draw too, and that is the point of the list: a position
+    // nobody is standing in is the row you are reading this to find.
+    for s in &slots {
+        let here = mine.contains(&s.project);
         let mark = if here { p.cyan("▣") } else { p.dim("·") };
-        let seat = match s.pane.is_empty() {
-            true => s.workspace.clone(),
-            false => format!("{} · {}", s.workspace, s.pane),
+        let who = match (&s.occupant, s.elsewhere()) {
+            (Some(o) , _) if o.pane.is_empty() => o.workspace.clone(),
+            (Some(o), _) => format!("{} · {}", o.workspace, o.pane),
+            (None, true) => format!("on {}", s.host),
+            (None, false) => "empty · wsp spawn -p <project> --govern fills it".to_string(),
         };
-        println!("{} {}  {}", mark, p.bold(proj), p.dim(&seat));
+        println!("{} {}  {}", mark, p.bold(&s.project), p.dim(&who));
     }
     if mine.is_empty() {
         // Where a hand raised *here* would go. The question an agent asks is
@@ -430,5 +748,87 @@ mod tests {
         assert_eq!(governed_by(&g, "w1"), ["robustness", "wsp"]);
         assert_eq!(governed_by(&g, "w2"), ["data"]);
         assert!(governed_by(&g, "w3").is_empty());
+    }
+
+    fn store(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("wsp-govern-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        store.ensure_dirs().unwrap();
+        store
+    }
+
+    /// The property this task turns on, as an assertion: **the slot outlives
+    /// its occupant.**
+    ///
+    /// Standing down used to delete the record, so a night ending took the
+    /// position off the project with the agent, and the morning could not tell
+    /// "nobody is in the seat" from "this project never had one". Vacating
+    /// keeps the post and empties it: no seat to route a raised hand to — that
+    /// half must go on being exact — and a row that still exists to be filled.
+    #[test]
+    fn standing_down_empties_the_seat_and_leaves_it_standing() {
+        let store = store("vacate");
+        take(&store, "wsp", "w1", "w1:p1");
+        assert!(seat_for(&store.governors(), &tree(), Some("wsp")).is_some());
+
+        assert!(vacate(&store, "wsp"), "there was somebody in it");
+        let g = store.governors();
+        assert!(g.contains_key("wsp"), "the position went with the agent");
+        assert_eq!(seat_for(&g, &tree(), Some("wsp")), None, "an empty seat routes nothing");
+
+        let slots = slots(&g);
+        assert_eq!(slots.len(), 1);
+        assert!(!slots[0].filled(), "drawn, and drawn as empty");
+        assert!(!slots[0].elsewhere(), "empty here is not held elsewhere");
+
+        // Filled again by the next agent, which is the whole point of keeping
+        // it, and vacating twice changes nothing the second time.
+        assert!(!vacate(&store, "wsp"), "already empty");
+        take(&store, "wsp", "w2", "w2:p1");
+        assert_eq!(
+            seat_for(&store.governors(), &tree(), Some("wsp")).map(|s| s.workspace),
+            Some("w2".to_string())
+        );
+    }
+
+    /// Removing is the other decision, and it is about the project rather than
+    /// about the agent: this project has no governor at all. Kept separate
+    /// because one of the two happens every time a session ends and the other
+    /// should be typed on purpose.
+    #[test]
+    fn removing_a_seat_takes_the_position_off_the_project() {
+        let store = store("remove");
+        take(&store, "wsp", "w1", "w1:p1");
+        assert!(store.clear_governor("wsp"));
+        assert!(slots(&store.governors()).is_empty(), "no position, not an empty one");
+    }
+
+    /// A slot held from another machine is not an empty one. Reading it as
+    /// empty would invite a second agent into a position that is already taken,
+    /// which is the one thing a one-per-project record exists to stop.
+    #[test]
+    fn a_slot_filled_from_another_machine_reads_as_held_rather_than_empty() {
+        let g: BTreeMap<String, Value> = [(
+            "wsp".to_string(),
+            json!({ "workspace": "w1", "host": "somewhere-else" }),
+        )]
+        .into_iter()
+        .collect();
+        let s = &slots(&g)[0];
+        assert!(!s.filled(), "not reachable from here");
+        assert!(s.elsewhere(), "and not empty either");
+    }
+
+    /// The name a seat writes on its workspace, and the test that stops a claim
+    /// writing over it. Recognised on the mark rather than on the words,
+    /// because the words are project ids and a person may type one.
+    #[test]
+    fn a_workspace_wearing_the_seats_name_is_recognisably_ours() {
+        let label = seat_label(&["robustness".to_string(), "wsp".to_string()]);
+        assert!(label.contains("robustness") && label.contains("wsp"));
+        assert!(is_seat_label(&label));
+        assert!(!is_seat_label("robustness/078 · build a design artefact"));
+        assert!(!is_seat_label(""));
     }
 }

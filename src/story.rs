@@ -270,6 +270,30 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
     }
 }
 
+/// The same world with a custodian in `wsp`'s seat, and an empty seat on
+/// `verb`.
+///
+/// Both halves on purpose. A filled slot is what the position looks like when
+/// it is working, and an empty one is the case every other surface in wsp
+/// cannot show at all — the post outliving whoever was in it, which is the
+/// thing that has to be visible for anybody to fill it.
+///
+/// The custodian is `w2:p1`, which in [`world`] is an idle agent holding a
+/// `doing` task: the exact row that drew `← needs you` all night while it was
+/// the busiest agent on the machine. Here it draws as a seat, under `wsp`,
+/// rather than as a stalled worker under `verb`.
+fn seated_world() -> Snapshot {
+    let mut s = world();
+    s.governors.insert(
+        "wsp".to_string(),
+        json!({ "workspace": "w2", "pane": "w2:p1", "host": crate::util::hostname() }),
+    );
+    // Vacated rather than absent: `wsp govern --clear` and a reaped workspace
+    // both leave this, and it is what the tree has to keep drawing.
+    s.governors.insert("verb".to_string(), json!({ "vacated": "2026-08-17T04:00:00Z" }));
+    s
+}
+
 /// The same world with nothing running — what the panel looks like before any
 /// agent exists, which is most people's first sight of it.
 fn quiet_world() -> Snapshot {
@@ -354,6 +378,7 @@ fn target_label(t: &panel::Target) -> String {
         panel::Target::Inbox => "the inbox".into(),
         panel::Target::Unattached => "loose agents".into(),
         panel::Target::Pane(p) => format!("pane {p}"),
+        panel::Target::Seat(p) => format!("the {p} seat"),
         panel::Target::Overflow(k) => format!("hidden tail of {k}"),
         panel::Target::Nothing => "nothing".into(),
     }
@@ -485,6 +510,22 @@ impl<'a> Driver<'a> {
             self.key(Key::Down);
             if self.ui.selected_index() == before {
                 panic!("no row for project {id}");
+            }
+        }
+    }
+
+    /// And for a project's seat, which is a row of its own and not a pane: a
+    /// scene about the position has to name which position.
+    fn to_seat(&mut self, project: &str) -> &mut Self {
+        let want = panel::Target::Seat(project.to_string());
+        loop {
+            if self.ui.selected_target() == want {
+                return self;
+            }
+            let before = self.ui.selected_index();
+            self.key(Key::Down);
+            if self.ui.selected_index() == before {
+                panic!("no seat row for {project}");
             }
         }
     }
@@ -681,6 +722,29 @@ fn scenes() -> Vec<Scene> {
             .scene(
                 "Only what needs review",
                 "`R` narrows the tree to work an agent has finished with and handed back — `review` is where an agent stops, and only a person says `done`. The project rows stay so each one is placed, and every key goes on meaning what it means: `d` closes it, `o` sends it back, `↵` opens it in the detail pane. Nothing else changes, which is why this is a filter and not a second pane. The footer says the filter is on, because one left up silently reads as an empty backlog.",
+            ),
+    );
+
+    // The custodial slot, filled and empty, one after the other: the position
+    // is meant to be the same row either way, and two scenes side by side is
+    // the only way to show that.
+    let g = seated_world();
+
+    out.push(
+        Driver::new(&g)
+            .to_seat("wsp")
+            .scene(
+                "A governor, in its place",
+                "A project can have a custodial seat, and the agent in it is answerable for everything beneath \u{2014} it sequences what runs next, writes the direction an arriving agent needs, reviews finished work against the code, and holds the record. It is not claimed onto a task and should not be: the row is drawn under the project it answers for, directly beneath it and above the work, rather than under whatever task it had picked up to have somewhere to stand. That was the whole complaint this came from \u{2014} a governor of `wsp` appearing in the tree as an agent working a task three branches away. The mark is `\u{25a3}` wherever a seat is drawn, and the same agent in the census at the foot draws it too: an idle custodian is between the agents it started, which is most of the night, and none of that idleness is you being the blocker.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&g)
+            .to_seat("verb")
+            .scene(
+                "The seat outlives whoever was in it",
+                "`verb`'s seat is empty \u{2014} stood down, or its workspace closed \u{2014} and the row is still here. That is the point of a slot: the position belongs to the project and an agent fills it, so a night ending does not take the post down with the agent, and there is somewhere to stand when you want to fill it again. `wsp spawn -p verb --govern` opens a workspace, seats an agent in it and hands it the custodial work order rather than a claim. On a seat that has somebody in it, `T` says something to them \u{2014} addressed to the position, so it reaches whoever is in it when the sentence lands rather than the pane the agent started in.",
             ),
     );
 
@@ -1283,6 +1347,139 @@ mod tests {
     /// task — silently, and looking exactly like a misplaced click.
     fn ui_of(snap: &Snapshot, view: &panel::View) -> panel::Ui {
         panel::collect(snap, view)
+    }
+
+    /// The place, which is what the whole task turns on: a governor of `wsp`
+    /// draws under `wsp`.
+    ///
+    /// And draws there *instead of* under the task it borrowed. The seat in
+    /// this fixture is claimed onto `t-003`, a `verb` task — the arrangement
+    /// the live seat was in when Ed said *"I don't see you as governor, I still
+    /// see you as robustness/078"* — so the assertion has both halves: the row
+    /// is under the project it answers for, and it is not under the work it
+    /// picked up to have somewhere to stand.
+    #[test]
+    fn a_governor_draws_under_the_project_it_governs_and_nowhere_else() {
+        let w = seated_world();
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+
+        let rows: Vec<usize> = ui.rows_for_target(&panel::Target::Seat("wsp".into()));
+        assert_eq!(rows.len(), 1, "one position, one row");
+        // Directly under its project: the row above it is `wsp` itself.
+        let mut probe = ui.clone();
+        probe.select_for_test(rows[0] - 1);
+        assert_eq!(probe.selected_target(), panel::Target::Project("wsp".into()));
+
+        // The occupant is not drawn a second time in the tree as a worker on
+        // the task it holds. It is still in the census at the foot, which is a
+        // list of who is running rather than of where work sits.
+        let tree = ui.rows_for_test() - ui.dock_for_test();
+        let as_worker: Vec<usize> = ui
+            .rows_for_target(&panel::Target::Pane("w2:p1".into()))
+            .into_iter()
+            .filter(|i| *i < tree)
+            .collect();
+        assert!(as_worker.is_empty(), "the seat is drawn as a worker too: {as_worker:?}");
+        assert!(
+            ui.census_for_test().iter().any(|(_, a)| a.pane == "w2:p1"),
+            "and it fell out of the census, which is every agent running"
+        );
+    }
+
+    /// The slot outlives its occupant, and that is a thing you can see.
+    ///
+    /// `verb`'s seat has nobody in it — stood down, or its workspace closed —
+    /// and the row is still there, still selectable, still the place a person
+    /// goes to fill it. Every other surface in wsp answers "no governor" and
+    /// "never had one" with the same silence.
+    #[test]
+    fn an_empty_seat_is_still_drawn_and_can_still_be_stood_on() {
+        let w = seated_world();
+        let view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let rows = ui.rows_for_target(&panel::Target::Seat("verb".into()));
+        assert_eq!(rows.len(), 1, "the position went with the agent");
+        ui.select_for_test(rows[0]);
+        assert_eq!(ui.selected_kind(), panel::RowKind::Seat, "and the cursor can reach it");
+    }
+
+    /// The row that was wrong all night, on the surface a person actually looks
+    /// at.
+    ///
+    /// t-260817-013 taught `wip` and the panel's sort that an idle custodian is
+    /// not a person being the blocker, and left the *mark* alone — so the tree
+    /// and the dock went on drawing `←` on the busiest agent on the machine.
+    /// The seat is idle between the agents it starts, by construction, and that
+    /// is its resting state rather than a stall.
+    #[test]
+    fn an_idle_custodian_never_draws_as_an_agent_that_wants_you() {
+        let w = seated_world();
+        let view = panel::View::default();
+        let ui = ui_of(&w, &view);
+        let state = ui
+            .census_for_test()
+            .into_iter()
+            .find(|(_, a)| a.pane == "w2:p1")
+            .map(|(s, _)| s)
+            .expect("the custodian is running");
+        assert_eq!(state, panel::AgentState::Seated, "idle in a slot is coordinating");
+
+        // And the same pane without the slot is exactly what it always was, so
+        // the exception costs nobody else anything.
+        let ordinary = ui_of(&world(), &view)
+            .census_for_test()
+            .into_iter()
+            .find(|(_, a)| a.pane == "w2:p1")
+            .map(|(s, _)| s)
+            .expect("the same pane, ungoverned");
+        assert_eq!(ordinary, panel::AgentState::Asking);
+    }
+
+    /// The half a record could never be: you can say something to the governor
+    /// from the row that is the governor.
+    ///
+    /// Addressed to the project rather than to the pane, which is the whole
+    /// distinction — the sentence has to reach whoever is in the slot when it
+    /// lands, not the pane the agent happened to start in. And it runs the CLI,
+    /// like every other key here, so the shell and the panel cannot come to
+    /// disagree about what talking to a seat means.
+    #[test]
+    fn t_says_something_to_whoever_is_in_the_seat() {
+        let w = seated_world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let rows = ui.rows_for_target(&panel::Target::Seat("wsp".into()));
+        ui.select_for_test(rows[0]);
+
+        assert!(matches!(panel::apply_key(Key::Char('T'), &mut ui, &mut view), panel::Effect::None));
+        for c in "hold 060".chars() {
+            panel::apply_key(Key::Char(c), &mut ui, &mut view);
+        }
+        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            panel::Effect::Run { argv, .. } => {
+                assert_eq!(argv, vec!["govern", "wsp", "--tell", "hold 060"]);
+            }
+            _ => panic!("T should say it through the CLI"),
+        }
+    }
+
+    /// And the verb that would take the position apart is refused there.
+    ///
+    /// `f` sends an idle agent to find its own work, which for a custodian
+    /// means picking up a task — the exact move that turned a governor into an
+    /// agent working `robustness/078` and started this whole task off.
+    #[test]
+    fn a_seat_is_not_an_agent_to_be_sent_looking_for_work() {
+        let w = seated_world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let rows = ui.rows_for_target(&panel::Target::Seat("wsp".into()));
+        ui.select_for_test(rows[0]);
+        assert!(matches!(panel::apply_key(Key::Char('f'), &mut ui, &mut view), panel::Effect::None));
+        // `↵` still goes to its terminal: the position is not addressable
+        // *instead* of the agent in it.
+        assert!(matches!(panel::apply_key(Key::Enter, &mut ui, &mut view), panel::Effect::Focus(_)));
     }
 
     /// The label wins because it is the only one of the three anybody keeps

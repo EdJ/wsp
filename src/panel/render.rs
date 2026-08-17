@@ -142,6 +142,10 @@ pub(crate) mod glyph {
     pub const FLAG: &str = "▲";
     /// A pane with no agent in it.
     pub const SHELL: &str = "▫";
+    /// The custodian's slot on a project, filled or empty — `wsp govern`, `wsp
+    /// wip` and the panel all draw the position with this one mark, so a seat
+    /// looks like a seat wherever you meet it.
+    pub const SEAT: &str = "▣";
     /// Something is written in Overview or Details.
     pub const NOTES: &str = "≡";
     /// In the tag picker: carried already, about to be added, about to be
@@ -247,6 +251,8 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Accent, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in — the same mark and the same colour the agents view gives it, so one pane does not read two ways in one glance"),
                 mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
+                mark(&[(Style::Accent, g::SEAT), (Style::Plain, " "), (Style::Accent, "the governor")], "a seat", "the custodial slot on the project above it: the agent answerable for everything beneath, drawn where it is answerable rather than under whatever task it borrowed. T says something to it, ↵ goes there"),
+                mark(&[(Style::Dim, g::SEAT), (Style::Plain, " "), (Style::Muted, "seat · empty")], "an empty seat", "the position outlives whoever was in it — wsp spawn -p <project> --govern fills it again"),
                 mark(&[(Style::Dim, g::NOTES)], "written on", "something is in this row's Overview or Details — E opens it"),
                 mark(&[(Style::Warn, g::FLAG)], "raised", "an agent has flagged this task and said why — x lowers it"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
@@ -268,6 +274,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Query, g::QUESTION)], "blocked", "stopped, on a task parked with a question written on it — its own colour, because it wants an answer rather than a nudge"),
                 mark(&[(Style::Accent, g::WORKING)], "working", "running"),
                 mark(&[(Style::Muted, g::IDLE)], "spare", "stopped, holding nothing — a person's worth of attention going spare"),
+                mark(&[(Style::Accent, g::SEAT)], "coordinating", "stopped, and in a project's seat — a custodian is idle between the agents it starts, which is most of the night, and none of that idleness is you being the blocker"),
                 mark(&[(Style::Dim, g::QUIET)], "quiet", "herdr says neither, usually an agent that has not spoken since it started"),
                 mark(&[(Style::Dim, g::MORE), (Style::Plain, " "), (Style::Dim, "11")], "too many to draw", "the strip is clipped, never the count beside it — click the ⋯ for the rest"),
             ],

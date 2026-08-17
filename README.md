@@ -1672,9 +1672,12 @@ means.
 ## The seat
 
 ```sh
-wsp govern robustness    # this workspace coordinates robustness
-wsp govern               # who is seated, and which seat answers for here
-wsp govern --clear       # stand down
+wsp spawn -p robustness --govern   # open a workspace, seat an agent, tell it the job
+wsp govern robustness              # or take the seat from where you are
+wsp govern                         # every seat, filled and empty
+wsp govern wsp --tell "hold 060"   # say something to whoever is in it
+wsp govern --clear                 # stand down, and leave the seat open
+wsp govern verb --remove           # this project has no governor at all
 ```
 
 On 2026-08-17 one workspace ran twelve agents across the `robustness` backlog
@@ -1727,6 +1730,62 @@ would put a round-trip in front of every agent for the benefit of none. The one
 guard runs the other way: `wsp despawn` refuses to end a governing pane without
 `--force`, because the seat is the one agent whose thread does not come back,
 and that refusal costs the seat rather than anybody under it.
+
+### A slot, and the agent in it is a custodian
+
+The verb above was enough to *route* a raised hand and it was not a **position**.
+Ed, 2026-08-17, holding the `wsp` and `robustness` seats from one window: *"I
+don't see you as governor, I still see you as robustness/078 — and you've not
+been moved to sit below the wsp line as I would expect."* Measured on that seat,
+both surfaces described the task it had borrowed and neither said seat, or
+`robustness`, or `wsp`:
+
+```
+herdr tokens: scope=robustness/078  taskid=t-260816-078  tstatus=doing
+ws label:     robustness/078 · build a design artefact fo…
+```
+
+So a governor is a **slot on a project** — a third kind of node beside projects
+and tasks, and affordable only because it is a slot: no status of its own, no
+prose, nothing to finish. What it adds to the model is one edge that did not
+exist. Claims are agent-to-task; this is **agent-to-project**.
+
+**It has a place.** The slot draws in the tree directly under the project it
+belongs to, above that project's work, and its occupant is drawn there *instead
+of* under whatever task it borrowed — position is what a tree means. One
+workspace holding two slots draws under both, which is two positions filled by
+one agent. In herdr the workspace is named after the position rather than after
+the task, and a claim will not write over that name.
+
+```
+  ▾ wsp                       8 ●2
+     ▣ Verb UI             seat
+     · ! Panel work item number 5
+  ▾ verb                3 ▸1 ■1 ●2
+     ▣ seat · empty
+```
+
+**It is addressable.** `T` on the row, or `wsp govern <project> --tell "…"` from
+a shell — the panel runs the CLI, so there is one implementation. Addressed to
+the *position*: the sentence goes to whoever is in the slot when it lands, found
+through the workspace rather than through the pane the agent started in, and it
+arrives with no `/clear` in front of it, because emptying a governor's context
+to speak to it would destroy the thread the position exists to hold.
+
+**It outlives its occupant.** `--clear` and a reaped workspace both *vacate* the
+slot and leave it standing; `--remove` is the separate decision that a project
+has no governor. An empty slot is a row you can stand on and fill, which is the
+one state of a position no other surface in wsp could show at all.
+
+**And a custodian is told a different job.** `wsp spawn -p <proj> --govern`
+takes the slot before it starts the agent — so the agent's `SessionStart` hook
+runs `wsp brief` with the slot already in place — and then hands over the
+custodial work order rather than a claim: sequence what runs next and what
+waits, write the direction an arriving agent needs and no more, review finished
+work against the code rather than against the agent's report, hold the record.
+The brief agrees with it: a custodian is told what it is answerable for, and it
+is *not* told to go and claim something, which is the move that turns a governor
+back into an agent working somebody else's task.
 
 The record is keyed on the **project**, which is the one place this differs
 from the pins, mandates and claims beside it. Those are facts about a workspace
@@ -2551,7 +2610,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_checkout.rs` | a working tree per task, and landing it back on the trunk |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
-| `src/cmd_govern.rs` | the coordinating seat: who answers for a project's raised hands |
+| `src/cmd_govern.rs` | the custodial slot on a project: who answers for its raised hands, and how you talk to them |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |

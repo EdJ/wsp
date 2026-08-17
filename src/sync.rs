@@ -83,6 +83,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
     let pins = store.pins();
     let bindings = store.bindings();
     let claims = store.claims();
+    let governors = store.governors();
 
     let workspaces = herdr::workspaces()?;
     let agents = herdr::agents()?;
@@ -158,8 +159,16 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             None => (None, None, Default::default()),
         };
 
+        // The position, where there is one. A workspace holding a custodial slot
+        // is answerable for a project rather than working in it, and every
+        // other token here describes work — measured on the live seat, the
+        // sidebar said `scope=robustness/078` and nothing at all about the two
+        // governorships that window was actually holding.
+        let seat = crate::cmd_govern::governed_by(&governors, &ws.id);
+
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("proj", proj.clone()),
+            ("seat", Some(seat.join("·")).filter(|s| !s.is_empty())),
             ("tags", tags),
             ("todo", nonzero(c.open)),
             ("doing", nonzero(c.doing)),

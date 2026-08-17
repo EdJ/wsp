@@ -316,6 +316,21 @@ pub(crate) struct Brief {
     /// thousands of times a night for a fact that is always the same.
     pub seat: Option<(cmd_govern::Seat, bool)>,
 
+    /// The projects this pane's workspace is the custodian of, in id order.
+    ///
+    /// The second half of the seat, and a different question from it. `seat`
+    /// above answers *who coordinates the work in front of me* by walking up
+    /// from this pane's project; this answers *what am I responsible for*, and
+    /// the two disagree exactly when they should — a workspace holding the
+    /// `wsp` slot while standing in `robustness` is answerable for both, and
+    /// only this line knows it.
+    ///
+    /// Empty for every ordinary agent, which is every agent nearly all of the
+    /// time, and an empty vector draws nothing at all. That is the same
+    /// bargain `seat` makes and it matters for the same reason: this is the
+    /// output every request of every session pays for.
+    pub custodian: Vec<String>,
+
     /// The `wsp checkout` tree this pane is standing in, when it is in one.
     ///
     /// Worth a line of a brief, which is the most expensive output wsp has —
@@ -515,6 +530,11 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
             let mine = b.workspace.as_deref() == Some(s.workspace.as_str());
             (s, mine)
         }),
+        custodian: b
+            .workspace
+            .as_deref()
+            .map(|ws| cmd_govern::governed_by(&b.governors, ws))
+            .unwrap_or_default(),
         // A path rule rather than a question for git, so this stays free in the
         // one command a session-start hook runs.
         own_tree: b
@@ -557,6 +577,7 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
         "seat": r.seat.as_ref().map(|(s, mine)| json!({
             "project": s.project, "workspace": s.workspace, "pane": s.pane, "mine": mine,
         })),
+        "custodian": r.custodian,
         "task": r.mine.as_ref().map(|t| t.json()),
         "decisions": r.decided.iter().map(|(w, t)| json!({ "date": w, "text": t })).collect::<Vec<_>>(),
         "open": r.open.iter().map(|(t, _)| t.json()).collect::<Vec<_>>(),
@@ -751,7 +772,23 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // it changes what an agent does with a question, from sitting on it until
     // somebody looks at a panel to raising it at another agent that is watching
     // for exactly that.
-    if let Some((s, mine)) = &r.seat {
+    // The custodian's own line comes first and replaces the seat line, because
+    // for that one session they are the same fact said from opposite ends —
+    // "somebody is coordinating here" and "it is you" — and the second is the
+    // one that changes what the reader does next. It names every slot the
+    // workspace holds, where the seat line can only name the nearest, which for
+    // an agent answering for `wsp` while standing in `robustness` is the wrong
+    // half of its job.
+    if !r.custodian.is_empty() {
+        row(
+            "seat",
+            format!(
+                "{}  {}",
+                p.bold(&r.custodian.join(" ")),
+                p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
+            ),
+        );
+    } else if let Some((s, mine)) = &r.seat {
         row(
             "seat",
             match mine {
@@ -782,6 +819,16 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                 row("", p.dim(&format!("{} sub-task(s) open beneath it", r.under_mine)));
             }
         }
+        // A custodian holding nothing is not an agent that has failed to claim
+        // anything: it is an agent doing its job. The default line below tells
+        // it to go and claim something, which is the one instruction that would
+        // take the position apart — the seat that borrowed a task to stand on
+        // is exactly what t-260817-021 was filed about.
+        None if !r.custodian.is_empty() => row(
+            "you",
+            p.dim("holding nothing, which is the job — the work below is for the agents you start")
+                .to_string(),
+        ),
         None if r.mandate.is_some() => {
             row("you", p.dim("nothing claimed").to_string());
             // The loop, spelled out on the one line where it is actionable.
@@ -1063,6 +1110,37 @@ mod tests {
         assert_eq!(r.seat.as_ref().map(|(_, mine)| *mine), Some(true), "w1 is this pane's workspace");
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("wsp flag --seat"), "{text}");
+    }
+
+    /// A custodian's brief is about the position rather than about a task, and
+    /// the line that matters most is the one it must *not* draw.
+    ///
+    /// An agent in a slot holding nothing is doing its job. The default line
+    /// for an empty pair of hands tells it to go and claim something, and a
+    /// custodian that claims work is exactly what t-260817-021 was filed about
+    /// — the seat on the night this came from borrowed a task to have somewhere
+    /// to stand, and every surface then described it as that task's agent.
+    #[test]
+    fn a_custodian_is_told_what_it_is_answerable_for_rather_than_to_go_and_claim() {
+        let mut b = briefing();
+        // In the slot for `wsp` *and* for `robustness`, from one window, which
+        // is the case a seat line walking up the chain cannot say: it would
+        // name the nearest and stop.
+        for proj in ["wsp", "robustness"] {
+            b.governors.insert(
+                proj.into(),
+                json!({ "workspace": "w1", "host": util::hostname() }),
+            );
+        }
+        // Holding nothing, which is what a custodian holds.
+        b.world.bindings.clear();
+
+        let r = compose(&b);
+        assert_eq!(r.custodian, ["robustness", "wsp"].map(String::from).to_vec());
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("robustness wsp"), "both positions, not the nearest: {text}");
+        assert!(text.contains("wsp flag --seat"), "its inbox: {text}");
+        assert!(!text.contains("wsp claim <id>"), "a custodian was sent to claim work: {text}");
     }
 
     /// The three facts a session cannot start without, in the order it needs

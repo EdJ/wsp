@@ -484,6 +484,7 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("C", "hand it to a spare agent"),
                 ("u", "take the work back, clear"),
                 ("O S", "a terminal, an agent"),
+                ("T", "say it to a project's seat"),
                 ("x", "lower a raised flag"),
                 ("↵", "on a flag: the card again"),
                 ("X", "remove, after y/n"),

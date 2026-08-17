@@ -309,7 +309,7 @@ pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
             project: t.project.clone(),
             // The two halves the panel already joins: what herdr says the pane
             // is doing, and what the store says it is holding while it does it.
-            agent: pane.map(|p| crate::panel::agent_state(&p.state, Some(t.status()))),
+            agent: pane.map(|p| crate::panel::agent_state(&p.state, Some(t.status()), p.seat)),
             pane: pane.map(|p| p.pane.clone()),
             held: ctx
                 .claims
@@ -354,7 +354,7 @@ pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
         .map(|p| {
             let held = held_of(&p.pane);
             Agent {
-                state: crate::panel::agent_state(&p.state, held.map(|t| t.status())),
+                state: crate::panel::agent_state(&p.state, held.map(|t| t.status()), p.seat),
                 name: p.where_(),
                 pane: p.pane.clone(),
                 task: held.map(|t| t.id.clone()),

@@ -41,6 +41,16 @@ pub(crate) enum Ask {
     /// which is what `wsp project show` and the detail pane lead with.
     RenameProject { project: String, from: String },
     Note { task: String },
+    /// A sentence for the agent in a project's slot.
+    ///
+    /// The one prompt here that does not write anything down. Everything else
+    /// on this list changes the store and the agents read it; this is a person
+    /// talking to the custodian — directing it, correcting its sequencing,
+    /// telling it what to start next — which is what a governor has been for
+    /// since before wsp knew the position existed. Addressed to the project,
+    /// never to the pane: the row you are standing on is the post, and who is
+    /// in it is `wsp govern`'s business at the moment the sentence lands.
+    Tell { project: String },
 }
 
 impl Ask {
@@ -53,6 +63,7 @@ impl Ask {
             Ask::Rename { .. } => "title".into(),
             Ask::RenameProject { .. } => "name".into(),
             Ask::Note { .. } => "note".into(),
+            Ask::Tell { project } => format!("say to {project}"),
         }
     }
 
@@ -103,6 +114,14 @@ impl Ask {
                 vec!["project".into(), "set".into(), project.clone(), format!("name={v}")]
             }
             Ask::Note { task } => vec!["note".into(), task.clone(), v],
+            // Through the CLI like every other key here, which is what keeps
+            // the panel out of the business of finding the pane, choosing the
+            // agent's kind and deciding what a clear would cost — all of which
+            // `wsp govern --tell` already answers once, for the shell and the
+            // panel alike.
+            Ask::Tell { project } => {
+                vec!["govern".into(), project.clone(), "--tell".into(), v]
+            }
         }
     }
 }
@@ -349,7 +368,7 @@ pub(super) fn tell_released(a: &AgentRef, task: &str) -> Option<Tell> {
 pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
     Tell {
         pane: a.pane.clone(),
-        text: Some(crate::cmd_spawn::claimed_text(task, crate::cmd_spawn::Handover::Running)),
+        text: Some(crate::cmd_spawn::work_order(task, crate::cmd_spawn::Handover::Running)),
         note: format!("{} → {task}", a.where_()),
         clear: clear_command(&a.kind),
     }
@@ -1068,6 +1087,17 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Some(a) => Effect::Focus(a.clone()),
                 None => Effect::None,
             },
+            // A filled slot goes to the custodian's terminal, for the same
+            // reason a pane row does. An empty one has no terminal to go to and
+            // says the thing you would do about that instead — the row exists
+            // to be filled, and nothing else here fills it.
+            Target::Seat(project) => match ui.rows.get(ui.sel).and_then(|r| r.agent()) {
+                Some(a) => Effect::Focus(a.clone()),
+                None => {
+                    say(ui, format!("empty · wsp spawn -p {project} --govern"));
+                    Effect::None
+                }
+            },
             // Pressing it again on the thing already open shuts the pane, so
             // the same key both opens and closes and nothing has to be
             // remembered.
@@ -1361,10 +1391,41 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         Key::Char('u') => unassign(&target, ui),
         // The dock's own verb. `c` needs you to have decided what the work is;
         // this needs only that there is some.
+        //
+        // Not on a seat, even though the row answers with an agent: a custodian
+        // sent to find its own work is a custodian that has stopped being one,
+        // and the whole failure this position was built out of is a governor
+        // that picked up a task to have somewhere to stand.
+        Key::Char('f') if matches!(target, Target::Seat(_)) => {
+            say(ui, "a seat is not looking for work — T talks to it");
+            Effect::None
+        }
         Key::Char('f') => match ui.rows.get(ui.sel).and_then(|r| r.agent()).cloned() {
             Some(a) => find_work(&a, ui, view),
             None => {
                 say(ui, "f sets an agent looking — aim it at one");
+                Effect::None
+            }
+        },
+
+        // ---- a word with the custodian ----
+        //
+        // The half of a position that a record could never be: you can see the
+        // governor of `wsp` in the tree, and this is how you say something to
+        // it. Everywhere else in the panel a key hands an agent *work*; this
+        // hands it a sentence, because the job in that slot is the conversation
+        // — sequencing, direction, correction — and until now every word of it
+        // happened outside wsp, in a terminal somebody had to go and find.
+        Key::Char('T') => match &target {
+            Target::Seat(project) => {
+                view.mode = Mode::Prompt {
+                    verb: Ask::Tell { project: project.clone() },
+                    buffer: String::new(),
+                };
+                Effect::None
+            }
+            _ => {
+                say(ui, "T talks to a project's seat — aim at one");
                 Effect::None
             }
         },

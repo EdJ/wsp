@@ -57,6 +57,10 @@ const BOOL_FLAGS: &[&str] = &[
     "dry-run",
     // Same for `sandbox`, whose positional is a sandbox name.
     "keep", "seed", "fake",
+    // And `govern`, whose positional is a project: `wsp spawn -p wsp --govern`
+    // and `wsp govern wsp --remove` both put the flag last, where anything not
+    // known here swallows the argument after it.
+    "govern", "remove",
 ];
 
 pub struct Args {
@@ -345,7 +349,7 @@ fn main() {
             println!("named {} pane(s) after the task they hold", r.named);
             if args.has("reap") {
                 println!("ended {} claim(s) whose workspace is gone", r.reaped);
-                println!("stood down {} seat(s) whose workspace is gone", r.stood_down);
+                println!("emptied {} seat(s) whose workspace is gone", r.stood_down);
             }
             0
         }
@@ -456,10 +460,17 @@ fn help() {
                                     that task, then release the claim — a seat
                                     that will not close keeps its claim
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
-  wsp govern [<proj>] [--clear]     take the coordinating seat for a project:
-                                    raised hands under it arrive here instead of
-                                    on a person's panel, and this pane stops
-                                    reading as an agent that has stalled
+  wsp govern [<proj>] [--clear]     take the custodial seat on a project: raised
+                                    hands under it arrive here instead of on a
+                                    person's panel, and this pane stops reading
+                                    as an agent that has stalled; --clear stands
+                                    down and leaves the seat open, --remove takes
+                                    the seat off the project altogether
+  wsp govern <proj> --tell "…"      say something to whoever is in that seat —
+                                    the panel's T, from a shell
+  wsp spawn -p <proj> --govern      …or start one: a workspace on the project, an
+                                    agent in it, the seat taken, and a custodial
+                                    work order rather than a claim
   wsp release                       unbind this pane, leaving whatever is in it
   wsp pin <proj> [-w ws]            pin a workspace to a project
   wsp pin --top [-w ws]             pin it outside the tree entirely

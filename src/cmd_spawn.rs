@@ -29,6 +29,7 @@ use serde_json::json;
 
 use crate::agent_commands;
 use crate::cmd_agent;
+use crate::cmd_govern;
 use crate::place::{Agent, Order, Place, Refusal, Seat, State};
 use crate::place_herdr::Herdr;
 use crate::resolve::Index;
@@ -55,26 +56,68 @@ use crate::Args;
 /// The duplication is therefore disposed of by construction rather than by
 /// remembering — the caller that knows the hook has run is the caller that
 /// stops asking.
+///
+/// [`Handover::Custodian`] is the third, and it is a different *job* rather
+/// than a different route to the same one. By the decision of 2026-08-17 on
+/// t-260817-021 an agent can be assigned to a **project**, which is an edge the
+/// model did not have — every other assignment in wsp is agent-to-task — and
+/// what arrives in that slot is not a claimant with a piece of work to finish.
+/// It sequences, directs, reviews and holds the record for everything beneath
+/// it, and stands down when a person says so rather than when something is
+/// done. This reverses the line that used to sit at the one call site below:
+/// *"only a task gives an agent something to be told; a project workspace is a
+/// place to work, not an instruction"*. Under a slot, a project workspace **is**
+/// an instruction, and this is it.
+///
+/// It carries no fetch/no-fetch pair, because a custodian is spawned into its
+/// slot and its `SessionStart` hook has therefore already run with the slot in
+/// place — [`crate::cmd_brief`] draws the custodial brief off the same record.
+/// A *running* agent handed a slot would be the fourth case and would have to
+/// fetch; nothing in wsp does that yet, and inventing the sentence for it here
+/// would be inventing the flow.
 #[derive(Clone, Copy)]
 pub enum Handover {
     Spawned,
     Running,
+    Custodian,
 }
 
 /// What an agent is told about work it has just been handed.
 ///
-/// One definition, two cases: the panel says this to an agent it claims a task
-/// onto, and `spawn` says it to the agent it just started. Two wordings written
-/// in two places would be two contracts.
-pub fn claimed_text(task: &str, how: Handover) -> String {
+/// One definition, three cases: the panel says this to an agent it claims a
+/// task onto, `spawn` says it to the agent it just started, and `spawn
+/// --govern` says the custodial one to an agent it has just put in a project's
+/// slot. Wordings written in three places would be three contracts.
+///
+/// `subject` is a task for the first two and a **project** for the third, which
+/// is the whole of what the new edge comes to.
+pub fn work_order(subject: &str, how: Handover) -> String {
     match how {
         Handover::Spawned => format!(
-            "You have been claimed onto {task}. Your brief is already above: the task, \
+            "You have been claimed onto {subject}. Your brief is already above: the task, \
              what binds it, and what to read. Begin work when you're ready."
         ),
         Handover::Running => format!(
-            "You have been claimed onto {task}. Please run `wsp brief --session`, then begin \
+            "You have been claimed onto {subject}. Please run `wsp brief --session`, then begin \
              work on the task when you're ready."
+        ),
+        // The four things the seat did on the night this was written from, in
+        // the order they were done, and the one thing it must not become. No
+        // task is named because there is not one: what is above this sentence
+        // is the project's brief — what is open beneath it and who is standing
+        // in it — and picking one of those up itself is the failure mode, not
+        // the job.
+        Handover::Custodian => format!(
+            "You are the custodian of the {subject} project. You have not been claimed onto a \
+             task and you should not claim one. Your brief is already above: what {subject} is \
+             for, what is open beneath it, and who else is standing in it. The job is to \
+             sequence what runs next and what waits, to write the direction an arriving agent \
+             needs and no more, to review finished work against the code rather than against \
+             the agent's report, and to hold the record: decisions, corrections, and what must \
+             not close with the task that found it. `wsp flag --seat` is your inbox and `wsp \
+             spawn` puts agents under you. You coordinate rather than authorise, so nothing \
+             waits on your permission. Say what you are doing with `wsp say`, and begin by \
+             reading what is open."
         ),
     }
 }
@@ -376,6 +419,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
     };
 
+    // A slot is on a project, so `--govern` on a task is a sentence with no
+    // meaning rather than a near miss — and the near miss it would otherwise
+    // become is the expensive one: an agent claimed onto a task and told it is
+    // the custodian of everything above it.
+    if args.has("govern") && work.task.is_some() {
+        eprintln!("wsp: --govern seats an agent on a project — name one, or use -p");
+        return 2;
+    }
+
     // Still this machine's paths, deliberately. A project root is a path in the
     // store and `~` expands here, which is right while the machines mirror each
     // other and is exactly what the Linux box breaks; host-qualified roots are
@@ -446,9 +498,40 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
+    // The other assignment: this workspace is the custodian of a project. Done
+    // here, beside the claim and for the same reason it is here rather than
+    // after the agent starts — the agent's `SessionStart` hook runs `wsp
+    // brief`, and a slot recorded a second later is a custodian whose first
+    // sight of itself is a brief about holding nothing.
+    let governing: Option<String> = match args.has("govern") {
+        true => work.project.clone(),
+        false => None,
+    };
+    if let Some(project) = &governing {
+        match workspace_of(&seat) {
+            Some(ws) => {
+                if let Some(was) = cmd_govern::take(store, project, &ws, seat.as_str()) {
+                    println!("  {}", p.dim(&format!("{project} seat taken from {}", was.workspace)));
+                }
+            }
+            // The workspace id is herdr's word and the port has none for it, so
+            // this is the one fact `spawn` cannot get through `place`. Spoken
+            // rather than fatal: the terminal is open and the agent is about to
+            // be told what its job is, and the record is one command away from
+            // inside it.
+            None => eprintln!(
+                "wsp: opened {seat} but could not record the {project} seat — \
+                 run `wsp govern {project}` in it"
+            ),
+        }
+    }
+
+    // A slot is for an agent. `--govern` without `--agent` would record a
+    // position and leave a shell sitting in it, which is a seat that answers
+    // for raised hands and cannot read one.
     let mut started: Option<String> = None;
     let mut told = false;
-    if args.has("agent") {
+    if args.has("agent") || governing.is_some() {
         let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
         let name = work.task.clone().or_else(|| work.project.clone()).unwrap_or_default();
         let how = agent_commands::of(&kind);
@@ -468,16 +551,25 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         {
             Ok(()) => {
                 started = Some(kind.clone());
-                // Only a task gives an agent something to be told. A project
-                // seat is a place to work, not an instruction, and `f` in the
-                // panel is the key that turns one into the other.
-                if let Some(t) = &work.task {
+                // A task gives an agent something to be told, and so — since
+                // t-260817-021 — does a project it is being made custodian of.
+                // A bare project workspace is still what the line here used to
+                // say of all of them: a place to work rather than an
+                // instruction, with `f` in the panel the key that turns one
+                // into the other. What changed is that `--govern` is an
+                // instruction, and it is the custodial one.
+                let order = match (&work.task, &governing) {
+                    (Some(t), _) => Some(work_order(t, Handover::Spawned)),
+                    (None, Some(p)) => Some(work_order(p, Handover::Custodian)),
+                    (None, None) => None,
+                };
+                if let Some(text) = order {
                     // Through the kind rather than through the port. Readiness
                     // is established above, and *how* a sentence reaches an
                     // agent of this kind — its own channel, or the backend
                     // typing at it — is the one decision this file must not
                     // make; see `agent_commands`.
-                    match how.tell(place, &seat, &claimed_text(t, Handover::Spawned)) {
+                    match how.tell(place, &seat, &text) {
                         Ok(()) => told = true,
                         Err(e) => {
                             eprintln!("wsp: agent started but not told: {e}");
@@ -525,10 +617,27 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     }
     // An agent asked for and not started is a failure however well the seat
     // went: the caller wanted somebody working, and there is nobody.
-    if args.has("agent") && started.is_none() {
+    if (args.has("agent") || governing.is_some()) && started.is_none() {
         return 1;
     }
     0
+}
+
+/// The workspace a pane is in, which is the id a slot is recorded against.
+///
+/// The one herdr-shaped question `spawn` asks outside the port. `place::Seat`
+/// is a string wsp is forbidden to parse — the whole point of the handle — and
+/// `place::Seated` has no word for a workspace, because starting and stopping
+/// work never needed one. A slot does: it is keyed on the workspace for the
+/// same reason a claim is, so that an agent cleared and restarted on a new pane
+/// is the same custodian rather than a vacancy.
+fn workspace_of(seat: &Seat) -> Option<String> {
+    crate::herdr::panes()
+        .ok()?
+        .into_iter()
+        .find(|p| p.pane_id == seat.as_str())
+        .map(|p| p.workspace_id)
+        .filter(|w| !w.is_empty())
 }
 
 /// `wsp despawn` — end the agent on a piece of work, and put the work down.
@@ -860,13 +969,39 @@ mod tests {
     /// call rather than a dozen `wsp show`s.
     #[test]
     fn only_the_agent_whose_hook_missed_the_claim_is_asked_to_fetch() {
-        let spawned = claimed_text("t-260815-033", Handover::Spawned);
+        let spawned = work_order("t-260815-033", Handover::Spawned);
         assert!(spawned.contains("t-260815-033"));
         assert!(!spawned.contains("wsp brief"), "the hook has already injected it: {spawned}");
 
-        let running = claimed_text("t-260815-033", Handover::Running);
+        let running = work_order("t-260815-033", Handover::Running);
         assert!(running.contains("t-260815-033"));
         assert!(running.contains("wsp brief --session"), "the whole payload in one call: {running}");
+    }
+
+    /// The third case, and it is a different job rather than a different route
+    /// to the same one.
+    ///
+    /// What it must not say is the thing every other work order says: pick up
+    /// this task and finish it. A custodian that claims work is the failure the
+    /// position was built out of — the seat on the night this came from
+    /// borrowed t-260816-078 to have somewhere to stand, and every surface in
+    /// wsp then described it as an agent working that task.
+    #[test]
+    fn a_custodian_is_told_the_job_rather_than_handed_a_task() {
+        let text = work_order("robustness", Handover::Custodian);
+        assert!(text.contains("custodian of the robustness project"), "{text}");
+        assert!(!text.starts_with("You have been claimed"), "that is the other job: {text}");
+        assert!(text.contains("should not claim"), "and it has to be said: {text}");
+        // The four things the seat actually did, and the one it must not
+        // become. A gate is the failure mode with the widest blast radius —
+        // every agent under it waiting on a round-trip — so it is named.
+        for owed in ["sequence", "direction", "review", "record", "authorise"] {
+            assert!(text.contains(owed), "the work order drops `{owed}`: {text}");
+        }
+        // No fetch. `--govern` records the slot before the agent starts, so its
+        // `SessionStart` hook has already run `wsp brief` with the slot in
+        // place — asking again at request 1 is a whole context re-read.
+        assert!(!text.contains("wsp brief"), "the hook has already injected it: {text}");
     }
 
     /// The work order is ASCII, and it is not a style rule.
@@ -883,8 +1018,8 @@ mod tests {
     /// another unattended spawn to find. Ed's call, 2026-08-17: do not use them.
     #[test]
     fn the_work_order_is_ascii_because_a_spawn_once_hung_on_one_character() {
-        for how in [Handover::Spawned, Handover::Running] {
-            let text = claimed_text("t-260815-033", how);
+        for how in [Handover::Spawned, Handover::Running, Handover::Custodian] {
+            let text = work_order("t-260815-033", how);
             assert!(
                 text.is_ascii(),
                 "non-ASCII in a work order, which is what t-260817-004 was: {text}"
@@ -1186,6 +1321,20 @@ mod tests {
             util::real(&root.display().to_string()),
             "a project seat left the trunk"
         );
+
+        // `--govern` seats an agent on a project, and a task is not one. The
+        // near miss is the expensive one: a claim on a piece of work plus a
+        // sentence telling the agent it is answerable for everything above it,
+        // which is the confusion the slot exists to end. Refused before
+        // anything is opened, so a typo costs nothing.
+        let place = Opens(std::cell::RefCell::new(Vec::new()));
+        let code = place_work(
+            &place,
+            &store,
+            &Args::synth("spawn", &["t-1"], &[("govern", "true"), ("no-focus", "true")]),
+        );
+        assert_eq!(code, 2, "--govern on a task was accepted");
+        assert!(place.0.borrow().is_empty(), "it opened a workspace before refusing");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
