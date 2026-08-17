@@ -490,7 +490,7 @@ pub enum Filler {
 /// rather than an oversight. A running claude and a spec asking for a claude
 /// with one more flag on it are the same filler, because the alternative is a
 /// reconcile that kills somebody's session to restart it with a different
-/// preamble — a change to `cmd_spawn::TRIM` would then close every agent on the
+/// preamble — a change to `agent_commands::TRIM` would then close every agent on the
 /// seat. Flags decide what a *new* agent starts with, and nothing else.
 impl PartialEq for Filler {
     fn eq(&self, other: &Filler) -> bool {

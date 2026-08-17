@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+mod agent_commands;
 mod arrange;
 mod cmd_agent;
 mod cmd_brief;
