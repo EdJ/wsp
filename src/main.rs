@@ -12,6 +12,7 @@ mod arrange;
 mod cmd_agent;
 mod cmd_brief;
 mod cmd_checkout;
+mod cmd_govern;
 mod cmd_install;
 mod cmd_machine;
 mod cmd_mandate;
@@ -320,6 +321,7 @@ fn main() {
         "despawn" => cmd_spawn::despawn(&store, &args),
         "machine" | "machines" => cmd_machine::dispatch(&store, &args),
         "mandate" => cmd_mandate::mandate(&store, &args),
+        "govern" => cmd_govern::govern(&store, &args),
         "release" => cmd_agent::release(&store, &args),
         "pin" => cmd_agent::pin(&store, &args),
         "unpin" => cmd_agent::unpin(&store, &args),
@@ -341,6 +343,7 @@ fn main() {
             println!("named {} pane(s) after the task they hold", r.named);
             if args.has("reap") {
                 println!("ended {} claim(s) whose workspace is gone", r.reaped);
+                println!("stood down {} seat(s) whose workspace is gone", r.stood_down);
             }
             0
         }
@@ -445,6 +448,10 @@ fn help() {
                                     that task, then release the claim — a seat
                                     that will not close keeps its claim
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
+  wsp govern [<proj>] [--clear]     take the coordinating seat for a project:
+                                    raised hands under it arrive here instead of
+                                    on a person's panel, and this pane stops
+                                    reading as an agent that has stalled
   wsp release                       unbind this pane, leaving whatever is in it
   wsp pin <proj> [-w ws]            pin a workspace to a project
   wsp pin --top [-w ws]             pin it outside the tree entirely
@@ -476,10 +483,12 @@ fn help() {
   wsp hook <event>                  herdr event-hook entrypoint
   wsp doctor                        integrity check
   wsp say "…" [--clear]             say where you have got to, on your pane
-  wsp flag <id> ["why"]             raise a hand on a task, on every panel
+  wsp flag <id> ["why"]             raise a hand on a task — at the seat that
+                                    governs it, or on every panel if there is none
   wsp flag <id> --title T --body -  …with a card: a heading and a paragraph
   wsp flag <id> --ask claim         …and a question a keypress answers
-  wsp flag [--clear <id>]           what is raised; --clear lowers one
+  wsp flag [--clear <id>] [--seat]  what is raised, and whose it is; --seat
+                                    narrows it to this seat's own; --clear lowers
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
   wsp adopt [--yes]                 turn live workspaces into tasks

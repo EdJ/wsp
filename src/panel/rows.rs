@@ -833,6 +833,10 @@ pub struct Snapshot {
     /// said why. Machine-local state like the claims beside it, and the one
     /// input here that arrives from outside the person's own hands.
     pub flags: std::collections::BTreeMap<String, serde_json::Value>,
+    /// project id -> seat. Read for one question — whether an idle agent is a
+    /// coordinating seat between agents rather than a worker that has stopped —
+    /// which the panel would otherwise draw as the loudest row on the screen.
+    pub governors: std::collections::BTreeMap<String, serde_json::Value>,
     /// Every pane that exists, ours included — the furniture is dropped in
     /// [`collect`], where the rule about what counts as ours lives.
     ///
@@ -862,6 +866,7 @@ impl Snapshot {
             mandates: store.mandates(),
             claims: store.claims(),
             flags: store.flags(),
+            governors: store.governors(),
             panes,
         }
     }
@@ -936,8 +941,11 @@ pub(super) fn task_rows(
         .collect();
     mine.sort_by_key(|t| {
         let a = agent_for_task(&t.id);
-        let needs_you =
-            a.as_ref().map(|a| a.state == "idle").unwrap_or(false) && t.status() == Status::Doing;
+        let needs_you = crate::cmd_govern::needs_a_person(
+            a.as_ref().map(|a| a.state == "idle").unwrap_or(false),
+            t.status() == Status::Doing,
+            a.as_ref().map(|a| a.seat).unwrap_or(false),
+        );
         task_sort_key(t, a.is_some(), needs_you)
     });
 
@@ -966,8 +974,11 @@ pub(super) fn task_rows(
             }
         }
         let a = agent_for_task(&t.id);
-        let needs_you =
-            a.as_ref().map(|a| a.state == "idle").unwrap_or(false) && t.status() == Status::Doing;
+        let needs_you = crate::cmd_govern::needs_a_person(
+            a.as_ref().map(|a| a.state == "idle").unwrap_or(false),
+            t.status() == Status::Doing,
+            a.as_ref().map(|a| a.seat).unwrap_or(false),
+        );
         rows.push(Row::Task {
             id: t.id.clone(),
             project: t.project.clone(),
@@ -1195,6 +1206,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let as_ref = |a: &AgentRef, project: Option<String>| AgentRef {
         task: bound_task_of_pane(&a.pane),
         project,
+        seat: !crate::cmd_govern::governed_by(&snap.governors, &a.workspace).is_empty(),
         ..a.clone()
     };
 

@@ -101,6 +101,15 @@ pub(crate) struct AgentRef {
     ///
     /// The store's half of the row, like `task` above.
     pub(crate) project: Option<String>,
+    /// Whether this pane's workspace holds a coordinating seat — `wsp govern`.
+    ///
+    /// The store's half again, and it is here rather than being looked up where
+    /// it is read because it changes one existing judgement rather than adding
+    /// a row: an idle agent on a `doing` task is a person being the blocker,
+    /// unless it is a seat, which is idle between the agents it is sequencing.
+    /// See [`crate::cmd_govern::needs_a_person`], which is where that sentence
+    /// is enforced for every surface at once.
+    pub(crate) seat: bool,
 }
 
 impl AgentRef {
@@ -208,6 +217,7 @@ pub(crate) fn read() -> Live {
                 kind: p.agent.clone(),
                 task: None,
                 project: None,
+                seat: false,
             })
             .collect(),
     }

@@ -537,6 +537,31 @@ fn end_work(place: &dyn Place, store: &Store, args: &Args, me: Option<&str>) -> 
         return 2;
     }
 
+    // A governing pane is the one agent that cannot be restarted. Everything
+    // else here is replaceable — despawn and respawn is the ordinary way to
+    // clear a stuck agent — but a seat's whole value is the thread it has been
+    // holding all session, and there is no verb that puts that back.
+    //
+    // A guard on this verb rather than a gate in front of the agents: nothing
+    // under a seat waits on it, and this refusal costs only whoever pointed
+    // despawn at the seat. Fail-open by construction — the record names the
+    // pane the seat started in, so a seat whose agent has already been replaced
+    // stops matching and this says nothing.
+    if !args.has("force") {
+        let governors = store.governors();
+        let held: Vec<String> = governors
+            .iter()
+            .filter(|(_, rec)| rec.get("pane").and_then(|x| x.as_str()) == Some(seat.as_str()))
+            .map(|(proj, _)| proj.clone())
+            .collect();
+        if !held.is_empty() {
+            eprintln!("{} {seat} is the seat for {}", p.yellow("✗"), held.join(" "));
+            eprintln!("  {}", p.dim("the thread it is holding does not come back — `wsp govern --clear` there first"));
+            eprintln!("  {}", p.dim(&format!("wsp despawn --pane {seat} --force   to end it anyway")));
+            return 1;
+        }
+    }
+
     let closed = match place.stop(&seat) {
         Ok(()) => true,
         // Already gone. The first half of the verb is done, however it happened.

@@ -630,6 +630,45 @@ impl Store {
         removed
     }
 
+    // ---- governors --------------------------------------------------------
+    //
+    // A mandate says a workspace may take work in a project. A governor says a
+    // workspace is the *coordination point* for one — where a raised hand goes,
+    // and which agent is sequencing rather than working.
+    //
+    // Keyed on the project rather than on the workspace, which is the one place
+    // this differs from every other record beside it. A pin, a mandate and a
+    // claim are all facts about a workspace and there can be many per project;
+    // there is at most one seat per project, and the question every reader asks
+    // is "who governs this?" rather than "what does this workspace govern".
+    // Keying it the other way would make the cardinality unenforceable and the
+    // lookup a scan, in the one file the panel reads on every tick.
+    //
+    // State rather than store, for the same reason as a claim: the seat is a
+    // live workspace on this host and means nothing tomorrow, while the project
+    // it governs is durable and already in git. The hierarchy is committed; the
+    // agent sitting in it is not.
+
+    /// project id -> governor record: which workspace holds the seat.
+    pub fn governors(&self) -> BTreeMap<String, Value> {
+        match self.read_json("governors.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_governor(&self, project: &str, value: Value) {
+        self.update_json("governors.json", |g| {
+            g.insert(project.to_string(), value);
+        });
+    }
+
+    pub fn clear_governor(&self, project: &str) -> bool {
+        let mut removed = false;
+        self.update_json("governors.json", |g| removed = g.remove(project).is_some());
+        removed
+    }
+
     // ---- raised hands ---------------------------------------------------
     //
     // A flag is an agent asking to be looked at: this task, and here is why.

@@ -3,6 +3,7 @@
 
 use serde_json::json;
 
+use crate::cmd_govern;
 use crate::herdr;
 use crate::model::{Status, Task};
 use crate::resolve::{self, Index};
@@ -584,9 +585,29 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         }
         // Say where it went. A command whose whole effect is on somebody else's
         // screen has to name the screen, or it reads as having done nothing.
-        println!("  {}", p.dim("raised on every panel · x there lowers it"));
+        println!("  {}", p.dim(&addressed(store, &task)));
     }
     0
+}
+
+/// Who a raised hand is addressed to, in one line of receipt.
+///
+/// Addressing, not delivery. Nothing is pushed at the seat: the flag is written
+/// where it always was and every panel still draws it, and what this adds is
+/// the sentence saying whose it is. Pushing would mean prompting a live agent
+/// mid-task — a whole context re-read per interruption, into a session that is
+/// holding the thread on purpose — to save it a poll it was going to make
+/// anyway. That is the gate this is not.
+///
+/// Derived rather than stored, so nothing goes stale. A seat taken after the
+/// hand went up still answers for it, and a seat that stands down hands its
+/// flags to whoever is above it without touching a single flag record.
+fn addressed(store: &Store, task: &Task) -> String {
+    let index = Index::new(store.projects());
+    match cmd_govern::seat_for(&store.governors(), &index, task.project.as_deref()) {
+        Some(s) => format!("raised to the {} seat · {} · x there lowers it", s.project, s.workspace),
+        None => "raised on every panel · x there lowers it".into(),
+    }
 }
 
 /// The panel's mark, borrowed for the receipt so the two agree about what a
@@ -613,13 +634,42 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     let at = |v: &serde_json::Value| v.get("at").and_then(|x| x.as_str()).unwrap_or("").to_string();
     rows.sort_by(|a, b| at(b.1).cmp(&at(a.1)));
 
+    // Whose hands these are. The order stays newest-first — an interruption is
+    // read in the order it arrived, and re-sorting by addressee would bury the
+    // one raised while you were reading the last — so the seat is a mark on the
+    // row instead. `--seat` is for the agent that only wants its own.
+    let index = Index::new(store.projects());
+    let governors = store.governors();
+    let mine = herdr::Env::read()
+        .workspace_id
+        .map(|ws| cmd_govern::governed_by(&governors, &ws))
+        .unwrap_or_default();
+    let only_mine = args.has("seat");
+    // Asked for an inbox from a pane that has no seat. Said plainly, because
+    // "nothing raised for you" and "you are not the seat" look identical from
+    // an empty list, and only one of them is worth acting on.
+    if only_mine && mine.is_empty() {
+        println!("{}", p.dim("this workspace is nobody's seat — wsp flag alone shows them all"));
+        return 0;
+    }
+    let mut shown = 0;
+
     for (id, f) in rows {
+        let task = store.task(id);
+        let seat = task
+            .as_ref()
+            .and_then(|t| cmd_govern::seat_for(&governors, &index, t.project.as_deref()));
+        let held_here = seat.as_ref().map(|s| mine.contains(&s.project)).unwrap_or(false);
+        if only_mine && !held_here {
+            continue;
+        }
+        shown += 1;
         let get = |k: &str| f.get(k).and_then(|x| x.as_str()).unwrap_or("");
         // A flag on a task that has since been retired is a hand raised about
         // nothing. Say so rather than printing a bare id: the fix is to lower
         // it, and nothing else here will.
-        let title = match store.task(id) {
-            Some(t) => t.title,
+        let title = match &task {
+            Some(t) => t.title.clone(),
             None => p.dim("(no such task)").to_string(),
         };
         println!("{} {}  {}", p.red(glyph_flag()), p.bold(id), title);
@@ -634,9 +684,21 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         if held > 0 {
             second.push(util::duration_human(held));
         }
+        // Nothing when there is no seat above it, which is the ordinary case
+        // and already reads as "this is yours" to the person looking at it.
+        if let Some(s) = &seat {
+            second.push(match held_here {
+                true => format!("▣ yours · {}", s.project),
+                false => format!("▣ {} seat · {}", s.project, s.workspace),
+            });
+        }
         if !second.is_empty() {
             println!("  {}", p.dim(&second.join(" · ")));
         }
+    }
+    if shown == 0 {
+        println!("{}", p.dim("nothing raised to this seat"));
+        return 0;
     }
     println!("{}", p.dim("wsp flag --clear <id> lowers one"));
     0
@@ -1239,6 +1301,11 @@ pub struct Reconciled {
     pub named: usize,
     /// Claims dropped because the workspace holding them is gone.
     pub reaped: usize,
+    /// Seats dropped for the same reason. Separate from `reaped` because they
+    /// are not the same loss: a reaped claim frees work for somebody else to
+    /// take, and a swept seat means raised hands stop being addressed to a
+    /// workspace nobody is in.
+    pub stood_down: usize,
 }
 
 /// Returns what it put right.
@@ -1323,7 +1390,8 @@ pub(crate) fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, id: &
 pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
     let mut out = Reconciled::default();
     let claims = store.claims();
-    if claims.is_empty() {
+    let governors = store.governors();
+    if claims.is_empty() && governors.is_empty() {
         return out;
     }
     let Ok(panes) = herdr::panes() else { return out };
@@ -1332,6 +1400,33 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
 
     if reap {
         let answered = answered_by_machine(workspaces.iter().map(|w| w.id.as_str()));
+
+        // A seat whose workspace has gone is worse than no seat: every raised
+        // hand under it goes on being addressed to a workspace nobody is
+        // sitting in, and the brief goes on naming it. Swept here rather than
+        // checked at every read, so the cost lands on the daemon's reap and not
+        // on the panel's tick — and behind the same `may_reap` guard as the
+        // claims, because an empty answer from a machine that did not reply is
+        // what once reaped every binding in the store.
+        for (project, g) in &governors {
+            let get = |k: &str| g.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            if !get("host").is_empty() && get("host") != host {
+                continue;
+            }
+            if !may_reap(&answered, get("workspace")) {
+                continue;
+            }
+            if workspaces.iter().any(|w| w.id == get("workspace")) {
+                continue;
+            }
+            store.clear_governor(project);
+            store.log_event(
+                "governor-cleared",
+                json!({ "project": project, "why": "workspace closed" }),
+            );
+            out.stood_down += 1;
+        }
+
         for (task_id, c) in &claims {
             let get = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("");
             if !get("host").is_empty() && get("host") != host {
@@ -1354,6 +1449,12 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
         // commit that carries them is this one. Nothing is written when
         // nothing was reaped, and `git_commit` is a no-op on that.
         store.git_commit(&format!("wsp: release {} task(s) whose workspace closed", out.reaped));
+    }
+    // Nothing claimed leaves nothing to bind or rename. Checked here rather
+    // than at the top so a store whose only live record is a seat still gets
+    // its dead seats swept.
+    if claims.is_empty() {
+        return out;
     }
     let claims = if out.reaped > 0 { store.claims() } else { claims };
 
@@ -1768,6 +1869,9 @@ pub(crate) struct Wip {
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
     pub pins: std::collections::BTreeMap<String, String>,
+    /// project id -> seat. Read once here rather than per row: the map is small
+    /// and every row asks it the same question.
+    pub governors: std::collections::BTreeMap<String, serde_json::Value>,
     /// Only the panes running an agent: `wip` is about who is working, and a
     /// shell is a person at a terminal rather than work in progress.
     pub agents: Vec<herdr::Pane>,
@@ -1785,6 +1889,7 @@ impl Wip {
             bindings: store.bindings(),
             claims: store.claims(),
             pins: store.pins(),
+            governors: store.governors(),
             agents: if up { herdr::agents().unwrap_or_default() } else { Vec::new() },
             workspaces: if up { herdr::workspaces().unwrap_or_default() } else { Vec::new() },
         }
@@ -1800,6 +1905,9 @@ struct WipRow {
     workspace: String,
     state: String,
     needs_you: bool,
+    /// The projects this pane's workspace is the seat for. Empty for every
+    /// ordinary agent, which is every agent most of the time.
+    seat: Vec<String>,
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
@@ -1832,7 +1940,9 @@ fn wip_rows(w: &Wip) -> Vec<WipRow> {
         );
 
         let idle = a.agent_status == "idle";
-        let needs_you = idle && bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
+        let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
+        let seat = cmd_govern::governed_by(&w.governors, &a.workspace_id);
+        let needs_you = cmd_govern::needs_a_person(idle, doing, !seat.is_empty());
 
         rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),
@@ -1844,6 +1954,7 @@ fn wip_rows(w: &Wip) -> Vec<WipRow> {
             workspace: label.unwrap_or_default(),
             state: a.agent_status.clone(),
             needs_you,
+            seat,
         });
     }
     rows.sort_by(|a, b| a.project.cmp(&b.project).then(a.pane.cmp(&b.pane)));
@@ -1867,7 +1978,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         "agents": rows.iter().map(|r| json!({
             "project": r.project, "task": r.task, "task_id": r.task_id,
             "pane": r.pane, "workspace": r.workspace, "state": r.state,
-            "needs_you": r.needs_you,
+            "needs_you": r.needs_you, "seat": r.seat,
         })).collect::<Vec<_>>(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
         "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
@@ -1907,7 +2018,14 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                 "idle" => p.dim(&util::pad("idle", 8)),
                 other => p.dim(&util::pad(other, 8)),
             };
-            let flag = if r.needs_you { p.yellow("← needs you") } else { String::new() };
+            // A seat says so instead of saying it needs you. The two can never
+            // both be true — [`cmd_govern::needs_a_person`] is what makes them
+            // exclusive — and the column is the same width either way.
+            let flag = match (r.seat.is_empty(), r.needs_you) {
+                (false, _) => p.cyan(&format!("▣ seat · {}", r.seat.join(" "))),
+                (true, true) => p.yellow("← needs you"),
+                (true, false) => String::new(),
+            };
             out.push(format!(
                 "{}  {}  {}  {} {}",
                 util::pad(&r.project, pw),
@@ -3204,6 +3322,7 @@ mod tests {
             bindings,
             claims: std::collections::BTreeMap::new(),
             pins: std::collections::BTreeMap::new(),
+            governors: std::collections::BTreeMap::new(),
             agents: vec![
                 wip_agent("w1:p1", "w1", "working", "wsp"),
                 // Stopped, on a task that is still doing: the ← this view is for.
@@ -3255,6 +3374,43 @@ mod tests {
         w.agents[2].title = String::new();
         let rows = wip_rows(&w);
         assert_eq!(rows.iter().find(|r| r.pane == "w3:p1").unwrap().task, "(unbound)");
+    }
+
+    /// The row that was wrong for a whole night. `w2:p1` is idle on a task that
+    /// is still `doing`, which for a worker means a person has become the
+    /// blocker — and for a seat means it is between the agents it is
+    /// sequencing, which is where a seat spends most of its time. The same
+    /// pane, the same herdr reading, and the opposite answer.
+    #[test]
+    fn a_seat_idle_between_its_agents_does_not_read_as_one_that_has_stalled() {
+        let mut w = wip_world();
+        assert!(wip_rows(&w).iter().find(|r| r.pane == "w2:p1").unwrap().needs_you);
+
+        w.governors.insert(
+            "wsp".into(),
+            json!({ "workspace": "w2", "host": util::hostname() }),
+        );
+        let row = wip_rows(&w).into_iter().find(|r| r.pane == "w2:p1").unwrap();
+        assert!(!row.needs_you, "a seat waiting on its agents is not a person being the blocker");
+        assert_eq!(row.seat, ["wsp"], "and the row says which project it is the seat for");
+
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("seat · wsp"), "{text}");
+        assert!(!text.contains("needs you"), "nobody else here has stopped:\n{text}");
+    }
+
+    /// A seat on the laptop is not a seat the desktop can reach: the record
+    /// names a herdr workspace, and herdr's ids are per machine. Read the other
+    /// way, every agent in that workspace here would stop reading as stalled.
+    #[test]
+    fn a_seat_recorded_on_another_machine_changes_no_row_here() {
+        let mut w = wip_world();
+        w.governors
+            .insert("wsp".into(), json!({ "workspace": "w2", "host": "somewhere-else" }));
+        assert!(
+            wip_rows(&w).iter().find(|r| r.pane == "w2:p1").unwrap().needs_you,
+            "still a stalled agent, because that seat is not here"
+        );
     }
 
     /// herdr silent costs the view its agents and nothing else. The queues

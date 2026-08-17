@@ -261,6 +261,11 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // the one that shows the section, so every other frame goes on saying
         // what the panel says on an ordinary afternoon.
         flags: BTreeMap::new(),
+        // Nobody coordinating, which is the ordinary state and the one the
+        // storyboard is for. A seat changes one judgement on one row — see
+        // [`crate::cmd_govern`] — and a world that had one would be showing
+        // the exception in every frame.
+        governors: BTreeMap::new(),
         panes: agents,
     }
 }

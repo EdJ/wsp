@@ -14,6 +14,7 @@
 use serde_json::json;
 
 use crate::cmd_agent::{self, current_project};
+use crate::cmd_govern;
 use crate::cmd_mandate;
 use crate::herdr;
 use crate::model::Task;
@@ -239,6 +240,10 @@ pub(crate) struct Briefing {
     pub world: overlap::World,
     /// Standing direction for this workspace, if there is any.
     pub mandate: Option<String>,
+    /// Every seat that exists. Composed against, rather than resolved here,
+    /// because which seat answers for this pane depends on the project the
+    /// brief is still working out.
+    pub governors: std::collections::BTreeMap<String, serde_json::Value>,
     /// The store's own rules, already capped.
     pub rules: Option<String>,
     /// Where this pane resolved to. Taken in rather than worked out here: the
@@ -261,6 +266,7 @@ impl Briefing {
         Briefing {
             project: current_project(store, args, &world.index).unwrap_or(None),
             mandate: cmd_mandate::current(store, env.workspace_id.as_deref()),
+            governors: store.governors(),
             rules: rules(store),
             pane: env.pane_id,
             workspace: env.workspace_id,
@@ -301,6 +307,15 @@ pub(crate) struct Brief {
     /// anything — the one thing the brief tells herdr rather than the reader.
     /// `None` when the question does not apply.
     pub looking: Option<bool>,
+    /// The seat that answers for work here, and whether this pane is it.
+    ///
+    /// `None` is the ordinary case — no seat anywhere above this project — and
+    /// it draws nothing at all. That matters more here than anywhere else in
+    /// wsp: the brief is re-read on every request of every session, so a line
+    /// that is present when nobody is coordinating is a line paid tens of
+    /// thousands of times a night for a fact that is always the same.
+    pub seat: Option<(cmd_govern::Seat, bool)>,
+
     /// The `wsp checkout` tree this pane is standing in, when it is in one.
     ///
     /// Worth a line of a brief, which is the most expensive output wsp has —
@@ -496,6 +511,10 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         // no mandate is left alone: an agent that has to ask before it takes
         // anything is waiting on a person, not looking.
         looking: (mine.is_none() && b.mandate.is_some()).then(|| !open.is_empty()),
+        seat: cmd_govern::seat_for(&b.governors, index, b.project.as_deref()).map(|s| {
+            let mine = b.workspace.as_deref() == Some(s.workspace.as_str());
+            (s, mine)
+        }),
         // A path rule rather than a question for git, so this stays free in the
         // one command a session-start hook runs.
         own_tree: b
@@ -535,6 +554,9 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
         "pane": b.pane,
         "workspace": b.workspace,
         "mandate": r.mandate,
+        "seat": r.seat.as_ref().map(|(s, mine)| json!({
+            "project": s.project, "workspace": s.workspace, "pane": s.pane, "mine": mine,
+        })),
         "task": r.mine.as_ref().map(|t| t.json()),
         "decisions": r.decided.iter().map(|(w, t)| json!({ "date": w, "text": t })).collect::<Vec<_>>(),
         "open": r.open.iter().map(|(t, _)| t.json()).collect::<Vec<_>>(),
@@ -720,6 +742,23 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // agent to go looking for permission.
     if let Some(m) = &r.mandate {
         row("mandate", format!("{}  {}", p.bold(m), p.dim("take work here without asking")));
+    }
+
+    // Who is coordinating, when anybody is. Beside the mandate because the two
+    // are the same kind of fact — what this pane is allowed to do without
+    // asking, and who it is working alongside — and above the work for the same
+    // reason. Fifteen tokens, and only in a session that has a seat above it:
+    // it changes what an agent does with a question, from sitting on it until
+    // somebody looks at a panel to raising it at another agent that is watching
+    // for exactly that.
+    if let Some((s, mine)) = &r.seat {
+        row(
+            "seat",
+            match mine {
+                true => format!("{}  {}", p.bold(&s.project), p.dim("yours — wsp flag --seat is your inbox")),
+                false => format!("{}  {}", p.bold(&s.project), p.dim("coordinating here · wsp flag <id> reaches it")),
+            },
+        );
     }
 
     // What you are on. `—` rather than silence: an agent with no task is a
@@ -972,12 +1011,58 @@ mod tests {
                 claims: std::collections::BTreeMap::new(),
             },
             mandate: Some("wsp".into()),
+            // Nobody coordinating. The ordinary state, and the baseline the
+            // seat tests below add a seat to: the brief has to be identical
+            // without one.
+            governors: std::collections::BTreeMap::new(),
             rules: Some("commit through your own index".into()),
             project: Some("wsp".into()),
             pane: Some("w1:p1".into()),
             workspace: Some("w1".into()),
             cwd: Some("/home/ed/claude/wsp".into()),
         }
+    }
+
+    /// The brief is re-read on every request of every session, so the test that
+    /// matters about the seat line is the one about it not being there. No
+    /// governor anywhere is the normal state and it has to cost nothing —
+    /// literally nothing, byte for byte.
+    #[test]
+    fn a_brief_with_nobody_coordinating_says_nothing_about_a_seat() {
+        let text = brief_lines(&compose(&briefing()), &plain(), Depth::Normal).join("\n");
+        assert!(!text.contains("seat"), "{text}");
+    }
+
+    /// And when there is one, it is one line naming the project rather than the
+    /// workspace: an agent does not address a raised hand at a herdr id, it
+    /// raises it on a task and the chain decides where that lands.
+    #[test]
+    fn a_seat_above_this_pane_is_named_in_one_line() {
+        let mut b = briefing();
+        b.governors.insert(
+            "wsp".into(),
+            json!({ "workspace": "w9", "host": util::hostname() }),
+        );
+        let r = compose(&b);
+        assert_eq!(r.seat.as_ref().map(|(s, mine)| (s.project.as_str(), *mine)), Some(("wsp", false)));
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("wsp flag <id> reaches it"), "{text}");
+    }
+
+    /// The seat reading its own brief is told it is the seat, and told where
+    /// its inbox is — which is the one thing it cannot work out from a pane it
+    /// is already sitting in.
+    #[test]
+    fn the_seat_reading_its_own_brief_is_told_it_is_the_seat() {
+        let mut b = briefing();
+        b.governors.insert(
+            "wsp".into(),
+            json!({ "workspace": "w1", "host": util::hostname() }),
+        );
+        let r = compose(&b);
+        assert_eq!(r.seat.as_ref().map(|(_, mine)| *mine), Some(true), "w1 is this pane's workspace");
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("wsp flag --seat"), "{text}");
     }
 
     /// The three facts a session cannot start without, in the order it needs
@@ -1075,6 +1160,7 @@ mod tests {
                 claims: std::collections::BTreeMap::new(),
             },
             mandate: None,
+            governors: std::collections::BTreeMap::new(),
             rules: None,
             project: None,
             pane: None,

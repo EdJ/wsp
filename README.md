@@ -1669,6 +1669,72 @@ or when the backlog runs dry, which the brief says in as many words. A mandate
 with no end is standing permission, which is not what "go work on project x"
 means.
 
+## The seat
+
+```sh
+wsp govern robustness    # this workspace coordinates robustness
+wsp govern               # who is seated, and which seat answers for here
+wsp govern --clear       # stand down
+```
+
+On 2026-08-17 one workspace ran twelve agents across the `robustness` backlog
+for a night, and it worked. It worked by convention: the seat was an ordinary
+claim on an ordinary task that happened to be the artefact it was writing, so
+nothing in wsp could tell the agent *sequencing* the work from the agents doing
+it. Two things went wrong all night, and they are what this verb removes.
+
+**`wsp wip` drew the seat as an agent that needs you.** Idle process on a
+`doing` task means a person has become the blocker — for a worker. A seat is
+idle *between* the agents it is waiting on, which is most of the time, so the
+loudest row on the panel was the one that never meant anything. Now it reads:
+
+```
+PROJECT   TASK                                    PANE     STATE
+robustness  build a design artefact                w1:p6   idle     ▣ seat · robustness
+wsp         the seam under the panel               w2:p1   idle     ← needs you
+```
+
+**A raised hand had nowhere to go.** `wsp flag` said *raised on every panel*,
+because a person's screen was the only destination there was. With a seat, the
+receipt names it, `wsp flag` marks whose each hand is, and `wsp flag --seat` is
+the seat's own inbox:
+
+```
+▲ t-260816-094  reconcile erases every agent's sentence
+  can I take this? · w4:p1 · 6m · ▣ yours · robustness
+```
+
+**Per hierarchy, like everything else that is inherited.** `wsp` has a seat,
+`robustness` has its own, a sub-project may have one. A hand raised on a `data`
+task asks `data`, then `robustness`, then `wsp`, and takes the first answer —
+so there is no escalation step, only a walk that does not stop at a level with
+nobody in it. **The chain always terminates, because the person is the governor
+of last resort**: nothing above it means the flag is raised on every panel,
+which is exactly what happens today.
+
+That is also the whole answer to *what if there is no seat*, which is the normal
+state. No governor anywhere is one missing file and one empty map, and every
+output in this tree is byte for byte what it was — including `wsp brief`, which
+draws the `seat` line only when there is a seat above the pane reading it. The
+brief is re-read on every request of every session, so a line that is present
+when nobody is coordinating is paid tens of thousands of times a night for a
+fact that never changes.
+
+**A coordination point, not an approval gate.** No verb consults a seat before
+acting. A governor changes who is *expected to look* at a raised hand and how a
+seat is *drawn*, and changes nothing about what any agent may do — a gate here
+would put a round-trip in front of every agent for the benefit of none. The one
+guard runs the other way: `wsp despawn` refuses to end a governing pane without
+`--force`, because the seat is the one agent whose thread does not come back,
+and that refusal costs the seat rather than anybody under it.
+
+The record is keyed on the **project**, which is the one place this differs
+from the pins, mandates and claims beside it. Those are facts about a workspace
+and there can be many per project; there is at most one seat per project, and
+every reader asks *who governs this?* rather than *what does this workspace
+govern*. It is state rather than store for the same reason a claim is: the
+hierarchy is committed and durable, and the agent sitting in it is neither.
+
 ## Moving between tasks
 
 One agent works several tasks in a sitting, so `claim` is also the verb for
@@ -2473,6 +2539,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_checkout.rs` | a working tree per task, and landing it back on the trunk |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
+| `src/cmd_govern.rs` | the coordinating seat: who answers for a project's raised hands |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
@@ -2492,7 +2559,8 @@ fast builds are a feature here, because a session-start hook runs this binary.
 
 - **Status is work state, not process state.** herdr's `idle`/`working` describes
   the process; `doing`/`blocked`/`review` describes the work. `wsp wip` flags the
-  gap between them — process-idle on a `doing` task means a human is the blocker.
+  gap between them — process-idle on a `doing` task means a human is the blocker,
+  unless the pane holds a seat (`wsp govern`), which is idle between its agents.
 - **The focused panel refreshes at 250 ms; the rest at 30 s.** Both the store
   stat and the two socket calls sit behind that gate, so twenty idle panels do
   no work between refreshes while the one you are looking at feels immediate.
