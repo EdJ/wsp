@@ -617,6 +617,29 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // The session the agent is running under, recorded now that there is one.
+    //
+    // The claim above ran *before* `start` — that ordering is this file's and is
+    // deliberate, because the agent reads the claim in its `SessionStart` brief
+    // — so the binding it wrote could not carry a session, and until 2026-08-17
+    // none ever did. This is the first moment anything can, and it is the moment
+    // the value is cheapest: the backend has just been asked whether the agent
+    // is ready, so it plainly has an opinion about what is in the seat.
+    //
+    // Best-effort, and silent. A backend that cannot say yet — herdr's detection
+    // lags a launch by a second or so — leaves the field empty and the daemon's
+    // next `sync` fills it, which is why nothing here waits or complains.
+    if started.is_some() {
+        if let Ok(rows) = place.census() {
+            cmd_agent::learn_sessions(
+                store,
+                rows.iter()
+                    .filter(|r| r.seat == seat)
+                    .map(|r| (r.seat.as_str(), r.session.as_str())),
+            );
+        }
+    }
+
     if args.json() {
         println!(
             "{}",

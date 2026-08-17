@@ -1,7 +1,9 @@
 //! Agent binding, context resolution, and the views that join the store to
 //! herdr's live panes.
 
-use serde_json::json;
+use std::collections::BTreeMap;
+
+use serde_json::{json, Value};
 
 use crate::cmd_govern;
 use crate::herdr;
@@ -1059,7 +1061,6 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     };
 
     let env = herdr::Env::read();
-    let session = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
 
     // Claiming on behalf of another pane — from the panel, say — means the
     // environment describes the caller, not the target. Ask herdr what that
@@ -1073,6 +1074,20 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         .filter(|w| !w.is_empty())
         .or_else(|| env.workspace_id.clone())
         .unwrap_or_default();
+
+    // The session in the seat, from the party that knows. This read
+    // `CLAUDE_SESSION_ID` out of the caller's own environment until 2026-08-17,
+    // and Claude Code does not set that variable — so every binding this store
+    // had ever written carried `""`, and nothing noticed because nothing read
+    // it. The same objection as the workspace above applies twice over: a claim
+    // made from the panel would have recorded the *panel's* session for
+    // somebody else's seat. herdr reports `agent_session` on a `pane.list` row
+    // (recorded against 0.7.5, protocol 17), so the answer is already in hand.
+    //
+    // Empty here is the honest answer and the ordinary one: `spawn` claims
+    // before it starts the agent, so at this instant the seat is usually still
+    // a shell. [`learn_sessions`] is what fills it once there is a session.
+    let session = target.as_ref().map(|p| p.session_id.clone()).unwrap_or_default();
     let cwd = match &target {
         Some(p) if !p.cwd.is_empty() => p.cwd.clone(),
         _ => std::env::current_dir().map(|c| util::contract(&c)).unwrap_or_default(),
@@ -1351,6 +1366,91 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         }
     }
     0
+}
+
+/// What a backend reading teaches about the sessions in seats already bound.
+///
+/// **A session id cannot be recorded when the claim is made, and that is the
+/// whole reason this exists rather than one line in [`claim`].** `spawn`'s order
+/// is workspace, claim, agent, and the claim has to land first because the agent
+/// reads it in the `SessionStart` brief on its way in. So at the instant the
+/// binding is written the seat is still a shell, there is no session, and every
+/// binding written by a spawn is written inside that window. Fixing where
+/// `claim` reads from is necessary — it was reading the *caller's* environment —
+/// and on its own it would have left the field empty for every spawned agent,
+/// which is all of them.
+///
+/// The two rules, and both are the point.
+///
+/// **Silence is not a correction.** A row carrying no session leaves the
+/// recorded one alone. A pane whose agent has died reports no `agent_session`,
+/// and that is the moment the id is worth the most: it is what `claude --resume`
+/// needs to bring the same session back, which is what `wsp-073` buys a remote
+/// agent for the price of a dropped ssh. Writing `""` over it would delete the
+/// fact at the instant it became useful. Same judgement `sync` already makes
+/// about a machine that did not answer, one field further in.
+///
+/// **A different session is a correction, and is taken.** `/clear`, a restart by
+/// hand and a resume that mints a fresh id all leave a seat holding a session
+/// that is not the recorded one, and the backend is the party that knows. A
+/// recorded id that no longer names the agent in the seat is worse than none:
+/// it resumes the wrong conversation.
+fn sessions_learned<'a>(
+    bindings: &BTreeMap<String, Value>,
+    seen: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    seen.filter(|(_, session)| !session.trim().is_empty())
+        .filter_map(|(seat, session)| {
+            // An unbound pane is not this function's business — a session in a
+            // seat nobody has claimed anything in is `reconcile`'s to notice, if
+            // it is anybody's. A binding with no such key at all reads as empty
+            // and is therefore learned rather than skipped: `adopt` writes one
+            // of those every time, so that is a live shape and not a defence
+            // against an imagined store.
+            let b = bindings.get(seat)?;
+            let had = b.get("agent_session_id").and_then(|v| v.as_str()).unwrap_or("");
+            (had != session).then(|| (seat.to_string(), session.to_string()))
+        })
+        .collect()
+}
+
+/// Record against each bound seat the session the backend says is sitting in it.
+///
+/// Called from wherever a backend reading is already in hand — `sync`, which has
+/// the pane list every tick, and `spawn`, which asks once the moment its agent
+/// is ready. Neither pays a round-trip for it. Returns how many bindings
+/// changed, which is zero on every tick after the one where an agent started.
+///
+/// The event is logged because it is the only place a *history* of sessions
+/// against a task can come from: a binding holds one at a time, and an agent
+/// that is cleared and resumed twice leaves three. `render-061` wants exactly
+/// that list, and this is where it accrues without being built.
+pub fn learn_sessions<'a>(store: &Store, seen: impl Iterator<Item = (&'a str, &'a str)>) -> usize {
+    // Read unlocked, because the expensive half is the caller's backend reading
+    // and this is only deciding whether there is anything to write at all.
+    let learned = sessions_learned(&store.bindings(), seen);
+    if learned.is_empty() {
+        return 0;
+    }
+    store.locked(|| {
+        // Re-read inside the lock: a claim landing between the two readings has
+        // rebound this pane to another task, and the session belongs to the
+        // agent in the seat either way — but the rest of the record is now
+        // somebody else's and must not be written back from the stale copy.
+        let bindings = store.bindings();
+        for (seat, session) in &learned {
+            let Some(mut b) = bindings.get(seat).cloned() else { continue };
+            let task = b.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let Some(o) = b.as_object_mut() else { continue };
+            o.insert("agent_session_id".to_string(), json!(session));
+            store.set_binding(seat, b);
+            store.log_event(
+                "session-learned",
+                json!({ "id": task, "pane": seat, "session": session }),
+            );
+        }
+    });
+    learned.len()
 }
 
 /// Rebuild bindings from claims and whatever herdr currently has open.
@@ -4004,4 +4104,92 @@ mod tests {
         assert_eq!(standing_in(&h), None, "and nowhere is an answer");
     }
 
+    /// A store of bindings, in the shape `claim`, `reconcile` and `adopt`
+    /// actually write them — including `adopt`'s, which carries no
+    /// `agent_session_id` key at all.
+    fn bound(rows: &[(&str, &str, Option<&str>)]) -> BTreeMap<String, Value> {
+        rows.iter()
+            .map(|(pane, task, session)| {
+                let mut b = json!({ "task_id": task, "pane_id": pane });
+                if let Some(s) = session {
+                    b["agent_session_id"] = json!(s);
+                }
+                (pane.to_string(), b)
+            })
+            .collect()
+    }
+
+    /// The defect, at the line that decides it: every binding this store has
+    /// ever written carried `""`, because a claim is made before the agent that
+    /// would have a session exists. So the empty field is not a failure to
+    /// record — it is the state a seat is in between the claim and the agent,
+    /// and this is the step that ends it.
+    #[test]
+    fn a_seat_claimed_before_its_agent_existed_learns_the_session_when_one_appears() {
+        let store = bound(&[("w1:p1", "robustness-060", Some(""))]);
+
+        // Between claim and start: herdr has a pane and nothing in it.
+        let nothing = sessions_learned(&store, [("w1:p1", "")].into_iter());
+        assert!(nothing.is_empty(), "no agent, no session, nothing to write");
+
+        // The agent comes up and herdr says which session it is.
+        let learned = sessions_learned(&store, [("w1:p1", "309b2e2c")].into_iter());
+        assert_eq!(learned, vec![("w1:p1".to_string(), "309b2e2c".to_string())]);
+
+        // An `adopt`ed binding has no such key and is in exactly the same
+        // position, so absence has to read as empty rather than as "skip".
+        let adopted = bound(&[("w1:p1", "robustness-060", None)]);
+        assert_eq!(sessions_learned(&adopted, [("w1:p1", "309b2e2c")].into_iter()).len(), 1);
+    }
+
+    /// **Silence is not a correction**, and this is the reading that would
+    /// destroy the whole point of the field. A pane whose agent has died carries
+    /// no `agent_session`, and that is precisely when the id matters: it is what
+    /// `claude --resume` needs to bring the same session back after an ssh drops
+    /// (`wsp-073`). Writing the empty string over it would delete the fact at the
+    /// instant it became useful — the same shape as `sync` reaping every binding
+    /// on one pane list that timed out.
+    #[test]
+    fn a_seat_whose_agent_died_keeps_the_session_it_was_last_seen_with() {
+        let store = bound(&[("w1:p1", "robustness-060", Some("309b2e2c"))]);
+
+        assert!(
+            sessions_learned(&store, [("w1:p1", "")].into_iter()).is_empty(),
+            "a dead agent's silence must not erase the id a resume is keyed on"
+        );
+        assert!(
+            sessions_learned(&store, [("w1:p1", "   ")].into_iter()).is_empty(),
+            "and a blank one is silence too"
+        );
+    }
+
+    /// A *different* session is a correction and is taken. `/clear` mints a new
+    /// id inside the same process, and a restart by hand mints one in the same
+    /// pane — so a recorded id can stop naming the agent that is sitting there,
+    /// and a stale one is worse than none because it resumes the wrong
+    /// conversation.
+    #[test]
+    fn a_seat_now_holding_another_session_is_corrected_to_it() {
+        let store = bound(&[("w1:p1", "robustness-060", Some("309b2e2c"))]);
+
+        let learned = sessions_learned(&store, [("w1:p1", "f1487db7")].into_iter());
+        assert_eq!(learned, vec![("w1:p1".to_string(), "f1487db7".to_string())]);
+
+        // And the ordinary tick, where nothing has changed, writes nothing:
+        // `sync` runs this every 20s against every pane on the machine.
+        let same = sessions_learned(&store, [("w1:p1", "309b2e2c")].into_iter());
+        assert!(same.is_empty(), "a store write per tick per pane is not a projection");
+    }
+
+    /// Only seats wsp has bound. herdr reports a session for every agent on the
+    /// machine — a colleague's pane, the governor, a `claude` somebody started
+    /// by hand — and none of those is a binding this may invent.
+    #[test]
+    fn a_session_in_a_seat_wsp_has_not_bound_teaches_it_nothing() {
+        let store = bound(&[("w1:p1", "robustness-060", Some(""))]);
+        let seen = [("w1:p1", "309b2e2c"), ("w9:p1", "77fa398b")];
+
+        let learned = sessions_learned(&store, seen.into_iter());
+        assert_eq!(learned, vec![("w1:p1".to_string(), "309b2e2c".to_string())]);
+    }
 }

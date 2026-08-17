@@ -683,10 +683,23 @@ fn pane_json(spot: &Spot) -> Value {
     if !spot.label.is_empty() {
         v["label"] = json!(spot.label);
     }
-    if !spot.session.is_empty() {
-        // The shape a session arrives in, which is what `herdr::parse_pane`
-        // digs `session_id` out of.
-        v["agent_session"] = json!({ "source": "wsp", "agent": agent.unwrap_or(""), "kind": "id", "value": spot.session });
+    // The shape a session arrives in, which is what `herdr::parse_pane` digs
+    // `session_id` out of — and **only while there is an agent to have one**.
+    //
+    // Recorded 2026-08-17 in a sandbox session, herdr 0.7.5: a Claude Code was
+    // spawned into `w1:p1`, herdr reported `agent_session.value`, the process
+    // was killed, and the very next `pane.list` gave `agent_status: "unknown"`
+    // with no `agent` and no `agent_session` at all. herdr's own
+    // `session.json` had dropped the key too, so it does not come back after a
+    // restart either — the persistence is of a *live* agent's session and not
+    // of the fact that a session once ran there.
+    //
+    // That is the whole reason `cmd_agent::sessions_learned` refuses to treat
+    // an absent session as a correction: the moment wsp most needs the id is
+    // the moment the backend stops offering it.
+    if let (Some(a), false) = (agent, spot.session.is_empty()) {
+        v["agent_session"] =
+            json!({ "source": "wsp", "agent": a, "kind": "id", "value": spot.session });
     }
     if !spot.tokens.is_empty() {
         v["tokens"] = Value::Object(spot.tokens.iter().map(|(k, x)| (k.clone(), json!(x))).collect());
@@ -2069,7 +2082,10 @@ mod tests {
         let stage = Stage::of(vec![
             Spot::agent("w1:p1", "claude", "t-1", State::Starting).labelled("one").on("w1", "w1:t1"),
             Spot::agent("w1:p2", "claude", "t-2", State::Working).labelled("two").on("w1", "w1:t1"),
-            Spot::agent("w2:p1", "claude", "t-3", State::Gone).labelled("three").on("w2", "w2:t1"),
+            Spot::agent("w2:p1", "claude", "t-3", State::Gone)
+                .session("s-3")
+                .labelled("three")
+                .on("w2", "w2:t1"),
             Spot::empty("w2:p2").labelled("a shell").on("w2", "w2:t1"),
         ]);
         let fake = Fake::bind(dir.join("herdr.sock"), stage).unwrap();
@@ -2082,6 +2098,13 @@ mod tests {
         assert_eq!(panes[0].agent_status, "idle", "starting reads as idle from a listing");
         assert_eq!(panes[1].agent_status, "working");
         assert_eq!(panes[2].agent, "", "an agent that has gone leaves a pane that looks like a shell");
+        // And it takes its session with it, recorded against a live herdr on
+        // 2026-08-17 by killing a spawned Claude Code and reading the next
+        // `pane.list`. This is the reading `cmd_agent::sessions_learned` must
+        // not act on: it is silence, not a correction, and treating it as one
+        // would erase the id `claude --resume` needs at the one moment it is
+        // wanted.
+        assert_eq!(panes[2].session_id, "", "a dead agent's pane offers no session id");
         assert_eq!(panes[3].agent_status, "unknown");
 
         // …and `agent.list` is the narrower question, which a gone agent is not

@@ -104,7 +104,18 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             let answered =
                 crate::cmd_agent::answered_by_machine(live.iter().map(|s| s.as_str()));
             let keep = kept_bindings(&live, bindings.keys(), &answered);
-            store.reap_bindings(&keep)
+            let dropped = store.reap_bindings(&keep);
+            // The one reading of herdr that happens on every tick, and it
+            // already carries `agent_session` on the rows that have one. A
+            // binding cannot record the session at the moment it is written —
+            // `spawn` claims before it starts the agent — so this is what makes
+            // the field true rather than merely present. After the reap, so a
+            // binding about to be dropped is not written to first.
+            crate::cmd_agent::learn_sessions(
+                store,
+                panes.iter().map(|p| (p.pane_id.as_str(), p.session_id.as_str())),
+            );
+            dropped
         }
     };
     let bindings = if reaped > 0 { store.bindings() } else { bindings };
