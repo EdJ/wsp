@@ -1937,6 +1937,51 @@ mod tests {
         assert!(!read(&starting).will_take_a_prompt(), "the port would tell a caller to prompt a banner");
     }
 
+    /// The launch window is something [`Stage::unnamed`] *does*, not something
+    /// it *is* — so a stage of agents that are already up is unaffected by it
+    /// being on by default.
+    ///
+    /// Worth pinning because the default is the risky half of that change: every
+    /// existing fixture builds its seats with agents already in them and never
+    /// calls `agent.start`, so if the window were a property of a seat rather
+    /// than of a start, turning it on would have made the fake disagree with a
+    /// herdr that finished launching an hour ago. The countdown is armed by
+    /// `agent.start` and by nothing else, which is what these two readings say.
+    #[test]
+    fn a_stage_of_agents_that_are_already_up_never_enters_the_launch_window() {
+        let _env = util::env_lock();
+        let dir = scratch("already-up");
+        let stage = Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]);
+        assert!(stage.unnamed > 0, "the window is off, and this asserts nothing");
+        let fake = Fake::bind(dir.join("herdr.sock"), stage).unwrap();
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let read = || {
+            let v = herdr::call("agent.get", json!({ "target": "w1:p1" })).expect("the fake answered");
+            herdr::parse_pane(v.get("agent").expect("a record"))
+        };
+        assert_eq!(read().agent, "claude", "a seat nobody started went blind");
+        assert_eq!(read().agent, "claude", "…and again, so this is not a countdown running out");
+
+        // Armed by a start and by nothing else, so the same seat read *after*
+        // one is in the window. The pair is the field: same stage, same seat,
+        // and the only thing between the two readings is `agent.start`.
+        herdr::call("agent.start", json!({ "pane_id": "w1:p1", "kind": "claude", "name": "t-1" }))
+            .expect("started");
+        let coming_up = read();
+        assert_eq!(coming_up.agent, "", "the launch window named an agent");
+        assert_eq!(coming_up.launch_pending, Some(true));
+        assert_eq!(
+            crate::place_herdr::state_of_agent(&coming_up),
+            State::Empty,
+            "which wsp reads as an empty seat, and that is the whole of t-260817-010"
+        );
+
+        std::env::remove_var("HERDR_SOCKET_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Which readings can tell a starting agent from an idle one, recorded
     /// rather than reasoned about — because `place.rs` reasons about it and
     /// gets it half right.
