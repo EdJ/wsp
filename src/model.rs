@@ -131,6 +131,18 @@ pub struct Project {
     pub roots: Vec<String>,
     pub status: String,
     pub brief: String,
+    /// The prefix this project's task ids carry, empty when it is just the
+    /// slug. See [`Project::code`] for why it is stored empty rather than
+    /// filled in.
+    pub code_raw: String,
+    /// Highest number this project has handed out — a hint, not the truth.
+    ///
+    /// [`crate::store::Store::alloc_task_id`] reads it to skip the directory
+    /// scan and then settles the race with `O_EXCL` regardless, so a `seq` that
+    /// is stale, missing, or wrong costs a scan and never a duplicate id. That
+    /// is the whole reason it can live here, in a file two machines might both
+    /// be writing, rather than under a lock.
+    pub seq: usize,
     pub body: String,
 }
 
@@ -144,6 +156,22 @@ impl Project {
         }
     }
 
+    /// The prefix task ids in this project take: the code if one is set, and
+    /// the slug otherwise.
+    ///
+    /// Defaulting here rather than at write time keeps "no code set" and "code
+    /// set to the slug" the same state on disk. They behave identically, and a
+    /// project that stored its slug in `code:` would silently stop tracking a
+    /// slug that later changed — which is a thing that cannot happen today but
+    /// is exactly what t-260817-025 exists to make possible.
+    pub fn code(&self) -> &str {
+        if self.code_raw.is_empty() {
+            &self.id
+        } else {
+            &self.code_raw
+        }
+    }
+
     pub fn from_doc(doc: &Doc, fallback_id: &str) -> Project {
         let id = doc.opt("id").unwrap_or_else(|| fallback_id.to_string());
         Project {
@@ -154,6 +182,8 @@ impl Project {
             roots: doc.list("roots"),
             status: doc.opt("status").unwrap_or_else(|| "active".into()),
             brief: doc.str("brief"),
+            code_raw: doc.opt("code").unwrap_or_default(),
+            seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             body: doc.body.clone(),
         }
     }
@@ -167,6 +197,8 @@ impl Project {
         d.set_list("roots", &self.roots);
         d.set_str("status", &self.status);
         d.set_str("brief", &self.brief);
+        d.set_str("code", &self.code_raw);
+        d.set_str("seq", &self.seq.to_string());
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d

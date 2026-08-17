@@ -965,13 +965,15 @@ pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, 
 
 /// What you would type to mean this task, and no more of it than you have to.
 ///
-/// `t-260815-004` is thirteen columns of a pane that is thirty wide, and eleven
-/// of them are the same on every row. The suffix is what the CLI resolves —
-/// `wsp start 004` — so the suffix is what the panel shows, unless another
-/// open task shares it, in which case the date is the part that separates them
-/// and the whole thing has to be typed anyway.
+/// The suffix is what the CLI resolves — `wsp start 004` — so the suffix is
+/// what the panel shows, unless another open task shares it, in which case the
+/// prefix is the part that separates them and the whole thing has to be typed
+/// anyway. Under dated ids the shared part was the date and was identical on
+/// nearly every row, which is what made showing it wasteful; under per-project
+/// ids it is the project, and a pane usually holds one — so the full id is
+/// shorter than it was and appears more often, both of which are improvements.
 fn ident_of(tasks: &[Task], task: &Task) -> String {
-    let full = || task.id.strip_prefix("t-").unwrap_or(&task.id).to_string();
+    let full = || task.id.clone();
     // A bare suffix resolves against *open* tasks only, so a finished one has
     // to be named in full — showing `014` for a task `wsp show 014` cannot
     // find would be worse than showing nothing.

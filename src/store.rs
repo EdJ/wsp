@@ -24,6 +24,46 @@ thread_local! {
     static DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
+/// The id prefix for a task filed nowhere.
+///
+/// Reserved: no project may take it as a slug or a code, because a project that
+/// did would share a numbering space with the inbox and the two would hand out
+/// the same id. [`Store::code_taken`] is where that is enforced.
+pub const INBOX_CODE: &str = "inbox";
+
+/// What a user-typed id came to, or why it came to nothing.
+///
+/// `Ambiguous` exists because "no such task" was a lie the moment ids stopped
+/// being unique per day. A bare `022` matched two open tasks, so the lookup
+/// returned nothing and every caller printed `no such task 022` — about a
+/// suffix that names two, one of which Ed then spent time reading. Under
+/// per-project ids a bare number is ambiguous *more* often, not less, so the
+/// answer has to be the candidates rather than a shrug.
+pub enum Found {
+    One(Box<Task>),
+    Ambiguous(Vec<Task>),
+    Nothing,
+}
+
+impl Found {
+    /// The message to print when this is not a single task, ready to hand to
+    /// `eprintln!`. `None` when it is one and there is nothing to say.
+    pub fn why(&self, needle: &str) -> Option<String> {
+        match self {
+            Found::One(_) => None,
+            Found::Nothing => Some(format!("wsp: no such task `{needle}`")),
+            Found::Ambiguous(ts) => {
+                let mut s = format!("wsp: `{needle}` names {} tasks:", ts.len());
+                for t in ts {
+                    let title: String = t.title.chars().take(48).collect();
+                    s.push_str(&format!("\n  {}  {}", t.id, title));
+                }
+                Some(s)
+            }
+        }
+    }
+}
+
 pub struct Store {
     pub root: PathBuf,
     pub state: PathBuf,
@@ -246,29 +286,74 @@ impl Store {
         self.tasks_dir().join(format!("{id}.md"))
     }
 
-    /// Resolve a user-typed id: exact, then bare suffix (`003`), then unique
-    /// case-insensitive title substring.
-    pub fn find_task(&self, needle: &str) -> Option<Task> {
+    /// Resolve a user-typed id: exact, then a retired id, then bare suffix
+    /// (`003`), then unique case-insensitive title substring.
+    ///
+    /// The retired-id step is what keeps three days of git history, every
+    /// agent's notes and Ed's own memory working after the renumbering. See
+    /// [`Store::renamed_ids`].
+    pub fn resolve_task(&self, needle: &str) -> Found {
         if let Some(t) = self.task(needle) {
-            return Some(t);
+            return Found::One(Box::new(t));
+        }
+        if let Some(now) = self.renamed_ids().get(needle) {
+            if let Some(t) = self.task(now) {
+                return Found::One(Box::new(t));
+            }
         }
         let all = self.tasks();
         let open: Vec<&Task> = all.iter().filter(|t| t.status().is_open()).collect();
 
-        let by_suffix: Vec<&&Task> = open.iter().filter(|t| t.id.ends_with(needle)).collect();
-        if by_suffix.len() == 1 {
-            return Some((*by_suffix[0]).clone());
+        // A suffix must land on a `-` boundary. Without that `022` also
+        // matched `wsp-1022`, and — worse under the new scheme — `rob` matched
+        // every id in a project whose code ended in those letters.
+        let by_suffix: Vec<Task> = open
+            .iter()
+            .filter(|t| t.id == needle || t.id.strip_suffix(needle).is_some_and(|h| h.ends_with('-')))
+            .map(|t| (*t).clone())
+            .collect();
+        match by_suffix.len() {
+            1 => return Found::One(Box::new(by_suffix.into_iter().next().expect("just checked"))),
+            0 => {}
+            _ => return Found::Ambiguous(by_suffix),
         }
 
         let lower = needle.to_ascii_lowercase();
-        let by_title: Vec<&&Task> = open
+        let by_title: Vec<Task> = open
             .iter()
             .filter(|t| t.title.to_ascii_lowercase().contains(&lower))
+            .map(|t| (*t).clone())
             .collect();
-        if by_title.len() == 1 {
-            return Some((*by_title[0]).clone());
+        match by_title.len() {
+            1 => Found::One(Box::new(by_title.into_iter().next().expect("just checked"))),
+            0 => Found::Nothing,
+            _ => Found::Ambiguous(by_title),
         }
-        None
+    }
+
+    /// The task a needle names, or the message saying why it named none.
+    ///
+    /// What every command a person types at should use. The `Err` is a ready
+    /// sentence, so a caller cannot accidentally flatten "names two tasks, here
+    /// they are" back into "no such task" — which is what the store told Ed
+    /// when he typed `022`, and is why he read the wrong one.
+    pub fn task_or_why(&self, needle: &str) -> Result<Task, String> {
+        match self.resolve_task(needle) {
+            Found::One(t) => Ok(*t),
+            other => Err(other.why(needle).unwrap_or_default()),
+        }
+    }
+
+    /// [`Store::resolve_task`] for the callers that only want the task, with
+    /// an ambiguous match reading as no match.
+    ///
+    /// Prefer `task_or_why` in anything a person types at: this drops the one
+    /// piece of information they need to type something better.
+    pub fn find_task(&self, needle: &str) -> Option<Task> {
+        match self.resolve_task(needle) {
+            Found::One(t) => Some(*t),
+            _ => None,
+        }
     }
 
     pub fn save_task(&self, t: &Task) -> std::io::Result<()> {
@@ -277,6 +362,224 @@ impl Store {
         write_atomic(&path, &t.render())?;
         self.wrote(path);
         Ok(())
+    }
+
+    // ---- renaming, and the ids that were left behind ----------------------
+    //
+    // An id must never change. Two things break that rule on purpose, and both
+    // pay for it here: the migration off dated ids, and a task leaving the
+    // inbox for a project whose space it must join.
+    //
+    // What makes it payable is that the old id keeps resolving for ever.
+    // `ids.json` is the record of what became what, it is committed with the
+    // store, and `resolve_task` reads it before it gives up. So three days of
+    // git history, every note an agent wrote and whatever a person still has in
+    // their head go on working — which is also the thing that closes the
+    // disagreement Ed accepted when he chose to leave git history unrewritten.
+
+    pub fn ids_path(&self) -> PathBuf {
+        self.root.join("ids.json")
+    }
+
+    /// Retired id -> the id it became. Never has an entry whose value is itself
+    /// a key: see [`Store::rename_tasks`] for why chains are collapsed.
+    pub fn renamed_ids(&self) -> BTreeMap<String, String> {
+        let Ok(text) = fs::read_to_string(self.ids_path()) else {
+            return BTreeMap::new();
+        };
+        match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(m)) => m
+                .into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    /// Rename tasks wholesale, rewriting every reference to them in one pass.
+    ///
+    /// One pass rather than one per task, because the alternative is
+    /// quadratic: 267 renamings over a 300-file store is 80,000 file reads to
+    /// do what a single walk does once.
+    ///
+    /// Substitution is by token, not by text search. Every maximal run of
+    /// `[A-Za-z0-9_-]` is looked up whole, so `wspt-260815-005` is one token
+    /// that matches nothing rather than a hit inside a longer word — the same
+    /// boundary rule the prose scanner in `cmd_brief` already had to learn —
+    /// and no rewritten id can be rewritten again by a later entry in the same
+    /// map.
+    ///
+    /// Returns what it rewrote: (files touched, references rewritten).
+    pub fn rename_tasks(&self, map: &BTreeMap<String, String>) -> std::io::Result<(usize, usize)> {
+        if map.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut files = 0usize;
+        let mut refs = 0usize;
+
+        // The task files themselves move first, so that nothing below is
+        // reading a path that is about to stop existing. `id:` inside the file
+        // is rewritten by the same substitution as everything else.
+        for (from, to) in map {
+            let (a, b) = (self.task_path(from), self.task_path(to));
+            if a.exists() {
+                // An *empty* file at the destination is a reservation that
+                // `alloc_task_id` has already won with O_EXCL, and renaming
+                // onto it is how the reservation gets filled. Anything with
+                // content in it is a real task and a real collision.
+                if b.exists() && fs::metadata(&b).map(|m| m.len() > 0).unwrap_or(true) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("{from} cannot become {to}: {to} already exists"),
+                    ));
+                }
+                fs::rename(&a, &b)?;
+                self.wrote(a);
+                self.wrote(b);
+            }
+        }
+        // The archive holds ids in the same space and is cited by live prose,
+        // so it moves too. A `~2` suffix marks a record filed beside an earlier
+        // one of the same name and has to survive the move intact.
+        if let Ok(months) = fs::read_dir(self.archive_dir()) {
+            for m in months.flatten() {
+                let Ok(entries) = fs::read_dir(m.path()) else { continue };
+                for e in entries.flatten() {
+                    let path = e.path();
+                    let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else { continue };
+                    let (id, tail) = match stem.split_once('~') {
+                        Some((id, n)) => (id, format!("~{n}")),
+                        None => (stem, String::new()),
+                    };
+                    if let Some(to) = map.get(id) {
+                        let dest = m.path().join(format!("{to}{tail}.md"));
+                        fs::rename(&path, &dest)?;
+                        self.wrote(path);
+                        self.wrote(dest);
+                    }
+                }
+            }
+        }
+
+        // Now the references, in everything that can hold one.
+        let mut targets: Vec<PathBuf> = Vec::new();
+        let collect = |dir: PathBuf, out: &mut Vec<PathBuf>| {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                        out.push(p);
+                    }
+                }
+            }
+        };
+        collect(self.tasks_dir(), &mut targets);
+        collect(self.projects_dir(), &mut targets);
+        if let Ok(months) = fs::read_dir(self.archive_dir()) {
+            for m in months.flatten() {
+                collect(m.path(), &mut targets);
+            }
+        }
+        for path in targets {
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let (out, n) = substitute_tokens(&text, map);
+            if n > 0 {
+                write_atomic(&path, &out)?;
+                self.wrote(path);
+                files += 1;
+                refs += n;
+            }
+        }
+
+        // Ephemeral state keys tasks by id too — a claim, a binding, a raised
+        // hand, the event log. It is not committed, so it is rewritten under
+        // the same lock everything else takes rather than with the store.
+        // Rewriting the raw text is sound here precisely because an id can hold
+        // no JSON metacharacter: there is nothing to escape and nothing to
+        // reparse.
+        self.locked(|| {
+            for name in
+                ["bindings.json", "claims.json", "worked.json", "flags.json", "governors.json",
+                 "mandates.json", "pins.json", "detail.json", "panel-view.json", "panels.json",
+                 "events.jsonl"]
+            {
+                let path = self.state_file(name);
+                let Ok(text) = fs::read_to_string(&path) else { continue };
+                let (out, n) = substitute_tokens(&text, map);
+                if n > 0 {
+                    let _ = write_atomic(&path, &out);
+                    files += 1;
+                    refs += n;
+                }
+            }
+        });
+
+        // And the record of what became what. Chains are collapsed as they are
+        // added: if `inbox-003` already pointed at `data-014` and `data-014` is
+        // now becoming something else, `inbox-003` is repointed at the end of
+        // the chain rather than at a link in it, so a lookup stays one step and
+        // can never land on an id that no longer exists.
+        let mut ids = self.renamed_ids();
+        for (_, v) in ids.iter_mut() {
+            if let Some(end) = map.get(v.as_str()) {
+                *v = end.clone();
+            }
+        }
+        for (from, to) in map {
+            ids.insert(from.clone(), to.clone());
+        }
+        ids.retain(|k, v| k != v);
+        let json = Value::Object(
+            ids.into_iter().map(|(k, v)| (k, Value::String(v))).collect(),
+        );
+        write_atomic(&self.ids_path(), &serde_json::to_string_pretty(&json).unwrap_or_default())?;
+        self.wrote(self.ids_path());
+
+        Ok((files, refs))
+    }
+
+    /// Whether a code is already spoken for — by a project, by the inbox, or by
+    /// ids that have already been handed out under it.
+    ///
+    /// The last clause is the one that matters and the one that is easy to miss.
+    /// A code freed by a project being renamed is *not* free: the tasks it
+    /// numbered still exist and still answer to it, so handing it to a second
+    /// project would put two tasks under one name, which is the exact failure
+    /// the archive already carries scars from.
+    pub fn code_taken(&self, code: &str, excluding: Option<&str>) -> Option<String> {
+        if code == INBOX_CODE {
+            return Some("the inbox numbers under it".into());
+        }
+        for p in self.projects() {
+            if Some(p.id.as_str()) == excluding {
+                continue;
+            }
+            if p.code() == code {
+                return Some(format!("project `{}` uses it", p.id));
+            }
+        }
+        // Ids already handed out under it. Which project they belong to is the
+        // whole question: a project reclaiming a code it used before is fine,
+        // and a *different* project taking it would put two tasks under one
+        // name for ever.
+        let prefix = format!("{code}-");
+        let held: Vec<Task> = self
+            .tasks()
+            .into_iter()
+            .chain(self.archived_tasks())
+            .filter(|t| {
+                t.id.strip_prefix(&prefix).is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .filter(|t| t.project.as_deref() != excluding)
+            .collect();
+        match held.first() {
+            Some(t) => Some(format!(
+                "{} already answers to it, in {}",
+                t.id,
+                t.project.clone().unwrap_or_else(|| "the inbox".into())
+            )),
+            None => None,
+        }
     }
 
     /// The highest number ever handed out under a day's prefix, live *or*
@@ -314,6 +617,33 @@ impl Store {
         top
     }
 
+    /// Every task the archive holds, read in full.
+    ///
+    /// The migration needs their `project` and not just their names: an
+    /// archived task numbers in the same space as a live one, and giving a live
+    /// task a number an archived one already answers to is the collision the
+    /// archive exists to have survived.
+    pub fn archived_tasks(&self) -> Vec<Task> {
+        let mut out = Vec::new();
+        let Ok(months) = fs::read_dir(self.archive_dir()) else { return out };
+        for m in months.flatten() {
+            let Ok(entries) = fs::read_dir(m.path()) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else { continue };
+                let id = stem.split('~').next().unwrap_or(stem).to_string();
+                if let Ok(text) = fs::read_to_string(&path) {
+                    out.push(Task::from_doc(&fm::parse(&text), &id));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
     /// Ids the archive holds. `doctor` reads it to catch a name that belongs to
     /// two pieces of work.
     pub fn archived_ids(&self) -> Vec<String> {
@@ -338,31 +668,68 @@ impl Store {
         out
     }
 
-    /// Allocate `t-YYMMDD-NNN`, reserving the file with O_EXCL so two agents
-    /// adding a task in the same second cannot collide.
-    pub fn alloc_task_id(&self) -> std::io::Result<String> {
+    /// Allocate `<code>-NNN` in the project's own numbering space.
+    ///
+    /// Two things settle the id, and only one of them is the counter. The
+    /// project's `seq` says where to *start* looking, which turns the O(n)
+    /// directory scan into an O(1) field read; `O_EXCL` on the file is what
+    /// actually decides who gets the number, exactly as it did under the dated
+    /// scheme. Keeping those apart is the whole reason the counter is allowed
+    /// to live in a file two machines may both be writing: a `seq` that is
+    /// stale, missing or hand-edited costs one scan and can never hand the same
+    /// id to two tasks.
+    ///
+    /// The scan is taken lazily — only once the hint has been proved wrong —
+    /// so the cost of a fresh clone, whose project files carry a `seq` of 0, is
+    /// one wasted `open` rather than one per task the project already holds.
+    ///
+    /// A task with no project numbers in `inbox`, which has no file to hold a
+    /// counter and so always takes the scan. That is affordable because the
+    /// inbox is meant to be emptied, and it is the only space whose ids are not
+    /// permanent: see [`Store::rename_task`], which renumbers a task into its
+    /// project's space when it is finally filed.
+    pub fn alloc_task_id(&self, project: Option<&str>) -> std::io::Result<String> {
         fs::create_dir_all(self.tasks_dir())?;
-        let stamp = util::today_stamp();
-        let prefix = format!("t-{stamp}-");
-        // Past everything the day has already used, rather than into the first
-        // gap. A gap means something was retired, and reusing its number is
-        // how one name comes to mean two things.
-        let mut n = self.highest_seq(&prefix) + 1;
+        let proj = project.and_then(|p| self.project(p));
+        let code = proj.as_ref().map(|p| p.code().to_string());
+        let prefix = format!("{}-", code.as_deref().unwrap_or(INBOX_CODE));
+
+        // Past everything the space has already used, rather than into the
+        // first gap. A gap means something was retired, and reusing its number
+        // is how one name comes to mean two things.
+        let mut n = proj.as_ref().map(|p| p.seq).unwrap_or(0) + 1;
+        let mut scanned = proj.is_none();
+        if scanned {
+            n = self.highest_seq(&prefix) + 1;
+        }
         loop {
-            if n > 999 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "more than 999 tasks in one day; bump the id scheme",
-                ));
-            }
             let id = format!("{prefix}{n:03}");
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(self.task_path(&id))
             {
-                Ok(_) => return Ok(id),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                Ok(_) => {
+                    if let Some(mut p) = proj {
+                        // Written back after the id is won, not before, so a
+                        // process that dies mid-allocation leaves a counter
+                        // that is behind rather than ahead — behind costs a
+                        // scan, ahead silently skips numbers for ever.
+                        p.seq = n;
+                        let _ = self.save_project(&p);
+                    }
+                    return Ok(id);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if scanned {
+                        n += 1;
+                    } else {
+                        // The hint was wrong. One scan replaces what would
+                        // otherwise be one failed `open` per task in the way.
+                        scanned = true;
+                        n = self.highest_seq(&prefix) + 1;
+                    }
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1062,6 +1429,52 @@ impl Store {
     }
 }
 
+/// Replace whole identifier tokens using `map`, returning the text and how many
+/// were replaced.
+///
+/// A token is a maximal run of `[A-Za-z0-9_-]`, which is what makes this safe
+/// to run over prose, frontmatter and raw JSON alike. Three properties follow
+/// from taking maximal runs, and all three are load-bearing:
+///
+/// - `wspt-260815-005` is one token, so an id is never matched inside a longer
+///   word. `[t-260815-004]` is not, because `[` cannot be in a token.
+/// - A token is looked up once and emitted, never re-examined, so one entry in
+///   the map can never rewrite what another entry just produced.
+/// - An id holds no character that JSON quotes or escapes, so applying this to
+///   the raw text of a state file needs no parse and can produce nothing that
+///   fails to reparse.
+pub fn substitute_tokens(text: &str, map: &BTreeMap<String, String>) -> (String, usize) {
+    fn is_tok(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut n = 0usize;
+    let mut rest = text;
+    while !rest.is_empty() {
+        match rest.find(is_tok) {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                let tail = &rest[start..];
+                let end = tail.find(|c: char| !is_tok(c)).unwrap_or(tail.len());
+                let tok = &tail[..end];
+                match map.get(tok) {
+                    Some(to) => {
+                        out.push_str(to);
+                        n += 1;
+                    }
+                    None => out.push_str(tok),
+                }
+                rest = &tail[end..];
+            }
+        }
+    }
+    (out, n)
+}
+
 /// Write via temp file + rename so a reader never sees a half-written task.
 pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -1168,6 +1581,206 @@ mod tests {
 
         assert!(store.clear_machine_live("mb2"));
         assert!(store.machine_live("mb2").is_none(), "back to no opinion, not a negative one");
+    }
+
+    // ---- per-project ids --------------------------------------------------
+
+    fn proj(store: &Store, id: &str, code: &str) -> Project {
+        let mut p = Project::new(id);
+        p.code_raw = code.to_string();
+        store.save_project(&p).unwrap();
+        p
+    }
+
+    /// The point of the whole scheme, at the one line where it happens: the id
+    /// says which project the task is in, and two projects numbering at the
+    /// same time do not share a number.
+    #[test]
+    fn ids_number_in_their_own_project_and_the_prefix_says_which() {
+        let store = scratch("ids-per-project");
+        proj(&store, "wsp", "");
+        proj(&store, "robustness", "");
+
+        assert_eq!(store.alloc_task_id(Some("wsp")).unwrap(), "wsp-001");
+        assert_eq!(store.alloc_task_id(Some("robustness")).unwrap(), "robustness-001");
+        assert_eq!(store.alloc_task_id(Some("wsp")).unwrap(), "wsp-002");
+
+        // The incident this exists to prevent: `add` answered 014, `013` was
+        // typed, and 013 was a real task in another project. Now it is not.
+        assert_eq!(store.alloc_task_id(Some("robustness")).unwrap(), "robustness-002");
+        assert!(!store.task_path("robustness-013").exists(), "the slip lands on nothing");
+        assert!(!store.task_path("wsp-013").exists());
+    }
+
+    /// The counter is a hint and the file is the truth. Every way of getting
+    /// the hint wrong has to cost a scan and nothing else — because the hint
+    /// lives in a file two machines may both be writing, and that is only
+    /// affordable if being wrong is cheap rather than corrupting.
+    #[test]
+    fn a_wrong_counter_costs_a_scan_and_never_a_duplicate_id() {
+        let store = scratch("ids-hint");
+        proj(&store, "wsp", "");
+        for _ in 0..4 {
+            store.alloc_task_id(Some("wsp")).unwrap();
+        }
+        assert_eq!(store.project("wsp").unwrap().seq, 4, "the hint tracks what was handed out");
+
+        // Behind — a fresh clone, or a counter that never got written back.
+        let mut p = store.project("wsp").unwrap();
+        p.seq = 0;
+        store.save_project(&p).unwrap();
+        assert_eq!(store.alloc_task_id(Some("wsp")).unwrap(), "wsp-005");
+
+        // Ahead — a hand-edit, or a write from a machine that got further.
+        let mut p = store.project("wsp").unwrap();
+        p.seq = 40;
+        store.save_project(&p).unwrap();
+        assert_eq!(store.alloc_task_id(Some("wsp")).unwrap(), "wsp-041", "trusted, and it is free");
+
+        // Gone entirely. The scan reaches past everything ever used rather
+        // than into the first gap, because a gap is a task that was retired
+        // and reusing its number is how one name comes to mean two things.
+        std::fs::remove_file(store.task_path("wsp-041")).unwrap();
+        let mut p = store.project("wsp").unwrap();
+        p.seq = 0;
+        store.save_project(&p).unwrap();
+        assert_eq!(store.alloc_task_id(Some("wsp")).unwrap(), "wsp-006", "the first free one above the scan");
+    }
+
+    /// A code is what keeps a descriptive slug from making a long id. Changing
+    /// one starts a new space; it never renumbers what is already out.
+    #[test]
+    fn a_code_gives_the_project_a_shorter_space_without_moving_what_is_out() {
+        let store = scratch("ids-code");
+        proj(&store, "strata-prototype", "sp");
+        let id = store.alloc_task_id(Some("strata-prototype")).unwrap();
+        assert_eq!(id, "sp-001");
+        let mut t = Task::new("the first one", &id);
+        t.project = Some("strata-prototype".into());
+        store.save_task(&t).unwrap();
+
+        assert!(store.code_taken("sp", None).is_some(), "another project cannot take it");
+        assert!(store.code_taken("sp", Some("strata-prototype")).is_none(), "its owner may keep it");
+        assert!(store.code_taken(INBOX_CODE, None).is_some(), "the inbox numbers under it");
+
+        // Freed by its owner, and still not free: the tasks it numbered exist.
+        let mut p = store.project("strata-prototype").unwrap();
+        p.code_raw = "proto".into();
+        p.seq = 0;
+        store.save_project(&p).unwrap();
+        assert!(
+            store.code_taken("sp", None).is_some(),
+            "sp-001 still answers to it, so a second project must not have it"
+        );
+        assert_eq!(store.alloc_task_id(Some("strata-prototype")).unwrap(), "proto-001");
+    }
+
+    /// Substitution is by whole token. Three properties hang off that, and all
+    /// three have already been got wrong somewhere in this codebase.
+    #[test]
+    fn references_are_rewritten_by_token_and_never_inside_a_word() {
+        let mut map = BTreeMap::new();
+        map.insert("t-260815-022".to_string(), "robustness-022".to_string());
+        map.insert("robustness-022".to_string(), "nope-999".to_string());
+
+        let (out, n) = substitute_tokens(
+            "see t-260815-022 and [t-260815-022], but not wspt-260815-022 or t-260815-0221",
+            &map,
+        );
+        assert_eq!(n, 2, "twice, and not inside the two longer words");
+        assert!(out.contains("see robustness-022 and [robustness-022]"));
+        assert!(out.contains("wspt-260815-022"), "a longer token is a different token");
+        assert!(out.contains("t-260815-0221"));
+        assert!(
+            !out.contains("nope-999"),
+            "what one entry produced must not be rewritten again by another"
+        );
+
+        // Raw JSON, which is sound precisely because an id holds nothing that
+        // JSON quotes or escapes.
+        let (json, _) = substitute_tokens(r#"{"task_id":"t-260815-022"}"#, &map);
+        assert_eq!(json, r#"{"task_id":"robustness-022"}"#);
+    }
+
+    /// A rename has to take every reference with it, and leave a bridge from
+    /// the old id — otherwise three days of git history and every note an
+    /// agent wrote stop resolving on the day of the migration.
+    #[test]
+    fn renaming_carries_the_references_and_leaves_the_old_id_resolving() {
+        let store = scratch("ids-rename");
+        proj(&store, "data", "");
+
+        let mut parent = Task::new("the parent", "t-260815-024");
+        parent.project = Some("data".into());
+        parent.body = "## Overview\nleans on t-260815-014\n".into();
+        store.save_task(&parent).unwrap();
+
+        let mut kid = Task::new("the child", "t-260815-014");
+        kid.project = Some("data".into());
+        kid.parent = Some("t-260815-024".into());
+        store.save_task(&kid).unwrap();
+        store.set_claim("t-260815-024", json!({ "host": "here" }));
+
+        let mut map = BTreeMap::new();
+        map.insert("t-260815-024".to_string(), "data-001".to_string());
+        map.insert("t-260815-014".to_string(), "data-002".to_string());
+        let (_, refs) = store.rename_tasks(&map).unwrap();
+        assert!(refs >= 3, "the id field, the parent field and the prose: {refs}");
+
+        assert!(store.task("t-260815-024").is_none(), "the old file is gone");
+        let moved = store.task("data-001").expect("under its new name");
+        assert_eq!(moved.id, "data-001", "including the id inside the file");
+        assert!(moved.body.contains("data-002"), "prose came too: {}", moved.body);
+        assert_eq!(
+            store.task("data-002").and_then(|t| t.parent),
+            Some("data-001".into()),
+            "and the parent field, which is what the tree is drawn from"
+        );
+        assert!(store.claims().contains_key("data-001"), "and the claim, which is ephemeral");
+
+        // The bridge. This is what makes leaving git history unrewritten a
+        // decision rather than a dead end.
+        assert_eq!(store.renamed_ids().get("t-260815-024"), Some(&"data-001".to_string()));
+        assert_eq!(
+            store.find_task("t-260815-024").map(|t| t.id),
+            Some("data-001".into()),
+            "an id from before the migration still resolves"
+        );
+
+        // Chains collapse, so a second rename never leaves a lookup pointing
+        // at a link that no longer exists.
+        let mut again = BTreeMap::new();
+        again.insert("data-001".to_string(), "data-009".to_string());
+        store.rename_tasks(&again).unwrap();
+        assert_eq!(store.renamed_ids().get("t-260815-024"), Some(&"data-009".to_string()));
+        assert_eq!(store.find_task("t-260815-024").map(|t| t.id), Some("data-009".into()));
+    }
+
+    /// "No such task" was a lie about a suffix that named two, and it is the
+    /// lie that cost Ed his afternoon reading the wrong `022`.
+    #[test]
+    fn a_suffix_that_names_two_tasks_says_so_rather_than_saying_no() {
+        let store = scratch("ids-ambiguous");
+        for (id, title) in [("wsp-022", "one tree per agent"), ("render-022", "the other one")] {
+            let mut t = Task::new(title, id);
+            t.project = Some(id.split('-').next().unwrap().into());
+            store.save_task(&t).unwrap();
+        }
+        let mut only = Task::new("alone", "data-005");
+        only.project = Some("data".into());
+        store.save_task(&only).unwrap();
+
+        let why = store.task_or_why("022").expect_err("two tasks answer to it");
+        assert!(why.contains("names 2 tasks"), "{why}");
+        assert!(why.contains("wsp-022") && why.contains("render-022"), "and it names them: {why}");
+        assert!(!why.contains("no such task"), "which is what it used to say: {why}");
+
+        assert_eq!(store.task_or_why("005").map(|t| t.id), Ok("data-005".into()), "one match still works");
+        assert_eq!(store.task_or_why("wsp-022").map(|t| t.id), Ok("wsp-022".into()), "and the whole id always does");
+
+        // A suffix has to land on a `-`, or a project code would match every
+        // id in a project whose code merely ended in those letters.
+        assert!(store.task_or_why("22").is_err(), "not a boundary");
     }
 
     fn scratch(tag: &str) -> Store {

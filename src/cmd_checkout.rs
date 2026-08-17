@@ -163,7 +163,39 @@ pub(crate) fn trunk_branch(trunk: &Path) -> Option<String> {
 /// name both: it is already unique, and a worktree left behind names the task
 /// that abandoned it.
 pub(crate) fn checkout_dir(trunk: &Path, task: &str) -> PathBuf {
-    trunk.join(WORKTREES).join(task)
+    let base = trunk.join(WORKTREES);
+    let dir = base.join(task);
+    if dir.join(".git").exists() {
+        return dir;
+    }
+    // A tree made before the task was renumbered is named after the id it had
+    // then, and its commits are on a branch of that name. Making a second tree
+    // beside it would leave that work on a branch `land` no longer looks for —
+    // which is why the migration deliberately does not rename trees somebody
+    // may be standing in, and why the name is resolved here instead.
+    for former in former_ids(task) {
+        let old = base.join(&former);
+        if old.join(".git").exists() {
+            return old;
+        }
+    }
+    dir
+}
+
+/// Ids this task used to have, newest first.
+///
+/// Read from the store rather than passed in, because every one of the twenty
+/// callers of [`checkout_dir`] would otherwise have to carry a store it does
+/// not need. It is one small file, read at most once per checkout, and a store
+/// that has never renamed anything has no file at all.
+fn former_ids(task: &str) -> Vec<String> {
+    crate::store::Store::open()
+        .renamed_ids()
+        .into_iter()
+        .filter(|(_, to)| to == task)
+        .map(|(from, _)| from)
+        .rev()
+        .collect()
 }
 
 /// Make this task's tree if it has none. Returns whether it was new.

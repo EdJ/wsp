@@ -34,13 +34,40 @@ Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` a
 | Path | What |
 |---|---|
 | `~/wsp/projects/<slug>.md` | one project per file: parent, tags, roots, brief |
-| `~/wsp/tasks/<id>.md` | one task per file: `t-YYMMDD-NNN` |
+| `~/wsp/tasks/<id>.md` | one task per file: `<project>-NNN`, or `inbox-NNN` |
 | `~/wsp/archive/tasks/YYYY-MM/` | swept `done` tasks |
+| `~/wsp/ids.json` | retired id → the id it became, so old ones still resolve |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
 | `~/.local/state/wsp/` | claims, bindings, pins, mandates, `worked.json`, `events.jsonl` — machine-local, not in git |
 
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
+
+### Ids
+
+An id is `<project>-NNN`, continuous within a project rather than within a day:
+`wsp-013`, `robustness-014`, `trance-007`. Every project is its own space, at
+whatever depth it sits, so the prefix answers *where does this task live* — and
+a mistyped digit lands on an id that does not exist rather than on a real task
+in some other project, which is the accident the scheme was built after.
+
+The prefix is the project's `code`, which defaults to its slug. Set one when a
+descriptive slug would make a long id: `wsp code strata-prototype sp` and its
+next task is `sp-063`. Tasks already handed out keep the prefix they were given
+— an id names the task, not where it sits, which is the same reason a task that
+moves project keeps its old prefix.
+
+The counter lives as `seq:` in the project's own file, so two machines adding to
+different projects never touch the same line. It is a hint, not the truth:
+`alloc_task_id` reads it to skip a directory scan, then reserves the file with
+`O_EXCL`, which is what actually settles a race. A `seq` that is stale, missing
+or hand-edited costs one scan and can never hand out a duplicate.
+
+A task filed nowhere is `inbox-NNN`, and that is the one id allowed to change —
+`wsp mv <id> -p <project>` renumbers it into the project's space, because until
+a task has a project it has no space to be continuous in. Every renaming is
+recorded in `ids.json` and every old id goes on resolving for ever, which is
+what lets `wsp migrate` renumber a store without breaking its git history.
 
 Every command commits the files it wrote, and only those — `wsp note` commits
 one task, an archive sweep commits the set it moved, `wsp init` is the one
@@ -190,13 +217,13 @@ filters say so in the footer as they go. An agent holding nothing is told so
 rather than moved: that is a pane to give work to, which is `f` or `c`.
 
 `i` puts each task's id in front of its title — the thing you type at a shell
-beside the thing you read. Off by default: `t-260815-004` is thirteen columns of
-a pane that is thirty wide and eleven of them are identical on every row, so
-what shows is the suffix, which is exactly what `wsp start 004` resolves. When
-another *open* task shares that suffix the date is what separates them and the
-whole id appears instead; a finished task always shows in full, because a bare
-suffix resolves against open tasks only and an id you cannot type is worse than
-no id at all.
+beside the thing you read. Off by default, and what shows is the suffix, which
+is exactly what `wsp start 004` resolves. When another *open* task shares that
+suffix the whole id appears instead; a finished task always shows in full,
+because a bare suffix resolves against open tasks only and an id you cannot type
+is worse than no id at all. A suffix that names more than one task is now
+answered with the candidates rather than with "no such task" — the shrug that
+had Ed reading the wrong `022` for a while on 2026-08-17.
 
 `F` docks the selected row's title under the tree, in full and wrapped, and
 follows the cursor. A row is one line wide and a title is not: titles here run

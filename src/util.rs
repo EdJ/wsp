@@ -125,7 +125,13 @@ pub fn today_ymd() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// `260814` — the task-id date stamp.
+/// `260814` — the stamp task ids carried before they carried a project.
+///
+/// Nothing allocates with it any more; ids number in their project's space.
+/// Kept because `cmd_migrate::is_dated` and every id written before
+/// 2026-08-17 still have its shape in them, and because the date an id used to
+/// encode is a thing a reader may still want to compute.
+#[allow(dead_code)]
 pub fn today_stamp() -> String {
     let (y, m, d, ..) = parts(epoch_secs());
     format!("{:02}{:02}{:02}", y % 100, m, d)

@@ -59,7 +59,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         }
     }
 
-    let id = match store.alloc_task_id() {
+    let id = match store.alloc_task_id(project.as_deref()) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("wsp: cannot allocate id: {e}");
@@ -281,9 +281,12 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp show <id>");
         return 2;
     };
-    let Some(t) = store.find_task(&needle) else {
-        eprintln!("wsp: no task matching `{needle}`");
-        return 1;
+    let t = match store.task_or_why(&needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
     };
     if args.json() {
         let mut v = t.json();
@@ -388,9 +391,12 @@ where
         eprintln!("usage: wsp {verb} <id>");
         return 2;
     };
-    let Some(mut t) = store.find_task(&needle) else {
-        eprintln!("wsp: no task matching `{needle}`");
-        return 1;
+    let mut t = match store.task_or_why(&needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
     };
     f(&mut t);
     t.touch();
@@ -559,9 +565,12 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp mv <id> -p <project> | --parent <id> | --parent none");
         return 2;
     };
-    let Some(subject) = store.find_task(&needle) else {
-        eprintln!("wsp: no task matching `{needle}`");
-        return 1;
+    let subject = match store.task_or_why(&needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
     };
 
     // `--parent` unset, `--parent none` and `--parent <id>` are three different
@@ -645,6 +654,36 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // Filing an inbox task is the one place an id is allowed to change, and
+    // the reason is that until a task has a project it has no space to be
+    // continuous in. The new ids are reserved *now*, before anything is
+    // written, so that the log each task keeps can name the id it is about to
+    // take — a rename recorded only in the file it renamed is a rename nobody
+    // reading the old id can follow.
+    let mut renumber: std::collections::BTreeMap<String, String> = Default::default();
+    if let Some(into) = &target {
+        let mut filing: Vec<String> = Vec::new();
+        if is_inbox_id(&subject.id) {
+            filing.push(subject.id.clone());
+        }
+        for id in crate::resolve::descendants_of(&tasks, &subject.id) {
+            if is_inbox_id(&id) {
+                filing.push(id);
+            }
+        }
+        for old in filing {
+            match store.alloc_task_id(Some(into)) {
+                Ok(new) => {
+                    renumber.insert(old, new);
+                }
+                Err(e) => {
+                    eprintln!("wsp: cannot allocate an id in {into}: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
+
     // The sub-tree comes too. These land before `mutate` writes the task
     // itself, so the single commit it makes on its way out holds the whole
     // move — a sub-tree left in the old project by a half-applied move is
@@ -665,6 +704,9 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
                 target.clone().unwrap_or_else(|| "the inbox".into()),
                 subject.id
             ));
+            if let Some(new) = renumber.get(&kid.id) {
+                kid.log(&format!("filed out of the inbox: {} is now {new}", kid.id));
+            }
             kid.touch();
             if let Err(e) = store.save_task(&kid) {
                 eprintln!("wsp: write failed for {}: {e}", kid.id);
@@ -684,7 +726,8 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     let attaches = matches!(new_parent, Some(Some(_)));
     let detaches = matches!(new_parent, Some(None)) && subject.parent.is_some();
     let verb = if attaches || detaches { "re-parented" } else { "moved" };
-    mutate(store, args, verb, |t| {
+    let subject_new = renumber.get(&subject.id).cloned();
+    let code = mutate(store, args, verb, |t| {
         let was_project = t.project.clone();
         t.project = target.clone();
         if let Some(p) = &new_parent {
@@ -700,6 +743,9 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
             }
             _ => t.log(&format!("moved to {}", label(&target))),
         }
+        if let Some(new) = &subject_new {
+            t.log(&format!("filed out of the inbox: {} is now {new}", t.id));
+        }
         if carried > 0 {
             t.log(&format!(
                 "{carried} sub-task{} carried from {}",
@@ -707,7 +753,42 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
                 label(&was_project)
             ));
         }
-    })
+    });
+    if code != 0 || renumber.is_empty() {
+        return code;
+    }
+
+    // Last, because everything above still refers to the old ids and the
+    // rename is what makes those references stale. It rewrites them all, and
+    // records what became what so the old id goes on resolving afterwards.
+    match store.rename_tasks(&renumber) {
+        Ok((files, refs)) => {
+            store.git_commit(&format!(
+                "wsp: file {} out of the inbox into {}",
+                renumber.len(),
+                label(&target)
+            ));
+            let p = Paint::new();
+            for (old, new) in &renumber {
+                println!("  {} {} → {}", p.dim("renumbered"), p.dim(old), p.bold(new));
+            }
+            if refs > 0 {
+                println!("  {}", p.dim(&format!("{refs} reference(s) rewritten across {files} file(s)")));
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("wsp: the move landed but the renumbering did not: {e}");
+            1
+        }
+    }
+}
+
+/// Is this id in the inbox's numbering space — the one space whose ids are not
+/// permanent, because a task with no project has no space to be continuous in?
+fn is_inbox_id(id: &str) -> bool {
+    id.strip_prefix(&format!("{}-", crate::store::INBOX_CODE))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A project id, or the name we give the absence of one in prose.
@@ -961,9 +1042,12 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp rm <id>");
         return 2;
     };
-    let Some(t) = store.find_task(&needle) else {
-        eprintln!("wsp: no task matching `{needle}`");
-        return 1;
+    let t = match store.task_or_why(&needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
     };
     let filed = match store.archive_task(&t) {
         Ok(name) => name,
@@ -1023,9 +1107,12 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp edit <id> [--overview | --details | --decisions | --raw]");
         return 2;
     };
-    let Some(t) = store.find_task(&needle) else {
-        eprintln!("wsp: no task matching `{needle}`");
-        return 1;
+    let t = match store.task_or_why(&needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
     };
     edit_prose(
         store,

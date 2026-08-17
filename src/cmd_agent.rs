@@ -440,9 +440,12 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         return list_flags(store, args);
     };
 
-    let Some(task) = store.find_task(&needle) else {
-        eprintln!("wsp: no task matching `{needle}`");
-        return 1;
+    let task = match store.task_or_why(&needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
     };
 
     // Read, and still up. The card is the interruption and the row is the
@@ -987,9 +990,12 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp claim <id>   (inside a herdr pane)");
         return 2;
     };
-    let Some(t) = store.find_task(&needle) else {
-        eprintln!("wsp: no task matching `{needle}`");
-        return 1;
+    let t = match store.task_or_why(&needle) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
     };
     let Some(pane) = pane_id(args) else {
         eprintln!("wsp: no pane to bind — run this inside a herdr pane, or pass --pane");
@@ -2742,6 +2748,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // `show` answers with the live one while the log, the claim and any
     // `parent` pointing at it describe both.
     let archived = store.archived_ids();
+    let archived_tasks = store.archived_tasks();
     let claims = store.claims();
     let worked = store.worked();
     for t in &tasks {
@@ -2766,6 +2773,67 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
             problems.push(format!(
                 "  …and {} still keyed on it, which may belong to either",
                 carried.join(" and ")
+            ));
+        }
+    }
+
+    // Two projects numbering in one space is the same failure a step earlier:
+    // nothing has collided yet, but the next `wsp add` in either of them will
+    // reach for a number the other has already used.
+    let mut codes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for p in &index.projects {
+        codes.entry(p.code().to_string()).or_default().push(p.id.clone());
+    }
+    for (code, owners) in &codes {
+        if owners.len() > 1 {
+            problems.push(format!(
+                "projects {} all number under `{code}-` — `wsp code <project> <new>` separates them",
+                owners.join(", ")
+            ));
+        }
+        if code == crate::store::INBOX_CODE {
+            problems.push(format!(
+                "project {} numbers under `{code}-`, which the inbox already uses",
+                owners.join(", ")
+            ));
+        }
+    }
+
+    // A counter that has fallen behind costs one directory scan and is not
+    // worth alarming anybody about; one that has run *ahead* silently skips
+    // numbers for ever, and is the only direction worth reporting.
+    for p in &index.projects {
+        let top = tasks
+            .iter()
+            .chain(archived_tasks.iter())
+            .filter_map(|t| t.id.strip_prefix(&format!("{}-", p.code())))
+            .filter_map(|n| n.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        if p.seq > top {
+            notes.push(format!(
+                "{} counts from {} but its highest id is {top} — {} number(s) will be skipped",
+                p.id,
+                p.seq,
+                p.seq - top
+            ));
+        }
+    }
+
+    // Ids still in the dated scheme, which is a note and not a problem: a
+    // part-migrated store works, it is only harder to read.
+    let dated = tasks.iter().filter(|t| crate::cmd_migrate::is_dated(&t.id)).count();
+    if dated > 0 {
+        notes.push(format!(
+            "{dated} task(s) still carry dated ids — `wsp migrate -n` shows what they would become"
+        ));
+    }
+
+    // The bridge from old ids to new is only a bridge while both ends stand.
+    for (from, to) in store.renamed_ids() {
+        if store.task(&to).is_none() && !archived.contains(&to) {
+            problems.push(format!(
+                "ids.json says {from} became {to}, and there is no {to} — every old reference to it now resolves to nothing"
             ));
         }
     }
@@ -2993,7 +3061,7 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
 
     let mut made = 0;
     for (ws, label, project, pane) in &plan {
-        let Ok(id) = store.alloc_task_id() else { continue };
+        let Ok(id) = store.alloc_task_id(project.as_deref()) else { continue };
         let mut t = crate::model::Task::new(label, &id);
         t.project = project.clone();
         t.set_status(Status::Doing);

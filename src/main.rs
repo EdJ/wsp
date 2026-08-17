@@ -15,6 +15,7 @@ mod cmd_checkout;
 mod cmd_govern;
 mod cmd_install;
 mod cmd_machine;
+mod cmd_migrate;
 mod cmd_mandate;
 mod cmd_project;
 mod cmd_sandbox;
@@ -339,6 +340,8 @@ fn main() {
         "hook" => cmd_agent::hook(&store, &args),
         "doctor" => cmd_agent::doctor(&store, &args),
         "adopt" => cmd_agent::adopt(&store, &args),
+        "migrate" => cmd_migrate::run(&store, &args),
+        "code" => cmd_migrate::code(&store, &args),
         "view" => detail::run(&store, &args),
         "kanban" | "board" => kanban::run(&store, &args),
         "say" => cmd_agent::say(&store, &args),
@@ -511,8 +514,20 @@ fn help() {
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
   wsp adopt [--yes]                 turn live workspaces into tasks
+  wsp code [<proj> [<code>]]        the prefix a project's ids take, so a long
+                                    slug can still number short: strata-prototype
+                                    with code sp gives sp-062. Defaults to the
+                                    slug; tasks already handed out keep theirs
+  wsp migrate [-n] [--all]          renumber dated ids into each project's own
+                                    space, rewriting every reference; -n plans it
+                                    and writes nothing. Old ids go on resolving
+  wsp migrate --refs <path> [-n]    …and bring a source tree's comments forward
 
-Ids accept a bare suffix (003) or a unique title substring.
+Ids are `<project>-NNN`, continuous within a project rather than within a day,
+and a task filed nowhere is `inbox-NNN` until `wsp mv -p` files it — the one
+place an id changes, and it is recorded so the old one still resolves.
+Ids accept a bare suffix (003) or a unique title substring; a suffix that names
+more than one task now lists them rather than answering "no such task".
 Every command takes --json. Set WSP_HOME to relocate the store.
 --terse, or WSP_TERSE=1 for a whole session, leaves out what you already have:
 the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
