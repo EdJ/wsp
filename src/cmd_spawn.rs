@@ -295,6 +295,31 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         .get("cwd")
         .or_else(|| work.project.as_deref().and_then(|p| index.root_of(p)));
 
+    // One tree per agent, which is the whole of t-260815-022 and is done here
+    // rather than asked of the agent. Every softer version of it has been tried
+    // in this repository and recorded on that task — naming paths, staging by
+    // hunk, announcing first — and each failed the same way: an agent that has
+    // to remember a rule is an agent that will be halfway through something
+    // more interesting when it matters. An agent that is simply standing in a
+    // checkout of its own cannot take anybody's work, because the work is not
+    // there to take.
+    //
+    // Only a task gets one. A project seat is a place to work rather than a
+    // piece of work, it has nothing to branch for and nothing to land, and it
+    // is where a person reviewing the whole tree wants to be standing.
+    // `--no-tree` for the case where you deliberately want the trunk, and a
+    // spoken fallback when the tree cannot be made, because a spawn that fails
+    // outright over this is worse than a spawn that says where it put you.
+    let cwd = match (&work.task, &cwd) {
+        (Some(task), Some(root)) if !args.has("no-tree") => {
+            Some(crate::cmd_checkout::tree_for(root, task).unwrap_or_else(|| {
+                eprintln!("wsp: no tree of its own for {task} — opening in {root}");
+                root.clone()
+            }))
+        }
+        _ => cwd,
+    };
+
     let order = order(&work, cwd.as_deref(), on.as_deref(), !args.has("no-focus"));
     let seat = match place.open(&order) {
         Ok(v) => v,
@@ -716,6 +741,98 @@ mod tests {
                 "non-ASCII in a work order, which is what t-260817-004 was: {text}"
             );
         }
+    }
+
+    /// A backend that only remembers what it was asked to open.
+    struct Opens(std::cell::RefCell<Vec<Order>>);
+
+    impl Place for Opens {
+        fn open(&self, order: &Order) -> crate::place::Result<Seat> {
+            self.0.borrow_mut().push(order.clone());
+            Ok(Seat::new("w9:p1"))
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("spawn does not end seats")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("no agent was asked for")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<()> {
+            panic!("no agent was asked for")
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            panic!("spawn does not ask how the work is going")
+        }
+        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+            panic!("spawn is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("spawn does not wait for anything")
+        }
+    }
+
+    /// The whole of t-260815-022, at the one line where it happens.
+    ///
+    /// Every softer answer to two agents in one checkout has been tried in this
+    /// repository and each failed the same way — an agent that has to remember
+    /// a rule is halfway past it when it matters. So the tree is not something
+    /// an agent asks for, it is where `spawn` opens the pane; and the assertion
+    /// that matters is that a task seat is *not* opened at the project root.
+    ///
+    /// A project seat still is. It has nothing to branch for and nothing to
+    /// land, and it is where somebody reading the whole tree wants to stand.
+    #[test]
+    fn a_task_seat_is_opened_in_a_checkout_of_its_own_and_a_project_seat_is_not() {
+        let _guard = no_backend();
+        let store = seat("tree");
+        let root = store.root.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        for argv in [
+            vec!["init", "--quiet", "-b", "master"],
+            vec!["commit", "--quiet", "--allow-empty", "-m", "first"],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(&argv)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let mut proj = Project::new("robustness");
+        proj.roots = vec![root.display().to_string()];
+        store.save_project(&proj).unwrap();
+        let mut task = crate::model::Task::new("one tree each", "t-1");
+        task.project = Some("robustness".into());
+        store.save_task(&task).unwrap();
+
+        let opened = |args: Args| {
+            let place = Opens(std::cell::RefCell::new(Vec::new()));
+            place_work(&place, &store, &args);
+            let cwd = place.0.borrow().first().and_then(|o| o.cwd.clone()).unwrap_or_default();
+            cwd
+        };
+
+        let cwd = opened(Args::synth("spawn", &["t-1"], &[("no-focus", "true")]));
+        assert!(
+            cwd.ends_with(".worktrees/t-1"),
+            "a task seat was opened in the shared trunk: {cwd}"
+        );
+        assert!(std::path::Path::new(&cwd).join(".git").exists(), "{cwd} is not a checkout");
+
+        let cwd = opened(Args::synth("spawn", &[], &[("project", "robustness"), ("no-focus", "true")]));
+        assert_eq!(
+            util::real(&cwd),
+            util::real(&root.display().to_string()),
+            "a project seat left the trunk"
+        );
+
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 
     /// A backend that answers `stop` however the test needs, and nothing else.

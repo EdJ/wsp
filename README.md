@@ -2391,22 +2391,51 @@ writes nothing down. The commit stamped into the binary itself is
 `t-260816-050`; until that ships, "which of these three commits is live" is
 answered by the record beside the file rather than by the file.
 
+### `wsp checkout`, because the tree itself was the shared thing
+
+Every rule above reduces the chance of taking someone's work and none of them
+removes it, because they all defend a checkout that belongs to nobody. `wsp
+checkout` gives the task in hand a working tree of its own, on a branch of its
+own, and `wsp land` puts it back on the trunk. `wsp spawn` does it without being
+asked — the lesson this repository keeps re-learning is that a rule an agent has
+to remember is a rule it will be halfway past when it matters.
+
+    ~/claude/wsp                       the trunk: what a review reads
+    ~/claude/wsp/.worktrees/t-…-022    one agent, one task, one branch
+
+Nested under the root and gitignored, because `project_for_cwd` and `overlap`
+place a pane by longest-prefix match against declared project roots: a worktree
+outside the root resolves to no project, so `wsp where` goes blank and `overlap`
+reads two agents in two worktrees as `Elsewhere` — silencing the warning in
+exactly the arrangement this creates. `overlap` learned the matching correction:
+a tree under `.worktrees/` is *not* inside the trunk however much the prefix
+says so, and it reports `separate tree` rather than a warning it has no business
+raising.
+
+Branches are short and land early, because review stays whole-tree (Ed,
+2026-08-17). A reviewer reading the trunk against long-lived per-task branches
+would be reading a tree none of the work is in. `land` rebases onto the trunk
+and fast-forwards the trunk onto that, so the trunk stays linear and never gains
+a merge commit from here — and the rebase is where two agents who edited one
+file finally meet. That is the arrangement working: the collision that used to
+be a silent sweep is now a conflict, in your own tree, with both sides named.
+
+It also prints the diffstat of what actually reached the trunk, which is step 4
+of the procedure above and the check that caught a wrong commit on two
+consecutive days.
+
+What it costs is a second checkout and a second `target/` per agent, and one
+more thing that can be left behind: `wsp checkout --rm` drops a tree, and `land`
+drops it for you. The reasoning is in `src/cmd_checkout.rs` and on
+`t-260815-022`.
+
 ### What none of it fixes
 
-Every rule above reduces the chance of taking someone's work; none removes it,
-because the tree itself is shared. `t-260815-022` — one working tree per agent —
-is the structural answer. It was parked on 2026-08-15 with its own revisit
-conditions written down: agents running unattended, a backlog outgrowing what
-two agents can keep disjoint, sweeps continuing after the render/data
-segmentation. All three came true within a day, and it was unparked on
-2026-08-16.
-
-Most of it has since been split out into pieces that need none of its open
-questions — `wsp verify` above is the build half, `wsp sandbox` the live-run
-half — which leaves 022 holding the part that has no cheaper version: a tree you
-*edit* in, and therefore branch policy, where the worktrees live, how a review
-sees the whole change rather than one agent's corner, and the `project_for_cwd`
-resolution that only a tree with a pane standing in it needs.
+A tree each closes the sweeps and does not close everything. Two agents editing
+one file still produce a conflict — a better failure, not no failure. The store
+under `~/wsp`, `~/.local/bin/wsp` and the live herdr are shared by design and
+have their own answers above. And an agent standing in the trunk, which is where
+a person reviewing wants to be, is back in the world every rule above describes.
 
 The other half is not a rule at all. Three of the six incidents cost nothing but
 the time spent not knowing what had happened, and all three were resolved by one
@@ -2441,6 +2470,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
+| `src/cmd_checkout.rs` | a working tree per task, and landing it back on the trunk |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_machine.rs` | the machines agents can be run on |

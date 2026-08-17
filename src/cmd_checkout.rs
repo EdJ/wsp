@@ -167,6 +167,33 @@ fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<bool, Strin
     Ok(true)
 }
 
+/// The directory a workspace being opened on `task` should stand in.
+///
+/// The one seam `spawn` uses, and the reason any of this is worth building. A
+/// rule an agent has to remember is a rule that gets skipped — that is written
+/// down three times over on t-260815-022, about naming paths, about announcing
+/// first, and about the isolation build that became `wsp verify`. So the tree
+/// is not something an agent asks for; it is where the pane is opened.
+///
+/// `root` is a project root out of the store and comes back the same shape, `~`
+/// and all, because expanding paths is the backend's job and not this one's.
+/// `None` is the honest answer to "nothing to isolate here": a root that is not
+/// a git repository, or a repository on a detached HEAD with no trunk to branch
+/// from. The caller opens the root itself and says so.
+pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
+    let root = util::expand(root);
+    let repo = toplevel(&root)?;
+    let trunk = trunk(&repo)?;
+    let branch = trunk_branch(&trunk)?;
+    let dir = checkout_dir(&trunk, task);
+    // A branch already checked out in another worktree makes `add` refuse, which
+    // is git declining to put two agents on one task — the same thing the claim
+    // guard declines a moment later, and a good reason to fall back to the root
+    // rather than to fail the spawn.
+    ensure(&repo, &dir, task, &branch).ok()?;
+    Some(util::contract(&dir))
+}
+
 /// Whether a tree has anything uncommitted, tracked or not.
 fn dirty(dir: &Path) -> bool {
     git(dir, &["status", "--porcelain", "--untracked-files=all"])
@@ -539,6 +566,26 @@ mod tests {
         assert!(ensure(&dir, &wt, "t-3", "master").unwrap(), "the tree was not remade");
         assert!(wt.join("wip.txt").exists(), "the work left on the branch did not come back");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The seam `spawn` opens a workspace through. A task gets a tree; a root
+    /// that is not a repository gets nothing and the caller opens the root, so
+    /// spawning into a project that is not under git goes on working.
+    #[test]
+    fn a_spawn_onto_a_task_is_given_a_tree_and_a_spawn_into_nothing_is_not() {
+        let dir = scratch("spawn");
+        repo(&dir);
+        let root = dir.display().to_string();
+
+        let placed = tree_for(&root, "t-5").expect("a task in a repository gets a tree");
+        assert!(placed.ends_with(".worktrees/t-5"), "opened somewhere else: {placed}");
+        assert!(checkout_dir(&dir, "t-5").join(".git").exists(), "the path is not a checkout");
+
+        let bare = scratch("spawn-bare");
+        assert_eq!(tree_for(&bare.display().to_string(), "t-5"), None, "a directory git does not know");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     /// `overlap` asks this about every pane herdr reports, so it has to be a

@@ -46,7 +46,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Flags that never consume the following token.
 const BOOL_FLAGS: &[&str] = &[
     "json", "all", "force", "top", "raw", "overview", "details", "decisions", "verbose", "quiet", "yes", "clear", "tree", "inbox", "open", "done",
-    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "terse", "seen", "full",
+    "help", "version", "no-commit", "closed", "here", "agent", "no-focus", "no-tree", "terse", "seen", "full",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm",
