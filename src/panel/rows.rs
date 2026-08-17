@@ -6,12 +6,14 @@
 //! splitting the data from its drawing would put one change in two files every
 //! time.
 //!
-//! Nothing here talks to herdr or the store. [`collect`] takes a [`Snapshot`]
-//! in, so the same rows come out on a laptop with nothing running.
+//! Nothing here talks to herdr or the store, and nothing here *names* herdr:
+//! [`collect`] takes a [`Snapshot`] in, whose pane rows are wsp's own
+//! [`AgentRef`], so the same rows come out on a laptop with nothing running and
+//! a renderer handed them is not handed the runner's structs.
 
 use std::time::Instant;
 
-use crate::herdr;
+use crate::live::AgentRef;
 use crate::model::{Priority, Status, Task};
 use crate::resolve::{self, Counts, Index};
 use crate::store::Store;
@@ -57,43 +59,6 @@ pub(super) const MAX_FLAGS_DOCKED: usize = 3;
 /// header carries the census in full, and this carries the top of it in the
 /// form you can aim a verb at.
 pub(super) const MAX_AGENTS_DOCKED: usize = 5;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentRef {
-    pub(super) pane: String,
-    pub(super) workspace: String,
-    pub(super) state: String,
-    /// What to call it — see [`pane_name`]. The pane's own label first, which
-    /// `claim` and `wsp say` keep current, then its terminal title, then the
-    /// workspace it stands in.
-    pub(super) where_: String,
-    /// Whether an agent is running here, or it is just a shell.
-    pub(super) agent: bool,
-    /// Which agent, as herdr spells it — `claude`, `codex`, `gemini` — and the
-    /// empty string for a shell. Carried because one thing a verb does to a
-    /// pane is not the same sentence at every kind: emptying a context is
-    /// `/clear` at Claude Code and something else, or nothing, everywhere else.
-    pub(super) kind: String,
-    /// The task claimed to this pane, if it holds one. Carried so a verb aimed
-    /// at the pane can refuse on the ground that matters — it already has work
-    /// — rather than on where the row happens to sit.
-    pub(super) task: Option<String>,
-    /// The project this pane would take work from: its mandate if it has one,
-    /// else wherever it is standing. Deliberately not the same question as
-    /// which branch of the tree the row is drawn under — standing direction
-    /// says what a pane is *for*, and the tree places it by where it *is*.
-    pub(super) project: Option<String>,
-}
-
-impl AgentRef {
-    /// The terminal this stands for. The only field anything outside the panel
-    /// has business with: a pane id is what a command names and what a test can
-    /// check a click against.
-    #[cfg(test)]
-    pub(crate) fn pane(&self) -> &str {
-        &self.pane
-    }
-}
 
 /// What an agent is waiting for, as far as anything here can tell.
 ///
@@ -529,7 +494,6 @@ pub(crate) struct Ui {
     pub(super) pending: Option<Card>,
     pub(super) sel: usize,
     pub(super) message: Option<(String, Instant)>,
-    pub(super) self_focused: bool,
     /// Every tag anything in the store carries, commonest first.
     ///
     /// Tags are a small closed vocabulary — nineteen across the whole store,
@@ -869,15 +833,27 @@ pub struct Snapshot {
     /// said why. Machine-local state like the claims beside it, and the one
     /// input here that arrives from outside the person's own hands.
     pub flags: std::collections::BTreeMap<String, serde_json::Value>,
-    pub workspaces: Vec<herdr::Workspace>,
-    pub panes: Vec<herdr::Pane>,
+    /// Every pane that exists, ours included — the furniture is dropped in
+    /// [`collect`], where the rule about what counts as ours lives.
+    ///
+    /// There is no workspace list beside it. A row carries the name of the
+    /// place it stands in, and the one other thing the panel ever read off a
+    /// workspace was `focused`, which is a scheduling input rather than
+    /// anything drawn: it belongs to the event loop and is now taken there,
+    /// from [`crate::live::Live`].
+    pub panes: Vec<AgentRef>,
 }
 
 impl Snapshot {
-    /// The live path: read the store, ask herdr. A herdr that isn't answering
-    /// degrades to an empty pane list rather than an error, so the panel still
-    /// shows the durable half.
-    pub(super) fn live(store: &Store) -> Snapshot {
+    /// The live path: read the store, and join it with a reading of the runner
+    /// the caller already has.
+    ///
+    /// Handed in rather than fetched here, for two reasons. The event loop
+    /// needs the same reading for the focus it schedules on, and a second call
+    /// would be a second answer as well as a second round-trip; and this file
+    /// is a view, so the socket call belongs on the other side of
+    /// [`crate::live`] — see this module's own opening line.
+    pub(super) fn live(store: &Store, panes: Vec<AgentRef>) -> Snapshot {
         Snapshot {
             projects: store.projects(),
             tasks: store.tasks(),
@@ -886,34 +862,9 @@ impl Snapshot {
             mandates: store.mandates(),
             claims: store.claims(),
             flags: store.flags(),
-            workspaces: herdr::workspaces().unwrap_or_default(),
-            panes: herdr::panes().unwrap_or_default(),
+            panes,
         }
     }
-}
-
-/// What to call a pane's row: its label, else its terminal title, else the
-/// workspace it stands in.
-///
-/// The label comes first because it is the only one of the three that is kept
-/// up to date. `claim` writes the task into it and `wsp say` writes whatever
-/// the agent is doing right now, so on a task's own row the line beneath reads
-/// as progress — the task above, the state of it below.
-///
-/// The terminal title is what an agent called itself when it started and never
-/// revises: a pane three tasks later still announced its opening prompt, which
-/// is worse than useless, because it is a specific and confident answer to the
-/// question and it is wrong. It stays as the fallback for panes wsp has never
-/// named, where it is the best thing on offer — and the workspace label behind
-/// that, for a shell, which has no title of its own but is still worth naming
-/// by where it stands.
-pub(crate) fn pane_name(label: &str, title: &str, workspace: &str) -> String {
-    [label, title, workspace]
-        .into_iter()
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or_default()
-        .to_string()
 }
 
 pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, u8, u8, u8, String) {
@@ -1054,7 +1005,7 @@ pub(super) fn task_rows(
         // or doing.
         if let Some(a) = a {
             rows.push(Row::Agent {
-                title: a.where_.clone(),
+                title: a.where_(),
                 // The task is right here, so the row can say what the pane is
                 // waiting for rather than only whether it is running — which
                 // is the whole of the difference between `←` and `?`.
@@ -1073,10 +1024,10 @@ pub(super) fn task_rows(
 /// Rebuild the rows from a snapshot, keeping the cursor where it was and
 /// carrying any pending message across. Shared with the storyboard so an
 /// offline flow lands on the same row a live one would.
-pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_ws: Option<&str>) {
+pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View) {
     let sel = ui.sel;
     let was = ui.cursor();
-    rebuild(ui, snap, view, self_ws, &was, sel);
+    rebuild(ui, snap, view, &was, sel);
 
     // Something was just created, or a row elsewhere has asked to be shown
     // here: put the cursor on it. Done after the rebuild because until then the
@@ -1094,7 +1045,7 @@ pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_w
                 break;
             }
             if loosen(view, snap, &want) {
-                rebuild(ui, snap, view, self_ws, &was, sel);
+                rebuild(ui, snap, view, &was, sel);
             }
         }
         if let Some(i) = row_for(&ui.rows, &want) {
@@ -1120,16 +1071,9 @@ pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View, self_w
 /// Which side of the dock it was on is part of the row's identity here: a pane
 /// is drawn twice, and taking the first match took the tree copy every time.
 /// See [`Cursor`].
-fn rebuild(
-    ui: &mut Ui,
-    snap: &Snapshot,
-    view: &View,
-    self_ws: Option<&str>,
-    was: &Cursor,
-    sel: usize,
-) {
+fn rebuild(ui: &mut Ui, snap: &Snapshot, view: &View, was: &Cursor, sel: usize) {
     let msg = ui.message.take();
-    *ui = collect(snap, view, self_ws);
+    *ui = collect(snap, view);
     let tree_len = ui.tree_len();
     ui.sel = match was.target {
         Target::Nothing => sel,
@@ -1212,14 +1156,13 @@ fn unfilter(view: &mut View, snap: &Snapshot, task: &str) -> bool {
     moved
 }
 
-pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui {
+pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let index = Index::new(snap.projects.clone());
     let tasks = snap.tasks.clone();
     let counts = resolve::counts_by_project(&index, &tasks);
     let bindings = &snap.bindings;
     let pins = &snap.pins;
 
-    let workspaces = &snap.workspaces;
     // Our own panels are furniture, not work. Everything else is a pane
     // someone opened, agent or not — a shell sitting in a project is a fact
     // about that project whether or not an agent ever attaches to it.
@@ -1231,16 +1174,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // holding a copy of this very tree, drawn inside it as a shell somebody is
     // standing in.
     let furniture = [PANEL_LABEL, VIEW_LABEL, BOARD_LABEL, FULL_LABEL];
-    let panes: Vec<&herdr::Pane> =
+    let panes: Vec<&AgentRef> =
         snap.panes.iter().filter(|p| !furniture.contains(&p.label.as_str())).collect();
-    let self_focused = self_ws
-        .and_then(|id| workspaces.iter().find(|w| w.id == id))
-        .map(|w| w.focused)
-        .unwrap_or(true);
-
-    let ws_label = |id: &str| -> String {
-        workspaces.iter().find(|w| w.id == id).map(|w| w.label.clone()).unwrap_or_default()
-    };
 
     // pane -> task id
     let bound_task_of_pane = |pane: &str| -> Option<String> {
@@ -1250,20 +1185,17 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             .and_then(|t| t.as_str())
             .map(|s| s.to_string())
     };
+    // The store's half of a row, filled onto the runner's half: `crate::live`
+    // leaves `task` and `project` empty because a runner knows neither.
+    //
     // `project` is what the pane would take *work* from, which the caller has
-    // (see `pane_name` above for how a pane row is named)
     // usually just resolved for its own reasons — passed in rather than worked
     // out again here, because resolution canonicalises every project root and
     // this runs four times a second against every pane on the machine.
-    let as_ref = |a: &herdr::Pane, project: Option<String>| AgentRef {
-        pane: a.pane_id.clone(),
-        workspace: a.workspace_id.clone(),
-        state: a.agent_status.clone(),
-        where_: pane_name(&a.label, &a.title, &ws_label(&a.workspace_id)),
-        agent: !a.agent.is_empty(),
-        kind: a.agent.clone(),
-        task: bound_task_of_pane(&a.pane_id),
+    let as_ref = |a: &AgentRef, project: Option<String>| AgentRef {
+        task: bound_task_of_pane(&a.pane),
         project,
+        ..a.clone()
     };
 
     // task id -> the pane claimed to it. No project: a pane holding a task is
@@ -1271,7 +1203,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     // first.
     let agent_for_task = |task_id: &str| -> Option<AgentRef> {
         panes.iter().find_map(|a| {
-            (bound_task_of_pane(&a.pane_id).as_deref() == Some(task_id)).then(|| as_ref(a, None))
+            (bound_task_of_pane(&a.pane).as_deref() == Some(task_id)).then(|| as_ref(a, None))
         })
     };
 
@@ -1287,7 +1219,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
     let mut census: Vec<(AgentState, Census, AgentRef)> = Vec::new();
 
     for a in panes.iter() {
-        let bound = bound_task_of_pane(&a.pane_id);
+        let bound = bound_task_of_pane(&a.pane);
         let bound_project = bound
             .as_ref()
             .and_then(|id| tasks.iter().find(|t| &t.id == id))
@@ -1304,27 +1236,27 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 claim: resolve::claimed_project(
                     &snap.claims,
                     &tasks,
-                    Some(&a.workspace_id),
-                    Some(&ws_label(&a.workspace_id)),
+                    Some(&a.workspace),
+                    Some(&a.workspace_label),
                 ),
             },
-            Some(&a.workspace_id),
-            Some(&ws_label(&a.workspace_id)),
+            Some(&a.workspace),
+            Some(&a.workspace_label),
             Some(&a.cwd),
         );
         // Where it stands places the row; standing direction says what it is
         // for, and that is what a verb sends it to work. A mandate on `data`
         // and a cwd in `wsp` are both true at once — the tree wants the second
         // and `f` wants the first.
-        let direction = crate::cmd_mandate::from_map(&snap.mandates, &a.workspace_id)
+        let direction = crate::cmd_mandate::from_map(&snap.mandates, &a.workspace)
             .filter(|p| index.get(p).is_some())
             .or_else(|| r.project.clone());
         // Shells are not in the census. A pane with nobody in it is a fact
         // about a place, and the agents view is a list of people.
-        if !a.agent.is_empty() {
+        if a.agent {
             let holds = bound.as_ref().and_then(|id| tasks.iter().find(|t| &t.id == id));
             census.push((
-                agent_state(&a.agent_status, holds.map(|t| t.status())),
+                agent_state(&a.state, holds.map(|t| t.status())),
                 Census {
                     // Where it stands, before where it is aimed: a pane holding
                     // a task is placed by that task's project, and only one
@@ -1353,7 +1285,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 // pinned at the foot where it cannot scroll away — putting it
                 // in the tree as well would be the same pane twice in one
                 // glance, which is one pane too many to count.
-                if bound.is_none() && a.agent.is_empty() {
+                if bound.is_none() && !a.agent {
                     loose_by_project.entry(p.clone()).or_default().push(as_ref(a, direction));
                 }
             }
@@ -1362,7 +1294,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             None => {
                 // A shell that resolves nowhere is still a fact about nothing
                 // in particular, and keeps the tree's own group for it.
-                if bound.is_none() && a.agent.is_empty() {
+                if bound.is_none() && !a.agent {
                     homeless.push(as_ref(a, direction));
                 }
             }
@@ -1492,7 +1424,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 };
                 for a in ps.iter().take(shown) {
                     rows.push(Row::Agent {
-                        title: a.where_.clone(),
+                        title: a.where_(),
                         // Shells, every one of them — nothing is bound here, so
                         // there is no task to read a state off and the row
                         // draws `▫` regardless.
@@ -1539,14 +1471,14 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         });
         if !folded {
             for a in homeless {
-                let title = a.where_.clone();
+                let title = a.where_();
                 let state = agent_state(&a.state, None);
                 rows.push(Row::Agent { agent: a, title, depth: 1, state, census: None });
             }
         }
     }
 
-    census.sort_by(|(a, _, ar), (b, _, br)| a.cmp(b).then(ar.where_.cmp(&br.where_)));
+    census.sort_by(|(a, _, ar), (b, _, br)| a.cmp(b).then(ar.where_().cmp(&br.where_())));
 
     // The agents, either way round.
     //
@@ -1571,7 +1503,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
             for i in group {
                 let (state, c, a) = &census[i];
                 list.push(Row::Agent {
-                    title: a.where_.clone(),
+                    title: a.where_(),
                     agent: a.clone(),
                     depth: 1,
                     state: *state,
@@ -1645,7 +1577,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
                 for i in group {
                     let (state, c, a) = &census[i];
                     rows.push(Row::Agent {
-                        title: a.where_.clone(),
+                        title: a.where_(),
                         agent: a.clone(),
                         depth: 1,
                         state: *state,
@@ -1704,7 +1636,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View, self_ws: Option<&str>) -> Ui
         review: tasks.iter().filter(|t| t.status() == Status::Review).count(),
         sel: 0,
         message: None,
-        self_focused,
         vocabulary: vocabulary(snap),
         show_done: view.show_done,
         review_only: view.review_only,

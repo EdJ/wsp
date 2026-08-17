@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::herdr;
+use crate::live::{self, AgentRef};
 use crate::model::{Priority, Status, Task};
 use crate::panel::AgentState;
 use crate::resolve::{self, Counts, Index};
@@ -138,7 +138,7 @@ pub(crate) struct Column {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Agent {
     pub(crate) state: AgentState,
-    /// The pane's own name — see [`crate::panel::pane_name`].
+    /// The pane's own name — see [`crate::live::pane_name`].
     pub(crate) name: String,
     pub(crate) pane: String,
     /// The task in its hands, if it has one. `None` is the whole point of the
@@ -246,10 +246,7 @@ pub(crate) struct Ctx {
     pub bindings: BTreeMap<String, Value>,
     /// task -> the claim on it, read for `claimed_at`.
     pub claims: BTreeMap<String, Value>,
-    pub panes: Vec<herdr::Pane>,
-    /// Only for naming: a pane wsp has never labelled falls back to the
-    /// workspace it stands in.
-    pub workspaces: Vec<herdr::Workspace>,
+    pub panes: Vec<AgentRef>,
 }
 
 impl Ctx {
@@ -261,8 +258,7 @@ impl Ctx {
             claims: store.claims(),
             // A herdr that is not answering costs the agent marks and nothing
             // else. The durable half is the board.
-            panes: herdr::panes().unwrap_or_default(),
-            workspaces: herdr::workspaces().unwrap_or_default(),
+            panes: live::panes(),
         }
     }
 }
@@ -281,13 +277,13 @@ impl Ctx {
 /// three completions through a year of them.
 pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
     // pane -> task, inverted once rather than scanned per card.
-    let held_by: BTreeMap<&str, &herdr::Pane> = ctx
+    let held_by: BTreeMap<&str, &AgentRef> = ctx
         .panes
         .iter()
         .filter_map(|p| {
             let task = ctx
                 .bindings
-                .get(&p.pane_id)?
+                .get(&p.pane)?
                 .get("task_id")?
                 .as_str()
                 .filter(|s| !s.is_empty())?;
@@ -313,8 +309,8 @@ pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
             project: t.project.clone(),
             // The two halves the panel already joins: what herdr says the pane
             // is doing, and what the store says it is holding while it does it.
-            agent: pane.map(|p| crate::panel::agent_state(&p.agent_status, Some(t.status()))),
-            pane: pane.map(|p| p.pane_id.clone()),
+            agent: pane.map(|p| crate::panel::agent_state(&p.state, Some(t.status()))),
+            pane: pane.map(|p| p.pane.clone()),
             held: ctx
                 .claims
                 .get(&t.id)
@@ -354,21 +350,13 @@ pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
     let mut agents: Vec<Agent> = ctx
         .panes
         .iter()
-        .filter(|p| !p.agent.is_empty())
+        .filter(|p| p.agent)
         .map(|p| {
-            let held = held_of(&p.pane_id);
+            let held = held_of(&p.pane);
             Agent {
-                state: crate::panel::agent_state(&p.agent_status, held.map(|t| t.status())),
-                name: crate::panel::pane_name(
-                    &p.label,
-                    &p.title,
-                    &ctx.workspaces
-                        .iter()
-                        .find(|w| w.id == p.workspace_id)
-                        .map(|w| w.label.clone())
-                        .unwrap_or_default(),
-                ),
-                pane: p.pane_id.clone(),
+                state: crate::panel::agent_state(&p.state, held.map(|t| t.status())),
+                name: p.where_(),
+                pane: p.pane.clone(),
                 task: held.map(|t| t.id.clone()),
                 held: held
                     .and_then(|t| ctx.claims.get(&t.id))
@@ -457,7 +445,6 @@ mod tests {
             bindings: BTreeMap::new(),
             claims: BTreeMap::new(),
             panes: Vec::new(),
-            workspaces: Vec::new(),
         }
     }
 
@@ -544,11 +531,12 @@ mod tests {
     /// tell you what to do next and this tells you who could do it.
     #[test]
     fn the_agents_with_nothing_in_their_hands_are_the_ones_a_board_cannot_show() {
-        let pane = |id: &str, status: &str, label: &str| herdr::Pane {
-            pane_id: id.into(),
-            workspace_id: "w1".into(),
-            agent: "claude".into(),
-            agent_status: status.into(),
+        let pane = |id: &str, status: &str, label: &str| AgentRef {
+            pane: id.into(),
+            workspace: "w1".into(),
+            agent: true,
+            kind: "claude".into(),
+            state: status.into(),
             label: label.into(),
             ..Default::default()
         };
@@ -562,7 +550,7 @@ mod tests {
             pane("w1:p3", "idle", "Verb UI"),
             // A shell is a fact about a place, not a person. It is not capacity
             // and it is not in the census.
-            herdr::Pane { pane_id: "w1:p4".into(), label: "a shell".into(), ..Default::default() },
+            AgentRef { pane: "w1:p4".into(), label: "a shell".into(), ..Default::default() },
         ];
         c.bindings.insert("w1:p1".into(), serde_json::json!({ "task_id": "t-01" }));
         c.bindings.insert("w1:p2".into(), serde_json::json!({ "task_id": "t-02" }));

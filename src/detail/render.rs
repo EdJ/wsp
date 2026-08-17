@@ -4,7 +4,7 @@
 //! fixture can render a frame with nothing running — the same decision the
 //! panel's `Snapshot` makes, for the same reason.
 
-use crate::herdr;
+use crate::live::{self, AgentRef};
 use crate::model::{Priority, Status, Task};
 use crate::panel::{self, line, Line, Style};
 use crate::resolve::{self, Index};
@@ -50,13 +50,13 @@ pub(crate) struct Ctx {
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
     pub worked: std::collections::BTreeMap<String, serde_json::Value>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
-    pub panes: Vec<herdr::Pane>,
+    pub panes: Vec<AgentRef>,
     /// The sections in the editor columns beside this pane, left to right.
     ///
-    /// Cannot be derived from `panes`: a `herdr::Pane` carries no geometry, so
-    /// which label is the second column across takes a separate call. Filled
-    /// once per repaint by `live`, and left empty by a storyboard, where there
-    /// are no editors and the menu is rightly absent.
+    /// Cannot be derived from `panes`: a pane row carries no geometry, so which
+    /// label is the second column across takes a separate call. Filled once per
+    /// repaint by `live`, and left empty by a storyboard, where there are no
+    /// editors and the menu is rightly absent.
     pub columns: Vec<String>,
 }
 
@@ -68,17 +68,17 @@ impl Ctx {
             claims: store.claims(),
             worked: store.worked(),
             bindings: store.bindings(),
-            panes: herdr::panes().unwrap_or_default(),
+            panes: live::panes(),
             columns: super::editors::editor_columns(),
         }
     }
 
     /// The pane working this task, if the live join says so.
-    fn pane_for(&self, task: &str) -> Option<&herdr::Pane> {
+    fn pane_for(&self, task: &str) -> Option<&AgentRef> {
         let pane_id = self.bindings.iter().find_map(|(pane, b)| {
             (b.get("task_id").and_then(|t| t.as_str()) == Some(task)).then(|| pane.clone())
         })?;
-        self.panes.iter().find(|p| p.pane_id == pane_id)
+        self.panes.iter().find(|p| p.pane == pane_id)
     }
 }
 
@@ -239,8 +239,8 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     }
     match ctx.pane_for(&t.id) {
         Some(p) => {
-            let what = if p.agent.is_empty() { "shell".to_string() } else { p.agent.clone() };
-            out.push(field("pane", &format!("{} · {what} {}", p.pane_id, p.agent_status), Style::Plain));
+            let what = if p.agent { p.kind.clone() } else { "shell".to_string() };
+            out.push(field("pane", &format!("{} · {what} {}", p.pane, p.state), Style::Plain));
         }
         None => out.push(field("pane", "", Style::Dim)),
     }

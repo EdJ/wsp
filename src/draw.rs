@@ -78,62 +78,36 @@
 //! `Spec::focus` a statement about the destination rather than a precondition
 //! for anything here.
 //!
-//! It holds by construction rather than by discipline, and the measurement
-//! below is why: `focused` reaches the view layer and never reaches a frame.
+//! It holds by construction rather than by discipline, and the seam holds the
+//! same line one layer down: `focused` does not reach the view layer either.
+//! herdr's two focus facts are carried on `live::Live`, beside the rows rather
+//! than inside them, because their only reader is the panel's event loop —
+//! picking the refresh interval, and deciding what a click means. A scheduling
+//! input travelling inside a view is one every renderer is handed and none of
+//! them can use.
 //!
-//! # The finding: every view in this tree carries a herdr type
+//! # The seam under this port, and why it is not the port's business
 //!
-//! t-260816-059 flagged that `panel::Snapshot` holds `herdr::Workspace` and
-//! `herdr::Pane` — two of its ten fields being the runner's types in the view's
-//! struct. Nothing has moved it, and writing this file is what makes the cost
-//! concrete rather than aesthetic, so it is reported here rather than worked
-//! around.
+//! This file names no herdr type, because [`Paint`] is a trait and the view
+//! stays behind it. That was true before t-260817-012 and did not mean much:
+//! all three views carried the runner's structs — `panel::Snapshot` held
+//! `Vec<herdr::Workspace>` and `Vec<herdr::Pane>`, `detail::Ctx` and
+//! `kanban::Ctx` a pane list each — so the cost landed on whoever implemented
+//! the trait, and a canvas renderer for a phone would have had to link wsp's
+//! herdr socket client to compile.
 //!
-//! It is not one view. All three carry one: `panel::Snapshot`
-//! (`workspaces`, `panes`), `detail::Ctx` (`panes`) and `kanban::Ctx`. So a
-//! renderer that is handed a view is handed a herdr type, on every surface,
-//! and the storyboard already pays for it — `story.rs` has `fn workspace(…) ->
-//! herdr::Workspace` and `fn agent(…) -> herdr::Pane` at its top, which is a
-//! test fabricating the runner's structs in order to draw a picture that has
-//! nothing to do with the runner.
-//!
-//! **The port itself is clean, and that is not the same as the seam being
-//! clean.** Nothing in this file names a herdr type, because [`Paint`] is a
-//! trait and the view stays behind it. The cost lands one layer down, on
-//! whoever implements it — and a canvas renderer for a phone would have to link
-//! wsp's herdr socket client to compile.
-//!
-//! What it would take is small, which is the argument for doing it. Measured at
-//! 96b37a4, the three view and render layers read **eight** fields off herdr's
-//! two types: `pane_id`, `workspace_id`, `label`, `title`, `agent`,
-//! `agent_status`, `cwd`, and `focused`.
-//!
-//! - **Seven of the eight are drawn.** The eighth, `Workspace::focused`, never
-//!   reaches a frame: its only consumer is `panel/run.rs:871`, where it picks
-//!   the refresh interval — 250 ms for the pane in front of you, 30 s for the
-//!   rest. It is a *scheduling* input that has been travelling inside the view.
-//! - **The projection of the other seven already exists**, and is already
-//!   wsp's own: `panel::rows::AgentRef` (`rows.rs:62`) is built out of exactly
-//!   those fields, inside `collect()`. Taking herdr out of the views means
-//!   hoisting that projection from inside `collect` up to `Snapshot::live`,
-//!   where the socket call is — not inventing a type.
-//! - `place::Seated` covers five of the seven (`seat`, `label`, `cwd`, `agent`,
-//!   `state`). The two it does not are `title` — a pane's terminal title, the
-//!   second fallback in `rows::pane_name` — and `workspace_id`, which is where
-//!   a row sends you. Both are drawing facts, so the honest answer is that the
-//!   view's pane row is `AgentRef`, not `Seated`, and the two ports stay
-//!   separate as `place.rs` and `arrange.rs` already argued.
-//!
-//! That is a one-file change with a test, and it is t-260816-059's rather than
-//! this task's. Recorded here so that the next reader of this port knows the
-//! port is clean and the seam is not.
+//! It does not now. `crate::live` is where the socket call sits and
+//! `live::AgentRef` is what a view carries, so a target below this port is
+//! handed wsp's own types and nothing else. The rule that keeps it that way is
+//! falsifiable rather than argued: no `herdr::` in `panel/rows.rs`,
+//! `detail/render.rs`, `kanban/mod.rs` or `story.rs`.
 //!
 //! # What is deliberately absent
 //!
 //! - **A view type.** [`Paint`] is a trait so that this file names none of the
-//!   three, and so that the herdr dependency above stays in the adapter where
-//!   it can be seen. A port that imported `Snapshot` would have made the
-//!   finding invisible by making it unavoidable.
+//!   three. A port that imported `Snapshot` would have tied the renderer to one
+//!   surface's answer, and — while the views still carried herdr — would have
+//!   made that dependency unavoidable rather than visible.
 //! - **Input.** A renderer draws; keys are `panel::keys` and `kanban::keys`,
 //!   and the state they mutate is the painter's — see [`Paint::paint`] taking
 //!   `&mut self`, which is the only concession this port makes to the fact that

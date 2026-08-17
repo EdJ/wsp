@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use crate::herdr;
+use crate::live::AgentRef;
 use crate::model::{Project, Task};
 use crate::input::Key;
 use crate::panel::{self, Snapshot};
@@ -48,21 +48,36 @@ fn tagged(mut t: Task, tags: &[&str]) -> Task {
     t
 }
 
-fn workspace(id: &str, label: &str, focused: bool) -> herdr::Workspace {
-    herdr::Workspace {
-        id: id.to_string(),
-        label: label.to_string(),
-        focused,
-        ..Default::default()
+/// The workspaces the fixture's panes stand in.
+///
+/// A list of places, and not a field on the snapshot: a pane row carries the
+/// name of the place it stands in, so the join herdr's two lists used to need
+/// has already happened by the time a view sees one. What the workspaces
+/// themselves said — a label, and which was focused — is either on the row or
+/// is not a view fact at all. See `crate::live`.
+fn workspace(id: &str) -> String {
+    match id {
+        "w0" => "orchestrator",
+        "w1" => "Trance Video",
+        "w2" => "Verb UI",
+        "w3" => "Easter",
+        "w4" => "Trance Lite",
+        "w5" => "panel work",
+        // A label that matches no project, for a pane that stands nowhere.
+        "w6" => "scratch",
+        _ => "",
     }
+    .to_string()
 }
 
-fn agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Pane {
-    herdr::Pane {
-        pane_id: pane.to_string(),
-        workspace_id: ws.to_string(),
-        agent: "claude".into(),
-        agent_status: state.to_string(),
+fn agent(pane: &str, ws: &str, state: &str, title: &str) -> AgentRef {
+    AgentRef {
+        pane: pane.to_string(),
+        workspace: ws.to_string(),
+        workspace_label: workspace(ws),
+        agent: true,
+        kind: "claude".into(),
+        state: state.to_string(),
         title: title.to_string(),
         ..Default::default()
     }
@@ -70,10 +85,11 @@ fn agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Pane {
 
 /// A pane with nobody driving it. The panel could not see these at all before,
 /// because a shell is not an agent.
-fn shell(pane: &str, ws: &str, cwd: &str) -> herdr::Pane {
-    herdr::Pane {
-        pane_id: pane.to_string(),
-        workspace_id: ws.to_string(),
+fn shell(pane: &str, ws: &str, cwd: &str) -> AgentRef {
+    AgentRef {
+        pane: pane.to_string(),
+        workspace: ws.to_string(),
+        workspace_label: workspace(ws),
         cwd: cwd.to_string(),
         ..Default::default()
     }
@@ -170,17 +186,6 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         tasks.push(if i == 5 { prio(t, "high") } else { t });
     }
 
-    let workspaces = vec![
-        workspace("w0", "orchestrator", true),
-        workspace("w1", "Trance Video", false),
-        workspace("w2", "Verb UI", false),
-        workspace("w3", "Easter", false),
-        workspace("w4", "Trance Lite", false),
-        workspace("w5", "panel work", false),
-        // A label that matches no project, for a pane that stands nowhere.
-        workspace("w6", "scratch", false),
-    ];
-
     let agents = vec![
         agent("w1:p1", "w1", "working", "Trance Video"),
         agent("w2:p1", "w2", "idle", "Verb UI"),
@@ -218,7 +223,13 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // The orchestrator's own home — resolves to no project on purpose.
         shell("w0:p1", "w0", "~/claude"),
         // One of ours, which must never appear as work.
-        herdr::Pane { label: panel::PANEL_LABEL.into(), pane_id: "w0:p2".into(), workspace_id: "w0".into(), ..Default::default() },
+        AgentRef {
+            label: panel::PANEL_LABEL.into(),
+            pane: "w0:p2".into(),
+            workspace: "w0".into(),
+            workspace_label: workspace("w0"),
+            ..Default::default()
+        },
     ];
 
     // w1's agent is claimed to a doing task; w2's is claimed to a doing task
@@ -250,7 +261,6 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // the one that shows the section, so every other frame goes on saying
         // what the panel says on an ordinary afternoon.
         flags: BTreeMap::new(),
-        workspaces,
         panes: agents,
     }
 }
@@ -407,7 +417,7 @@ impl<'a> Driver<'a> {
         // `q` means depends on whether this panel is the tab or the furniture.
         view.fit_to_pane(w);
         view.takes_the_tab(true);
-        let ui = panel::collect(snap, &view, Some("w0"));
+        let ui = panel::collect(snap, &view);
         panel::place(&ui, &mut view, w, h);
         Driver { snap, view, ui, log: Vec::new(), size: (w, h) }
     }
@@ -417,7 +427,7 @@ impl<'a> Driver<'a> {
         // The reducer may ask for a refetch; offline that just means rebuilding
         // the rows from the same snapshot, exactly as the live loop does.
         if let panel::Effect::Refetch = panel::apply_key(k, &mut self.ui, &mut self.view) {
-            panel::refetch_into(&mut self.ui, self.snap, &mut self.view, Some("w0"));
+            panel::refetch_into(&mut self.ui, self.snap, &mut self.view);
         }
         // And the loop draws, which is where the view keeps its place. A
         // driver that skipped this would leave the tree deciding its offset
@@ -968,7 +978,6 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
         // "356d" is a fixture whose age is showing.
         claims: BTreeMap::new(),
         panes: w.panes.clone(),
-        workspaces: w.workspaces.clone(),
     };
 
     let shot = |title: &str, caption: &str, scope: Scope, cur: Cursor, done: bool, note: &str| {
@@ -1268,7 +1277,7 @@ mod tests {
     /// here is one where being off by a single line would act on the wrong
     /// task — silently, and looking exactly like a misplaced click.
     fn ui_of(snap: &Snapshot, view: &panel::View) -> panel::Ui {
-        panel::collect(snap, view, Some("w0"))
+        panel::collect(snap, view)
     }
 
     /// The label wins because it is the only one of the three anybody keeps
@@ -1277,7 +1286,7 @@ mod tests {
     /// confidently, and wrongly, which is the failure a blank would not be.
     #[test]
     fn a_pane_is_named_by_the_name_somebody_is_still_maintaining() {
-        use crate::panel::pane_name;
+        use crate::live::pane_name;
 
         // `claim` and `wsp say` both write the label, so it answers first.
         assert_eq!(pane_name("reading the claim guard", "◑ Pick up wsp 041", "wsp"), "reading the claim guard");
@@ -1319,7 +1328,7 @@ mod tests {
         panel::place(&ui, &mut view, W, H);
         for k in keys {
             if let panel::Effect::Refetch = panel::apply_key(*k, &mut ui, &mut view) {
-                panel::refetch_into(&mut ui, snap, &mut view, Some("w0"));
+                panel::refetch_into(&mut ui, snap, &mut view);
             }
             // The draw between one key and the next, which is where the view
             // keeps its place. Skipping it leaves a panel whose tree derives
@@ -1340,7 +1349,7 @@ mod tests {
         let (mut ui, _view) = showing(&w, &[Key::Char('w')]);
 
         let running =
-            w.panes.iter().filter(|p| !p.agent.is_empty() && p.label != panel::PANEL_LABEL).count();
+            w.panes.iter().filter(|p| p.agent && p.label != panel::PANEL_LABEL).count();
         let mut kinds = Vec::new();
         for i in 0..ui.rows_for_test() {
             ui.select_for_test(i);
@@ -1555,7 +1564,7 @@ mod tests {
         w.projects.push(child);
         // The pane that was standing nowhere, moved into it. Longest root wins,
         // so it lands in `panel` rather than the `wsp` it is also inside.
-        let pane = w.panes.iter_mut().find(|p| p.pane_id == "w3:p1").expect("w3:p1");
+        let pane = w.panes.iter_mut().find(|p| p.pane == "w3:p1").expect("w3:p1");
         pane.cwd = "~/claude/wsp/panel".into();
 
         let (mut ui, _view) = showing(&w, &[Key::Char('w')]);
@@ -1718,7 +1727,7 @@ mod tests {
         for (i, (_, agent)) in ui.census_for_test().into_iter().enumerate() {
             let hit = panel::click(&mut ui, &mut view, W, H, 4 + i, 0, WORKING_HERE);
             match hit {
-                panel::Hit::Focus(a) => assert_eq!(a.pane(), agent.pane(), "mark {i}"),
+                panel::Hit::Focus(a) => assert_eq!(a.pane, agent.pane, "mark {i}"),
                 other => panic!("mark {i} should go to a terminal, got {other:?}"),
             }
         }
@@ -1835,7 +1844,7 @@ mod tests {
 
         assert_eq!(headings, ["trance", "verb", "no project"], "the tree's order, in the foot");
         let first_five: Vec<String> =
-            census.iter().take(5).map(|(_, a)| a.pane().to_string()).collect();
+            census.iter().take(5).map(|(_, a)| a.pane.clone()).collect();
         let mut sorted = panes.clone();
         sorted.sort();
         let mut want = first_five.clone();
@@ -1880,7 +1889,7 @@ mod tests {
         // `→` on the `⋯` opens the tail in place, exactly as a project's does.
         panel::apply_key(Key::Char('G'), &mut ui, &mut view);
         if let panel::Effect::Refetch = panel::apply_key(Key::Right, &mut ui, &mut view) {
-            panel::refetch_into(&mut ui, &w, &mut view, Some("w0"));
+            panel::refetch_into(&mut ui, &w, &mut view);
         }
         let docked = ui.dock_for_test();
         let mut agents = 0;
@@ -1990,7 +1999,7 @@ mod tests {
         );
 
         let was = ui.selected_index();
-        panel::refetch_into(&mut ui, &w, &mut view, Some("w0"));
+        panel::refetch_into(&mut ui, &w, &mut view);
         assert_eq!(ui.selected_index(), was, "a rebuild left the cursor where it was");
         assert!(
             ui.selected_index() >= ui.rows_for_test() - ui.dock_for_test(),
@@ -2507,7 +2516,7 @@ mod tests {
     fn step(snap: &Snapshot, ui: &mut panel::Ui, view: &mut panel::View, k: Key) -> panel::Effect {
         let e = panel::apply_key(k, ui, view);
         if matches!(e, panel::Effect::Refetch) {
-            panel::refetch_into(ui, snap, view, Some("w0"));
+            panel::refetch_into(ui, snap, view);
         }
         e
     }
@@ -2808,8 +2817,8 @@ mod tests {
         assert_eq!(clear_before_the_claim(&world()), Some("/clear"));
 
         let mut other = world();
-        for p in other.panes.iter_mut().filter(|p| p.pane_id == "w4:p2") {
-            p.agent = "codex".into();
+        for p in other.panes.iter_mut().filter(|p| p.pane == "w4:p2") {
+            p.kind = "codex".into();
         }
         assert_eq!(clear_before_the_claim(&other), None);
     }
@@ -3021,7 +3030,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         if let panel::Effect::Refetch = press(&mut ui, &mut view, 'R') {
-            panel::refetch_into(&mut ui, &w, &mut view, Some("w0"));
+            panel::refetch_into(&mut ui, &w, &mut view);
         }
         assert!(
             !has(&ui, &panel::Target::Pane("w6:p1".into())),
@@ -3043,8 +3052,8 @@ mod tests {
     #[test]
     fn a_hand_over_with_nobody_to_hand_to_does_nothing() {
         let mut w = world();
-        for p in w.panes.iter_mut().filter(|p| !p.agent.is_empty()) {
-            p.agent_status = "working".into();
+        for p in w.panes.iter_mut().filter(|p| p.agent) {
+            p.state = "working".into();
         }
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
@@ -3153,8 +3162,8 @@ mod tests {
     #[test]
     fn an_agent_whose_clear_we_cannot_spell_is_only_released() {
         let mut w = world();
-        for p in w.panes.iter_mut().filter(|p| p.pane_id == "w2:p1") {
-            p.agent = "codex".into();
+        for p in w.panes.iter_mut().filter(|p| p.pane == "w2:p1") {
+            p.kind = "codex".into();
         }
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
@@ -3947,7 +3956,7 @@ mod tests {
             }
         }
         if let panel::Effect::Refetch = panel::apply_key(Key::Right, &mut ui, &mut view) {
-            panel::refetch_into(&mut ui, &f, &mut view, Some("w0"));
+            panel::refetch_into(&mut ui, &f, &mut view);
         }
         assert_eq!(count(&mut ui), f.flags.len(), "all of them, once asked");
     }
@@ -4197,7 +4206,7 @@ mod tests {
         // The other panel rebuilds on its own tick and puts it away, with
         // nobody having touched that pane.
         let mut ui = there;
-        panel::refetch_into(&mut ui, &answered, &mut theirs, Some("w0"));
+        panel::refetch_into(&mut ui, &answered, &mut theirs);
         panel::place(&ui, &mut theirs, W, H);
         assert!(
             matches!(theirs.mode, panel::Mode::Browse),
@@ -4217,7 +4226,7 @@ mod tests {
 
         let mut lowered = flagged_world();
         lowered.flags.remove("t-105");
-        panel::refetch_into(&mut ui, &lowered, &mut view, Some("w0"));
+        panel::refetch_into(&mut ui, &lowered, &mut view);
         panel::place(&ui, &mut view, W, H);
         assert!(matches!(view.mode, panel::Mode::Browse), "the card outlived the flag");
     }
@@ -4238,7 +4247,7 @@ mod tests {
         if let Some(r) = again.flags.get_mut("t-105").and_then(|r| r.as_object_mut()) {
             r.insert("said".into(), json!("actually the reducer is free now"));
         }
-        panel::refetch_into(&mut ui, &again, &mut view, Some("w0"));
+        panel::refetch_into(&mut ui, &again, &mut view);
         panel::place(&ui, &mut view, W, H);
         match &view.mode {
             panel::Mode::Card(c) => assert_eq!(c.said(), "actually the reducer is free now"),
@@ -4276,7 +4285,7 @@ mod tests {
             r.insert("seen".into(), json!(true));
         }
         panel::apply_key(Key::Esc, &mut ui, &mut view);
-        panel::refetch_into(&mut ui, &answered, &mut view, Some("w0"));
+        panel::refetch_into(&mut ui, &answered, &mut view);
         panel::place(&ui, &mut view, W, H);
         match &view.mode {
             panel::Mode::Card(c) => assert_eq!(c.task(), "t-006", "the queue stopped after one"),

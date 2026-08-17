@@ -15,13 +15,14 @@ use serde_json::json;
 
 use crate::herdr;
 use crate::input::Key;
+use crate::live::AgentRef;
 use crate::model::Priority;
 use crate::store::Store;
 
 use super::install::list_panes;
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
-use super::rows::{hotkeys, AgentRef, Target, Ui};
+use super::rows::{hotkeys, Target, Ui};
 use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,7 +309,7 @@ pub(super) fn tell_find_work(a: &AgentRef, project: &str) -> Tell {
             "Find your next piece of work: run `wsp next -p {project}`, `wsp claim` what it \
              names, then do it. If nothing is actionable, say so and stop."
         )),
-        note: format!("{} → looking in {project}", a.where_),
+        note: format!("{} → looking in {project}", a.where_()),
         clear: clear_command(&a.kind),
     }
 }
@@ -332,7 +333,7 @@ pub(super) fn tell_released(a: &AgentRef, task: &str) -> Option<Tell> {
         // came. The name is the one the row had a moment ago — the release
         // takes it off the pane, so by the time this is drawn it is already
         // what the agent *was* called.
-        note: format!("{} ← {task}", a.where_),
+        note: format!("{} ← {task}", a.where_()),
         clear: Some(clear_command(&a.kind)?),
     })
 }
@@ -349,7 +350,7 @@ pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
     Tell {
         pane: a.pane.clone(),
         text: Some(crate::cmd_spawn::claimed_text(task, crate::cmd_spawn::Handover::Running)),
-        note: format!("{} → {task}", a.where_),
+        note: format!("{} → {task}", a.where_()),
         clear: clear_command(&a.kind),
     }
 }
@@ -406,7 +407,7 @@ pub(super) fn tell_refused(ui: &Ui, pane: &str, task: &str) -> Option<Tell> {
             "Not {task} — your flag on it was answered no. Carry on with what you have, and \
              `wsp flag` again if you think it is still the right next thing."
         )),
-        note: format!("{} → not {task}", a.where_),
+        note: format!("{} → not {task}", a.where_()),
         clear: None,
     })
 }
@@ -606,13 +607,13 @@ fn unassign(target: &Target, ui: &mut Ui) -> Effect {
         return Effect::None;
     };
     let Some(task) = a.task.clone() else {
-        say(ui, format!("{} holds nothing already", a.where_));
+        say(ui, format!("{} holds nothing already", a.where_()));
         return Effect::None;
     };
     let idle = a.agent && a.state == "idle";
     let then = idle.then(|| tell_released(&a, &task)).flatten();
     if !idle {
-        say(ui, format!("{} → nothing · still working, so not cleared", a.where_));
+        say(ui, format!("{} → nothing · still working, so not cleared", a.where_()));
     }
     Effect::Run {
         // No `--force`. `release` refuses on nothing: a pane either holds a
@@ -644,12 +645,12 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
         // for it anyway: an agent holding no task is one you give work to, not
         // one you follow. `f` and `c` are the keys for that, and saying so is
         // more use than saying no.
-        say(ui, format!("{} holds nothing · f or c gives it some", a.where_));
+        say(ui, format!("{} holds nothing · f or c gives it some", a.where_()));
         return Effect::None;
     };
     view.agents = false;
     view.land_on = Some(task);
-    say(ui, format!("{} · in the tree", a.where_));
+    say(ui, format!("{} · in the tree", a.where_()));
     Effect::Refetch
 }
 

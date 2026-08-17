@@ -12,14 +12,17 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::input::Key;
+use crate::live::AgentRef;
 use crate::util;
 
-use super::rows::{AgentRef, Card, Request, Row, Ui};
+use super::rows::{Card, Request, Row, Ui};
 use super::verbs::{browse_key, pick_tell, Ask, Pick, Tell};
 
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
 /// event loop and handed to `collect`, which is otherwise a pure function of
-/// the store plus herdr.
+/// its [`Snapshot`]: the store, joined with what is running.
+///
+/// [`Snapshot`]: super::rows::Snapshot
 impl View {
     /// Take the shape of the pane this panel is drawn in.
     ///

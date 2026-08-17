@@ -15,12 +15,13 @@ use serde_json::{json, Value};
 
 use crate::herdr;
 use crate::input::Key;
+use crate::live::{self, AgentRef};
 use crate::store::Store;
 use crate::util::exe_stamp;
 
 use super::keys::{apply_key, say, Effect, Mode, View};
 use super::render::{frame, to_ansi};
-use super::rows::{collect, refetch_into, AgentRef, Cursor, Snapshot, Target, Ui};
+use super::rows::{collect, refetch_into, Cursor, Snapshot, Target, Ui};
 use super::shared;
 use super::verbs::{close_view, inspect, open_board, open_full, pop_out, run_wsp, send_tell, Tell};
 
@@ -307,28 +308,6 @@ fn focus_self(pane: Option<&str>, ws: Option<&str>) {
     }
 }
 
-/// Does the keyboard belong to this pane, according to herdr's own census?
-///
-/// One pane on the machine answers yes: `pane.list` marks the focused pane of
-/// the focused workspace and nothing else, which is why this is a census
-/// question rather than a workspace one. `self_focused` is the other half of the
-/// same picture and is not a substitute — a panel in the workspace being looked
-/// at is on screen, and the shell beside it may still be the pane being worked
-/// in.
-///
-/// Current because the loop refetches the moment focus lands anywhere in this
-/// workspace, and every 250ms while it is on screen; see the `focused_us` branch
-/// for why that covers the keyboard crossing between two panes of one workspace.
-///
-/// A panel with no pane id of its own — run outside herdr — answers yes, the
-/// same way `collect` treats a workspace it cannot find. Something that cannot
-/// tell whether it is being worked in should act on what it is told rather than
-/// refuse.
-fn holds_keyboard(snap: &Snapshot, me: Option<&str>) -> bool {
-    let Some(me) = me else { return true };
-    snap.panes.iter().find(|p| p.pane_id == me).map(|p| p.focused).unwrap_or(true)
-}
-
 pub(super) fn focus(agent: &AgentRef) {
     let _ = herdr::call("workspace.focus", json!({ "workspace_id": agent.workspace }));
     let _ = herdr::call("pane.focus", json!({ "pane_id": agent.pane }));
@@ -486,18 +465,33 @@ pub(super) fn event_loop(
     // Who we are, for taking focus when the mouse says the reader is here, and
     // for knowing whether it was already here when they clicked.
     let me = herdr::Env::read().pane_id;
-    let snap = Snapshot::live(store);
-    // Whether the keyboard is in this pane. Kept by the loop rather than read
-    // off the frame: it decides what a click means, and a click is the one
-    // gesture that arrives in a pane nobody is working in.
-    let mut keyboard = holds_keyboard(&snap, me.as_deref());
+    let live = live::read();
+    // The two focus questions, asked of the reading the frame is built from and
+    // kept by the loop rather than carried in the view.
+    //
+    // Whether the keyboard is in this pane decides what a click means, and a
+    // click is the one gesture that arrives in a pane nobody is working in.
+    // One pane on the machine answers yes: `pane.list` marks the focused pane
+    // of the focused workspace and nothing else, which is why it is a census
+    // question rather than a workspace one.
+    //
+    // Whether this workspace is on screen is the other half of the same picture
+    // and is not a substitute — a panel in the workspace being looked at is on
+    // screen, and the shell beside it may still be the pane being worked in. It
+    // decides the cadence, far below.
+    //
+    // Neither is drawn, which is why neither is in the [`Snapshot`]: see
+    // `crate::live`, and `crate::draw`'s "focus is not an input".
+    let mut keyboard = live.has_keyboard(me.as_deref());
+    let mut self_focused = live.on_screen(self_ws);
+    let snap = Snapshot::live(store, live.panes);
     // What shape of thing this pane is, before the rows are built from it: a
     // page shows a project's tasks all of them and a sidebar shows six. See
     // [`View::wide`], and the tick below, which is where a pane that changes
     // shape under a running panel is noticed.
     let mut drawn_size = term_size();
     view.fit_to_pane(drawn_size.0);
-    let mut ui = collect(&snap, &view, self_ws);
+    let mut ui = collect(&snap, &view);
     if point_at(&mut ui, &want) {
         want = Cursor::default();
     }
@@ -785,9 +779,9 @@ pub(super) fn event_loop(
                 // is slow *because* the last snapshot said it was not being
                 // looked at, and never taking the one that would say otherwise.
                 //
-                // It is also what keeps [`holds_keyboard`] honest, and this is
-                // the event that can do it: measured against the live server,
-                // herdr raises `workspace.focused` on every move of the keyboard
+                // It is also what keeps `keyboard` honest, and this is the
+                // event that can do it: measured against the live server, herdr
+                // raises `workspace.focused` on every move of the keyboard
                 // — including one pane to the next inside a single workspace,
                 // where the workspace being focused has not changed at all. So
                 // the reader stepping off this pane onto the shell beside it
@@ -853,10 +847,10 @@ pub(super) fn event_loop(
                 // out the rest of the thirty seconds.
                 //
                 // An empty list is herdr not answering, not everybody finishing
-                // at once — `panes()` degrades to empty the same way
-                // [`Snapshot::live`] does, and reading that as news would clear
-                // the dock every time the socket hiccuped.
-                if !ui.self_focused && last_poll.elapsed() >= STATUS_POLL {
+                // at once — this call degrades to empty the same way
+                // [`crate::live::read`] does, and reading that as news would
+                // clear the dock every time the socket hiccuped.
+                if !self_focused && last_poll.elapsed() >= STATUS_POLL {
                     last_poll = Instant::now();
                     let now = herdr::panes().unwrap_or_default();
                     if !now.is_empty() && status_moved(&drawn_status, &now) {
@@ -868,7 +862,7 @@ pub(super) fn event_loop(
                 // behind it should cost nothing. Both the fingerprint stat and
                 // the two socket calls sit behind this gate, so an idle
                 // background panel does no work at all between refreshes.
-                let interval = if ui.self_focused {
+                let interval = if self_focused {
                     Duration::from_millis(250)
                 } else {
                     Duration::from_secs(30)
@@ -905,18 +899,22 @@ pub(super) fn event_loop(
             if taken.target != Target::Nothing {
                 want = taken;
             }
-            let snap = Snapshot::live(store);
+            let live = live::read();
             // Free: the panes were fetched for the frame either way, and this is
-            // the same list herdr answers "who has the keyboard" out of.
-            keyboard = holds_keyboard(&snap, me.as_deref());
+            // the same reading herdr answers "who has the keyboard" and "which
+            // workspace is on screen" out of. Both are read here rather than off
+            // the frame, because a frame is what a renderer draws and neither of
+            // these is ever drawn.
+            keyboard = live.has_keyboard(me.as_deref());
+            self_focused = live.on_screen(self_ws);
+            let snap = Snapshot::live(store, live.panes);
             // Likewise free, and it has to be taken from the same list the frame
             // is drawn from: the poll asks whether herdr has moved on from what
             // the reader is looking at, so what the reader is looking at is what
             // it must be compared against.
             drawn_status.clear();
-            drawn_status
-                .extend(snap.panes.iter().map(|p| (p.pane_id.clone(), p.agent_status.clone())));
-            refetch_into(&mut ui, &snap, &mut view, self_ws);
+            drawn_status.extend(snap.panes.iter().map(|p| (p.pane.clone(), p.state.clone())));
+            refetch_into(&mut ui, &snap, &mut view);
             if point_at(&mut ui, &want) {
                 want = Cursor::default();
             }
@@ -1006,40 +1004,6 @@ mod tests {
     fn the_keyboard_moving_is_something_the_panel_is_told() {
         assert!(CHATTY.contains(&"workspace.focused"));
         assert!(is(CHATTY, "workspace_focused"), "and by the name the stream uses");
-    }
-
-    /// One pane in the census has the keyboard, and a click means one thing in
-    /// that pane and another in every other. This is where the loop starts from
-    /// and where it recovers to when the event stream has been away.
-    #[test]
-    fn the_keyboard_is_where_the_census_says_it_is() {
-        let census = |panes: &[(&str, bool)]| Snapshot {
-            projects: Vec::new(),
-            tasks: Vec::new(),
-            bindings: Default::default(),
-            pins: Default::default(),
-            mandates: Default::default(),
-            claims: Default::default(),
-            flags: Default::default(),
-            workspaces: Vec::new(),
-            panes: panes
-                .iter()
-                .map(|(id, has)| herdr::Pane {
-                    pane_id: (*id).to_string(),
-                    focused: *has,
-                    ..Default::default()
-                })
-                .collect(),
-        };
-
-        let snap = census(&[("w1:p1", false), ("w0:p3", true)]);
-        assert!(!holds_keyboard(&snap, Some("w1:p1")));
-        assert!(holds_keyboard(&snap, Some("w0:p3")));
-        // A panel that cannot name itself is one running outside herdr, where
-        // there is no focus to lose. It acts on what it is told rather than
-        // swallowing every click it is ever sent.
-        assert!(holds_keyboard(&snap, None));
-        assert!(holds_keyboard(&snap, Some("w9:p9")), "and a pane herdr has never heard of");
     }
 
     /// A pane gaining an agent is the event the dock exists for, and herdr

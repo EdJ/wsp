@@ -228,7 +228,6 @@ mod tests {
             bindings: BTreeMap::new(),
             claims: BTreeMap::new(),
             panes: Vec::new(),
-            workspaces: Vec::new(),
         };
         collect(&ctx, &Scope::Project("wsp".into()), show_done)
     }

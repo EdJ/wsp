@@ -70,11 +70,6 @@ pub(crate) use rows::Card;
 // tests need them from outside.
 #[cfg(test)]
 pub(crate) use keys::{click, wheel, Hit};
-// What to call a pane. Out here because the board names the same panes, and a
-// second answer to "what is this terminal called" is how the two surfaces come
-// to disagree about which of the three strings is current. The storyboard also
-// tests the rule directly, rather than through six fabricated panes.
-pub(crate) use rows::pane_name;
 pub(crate) use render::{
     frame, glyph, legend, line, place, to_ansi, to_html, to_html_spans, Line, Style,
 };
