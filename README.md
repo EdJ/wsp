@@ -2490,10 +2490,22 @@ It also prints the diffstat of what actually reached the trunk, which is step 4
 of the procedure above and the check that caught a wrong commit on two
 consecutive days.
 
+**Landing is not finishing** (Ed, 2026-08-17). `land` used to remove the tree it
+had landed, which read as tidiness and was not: a task can be reopened, and a
+tree destroyed on every land has to be rebuilt — a second checkout and a cold
+`target/` — every time work resumes. It also deleted its own caller's cwd the
+first time anybody ran it, since the agent landing is standing in the tree. So
+the tree outlives the landing, `wsp checkout --rm` ends it when the task is
+genuinely over, and `wsp checkout --sweep` is there for when nobody remembers
+to: the trees whose task is closed, skipping any that somebody is standing in or
+has uncommitted work in, `-n` to look first. That is the same shape as `wsp
+archive` for tasks and `wsp reconcile --reap` for claims, and it exists for the
+same reason both of those do.
+
 What it costs is a second checkout and a second `target/` per agent, and one
-more thing that can be left behind: `wsp checkout --rm` drops a tree, and `land`
-drops it for you. The reasoning is in `src/cmd_checkout.rs` and on
-`t-260815-022`.
+more thing that can be left behind — which is what the sweep and `wsp doctor`
+between them are for. The reasoning is in `src/cmd_checkout.rs` and on
+`t-260815-022` and `t-260817-018`.
 
 ### What none of it fixes
 

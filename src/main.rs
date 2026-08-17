@@ -51,6 +51,8 @@ const BOOL_FLAGS: &[&str] = &[
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm",
+    // And `checkout`, whose positional is a task id.
+    "sweep",
     // And for `install`, whose positional is the binary to install.
     "dry-run",
     // Same for `sandbox`, whose positional is a sandbox name.
@@ -412,13 +414,19 @@ fn help() {
                                     SessionStart hook's call — paid once at the
                                     top of a session, not on every brief after
   wsp commit-help                   how to commit in a tree somebody else is in
-  wsp checkout [<id>] [--rm]        a working tree of your own for the task in
+  wsp checkout [<id>]               a working tree of your own for the task in
                                     hand, under .worktrees/, on its own branch —
                                     nobody else's edits are in it and yours are
                                     in nobody else's commit
-  wsp land [<id>] [--keep]          rebase it onto the trunk and fast-forward the
-                                    trunk onto it, then drop the tree; prints
-                                    what actually moved
+  wsp checkout [<id>] --rm [--force]  end it, when the task is genuinely over;
+                                    the branch stays if it holds work, and
+                                    --force is needed to lose uncommitted work
+  wsp checkout --sweep [-n]         …or every tree here whose task is closed and
+                                    nobody removed; skips any tree somebody is
+                                    standing in or has work in, -n to look first
+  wsp land [<id>]                   rebase it onto the trunk and fast-forward the
+                                    trunk onto it; prints what actually moved.
+                                    The tree stays — landing is not finishing
   wsp verify [<path>…] [--check] [--release] [--rm]
                                     build and test your change in a tree of your
                                     own, at HEAD — the only build whose result

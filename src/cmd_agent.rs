@@ -2645,6 +2645,8 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // somebody said so, and a check that went hunting for git repositories
     // would be reporting on trees nobody asked it about.
     let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    // Read once, not once per root: it walks the task directory and the archive.
+    let closed = crate::cmd_checkout::finished(store);
     for p in &index.projects {
         for r in &p.roots {
             let root = util::real(r);
@@ -2653,17 +2655,19 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
             }
             seen.push(root.clone());
             // A tree per task leaks the same way a tree per build did, and for
-            // the same reason: `land` drops the one it landed, and what is left
-            // is every tree `land` never saw. A note rather than a problem —
-            // nothing is broken, it is disk — and never removed from here,
-            // because a directory somebody is standing in is not litter.
-            let closed = |id: &str| {
-                tasks.iter().find(|t| t.id == id).map(|t| !t.status().is_open()).unwrap_or(false)
-            };
-            for (task, why) in crate::cmd_checkout::stale(&root, &closed) {
+            // the same reason: landing no longer removes anything, `--rm` is a
+            // command somebody has to remember, and this is what is left when
+            // nobody did. A note rather than a problem — nothing is broken, it
+            // is disk — and never removed from here, because `doctor` looks at
+            // every declared root and a command that deletes directories should
+            // only ever act on the one you are standing in.
+            for s in crate::cmd_checkout::stale(&root, &closed) {
                 notes.push(format!(
-                    "{}: the tree for {task} is finished with — {why} — `wsp checkout {task} --rm`",
-                    util::contract(&root)
+                    "{}: the tree for {} is finished with — {} — {}",
+                    util::contract(&root),
+                    s.task,
+                    s.note,
+                    s.why.fix(&s.task)
                 ));
             }
             match tree_index_loss(&root) {

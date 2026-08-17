@@ -50,6 +50,31 @@
 //! of the whole arrangement: the collision that used to be a silent sweep is now
 //! a conflict with both sides named, in your own tree, yours to resolve.
 //!
+//! # Landing leaves the tree standing
+//!
+//! `land` used to remove the tree it had landed, which read as tidiness and was
+//! not. Ed's call, 2026-08-17: a task can be reopened, and a tree destroyed on
+//! every land has to be rebuilt every time work resumes — a second checkout, a
+//! cold `target/` and the minutes of both, paid on the routine act to save them
+//! on the rare one.
+//!
+//! So the tree outlives the landing, and three things follow. Landing is
+//! exactly what its name says — put my commits on the trunk — which makes it
+//! safe to run repeatedly and safe to run from inside the tree: the first `land`
+//! ever run deleted its own caller's cwd out from under it (t-260817-018), and
+//! that failure is now unreachable rather than handled. Removing is `checkout
+//! --rm`, run when a task is genuinely finished, which is a moment somebody
+//! decides rather than a side effect of a verb they run all day. And because a
+//! command somebody has to remember is a command that gets forgotten — which is
+//! the lesson of every leak recorded on t-260815-022 — there is [`sweep`], the
+//! same shape as `wsp archive` for tasks and `wsp reconcile --reap` for claims,
+//! and it exists for the same reason both of those do.
+//!
+//! The sweep removes trees whose *task is closed* and nothing else. [`stale`]
+//! also reports the tree that is merely clean and level with the trunk, and that
+//! one is reported forever rather than swept: it is indistinguishable from the
+//! tree made thirty seconds ago for an agent that has not typed yet.
+//!
 //! # Under the root, gitignored
 //!
 //! The third question t-260815-022 carried. [`crate::resolve::Index::project_for_cwd`]
@@ -194,6 +219,42 @@ pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
     Some(util::contract(&dir))
 }
 
+/// Why a tree is finished with.
+///
+/// A distinction rather than a sentence, because the two are not equally sure
+/// and [`sweep`] acts on only one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Why {
+    /// The task is closed. Somebody decided the work was over, which is the
+    /// only fact here strong enough to remove a directory on — and it holds
+    /// however much is in the tree, because that is a fact about the work.
+    Closed,
+    /// Nothing uncommitted, and nothing the trunk has not got. Worth naming and
+    /// never worth sweeping: it is exactly what the tree made thirty seconds ago
+    /// for an agent that has not typed yet looks like.
+    Idle,
+}
+
+impl Why {
+    /// What to do about it — which is a different command for each, and the
+    /// reason a caller reporting these has to know which one it is holding.
+    pub(crate) fn fix(&self, task: &str) -> String {
+        match self {
+            Why::Closed => "`wsp checkout --sweep`".into(),
+            Why::Idle => format!("`wsp checkout {task} --rm`"),
+        }
+    }
+}
+
+/// A tree that is finished with: which task's, why, and how to say so.
+pub(crate) struct Stale {
+    pub task: String,
+    pub why: Why,
+    /// The reason as a reader wants it, since only this function knows the name
+    /// of the trunk branch it just compared against.
+    pub note: String,
+}
+
 /// The trees under `root` that are finished with, and the reason each is.
 ///
 /// Reported rather than removed, and reported by `wsp doctor` rather than by a
@@ -201,19 +262,18 @@ pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
 /// asks for: `git worktree list` held four abandoned trees on 2026-08-16 and
 /// three more on the day before, ~132M of them, and nobody was careless — a
 /// procedure run by hand at the end of a long piece of work is a procedure that
-/// gets abandoned halfway when something more interesting happens. `land`
-/// removes the tree it landed, so what this finds is what `land` never saw.
+/// gets abandoned halfway when something more interesting happens.
 ///
 /// `closed` is asked of the store by the caller rather than read here, because
 /// the two reasons are different in kind and only one of them is git's: a tree
 /// whose task is done is finished even if it has uncommitted work in it, and
 /// that is a fact about the work rather than about the checkout.
-pub(crate) fn stale(root: &Path, closed: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
+pub(crate) fn stale(root: &Path, closed: &dyn Fn(&str) -> bool) -> Vec<Stale> {
     let Some(trunk) = trunk(root) else { return Vec::new() };
     let Some(branch) = trunk_branch(&trunk) else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(trunk.join(WORKTREES)) else { return Vec::new() };
 
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<Stale> = Vec::new();
     for e in entries.flatten() {
         let dir = e.path();
         if !dir.join(".git").exists() {
@@ -223,12 +283,104 @@ pub(crate) fn stale(root: &Path, closed: &dyn Fn(&str) -> bool) -> Vec<(String, 
             continue;
         };
         if closed(&task) {
-            out.push((task, "the task is closed".into()));
+            out.push(Stale { task, why: Why::Closed, note: "the task is closed".into() });
         } else if !dirty(&dir) && ahead(root, &branch, &task).is_empty() {
-            out.push((task, format!("nothing uncommitted and nothing {branch} has not got")));
+            let note = format!("nothing uncommitted and nothing {branch} has not got");
+            out.push(Stale { task, why: Why::Idle, note });
         }
     }
-    out.sort();
+    out.sort_by(|a, b| a.task.cmp(&b.task));
+    out
+}
+
+/// Take a tree away, leaving the branch if it still holds work.
+///
+/// The one place a checkout is destroyed, so that `--rm` and [`sweep`] cannot
+/// come to disagree about what removing one means. `--force` on the `worktree
+/// remove` and the `remove_dir_all` after it are there because the caller has
+/// already decided — whoever calls this has looked at [`dirty`] and either
+/// found nothing or been told to go ahead anyway.
+///
+/// `-d` and not `-D` on the branch: a branch git will not delete is one holding
+/// commits the trunk has not got, and that is work rather than litter. Left
+/// behind, `checkout` finds it again and rebuilds the tree from it, which is
+/// what makes removing a tree recoverable and reopening a task cheap.
+fn remove(repo: &Path, dir: &Path, task: &str) -> Removed {
+    let existed = dir.exists();
+    let _ = git(repo, &["worktree", "remove", "--force", &dir.display().to_string()]);
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = git(repo, &["worktree", "prune"]);
+    let branch_kept = git(repo, &["branch", "-d", task]).is_none();
+    Removed { existed, branch_kept }
+}
+
+struct Removed {
+    existed: bool,
+    branch_kept: bool,
+}
+
+/// What one sweep did, and what it declined to do.
+#[derive(Default)]
+pub(crate) struct Swept {
+    /// Tasks whose trees went.
+    pub removed: Vec<String>,
+    /// Tasks whose branch outlived the tree because it still holds commits the
+    /// trunk has not got.
+    pub branches: Vec<String>,
+    /// Tasks left alone, and why. Reported rather than silent: a sweep that
+    /// quietly skips things is one nobody can tell from a sweep that found
+    /// nothing.
+    pub kept: Vec<(String, String)>,
+}
+
+/// Remove the trees whose task is closed, and say what was left standing.
+///
+/// The acting half of [`stale`], and deliberately narrower than it: only
+/// [`Why::Closed`] is swept, because a closed task is somebody's decision and
+/// an idle tree is a guess about a directory. Three further refusals, all in the
+/// direction of leaving a tree that could have gone rather than removing one
+/// that could not:
+///
+/// - `busy` is the world outside git — a claim still held, a pane standing in
+///   the tree, the caller's own cwd — and comes in as a closure so the rule can
+///   be tested without a store or a live herdr, the same bargain [`stale`]
+///   makes with `closed`.
+/// - Uncommitted work stops the removal even though a closed task means the
+///   tree is finished with. What a branch holds comes back with `wsp checkout`;
+///   what was never committed does not come back at all, and this is the one
+///   thing here that is not recoverable.
+/// - A tree whose task the store has never heard of is not swept, because the
+///   sweep would then read a store pointed somewhere else as a repository full
+///   of litter. The caller decides what "closed" means, and the answer for an
+///   unknown id is no.
+pub(crate) fn sweep(
+    root: &Path,
+    closed: &dyn Fn(&str) -> bool,
+    busy: &dyn Fn(&str) -> Option<String>,
+    dry: bool,
+) -> Swept {
+    let mut out = Swept::default();
+    let Some(trunk) = trunk(root) else { return out };
+    for s in stale(root, closed) {
+        if s.why != Why::Closed {
+            continue;
+        }
+        if let Some(why) = busy(&s.task) {
+            out.kept.push((s.task, why));
+            continue;
+        }
+        let dir = checkout_dir(&trunk, &s.task);
+        if dirty(&dir) {
+            out.kept.push((s.task, "uncommitted work in it".into()));
+            continue;
+        }
+        if !dry {
+            if remove(root, &dir, &s.task).branch_kept {
+                out.branches.push(s.task.clone());
+            }
+        }
+        out.removed.push(s.task);
+    }
     out
 }
 
@@ -333,6 +485,11 @@ fn locate(store: &Store, args: &Args) -> Result<Where, String> {
 
 pub fn checkout(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
+    // Before `locate`, which wants a task: the sweep is about every tree in the
+    // repository and is exactly the command you reach for holding none.
+    if args.has("sweep") {
+        return swept(store, args);
+    }
     let w = match locate(store, args) {
         Ok(w) => w,
         Err(e) => {
@@ -347,20 +504,30 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: you are standing in {} — cd out of it first", util::contract(&w.dir));
             return 2;
         }
-        let existed = w.dir.exists();
-        let _ = git(&w.repo, &["worktree", "remove", "--force", &w.dir.display().to_string()]);
-        let _ = std::fs::remove_dir_all(&w.dir);
-        let _ = git(&w.repo, &["worktree", "prune"]);
-        // `-d` and not `-D`: a branch git will not delete is one holding commits
-        // the trunk has not got, and that is work rather than litter.
-        let kept = git(&w.repo, &["branch", "-d", &w.task]).is_none();
+        // Uncommitted work is the one thing removing a tree destroys for good:
+        // the branch carries every commit back when the task is picked up
+        // again, and carries nothing that was never committed. This mattered
+        // less when `land` did the removing, because `land` refused to run on a
+        // dirty tree at all; now that `--rm` is the only way a tree goes, the
+        // refusal has to live here.
+        if dirty(&w.dir) && !args.has("force") {
+            eprintln!(
+                "wsp: {} has uncommitted work — commit it, or `--force` to lose it",
+                util::contract(&w.dir)
+            );
+            return 2;
+        }
+        let r = remove(&w.repo, &w.dir, &w.task);
         if args.json() {
-            println!("{}", json!({"removed": existed, "branch_kept": kept, "path": util::contract(&w.dir)}));
-        } else if !existed {
+            println!(
+                "{}",
+                json!({"removed": r.existed, "branch_kept": r.branch_kept, "path": util::contract(&w.dir)})
+            );
+        } else if !r.existed {
             println!("no tree for {}", w.task);
         } else {
             println!("removed {}", util::contract(&w.dir));
-            if kept {
+            if r.branch_kept {
                 println!("{}", p.yellow(&format!("branch {} kept — it has commits the trunk has not", w.task)));
             }
         }
@@ -403,6 +570,107 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
     }
     println!("{} {}", p.dim("cd"), util::contract(&w.dir));
     0
+}
+
+/// `wsp checkout --sweep` — the trees nobody ran `--rm` on.
+///
+/// The repository the caller is standing in, rather than every declared project
+/// root: this removes directories, and the blast radius of a command that does
+/// that should be the tree you can see. `wsp doctor` is the half that looks
+/// everywhere and only reports.
+///
+/// `-n` prints the same list and touches nothing, which is what makes the first
+/// run of a removing command something a person can bring themselves to type.
+fn swept(store: &Store, args: &Args) -> i32 {
+    let p = util::Paint::new();
+    let dry = args.has("dry-run");
+    let Ok(cwd) = std::env::current_dir() else {
+        eprintln!("wsp: cannot read the current directory");
+        return 2;
+    };
+    let Some(repo) = toplevel(&cwd) else {
+        eprintln!("wsp: {} is not in a git repository", util::contract(&cwd));
+        return 2;
+    };
+    let Some(trunk) = trunk(&repo) else {
+        eprintln!("wsp: cannot find the repository's main working tree");
+        return 2;
+    };
+
+    let closed = finished(store);
+    let here = util::real(&cwd.display().to_string());
+    let claims = store.claims();
+    // Where the panes are standing is herdr's to answer, and a herdr that is not
+    // there answers nothing — so the sweep falls back to the two facts it can
+    // read without one, its own cwd and the claims. Both refuse in the safe
+    // direction, and neither can be made wrong by a socket being down.
+    let panes = if crate::herdr::available() { crate::herdr::panes().unwrap_or_default() } else { Vec::new() };
+    let busy = |task: &str| -> Option<String> {
+        let dir = util::real(&checkout_dir(&trunk, task).display().to_string());
+        if here.starts_with(&dir) {
+            return Some("you are standing in it".into());
+        }
+        if let Some(pane) = panes.iter().find(|x| util::real(&x.cwd).starts_with(&dir)) {
+            return Some(format!("{} is standing in it", pane.pane_id));
+        }
+        // A claim on a closed task is unusual and it is still somebody: the
+        // agent that finished the work and has not let go of it yet.
+        claims.contains_key(task).then(|| "still claimed".to_string())
+    };
+
+    let out = sweep(&repo, &closed, &busy, dry);
+
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "removed": out.removed,
+                "branches_kept": out.branches,
+                "kept": out.kept.iter().map(|(t, w)| json!({"task": t, "why": w})).collect::<Vec<_>>(),
+                "dry_run": dry,
+            })
+        );
+        return 0;
+    }
+
+    for task in &out.removed {
+        let path = util::contract(&checkout_dir(&trunk, task));
+        println!("{} {path}", if dry { p.dim("would remove") } else { p.dim("removed") });
+    }
+    for task in &out.branches {
+        println!("{}", p.yellow(&format!("branch {task} kept — it has commits the trunk has not")));
+    }
+    for (task, why) in &out.kept {
+        println!("{} {task} — {why}", p.dim("kept"));
+    }
+    if out.removed.is_empty() && out.kept.is_empty() {
+        println!("{}", p.dim("no tree here belongs to a finished task"));
+    }
+    0
+}
+
+/// Whether the store considers a task finished — done, or archived out of the
+/// store entirely.
+///
+/// One definition, because `doctor` reporting a tree as litter and the sweep
+/// removing it have to be answering the same question. Archived counts: the
+/// task file has moved to `archive/tasks/`, so a tree named after it would
+/// otherwise be invisible to both — a leak that grows precisely with how long
+/// the arrangement has been running.
+///
+/// An id the store has never heard of is *not* finished. That is the answer
+/// that keeps a store pointed somewhere else — `WSP_HOME` in a sandbox, a fresh
+/// checkout with no store at all — from reading as a repository full of litter.
+pub(crate) fn finished(store: &Store) -> impl Fn(&str) -> bool {
+    let tasks = store.tasks();
+    let archived = store.archived_ids();
+    move |id: &str| {
+        tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| !t.status().is_open())
+            .unwrap_or_else(|| archived.iter().any(|a| a == id))
+    }
 }
 
 pub fn land(store: &Store, args: &Args) -> i32 {
@@ -470,17 +738,10 @@ pub fn land(store: &Store, args: &Args) -> i32 {
         .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default();
 
-    let kept = args.has("keep");
-    if !kept {
-        let _ = git(&w.repo, &["worktree", "remove", &w.dir.display().to_string()]);
-        let _ = std::fs::remove_dir_all(&w.dir);
-        let _ = git(&w.repo, &["worktree", "prune"]);
-        let _ = git(&w.repo, &["branch", "-d", &w.task]);
-    } else {
-        // Landed and still standing in it: put the branch back on the trunk so
-        // the next piece of work starts from what everyone else can see.
-        let _ = git_ok(&w.dir, &["reset", "--hard", &w.branch, "--quiet"]);
-    }
+    // Nothing is removed here — see the module docs. The tree is left exactly
+    // where it was, on its own branch, level with the trunk it just landed on,
+    // ready for the next commit or for the same task being picked up again next
+    // week. `wsp checkout --rm` ends it when the work is genuinely over.
 
     if args.json() {
         println!(
@@ -490,7 +751,6 @@ pub fn land(store: &Store, args: &Args) -> i32 {
                 "into": w.branch,
                 "commits": landed,
                 "files": files,
-                "tree_kept": kept,
             })
         );
         return 0;
@@ -502,9 +762,6 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     }
     for f in &files {
         println!("  {}", p.dim(f));
-    }
-    if !kept {
-        println!("{}", p.dim("tree removed — `wsp checkout` for the next one"));
     }
     0
 }
@@ -629,8 +886,9 @@ mod tests {
         run(&busy, &["commit", "--quiet", "-m", "wip"]);
 
         let found = stale(&dir, &never_closed);
-        assert_eq!(found.len(), 1, "wrong trees named: {found:?}");
-        assert_eq!(found[0].0, "t-idle");
+        assert_eq!(found.len(), 1, "wrong trees named: {:?}", names(&found));
+        assert_eq!(found[0].task, "t-idle");
+        assert_eq!(found[0].why, Why::Idle);
 
         // Uncommitted work counts as work: a tree is not litter because git has
         // not been told about what is in it yet.
@@ -639,7 +897,101 @@ mod tests {
 
         // A closed task ends its tree whatever is in it — the work is over, and
         // the tree outliving it is the leak.
-        assert_eq!(stale(&dir, &|id: &str| id == "t-busy")[0].0, "t-busy");
+        let closed = stale(&dir, &|id: &str| id == "t-busy");
+        assert_eq!(closed[0].task, "t-busy");
+        assert_eq!(closed[0].why, Why::Closed, "a closed task's tree was named for the wrong reason");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn names(found: &[Stale]) -> Vec<&str> {
+        found.iter().map(|s| s.task.as_str()).collect()
+    }
+
+    /// Landing puts commits on the trunk and does nothing else to the tree it
+    /// took them from.
+    ///
+    /// It used to remove it, which deleted its own caller's cwd the first time
+    /// anybody ran it (t-260817-018) and cost a fresh checkout and a cold
+    /// `target/` every time work resumed on a task. So the tree is still there
+    /// afterwards, still on its branch, and landing again from it is an ordinary
+    /// thing to do rather than a rebuild.
+    #[test]
+    fn a_landed_tree_is_still_standing_and_lands_again() {
+        let dir = scratch("relanding");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-6");
+        ensure(&dir, &wt, "t-6", "master").unwrap();
+
+        for n in ["one", "two"] {
+            std::fs::write(wt.join(format!("{n}.txt")), n).unwrap();
+            run(&wt, &["add", "."]);
+            run(&wt, &["commit", "--quiet", "-m", n]);
+            // What `land` does, and now the whole of it.
+            git_ok(&wt, &["rebase", "master"]).unwrap();
+            git_ok(&dir, &["merge", "--ff-only", "--quiet", "t-6"]).unwrap();
+
+            assert!(wt.join(".git").exists(), "the tree did not survive landing {n}");
+            assert!(!dirty(&wt), "landing left the tree it landed from dirty");
+            assert!(ahead(&dir, "master", "t-6").is_empty(), "the branch is still ahead after landing");
+            assert!(dir.join(format!("{n}.txt")).exists(), "{n} did not reach the trunk");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep is the acting half of the report, and it is narrower on
+    /// purpose: only a closed task's tree goes, and only when nothing and
+    /// nobody in it would be lost with it.
+    #[test]
+    fn the_sweep_takes_a_closed_tasks_tree_and_leaves_everything_it_cannot_prove() {
+        let dir = scratch("sweep");
+        repo(&dir);
+
+        // Four trees, one reason each to be here.
+        for t in ["t-done", "t-open", "t-held", "t-messy"] {
+            ensure(&dir, &checkout_dir(&dir, t), t, "master").unwrap();
+        }
+        std::fs::write(checkout_dir(&dir, "t-messy").join("draft.txt"), "not committed\n").unwrap();
+
+        let closed = |id: &str| id != "t-open";
+        let busy = |id: &str| (id == "t-held").then(|| "you are standing in it".to_string());
+
+        // `-n` says the same thing and touches nothing, which is what makes the
+        // first run of a removing command typeable.
+        let looked = sweep(&dir, &closed, &busy, true);
+        assert_eq!(looked.removed, ["t-done"], "the dry run named the wrong trees");
+        assert!(checkout_dir(&dir, "t-done").join(".git").exists(), "-n removed a tree");
+
+        let out = sweep(&dir, &closed, &busy, false);
+        assert_eq!(out.removed, ["t-done"]);
+        assert!(!checkout_dir(&dir, "t-done").exists(), "the finished tree is still here");
+        for t in ["t-open", "t-held", "t-messy"] {
+            assert!(checkout_dir(&dir, t).join(".git").exists(), "{t} was swept and should not have been");
+        }
+        let kept: Vec<&str> = out.kept.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(kept, ["t-held", "t-messy"], "a skipped tree went unreported: {:?}", out.kept);
+        assert!(out.kept[1].1.contains("uncommitted"), "the reason did not name the work at risk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A swept tree is recoverable and an unswept one has to be: the branch
+    /// outlives the directory, so a task reopened after its tree went finds its
+    /// commits again — and the branch is only kept when it holds some.
+    #[test]
+    fn the_sweep_keeps_the_branch_when_it_still_holds_work() {
+        let dir = scratch("sweep-branch");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-7");
+        ensure(&dir, &wt, "t-7", "master").unwrap();
+        std::fs::write(wt.join("unlanded.txt"), "mine\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", "never landed"]);
+
+        let out = sweep(&dir, &|_| true, &|_| None, false);
+        assert_eq!(out.removed, ["t-7"]);
+        assert_eq!(out.branches, ["t-7"], "the branch went with the tree, and the commit with it");
+
+        ensure(&dir, &wt, "t-7", "master").unwrap();
+        assert!(wt.join("unlanded.txt").exists(), "reopening the task did not get the work back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
