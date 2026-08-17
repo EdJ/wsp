@@ -200,6 +200,34 @@ fn forget_keys() -> Vec<String> {
     keys
 }
 
+/// Everything a process wsp starts in here must not inherit, taken off it.
+///
+/// Two lists and they are not the same list, which is why this is a function
+/// rather than one more clause in [`forgettable`]. What that one names is
+/// wrong *in a sandbox* and is printed for the caller to `unset` in their own
+/// shell. [`crate::place::shed_keys`] names the caller's Claude Code session,
+/// which is wrong in **any** new session and is nobody's business to unset in
+/// the shell they are sitting in — an agent that unset `CLAUDECODE` for its own
+/// pane would have changed how every command it runs behaves.
+///
+/// It belongs here because **this is the one server wsp starts itself**, and a
+/// server is what starts every process under it. Recorded 2026-08-17 off the
+/// sandbox server of an agent's own `wsp sandbox`: `CLAUDECODE`,
+/// `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`, and the caller's
+/// `CLAUDE_CODE_MESSAGING_SOCKET` with the token for it — inherited whole, and
+/// handed on to every pane the sandbox would ever open. `cmd_spawn::order`
+/// sheds them again for the seats *wsp* opens; this is what a pane somebody
+/// opens by hand in here gets, and it is where the measurement that opened
+/// t-260817-006 lost its transcript.
+fn forget(c: &mut Command) {
+    for k in forget_keys() {
+        c.env_remove(k);
+    }
+    for k in crate::place::shed_keys() {
+        c.env_remove(k);
+    }
+}
+
 /// `PATH` is prefixed rather than replaced: a sandbox is still a shell, and a
 /// command that cannot find `git` or `cargo` is not isolated, it is broken.
 fn path_with(shim: &Path, current: Option<&str>) -> String {
@@ -295,9 +323,7 @@ fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    for k in forget_keys() {
-        c.env_remove(k);
-    }
+    forget(&mut c);
     // Not in `forget_keys` — it is how a *child* is told where the sandbox is,
     // and we do not know that yet. What we do know is that the caller's is
     // wrong, and the server sets its own for everything it starts.
@@ -632,9 +658,7 @@ fn fake_command(sb: &Sandbox, stage: &Path) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    for k in forget_keys() {
-        c.env_remove(k);
-    }
+    forget(&mut c);
     for (k, v) in sb.store_env() {
         c.env(k, v);
     }
@@ -845,9 +869,7 @@ fn child(sb: &Sandbox, cmd: &str) -> Command {
     c.arg("-c").arg(cmd);
     // Forgotten first, set second: `HERDR_SOCKET_PATH` is both a variable the
     // caller may hold and the one thing the sandbox most needs to say.
-    for k in forget_keys() {
-        c.env_remove(k);
-    }
+    forget(&mut c);
     for (k, v) in sb.env() {
         c.env(k, v);
     }
@@ -1211,6 +1233,47 @@ mod tests {
         sb.socket = sb.dir.join("herdr.sock");
         let full: std::collections::HashMap<String, String> = sb.env().into_iter().collect();
         assert_eq!(full.get("HERDR_SOCKET_PATH"), Some(&sb.socket.display().to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The server is what starts every process in here, so what it inherits is
+    /// what every pane in the sandbox inherits.
+    ///
+    /// Recorded 2026-08-17 off a real one: an agent's `wsp sandbox` handed its
+    /// server the whole of its own Claude Code session, and the agent started in
+    /// there believed it was that session's child and saved no transcript. This
+    /// is the same list `cmd_spawn::order` sheds, and it is here as well because
+    /// a pane opened by hand in a sandbox never passes through an `Order`.
+    ///
+    /// Checked against a `Command`, which is what is actually handed over,
+    /// rather than against the map we meant to build — the same reason
+    /// `fake_command` exists as a function at all.
+    #[test]
+    fn the_herdr_a_sandbox_starts_is_not_handed_the_callers_session() {
+        let _env = util::env_lock();
+        std::env::set_var("CLAUDE_CODE_MESSAGING_TOKEN", "the-callers-credential");
+        let dir = scratch("server-session");
+        let sb = sandbox_at(&dir, "wsp-w1");
+
+        let c = fake_command(&sb, &stage_file(&sb.dir));
+        let envs: Vec<(String, Option<String>)> = c
+            .get_envs()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        for (k, v) in &envs {
+            assert!(
+                !(crate::place::shed(k) && v.is_some()),
+                "{k} was handed to the server as {v:?} — every pane under it gets this"
+            );
+        }
+        let named: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            named.contains(&crate::place::CHILD_MARKER),
+            "the marker is not taken off, and it is the one that costs the transcript"
+        );
+        std::env::remove_var("CLAUDE_CODE_MESSAGING_TOKEN");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

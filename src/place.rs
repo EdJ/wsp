@@ -270,6 +270,88 @@ use std::collections::BTreeMap;
 /// the backend which seat it is in — and it is a decision, not an oversight.
 pub const SEAT_ENV: &str = "WSP_SEAT";
 
+/// The marker that turns a spawned Claude Code into somebody else's child, and
+/// the one variable measured to break a spawn outright.
+///
+/// A session that finds `CLAUDE_CODE_CHILD_SESSION` in its environment believes
+/// it is a sub-session of the one that set it and **writes no transcript at
+/// all**. The only evidence is one line in the pane, truncated where it matters:
+/// `⚠ Transcript saving is off — inherited CLAUDE_CODE…`. Nothing fails, nothing
+/// is logged, and an agent spawned this way works perfectly and leaves no
+/// record. Claude Code knows the leak class — it probes `tmux show-environment`
+/// to tell a real marker from one that is merely ambient in the multiplexer —
+/// and herdr is not tmux, so under herdr the marker is always believed.
+///
+/// Measured 2026-08-17 against Claude Code 2.1.233, three panes of one sandbox,
+/// each started with `agent.start` and prompted:
+///
+/// | pane | what it inherited | transcript |
+/// |---|---|---|
+/// | as spawned today | the caller's whole session | **none** |
+/// | this one name emptied | — | 36,752 bytes |
+/// | every name in [`shed`] emptied | — | 36,882 bytes |
+///
+/// So it is shed whether or not the caller has it, unlike the rest: the leak
+/// does not need wsp to be the carrier. A herdr server started by hand from
+/// inside an agent's pane hands the marker to every seat it will ever open, and
+/// a `wsp` run from a clean shell against that server can see nothing wrong with
+/// its own environment to strip.
+pub const CHILD_MARKER: &str = "CLAUDE_CODE_CHILD_SESSION";
+
+/// What a seat's occupant must **not** find: a variable that names the Claude
+/// Code session the caller is sitting in, rather than anything about the seat.
+///
+/// The other half of [`SEAT_ENV`]. That one is the handle a spawn owes the
+/// child; this is the identity a spawn owes it *not* to pass on, and both are
+/// facts about placing work rather than about any backend.
+///
+/// A prefix rather than the four names anybody could list today, for the reason
+/// `cmd_sandbox::forgettable` gives about `HERDR_`: a variable Claude Code adds
+/// next month is a fact about the caller's session too, and this defect exists
+/// precisely because [`CHILD_MARKER`] was a name nobody knew to unset. What the
+/// prefix catches beyond the marker is worth naming, because none of it is
+/// harmless: `CLAUDE_CODE_SESSION_ID` is the caller's own session id, and
+/// `CLAUDE_CODE_MESSAGING_SOCKET` and `..._TOKEN` are the caller's control
+/// channel and the credential for it, handed to an unrelated agent.
+///
+/// `CLAUDE_PID` is named because the prefix misses it and it is the same fact:
+/// the control socket is `/tmp/cc-socks/<CLAUDE_PID>.sock`, so shedding the
+/// socket and keeping the pid that spells it is half a strip. The prefix stops
+/// at `CLAUDE_CODE_` rather than `CLAUDE_` for the opposite reason — a setting
+/// like `CLAUDE_CONFIG_DIR` says where this machine keeps its configuration and
+/// is *supposed* to be inherited. Identity is shed; preference is not.
+pub fn shed(key: &str) -> bool {
+    matches!(key, "CLAUDECODE" | "CLAUDE_PID") || key.starts_with("CLAUDE_CODE_")
+}
+
+/// The same rule against this process's environment: what a caller would have
+/// to `unset` before spawning by hand, which is the workaround this replaces.
+///
+/// [`CHILD_MARKER`] is always in the list and the rest is only what is actually
+/// here, so a spawn from a shell with none of this in it is one name long.
+pub fn shed_keys() -> Vec<String> {
+    let mut keys: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| shed(k) && k != CHILD_MARKER)
+        .collect();
+    keys.sort();
+    keys.insert(0, CHILD_MARKER.into());
+    keys
+}
+
+/// The same list as the entries an [`Order`] carries to shed them.
+///
+/// **Emptied rather than removed, because removal is not on the wire.** A seat's
+/// environment is a string-to-string map on the call that creates it — herdr's
+/// `workspace.create` takes one and `agent.start` takes none — so the only strip
+/// a port can express is an override, and an empty value is the strongest one
+/// there is. That it is strong enough was measured rather than assumed; the
+/// table on [`CHILD_MARKER`] is that measurement, and an agent started with all
+/// of these empty came up, answered and saved its transcript.
+pub fn shed_env() -> BTreeMap<String, String> {
+    shed_keys().into_iter().map(|k| (k, String::new())).collect()
+}
+
 /// A durable handle to somewhere an agent can run.
 ///
 /// **Durable** is the requirement and it is the one the port will not bend on:
@@ -632,6 +714,52 @@ pub trait Place {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a seat's occupant must not find, and where the line is drawn.
+    ///
+    /// The rule is a prefix so that the name Claude Code adds next month is shed
+    /// without anybody noticing it exists — which is the whole defect, since
+    /// [`CHILD_MARKER`] was such a name until it cost a measurement its
+    /// transcript. It stops short of every `CLAUDE_` because a configuration
+    /// directory is a fact about the machine and is meant to be inherited.
+    #[test]
+    fn a_new_session_does_not_inherit_the_one_that_spawned_it() {
+        for key in [
+            "CLAUDECODE",
+            CHILD_MARKER,
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_PID",
+            "CLAUDE_CODE_SOMETHING_ADDED_LATER",
+        ] {
+            assert!(shed(key), "{key} names the spawning session and would have reached the seat");
+        }
+        for key in ["CLAUDE_CONFIG_DIR", "WSP_TASK", "HERDR_SOCKET_PATH", "PATH", SEAT_ENV] {
+            assert!(!shed(key), "{key} is not an identity and the seat is poorer without it");
+        }
+    }
+
+    /// The marker is shed whether or not the caller is carrying it, and the
+    /// strip is an empty value rather than an absence.
+    ///
+    /// Both halves are forced by where the leak can come from. wsp is not the
+    /// only carrier — a herdr started by hand inside an agent's pane hands the
+    /// marker to every seat it will ever open, and a `wsp` run from a clean
+    /// shell against that server sees nothing of its own to strip. And a seat's
+    /// environment is a map on the call that creates it, so there is no way to
+    /// spell "unset" on the wire at all.
+    #[test]
+    fn the_marker_is_shed_by_a_caller_who_does_not_have_it() {
+        let env = shed_env();
+        assert_eq!(
+            env.get(CHILD_MARKER).map(String::as_str),
+            Some(""),
+            "a spawn from a clean shell onto a dirty herdr still has to say this"
+        );
+        assert!(env.values().all(String::is_empty), "an override is the only strip on the wire");
+        assert!(env.keys().all(|k| shed(k)), "the order carries nothing the rule did not name");
+    }
 
     /// The one question every caller of `state == "idle"` is actually asking,
     /// and the two answers that cost the most.

@@ -88,15 +88,25 @@ pub fn claimed_text(task: &str, how: Handover) -> String {
 /// is a claim rather than this — but for the life of the session it is exact,
 /// and exactness is what the cwd heuristic lacks.
 ///
+/// It also *strips*, which is the same job and was the missing half of it: a
+/// spawned agent is a new session and must inherit none of the spawning
+/// session's identity. [`crate::place::shed_env`] says which names and why, and why an
+/// empty value is the only strip there is to make. Nothing else in wsp is
+/// positioned to do it — this is the one function that decides what a seat's
+/// occupant finds — and it fails silently when it is not done: the agent runs
+/// fine and saves no transcript.
+///
 /// A pure function of what `spawn` resolved, so what an agent is handed can be
 /// asserted without a backend to hand it to.
 fn order(work: &Work, cwd: Option<&str>, on: Option<&str>, show: bool) -> Order {
-    // The store first, then what this seat is for — the latter wins if someone
+    // Shed first: everything below is something this seat is *for*, and none of
+    // it collides with a name the caller's Claude Code set.
+    let mut env = crate::place::shed_env();
+    // The store next, then what this seat is for — the latter wins if someone
     // has both, which is right: it is more specific.
-    let mut env: std::collections::BTreeMap<String, String> = util::store_env()
-        .into_iter()
-        .filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string())))
-        .collect();
+    env.extend(
+        util::store_env().into_iter().filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string()))),
+    );
     if let Some(p) = &work.project {
         env.insert("WSP_PROJECT".into(), p.clone());
     }
@@ -758,6 +768,32 @@ mod tests {
         assert!(o.env.get("WSP_TASK").is_none());
         assert!(o.on.is_none());
         assert!(o.show);
+    }
+
+    /// The other half of the same order: an agent spawned from inside an agent
+    /// is a new session and inherits none of the spawning session's identity.
+    ///
+    /// Left in, `CLAUDE_CODE_CHILD_SESSION` tells the child it is somebody's
+    /// sub-session and it saves no transcript — so it works, looks right, and
+    /// leaves no record, which is worst exactly when somebody is measuring. The
+    /// argument and the measurement are on `place::CHILD_MARKER`; what this
+    /// asserts is that the strip is in the order rather than in a `env -u`
+    /// incantation the caller has to remember.
+    #[test]
+    fn a_spawned_agent_is_not_handed_the_spawning_session() {
+        let work = Work { task: None, project: None, label: "probe".into() };
+        let o = order(&work, None, None, false);
+        assert_eq!(
+            o.env.get(crate::place::CHILD_MARKER).map(String::as_str),
+            Some(""),
+            "the spawned agent will save no transcript and say so in one truncated line"
+        );
+        for (k, v) in &o.env {
+            assert!(
+                !crate::place::shed(k) || v.is_empty(),
+                "{k}={v} is the caller's session, handed to the seat"
+            );
+        }
     }
 
     /// The two sub-projects the backlog is split into have no checkout of
