@@ -349,14 +349,15 @@ impl Tally {
     }
 }
 
-/// The tier of an attempt that has not finished, read off the transcript now.
+/// The tier of an attempt whose claim has not ended, read off the transcript
+/// now.
 ///
 /// The one reading here that is not out of the log, and it is not an exception
-/// to the rule that evidence lives on the task — it is the same rule. An open
-/// attempt *has* no closing line, because the agent is still in the seat, so
-/// there is nothing on the task to read and no possibility of there being any.
-/// When it ends, `hand_off` writes what this is reading and the row stops being
-/// live.
+/// to the rule that evidence lives on the task — it is the same rule. An
+/// unfinished attempt *has* no closing line, because the agent is still in the
+/// seat, so there is nothing on the task to read and no possibility of there
+/// being any. When it ends, `hand_off` writes what this is reading and the row
+/// stops being live.
 ///
 /// Which makes it the question a person actually asks about a running agent —
 /// *what is that pane running* — answered from the record rather than by
@@ -398,7 +399,13 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
     };
     let mut rows: Vec<Attempt> = tasks.iter().flat_map(|t| attempts_of(t)).collect();
     rows.sort_by(|a, b| a.at.cmp(&b.at).then(a.task.cmp(&b.task)));
-    for a in rows.iter_mut().filter(|a| a.outcome == Outcome::Open) {
+    // Every attempt that has not *ended*, which is not the same set as the ones
+    // still `open`: an agent that has put its work up for review and is holding
+    // the claim while somebody reads it has reached an outcome and written
+    // nothing down, because the clause is written when the claim ends. There
+    // are usually a few of those, and they are the most recent evidence there
+    // is.
+    for a in rows.iter_mut().filter(|a| a.until.is_empty()) {
         live(store, a);
     }
 
