@@ -4,9 +4,15 @@
 //! knows the mode — `j` means "down" while browsing and means `j` while typing
 //! a title, and only something holding [`Mode`] can tell those apart.
 //!
-//! [`apply_key`] is pure: state in, [`Effect`] out. Nothing in this file talks
-//! to a terminal or to herdr, which is what lets the storyboard push scripted
-//! keys through the same path the live panel runs.
+//! [`apply_input`] is pure: state in, [`Effect`] out. Nothing in this file
+//! talks to a terminal or to herdr, which is what lets the storyboard push
+//! scripted input through the same path the live panel runs.
+//!
+//! Every input goes through that one door — a key, a click, the wheel, and the
+//! keyboard arriving or leaving. The three that are not keys used to be
+//! translated by the event loop instead, which meant the sentence they spell
+//! ("a click on the selected row *is* `↵`") could only be run by a person at a
+//! trackpad. [`apply_key`] is still the inner half, for a key alone.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -53,6 +59,26 @@ impl View {
     #[cfg(test)]
     pub(crate) fn set_focus_for_test(&mut self, on: bool) {
         self.focus = on;
+    }
+
+    /// What the panel is in the middle of, as one word.
+    ///
+    /// The mode is the half of the state a frame is worst at reporting: a
+    /// prompt and a pick both draw a line in the footer, and a tag picker over
+    /// a task looks like a task with rows under it. So a storyboard scene that
+    /// means "the keyboard is now the card's" has to be able to *say* it, and
+    /// this is the name it says. Not [`Mode`] itself, because outside this
+    /// module nothing has business matching on one.
+    pub(crate) fn mode_name(&self) -> &'static str {
+        match self.mode {
+            Mode::Browse => "browse",
+            Mode::Prompt { .. } => "a prompt",
+            Mode::Pick { .. } => "a pick",
+            Mode::Tags(_) => "the tag picker",
+            Mode::Find { .. } => "a search",
+            Mode::Card(_) => "a card",
+            Mode::Confirm { .. } => "a confirmation",
+        }
     }
 }
 
@@ -1456,4 +1482,100 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         view.keyed = true;
     }
     effect
+}
+
+/// Everything that can arrive at a panel from outside it.
+///
+/// [`apply_key`] was the whole alphabet while the only input was a keystroke.
+/// It is not: a click has to be turned into a row before it means anything, a
+/// wheel moves the view rather than the cursor, and whether the pane holds the
+/// keyboard changes what the *next* click does. Those three lived in the event
+/// loop, which is the one place a fixture cannot reach — so the click that
+/// selects, the click that opens, and the click that only takes the keyboard
+/// were all verified by pointing at a real pane and looking.
+///
+/// This is that alphabet with nothing left in the loop but the parts that are
+/// genuinely about a terminal: reading the pane's size, and telling herdr where
+/// the reader now is. See [`apply_input`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Input {
+    /// A key as it was typed. [`Key`] carries the mouse too, because that is
+    /// how a mouse arrives from a terminal — an SGR report parsed into
+    /// [`Key::Click`] or [`Key::Wheel`] by `crate::input`.
+    Key(Key),
+    /// The keyboard arrived in this pane, or left it.
+    ///
+    /// Not a key, and not drawn — `crate::draw`'s "focus is not an input" holds
+    /// here too, which is why it is a message to the reducer rather than a
+    /// field on [`View`]. Its only consequence is what a click means: on the
+    /// pane you are working in a click selects, and on one you are only looking
+    /// at it says "I am working here now" and nothing else.
+    Focus(bool),
+}
+
+/// One input, applied.
+///
+/// `keyboard` is the panel's answer to "is this the pane being worked in", and
+/// it is `&mut` because a click changes it: pointing at a pane is a statement
+/// that you are working in it, and the pane has answered by taking focus. The
+/// loop still owns the round-trip that tells herdr — that is a socket call on a
+/// clock, not a state transition — and this owns the fact.
+///
+/// It lives beside [`apply_key`] rather than in the loop for the reason the
+/// whole module doc gives: state in, [`Effect`] out, nothing here talks to a
+/// terminal. What a click is worth testing for is not the arithmetic of which
+/// row is under the pointer — that is [`click`], and it was already reachable —
+/// but the sentence the loop was spelling around it: that a click on the
+/// selected row *is* `↵`, that the `⋯` in the strip *is* `w`, and that a click
+/// into an unfocused panel is neither.
+pub(crate) fn apply_input(
+    input: Input,
+    ui: &mut Ui,
+    view: &mut View,
+    w: usize,
+    h: usize,
+    keyboard: &mut bool,
+) -> Effect {
+    let k = match input {
+        Input::Focus(f) => {
+            *keyboard = f;
+            return Effect::None;
+        }
+        Input::Key(k) => k,
+    };
+    // Whether the pane was being worked in is read before the line that changes
+    // it, because that is the question the click is answering.
+    let had = *keyboard;
+    if matches!(k, Key::Click { .. } | Key::Wheel { .. }) {
+        *keyboard = true;
+    }
+    match k {
+        Key::Wheel { up } => {
+            wheel(ui, view, w, h, up);
+            Effect::None
+        }
+        // Select, then activate. One click moves the cursor and does nothing
+        // else; a click on the row already under it means what `↵` means, so it
+        // *becomes* that key rather than restating what opening a row does. A
+        // click that both selects and opens is how you end up somewhere you did
+        // not ask to be, on a row you had not read — and here `↵` can focus
+        // another pane, so that is a terminal you were not looking at.
+        Key::Click { x, y } => match click(ui, view, w, h, x, y, had) {
+            Hit::Activate => apply_key(Key::Enter, ui, view),
+            // A mark in the strip is an agent, and going there is the whole of
+            // what it means. The keyboard goes with it.
+            Hit::Focus(a) => {
+                *keyboard = false;
+                Effect::Focus(a)
+            }
+            // The `⋯`: the agents the strip could not draw. It stands for the
+            // same thing `w` does, so it presses it.
+            Hit::Rest => apply_key(Key::Char('w'), ui, view),
+            // Selected, or landed on furniture, or landed on a pane nobody was
+            // working in — all of which the cursor and `keyboard` above have
+            // already recorded, and none of which anybody has to be told about.
+            Hit::Select | Hit::Nothing | Hit::Keyboard => Effect::None,
+        },
+        k => apply_key(k, ui, view),
+    }
 }

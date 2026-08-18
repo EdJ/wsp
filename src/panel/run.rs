@@ -21,7 +21,7 @@ use crate::live::{self, AgentRef};
 use crate::store::Store;
 use crate::util::exe_stamp;
 
-use super::keys::{apply_key, say, Effect, Mode, View};
+use super::keys::{apply_input, say, Effect, Input, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, Cursor, Snapshot, Target, Ui};
 use super::shared;
@@ -708,7 +708,7 @@ pub(super) fn event_loop(
     drawn_size = draw(screen, &ui, &mut view);
 
     loop {
-        let mut msg = match carry.pop_front() {
+        let msg = match carry.pop_front() {
             Some(m) => m,
             None => match rx.recv_timeout(Duration::from_secs(60)) {
                 Ok(m) => m,
@@ -717,82 +717,37 @@ pub(super) fn event_loop(
             },
         };
 
-        // Select, then activate. One click moves the cursor and does nothing
-        // else; a click on the row already under it means what `↵` means, so
-        // it *becomes* that key rather than restating what opening a row does.
-        // A click that both selects and opens is how you end up somewhere you
-        // did not ask to be, on a row you had not read — and here `↵` can
-        // focus another pane, so that is a terminal you were not looking at.
-        //
-        // Translated before the dispatch rather than inside it: only the loop
-        // knows the pane's size, and `render::row_at` is the arithmetic that
-        // drew the frame, so the row under the pointer is the row that acts.
-        //
-        // Whether the pane was being worked in is read before the line that
-        // changes it, because that is the question the click is answering.
-        let had_keyboard = keyboard;
+        // Pointing at a pane is a statement that you are working in it, so
+        // the mouse takes the keyboard before it means anything else. Only the
+        // round-trip is here: `apply_input` owns the fact, and this owns the
+        // clock, because a scroll is a burst of events and focus is a socket
+        // call. Everything the click then *means* — select, activate, the strip
+        // — is in the reducer, where a fixture can drive it.
         if matches!(msg, Msg::Key(Key::Click { .. } | Key::Wheel { .. }))
             && took_focus.elapsed() > Duration::from_millis(400)
         {
             took_focus = Instant::now();
             focus_self(me, self_ws);
-            // `focus_self` is a round-trip that has already returned, so this is
-            // not a guess: the keyboard is here, and the next click within the
-            // 400ms above — which does not ask herdr again — knows it.
-            keyboard = true;
-        }
-
-        if let Msg::Key(Key::Click { x, y }) = msg {
-            let (w, h) = screen.size();
-            match super::keys::click(&mut ui, &mut view, w, h, x, y, had_keyboard) {
-                super::keys::Hit::Activate => msg = Msg::Key(Key::Enter),
-                // A mark in the strip is an agent, and going there is the whole
-                // of what it means.
-                super::keys::Hit::Focus(a) => {
-                    focus(&a);
-                    keyboard = false;
-                    continue;
-                }
-                // The `⋯`: the agents the strip could not draw. It stands for
-                // the same thing `w` does, so it presses it.
-                super::keys::Hit::Rest => msg = Msg::Key(Key::Char('w')),
-                super::keys::Hit::Select => {
-                    shared::share(store, &view, ui.cursor(), &mut agreed);
-                    drawn_size = draw(screen, &ui, &mut view);
-                    continue;
-                }
-                // The pane was not the one being worked in, and now it is. That
-                // is the whole of what the click did: the frame has not changed
-                // and there is nothing to draw.
-                super::keys::Hit::Keyboard => continue,
-                super::keys::Hit::Nothing => continue,
-            }
-        }
-
-        // The wheel moves the view, so it needs the pane's size the way a
-        // click does: how far three rows is depends on nothing, but where the
-        // last screen ends depends on how many rows the tree has been given.
-        //
-        // It is not gated on the keyboard being here the way a click is: a
-        // wheel cannot send you anywhere, so there is nothing to bounce, and a
-        // pane you cannot scroll without clicking into it first is worse at the
-        // one thing the panel is for — being read from across the screen.
-        if let Msg::Key(Key::Wheel { up }) = msg {
-            let (w, h) = screen.size();
-            super::keys::wheel(&mut ui, &mut view, w, h, up);
-            shared::share(store, &view, ui.cursor(), &mut agreed);
-            drawn_size = draw(screen, &ui, &mut view);
-            continue;
         }
 
         let mut refetch = false;
         let is_key = matches!(msg, Msg::Key(_));
-        if is_key {
-            // The person is driving. Whatever the file wanted, they want this.
+        // The person is driving. Whatever the file wanted, they want this.
+        //
+        // The wheel is the exception, and it is the same exception it makes
+        // everywhere: it moves the view and deliberately leaves the cursor
+        // alone, so a wish about where the cursor belongs is not answered by a
+        // scroll and still stands after one.
+        if matches!(msg, Msg::Key(k) if !matches!(k, Key::Wheel { .. })) {
             want = Cursor::default();
         }
+        // The pane's size is the loop's to read, and `render::row_at` is the
+        // arithmetic that drew the frame — so the row a click lands on is the
+        // row that acts.
+        let (w, h) = screen.size();
         match msg {
-            Msg::Key(k) => match apply_key(k, &mut ui, &mut view) {
+            Msg::Key(k) => match apply_input(Input::Key(k), &mut ui, &mut view, w, h, &mut keyboard)
+            {
                 Effect::Quit => return Outcome::Quit,
                 Effect::None => {}
                 Effect::Refetch => refetch = true,
@@ -1076,7 +1031,15 @@ pub(super) fn event_loop(
             // workspace is on screen" out of. Both are read here rather than off
             // the frame, because a frame is what a renderer draws and neither of
             // these is ever drawn.
-            (keyboard, self_focused) = screen.focus(&live, me, self_ws);
+            //
+            // The keyboard half goes in through the same door a key does, and
+            // not because the assignment needs help: focus entering or leaving
+            // the panel is an input, it changes what the next click means, and
+            // a harness that could only *set the flag* would be driving a path
+            // this loop does not take. See [`Input::Focus`].
+            let (has_keyboard, on_screen) = screen.focus(&live, me, self_ws);
+            apply_input(Input::Focus(has_keyboard), &mut ui, &mut view, w, h, &mut keyboard);
+            self_focused = on_screen;
             let snap = Snapshot::live(store, live.panes);
             // Likewise free, and it has to be taken from the same list the frame
             // is drawn from: the poll asks whether herdr has moved on from what

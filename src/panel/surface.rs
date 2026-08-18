@@ -310,7 +310,16 @@ fn read_host(
                         // four columns is not a picture at all.
                         host.size = ((cols as usize).max(16), (rows as usize).max(6));
                     }
-                    host.focused = message.get("focused").and_then(Value::as_bool).unwrap_or(false);
+                    // Absent means unchanged, the way an absent size does two
+                    // lines above. They used not to agree: a message carrying
+                    // only new cells cleared `focused`, so a resize moved the
+                    // keyboard out of a sidebar nobody had left — and the next
+                    // click into it would be swallowed as the one that takes
+                    // focus back. Nothing on either side of the pipe reports
+                    // that; it reads as a click that did not register.
+                    if let Some(f) = message.get("focused").and_then(Value::as_bool) {
+                        host.focused = f;
+                    }
                 }
             }
             // What herdr is running, pushed rather than asked for. See
@@ -801,6 +810,61 @@ mod tests {
             matches!(rx.recv(), Ok(Msg::Tick)),
             "a resize has to wake the loop, or the frame stays the old size"
         );
+    }
+
+    /// Focus arriving and leaving, which is the host's word and nothing this
+    /// side can ask about.
+    ///
+    /// A pane panel asks herdr's census who has the keyboard. A surface cannot:
+    /// its host *is* herdr, and the answer comes down the pipe with everything
+    /// else. Both directions, because the one that matters is the second —
+    /// nothing on the panel changes when the keyboard leaves except what the
+    /// next click means, so a leave that did not arrive is invisible until
+    /// somebody points at the sidebar and nothing happens.
+    #[test]
+    fn the_keyboard_arriving_and_leaving_the_sidebar_is_told_by_the_host() {
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let wire = || Wire {
+            host: Arc::clone(&host),
+            running: nothing_told(),
+            last: String::new(),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+
+        let told = |line: &str, tx: Sender<Msg>| {
+            read_host(line.as_bytes(), Arc::clone(&host), nothing_told(), tx);
+        };
+
+        told("{\"t\":\"host\",\"cols\":34,\"rows\":50,\"focused\":true}\n", tx.clone());
+        assert!(wire().focus(&Live::default(), None, None).0, "the keyboard never arrived");
+
+        told("{\"t\":\"host\",\"cols\":34,\"rows\":50,\"focused\":false}\n", tx);
+        assert!(!wire().focus(&Live::default(), None, None).0, "and never left again");
+    }
+
+    /// And a message that says nothing about it leaves it alone.
+    ///
+    /// The same rule the size beside it has always had. A resize that moved the
+    /// keyboard would make the next click into the sidebar the one that takes
+    /// focus back rather than the one that acts — a click that reads, from the
+    /// outside, as a click that did not register.
+    #[test]
+    fn a_host_that_only_says_the_size_does_not_move_the_keyboard() {
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+
+        read_host(
+            "{\"t\":\"host\",\"cols\":34,\"rows\":50,\"focused\":true}\n\
+             {\"t\":\"host\",\"cols\":40,\"rows\":50}\n"
+                .as_bytes(),
+            Arc::clone(&host),
+            nothing_told(),
+            tx,
+        );
+
+        let told = host.lock().unwrap();
+        assert_eq!(told.size, (40, 50), "the resize was dropped");
+        assert!(told.focused, "the resize took the keyboard with it");
     }
 
     #[test]

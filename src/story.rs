@@ -1,12 +1,45 @@
-//! `wsp panel storyboard` — render the panel without a terminal.
+//! `wsp panel storyboard` — the panel driven and drawn without a terminal.
+//!
+//! Four steps, and the shape is Ed's: **state, modification, state', render.**
+//! A fixture is a state built in memory; an input is a modification; the reducer
+//! is the only thing that produces the next state; and the frame is what that
+//! state looks like. Nothing here talks to herdr or the store, which is the
+//! point — the frames come out the same on a laptop with nothing running.
 //!
 //! Two kinds of scene, mirroring the pair that works well on the Daisy side:
 //! *fixtures* pin a hand-built state and catch layout regressions, and *flows*
-//! push scripted keys through the real reducer so the frame is a consequence of
-//! input rather than an assertion about it.
+//! push scripted input through the real reducer so the frame is a consequence
+//! of input rather than an assertion about it.
 //!
-//! Nothing here talks to herdr or the store. That is the point: the frames come
-//! out the same on a laptop with nothing running.
+//! # The alphabet of modifications
+//!
+//! Keys, clicks, the wheel, and the keyboard arriving or leaving — everything a
+//! panel can be handed. All of it goes through [`panel::apply_input`], which is
+//! the door the live event loop uses; see [`Driver::input`]. It was keys alone
+//! for a long time, and the three that were missing were exactly the three that
+//! could only be verified by a person at a trackpad. Two of the panel's live
+//! failures were mouse failures, and neither had a test that could have caught
+//! one.
+//!
+//! A script names the row it means — [`Driver::to_task`], [`Driver::click_on`]
+//! — rather than counting presses or coordinates, so a fixture that gains a
+//! task does not silently re-aim every scene written against it.
+//!
+//! # Why a filmstrip is not enough on its own
+//!
+//! Sixty-odd captioned frames catch a change in the drawing, and that is worth
+//! having. What they cannot do is state intent: a frame fails with a diff
+//! rather than a reason, and it has no way to say *after this click the cursor
+//! is on that task and the effect is `inspect`*. Half of a transition is not
+//! drawn at all — an effect is what the panel asked the loop to do, and `c` on
+//! a task and `c` on an agent draw the same next frame while one of them runs
+//! `wsp claim`.
+//!
+//! So a script writes [`Claim`]s beside the inputs that satisfy them, and they
+//! are checked as the scenes are built. One pass yields both halves: what
+//! became true, and what it looked like. The page draws the claims under the
+//! frame they belong to, and `every_claim_the_storyboard_makes_holds` fails the
+//! build when one does not.
 
 use std::collections::BTreeMap;
 
@@ -401,11 +434,33 @@ fn read_world() -> Snapshot {
 struct Scene {
     title: String,
     caption: String,
-    /// The keys that produced this frame, as the reader would press them.
+    /// The inputs that produced this frame, as the reader would make them.
     gesture: String,
     /// What a subcommand aimed at the cursor would act on.
     target: String,
+    /// What the script said the inputs would make true, and whether it did.
+    claims: Vec<Claim>,
     html: String,
+}
+
+/// What a script says a modification made true.
+///
+/// A filmstrip catches a change in the drawing and cannot state intent: it
+/// fails with a diff rather than a reason, and it has no way to say "after this
+/// key the cursor is on the next task and the effect is a refetch". Ed's
+/// framing is that the assertion belongs on the **transition**, with the render
+/// as the fourth step rather than the only one.
+///
+/// So a claim is written beside the input that is meant to satisfy it, checked
+/// as the scene is built, and drawn under the frame. One script yields both
+/// halves: what became true, and what it looked like. A claim that does not
+/// hold fails a test by name — and says so on the page, which is where anyone
+/// reading the filmstrip is already looking.
+struct Claim {
+    /// The sentence a reader sees under the frame.
+    said: String,
+    /// What actually happened, when that is not what was said.
+    broke: Option<String>,
 }
 
 /// Reads the seam back out in the store's own vocabulary, so a scene shows
@@ -423,6 +478,33 @@ fn target_label(t: &panel::Target) -> String {
     }
 }
 
+/// What the reducer asked the loop for, as one phrase.
+///
+/// The effect is the half of a transition no frame can show. `c` on a task and
+/// `c` on an idle agent draw the same next frame and mean different things —
+/// one of them ran `wsp claim` and typed a work order into a terminal — so a
+/// scene that only compares pictures cannot tell them apart. Named rather than
+/// compared as a value: `Run` carries argv, and a claim reading `run wsp claim
+/// t-004 --pane w1:p1` is the sentence a reader wants, where a `Vec<String>`
+/// in a diff is not.
+fn effect_label(e: &panel::Effect) -> String {
+    match e {
+        panel::Effect::None => "nothing".into(),
+        panel::Effect::Refetch => "a refetch".into(),
+        panel::Effect::Focus(a) => format!("focus {}", a.pane),
+        panel::Effect::Sync => "a sync".into(),
+        panel::Effect::Quit => "quit".into(),
+        panel::Effect::Spawn { argv, .. } => format!("spawn: wsp {}", argv.join(" ")),
+        panel::Effect::Inspect(_) => "inspect".into(),
+        panel::Effect::CloseView => "close the view".into(),
+        panel::Effect::PopOut { label, .. } => format!("pop out {label}"),
+        panel::Effect::Board { label, .. } => format!("open {label}"),
+        panel::Effect::Full => "open the tab".into(),
+        panel::Effect::Run { argv, .. } => format!("run wsp {}", argv.join(" ")),
+        panel::Effect::Tell(_) => "tell an agent".into(),
+    }
+}
+
 fn key_name(k: Key) -> String {
     match k {
         Key::Up => "↑".into(),
@@ -437,7 +519,10 @@ fn key_name(k: Key) -> String {
         Key::Backspace => "\u{232b}".into(),
         Key::KillLine => "^U".into(),
         Key::Interrupt => "^C".into(),
-        Key::Click { x, y } => format!("click {x},{y}"),
+        // Not the coordinates. Where a click landed is what the claim under
+        // the frame says, in the store's own words; `click 2,14` on a gesture
+        // chip is a number pair the reader has to hold the fixture to decode.
+        Key::Click { .. } => "click".into(),
         Key::Wheel { up } => if up { "wheel ↑".into() } else { "wheel ↓".into() },
     }
 }
@@ -471,6 +556,19 @@ struct Driver<'a> {
     /// because a fullscreen panel is the same panel in a bigger pane and there
     /// is no other difference to show.
     size: (usize, usize),
+    /// Whether this pane is the one being worked in.
+    ///
+    /// Not part of the view — `crate::draw`'s "focus is not an input" holds
+    /// here, and nothing below draws it. It is on the driver because it is the
+    /// one piece of the panel's state a *click* reads and writes, so a script
+    /// that could not set it could only ever drive the focused case, which is
+    /// the half that was never the bug.
+    keyboard: bool,
+    /// What the last input asked the loop for. The half of a transition the
+    /// frame cannot show; see [`effect_label`].
+    effect: panel::Effect,
+    /// What the script has said about the inputs since the last scene.
+    claims: Vec<Claim>,
 }
 
 impl<'a> Driver<'a> {
@@ -488,14 +586,40 @@ impl<'a> Driver<'a> {
         view.takes_the_tab(true);
         let ui = panel::collect(snap, &view);
         panel::place(&ui, &mut view, w, h);
-        Driver { snap, view, ui, log: Vec::new(), size: (w, h) }
+        Driver {
+            snap,
+            view,
+            ui,
+            log: Vec::new(),
+            size: (w, h),
+            // A panel opens as the pane being worked in. Every script that says
+            // nothing about focus is describing that panel, which is the one
+            // almost every reader has in front of them.
+            keyboard: true,
+            effect: panel::Effect::None,
+            claims: Vec::new(),
+        }
     }
 
-    fn key(&mut self, k: Key) -> &mut Self {
-        self.log.push(key_name(k));
+    /// One input, through the door the live loop uses.
+    ///
+    /// [`panel::apply_input`] and not `apply_key`: a click has to be turned
+    /// into a row before it means anything, and that translation used to live
+    /// in the event loop, where no fixture could reach it. A script driving
+    /// `apply_key` and doing the translation itself would be testing its own
+    /// copy of the loop, which is the one thing a harness must never be.
+    fn input(&mut self, input: panel::Input) -> &mut Self {
+        self.log.push(match &input {
+            panel::Input::Key(k) => key_name(*k),
+            panel::Input::Focus(true) => "\u{2328} here".into(),
+            panel::Input::Focus(false) => "\u{2328} away".into(),
+        });
+        let (w, h) = self.size;
+        self.effect =
+            panel::apply_input(input, &mut self.ui, &mut self.view, w, h, &mut self.keyboard);
         // The reducer may ask for a refetch; offline that just means rebuilding
         // the rows from the same snapshot, exactly as the live loop does.
-        if let panel::Effect::Refetch = panel::apply_key(k, &mut self.ui, &mut self.view) {
+        if let panel::Effect::Refetch = self.effect {
             panel::refetch_into(&mut self.ui, self.snap, &mut self.view);
         }
         // And the loop draws, which is where the view keeps its place. A
@@ -504,6 +628,68 @@ impl<'a> Driver<'a> {
         // scrolling replaced.
         panel::place(&self.ui, &mut self.view, self.size.0, self.size.1);
         self
+    }
+
+    fn key(&mut self, k: Key) -> &mut Self {
+        self.input(panel::Input::Key(k))
+    }
+
+    /// Point at the line a target is drawn on.
+    ///
+    /// By target and not by coordinate, for the reason [`Driver::to_task`]
+    /// exists rather than a count of `j` presses: `click 2, 14` describes the
+    /// fixture it was written against, and would go on passing while it
+    /// silently pointed at a different row, the day a project above it gained a
+    /// task. The line is asked of [`panel::row_at`] — the arithmetic that drew
+    /// the frame — so a scripted click lands where a real one would.
+    fn click_on(&mut self, want: panel::Target) -> &mut Self {
+        let (w, h) = self.size;
+        let rows = self.ui.rows_for_target(&want);
+        let row = *rows.first().unwrap_or_else(|| panic!("no row for {}", target_label(&want)));
+        let y = (0..h)
+            .find(|&y| panel::row_at(&self.ui, &self.view, w, h, y) == Some(row))
+            .unwrap_or_else(|| panic!("{} is not on the pane", target_label(&want)));
+        self.click_at(2, y)
+    }
+
+    /// Point at whatever the cursor is already on — the second half of select,
+    /// then activate.
+    fn click_again(&mut self) -> &mut Self {
+        let want = self.ui.selected_target();
+        self.click_on(want)
+    }
+
+    /// Point at a mark in the header strip. Not a row: see
+    /// [`panel::strip_column`].
+    fn click_mark(&mut self, pane: &str) -> &mut Self {
+        let x = panel::strip_column(&self.ui, self.size.0, pane)
+            .unwrap_or_else(|| panic!("the strip is not drawing {pane}"));
+        self.click_at(x, 0)
+    }
+
+    /// And at the ellipsis that stands for the agents it could not draw. Only a
+    /// test points at that one — see [`panel::strip_rest_column`].
+    #[cfg(test)]
+    fn click_rest(&mut self) -> &mut Self {
+        let x = panel::strip_rest_column(&self.ui, self.size.0)
+            .unwrap_or_else(|| panic!("the strip is not clipped at {} cells", self.size.0));
+        self.click_at(x, 0)
+    }
+
+    /// A raw coordinate. The primitive the three above resolve to, and the one
+    /// to reach for when the point of the scene *is* the coordinate — a click
+    /// on furniture, on the blank tail, on a line nothing is drawn on.
+    fn click_at(&mut self, x: usize, y: usize) -> &mut Self {
+        self.key(Key::Click { x, y })
+    }
+
+    fn wheel(&mut self, up: bool) -> &mut Self {
+        self.key(Key::Wheel { up })
+    }
+
+    /// The keyboard arrived in this pane, or left it.
+    fn focus(&mut self, here: bool) -> &mut Self {
+        self.input(panel::Input::Focus(here))
     }
 
     fn keys(&mut self, ks: &[Key]) -> &mut Self {
@@ -588,6 +774,22 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// An agent with nothing in its hands, which is not in the tree.
+    ///
+    /// It used to be, and these scenes were written when it was. An unclaimed
+    /// agent stopped being a tree row when the census was pinned at the foot —
+    /// the same pane twice in one glance is one too many to count — and this
+    /// fixture holds more agents than the section draws, so the spare one sits
+    /// behind its `⋯`. `G` to the last row, `→` to open the tail where it
+    /// stands, and `⇱` back to the top to hunt down from.
+    ///
+    /// Three presses that say out loud where a spare agent now lives. The
+    /// storyboard had been panicking on this row since the day it moved, and
+    /// nothing ran it: see `every_scene_the_storyboard_ships_can_be_drawn`.
+    fn to_spare(&mut self, pane: &str) -> &mut Self {
+        self.keys(&[Key::Char('G'), Key::Right, Key::Home]).to_pane(pane)
+    }
+
     /// Press `Down` until the cursor sits on a row of `want`. Bounded by the
     /// cursor going nowhere, so a `want` that is not present terminates rather
     /// than spins.
@@ -620,6 +822,71 @@ impl<'a> Driver<'a> {
         }
     }
 
+    // ---- what the script says the inputs made true ----------------------
+    //
+    // Each of these is one sentence about the state the inputs arrived at, and
+    // each is checked here rather than left for a diff to notice. Written
+    // beside the input that is meant to satisfy it, so a script reads as
+    // modification, claim, modification, claim — and the frame at the end is
+    // the fourth step rather than the only one. See [`Claim`].
+
+    /// Record a sentence, and what actually happened if it is not true.
+    fn claim(&mut self, said: String, ok: bool, but: String) -> &mut Self {
+        self.claims.push(Claim { said, broke: (!ok).then_some(but) });
+        self
+    }
+
+    /// The cursor is on this, in the store's own words — which is to say: this
+    /// is what the next verb acts on.
+    fn now_on(&mut self, want: &str) -> &mut Self {
+        let at = target_label(&self.ui.selected_target());
+        self.claim(format!("the cursor is on {want}"), at == want, format!("it is on {at}"))
+    }
+
+    /// And this is what the panel asked the loop to do about it.
+    fn did(&mut self, want: &str) -> &mut Self {
+        let got = effect_label(&self.effect);
+        self.claim(format!("the effect is {want}"), got == want, format!("it is {got}"))
+    }
+
+    /// What the panel is now in the middle of — the half of the state a frame
+    /// reports worst. See [`panel::View::mode_name`].
+    fn now_in(&mut self, want: &str) -> &mut Self {
+        let got = self.view.mode_name();
+        self.claim(
+            format!("the keyboard is in {want}"),
+            got == want,
+            format!("it is in {got}"),
+        )
+    }
+
+    /// The words the panel put in front of the reader. Read off the frame and
+    /// not off the state, because a footer nobody can see is not a message.
+    fn says(&mut self, want: &str) -> &mut Self {
+        let (w, h) = self.size;
+        let frame = panel::frame(&self.ui, &mut self.view, w, h);
+        let said = frame.iter().any(|l| l.text().contains(want));
+        self.claim(format!("the panel says \u{201c}{want}\u{201d}"), said, "it does not".into())
+    }
+
+    /// Whether this is the pane being worked in. The one fact a click both
+    /// reads and writes, and the one that made the two live mouse failures
+    /// invisible to every test that existed.
+    fn has_the_keyboard(&mut self, want: bool) -> &mut Self {
+        let got = self.keyboard;
+        self.claim(
+            match want {
+                true => "the keyboard is in this pane".into(),
+                false => "the keyboard is somewhere else".into(),
+            },
+            got == want,
+            match got {
+                true => "it is here".into(),
+                false => "it is not".into(),
+            },
+        )
+    }
+
     fn scene(&mut self, title: &str, caption: &str) -> Scene {
         Scene {
             title: title.to_string(),
@@ -630,6 +897,7 @@ impl<'a> Driver<'a> {
                 compress(&self.log)
             },
             target: target_label(&self.ui.selected_target()),
+            claims: std::mem::take(&mut self.claims),
             html: panel::to_html(
                 &panel::frame(&self.ui, &mut self.view, self.size.0, self.size.1),
                 self.size.0,
@@ -722,14 +990,14 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
-            .to_pane("w4:p2")
+            .to_spare("w4:p2")
             .key(Key::Char('c'))
-            .scene("Handing work to an idle agent", "`○` is an agent that has stopped holding nothing — a person's worth of attention going spare, and the row the section exists to keep on screen: it sorts above the busy ones for exactly that reason, since there is nothing to do about an agent that is working. `c` on it turns the tree into the picker: choose what it takes."),
+            .scene("Handing work to an idle agent", "`○` is an agent that has stopped holding nothing — a person's worth of attention going spare, and the row the section exists to keep on screen: it sorts above the busy ones for exactly that reason, since there is nothing to do about an agent that is working. `c` on it turns the tree into the picker: choose what it takes. The section draws five and this world runs seven, so `G →` opens its tail first — an unclaimed agent is only in the census, never in the tree, and drawing the same pane twice in one glance is one time too many to count."),
     );
 
     out.push(
         Driver::new(&w)
-            .to_pane("w4:p2")
+            .to_spare("w4:p2")
             .key(Key::Char('c'))
             .up_to(panel::RowKind::More)
             .key(Key::Enter)
@@ -738,7 +1006,7 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
-            .to_pane("w4:p2")
+            .to_spare("w4:p2")
             .key(Key::Char('f'))
             .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — and asks first, because everything that aims an agent does. Say yes and the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command, and a refusal puts up no question at all."),
     );
@@ -921,6 +1189,8 @@ fn scenes() -> Vec<Scene> {
             .down_to(panel::RowKind::Project)
             .key(Key::Char('a'))
             .type_in("Retune the plate decay")
+            .now_in("a prompt")
+            .says("Retune the plate decay")
             .scene("Adding to a project", "a on a project opens a field in the footer. The cursor's row decides the scope, so this becomes `wsp add … -p audio` without asking which project."),
     );
 
@@ -1017,6 +1287,8 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .down_to(panel::RowKind::Project)
             .key(Key::Char('X'))
+            .now_in("a confirmation")
+            .did("nothing")
             .scene("Before removing", "X asks first, and the question carries the consequence — how many tasks would be displaced — because the answer changes with the row and you should not have to remember."),
     );
 
@@ -1024,6 +1296,8 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .down_to(panel::RowKind::Task)
             .key(Key::Char('c'))
+            .now_in("a pick")
+            .did("nothing")
             .scene("Claiming", "c from a task picks the agent that takes it. From an agent row it runs the other way — pick the task it moves to, which is how one agent hands itself from one piece of work to the next."),
     );
 
@@ -1039,6 +1313,74 @@ fn scenes() -> Vec<Scene> {
             .to_pane("w2:p1")
             .key(Key::Char('u'))
             .scene("Before taking work back", "The five keys that generate or re-aim an agent — S C c f u — all ask, the way X does. Nothing here is a record you can retype: u releases the claim *and* empties the window, and an emptied context does not come back. The question names the agent rather than the pane id, and says whether it is still mid-task, which is the fact you want before answering and the one the tree does not show you."),
+    );
+
+    // ---- the mouse, and the pane the keyboard is in ----------------------
+    //
+    // Scripted for the first time here. The mouse had bitten twice in live use
+    // — a herdr restart that broke it in every pane application, and a session
+    // where selection worked but nothing fired — and neither had a test that
+    // could have caught it, because the arithmetic was reachable and the
+    // *sentence around it* was in the event loop. See `panel::apply_input`.
+
+    out.push(
+        Driver::new(&w)
+            .click_on(panel::Target::Task("t-002".into()))
+            .now_on("task t-002")
+            .did("nothing")
+            .scene(
+                "Pointing at a row",
+                "One click moves the cursor and does nothing else. A click that both selects and opens is how you end up somewhere you did not ask to be, on a row you had not read — and here ↵ can focus another pane, so that is a terminal you were not looking at. The row also stays under the pointer: a click pins the view where the frame left it, where a keystroke landing in the same place is owed rows beyond it.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .click_on(panel::Target::Task("t-002".into()))
+            .click_again()
+            .now_on("task t-002")
+            .did("inspect")
+            .scene(
+                "Then activating",
+                "The second click on the row already under the cursor means what ↵ means — it *becomes* that key rather than restating what opening a row does. So the two gestures cannot drift: whatever ↵ grows into on a task row, the second click grows into as well.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .focus(false)
+            .click_on(panel::Target::Task("t-002".into()))
+            .now_on("the inbox")
+            .has_the_keyboard(true)
+            .did("nothing")
+            .scene(
+                "A click into a pane nobody is working in",
+                "The mouse reaches a pane the keyboard is not in — that is what makes the panel worth pointing at — and taking the keyboard is the whole of what this click did. The cursor has not moved: acting as well is the bounce Ed named, where pointing at the agent the cursor is already on means ↵, and focus arrives here and leaves again for that agent's terminal in the same gesture. The next click has the keyboard and means what it says.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .click_mark("w2:p1")
+            .did("focus w2:p1")
+            .has_the_keyboard(false)
+            .now_on("the inbox")
+            .scene(
+                "Pointing at a mark in the strip",
+                "The one clickable thing on the panel that is not a row. A mark *is* an agent, so there is nothing to select and one click goes there — the strip is a line of single columns, there is nothing to read on the way, and the ← you are reaching for is one you have already decided to answer. The keyboard goes with it, which is why the panel says so rather than waiting for herdr's census to agree.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .wheel(false)
+            .wheel(false)
+            .now_on("the inbox")
+            .did("nothing")
+            .scene(
+                "Scrolling past the cursor",
+                "The wheel moves the view and leaves the cursor where it is. What is selected is something you decided, not a consequence of where you are looking: dragging it along means a scroll to check something quietly moves the row the next verb acts on, and you have no way of knowing it did. Off the pane is a state the panel is allowed to be in — the next keystroke brings the view back to it. Unlike a click it is not gated on the keyboard being here, because a wheel cannot send you anywhere.",
+            ),
     );
 
     out.extend(detail_scenes(&w));
@@ -1101,6 +1443,9 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
             Focus::Project(p) => format!("project {p}"),
             Focus::Nothing => "nothing".into(),
         },
+        // A still frame of a pane nothing was driven through: there was no
+        // transition, so there is nothing to claim about one.
+        claims: Vec::new(),
         html: panel::to_html(&detail::frame(&ctx, &focus, W, H), W),
     };
     vec![
@@ -1147,6 +1492,7 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
             caption: caption.to_string(),
             gesture: "K".into(),
             target,
+            claims: Vec::new(),
             html: panel::to_html(&kanban::frame(&board, &cur, BW, BH, note), BW),
         }
     };
@@ -1283,6 +1629,20 @@ pre.wsp .sel { background:#E4EAE7; color:#0D1110; }
 pre.wsp .sel .d, pre.wsp .sel .m, pre.wsp .sel .a, pre.wsp .sel .w,
 pre.wsp .sel .q, pre.wsp .sel .p { color:#0D1110; }
 
+/* A claim is a sentence the script made true, and it sits under the frame it
+   is about rather than beside the caption: the caption is prose about why, and
+   these are the facts a test is holding the code to. */
+.claims { margin:.8rem 0 0; padding:0; list-style:none; display:flex;
+  flex-direction:column; gap:.25rem; }
+.claims li {
+  font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  color:var(--sub);
+}
+.claims li::before { content:"\2713"; color:var(--accent); margin-right:.5rem; }
+.claims li.broke { color:#C2453B; font-weight:600; }
+.claims li.broke::before { content:"\2717"; color:#C2453B; }
+.claims li.broke b { font-weight:400; }
+
 footer {
   margin-top:3rem; padding-top:1.25rem; border-top:1px solid var(--edge);
   color:var(--sub); font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
@@ -1374,17 +1734,33 @@ fn page(scenes: &[Scene]) -> String {
 
     out.push_str("<h2 class=\"sec\">Frames</h2>\n<div class=\"scenes\">\n");
     for s in scenes {
+        let mut claims = String::new();
+        if !s.claims.is_empty() {
+            claims.push_str("<ul class=\"claims\">");
+            for c in &s.claims {
+                match &c.broke {
+                    None => claims.push_str(&format!("<li>{}</li>", esc(&c.said))),
+                    Some(what) => claims.push_str(&format!(
+                        "<li class=\"broke\">{} \u{2014} <b>{}</b></li>",
+                        esc(&c.said),
+                        esc(what),
+                    )),
+                }
+            }
+            claims.push_str("</ul>");
+        }
         out.push_str(&format!(
             "<section class=\"scene\">\
              <div class=\"rail\"><h2>{}</h2><span class=\"gesture\">{}</span><p>{}</p>\
              <p class=\"tgt\">cursor is on <b>{}</b></p></div>\
-             <div class=\"frame\">{}</div>\
+             <div class=\"frame\">{}{}</div>\
              </section>\n",
             esc(&s.title),
             esc(&s.gesture),
             esc(&s.caption),
             esc(&s.target),
             s.html,
+            claims,
         ));
     }
     out.push_str("</div>\n");
@@ -1397,9 +1773,33 @@ fn page(scenes: &[Scene]) -> String {
     out
 }
 
+/// Every claim the scripts made that did not hold, as `scene: said — but`.
+///
+/// The filmstrip and the assertions come out of one pass, so this is free: the
+/// scenes have already been built by the time anyone asks. It is what the test
+/// below checks and what the command prints, which means a broken transition
+/// fails the build *and* is legible to whoever was only looking at the page.
+fn broken(scenes: &[Scene]) -> Vec<String> {
+    scenes
+        .iter()
+        .flat_map(|s| {
+            s.claims.iter().filter_map(|c| {
+                c.broke.as_ref().map(|b| format!("{}: {} \u{2014} {b}", s.title, c.said))
+            })
+        })
+        .collect()
+}
+
 pub fn run(args: &crate::Args) -> i32 {
     let scenes = scenes();
     let html = page(&scenes);
+    // Said on the way past rather than instead of writing the page: a page
+    // showing where a claim broke is more use than no page, and the frame
+    // beside the broken claim is usually the answer.
+    let broke = broken(&scenes);
+    for line in &broke {
+        eprintln!("wsp: {line}");
+    }
 
     match args.get("out") {
         Some(path) => {
@@ -1410,7 +1810,7 @@ pub fn run(args: &crate::Args) -> i32 {
             match crate::store::write_atomic(&p, &html) {
                 Ok(()) => {
                     println!("wrote {} ({} scenes)", p.display(), scenes.len());
-                    0
+                    (!broke.is_empty()) as i32
                 }
                 Err(e) => {
                     eprintln!("wsp: {}: {e}", p.display());
@@ -1420,7 +1820,7 @@ pub fn run(args: &crate::Args) -> i32 {
         }
         None => {
             print!("{html}");
-            0
+            (!broke.is_empty()) as i32
         }
     }
 }
@@ -1428,6 +1828,47 @@ pub fn run(args: &crate::Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The filmstrip is only as good as its being built, and it was not.
+    ///
+    /// `wsp panel storyboard` panicked — `no row for pane w4:p2` — from the day
+    /// an unclaimed agent stopped being a tree row, which is months of the page
+    /// being unbuildable with nothing saying so. Nothing ran it: `board_scenes`
+    /// had a test of its own and the panel's scenes had none, so the scripts
+    /// that drive the whole thing were exercised only by a person typing the
+    /// command, and nobody had a reason to.
+    ///
+    /// This is that reason. Every hunt in a script — `to_task`, `to_pane`,
+    /// `to_spare` — panics when the row it names is not there, which is the
+    /// design: a scene names the row it means so the caption underneath cannot
+    /// go on describing a row that has moved. That only helps if something
+    /// presses the button.
+    #[test]
+    fn every_scene_the_storyboard_ships_can_be_drawn() {
+        let scenes = scenes();
+        assert!(scenes.len() > 50, "the storyboard is {} scenes", scenes.len());
+        for s in &scenes {
+            assert!(!s.html.is_empty(), "{} drew nothing", s.title);
+        }
+    }
+
+    /// And the assertions the scripts make hold.
+    ///
+    /// This is the half the filmstrip could never do. A frame catches a change
+    /// in the drawing and fails with a diff; it cannot say "after this click
+    /// the cursor is on that task and the effect is `inspect`", so a transition
+    /// that broke while the picture stayed the same — which is every mouse
+    /// failure this panel has had in live use — went past it. The claims are
+    /// checked as the scenes are built, so the page and the assertions come out
+    /// of one pass and cannot describe different runs.
+    #[test]
+    fn every_claim_the_storyboard_makes_holds() {
+        let scenes = scenes();
+        let claimed: usize = scenes.iter().map(|s| s.claims.len()).sum();
+        assert!(claimed > 0, "no scene claims anything, so nothing is being checked");
+        let broke = broken(&scenes);
+        assert!(broke.is_empty(), "{}", broke.join("\n"));
+    }
 
     /// A click acts on the row under the pointer, or on nothing. Every case
     /// here is one where being off by a single line would act on the wrong
@@ -1760,6 +2201,144 @@ mod tests {
     /// means one thing and only that — see
     /// [`a_click_on_a_pane_nobody_is_working_in_only_goes_there`].
     const WORKING_HERE: bool = true;
+
+    // ---- the sentence the loop used to spell -----------------------------
+    //
+    // `click` and `wheel` were always reachable, and were always tested. What
+    // was not is what the event loop did with the answer: a `Hit` became a
+    // keystroke, or a focus call, or nothing, in twenty lines that only a
+    // person at a trackpad could run. Both live mouse failures were in that
+    // gap — selection worked and nothing fired — so these are about the
+    // translation and not about the arithmetic under it.
+
+    /// A click on the row the cursor is already on *is* `↵`, whatever `↵` has
+    /// grown into.
+    ///
+    /// Compared against the key rather than against a named effect, which is
+    /// the whole point: the two must not be able to drift. A test asserting
+    /// `Effect::Inspect` would go on passing on the day `↵` on a task started
+    /// doing something else and the click did not follow it.
+    #[test]
+    fn a_second_click_on_a_row_is_whatever_return_does_to_it() {
+        let w = world();
+        for kind in [panel::RowKind::Task, panel::RowKind::Project, panel::RowKind::Agent] {
+            let mut bykey = Driver::new(&w);
+            bykey.down_to(kind);
+            let want = bykey.ui.selected_target();
+            bykey.key(Key::Enter);
+
+            let mut bymouse = Driver::new(&w);
+            bymouse.down_to(kind);
+            bymouse.click_again();
+            assert_eq!(
+                effect_label(&bymouse.effect),
+                effect_label(&bykey.effect),
+                "a second click on {} is not what ↵ is",
+                target_label(&want),
+            );
+        }
+    }
+
+    /// Ed: "clicks should only perform their action if the pane was already
+    /// focused, to avoid bouncing."
+    ///
+    /// The click arrives, the panel takes the keyboard, and that is the whole
+    /// of what happened — the cursor has not moved and no effect was asked
+    /// for. The *next* click means what it says. Driven here as two clicks in
+    /// a row, which is the gesture a person makes and the one the loop's
+    /// `had_keyboard` line existed for.
+    #[test]
+    fn a_click_into_an_unwatched_pane_takes_the_keyboard_and_nothing_else() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        let opened_on = d.ui.selected_target();
+        d.focus(false);
+
+        d.click_on(panel::Target::Task("t-002".into()));
+        assert_eq!(d.ui.selected_target(), opened_on, "the click moved the cursor as well");
+        assert_eq!(d.effect, panel::Effect::None, "and asked for something");
+        assert!(d.keyboard, "the pane it landed in is now the one being worked in");
+
+        d.click_on(panel::Target::Task("t-002".into()));
+        assert_eq!(
+            d.ui.selected_target(),
+            panel::Target::Task("t-002".into()),
+            "the second click still did not act",
+        );
+    }
+
+    /// And the wheel is not gated on it: a wheel cannot send you anywhere, so
+    /// there is nothing to bounce, and a pane you have to click into before you
+    /// can scroll it is worse at the one thing the panel is for — being read
+    /// from across the screen.
+    #[test]
+    fn the_wheel_reaches_a_pane_the_keyboard_is_not_in() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.focus(false);
+        // What is at the top of the tree, which is what a scroll moves.
+        let top = |d: &Driver| panel::row_at(&d.ui, &d.view, W, H, 2);
+        let at = top(&d);
+        d.wheel(false);
+        assert_ne!(top(&d), at, "the wheel was swallowed the way a click is");
+    }
+
+    /// The `⋯` at the end of a clipped strip stands for the agents it could not
+    /// draw, which is exactly what the agents view is — so it presses `w`.
+    ///
+    /// Against the key again, for the same reason as the second click: one
+    /// mark, one keystroke, and no third statement of what "the rest of the
+    /// agents" means.
+    #[test]
+    fn the_rest_of_a_clipped_strip_is_the_key_that_opens_the_agents() {
+        let w = world();
+        // Narrow enough that seven marks cannot fit beside the name and total.
+        let mut bymouse = Driver::at(&w, 10, H);
+        bymouse.click_rest();
+
+        let mut bykey = Driver::at(&w, 10, H);
+        bykey.key(Key::Char('w'));
+        assert_eq!(
+            bymouse.ui.selected_target(),
+            bykey.ui.selected_target(),
+            "the ⋯ and w land somewhere different",
+        );
+        assert_eq!(effect_label(&bymouse.effect), effect_label(&bykey.effect));
+    }
+
+    /// A mark in the strip is an agent, and the keyboard goes with it.
+    ///
+    /// Said by the panel rather than waited for: the census will agree within
+    /// the tick, and a click landing inside that window would be the bounce
+    /// with a stopwatch on it.
+    #[test]
+    fn pointing_at_a_mark_sends_the_keyboard_to_that_agent() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        d.click_mark("w2:p1");
+        match &d.effect {
+            panel::Effect::Focus(a) => assert_eq!(a.pane, "w2:p1"),
+            other => panic!("a mark should go to a terminal, got {other:?}"),
+        }
+        assert!(!d.keyboard, "the panel still thinks it is the pane being worked in");
+    }
+
+    /// Focus is not drawn, and this is what that means in practice.
+    ///
+    /// `crate::draw`'s rule is that no renderer reads it — so the frame before
+    /// and after the keyboard leaves is the same frame, and the only difference
+    /// is what the next click does. A test that asserted a visible change would
+    /// be asserting the rule is broken.
+    #[test]
+    fn the_keyboard_arriving_or_leaving_changes_nothing_that_is_drawn() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        let before = panel::to_html(&panel::frame(&d.ui, &mut d.view, W, H), W);
+        d.focus(false);
+        let after = panel::to_html(&panel::frame(&d.ui, &mut d.view, W, H), W);
+        assert_eq!(before, after, "focus reached something that draws");
+        assert_eq!(d.effect, panel::Effect::None, "and asked the loop for something");
+    }
 
     /// Drive the panel the way a person would and hand back what it is
     /// showing: the reducer, then the rebuild the live loop does for it.

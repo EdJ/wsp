@@ -734,9 +734,11 @@ impl Ui {
         self.dock
     }
 
-    /// Every row standing for the same thing, for a test that has to prove the
-    /// panel draws one of them twice on purpose.
-    #[cfg(test)]
+    /// Every row standing for the same thing: for a test that has to prove the
+    /// panel draws one of them twice on purpose, and for a scripted click,
+    /// which has to find the line a target is drawn on before it can point at
+    /// it. See `super::strip_column` for the one clickable thing that is not a
+    /// row.
     pub(crate) fn rows_for_target(&self, want: &Target) -> Vec<usize> {
         self.rows
             .iter()

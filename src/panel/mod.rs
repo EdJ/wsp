@@ -58,7 +58,12 @@ mod shared;
 mod surface;
 mod verbs;
 
-pub(crate) use keys::{apply_key, Effect, View};
+pub(crate) use keys::{apply_input, Effect, Input, View};
+// The reducer's inner door: one key, no pane size, no focus. Every input the
+// live loop takes now goes through `apply_input`, so the only callers left are
+// the tests that predate it and are about a key alone.
+#[cfg(test)]
+pub(crate) use keys::apply_key;
 // The card a raised hand becomes, and the mode it holds the keyboard in. Out
 // here for the storyboard, which has to be able to ask whether a card is up —
 // a popup that only the live panel could reach would be one no fixture could
@@ -79,13 +84,40 @@ pub(crate) use render::{
 // like rather than one per surface.
 pub(crate) use render::ansi_of;
 pub(crate) use render::{INV as ANSI_INV, OFF as ANSI_OFF};
-// The live click mapping reaches `row_at` through `super::render` inside this
-// module; only the storyboard's tests need it from outside, so it is exported
-// for them alone rather than widening the surface for everyone.
-#[cfg(test)]
+// Which row is drawn at which line. The live click mapping reaches this
+// through `super::render` inside the module; outside it, the storyboard needs
+// it to point a *scripted* click at a row rather than at a coordinate — for
+// the reason `Driver::to_task` exists rather than a count of `j` presses. A
+// script that said `click 2,14` would describe the fixture it was written
+// against and would go on passing, silently pointing at a different row, the
+// day a project gained a task above it.
 pub(crate) use render::row_at;
 #[cfg(test)]
 pub(crate) use render::to_html_spans as spans_of;
+
+/// The column of the header strip that stands for a pane, if the strip is
+/// drawing it.
+///
+/// The strip is the one clickable thing on the panel that is not a row, so a
+/// script pointing at it cannot go through [`row_at`] — and a column counted by
+/// hand describes the fixture's census rather than the strip. Asked of
+/// `strip_at`, which is the arithmetic the live click already reads, so a
+/// scripted click on a mark lands where a real one would.
+pub(crate) fn strip_column(ui: &Ui, w: usize, pane: &str) -> Option<usize> {
+    (0..w).find(|&x| match render::strip_at(ui, w, x) {
+        Some(render::StripHit::Agent(i)) => ui.census.get(i).is_some_and(|(_, a)| a.pane == pane),
+        _ => false,
+    })
+}
+
+/// And the column of the ellipsis at the end of a strip too long for the pane.
+/// Only a test drives that one: the filmstrip is drawn at a width where the
+/// strip fits, because a scene narrow enough to clip it is a scene about the
+/// clipping and not about the panel.
+#[cfg(test)]
+pub(crate) fn strip_rest_column(ui: &Ui, w: usize) -> Option<usize> {
+    (0..w).find(|&x| render::strip_at(ui, w, x) == Some(render::StripHit::Rest))
+}
 
 /// Draw one row exactly as the frame would, so a test can ask whether the row
 /// a click maps to is the row that was painted there.
