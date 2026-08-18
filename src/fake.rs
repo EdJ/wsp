@@ -1026,6 +1026,26 @@ impl Fake {
             while !accept.stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // The listener is non-blocking so that `stop` is
+                        // ever looked at. The connection must not be, and BSD
+                        // hands it the listener's `O_NONBLOCK` anyway —
+                        // measured here; POSIX says otherwise and Linux agrees
+                        // with POSIX. Left set, `serve`'s first `read_line`
+                        // answered `WouldBlock` whenever the request had not
+                        // landed yet, was matched by the arm that means *the
+                        // client went away*, and hung up on somebody
+                        // mid-sentence. What the caller saw was an empty reply
+                        // or a broken pipe from a backend that was up the whole
+                        // time — including a real one, since `wsp sandbox
+                        // --fake` serves through this bind.
+                        //
+                        // A busy suite hid it, as it hid `robustness-072` and
+                        // for the same reason: contention handed the writer its
+                        // turn before the reader got one. Alone on this machine
+                        // `a_seat_the_fake_did_not_invent_is_still_a_seat`
+                        // failed 14 times in 60, and 0 in 200 after
+                        // (`robustness-074`).
+                        let _ = stream.set_nonblocking(false);
                         let inner = Arc::clone(&accept);
                         std::thread::spawn(move || serve(inner, stream));
                     }
@@ -2002,6 +2022,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A caller that takes its time asking is still a caller.
+    ///
+    /// The pause is the whole test, and it is why nothing here caught the
+    /// non-blocking accept for as long as it stood: every other case connects
+    /// and writes in the same breath, and this one puts the fake inside its
+    /// first read before there is anything to read. The argument is at the
+    /// accept.
+    #[test]
+    fn a_caller_that_takes_its_time_asking_is_still_answered() {
+        let dir = scratch("slow");
+        let fake = Fake::bind(dir.join("herdr.sock"), Stage::new()).unwrap();
+        let mut s = UnixStream::connect(fake.path()).unwrap();
+        s.set_read_timeout(Some(DELIVERY)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        s.write_all(b"{\"id\":\"t1\",\"method\":\"pane.list\",\"params\":{}}\n")
+            .expect("the fake hung up before the request arrived");
+        s.flush().unwrap();
+
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("a reply, not a hang-up: {e} — {line:?}"));
+        assert_eq!(reply["id"], "t1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn call(fake: &Fake, method: &str, params: Value) -> Result<Value, String> {
