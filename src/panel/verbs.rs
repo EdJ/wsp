@@ -575,8 +575,13 @@ fn find_work(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
         say(ui, "a shell has nobody to tell");
         return Effect::None;
     }
-    if let Some(t) = &a.task {
-        say(ui, format!("it holds {t} — v hands that back first"));
+    // On what the task is *at*, not on there being one — see
+    // [`crate::live::Claimed::in_hand`]. The commonest agent on the machine has
+    // finished, put its task to `review` and is standing there idle, and
+    // `claim` leaves that task where it is: the `v` this used to demand first
+    // would have changed nothing. Mid-task the refusal is right and stays.
+    if let Some(t) = a.task.as_ref().filter(|t| t.in_hand()) {
+        say(ui, format!("it holds {} — v hands that back first", t.id));
         return Effect::None;
     }
     if a.state != "idle" {
@@ -690,7 +695,7 @@ fn unassign(target: &Target, ui: &mut Ui, view: &mut View) -> Effect {
         );
         return Effect::None;
     };
-    let Some(task) = a.task.clone() else {
+    let Some(task) = a.task.as_ref().map(|t| t.id.clone()) else {
         say(ui, format!("{} holds nothing already", a.where_()));
         return Effect::None;
     };
@@ -734,7 +739,7 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
         say(ui, "W finds an agent's work — aim at an agent");
         return Effect::None;
     };
-    let Some(task) = a.task.clone() else {
+    let Some(task) = a.task.as_ref().map(|t| t.id.clone()) else {
         // Nothing to be shown, and the tree would be the wrong place to look
         // for it anyway: an agent holding no task is one you give work to, not
         // one you follow. `f` and `c` are the keys for that, and saying so is

@@ -13,7 +13,7 @@
 
 use std::time::Instant;
 
-use crate::live::AgentRef;
+use crate::live::{self, AgentRef};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::{self, Counts, Index};
 use crate::store::Store;
@@ -810,7 +810,7 @@ impl Ui {
     /// and `u` on a task row is a question about who holds it, which is a fact
     /// about the world and not about what is currently drawn.
     pub(super) fn agent_on_task(&self, task: &str) -> Option<&AgentRef> {
-        self.census.iter().map(|(_, a)| a).find(|a| a.task.as_deref() == Some(task))
+        self.census.iter().map(|(_, a)| a).find(|a| a.task.as_ref().is_some_and(|t| t.id == task))
     }
 
     /// Somebody free to hand work to, preferring one already pointed at the
@@ -1334,7 +1334,14 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // out again here, because resolution canonicalises every project root and
     // this runs four times a second against every pane on the machine.
     let as_ref = |a: &AgentRef, project: Option<String>| AgentRef {
-        task: bound_task_of_pane(&a.pane),
+        // The status beside the id, because a verb aimed at the pane has to
+        // tell an agent mid-task from one that has handed its work back. `None`
+        // for a binding whose task the store no longer has — see
+        // [`live::Claimed::status`].
+        task: bound_task_of_pane(&a.pane).map(|id| live::Claimed {
+            status: tasks.iter().find(|t| t.id == id).map(|t| t.status()),
+            id,
+        }),
         project,
         seat: crate::cmd_govern::governs(&snap.governors, &a.workspace),
         ..a.clone()
@@ -1397,15 +1404,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let seated_panes: Vec<String> =
         seats.values().filter_map(|(a, _)| a.as_ref().map(|a| a.pane.clone())).collect();
 
-    // task id -> the pane claimed to it. No project: a pane holding a task is
-    // not looking for one, and every verb that would ask refuses on the task
-    // first.
-    let agent_for_task = |task_id: &str| -> Option<AgentRef> {
-        panes.iter().filter(|a| !seated_panes.contains(&a.pane)).find_map(|a| {
-            (bound_task_of_pane(&a.pane).as_deref() == Some(task_id)).then(|| as_ref(a, None))
-        })
-    };
-
     // Place every unclaimed pane against a project. Claimed ones already have
     // a home: the task they are bound to.
     let mut live_by_project: std::collections::BTreeMap<String, usize> = Default::default();
@@ -1416,6 +1414,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // expensive half of this function and it runs four times a second — and
     // because the two answers must not be worked out twice and disagree.
     let mut census: Vec<(AgentState, Census, AgentRef)> = Vec::new();
+    // pane -> what it would take work from, kept because the row a pane gets
+    // under its own task wants the same answer and resolution is the expensive
+    // half of this function.
+    let mut direction_of: std::collections::BTreeMap<String, Option<String>> = Default::default();
 
     for a in panes.iter() {
         let bound = bound_task_of_pane(&a.pane);
@@ -1450,6 +1452,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         let direction = crate::cmd_mandate::from_map(&snap.mandates, &a.workspace)
             .filter(|p| index.get(p).is_some())
             .or_else(|| r.project.clone());
+        direction_of.insert(a.pane.clone(), direction.clone());
         // Shells are not in the census. A pane with nobody in it is a fact
         // about a place, and the agents view is a list of people.
         if a.agent {
@@ -1504,6 +1507,19 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             }
         }
     }
+
+    // task id -> the pane claimed to it, carrying the same direction its row in
+    // the dock carries. It used to carry none, on the ground that a pane
+    // holding a task is not looking for one — which stopped being true the
+    // moment `f` learned to tell a task in hand from one handed back. Two rows
+    // for the same pane that answer `f` differently is the tree and the dock
+    // disagreeing about a pane, so both are given the one answer.
+    let agent_for_task = |task_id: &str| -> Option<AgentRef> {
+        panes.iter().filter(|a| !seated_panes.contains(&a.pane)).find_map(|a| {
+            (bound_task_of_pane(&a.pane).as_deref() == Some(task_id))
+                .then(|| as_ref(a, direction_of.get(&a.pane).cloned().flatten()))
+        })
+    };
 
     // Quiet branches stay folded away, but a project holding only finished work
     // must reappear the moment `show_done` is on — otherwise the toggle looks

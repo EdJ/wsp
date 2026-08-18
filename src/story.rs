@@ -3420,6 +3420,47 @@ mod tests {
         }
     }
 
+    /// The commonest agent on the machine at four in the afternoon: one that
+    /// has finished, put its task to `review`, and is standing there idle
+    /// holding work only a person can close. `f` refused on it for a year
+    /// because the row carried the task's id and not its status, and the `v` it
+    /// asked for first would have changed nothing — `claim` leaves the last
+    /// task where it is.
+    #[test]
+    fn an_agent_that_has_handed_its_work_back_is_still_sent_looking() {
+        let mut w = world();
+        // t-004 is at `review`, and the pane holding it is idle. Nothing else
+        // about the pane changes.
+        w.bindings.insert("w4:p2".into(), json!({ "task_id": "t-004" }));
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_pane(&mut ui, "w4:p2");
+        match confirmed(&mut ui, &mut view, 'f') {
+            panel::Effect::Tell(t) => {
+                assert_eq!(t.pane, "w4:p2");
+                let said = t.text.clone().expect("a sentence, not just a clear");
+                assert!(said.contains("wsp next -p verb"), "said: {said}");
+            }
+            _ => panic!("an agent whose work is at review is free to be sent looking"),
+        }
+    }
+
+    /// And the half of the old refusal that was right. An agent in the middle
+    /// of a task keeps it: work taken off one halfway through is work done
+    /// twice, so `f` still says no and still names the key that hands it back.
+    #[test]
+    fn an_agent_in_the_middle_of_a_task_is_left_alone() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        // Idle, so it is only what it holds — t-003, at `doing` — that refuses.
+        on_pane(&mut ui, "w2:p1");
+        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+        // A refusal, not a question: `f` answers `None` both when it declines
+        // and when its y/n is up, so the mode is what tells the two apart.
+        assert!(matches!(view.mode, panel::Mode::Browse), "a refusal leaves no question up");
+    }
+
     /// Standing direction beats the directory. A pane mandated to one project
     /// while sitting in another's checkout is *for* the mandate — and the panel
     /// has to agree with the answer `wsp where` would give inside that pane, or

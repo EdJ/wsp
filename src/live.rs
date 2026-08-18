@@ -55,6 +55,7 @@
 use std::collections::BTreeMap;
 
 use crate::herdr;
+use crate::model::Status;
 
 /// A pane, as a view knows one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -87,13 +88,14 @@ pub(crate) struct AgentRef {
     /// pane is not the same sentence at every kind: emptying a context is
     /// `/clear` at Claude Code and something else, or nothing, everywhere else.
     pub(crate) kind: String,
-    /// The task claimed to this pane, if it holds one. Carried so a verb aimed
-    /// at the pane can refuse on the ground that matters — it already has work
-    /// — rather than on where the row happens to sit.
+    /// The task claimed to this pane, if it holds one, and where that task has
+    /// got to. Carried so a verb aimed at the pane can refuse on the ground
+    /// that matters — it already has work — rather than on where the row
+    /// happens to sit.
     ///
     /// The store's half of the row: empty as [`read`] leaves it, filled by the
     /// view that joins.
-    pub(crate) task: Option<String>,
+    pub(crate) task: Option<Claimed>,
     /// The project this pane would take work from: its mandate if it has one,
     /// else wherever it is standing. Deliberately not the same question as
     /// which branch of the tree the row is drawn under — standing direction
@@ -116,6 +118,41 @@ pub(crate) struct AgentRef {
     /// post, and a `bool` sends every reader back to `governs` for an answer the
     /// join already had. See [`AgentRef::census_name`].
     pub(crate) seat: Option<String>,
+}
+
+/// A pane's claim, as a view knows one: which task, and how far along it is.
+///
+/// The status travels beside the id because a verb aimed at the pane cannot
+/// otherwise tell the two kinds of held work apart, and they want opposite
+/// answers. An agent in the middle of a task is one you leave alone; an agent
+/// that has put its task to `review` and is standing there is free — the work
+/// is a person's now, and `claim` leaves the last task where it is anyway. `f`
+/// refused on both for want of this one field, which meant refusing in the
+/// commonest situation there is and asking for a keystroke (`v`) that changes
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Claimed {
+    pub(crate) id: String,
+    /// `None` when the store has no such task any more: `wsp rm` deletes the
+    /// task and leaves the pane's binding naming it. Read as work still in
+    /// hand — `v` must still be able to hand a stale binding back, and a verb
+    /// that refuses on live work should refuse on the one case it cannot see
+    /// into.
+    pub(crate) status: Option<Status>,
+}
+
+impl Claimed {
+    /// Whether the work is still the agent's to do, as against put down.
+    ///
+    /// `done` and `parked` are free for the reason [`crate::panel::agent_state`]
+    /// already gives — a claim left on finished work is not work, and neither
+    /// is one on work somebody has decided not to do yet — and `review` joins
+    /// them, which is the whole of what this type is for. Everything else is a
+    /// task in its hands, `blocked` included: the answer to that question comes
+    /// back to this agent, and it is holding the context the answer is about.
+    pub(crate) fn in_hand(&self) -> bool {
+        !matches!(self.status, Some(Status::Review | Status::Done | Status::Parked))
+    }
 }
 
 impl AgentRef {
