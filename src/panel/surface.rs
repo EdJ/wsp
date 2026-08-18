@@ -82,6 +82,7 @@
 //!   `wsp_sidebar.rs`, where the wait before the restart is decided.
 
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -178,6 +179,9 @@ struct Wire {
     /// a surface that resent its whole frame five times a second would put the
     /// cost the tty screen avoids onto a pipe instead.
     last: String,
+    /// And where a copy of it is left for a reader that has no pipe to us. See
+    /// [`remember`].
+    frame_file: PathBuf,
 }
 
 impl Screen for Wire {
@@ -186,11 +190,16 @@ impl Screen for Wire {
     }
 
     fn paint(&mut self, lines: &[Line], w: usize, h: usize) -> (usize, usize) {
-        let painted = frame_json(lines, w, h);
+        let rows = frame_rows(lines, w, h);
+        let painted = frame_json(&rows);
         if painted != self.last {
             println!("{painted}");
             let _ = std::io::stdout().flush();
             self.last = painted;
+            // Inside the same guard as the print, and after it: the host is
+            // what is waiting for this frame, and the copy on disk is for
+            // whoever asks later.
+            remember(&self.frame_file, &rows, w, h);
         }
         (w, h)
     }
@@ -234,7 +243,17 @@ impl Screen for Wire {
 /// Separate from [`Wire::paint`], which prints it, because this is the part
 /// the two binaries have to agree on and printing is not something a test can
 /// look at.
-fn frame_json(lines: &[Line], w: usize, h: usize) -> String {
+fn frame_json(rows: &[Value]) -> String {
+    json!({ "t": "frame", "lines": rows }).to_string()
+}
+
+/// The rows of a frame, before either of the two things done with one.
+///
+/// Split out from [`frame_json`] because the frame goes two places now — down
+/// the pipe, and into the file [`remember`] writes — and building it twice or
+/// parsing it back would be two ways for the picture on disk to stop being the
+/// picture the host was given.
+fn frame_rows(lines: &[Line], w: usize, h: usize) -> Vec<Value> {
     let mut rows = Vec::with_capacity(lines.len().min(h));
     for line in lines.iter().take(h) {
         let mut line = line.clone();
@@ -245,7 +264,7 @@ fn frame_json(lines: &[Line], w: usize, h: usize) -> String {
         let spans = line.spans.iter().map(|s| span(s.style, &s.text, line.selected)).collect();
         rows.push(Value::Array(spans));
     }
-    json!({ "t": "frame", "lines": rows }).to_string()
+    rows
 }
 
 /// One span, as attributes.
@@ -269,6 +288,105 @@ fn span(style: Style, text: &str, selected: bool) -> Value {
         out.insert("inv".into(), json!(true));
     }
     Value::Object(out)
+}
+
+/// Leave the frame the host was just given where something that is not the
+/// host can read it.
+///
+/// `wsp peek panel` is how a governor sees what a person is actually looking
+/// at, and on 2026-08-18 it found two real rendering bugs by reading a frame
+/// rather than the code that built it. It worked by asking herdr to read a
+/// *pane*. A surface is not a pane — that is the property the fork exists to
+/// get — so there is nothing to ask, and the frame existed only on a pipe
+/// between two processes, neither of them `peek`.
+///
+/// The alternative was for `peek` to draw a fresh frame out of the same store.
+/// That is simpler, and it answers a different question: what the sidebar
+/// *would* show, at a size and a cursor position `peek` would have to invent.
+/// A picture that has stopped moving is a whole class of bug for something
+/// that draws from pushed events rather than polling, and the only thing that
+/// can show one is the frame the host was actually handed.
+///
+/// Cost is the frames that change and no others: this sits inside the same
+/// guard as the print, so a surface showing a still picture writes nothing.
+/// [`crate::store::write_atomic_unsynced`] rather than the durable write
+/// beside it — a reader must never see half a frame, which the rename gives,
+/// but a frame is worth nothing after a crash, and an fsync per keystroke
+/// would put back a share of the cost `fork-001` measured out of this loop.
+fn remember(path: &Path, rows: &[Value], w: usize, h: usize) {
+    let record = json!({
+        // Not read by anything yet. Written because the one question this file
+        // cannot otherwise answer is *whose* picture it is, and a peek that
+        // starts doubting the frame will want it.
+        "pid": std::process::id(),
+        "at": crate::util::now_iso(),
+        "cols": w,
+        "rows": h,
+        "lines": rows,
+    });
+    let _ = crate::store::write_atomic_unsynced(path, &record.to_string());
+}
+
+/// Where that file sits: beside the bindings and the daemon marker, because it
+/// is machine state of exactly their kind — true only while a process is up,
+/// and keyed on the state directory, so a sandbox's surface and the live one
+/// do not paint over each other's picture.
+///
+/// Nothing tidies it away when a surface exits. A frame from a surface that
+/// has gone is not misleading on its own; what would be is reading one as
+/// live, and that is [`crate::daemon::surface_drawing`]'s question rather than
+/// this file's.
+pub(crate) fn frame_path(state: &Path) -> PathBuf {
+    state.join("surface-frame.json")
+}
+
+/// The last frame a surface drew, as something to print.
+pub(crate) struct Frame {
+    /// The cells it was built for — the sidebar's rect, as the host reported
+    /// it. Worth printing beside the frame: half of what this is used to find
+    /// is a row costing more of them than it should.
+    pub cols: usize,
+    pub rows: usize,
+    /// When it was drawn, ISO. The one field that says whether the picture is
+    /// live: a surface writes only a frame that *changed*, so an old stamp
+    /// means the sidebar has not moved — which is either nothing happening or
+    /// the bug being looked for.
+    pub at: String,
+    /// One string per row, right-trimmed. The spans on disk carry colour, bold
+    /// and the selection bar; nothing reads them yet, and a reader that wants
+    /// to paint them has them without a surface change.
+    pub lines: Vec<String>,
+}
+
+/// Read it back. `None` for a state directory no surface has ever drawn in, and
+/// for a record this build cannot parse — a frame that cannot be read is not a
+/// frame, and the caller has something to say either way.
+pub(crate) fn last_frame(state: &Path) -> Option<Frame> {
+    let raw = std::fs::read_to_string(frame_path(state)).ok()?;
+    let record: Value = serde_json::from_str(&raw).ok()?;
+    let lines = record
+        .get("lines")?
+        .as_array()?
+        .iter()
+        .map(|row| {
+            let text: String = row
+                .as_array()
+                .map(|spans| {
+                    spans.iter().filter_map(|s| s.get("s").and_then(Value::as_str)).collect()
+                })
+                .unwrap_or_default();
+            // The padding is the wire's, so a selection bar reaches the edge of
+            // a host's cells. On a page it is trailing whitespace.
+            text.trim_end().to_string()
+        })
+        .collect();
+    let cells = |name: &str| record.get(name).and_then(Value::as_u64).unwrap_or(0) as usize;
+    Some(Frame {
+        cols: cells("cols"),
+        rows: cells("rows"),
+        at: record.get("at").and_then(Value::as_str).unwrap_or_default().to_string(),
+        lines,
+    })
 }
 
 /// Read the host until it stops talking.
@@ -553,7 +671,8 @@ pub fn run(store: &Store) -> i32 {
     // to whatever pane herdr itself was started from. What a key acts *on* is
     // resolved from the workspace on screen at the moment it is pressed — see
     // `stage` in [`super::verbs`].
-    let mut screen = Wire { host, running, last: String::new() };
+    let mut screen =
+        Wire { host, running, last: String::new(), frame_file: frame_path(&store.state) };
     match event_loop(store, &tx, &rx, &Where::nowhere(), false, &mut screen) {
         // Exit, where a panel re-execs. The host is already watching for a
         // surface that ended and already starts another; re-execing here would
@@ -651,6 +770,7 @@ mod tests {
             host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
             running: nothing_told(),
             last: String::new(),
+            frame_file: PathBuf::new(),
         };
 
         let (keyboard, on_screen) = wire.focus(&Live::default(), None, None);
@@ -724,6 +844,7 @@ mod tests {
             host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
             running,
             last: String::new(),
+            frame_file: PathBuf::new(),
         };
 
         let live = wire.live();
@@ -828,6 +949,7 @@ mod tests {
             host: Arc::clone(&host),
             running: nothing_told(),
             last: String::new(),
+            frame_file: PathBuf::new(),
         };
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
 
@@ -912,7 +1034,7 @@ mod tests {
         let mut line = super::super::render::line(Style::Accent, "wsp");
         line.selected = true;
 
-        let frame: Value = serde_json::from_str(&frame_json(&[line], 10, 4)).unwrap();
+        let frame: Value = serde_json::from_str(&frame_json(&frame_rows(&[line], 10, 4))).unwrap();
         let spans = frame["lines"][0].as_array().unwrap();
 
         assert_eq!(spans[0]["s"], json!("wsp"));
@@ -929,13 +1051,41 @@ mod tests {
         );
     }
 
+    /// The frame on the pipe and the frame on disk are the same frame, and what
+    /// comes back off disk is rows a person can read off a page — which is the
+    /// whole of what `wsp peek panel` is for: seeing what somebody is looking
+    /// at without asking them.
+    #[test]
+    fn the_frame_the_host_was_given_is_left_where_a_reader_with_no_pipe_can_read_it() {
+        let dir = std::env::temp_dir().join(format!("wsp-surface-frame-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(last_frame(&dir).is_none(), "nothing has drawn here yet");
+
+        let lines = vec![
+            super::super::render::line(Style::Plain, "wsp"),
+            super::super::render::line(Style::Dim, "fork-009"),
+        ];
+        remember(&frame_path(&dir), &frame_rows(&lines, 12, 4), 12, 4);
+
+        let frame = last_frame(&dir).expect("a frame was just written");
+        assert_eq!((frame.cols, frame.rows), (12, 4));
+        assert_eq!(
+            frame.lines,
+            vec!["wsp".to_string(), "fork-009".to_string()],
+            "the padding is the wire's, so the bar reaches a host's edge; on a page it is trailing space"
+        );
+        assert!(!frame.at.is_empty(), "an undated frame cannot be told from a stale one");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_frame_is_clipped_to_the_rows_the_host_has() {
         let lines: Vec<Line> = (0..9)
             .map(|i| super::super::render::line(Style::Plain, format!("row {i}")))
             .collect();
 
-        let frame: Value = serde_json::from_str(&frame_json(&lines, 10, 4)).unwrap();
+        let frame: Value = serde_json::from_str(&frame_json(&frame_rows(&lines, 10, 4))).unwrap();
 
         assert_eq!(frame["lines"].as_array().unwrap().len(), 4);
     }

@@ -1768,6 +1768,26 @@ pub fn substitute_tokens(text: &str, map: &BTreeMap<String, String>) -> (String,
 
 /// Write via temp file + rename so a reader never sees a half-written task.
 pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    replace(path, contents, true)
+}
+
+/// The same, without waiting for the disk.
+///
+/// The rename is what a *reader* depends on, and it is here either way: nobody
+/// ever sees half a file. The `fsync` is about the machine losing power between
+/// the write and the read, and it is the expensive half — on APFS it is
+/// milliseconds, which is nothing once a day and a great deal several times a
+/// second.
+///
+/// So: durable for anything a person would have to type again, and this for
+/// state that is only true while a process is up and is rewritten by that
+/// process within a tick. The surface's last frame is the case it was added
+/// for — see `panel::surface_frame`.
+pub fn write_atomic_unsynced(path: &Path, contents: &str) -> std::io::Result<()> {
+    replace(path, contents, false)
+}
+
+fn replace(path: &Path, contents: &str, durable: bool) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
@@ -1778,7 +1798,9 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
+        if durable {
+            f.sync_all()?;
+        }
     }
     fs::rename(&tmp, path)?;
     Ok(())

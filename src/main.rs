@@ -654,7 +654,8 @@ fn help() {
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back
-  wsp peek [panel|view|board|<task>]  what is actually on that pane
+  wsp peek [panel|view|board|<task>]  what is on that pane, or the frame the
+                                    sidebar surface last drew
 
 {machines}
   wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is

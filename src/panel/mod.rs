@@ -162,3 +162,8 @@ pub use run::run;
 // The same panel, drawn by a host that owns the cells — herdr's forked sidebar
 // today. See `surface.rs` for why the frame is built here and not there.
 pub use surface::run as surface;
+// And the frame it last drew, left on disk for a reader with no pipe to it —
+// `wsp peek panel`, which under the fork has no pane to ask herdr about. Named
+// for the surface out here, where `frame` already means the panel's own
+// renderer and would not say whose.
+pub(crate) use surface::last_frame as surface_frame;

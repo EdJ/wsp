@@ -1585,6 +1585,17 @@ and picking through the JSON, so the target resolves the way everything else in
 wsp resolves: by what you call the thing. No argument is the panel, because that
 is the question nine times in ten.
 
+Under the fork the panel is not a pane. `wsp surface` is a child of herdr drawn
+into the sidebar rect, belonging to no workspace, with nothing for `pane.read`
+to read — so it leaves each frame it draws beside the bindings, and `wsp peek
+panel` prints that. Deliberately the frame the host was *handed*, rather than a
+fresh one drawn on demand from the same store: a fresh one answers what the
+sidebar would show, at a size and a cursor position peek would have to invent,
+and a picture that has stopped moving is a whole class of bug for something that
+draws from pushed events. The header carries the cells it was built for and how
+old it is, which are the two facts that say whether to trust it. With no surface
+running the panel is a pane again and nothing changes.
+
 Two things it does not do. It shows what is on the pane *now*, not what happened
 when a key was pressed — `herdr pane wait-output` is the tool for that, and it
 is a different one. And it cannot press the key: a person still makes the
@@ -3120,6 +3131,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/panel/verbs.rs` | what the letters do |
 | `src/panel/run.rs` | the terminal, the event loop, the effects |
 | `src/panel/install.rs` | splitting the panel into a workspace, and back out |
+| `src/panel/surface.rs` | the same panel drawn by a host that owns the cells, and the frame it leaves for `peek` |
 | `src/detail/render.rs` | a task or a project, in full, and the column menu |
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
