@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::herdr;
 use crate::input::Key;
+use crate::kanban::Scope;
 use crate::live::AgentRef;
 use crate::model::Priority;
 use crate::store::Store;
@@ -832,13 +833,39 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 /// is [`open_full`], and the asking is what makes the tab a fallback rather
 /// than the design.
 ///
-/// **This is the seam every later expansion goes through.** A task written up
-/// and a board are the same request with a different number and a different
-/// thing drawn in the room; neither is a new message, a new host, or a herdr
-/// release. If a second function ever appears beside this one, the wire has
-/// grown a verb and the argument above has been lost.
+/// **This is the seam every later expansion goes through.** A board is the same
+/// request with a different number and a different thing drawn in the room;
+/// neither is a new message, a new host, or a herdr release. If a second
+/// function ever appears beside this one, the wire has grown a verb and the
+/// argument above has been lost.
+///
+/// # What this is called, and what it is not
+///
+/// It is a **page**: the panel given a wider rect, drawing something written to
+/// be read rather than glanced at. The word is not new here — [`is_page`] has
+/// decided what a row shows since long before the host could be asked for
+/// anything, and [`PAGE_MIN`] is where the tree stops abbreviating. What is new
+/// is that the panel can now ask to be one.
+///
+/// It was very nearly called an *overlay*, and that would have been wrong in a
+/// way worth writing down, because `Z`, `K` and everything after are named by
+/// whatever this is called. An overlay floats above something that is still
+/// there behind it, and is therefore something to dismiss to get back to what
+/// you were doing. None of that happens. There is one surface and it is the
+/// same surface: it is handed more columns and draws a different thing in them,
+/// nothing is drawn underneath it, nothing is occluded, and there is nothing
+/// behind to come back to — giving the room back is the panel becoming a
+/// sidebar again, not a lid closing.
+///
+/// The difference is not cosmetic. An overlay implies the host is composing two
+/// things and needs to know which is on top; a page is the host handing over
+/// columns and not knowing what goes in them, which is exactly why this cost no
+/// herdr release. The wire carries a number and never a reason, and "page" is
+/// the word on this side for what the number is *for*.
 ///
 /// [`View::wide`]: super::keys::View::wide
+/// [`is_page`]: super::render::is_page
+/// [`PAGE_MIN`]: super::render::PAGE_MIN
 pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usize>) -> bool {
     // Zero is how the wire spells giving it back; see herdr's `wsp_sidebar`.
     if !screen.ask_width(cols.unwrap_or(0)) {
@@ -910,15 +937,33 @@ pub(super) fn open_full(self_ws: Option<&str>) -> String {
     "the whole tree · q closes it".into()
 }
 
+/// The `wsp kanban` a board's tab runs, as argv.
+///
+/// One line, and it is here rather than inline so a test can hold it: the page
+/// and the tab that stands in for it have to be a board of the same thing, and
+/// what makes that true is [`Scope::label`] being the word the command line
+/// reads back — see [`Scope::named`].
+pub(super) fn board_argv(scope: &Scope) -> Vec<String> {
+    vec!["kanban".into(), scope.label()]
+}
+
 /// Open a board full-size in a tab of its own.
 ///
 /// The plain half of [`pop_out`]: a tab, its root pane, and the command in it.
 /// No splits, no editors, no marker files — a board wants the whole width and
 /// draws its own screen.
 ///
-/// A tab from a surface too, and deliberately: a board is columns of cards
-/// across a workspace, and a sidebar is one column of anything. This is the
-/// same asymmetry [`pop_out`] argues, for the same reason.
+/// **From a surface this is the fallback, exactly as it is for `Z`.** A board
+/// is columns of cards across a workspace and a sidebar is one column of
+/// anything — but the sidebar can now ask to stop being one, so `K` draws the
+/// board in place and this is what happens when there is nobody to ask: a tty
+/// panel, which is its pane's size, and a herdr too old to have said it takes
+/// widths. See [`expand`], and [`super::run::Screen::ask_width`].
+///
+/// The `wsp kanban` it runs is built from the same [`Scope`] the page would
+/// have drawn, rather than from a second argument alongside it. A fallback
+/// that could show a different project from the thing it stands in for is a
+/// bug that would only appear on the machines nobody is testing on.
 ///
 /// `exec`, so the command *is* the pane: when it quits the pane goes, and the
 /// tab with it. A shell left behind would be a tab you have to close twice.
@@ -929,12 +974,13 @@ pub(super) fn open_full(self_ws: Option<&str>) -> String {
 /// a stack of them. The label is what makes "the one already open" findable,
 /// and what stops the panel drawing a board as a shell standing in the very
 /// project it is a board of.
-pub(super) fn open_board(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
+pub(super) fn open_board(scope: &Scope, label: &str, self_ws: Option<&str>) -> String {
     let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
     let ws = ws.as_str();
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "wsp".into());
+    let argv = board_argv(scope);
 
     // Whatever board is open goes first. Closing its pane takes the tab with
     // it, exactly as quitting one does.
@@ -1761,19 +1807,20 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // what you want to see is the pile it came out of. The inbox is a scope
         // like any other and gets one too.
         Key::Char('K') => {
-            let (arg, label) = match &target {
-                Target::Project(p) => (p.clone(), p.clone()),
+            let scope = match &target {
+                Target::Project(p) => Scope::Project(p.clone()),
                 Target::Task(id) => match ui.project_of_task(id) {
-                    Some(p) => (p.clone(), p),
-                    None => ("inbox".to_string(), "inbox".to_string()),
+                    Some(p) => Scope::Project(p),
+                    None => Scope::Inbox,
                 },
-                Target::Inbox => ("inbox".to_string(), "inbox".to_string()),
+                Target::Inbox => Scope::Inbox,
                 _ => {
                     say(ui, "a board is a project's — aim at one, or at a task in it");
                     return Effect::None;
                 }
             };
-            Effect::Board { argv: vec!["kanban".into(), arg], label: format!("board {label}") }
+            let label = format!("board {}", scope.label());
+            Effect::Board { scope, label }
         }
 
         // ---- open a workspace for this row, with or without somebody in it ----
@@ -1931,6 +1978,97 @@ mod tests {
             view.asked_width, None,
             "nothing was asked of anybody, so there is nothing to give back"
         );
+    }
+
+    /// A host that hears everything, so what this side *says* can be read back.
+    /// The answer never arrives here — the host replies by resizing us — so
+    /// half of the mechanism is exactly this: the number, and nothing else.
+    #[derive(Default)]
+    struct Heard(Vec<usize>);
+
+    impl Screen for Heard {
+        fn size(&self) -> (usize, usize) {
+            (26, 40)
+        }
+
+        fn paint(&mut self, _lines: &[super::super::render::Line], w: usize, h: usize) -> (usize, usize) {
+            (w, h)
+        }
+
+        fn ask_width(&mut self, cols: usize) -> bool {
+            self.0.push(cols);
+            true
+        }
+    }
+
+    /// The pass condition of the whole seam, written as one sentence: three
+    /// pages, one function, and the only thing that differs is a number.
+    ///
+    /// The two numbers are different because the reasons are. A tree stops
+    /// abbreviating at [`PAGE_MIN`] and columns past that go into whitespace; a
+    /// board is four titles side by side and has no width that is enough, so it
+    /// asks past the end and takes what the host has. Neither reason is on the
+    /// wire, which is why the second one cost no herdr release.
+    #[test]
+    fn a_board_asks_for_every_column_there_is_and_the_tree_for_a_page() {
+        use super::super::render::{PAGE_MIN, WHOLE_SCREEN};
+        let mut heard = Heard::default();
+        let mut view = View::default();
+
+        assert!(expand(&mut heard, &mut view, Some(PAGE_MIN)));
+        assert_eq!(view.asked_width, Some(PAGE_MIN));
+        assert!(expand(&mut heard, &mut view, Some(WHOLE_SCREEN)));
+        assert_eq!(view.asked_width, Some(WHOLE_SCREEN));
+        assert!(expand(&mut heard, &mut view, None));
+
+        assert_eq!(
+            heard.0,
+            vec![PAGE_MIN, WHOLE_SCREEN, 0],
+            "one seam, three asks, and zero is the room going back",
+        );
+        assert_eq!(
+            view.asked_width, None,
+            "a page that has closed is not still asking for the room it had",
+        );
+    }
+
+    /// The board's number has to survive the crossing. `cols` is a `u16` on the
+    /// wire — see herdr's `wsp_sidebar` — and a request that does not fit is not
+    /// a request that gets clamped, it is a message the host cannot parse at
+    /// all: `K` would go quiet, on the hosts that support it, and only there.
+    #[test]
+    fn asking_past_the_end_is_still_a_number_the_wire_can_carry() {
+        use super::super::render::{PAGE_MIN, WHOLE_SCREEN};
+        assert!(
+            u16::try_from(WHOLE_SCREEN).is_ok(),
+            "the host reads cols as a u16 and would drop this on the floor",
+        );
+        assert!(
+            WHOLE_SCREEN > PAGE_MIN * 10,
+            "asking past the end only works while it is past every end there is",
+        );
+    }
+
+    /// The page and the tab it falls back to have to be a board of the same
+    /// thing, and what holds that together is one value used twice: the scope
+    /// names itself the way the command line reads it back.
+    ///
+    /// Broken by renaming a scope's label for the look of it, which is exactly
+    /// the change nobody would think to test by hand — the tab is the path that
+    /// only runs on an older herdr.
+    #[test]
+    fn the_tab_a_board_falls_back_to_is_a_board_of_the_same_thing() {
+        let index = crate::resolve::Index::new(vec![crate::model::Project::new("wsp")]);
+        for scope in [Scope::Project("wsp".into()), Scope::Inbox, Scope::Everything] {
+            let argv = board_argv(&scope);
+            assert_eq!(argv[0], "kanban");
+            assert_eq!(
+                crate::kanban::Scope::named(&argv[1], &index),
+                Some(scope.clone()),
+                "`wsp {}` is not a board of {scope:?}",
+                argv.join(" "),
+            );
+        }
     }
 
     /// The panel's own column, which is what makes `↵` cheap: the detail

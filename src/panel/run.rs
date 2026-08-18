@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use crate::herdr;
 use crate::input::Key;
+use crate::kanban;
 use crate::live::{self, AgentRef};
 use crate::store::Store;
 use crate::util::exe_stamp;
@@ -646,6 +647,140 @@ fn point_at(ui: &mut Ui, want: &Cursor) -> bool {
     }
 }
 
+/// The board, drawn in the room the host gave, in place of the tree.
+///
+/// The third caller of [`expand`] and the one that shows what the seam is for.
+/// `Z` asks for [`super::render::PAGE_MIN`] and the *same* rows get more room;
+/// this asks for [`super::render::WHOLE_SCREEN`] and draws something else
+/// entirely — and the difference between those two costs herdr nothing at all,
+/// because the wire carries a number of columns and never a reason for wanting
+/// them.
+///
+/// It sits here, in the loop, rather than in [`View`]. A [`kanban::Board`] is
+/// the store joined with the census — the same thing [`Ui`] is, and it is
+/// rebuilt on the same refetch — where `View` is the small durable half a
+/// second panel adopts. Two panels are looking at the same folds; they are not
+/// looking at the same board, any more than they share a cursor.
+///
+/// Everything on it is either the store's or this pane's, so there is nothing
+/// to lose when it closes and nothing to come back to when it opens. That is
+/// the same argument [`kanban`] makes for its own pane, and it is why `q` here
+/// gives the room back rather than putting a lid on something.
+struct BoardPage {
+    /// What the board is a board of, kept because a rebuild has to ask the
+    /// same question the first build asked.
+    scope: kanban::Scope,
+    /// Its own copy, opened from [`View::show_done`] and free to differ after
+    /// that. Inherited because arriving at a board with a `done` column the
+    /// tree was hiding — or without one it was showing — reads as the key
+    /// having changed a setting; kept separate because after that they are two
+    /// questions, and `A` on the board is a column appearing rather than rows.
+    show_done: bool,
+    cur: kanban::Cursor,
+    board: kanban::Board,
+}
+
+impl BoardPage {
+    fn open(store: &Store, scope: kanban::Scope, show_done: bool) -> BoardPage {
+        let board = kanban::collect(&kanban::Ctx::live(store), &scope, show_done);
+        BoardPage { scope, show_done, cur: kanban::Cursor::default(), board }
+    }
+
+    /// Rebuild from the store, and put the cursor back on the card it was on.
+    ///
+    /// `follow` is where a command has just moved a card to, named while the id
+    /// was still in hand: after the rebuild the slot it sat in belongs to
+    /// whatever moved up into it, so the cursor would otherwise be left
+    /// pointing at a neighbour.
+    fn rebuild(&mut self, store: &Store, follow: Option<String>) {
+        let keep = follow.or_else(|| self.board.card_at(&self.cur).map(|c| c.id.clone()));
+        self.board = kanban::collect(&kanban::Ctx::live(store), &self.scope, self.show_done);
+        self.cur =
+            keep.and_then(|id| self.board.find(&id)).unwrap_or_else(|| self.cur.clamped(&self.board));
+    }
+}
+
+/// What a key pressed on the board leaves for the loop to do.
+///
+/// The board's own [`kanban::Action`] speaks of cards and columns; this speaks
+/// of the pane. Two enums rather than one because the board is drawn in two
+/// places now — its own tab and this page — and only one of them has a room to
+/// give back.
+enum FromBoard {
+    /// Nothing the loop has to do; the cursor moved, or the footer was written.
+    Nothing,
+    /// Rebuild from the store, putting the cursor on this card if it is named.
+    Refetch(Option<String>),
+    /// The page is finished with. Give the room back and draw the tree.
+    Close,
+}
+
+/// A key, while the board has the pane.
+///
+/// Every verb here is one the tree's own keys already reach, through the same
+/// functions: the CLI does the work, the detail pane is the panel's, and an
+/// editor is a tab. What the board changes is which card they are aimed at, and
+/// that is the whole of it — see [`kanban::apply_key`], which decides that part
+/// and is shared with `wsp kanban`.
+fn board_key(
+    k: Key,
+    p: &mut BoardPage,
+    ui: &mut Ui,
+    view: &mut View,
+    store: &Store,
+    self_ws: Option<&str>,
+    me: Option<&str>,
+) -> FromBoard {
+    match kanban::apply_key(k, &p.board, &mut p.cur) {
+        kanban::Action::None => FromBoard::Nothing,
+        kanban::Action::Say(m) => {
+            say(ui, m);
+            FromBoard::Nothing
+        }
+        kanban::Action::Refetch => FromBoard::Refetch(None),
+        kanban::Action::ShowDone => {
+            p.show_done = !p.show_done;
+            say(ui, if p.show_done { "showing done" } else { "hiding done" });
+            FromBoard::Refetch(None)
+        }
+        // The CLI, exactly as the tree's keys run it: the event log, the hooks
+        // and the commit all happen because it is the same path a person at a
+        // shell would take. The card is about to be in another column and the
+        // cursor goes with it, so its id is named while it is still in hand.
+        kanban::Action::Run { argv, task } => {
+            match run_wsp(&argv) {
+                Ok(m) => say(ui, m.label),
+                Err(e) => say(ui, e),
+            }
+            FromBoard::Refetch(Some(task))
+        }
+        // An editor is a tab here too, and for the reason it is one everywhere
+        // else: `wsp edit` runs `$EDITOR`, which is a process in a pty, and the
+        // room this page is drawn in is cells this panel paints. See
+        // [`pop_out`].
+        kanban::Action::Edit { id } => {
+            say(ui, pop_out(&["edit".to_string(), id.clone()], &id, self_ws));
+            FromBoard::Nothing
+        }
+        // `↵` opens the task where the panel already shows things, and the
+        // board stands down on the way out — so you come back to the tree with
+        // it open rather than to a board you now have to leave. Only if it
+        // landed: with nowhere to put the detail, closing would take the task
+        // off the screen instead of putting it on one.
+        kanban::Action::Open { id } => {
+            let focus = crate::detail::Focus::Task(id);
+            let m = inspect(store, self_ws, &focus, me);
+            if !m.is_empty() {
+                say(ui, m);
+                return FromBoard::Nothing;
+            }
+            view.showing = Some(focus);
+            FromBoard::Close
+        }
+        kanban::Action::Quit => FromBoard::Close,
+    }
+}
+
 pub(super) fn event_loop(
     store: &Store,
     tx: &Sender<Msg>,
@@ -727,14 +862,44 @@ pub(super) fn event_loop(
     // to be handled in the order they arrived rather than thrown away.
     let mut carry: std::collections::VecDeque<Msg> = Default::default();
 
+    // The board, when one is up, and `None` for the tree. The whole of "what is
+    // drawn in the room" — see [`BoardPage`] — and it is one variable because
+    // there is one pane: a page replaces the tree rather than sitting over it.
+    let mut page: Option<BoardPage> = None;
+
     // `&mut` on the view because the frame is where the tree's scroll offset
     // is decided, and the view keeps it: the click handler two branches below
     // has to read the offset the pane in front of the reader is drawn with.
-    fn draw(screen: &mut dyn Screen, ui: &Ui, view: &mut View) -> (usize, usize) {
+    //
+    // The board is drawn from the same size and painted through the same
+    // backend, so nothing below this line knows which of the two it is looking
+    // at. That is what makes the page cheap: the host was told a number of
+    // columns and the choice of what goes in them never left this process.
+    fn draw(
+        screen: &mut dyn Screen,
+        ui: &Ui,
+        view: &mut View,
+        page: Option<&BoardPage>,
+    ) -> (usize, usize) {
         let (w, h) = screen.size();
-        screen.paint(&frame(ui, view, w, h), w, h)
+        match page {
+            Some(p) => {
+                // The footer the panel would have drawn, on the board's own
+                // footer line. One message and one clock across both, so a
+                // sentence written by a key on the tree does not vanish the
+                // moment the board takes the pane. See [`super::render::NOTE`].
+                let note = ui
+                    .message
+                    .as_ref()
+                    .filter(|(_, at)| at.elapsed() < super::render::NOTE)
+                    .map(|(m, _)| m.as_str())
+                    .unwrap_or_default();
+                screen.paint(&kanban::frame(&p.board, &p.cur, w, h, note), w, h)
+            }
+            None => screen.paint(&frame(ui, view, w, h), w, h),
+        }
     }
-    drawn_size = draw(screen, &ui, &mut view);
+    drawn_size = draw(screen, &ui, &mut view, page.as_ref());
 
     loop {
         let msg = match carry.pop_front() {
@@ -774,7 +939,40 @@ pub(super) fn event_loop(
         // arithmetic that drew the frame — so the row a click lands on is the
         // row that acts.
         let (w, h) = screen.size();
+        // Where a command has just moved a card to, for the board's rebuild.
+        // Named while the id is still in hand, because after the rebuild the
+        // slot it sat in belongs to whatever moved up into it.
+        let mut follow: Option<String> = None;
         match msg {
+            // A page has the pane and the keyboard with it. The tree's reducer
+            // is not consulted at all — not to fall through to and not to
+            // suppress: what is in front of the reader is a board, and a key
+            // that quietly moved a cursor they cannot see would be the seam
+            // showing. `q`, `esc` and `K` give the room back; see [`board_key`].
+            Msg::Key(k) if page.is_some() => {
+                let acted = page
+                    .as_mut()
+                    .map(|p| board_key(k, p, &mut ui, &mut view, store, self_ws, me));
+                match acted {
+                    None | Some(FromBoard::Nothing) => {}
+                    Some(FromBoard::Refetch(card)) => {
+                        follow = card;
+                        refetch = true;
+                    }
+                    Some(FromBoard::Close) => {
+                        // The room goes back through the same seam it was asked
+                        // for. The page is dropped whatever the host says: a
+                        // host that has stopped answering must not be able to
+                        // leave a board nobody can close.
+                        expand(screen, &mut view, None);
+                        page = None;
+                        // The tree behind has not been rebuilt while the board
+                        // was up unless something asked it to, and a command
+                        // run on the board is exactly that kind of something.
+                        refetch = true;
+                    }
+                }
+            }
             Msg::Key(k) => match apply_input(Input::Key(k), &mut ui, &mut view, w, h, &mut keyboard)
             {
                 Effect::Quit => return Outcome::Quit,
@@ -812,8 +1010,27 @@ pub(super) fn event_loop(
                 Effect::PopOut { argv, label } => {
                     say(&mut ui, pop_out(&argv, &label, self_ws));
                 }
-                Effect::Board { argv, label } => {
-                    say(&mut ui, open_board(&argv, &label, self_ws));
+                // `K`, the third caller of the one seam, and a line of it is
+                // the ask. What is different is the number — a board has no
+                // width that is enough, so it takes what the host has; see
+                // [`super::render::WHOLE_SCREEN`] — and what is drawn in the
+                // room, which herdr is never told. A host that cannot be asked
+                // opens the tab it always opened.
+                Effect::Board { scope, label } => {
+                    if expand(screen, &mut view, Some(super::render::WHOLE_SCREEN)) {
+                        // Built now rather than on the next refetch: this is a
+                        // board of the store as it is, and the frame at the
+                        // foot of this loop has to have something to draw.
+                        page = Some(BoardPage::open(store, scope, view.show_done));
+                        // Nothing said, where `Z` says "the whole tree". A
+                        // widened tree still looks like the tree and is worth a
+                        // word; a board looks like nothing else on this pane.
+                        // And the footer it would be written on is the board's
+                        // key hint — four seconds of naming what is obviously
+                        // on screen, in place of the keys that work on it.
+                    } else {
+                        say(&mut ui, open_board(&scope, &label, self_ws));
+                    }
                 }
                 // `Z`, both ways. A host that owns the rect is asked for the
                 // room and asked to take it back again, which is one key and
@@ -1103,6 +1320,16 @@ pub(super) fn event_loop(
             if point_at(&mut ui, &want) {
                 want = Cursor::default();
             }
+            // The board is the same store read a different way, so it is
+            // rebuilt on exactly the news the tree is — including a card an
+            // agent moved while nobody here pressed anything. The tree above is
+            // rebuilt too, unseen, and that is worth its one pass over rows
+            // already fetched: it is what makes giving the room back land on
+            // the tree as it is now rather than as it was before the board
+            // started changing it.
+            if let Some(p) = page.as_mut() {
+                p.rebuild(store, follow.take());
+            }
         }
 
         // Only input can change the durable half, so only input is worth the
@@ -1112,7 +1339,7 @@ pub(super) fn event_loop(
         if is_key {
             shared::share(store, &view, ui.cursor(), &mut agreed);
         }
-        drawn_size = draw(screen, &ui, &mut view);
+        drawn_size = draw(screen, &ui, &mut view, page.as_ref());
     }
 }
 
@@ -1161,6 +1388,32 @@ mod tests {
             "the flag check sits behind the cadence gate — an unfocused panel \
              would take up to thirty seconds to raise a card, and as long again \
              to put away one somebody else has answered",
+        );
+    }
+
+    /// A page has the keyboard, and the thing that makes that true is where one
+    /// arm sits relative to another.
+    ///
+    /// Both arms match `Msg::Key`, and the board's is a *guarded* one — so it
+    /// only works above the tree's. Put it below and the guard never fires:
+    /// every key would go to the tree's reducer, moving a cursor nobody can
+    /// see, and `q` would quit the panel instead of giving the room back. That
+    /// is silent in a way nothing else here is — the board would keep drawing,
+    /// correctly, of a board that no longer answers its own keys.
+    ///
+    /// Read out of the source for the same reason the tick test above is: the
+    /// order of two match arms is not something the type checker has an opinion
+    /// about, and no fixture can drive this loop.
+    #[test]
+    fn a_page_takes_the_keys_before_the_tree_does() {
+        let page = SRC.find("Msg::Key(k) if page.is_some()").expect("the board's arm went");
+        let tree = SRC
+            .find("Msg::Key(k) => match apply_input")
+            .expect("the tree's arm moved");
+        assert!(
+            page < tree,
+            "the board's arm is below the tree's, so its guard never fires and \
+             every key on the board goes to the tree behind it",
         );
     }
 

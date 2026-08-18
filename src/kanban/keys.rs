@@ -19,6 +19,23 @@ pub(crate) struct Cursor {
     pub(crate) row: usize,
 }
 
+impl Cursor {
+    /// The nearest place the cursor can actually be, after the card it was on
+    /// has gone. A column that empties under the cursor is ordinary — it is
+    /// what finishing the last card in it looks like.
+    ///
+    /// Here rather than beside either loop because there are two of them now:
+    /// the board in its own pane and the board drawn in place of the tree. Two
+    /// copies would agree until one of them learned about a fifth column.
+    pub(crate) fn clamped(self, board: &Board) -> Cursor {
+        let col = self.col.min(board.columns.len().saturating_sub(1));
+        let row = self
+            .row
+            .min(board.columns.get(col).map(|c| c.cards.len()).unwrap_or(0).saturating_sub(1));
+        Cursor { col, row }
+    }
+}
+
 /// What a key asked for beyond moving the cursor.
 pub(crate) enum Action {
     None,
@@ -109,7 +126,11 @@ pub(crate) fn apply_key(k: Key, board: &Board, cur: &mut Cursor) -> Action {
     };
 
     match k {
-        Key::Char('q') | Key::Esc | Key::Interrupt => Action::Quit,
+        // `K` as well as `q`, for the reason `Z` closes the tree it opened: a
+        // page that opens with one key and closes with another is one you leave
+        // open. It reads the same in both places this board is drawn — the tab
+        // goes, or the sidebar takes its room back.
+        Key::Char('q') | Key::Char('K') | Key::Esc | Key::Interrupt => Action::Quit,
 
         Key::Down | Key::Char('j') => {
             go(board, cur, Key::Down);
@@ -246,6 +267,52 @@ mod tests {
             Action::Run { argv, .. } => panic!("expected a refusal, got: {argv:?}"),
             _ => panic!("expected a refusal"),
         }
+    }
+
+    /// One key for one idea, in both places the board is drawn. `Z` closes the
+    /// tree it opened; this closes the board it opened, whether that means a
+    /// tab going or a sidebar taking its room back — and a page that opens with
+    /// one key and closes with another is a page you leave open.
+    #[test]
+    fn the_key_that_opens_a_board_is_also_the_key_that_closes_it() {
+        let b = board(&[("t-01", "todo", "normal")], true);
+        for k in [Key::Char('K'), Key::Char('q'), Key::Esc] {
+            let mut cur = Cursor::default();
+            assert!(
+                matches!(apply_key(k, &b, &mut cur), Action::Quit),
+                "{k:?} should stand the board down",
+            );
+        }
+    }
+
+    /// A column that empties under the cursor is ordinary — it is what
+    /// finishing the last card in it looks like — and the cursor has to land
+    /// somewhere that exists afterwards.
+    ///
+    /// Shared by the board's own pane and the board drawn in place of the tree,
+    /// which is why it is a method rather than a copy beside each loop. A
+    /// cursor left past the end reads no card, and every verb on this page is
+    /// about the card under it: the board would go quiet rather than wrong.
+    #[test]
+    fn a_cursor_left_past_the_end_comes_back_to_a_card_that_is_there() {
+        let full = board(
+            &[("t-01", "todo", "normal"), ("t-02", "todo", "normal"), ("t-03", "doing", "normal")],
+            true,
+        );
+        let mut cur = Cursor::default();
+        apply_key(Key::Char('j'), &full, &mut cur);
+        assert_eq!(cur, Cursor { col: 0, row: 1 });
+
+        // The card it was on has been finished, and `todo` is one shorter.
+        let after = board(&[("t-01", "todo", "normal"), ("t-03", "doing", "normal")], true);
+        assert_eq!(cur.clamped(&after), Cursor { col: 0, row: 0 });
+
+        // And the column that goes when `done` is put away takes the cursor
+        // back with it rather than leaving it off the right-hand edge, where
+        // every key would be aimed at a column that is not drawn.
+        let narrow = board(&[("t-01", "todo", "normal")], false);
+        assert_eq!(narrow.columns.len(), 3);
+        assert_eq!(Cursor { col: 3, row: 0 }.clamped(&narrow), Cursor { col: 2, row: 0 });
     }
 
     /// Reading across a board is the gesture it exists for, and the columns are

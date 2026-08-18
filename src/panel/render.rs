@@ -13,6 +13,13 @@ use crate::util;
 use super::keys::{keymap, Mode, View};
 use super::rows::{hotkeys, render_row, Row, Ui};
 
+/// How long the footer keeps what it was told.
+///
+/// One number for the panel and for the board it draws in place, because they
+/// are the same footer on the same pane: a message that outlived the page it
+/// was written on, or died sooner there, would be the seam showing.
+pub(super) const NOTE: Duration = Duration::from_secs(4);
+
 pub(super) const ACCENT: &str = "\x1b[38;2;95;191;164m";
 
 pub(super) const WARN: &str = "\x1b[38;2;224;138;75m";
@@ -668,6 +675,25 @@ pub(super) fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
 /// got there; at or above it, it is being read rather than glanced at.
 pub(super) const PAGE_MIN: usize = 96;
 
+/// What a page asks for when there is no width that would be enough.
+///
+/// [`PAGE_MIN`] is a threshold — the tree stops abbreviating there, and more
+/// room after that only spends columns on whitespace. A board has no such
+/// number: it is four columns side by side, every one of them a title that was
+/// written to be read, and every column it is given goes straight into them.
+/// So it asks for more than a terminal has and lets the host decide.
+///
+/// **That is the mechanism working rather than being cheated.** The host owns
+/// the rect: it gives what it has less the column it keeps for itself, and
+/// reports what it gave as the size of the next frame — so a request past the
+/// end is answered with the end, and the board is built for the width that
+/// came back. Asking for a specific large number instead would be this side
+/// guessing at a screen it cannot see, and being wrong on every other one.
+///
+/// The value is the largest the wire can carry: `cols` crosses as a `u16`, and
+/// a number that would not fit is a request the host cannot read at all.
+pub(super) const WHOLE_SCREEN: usize = u16::MAX as usize;
+
 /// Is this pane a page rather than a sidebar?
 ///
 /// Asked of the width alone, and it decides one thing: whether a project shows
@@ -1235,7 +1261,7 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             l
         }
         Mode::Browse => match &ui.message {
-            Some((m, at)) if at.elapsed() < Duration::from_secs(4) => {
+            Some((m, at)) if at.elapsed() < NOTE => {
                 line(Style::Accent, util::truncate(m, w))
             }
             // With the map up, the hint is a fifth of what is already on

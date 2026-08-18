@@ -186,6 +186,8 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
+    /// What this board is called, and — not by accident — the word the command
+    /// line takes for it. See [`Scope::named`], which reads it back.
     pub(crate) fn label(&self) -> String {
         match self {
             Scope::Project(p) => p.clone(),
@@ -194,21 +196,33 @@ impl Scope {
         }
     }
 
+    /// A scope by name, as the command line spells it.
+    ///
+    /// Split out of [`Scope::of`] because the panel now goes the other way:
+    /// `K` resolves a scope from the row under the cursor and hands it to the
+    /// board *and* to the `wsp kanban` the tab fallback runs — see
+    /// `panel::verbs::open_board`. That only works while every scope's
+    /// [`Scope::label`] is a name this function reads back as the same scope,
+    /// which is a property with a test on it rather than a coincidence.
+    pub(crate) fn named(name: &str, index: &Index) -> Option<Scope> {
+        match name {
+            "inbox" | "none" => Some(Scope::Inbox),
+            "all" | "everything" => Some(Scope::Everything),
+            _ => index.find(name).map(|p| Scope::Project(p.id.clone())),
+        }
+    }
+
     /// Read a scope off the command line: a positional, then `-p`, then
     /// whatever the pane is standing in.
     pub(crate) fn of(store: &Store, args: &crate::Args, index: &Index) -> Result<Scope, i32> {
         let named = args.rest.first().cloned().or_else(|| args.get("project"));
         if let Some(name) = named {
-            return match name.as_str() {
-                "inbox" | "none" => Ok(Scope::Inbox),
-                "all" | "everything" => Ok(Scope::Everything),
-                _ => match index.find(&name) {
-                    Some(p) => Ok(Scope::Project(p.id.clone())),
-                    None => {
-                        eprintln!("wsp: no such project `{name}`");
-                        Err(1)
-                    }
-                },
+            return match Scope::named(&name, index) {
+                Some(s) => Ok(s),
+                None => {
+                    eprintln!("wsp: no such project `{name}`");
+                    Err(1)
+                }
             };
         }
         // Nothing named: the same chain every other command resolves against —

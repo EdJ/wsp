@@ -623,7 +623,7 @@ pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(
                 ("F", "the title in full, docked", Scope::Always),
                 ("Z", "the whole tree, and back", Scope::Always),
                 ("E", "edit in a tab", Scope::TaskOrProject),
-                ("K", "the board, in a tab", Scope::Board),
+                ("K", "the board, and back", Scope::Board),
                 ("A i r", "show done, ids, sync", Scope::Always),
                 ("R", "only what needs review", Scope::Always),
                 ("w", "the agents, not the work", Scope::Always),
@@ -686,11 +686,13 @@ pub(crate) enum Effect {
     CloseView,
     /// Open the row full-size in a tab of its own, to be written in.
     PopOut { argv: Vec<String>, label: String },
-    /// The board, in a tab of its own. Where [`Effect::PopOut`] builds the
-    /// editing layout — a context pane with editors beside it — this is one
-    /// pane taking the whole tab: four columns of readable title is ninety
-    /// columns, and this pane is thirty-four.
-    Board { argv: Vec<String>, label: String },
+    /// The board, in place of the tree, at whatever width the host will give.
+    ///
+    /// `scope` is what the board is a board of, and it is also the argument the
+    /// tab fallback runs `wsp kanban` with — see [`super::verbs::open_board`].
+    /// One value rather than two, because a page and the tab that stands in for
+    /// it showing different projects is a bug nobody would find twice.
+    Board { scope: crate::kanban::Scope, label: String },
     /// The whole tree, in a tab of its own — or the one already open, brought
     /// to the front.
     ///

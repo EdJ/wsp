@@ -14,7 +14,7 @@ use crate::panel::{self, to_ansi};
 use crate::resolve::Index;
 use crate::store::Store;
 
-use super::{apply_key, collect, frame, Action, Board, Ctx, Cursor, Scope};
+use super::{apply_key, collect, frame, Action, Ctx, Cursor, Scope};
 
 /// How long the footer keeps what it was told.
 const NOTE: Duration = Duration::from_secs(4);
@@ -190,16 +190,7 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
             let keep = follow.or_else(|| board.card_at(&cur).map(|c| c.id.clone()));
             board = collect(&Ctx::live(store), scope, show_done);
             fingerprint = store.fingerprint();
-            cur = keep.and_then(|id| board.find(&id)).unwrap_or_else(|| clamped(&board, cur));
+            cur = keep.and_then(|id| board.find(&id)).unwrap_or_else(|| cur.clamped(&board));
         }
     }
-}
-
-/// The nearest place the cursor can actually be, after the card it was on has
-/// gone. A column that empties under the cursor is ordinary — it is what
-/// finishing the last card in it looks like.
-fn clamped(board: &Board, cur: Cursor) -> Cursor {
-    let col = cur.col.min(board.columns.len().saturating_sub(1));
-    let row = cur.row.min(board.columns.get(col).map(|c| c.cards.len()).unwrap_or(0).saturating_sub(1));
-    Cursor { col, row }
 }
