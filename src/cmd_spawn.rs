@@ -721,6 +721,17 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             // is `cmd_agent`'s vocabulary and migrating it is its own task; the
             // string is the same string either way.
             let mut flags: Vec<(&str, &str)> = vec![("pane", seat.as_str())];
+            // The tier travels with the claim, because the claim is what
+            // writes the attempt down. `spawn` is the only caller that knows
+            // it — an agent claiming at its own shell has no flag to pass and
+            // leaves the clause off, which is the honest record of a claim
+            // made with nothing stated.
+            if let Some(m) = &model {
+                flags.push(("model", m));
+            }
+            if let Some(e) = &effort {
+                flags.push(("effort", e));
+            }
             if args.has("force") {
                 flags.push(("force", "true"));
             }
@@ -1464,6 +1475,9 @@ mod tests {
         fn tell(&self, _: &dyn Place, _: &Seat, _: &str) -> crate::place::Result<()> {
             panic!("readiness does not deliver work orders")
         }
+        fn ran(&self, _: &str, _: &str) -> Option<agent_commands::Ran> {
+            None
+        }
     }
 
     /// A grace of thirty polls and a deadline of two thousand, on a clock that
@@ -1679,6 +1693,9 @@ mod tests {
             None
         }
         fn running(&self, _: &agent_commands::Spawn) -> Option<bool> {
+            None
+        }
+        fn ran(&self, _: &str, _: &str) -> Option<agent_commands::Ran> {
             None
         }
     }

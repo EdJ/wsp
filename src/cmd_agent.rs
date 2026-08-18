@@ -1001,6 +1001,73 @@ pub fn worked_line(w: &serde_json::Value) -> String {
     parts.join(" · ")
 }
 
+/// The tier a claim was made at, as a clause on the line that records the
+/// claim — and nothing at all when none was stated.
+///
+/// **A clause and not a line of its own**, which is the whole reason it is
+/// shaped like this. `wsp brief` hands an arriving agent the last four log
+/// lines and nothing more; a record that spent one of those four on the tier
+/// would push whatever direction was written on the task out of the brief, on
+/// every spawn, for ever. The claim line was already the one that says an
+/// attempt started, so this is the same sentence finishing itself.
+///
+/// **`default` is a word here and an absence in the flag**, and the asymmetry
+/// is deliberate. `--effort high` with no `--model` is a real thing to type,
+/// so the pair has to be printable with one half missing; `default/high` says
+/// *whatever the settings file says, at high effort*, which is precisely what
+/// was asked for and reads back unambiguously. What it does **not** do is
+/// name the model — because at the moment of the claim wsp does not know it,
+/// and the record that does is [`crate::agent_commands::Ran`], read off the
+/// transcript when the claim ends.
+///
+/// Empty for a spawn that stated neither, so the ordinary claim line is
+/// byte-for-byte what it was — the same compatibility rule `--model` itself
+/// keeps, and the reason nothing in the store needs migrating.
+fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
+    match (model, effort) {
+        (None, None) => String::new(),
+        (m, e) => format!(
+            " · spawned at {}/{}",
+            m.unwrap_or("default"),
+            e.unwrap_or("default")
+        ),
+    }
+}
+
+/// What served the attempt that is ending, as a clause on the line that ends
+/// it — and nothing at all when it cannot be read.
+///
+/// This is the field wsp-060 was written for, and the argument for reading it
+/// here rather than at report time is that **evidence has to be durable and a
+/// transcript is not**. The task file is committed to git and reaches every
+/// machine; `~/.claude/projects` is one machine's disk, is cleaned up on its
+/// own schedule, and holds nothing at all for an agent that ran on the other
+/// box. A report that read the transcript live would answer differently next
+/// month, which is the one thing calibration data must not do. So the reading
+/// happens once, at the moment the attempt closes, and what lands on the task
+/// is the answer rather than the pointer to it.
+///
+/// Silent on every failure, and that is the rule rather than laziness: the
+/// task said in as many words that a silently wrong label is worse than a
+/// missing one. A transcript that cannot be found, a kind that keeps none, an
+/// agent killed before it answered — each of those is *no clause*, and a
+/// reader that sees a release line with nothing after it knows exactly that
+/// much. There is no default to fall back on that would not be a guess.
+///
+/// It must never cost a release. Nothing here is fatal, nothing waits on a
+/// socket, and the file read is a line-at-a-time scan of one file — see
+/// `agent_commands::read_ran` for why it is not read whole.
+fn ran_at(store: &Store, task_id: &str) -> String {
+    let Some(thread) = crate::cmd_resume::thread_for_task(store, task_id) else {
+        return String::new();
+    };
+    let Some(ran) = crate::agent_commands::of(&thread.kind).ran(&thread.session, &thread.cwd)
+    else {
+        return String::new();
+    };
+    format!(" · ran {} · {} turns", ran.label(), ran.turns)
+}
+
 /// End a claim and leave the trace behind.
 ///
 /// An agent works several tasks in sequence, so every way a claim can end —
@@ -1020,6 +1087,13 @@ pub fn hand_off(store: &Store, task_id: &str, to: Option<&str>, reason: &str) {
     let from = get("claimed_at");
     let secs = util::since(&from);
 
+    // What the attempt was actually served at, asked for while the record that
+    // answers it is still standing: `thread_for_task` reads the binding first
+    // and the event log after it, and `release_pane` clears the binding before
+    // it gets here — so the log fallback is not a nicety, it is the path the
+    // commonest release takes.
+    let ran = ran_at(store, task_id);
+
     store.set_worked(
         task_id,
         json!({
@@ -1038,9 +1112,20 @@ pub fn hand_off(store: &Store, task_id: &str, to: Option<&str>, reason: &str) {
 
     if let Some(mut t) = store.task(task_id) {
         let spent = if secs > 0 { format!(" after {}", util::duration_human(secs)) } else { String::new() };
+        // Why it ended, where the line does not already say. `release` and
+        // `handoff` are the sentence itself and `done` is the `→ done` on the
+        // next line; what is left is the reaper, and it is the one an attempt
+        // must not be judged by. A workspace closed under an agent is not
+        // evidence that its tier could not do the work — 23 of the 213 attempts
+        // in this store had ended that way by 2026-08-18, and without this word
+        // every one of them counts against whatever ran it.
+        let why = match reason {
+            "release" | "handoff" | "done" => String::new(),
+            other => format!(" · {other}"),
+        };
         match to {
-            Some(next) => t.log(&format!("handed off to {next}{spent}")),
-            None => t.log(&format!("released{spent}")),
+            Some(next) => t.log(&format!("handed off to {next}{spent}{why}{ran}")),
+            None => t.log(&format!("released{spent}{why}{ran}")),
         }
         t.touch();
         let _ = store.save_task(&t);
@@ -1303,6 +1388,21 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
                 "workspace_id": workspace,
                 "workspace_label": named.clone().unwrap_or_else(|| ws_label.clone()),
                 "cwd": cwd,
+                // The same session the binding above gets, on the record that
+                // outlives the pane. A binding is per-seat and is cleared the
+                // moment an agent lets go — `release_pane` and `done` both drop
+                // it *before* the claim ends — so a reader that only had the
+                // binding could not answer what had just been running at the one
+                // moment anybody asks: the end of the attempt. See `ran_at`.
+                //
+                // Usually empty here and filled by `learn_sessions`, because
+                // `spawn` claims before it starts the agent. Not always: a claim
+                // made in a pane that already holds one — the panel's `c`, an
+                // agent claiming at its own shell — reads it off the pane row
+                // right here, and that path writes no `session-learned` event at
+                // all, which is how the event log turned out not to be a
+                // fallback worth having.
+                "agent_session_id": session,
                 "host": util::hostname(),
                 "claimed_at": util::now_iso(),
             }),
@@ -1343,9 +1443,10 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     for other in &displaced {
         t.log(&format!("taken over from pane {other}"));
     }
+    let asked = spawned_at(args.get("model").as_deref(), args.get("effort").as_deref());
     match left.first() {
-        Some(prev) => t.log(&format!("claimed by pane {pane}, taken up from {prev}")),
-        None => t.log(&format!("claimed by pane {pane}")),
+        Some(prev) => t.log(&format!("claimed by pane {pane}, taken up from {prev}{asked}")),
+        None => t.log(&format!("claimed by pane {pane}{asked}")),
     }
     let _ = store.save_task(&t);
     store.log_event(
@@ -1516,6 +1617,15 @@ pub fn learn_sessions<'a>(store: &Store, seen: impl Iterator<Item = (&'a str, &'
             let Some(o) = b.as_object_mut() else { continue };
             o.insert("agent_session_id".to_string(), json!(session));
             store.set_binding(seat, b);
+            // And on the claim, which is the copy that is still there when the
+            // attempt ends. Only where there is one: a session learned for a
+            // seat holding nothing has no task to be recorded against.
+            if let Some(mut c) = store.claims().get(&task).cloned() {
+                if let Some(o) = c.as_object_mut() {
+                    o.insert("agent_session_id".to_string(), json!(session));
+                    store.set_claim(&task, c);
+                }
+            }
             store.log_event(
                 "session-learned",
                 json!({ "id": task, "pane": seat, "session": session }),
@@ -3697,6 +3807,25 @@ mod tests {
         old.project = Some("robustness".into());
         let stale = said_label(&old, "still on the old one").unwrap();
         assert_eq!(pane_rename(&stale, &t), task_label(&t));
+    }
+
+    /// The compatibility rule `--model` itself keeps, at the other end of it: a
+    /// spawn that states no tier writes no clause, so every claim line in the
+    /// store that came before this is still exactly the line it was and nothing
+    /// needs migrating.
+    ///
+    /// And `default` is a word rather than an omission when *one* half was
+    /// stated. `--effort high` with no `--model` is an ordinary thing to type —
+    /// it is the cheaper knob and the one to reach for first — and the record
+    /// of it has to say which half was left to the settings file, or a reader
+    /// cannot tell `high effort on whatever is configured` from `high effort on
+    /// something nobody wrote down`.
+    #[test]
+    fn a_claim_that_states_no_tier_says_nothing_about_one() {
+        assert_eq!(spawned_at(None, None), "");
+        assert_eq!(spawned_at(Some("opus[1m]"), Some("high")), " · spawned at opus[1m]/high");
+        assert_eq!(spawned_at(None, Some("high")), " · spawned at default/high");
+        assert_eq!(spawned_at(Some("haiku"), None), " · spawned at haiku/default");
     }
 
     /// The subtraction that separates a loaded index from an agent halfway

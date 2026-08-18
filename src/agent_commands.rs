@@ -302,6 +302,35 @@ pub trait Kind {
     /// "not yet" as "never". Corroborating a seat that has already read empty
     /// for a while is what it is good for.
     fn running(&self, spawn: &Spawn) -> Option<bool>;
+
+    /// What actually served this session, read back off the agent's own
+    /// durable record of it — `None` for a kind that keeps none, or when it
+    /// cannot be found.
+    ///
+    /// The other half of [`Kind::tier`], and the reason wsp-060 exists. `tier`
+    /// checks what a spawn *asks for*; this reads what a session *got*, and the
+    /// two part company in ways no failure path anywhere would catch:
+    ///
+    /// - An agent types `/model` mid-session and finishes on a tier nothing
+    ///   wsp wrote down names. A record labelled with the flag it was spawned
+    ///   under would call that session by the tier it left behind, which is a
+    ///   router trained on the opposite of what happened.
+    /// - A spawn that names nothing at all — today's ordinary case — is
+    ///   labelled only by `~/.claude/settings.json`, which is not versioned,
+    ///   not shared between machines, and changes under the record.
+    /// - `--on <machine>` runs that machine's `claude`, whose settings and
+    ///   installed version are its own; the flag states the tier and cannot
+    ///   guarantee it.
+    ///
+    /// So the calibration field is *ran at* and not *spawned at*, and both are
+    /// kept: the second is the intent, the first is the fact, and the pair is
+    /// what says whether stating a tier changed anything.
+    ///
+    /// Keyed on the session rather than the seat, because the seat is gone by
+    /// the time this is asked — it is read when a claim ends — and the session
+    /// is the one handle that outlives it. `cwd` is a hint and not a key: see
+    /// [`transcript`], which falls back to a scan when the tree has moved.
+    fn ran(&self, session: &str, cwd: &str) -> Option<Ran>;
 }
 
 /// What is about to be started, as much of it as a kind is allowed to know.
@@ -424,6 +453,14 @@ impl Kind for Plain {
     /// Nothing to ask. An agent wsp knows nothing about beyond its name is one
     /// whose backend is the only witness there is.
     fn running(&self, _spawn: &Spawn) -> Option<bool> {
+        None
+    }
+
+    /// And nothing to read. A kind wsp cannot start at a stated tier is a kind
+    /// whose sessions it has no business labelling with one — the record stays
+    /// empty rather than being filled in with the default it would have
+    /// guessed.
+    fn ran(&self, _session: &str, _cwd: &str) -> Option<Ran> {
         None
     }
 }
@@ -669,6 +706,175 @@ impl Kind for Claude {
         let handle = mint(spawn.name, spawn.seat)?;
         Some(answers_to(&listing().ok()?, &handle))
     }
+
+    /// The transcript, which is the only witness that was there for the whole
+    /// session.
+    ///
+    /// Every other reading of what a Claude Code is running is a reading of
+    /// *now*: `claude agents --json` answers about live sessions, herdr's pane
+    /// row carries a session id and no tier at all, and both are gone by the
+    /// time a claim ends. The transcript is written as the session goes and
+    /// stays afterwards, and it carries the model on every assistant turn and
+    /// the effort beside it — so a `/model` halfway through is not a fact that
+    /// has to be caught as it happens, it is a second entry in the list this
+    /// returns.
+    ///
+    /// Recorded against Claude Code 2.1.234: one JSON object per line under
+    /// `~/.claude/projects/<cwd>/<session>.jsonl`, an assistant turn carrying
+    /// `message.model` (`claude-opus-5`) and a top-level `effort` (`high`).
+    fn ran(&self, session: &str, cwd: &str) -> Option<Ran> {
+        read_ran(&mut std::io::BufReader::new(std::fs::File::open(transcript(session, cwd)?).ok()?))
+    }
+}
+
+// ---- what actually ran ----------------------------------------------------
+
+/// The tier a session was actually served at, and how much of it there was.
+///
+/// Lists rather than scalars, and that is the whole point of reading this
+/// instead of trusting the spawn flag: a session can change model or effort
+/// under itself, and the honest record of one that did is *both* names in the
+/// order they served. Collapsing them to the first would name the tier a
+/// decision was escalated away from; collapsing to the last would erase the
+/// cheap attempt that failed, which is exactly the datum a try-cheap-then-
+/// escalate policy is calibrated against.
+///
+/// `turns` is assistant turns on the main thread, and it is here because it is
+/// the one number that separates an attempt that ground for an hour from one
+/// that was spawned and said nothing — wall-clock cannot, because it counts
+/// the agent waiting for a person the same as the agent working.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Ran {
+    /// Distinct model ids, in the order they first served a turn, with the
+    /// `claude-` prefix off: `opus-5`, `haiku-4-5`.
+    pub models: Vec<String>,
+    /// Distinct effort levels, same ordering rule. Empty where the runtime
+    /// recorded none, which is a real answer and not a missing one — an older
+    /// Claude Code wrote no `effort` at all.
+    pub efforts: Vec<String>,
+    pub turns: usize,
+}
+
+impl Ran {
+    /// `opus-5/high`, or `haiku-4-5→opus-5/high` for a session that moved.
+    ///
+    /// One string because it is what goes in a log line and what a report
+    /// groups by, and those two must be the same string or the report is
+    /// grouping on a rendering. The `/` is the same separator `spawned at`
+    /// uses, so the intent and the fact line up column-wise when both are
+    /// printed.
+    pub fn label(&self) -> String {
+        match self.efforts.is_empty() {
+            true => self.models.join("→"),
+            false => format!("{}/{}", self.models.join("→"), self.efforts.join("→")),
+        }
+    }
+}
+
+/// The file the session was written to, most likely place first.
+///
+/// Claude Code names the directory after the cwd with every character that is
+/// not a letter, a digit or a hyphen replaced by one — `/Users/ed/.local` is
+/// `-Users-ed--local` — so the direct hit costs one `stat` and is what happens
+/// every time an agent stayed in the tree it was spawned into.
+///
+/// **The scan is not belt and braces.** A claim's cwd is where the *work* is
+/// and the transcript is named after where the *pane* was, `wsp resume` starts
+/// a session in a new workspace at a recorded cwd, and `wsp checkout` is free
+/// to move a worktree; every one of those makes the derived path wrong while
+/// the session id stays exactly right. A session id is a uuid, so a scan
+/// cannot find the wrong file — it can only fail to find one.
+///
+/// The id is checked before it is put in a path. It arrives from herdr, which
+/// got it from the agent, and `spawn` is a verb agents drive: a session id with
+/// a `/` in it is not a session id, and refusing it here is cheaper than
+/// discovering what it opened.
+fn transcript(session: &str, cwd: &str) -> Option<PathBuf> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let file = format!("{session}.jsonl");
+    let projects = util::home().join(".claude").join("projects");
+    let derived = projects.join(mangle(cwd)).join(&file);
+    if derived.is_file() {
+        return Some(derived);
+    }
+    std::fs::read_dir(&projects)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(&file))
+        .find(|p| p.is_file())
+}
+
+/// A cwd as Claude Code spells it in a directory name.
+fn mangle(cwd: &str) -> String {
+    cwd.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
+}
+
+/// One transcript, reduced to what served it.
+///
+/// Read a line at a time rather than into a string: a transcript is as long as
+/// the session was, the longest on this machine is 123MB, and nothing here
+/// needs two of its turns at once.
+///
+/// Two filters, and each is a claim about what the record means:
+///
+/// - **The cheap `contains` is a gate, not the test.** It matches the bare word
+///   rather than `"type":"assistant"` on purpose: a filter that spells out the
+///   punctuation is a filter that silently passes nothing the day the writer
+///   puts a space after a colon, and a gate that fails open costs a parse while
+///   a gate that fails closed costs the whole record. What decides is the parse
+///   below — a tool result can quote a turn, and somebody's pasted output is
+///   not evidence of a tier.
+/// - **A sidechain is a different agent.** Sub-agent turns are written to the
+///   same file with `isSidechain` set, they can run on a model the session
+///   never chose, and the question this answers is what the *claimant* ran at.
+///   Counting them would report a tier nobody asked for on a task whose agent
+///   spawned one search.
+///
+/// `None` when nothing served a turn at all, which is a transcript that exists
+/// and is not evidence of a tier — an agent that started and was killed before
+/// it answered. Empty is not zero here: it must not become "ran at nothing".
+fn read_ran(src: &mut impl std::io::BufRead) -> Option<Ran> {
+    let mut ran = Ran::default();
+    let mut line = String::new();
+    while {
+        line.clear();
+        src.read_line(&mut line).unwrap_or(0) > 0
+    } {
+        if !line.contains("assistant") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(model) = v.pointer("/message/model").and_then(Value::as_str) else { continue };
+        // The runtime writes its own messages into the same stream and names
+        // the model `<synthetic>` — a cancelled turn, a refusal it composed
+        // itself — with every token count zero. Found in a 118MB transcript on
+        // 2026-08-18, one line among 2,046: enough to put a third tier in a
+        // label and a turn in a count that no model ever served. Angle brackets
+        // are the runtime saying *this is not a model*, so they are what is
+        // matched, rather than the one spelling seen so far.
+        if model.starts_with('<') {
+            continue;
+        }
+        ran.turns += 1;
+        let model = model.strip_prefix("claude-").unwrap_or(model).to_string();
+        if !ran.models.contains(&model) {
+            ran.models.push(model);
+        }
+        if let Some(effort) = v.get("effort").and_then(Value::as_str) {
+            if !ran.efforts.iter().any(|e| e == effort) {
+                ran.efforts.push(effort.to_string());
+            }
+        }
+    }
+    (!ran.models.is_empty()).then_some(ran)
 }
 
 /// Whether any live session goes by this name.
@@ -1516,5 +1722,135 @@ mod tests {
         assert!(!hedged.contains("is reachable"), "it is not reachable — the point: {hedged}");
         let doubt = hedged.find("nothing is answering").expect("the hedge, up front");
         assert!(doubt < hedged.find("wsp-f3").expect("the name"), "the hedge is last: {hedged}");
+    }
+
+    /// One assistant turn, as Claude Code 2.1.234 writes it — the fields this
+    /// reads and nothing else, so the test says what the coupling actually is.
+    fn turn(model: &str, effort: &str, sidechain: bool) -> String {
+        format!(
+            r#"{{"type":"assistant","isSidechain":{sidechain},"effort":"{effort}","message":{{"model":"{model}","role":"assistant","content":[]}}}}"#
+        )
+    }
+
+    fn ran_of(lines: &[String]) -> Option<Ran> {
+        read_ran(&mut std::io::Cursor::new(lines.join("\n")))
+    }
+
+    /// The ordinary session: one tier, and the turn count is what says how much
+    /// of it there was.
+    #[test]
+    fn a_transcript_says_what_served_it_and_how_many_turns_it_took() {
+        let ran = ran_of(&[
+            turn("claude-opus-5", "high", false),
+            r#"{"type":"user","message":{"role":"user","content":"go on"}}"#.into(),
+            turn("claude-opus-5", "high", false),
+        ])
+        .expect("three lines, two of them turns");
+        assert_eq!(ran.models, ["opus-5"], "the runtime's prefix is not part of the tier");
+        assert_eq!(ran.efforts, ["high"]);
+        assert_eq!(ran.turns, 2);
+        assert_eq!(ran.label(), "opus-5/high");
+    }
+
+    /// The case the whole field exists for. A `/model` mid-session leaves both
+    /// names in the file, in order, and a record that kept only the flag it was
+    /// spawned under would name the tier the session was escalated *away* from.
+    #[test]
+    fn a_session_that_changed_tier_under_itself_is_both_tiers_in_order() {
+        let ran = ran_of(&[
+            turn("claude-haiku-4-5", "medium", false),
+            turn("claude-opus-5", "high", false),
+            turn("claude-opus-5", "high", false),
+        ])
+        .expect("three turns");
+        assert_eq!(ran.label(), "haiku-4-5→opus-5/medium→high");
+        assert_eq!(ran.turns, 3, "every turn counts, whichever model took it");
+    }
+
+    /// A sub-agent writes to the same file and can run on a model the session
+    /// never chose. The question this answers is what the *claimant* ran at, so
+    /// a task whose agent spawned one search must not be reported as having run
+    /// on whatever that search used.
+    #[test]
+    fn a_sidechain_is_a_different_agent_and_is_not_counted() {
+        let ran = ran_of(&[
+            turn("claude-opus-5", "high", false),
+            turn("claude-haiku-4-5", "low", true),
+        ])
+        .expect("one turn on the main thread");
+        assert_eq!(ran.models, ["opus-5"]);
+        assert_eq!(ran.turns, 1);
+    }
+
+    /// A tool result can quote JSON, so the cheap `contains` that keeps the
+    /// parse off nine lines in ten is a gate and never the test.
+    #[test]
+    fn a_line_that_merely_quotes_a_turn_is_not_one() {
+        let quoted = r#"{"type":"user","message":{"role":"user","content":"I saw {\"type\":\"assistant\",\"message\":{\"model\":\"claude-fable-5\"}} in the log"}}"#;
+        let ran = ran_of(&[quoted.into(), turn("claude-opus-5", "high", false)]).expect("one turn");
+        assert_eq!(ran.models, ["opus-5"], "somebody's pasted output is not evidence of a tier");
+    }
+
+    /// Empty is not zero. An agent that started and was killed before it
+    /// answered leaves a transcript that is not evidence of a tier, and the
+    /// record of that has to be *nothing* rather than a label nobody earned.
+    #[test]
+    fn a_transcript_with_no_turns_in_it_is_no_answer_rather_than_an_empty_one() {
+        assert!(ran_of(&[r#"{"type":"summary","summary":"a session that never ran"}"#.into()]).is_none());
+    }
+
+    /// An older runtime wrote no `effort` at all, and the honest label for that
+    /// is the model on its own — not the default effort it might have been.
+    #[test]
+    fn a_transcript_that_records_no_effort_is_labelled_by_its_model_alone() {
+        let ran = read_ran(&mut std::io::Cursor::new(
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","role":"assistant"}}"#,
+        ))
+        .expect("one turn");
+        assert_eq!(ran.label(), "sonnet-5");
+    }
+
+    /// A cancelled turn is not a tier. The runtime composes messages of its own
+    /// into the transcript and names the model `<synthetic>`; counted, it puts
+    /// a model nobody ran in the label and a turn nobody took in the count.
+    #[test]
+    fn a_message_the_runtime_wrote_itself_is_not_a_turn() {
+        let ran = ran_of(&[
+            turn("claude-opus-5", "high", false),
+            turn("<synthetic>", "high", false),
+        ])
+        .expect("one real turn");
+        assert_eq!(ran.models, ["opus-5"]);
+        assert_eq!(ran.turns, 1);
+    }
+
+    /// The gate matches a bare word rather than the punctuation around it, and
+    /// this is the failure it is written against: a gate spelling out
+    /// `"type":"assistant"` reads a pretty-printed line as not a turn, comes
+    /// back with nothing, and looks exactly like a session that never ran.
+    #[test]
+    fn a_turn_written_with_spaces_in_it_is_still_a_turn() {
+        let ran = read_ran(&mut std::io::Cursor::new(
+            r#"{"type": "assistant", "effort": "max", "message": {"model": "claude-fable-5"}}"#,
+        ))
+        .expect("whitespace is not a format change");
+        assert_eq!(ran.label(), "fable-5/max");
+    }
+
+    /// The directory rule, which is the one thing here that is a guess about
+    /// somebody else's layout — hence the scan behind it in [`transcript`].
+    #[test]
+    fn a_cwd_becomes_a_directory_name_the_way_claude_code_spells_one() {
+        assert_eq!(mangle("/Users/ed/claude/wsp/.worktrees/wsp-060"), "-Users-ed-claude-wsp--worktrees-wsp-060");
+        assert_eq!(mangle("/Users/ed/.local/state"), "-Users-ed--local-state");
+    }
+
+    /// A session id arrives from herdr, which got it from the agent, and
+    /// `spawn` is a verb agents drive. One with a path separator in it is not a
+    /// session id, and refusing it is cheaper than finding out what it opened.
+    #[test]
+    fn a_session_id_that_is_not_one_never_reaches_the_filesystem() {
+        assert!(transcript("../../etc/passwd", "/tmp").is_none());
+        assert!(transcript("", "/tmp").is_none());
     }
 }

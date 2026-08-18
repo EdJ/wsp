@@ -10,6 +10,7 @@ use std::collections::HashMap;
 mod agent_commands;
 mod arrange;
 mod cmd_agent;
+mod cmd_attempts;
 mod cmd_brief;
 mod cmd_checkout;
 mod cmd_govern;
@@ -445,6 +446,7 @@ fn main() {
         "rm" | "remove" => cmd_task::rm(&store, &args),
         "archive" => cmd_task::archive(&store, &args),
 
+        "attempts" => cmd_attempts::attempts(&store, &args),
         "brief" => cmd_brief::brief(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
@@ -649,6 +651,9 @@ fn help() {
   wsp where                         what project am I in, and why
   wsp wip                           everything in flight, with agents
   wsp overlap                       who else is standing in this tree
+  wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
+                                    spawned at, the tier that actually served it,
+                                    how long to review, and whether it came back
   wsp peek [panel|view|board|<task>]  what is actually on that pane
 
 {machines}

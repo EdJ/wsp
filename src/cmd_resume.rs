@@ -299,8 +299,18 @@ pub fn thread_for_task(store: &Store, task: &str) -> Option<Thread> {
         .find(|(_, b)| b.get("task_id").and_then(Value::as_str) == Some(task))
         .map(|(_, b)| b);
 
-    let recorded =
-        bound.as_ref().map(|b| text(b, "agent_session_id")).filter(|s| !s.is_empty());
+    // Three rungs, and the middle one is not redundant with the first. A
+    // binding is per-seat and is cleared the moment an agent lets go — before
+    // the claim is, in both `release_pane` and `done` — so between those two
+    // writes the claim is the only record of what was in the seat. `cmd_agent`
+    // keeps the two in step: whoever writes one writes the other.
+    let recorded = [
+        bound.as_ref().map(|b| text(b, "agent_session_id")),
+        claim.map(|c| text(c, "agent_session_id")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|s| !s.is_empty());
     let (session, from) = match recorded {
         Some(s) => (s, Source::Record),
         None => (text(&logged(store, "id", task)?, "session"), Source::Log),
@@ -1017,6 +1027,34 @@ mod tests {
             ("abc", "/tmp/work", Source::Record)
         );
         assert_eq!(t.by_hand(), "cd /tmp/work && claude --resume abc");
+    }
+
+    /// And it comes off the *claim* when the binding is gone, which is the state
+    /// every release passes through: `release_pane` and `cmd_task::done` both
+    /// drop the binding before they end the claim, so at the one moment anybody
+    /// asks what had been running — the end of the attempt — the binding is
+    /// already gone.
+    ///
+    /// The event log is not the answer to this. A claim made in a pane that
+    /// already holds an agent reads the session straight off the pane row, so
+    /// `learn_sessions` sees nothing change and writes no `session-learned`
+    /// event at all — measured in a `--fake` sandbox on 2026-08-18, and it is
+    /// why `wsp-060`'s record of what ran came back empty until the claim
+    /// carried the session too.
+    #[test]
+    fn a_thread_survives_the_binding_being_cleared_before_the_claim_is() {
+        let (_env, store) = store("resume-claim");
+        store.set_claim(
+            "render-061",
+            json!({
+                "workspace_id": "w1",
+                "cwd": "/tmp/work",
+                "agent_session_id": "abc",
+                "host": util::hostname(),
+            }),
+        );
+        let t = thread_for_task(&store, "render-061").expect("the claim is a record too");
+        assert_eq!((t.session.as_str(), t.from), ("abc", Source::Record));
     }
 
     /// The boundary Ed drew: the offer is the last census, and an agent that is

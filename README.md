@@ -1187,6 +1187,28 @@ been reachable from `E` and from the CLI with nothing recording that anyone had
 been there — which is the failure the rule was written against, arriving by a
 door the rule did not mention.
 
+`## Log` is also where the record of *what ran* lives, and it is two clauses on
+two lines that were already there rather than lines of its own:
+
+```
+- 2026-08-18T12:50:09Z claimed by pane w58:p1 · spawned at opus[1m]/high
+- 2026-08-18T15:41:02Z released after 2h51m · ran opus-5/high · 96 turns
+```
+
+`spawned at` is what somebody typed — absent, and therefore silent, when they
+typed nothing. `ran` is read off the agent's own transcript when the claim ends,
+which is the only witness that was there for the whole session: an agent that
+types `/model` halfway through shows up as `haiku-4-5→opus-5`, and a spawn that
+stated nothing still gets a true label. Neither is filled in by guess, because a
+wrong tier on an attempt is worse than no tier — a router calibrated on it
+learns the opposite of what happened.
+
+Clauses rather than lines because `wsp brief` hands an arriving agent the last
+four log entries: a line of its own would push the direction written on the task
+out of the brief, on every spawn, for ever. `wsp attempts` reads them back and
+joins them to the outcome the store already records — reached review, finished,
+came back, blocked, and how long from claim to review.
+
 A title is not prose and is not edited here: `wsp rename <id> "new title"` is
 the verb, and it writes `renamed from "…"` into the log on its way past. That
 record is the point. A task that quietly became about something else, with no
@@ -3101,6 +3123,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/render.rs` | a task or a project, in full, and the column menu |
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
+| `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, the outcome |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_checkout.rs` | a working tree per task, and landing it back on the trunk |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
