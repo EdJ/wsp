@@ -672,6 +672,15 @@ pub enum Refusal {
     NoSeat(Seat),
     /// The agent is not in a state to be told anything.
     NotReady(State),
+    /// The sentence was delivered and the agent never acted on it.
+    ///
+    /// Only a backend that *watched* can say this, and saying it is the whole
+    /// value: it is [`Place::tell`]'s `Ok` and [`Place::nudge`]'s reason
+    /// arriving in one answer, so a caller learns in the reply what it
+    /// otherwise had to go and find out by looking. Not a failure on its own —
+    /// the work order is sitting where the agent can see it, and a submit is
+    /// what it is waiting for.
+    NotTaken,
     /// This backend cannot do that at all — a seat for a person on a backend
     /// with no terminal, say. Distinct from a failure, and not a bug.
     Unsupported(&'static str),
@@ -685,6 +694,7 @@ impl std::fmt::Display for Refusal {
             Refusal::Unreachable(w) => write!(f, "no backend answered: {w}"),
             Refusal::NoSeat(s) => write!(f, "no seat {s}"),
             Refusal::NotReady(s) => write!(f, "not ready — {}", s.as_str()),
+            Refusal::NotTaken => write!(f, "the sentence arrived and no turn started"),
             Refusal::Unsupported(w) => write!(f, "this backend cannot {w}"),
             Refusal::Backend(w) => write!(f, "{w}"),
         }
@@ -754,9 +764,18 @@ pub trait Place {
     /// keystrokes, and a backend with one should use its own submit rather than
     /// a sleep long enough for a TUI to finish pasting.
     ///
-    /// `Ok` is *delivered*, and it is not *taken*. The backend accepted the
-    /// call; whether the agent started a turn on it is [`Place::state`]'s
-    /// question and [`Place::nudge`] is what to do about the answer.
+    /// `Ok` is *delivered*, and on most backends it is not *taken*. The backend
+    /// accepted the call; whether the agent started a turn on it is
+    /// [`Place::state`]'s question and [`Place::nudge`] is what to do about the
+    /// answer.
+    ///
+    /// A backend that can watch for the turn itself is entitled to answer the
+    /// second question here instead, and should: [`Refusal::NotTaken`] is
+    /// *delivered and no turn started*, which is the reading a caller would
+    /// otherwise have had to go and take. It is not a failure and a caller that
+    /// treats it as one has thrown away the recovery. What it is not entitled to
+    /// do is make `Ok` mean less than it did — a backend that watched and one
+    /// that could not both say `Ok` when there is nothing to rescue.
     fn tell(&self, seat: &Seat, text: &str) -> Result<()>;
 
     /// Submit whatever is sitting unsent in the agent's input.

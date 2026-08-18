@@ -290,9 +290,14 @@ struct Patience<'a> {
     /// idle for the twenty seconds that followed.
     ///
     /// Five seconds is above the widest reading of that window and below the
-    /// point where a spawn feels stuck. It is paid on every spawn while herdr's
-    /// own submit keeps failing, which on that evening was every spawn there
-    /// was.
+    /// point where a spawn feels stuck.
+    ///
+    /// It used to be paid on every spawn, which on that evening was the whole
+    /// cost of the defect. It is now paid by a spawn that has already been told
+    /// the turn did not start and is confirming a submit, because a backend that
+    /// reports [`Refusal::NotTaken`] has done this wait already and
+    /// [`hand_over`] does not repeat it. A healthy handover through herdr pays
+    /// one `agent.get` and no sleep at all.
     taken: Duration,
     /// How many times to press submit again on a work order that arrived and
     /// was not taken.
@@ -443,6 +448,19 @@ fn wait_ready(
 /// it is the agent leaving idle**, which is a fact about the agent rather than
 /// a promise about the call.
 ///
+/// **Half of that reading has since moved to the server, and the half that
+/// stayed is the interesting one.** `agent.prompt` will now hold its reply until
+/// the agent's status moves and refuse when it does not
+/// (`place_herdr::Herdr::tell`), so on that backend the looking below is no
+/// longer how the defect is caught — the answer arrives already knowing. What it
+/// cannot answer is *why* nothing moved. herdr sees a prompt delivered to an
+/// agent that is genuinely idle, and that is the same picture whether the
+/// composer was a moment from ready or a folder-trust modal had the keyboard
+/// when the text arrived. Only the second is a thing a keystroke fixes and only
+/// wsp is in a position to try, so the submit stays and this function still
+/// exists. What it no longer does is *discover* the failure by waiting five
+/// seconds for it.
+///
 /// Then the loop is what was run by hand: press submit again, look again,
 /// bounded, and fail loudly rather than print a success. `Unsupported` from
 /// [`Place::nudge`] ends it at once — a backend with nothing to press has
@@ -467,21 +485,40 @@ fn hand_over(
     wait: &Patience,
 ) -> Result<(), String> {
     let seat = spawn.seat;
-    how.tell(place, seat, text).map_err(|e| e.to_string())?;
-    let mut pressed = 0;
-    while !took_it(place, seat, wait) {
+    // What was removed here, and it is a reading rather than a line: a backend
+    // that answers [`Refusal::NotTaken`] has just spent its own timeout watching
+    // for the turn this used to go and look for, so the first look is skipped and
+    // the submit is pressed at once. herdr does that watching now
+    // (`place_herdr::tell`), which is why the five seconds below are no longer
+    // the thing that catches the failure — they are what confirms the rescue.
+    //
+    // The refusal is not an error. A caller that propagated it would report the
+    // one failure this function exists to recover from, and `?` here was the
+    // whole of that mistake.
+    let mut look = match how.tell(place, seat, text) {
+        Ok(()) => true,
+        Err(Refusal::NotTaken) => false,
+        Err(e) => return Err(e.to_string()),
+    };
+    for pressed in 0..=wait.nudges {
+        if look && took_it(place, seat, wait) {
+            return Ok(());
+        }
+        // Only the first look can be skipped. After a submit nobody has watched
+        // anything, and the confirmation is wsp's again.
+        look = true;
         if pressed == wait.nudges {
-            return Err(format!("the work order is sitting in {seat} unsent"));
+            break;
         }
         match place.nudge(seat) {
-            Ok(()) => pressed += 1,
+            Ok(()) => {}
             Err(Refusal::Unsupported(_)) => {
                 return Err(format!("{seat} took the work order and started nothing"))
             }
             Err(e) => return Err(format!("{seat} did not take the work order: {e}")),
         }
     }
-    Ok(())
+    Err(format!("the work order is sitting in {seat} unsent"))
 }
 
 /// Whether a turn started inside [`Patience::taken`].
@@ -1654,6 +1691,15 @@ mod tests {
     struct Composer {
         starts_after: Option<u32>,
         can_press: bool,
+        /// Whether this backend *watched* for the turn and can say it never
+        /// started, which is what herdr's `agent.prompt` wait answers and what
+        /// the port spells [`Refusal::NotTaken`].
+        ///
+        /// `false` is every backend that cannot, and the composer's silence has
+        /// to be found by looking. The two answers describe the same seat and
+        /// the handover should reach the same end from both — what differs is
+        /// how long it spends finding out, which is what the test below is for.
+        watches: bool,
         pressed: std::cell::Cell<u32>,
         heard: std::cell::RefCell<Vec<String>>,
     }
@@ -1663,16 +1709,24 @@ mod tests {
             Composer {
                 starts_after,
                 can_press,
+                watches: false,
                 pressed: std::cell::Cell::new(0),
                 heard: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        fn watching(starts_after: Option<u32>) -> Composer {
+            Composer { watches: true, ..Composer::of(starts_after, true) }
         }
     }
 
     impl Place for Composer {
         fn tell(&self, _: &Seat, text: &str) -> crate::place::Result<()> {
             self.heard.borrow_mut().push(text.to_string());
-            Ok(())
+            match self.watches && self.starts_after != Some(0) {
+                true => Err(Refusal::NotTaken),
+                false => Ok(()),
+            }
         }
         fn nudge(&self, _: &Seat) -> crate::place::Result<()> {
             if !self.can_press {
@@ -1834,6 +1888,57 @@ mod tests {
         );
         assert_eq!(place.pressed.get(), 0, "something was pressed on a backend with no keys");
         assert_eq!(dial.elapsed(), TAKEN, "a backend that cannot be pressed was waited on twice");
+    }
+
+    /// **A backend that watched the turn never start is believed rather than
+    /// polled, and it reaches the same end.**
+    ///
+    /// herdr's `agent.prompt` now holds its reply until the agent's status moves
+    /// and refuses when it does not, so the five seconds this used to spend
+    /// discovering that were being spent twice — once by the server, then again
+    /// by wsp asking a question it had just been answered. The submit is pressed
+    /// at once instead, and the clock is the assertion: nothing is waited for
+    /// before the press, and what is waited for after it is the rescue.
+    ///
+    /// The recovery itself is untouched, and that is the point of pairing this
+    /// with the test above rather than replacing it. herdr can say a prompt was
+    /// delivered and the agent unmoved; it cannot say why, and a folder-trust
+    /// modal holding the keyboard looks from its side exactly like a composer
+    /// that was not ready. Only one of those is a thing a keystroke fixes, so
+    /// the keystroke stays.
+    #[test]
+    fn a_backend_that_says_the_turn_never_started_is_not_asked_again_before_pressing() {
+        let place = Composer::watching(Some(1));
+        let dial = util::Dial::new();
+        assert_eq!(handing_over(&place, &dial), Ok(()));
+        assert_eq!(place.pressed.get(), 1, "the work order still needed its submit");
+        assert_eq!(place.heard.borrow().len(), 1, "the work order was sent more than once");
+        assert_eq!(dial.elapsed(), Duration::ZERO, "wsp waited for what it had already been told");
+    }
+
+    /// The same backend on a healthy handover: `Ok` from something that watched
+    /// is a turn that started, and it costs one look and no waiting.
+    #[test]
+    fn a_handover_a_backend_confirmed_itself_costs_no_waiting() {
+        let place = Composer::watching(Some(0));
+        let dial = util::Dial::new();
+        assert_eq!(handing_over(&place, &dial), Ok(()));
+        assert_eq!(place.pressed.get(), 0, "return was pressed at an agent already working");
+        assert_eq!(dial.elapsed(), Duration::ZERO, "a spawn that went well waited for it");
+    }
+
+    /// A watching backend whose agent nothing rescues still fails, and the
+    /// bound is the presses rather than the answer that started it.
+    #[test]
+    fn a_turn_no_submit_starts_fails_the_spawn_whoever_noticed_first() {
+        let place = Composer::watching(None);
+        let dial = util::Dial::new();
+        assert_eq!(
+            handing_over(&place, &dial),
+            Err("the work order is sitting in w3M:p1 unsent".into())
+        );
+        assert_eq!(place.pressed.get(), PRESSES, "the press loop is not bounded");
+        assert_eq!(dial.elapsed(), TAKEN * PRESSES, "the look it was spared was not spared");
     }
 
     /// A backend that only remembers what it was asked to open.

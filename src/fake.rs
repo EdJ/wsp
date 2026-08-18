@@ -1315,6 +1315,7 @@ const NO_PANE: &str = "pane_not_found";
 const NO_AGENT: &str = "agent_not_found";
 const NOT_READY: &str = "agent_not_ready";
 const PANE_BUSY: &str = "agent_pane_busy";
+const NOT_TAKEN: &str = "agent_prompt_stalled";
 const OUR_OWN: &str = "fake_cannot";
 
 type Answer = Result<Value, (String, String)>;
@@ -1445,7 +1446,16 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             // The one guard that is the port's rather than herdr's wording:
             // `will_take_a_prompt` is `place::State`'s single answer to the
             // question every `state == "idle"` caller is actually asking.
-            if !spot.state.will_take_a_prompt() {
+            //
+            // `Working` is let through, and that is herdr's behaviour rather
+            // than a convenience. A real `agent.prompt` has no idle guard at all
+            // — it refuses a launch window and an unknown agent and nothing else
+            // — so a sentence addressed to an agent in the middle of a turn is
+            // accepted and queued behind it. That is not a corner: it is the
+            // whole of `wsp govern --tell`, which the fake could not reach while
+            // it modelled a guard herdr does not have.
+            let busy = spot.state == State::Working;
+            if !busy && !spot.state.will_take_a_prompt() {
                 return Err((
                     NOT_READY.into(),
                     format!("agent {seat} is {} and will not take a prompt", spot.state.as_str()),
@@ -1457,11 +1467,38 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             // could not express that failure before, which is why nothing here
             // ever noticed `spawn` reporting a handover it had not confirmed.
             let takes = stage.takes;
-            if takes {
+            if takes && !busy {
                 if let Some(spot) = stage.find_mut(&seat) {
                     spot.state = State::Working;
                 }
                 events.push(Event::Moved(seat.clone(), State::Working));
+            }
+            // `wait` is a caller asking herdr to hold the reply until the status
+            // moves, and modelling it is modelling its two failures rather than
+            // its duration — the fake answers in outcomes, and a test that slept
+            // for eight seconds to prove a point would be measuring the machine.
+            //
+            // Delivered and unmoved is `agent_prompt_stalled`, which is
+            // robustness-035 arriving as an answer instead of as a silence.
+            // Delivered to an agent that was *already* working is the trap: the
+            // status cannot change because it is already what it would change
+            // to, so herdr waits out the whole timeout and calls it a timeout —
+            // a plain failure reported for a sentence that arrived perfectly.
+            // A caller that sends the field to a busy agent gets this, and the
+            // fake's job is to make that a test failure rather than a night.
+            if params.get("wait").is_some() {
+                if busy {
+                    return Err((
+                        "timeout".into(),
+                        format!("timed out waiting for agent status on {seat}"),
+                    ));
+                }
+                if !takes {
+                    return Err((
+                        NOT_TAKEN.into(),
+                        format!("agent prompt to {seat} produced no observed state change"),
+                    ));
+                }
             }
             let spot = stage.find(&seat).expect("the seat answered a moment ago");
             json!({ "type": "agent_prompted", "agent": agent_json(spot) })

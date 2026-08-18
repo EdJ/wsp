@@ -210,7 +210,7 @@ pub fn mirrored_socket() -> String {
 /// answered by the agent rather than by the server.
 const SLOW: Duration = Duration::from_secs(10);
 
-/// The four herdr error codes wsp has ever had to tell apart.
+/// The five herdr error codes wsp has ever had to tell apart.
 ///
 /// Written down once and matched in this file only. `spawn` matching on
 /// `agent_pane_busy` at a call site was the coupling that survived every
@@ -220,6 +220,32 @@ const NOT_READY: &str = "agent_not_ready";
 const NO_AGENT: &str = "agent_not_found";
 const NO_PANE: &str = "pane_not_found";
 const PANE_BUSY: &str = "agent_pane_busy";
+const NOT_TAKEN: &str = "agent_prompt_stalled";
+
+/// Every status herdr has a word for, which is how [`Herdr::tell`] asks its wait
+/// for the one thing it wants and nothing more.
+///
+/// herdr's wait is two waits (`api/wait.rs:222`). The first is the one worth
+/// having: it holds the reply until the agent's `state_change_seq` moves, and
+/// that counter only moves on a real status change (`app/actions.rs:2973`), so
+/// it is evidence that the agent *left idle* rather than that keystrokes were
+/// written. The second then waits for a named status, and asking for one is how
+/// you get a false failure — a Claude Code that answers a work order by asking
+/// for a permission is `blocked` and never `working`, and a wait told to hold
+/// out for `working` would report a prompt that was plainly taken as stalled.
+/// Naming every status is what makes the second wait match at once and leaves
+/// the first as the whole of it.
+const ANY_STATUS: [&str; 5] = ["idle", "working", "blocked", "done", "unknown"];
+
+/// How long herdr has to watch a prompt take effect before it says it did not.
+///
+/// Bounded on both sides and neither bound is taste. Above herdr's own 5s cap on
+/// that watch, because the answer that tells a stalled prompt from an ordinary
+/// timeout is only produced when this is above it (`api/wait.rs:238`) — asking
+/// for five seconds gets the same wait and a reply wsp cannot read. Below
+/// [`SLOW`], because wsp's socket read has to outlast the answer it is waiting
+/// for, or a prompt herdr is about to report on comes back as no backend at all.
+const TAKEN: u64 = 8_000;
 
 /// herdr's failure, in wsp's words.
 fn refusal(seat: &Seat, e: &std::io::Error) -> Refusal {
@@ -234,6 +260,12 @@ fn refusal(seat: &Seat, e: &std::io::Error) -> Refusal {
     }
     if msg.contains(NO_AGENT) || msg.contains(NO_PANE) {
         return Refusal::NoSeat(seat.clone());
+    }
+    if msg.contains(NOT_TAKEN) {
+        // Only `agent.prompt` can answer this, and only when it was asked to
+        // watch. It is herdr reporting the sentence delivered and the agent
+        // unmoved, which is what the port calls not taken.
+        return Refusal::NotTaken;
     }
     Refusal::Backend(msg)
 }
@@ -519,10 +551,40 @@ impl Place for Herdr<'_> {
         }
     }
 
+    /// `agent.prompt`, and — unless the agent is already working — herdr's own
+    /// `wait` on it.
+    ///
+    /// **The field closes robustness-035 at the only place it could ever have
+    /// been closed.** Without it `agent.prompt` writes the text, schedules the
+    /// Enter 300ms later and answers `ok` before that Enter exists
+    /// (`app/api/agents.rs:105`), so `Ok` meant the server had taken the call and
+    /// nothing about the agent. With it the server holds the reply until the
+    /// agent's status moves, and says `agent_prompt_stalled` when it does not.
+    /// That is the reading wsp used to take for itself, taken by the only
+    /// process that can take it without a race.
+    ///
+    /// **The gate is not an optimisation.** An agent that is already working is
+    /// the case herdr's wait cannot answer: it skips the effect watch entirely
+    /// and goes to the second wait, which demands a status change — and a
+    /// sentence queued behind a turn in progress causes none, so the reply would
+    /// be held for the whole of [`TAKEN`] and then report a failure for a message
+    /// that was delivered. That is not a corner: it is `wsp govern --tell`, which
+    /// exists to speak to a governor in the middle of a night's sequencing, and
+    /// an unconditional wait would turn every one of those into eight seconds of
+    /// silence ending in a lie. So the wait is asked for only where its evidence
+    /// means something — a prompt into an agent that was not doing anything, on
+    /// the grounds that such an agent starting to do something is the proof.
+    ///
+    /// The extra `agent.get` that gate costs is one round trip on a local socket
+    /// against a call that is about to wait seconds, and there is no way to ask
+    /// for the first wait without it: what to send depends on the state, and only
+    /// herdr knows the state.
     fn tell(&self, seat: &Seat, text: &str) -> Result<()> {
-        herdr::call_for("agent.prompt", json!({ "target": seat.as_str(), "text": text }), SLOW)
-            .map(|_| ())
-            .map_err(|e| refusal(seat, &e))
+        let mut params = json!({ "target": seat.as_str(), "text": text });
+        if !matches!(self.state(seat), Ok(State::Working)) {
+            params["wait"] = json!({ "until": ANY_STATUS, "timeout_ms": TAKEN });
+        }
+        herdr::call_for("agent.prompt", params, SLOW).map(|_| ()).map_err(|e| refusal(seat, &e))
     }
 
     /// `agent.send_keys enter`, which is the recovery that was run by hand every
@@ -695,6 +757,67 @@ mod tests {
         assert_eq!(told.map(|a| a.seat), Some(Some(seat.clone())), "the sentence reached the seat");
         assert!(fake.verbs().starts_with(&[Verb::Open, Verb::Start]), "{:?}", fake.verbs());
 
+    }
+
+    /// A seat with an idle agent in it, which is what both tests below start
+    /// from and neither is about arranging.
+    fn seated(fake: &Fake, place: &Herdr) -> Seat {
+        let seat = place.open(&Order { label: "fork/015".into(), ..Order::default() })
+            .expect("a seat");
+        place.start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new() })
+            .expect("an agent");
+        fake.moves(&seat, State::Idle);
+        seat
+    }
+
+    /// **The trap in asking herdr to wait, and the one path it would have taken
+    /// down every night.**
+    ///
+    /// `wsp govern --tell` speaks to a governor in the middle of a night's
+    /// sequencing, and a sentence given to an agent that is already working is
+    /// queued behind the turn in progress. It is delivered, it is correct, and
+    /// nothing about the agent changes — so a wait that is watching for a change
+    /// watches for something that cannot happen, holds the reply for its whole
+    /// timeout, and then reports a failure for a message that arrived. Eight
+    /// seconds of silence ending in a lie, on the wire every agent on the machine
+    /// is directed with.
+    ///
+    /// The fake refuses that combination outright, so this passes only while wsp
+    /// keeps the wait for the case whose evidence means something: an agent that
+    /// was not doing anything and starts.
+    #[test]
+    fn a_message_to_an_agent_that_is_already_working_is_not_waited_on() {
+        let (fake, _env) = bound("busy", Stage::default());
+        let dial = Dial::new();
+        let place = brisk(&dial);
+        let seat = seated(&fake, &place);
+
+        fake.moves(&seat, State::Working);
+        assert_eq!(place.state(&seat).unwrap(), State::Working, "mid-turn, as a governor is");
+
+        place.tell(&seat, "stand down at eight").expect("a queued sentence is delivered");
+        let told = fake.asked().into_iter().find(|a| a.verb == Verb::Tell);
+        assert_eq!(told.map(|a| a.said), Some("stand down at eight".into()), "it reached the seat");
+    }
+
+    /// The other half: a prompt into an idle agent *is* waited on, and a wait
+    /// that comes back empty is [`Refusal::NotTaken`] rather than a success.
+    ///
+    /// This is robustness-035 arriving as an answer. The same stage — a socket
+    /// that accepts the call and leaves the sentence in the composer — used to be
+    /// indistinguishable from a healthy handover at this layer, and every reading
+    /// that found it out had to be taken by wsp afterwards.
+    #[test]
+    fn a_prompt_the_agent_never_acts_on_comes_back_as_not_taken() {
+        let mut stage = Stage::default();
+        stage.takes = false;
+        let (fake, _env) = bound("unsent", stage);
+        let dial = Dial::new();
+        let place = brisk(&dial);
+        let seat = seated(&fake, &place);
+
+        assert_eq!(place.tell(&seat, "go"), Err(Refusal::NotTaken));
+        assert_eq!(place.state(&seat).unwrap(), State::Idle, "idle in front of its own work order");
     }
 
     /// **t-260817-010.** An agent that has been started and not yet detected is
