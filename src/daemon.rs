@@ -524,6 +524,22 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         );
     }
 
+    // The agents that were running before the restart, offered back to whoever
+    // is at the machine.
+    //
+    // **Before the first sync, and that ordering is the whole of it.** `sync`
+    // rewrites the roster from what is running now — which, one second after
+    // herdr came up, is nothing. Reading it afterwards would find an empty
+    // census every time and offer nothing, on the one path this exists for.
+    // So the copy is taken here, while the file on disk is still the census
+    // from before the restart, and `cmd_resume::offered` reads that copy from
+    // then on.
+    //
+    // Nothing is started. It opens one terminal with the question in it, and a
+    // person answers. Ed, 2026-08-18: "it is not automatic: on load, ask the
+    // user."
+    crate::cmd_resume::ask_on_startup(store);
+
     match sync::sync(store, &mut cache, true) {
         Ok(r) => {
             if verbose {

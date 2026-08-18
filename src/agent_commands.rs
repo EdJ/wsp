@@ -286,6 +286,15 @@ pub struct Spawn<'a> {
     pub full: bool,
     pub name: &'a str,
     pub seat: &'a Seat,
+    /// A session to pick up where it left off, rather than a new one.
+    ///
+    /// t-260816-068 above, arriving as `render-061`: the id is wsp's — read off
+    /// a binding or a seat — and what to *do* with it is the kind's, because
+    /// only the kind knows whether its runtime can resume at all. Claude Code
+    /// takes `--resume <uuid>`; a kind that cannot ignores this and starts
+    /// fresh, which is the same fallback an unknown kind gets for everything
+    /// else here.
+    pub resume: Option<&'a str>,
 }
 
 /// The handle wsp will address this agent by, decided before it exists.
@@ -456,6 +465,15 @@ impl Kind for Claude {
         if let Some(handle) = mint(spawn.name, spawn.seat) {
             argv.push("-n".into());
             argv.push(handle);
+        }
+        // Last, after the name, for the reason the name is last: `--resume`
+        // takes a value, so nothing may follow it that could be eaten as one.
+        // It is not conditional on `full` — a resumed session is a *thread*
+        // being picked up, and which tools it has is still this spawn's
+        // decision rather than the old one's.
+        if let Some(session) = spawn.resume {
+            argv.push("--resume".into());
+            argv.push(session.to_string());
         }
         argv
     }
@@ -1097,7 +1115,7 @@ mod tests {
     /// ~28K, and a trim that pushes work into Bash costs more than it saves.
     /// A spawn description, so the tests below argue about one thing each.
     fn spawn<'a>(full: bool, name: &'a str, seat: &'a Seat) -> Spawn<'a> {
-        Spawn { full, name, seat }
+        Spawn { full, name, seat, resume: None }
     }
 
     #[test]

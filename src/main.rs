@@ -18,6 +18,7 @@ mod cmd_machine;
 mod cmd_migrate;
 mod cmd_mandate;
 mod cmd_project;
+mod cmd_resume;
 mod cmd_sandbox;
 mod cmd_spawn;
 mod cmd_task;
@@ -84,6 +85,8 @@ const BOOL_FLAGS: &[&str] = &[
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm",
+    // And `resume`, whose positional is a task or a project.
+    "print",
     // And `checkout`, whose positional is a task id.
     "sweep",
     // And for `install`, whose positional is the binary to install.
@@ -450,6 +453,7 @@ fn main() {
         "sandbox" => cmd_sandbox::sandbox(&store, &args),
         "claim" => cmd_agent::claim(&store, &args),
         "spawn" => cmd_spawn::spawn(&store, &args),
+        "resume" => cmd_resume::resume(&store, &args),
         "despawn" => cmd_spawn::despawn(&store, &args),
         "machine" | "machines" => cmd_machine::dispatch(&store, &args),
         "mandate" => cmd_mandate::mandate(&store, &args),
@@ -611,6 +615,12 @@ fn help() {
   wsp despawn <id> | --pane <seat>  the other end of it: end the agent working
                                     that task, then release the claim — a seat
                                     that will not close keeps its claim
+  wsp resume [<id>] [--print]       the agents that were running before herdr
+                                    restarted, offered back one row at a time:
+                                    ␣ to pick, ↵ to bring those back on the
+                                    session they were on. With an id, that one —
+                                    which may reach further back than the last
+                                    census. --print says how to do it by hand
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp govern [<proj>] [--clear]     take the custodial seat on a project: raised
                                     hands under it arrive here instead of on a

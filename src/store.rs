@@ -1403,6 +1403,141 @@ impl Store {
         removed
     }
 
+    // ---- the roster ------------------------------------------------------
+    //
+    // What was running the last time anything looked: one row per agent pane,
+    // with the session id that can bring it back. Written by `sync` on the tick
+    // that feeds the agents section of the panel, so it is *the census a person
+    // last saw* rather than a history — which is the whole of what makes it
+    // safe to offer back after a restart.
+    //
+    // Ed, 2026-08-18, setting the boundary this file exists to enforce: "only
+    // resume an agent if the user asks for it, or if it was ACTIVE at the
+    // moment of the restart. Do not reload every agent the store has ever
+    // seen." `events.jsonl` held 134 session records on the machine that was
+    // said on, and a startup that walked those would open dozens of workspaces
+    // nobody asked for. The log is still the reader of last resort for one id a
+    // person names; it is never the source of a list.
+    //
+    // Overwritten whole, never appended to. A row that is not in the newest
+    // census is not resumable — the agent ended, and an agent that ended is not
+    // one a restart interrupted.
+
+    /// The last census: what was running when anything last looked.
+    pub fn roster(&self) -> Vec<Value> {
+        match self.read_json("resumable.json").get("rows") {
+            Some(Value::Array(rows)) => rows.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// When that census was taken. What a person is asked after a restart is
+    /// "here is what you had running", and how long ago is half of it.
+    pub fn roster_at(&self) -> String {
+        self.read_json("resumable.json")
+            .get("at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Replace it. Silent when the rows have not changed, because this runs on
+    /// every daemon tick and an unchanged file rewritten every twenty seconds
+    /// is wear for no reader — which is also why the timestamp is beside the
+    /// rows rather than on each one, where it would make every tick a change.
+    pub fn set_roster(&self, rows: Vec<Value>) -> bool {
+        if self.roster() == rows {
+            return false;
+        }
+        self.write_json("resumable.json", &json!({ "at": util::now_iso(), "rows": rows }));
+        true
+    }
+
+    /// The census a restart interrupted, held back from being overwritten.
+    ///
+    /// The roster is rewritten on every tick, and the tick after a restart
+    /// writes an empty one — so the thing worth offering has a lifetime of
+    /// about twenty seconds unless something takes a copy. This is that copy:
+    /// written once, when the daemon comes up and finds a census none of whose
+    /// agents are running, and cleared the moment a person has answered the
+    /// question. It is not a second roster and nothing keeps it current.
+    pub fn held(&self) -> Vec<Value> {
+        match self.read_json("resume-held.json").get("rows") {
+            Some(Value::Array(rows)) => rows.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn set_held(&self, rows: Vec<Value>) {
+        self.write_json("resume-held.json", &json!({ "at": util::now_iso(), "rows": rows }));
+    }
+
+    /// When the held census was taken — the roster's own timestamp, carried
+    /// over, because what a person is told is how long ago they were running.
+    pub fn held_at(&self) -> String {
+        self.read_json("resume-held.json")
+            .get("at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The question has been answered. Asked once per restart, and a list that
+    /// is offered forever is a list nobody reads.
+    pub fn clear_held(&self) {
+        let _ = fs::remove_file(self.state_file("resume-held.json"));
+    }
+
+    /// One row taken off the offer, by the session it names.
+    ///
+    /// Exact where the liveness filter is inferential: an agent that has just
+    /// been resumed is known to be back by the thing that brought it back, and
+    /// waiting for it to reappear in a census under the same id is a guess
+    /// about somebody else's runtime. Both are wanted — the filter catches the
+    /// agent that never died — but this is the one that cannot be wrong.
+    pub fn forget_held(&self, session: &str) {
+        let rows: Vec<Value> = self
+            .held()
+            .into_iter()
+            .filter(|r| r.get("session").and_then(Value::as_str) != Some(session))
+            .collect();
+        match rows.is_empty() {
+            true => self.clear_held(),
+            false => self.write_json(
+                "resume-held.json",
+                &json!({ "at": self.held_at(), "rows": rows }),
+            ),
+        }
+    }
+
+    /// Every event of one kind, oldest first, as the `data` each carried.
+    ///
+    /// The event log's first *reader*, and it exists because of what
+    /// `render-061` had to decide: how far back a resume reaches. A binding and
+    /// a seat each hold one session at a time and are dropped when the pane or
+    /// the workspace goes; `events.jsonl` is append-only and holds every
+    /// session that has ever been learned. So the record is the truth and this
+    /// is the fallback — reached only when the record is gone, and never
+    /// allowed to overrule one that is still there, because an id in the log
+    /// may have been superseded by a `/clear` the log also recorded.
+    ///
+    /// Whole-file, and deliberately not indexed. It is 134 lines on the machine
+    /// this was written on and it is read when a person types `wsp resume`,
+    /// which is not a hot path; the substring test before the parse is what
+    /// keeps it from being one if the file grows.
+    pub fn events_of(&self, kind: &str) -> Vec<Value> {
+        let Ok(text) = fs::read_to_string(self.state_file("events.jsonl")) else {
+            return Vec::new();
+        };
+        let needle = format!("\"kind\":\"{kind}\"");
+        text.lines()
+            .filter(|l| l.contains(&needle))
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("kind").and_then(Value::as_str) == Some(kind))
+            .filter_map(|v| v.get("data").cloned())
+            .collect()
+    }
+
     pub fn log_event(&self, kind: &str, data: Value) {
         let _ = fs::create_dir_all(&self.state);
         let line = json!({ "ts": util::now_iso(), "kind": kind, "data": data });

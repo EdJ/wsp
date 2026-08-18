@@ -23,6 +23,7 @@
 //! [`despawn`] is the other end of it, and its order is the reverse: the seat
 //! goes first and the claim last, for the reason `place.rs` gives.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -142,6 +143,22 @@ pub fn work_order(subject: &str, how: Handover) -> String {
 /// A pure function of what `spawn` resolved, so what an agent is handed can be
 /// asserted without a backend to hand it to.
 fn order(work: &Work, cwd: Option<&str>, on: Option<&str>, show: bool) -> Order {
+    Order {
+        label: work.label.clone(),
+        cwd: cwd.map(|c| c.to_string()),
+        env: seat_env(work.project.as_deref(), work.task.as_deref()),
+        on: on.map(|m| m.to_string()),
+        show,
+    }
+}
+
+/// What any seat wsp opens is given, whatever opened it.
+///
+/// Here rather than inlined above because `wsp resume` opens seats too, and a
+/// resumed agent that inherited the caller's session identity — or missed the
+/// store it is supposed to be reading — would be a second, quieter copy of
+/// every failure [`crate::place::shed`] was written for.
+pub(crate) fn seat_env(project: Option<&str>, task: Option<&str>) -> BTreeMap<String, String> {
     // Shed first: everything below is something this seat is *for*, and none of
     // it collides with a name the caller's Claude Code set.
     let mut env = crate::place::shed_env();
@@ -150,19 +167,13 @@ fn order(work: &Work, cwd: Option<&str>, on: Option<&str>, show: bool) -> Order 
     env.extend(
         util::store_env().into_iter().filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string()))),
     );
-    if let Some(p) = &work.project {
-        env.insert("WSP_PROJECT".into(), p.clone());
+    if let Some(p) = project {
+        env.insert("WSP_PROJECT".into(), p.to_string());
     }
-    if let Some(t) = &work.task {
-        env.insert("WSP_TASK".into(), t.clone());
+    if let Some(t) = task {
+        env.insert("WSP_TASK".into(), t.to_string());
     }
-    Order {
-        label: work.label.clone(),
-        cwd: cwd.map(|c| c.to_string()),
-        env,
-        on: on.map(|m| m.to_string()),
-        show,
-    }
+    env
 }
 
 /// Where a spawn is going: this machine unless `--on` says otherwise.
@@ -203,7 +214,7 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
 /// spelt the way its own CLI spells it and passed straight through — an
 /// unknown one is refused by herdr with the whole catalogue in the message,
 /// which is a better list than one kept here and left to go stale.
-const DEFAULT_KIND: &str = "claude";
+pub(crate) const DEFAULT_KIND: &str = "claude";
 
 /// How long the caller is prepared to wait, in three numbers and a clock.
 ///
@@ -466,10 +477,26 @@ fn took_it(place: &dyn Place, seat: &Seat, wait: &Patience) -> bool {
 /// The order of the two lines at the call sites is load-bearing: the caller
 /// prints *why* the spawn failed and then calls this, so the wait inside delays
 /// the advice and never the diagnosis.
-fn unreached(how: &dyn agent_commands::Kind, place: &dyn Place, spawn: &agent_commands::Spawn) {
+pub(crate) fn unreached(how: &dyn agent_commands::Kind, place: &dyn Place, spawn: &agent_commands::Spawn) {
     if let Some(line) = agent_commands::recovery(how.address(place, spawn)) {
         eprintln!("wsp: {line}");
     }
+}
+
+/// Wait for a just-started agent to be ready for input, on the CLI's patience.
+///
+/// The one thing a second caller of `place.start` needs and cannot have: the
+/// two-question sequence — *does it exist*, *will it listen* — is this file's,
+/// and [`Patience`] is deliberately private because its numbers were each set
+/// by a failure and are not a knob. `wsp resume` starts an agent exactly the
+/// way `spawn` does and waits exactly as long.
+pub(crate) fn ready(
+    place: &dyn Place,
+    how: &dyn agent_commands::Kind,
+    spawn: &agent_commands::Spawn,
+    kind: &str,
+) -> Result<(), String> {
+    wait_ready(place, how, spawn, kind, &Patience::default())
 }
 
 /// What `spawn` resolved its argument to.
@@ -707,7 +734,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // a seat from starting an agent in it, so wsp holds the seat before
         // there is anything sitting there to ask. That ordering is what makes
         // the handle knowable in advance rather than discovered afterwards.
-        let spawn = agent_commands::Spawn { full: args.has("full"), name: &name, seat: &seat };
+        let spawn = agent_commands::Spawn { full: args.has("full"), name: &name, seat: &seat, resume: None };
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Whatever a backend
@@ -831,7 +858,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
 /// work never needed one. A slot does: it is keyed on the workspace for the
 /// same reason a claim is, so that an agent cleared and restarted on a new pane
 /// is the same custodian rather than a vacancy.
-fn workspace_of(seat: &Seat) -> Option<String> {
+pub(crate) fn workspace_of(seat: &Seat) -> Option<String> {
     crate::herdr::panes()
         .ok()?
         .into_iter()
@@ -1007,7 +1034,7 @@ fn end_work(place: &dyn Place, store: &Store, args: &Args, me: Option<&str>) -> 
 }
 
 /// `wsp claim <task> --pane <pane>`, called rather than shelled out to.
-fn cmd_agent_claim(store: &Store, task: &str, flags: &[(&str, &str)]) -> i32 {
+pub(crate) fn cmd_agent_claim(store: &Store, task: &str, flags: &[(&str, &str)]) -> i32 {
     crate::cmd_agent::claim(store, &Args::synth("claim", &[task], flags))
 }
 
@@ -1341,7 +1368,7 @@ mod tests {
         seat: &Seat,
         clock: &util::Dial,
     ) -> Result<(), String> {
-        let spawn = agent_commands::Spawn { full: false, name: "t-260817-010", seat };
+        let spawn = agent_commands::Spawn { full: false, name: "t-260817-010", seat, resume: None };
         let wait = Patience {
             ready: READY,
             taken: TAKEN,
@@ -1539,7 +1566,7 @@ mod tests {
 
     fn handing_over(place: &Composer, clock: &util::Dial) -> Result<(), String> {
         let seat = Seat::new("w3M:p1");
-        let spawn = agent_commands::Spawn { full: false, name: "robustness-035", seat: &seat };
+        let spawn = agent_commands::Spawn { full: false, name: "robustness-035", seat: &seat, resume: None };
         let wait = Patience {
             ready: READY,
             taken: TAKEN,

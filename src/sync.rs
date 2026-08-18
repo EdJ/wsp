@@ -70,6 +70,55 @@ fn kept_bindings<'a>(
     keep
 }
 
+/// The census, as rows that can be offered back: one per running agent, with
+/// what it would take to bring that agent back.
+///
+/// **Only panes with an agent and a session.** A shell is not an agent and has
+/// no thread to resume; an agent herdr has not yet reported a session for is
+/// one wsp cannot bring back, and a row promising otherwise would be a row
+/// that fails when it is taken. Both are omitted rather than drawn dim,
+/// because this list is a set of *offers*.
+///
+/// What each row carries is what `wsp resume` needs and nothing else: where it
+/// was, what it was on, and how to say so to a person. It is a projection of
+/// live state rather than a record — the file is overwritten whole on every
+/// tick — so nothing here is durable and nothing else may read it as if it
+/// were.
+fn roster(
+    panes: &[herdr::Pane],
+    agents: &[herdr::Pane],
+    bindings: &std::collections::BTreeMap<String, Value>,
+    governors: &std::collections::BTreeMap<String, Value>,
+) -> Vec<Value> {
+    panes
+        .iter()
+        .filter(|p| !p.agent.is_empty() && !p.session_id.is_empty())
+        .map(|p| {
+            let cwd = match p.cwd.is_empty() {
+                true => agents
+                    .iter()
+                    .find(|a| a.pane_id == p.pane_id && !a.cwd.is_empty())
+                    .map(|a| a.cwd.as_str())
+                    .unwrap_or_default(),
+                false => p.cwd.as_str(),
+            };
+            serde_json::json!({
+                "pane": p.pane_id,
+                "workspace": p.workspace_id,
+                "session": p.session_id,
+                "cwd": cwd,
+                "kind": p.agent,
+                "label": p.label,
+                "task": bindings
+                    .get(&p.pane_id)
+                    .and_then(|b| b.get("task_id"))
+                    .and_then(Value::as_str),
+                "seat": crate::cmd_govern::governs(governors, &p.workspace_id),
+            })
+        })
+        .collect()
+}
+
 /// Compute and push tokens. `force` ignores the change cache (used on the
 /// periodic TTL refresh).
 pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Report> {
@@ -115,6 +164,33 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
                 store,
                 panes.iter().map(|p| (p.pane_id.as_str(), p.session_id.as_str())),
             );
+            // And the same reading again for the seats, off the same rows.
+            // A custodian holds no claim, so nothing above this line records
+            // its session anywhere — see `cmd_govern::learn_seats`, which is
+            // the whole of `render-061`'s writer and costs one pass over a
+            // list already in hand.
+            crate::cmd_govern::learn_seats(
+                store,
+                panes.iter().map(|p| {
+                    let cwd = match p.cwd.is_empty() {
+                        // `pane.list` does not always carry a cwd; `agent.list`
+                        // does, and it was already read above for the sidebar.
+                        true => agents
+                            .iter()
+                            .find(|a| a.pane_id == p.pane_id && !a.cwd.is_empty())
+                            .map(|a| a.cwd.as_str())
+                            .unwrap_or_default(),
+                        false => p.cwd.as_str(),
+                    };
+                    (p.workspace_id.as_str(), p.session_id.as_str(), cwd)
+                }),
+            );
+            // And the census itself, kept so a restart can offer back what a
+            // person was actually looking at. `render-061`: written here
+            // because this is the same reading the agents section of the panel
+            // is drawn from, on the same tick — so what the roster holds is
+            // what was last on screen, and not a walk of anything older.
+            store.set_roster(roster(&panes, &agents, &bindings, &governors));
             dropped
         }
     };
