@@ -1216,7 +1216,13 @@ mod tests {
                 },
             )
             .expect("a process");
-        assert!(until(|| out.exists()), "the child never ran");
+        // Wait on the child exiting, not on the file appearing: the shell
+        // creates `env.txt` when it opens the redirection, ~20ms before `env`
+        // writes a byte into it, so existence says the child *started*. Run
+        // alone this failed 48 times in 50 on an empty env dump; under a loaded
+        // suite the first poll got descheduled and handed the child its 20ms,
+        // which is why concurrency was hiding the bug rather than causing it.
+        assert!(until(|| place.state(&seat).unwrap() == State::Gone), "the child never ran");
         std::env::remove_var(place::CHILD_MARKER);
         std::env::remove_var("CLAUDE_CODE_MESSAGING_TOKEN");
 
