@@ -238,6 +238,28 @@ impl Pick {
         }
     }
 
+    /// The question to put in front of this pick's `↵`, where it needs one.
+    ///
+    /// Only the three that move an agent. A pick is already two deliberate acts
+    /// — the key, then the row — so it is the last place a y/n looks earned;
+    /// what makes it earned here is that the second act is `↵`, the panel's
+    /// busiest key, and the tree under it is full of rows. Landing it one row
+    /// out on a claim binds the wrong pane and empties the wrong context.
+    ///
+    /// [`Pick::MoveTask`] and [`Pick::MoveProject`] get none. They rewrite a
+    /// field, `m` puts it back, and nothing that has been thinking for an hour
+    /// is affected either way.
+    pub(super) fn confirm(&self, at: &Target) -> Option<String> {
+        match (self, at) {
+            (Pick::PaneForTask { task }, Target::Pane(pane)) => Some(format!("hand {task} to {pane}?")),
+            (Pick::TaskForPane { pane }, Target::Task(task)) => Some(format!("put {pane} on {task}?")),
+            (Pick::WorkForAgent { pane, .. }, Target::Project(p)) => {
+                Some(format!("set {pane} to work {p}?"))
+            }
+            _ => None,
+        }
+    }
+
     /// The stronger form of [`argv`](Pick::argv), for when the CLI refuses.
     ///
     /// Only the two claims have one. `claim` refuses on work that is done, on
@@ -282,6 +304,26 @@ fn begin(view: &mut View, verb: Pick) -> Effect {
         view.agents = false;
         return Effect::Refetch;
     }
+    Effect::None
+}
+
+/// Put a question in front of a deed: the key has decided *what*, and this is
+/// the panel asking whether you meant to press it.
+///
+/// Everything an agent has is behind five of these keys, and each of them is
+/// one shift or one finger away from something harmless: `S` from the `s` that
+/// starts a task, `C` from the `c` beside it, `f` from the `d` that finishes
+/// one, `u` from the `i` that shows ids. The cost of the slip is not
+/// symmetrical — nothing undoes an emptied context window, and a claim landing
+/// on the wrong pane takes two agents down rather than one. So the letters that
+/// generate or re-aim an agent go through here, and the ones that merely look,
+/// move or change a record do not: a y/n on every keystroke is a y/n nobody
+/// reads.
+///
+/// `O` is the deliberate exception among neighbours: it opens a workspace and
+/// costs a directory, where `S` beside it costs a model and a context window.
+fn ask(view: &mut View, question: String, deed: Effect) -> Effect {
+    view.mode = Mode::Confirm { question, deed: Box::new(deed) };
     Effect::None
 }
 
@@ -547,9 +589,17 @@ fn find_work(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
             Pick::WorkForAgent { pane: a.pane.clone(), workspace: a.workspace.clone() },
         );
     };
+    // No `say` in front of it any more: the note is what [`super::run::tell`]
+    // puts on the footer once the sentence has actually gone in, and while the
+    // question is up the footer is the question.
     let tell = tell_find_work(a, &project);
-    say(ui, tell.note.clone());
-    Effect::Tell(tell)
+    // The project and not the agent, because the confirm is a footer line over
+    // a tree that has not moved: the agent is the row the cursor is sitting on
+    // and naming it again spends the twenty-eight columns the footer has on the
+    // one fact already on screen. Where it went is what you cannot see — it
+    // comes off a mandate or off the pane's directory, and getting it wrong
+    // sends an agent to work somewhere it will refuse to be.
+    ask(view, format!("find work in {project}?"), Effect::Tell(tell))
 }
 
 /// `C`: hand this task to whoever is spare, if anybody is.
@@ -571,7 +621,7 @@ fn find_work(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
 /// and saying it here would be a second copy of `claim`'s rules that could
 /// drift from the first — the refusal comes back as the y/n that `escalate`
 /// turns it into, exactly as it does from the pick.
-fn hand_over(target: &Target, ui: &mut Ui) -> Effect {
+fn hand_over(target: &Target, ui: &mut Ui, view: &mut View) -> Effect {
     let Target::Task(id) = target else {
         say(ui, "C hands work to a spare agent — aim at a task");
         return Effect::None;
@@ -592,7 +642,15 @@ fn hand_over(target: &Target, ui: &mut Ui) -> Effect {
     let argv = vec!["claim".into(), id.clone(), "--pane".into(), a.pane.clone()];
     let mut forced = argv.clone();
     forced.push("--force".into());
-    Effect::Run { argv, escalate: Some(forced), then: Some(tell_claimed(&a, id)) }
+    // The question names the pane, because this is the one key that chose it
+    // for you: `c` was pointed at somebody, and here the census was. A slip
+    // lands work on whichever agent happened to sort first, and the y/n is the
+    // only place that name is ever put in front of you.
+    ask(
+        view,
+        format!("hand {id} to {}?", a.where_()),
+        Effect::Run { argv, escalate: Some(forced), then: Some(tell_claimed(&a, id)) },
+    )
 }
 
 /// `u`: take the work back off an agent, and leave it spare.
@@ -613,7 +671,7 @@ fn hand_over(target: &Target, ui: &mut Ui) -> Effect {
 /// command, and an agent in the middle of a turn has a prompt that is not a
 /// prompt. The release still lands — taking work off a runaway agent is when
 /// you most want this key — and only the emptying waits for it to stop.
-fn unassign(target: &Target, ui: &mut Ui) -> Effect {
+fn unassign(target: &Target, ui: &mut Ui, view: &mut View) -> Effect {
     let holder = match target {
         Target::Pane(p) => ui.agent_at_pane(p),
         Target::Task(id) => ui.agent_on_task(id),
@@ -638,16 +696,26 @@ fn unassign(target: &Target, ui: &mut Ui) -> Effect {
     };
     let idle = a.agent && a.state == "idle";
     let then = idle.then(|| tell_released(&a, &task)).flatten();
-    if !idle {
-        say(ui, format!("{} → nothing · still working, so not cleared", a.where_()));
-    }
-    Effect::Run {
-        // No `--force`. `release` refuses on nothing: a pane either holds a
-        // binding or it does not, and the panel only got here by finding one.
-        argv: vec!["release".into(), "--pane".into(), a.pane.clone()],
-        escalate: None,
-        then,
-    }
+    // Whether it is mid-task belongs in the question rather than in a note
+    // beside it: the footer is one line and the confirm has it, so anything
+    // said here would be said to nobody. It is also the fact you most want
+    // before answering — taking work off an agent that is still doing it is
+    // the case this key exists for and the case a slip does most harm in.
+    let question = match idle {
+        true => format!("take {task} off {}?", a.where_()),
+        false => format!("{} is working · take {task} off it?", a.where_()),
+    };
+    ask(
+        view,
+        question,
+        Effect::Run {
+            // No `--force`. `release` refuses on nothing: a pane either holds a
+            // binding or it does not, and the panel only got here by finding one.
+            argv: vec!["release".into(), "--pane".into(), a.pane.clone()],
+            escalate: None,
+            then,
+        },
+    )
 }
 
 /// `W`: leave the agents view standing on the work.
@@ -1464,10 +1532,10 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // The same join, made without being asked who. `c` is for when you
         // know which pane you want; this is for when the only thing you want
         // is that somebody takes it.
-        Key::Char('C') => hand_over(&target, ui),
+        Key::Char('C') => hand_over(&target, ui, view),
         // The other direction. `c` joins a task to an agent; this takes the
         // join apart from whichever end you are looking at it from.
-        Key::Char('u') => unassign(&target, ui),
+        Key::Char('u') => unassign(&target, ui, view),
         // The dock's own verb. `c` needs you to have decided what the work is;
         // this needs only that there is some.
         //
@@ -1577,32 +1645,30 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 
         // ---- open a workspace for this row, with or without somebody in it ----
         //
-        // Two keys rather than one that asks, because they are two different
-        // decisions and only one of them is expensive: `O` is a place to work
-        // and `S` is a colleague, and the second costs a model and a context
-        // window. A y/n between the key and the thing would put the same
-        // question in front of the cheap one every time.
-        Key::Char('O') => spawn(&target, ui, false),
-        Key::Char('S') => spawn(&target, ui, true),
+        // Two keys rather than one that asks which, because they are two
+        // different decisions and only one of them is expensive: `O` is a
+        // place to work and `S` is a colleague, and the second costs a model
+        // and a context window. That asymmetry is also why only `S` puts a y/n
+        // in front of itself — a single key that first asked *which* would
+        // have put a question in front of the cheap one every time.
+        Key::Char('O') => spawn(&target, ui, view, false),
+        Key::Char('S') => spawn(&target, ui, view, true),
 
         // ---- destructive ----
         Key::Char('X') => match &target {
-            Target::Task(id) => {
-                view.mode = Mode::Confirm {
-                    argv: vec!["rm".into(), id.clone()],
-                    question: format!("retire {id}?"),
-                    escalate: None,
-                    then: None,
-                };
-                Effect::None
-            }
-            Target::Project(p) => {
-                // Deliberately without --force. If the project still holds
-                // work the CLI refuses, and that refusal becomes the next
-                // question rather than something the panel quietly overrode.
-                view.mode = Mode::Confirm {
+            Target::Task(id) => ask(
+                view,
+                format!("retire {id}?"),
+                Effect::Run { argv: vec!["rm".into(), id.clone()], escalate: None, then: None },
+            ),
+            // Deliberately without --force. If the project still holds work
+            // the CLI refuses, and that refusal becomes the next question
+            // rather than something the panel quietly overrode.
+            Target::Project(p) => ask(
+                view,
+                format!("remove {p}?"),
+                Effect::Run {
                     argv: vec!["project".into(), "rm".into(), p.clone()],
-                    question: format!("remove {p}?"),
                     escalate: Some(vec![
                         "project".into(),
                         "rm".into(),
@@ -1610,9 +1676,8 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                         "--force".into(),
                     ]),
                     then: None,
-                };
-                Effect::None
-            }
+                },
+            ),
             _ => {
                 say(ui, "nothing there to remove");
                 Effect::None
@@ -1640,7 +1705,7 @@ pub(super) fn toggle(view: &mut View, want: crate::detail::Focus) -> Effect {
 /// carry a second copy of any of that — which is how `O` came to open a
 /// workspace in the wrong tree for every task under `wsp/render`, a project
 /// whose root is its parent's.
-fn spawn(target: &Target, ui: &mut Ui, agent: bool) -> Effect {
+fn spawn(target: &Target, ui: &mut Ui, view: &mut View, agent: bool) -> Effect {
     let (mut argv, what) = match target {
         Target::Task(id) => (vec!["spawn".to_string(), id.clone()], id.clone()),
         Target::Project(p) => (
@@ -1666,7 +1731,15 @@ fn spawn(target: &Target, ui: &mut Ui, agent: bool) -> Effect {
         true => format!("starting an agent on {what}…"),
         false => format!("opening {what}…"),
     };
-    Effect::Spawn { argv, note }
+    let deed = Effect::Spawn { argv, note };
+    // Only the expensive half asks. A workspace is a directory and a pane; an
+    // agent is a model, a context window and a colleague who will start
+    // working on whatever the cursor happened to be on — and `S` sits one
+    // shift away from the `s` that starts a task.
+    match agent {
+        true => ask(view, format!("start an agent on {what}?"), deed),
+        false => deed,
+    }
 }
 
 /// Status verbs all have the same shape: one key, a task, no input.

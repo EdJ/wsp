@@ -233,18 +233,24 @@ pub(crate) enum Mode {
     /// the footer count are already there in the meantime, and it comes up the
     /// moment the prompt closes.
     Card(Card),
+    /// A yes before something that cannot be un-pressed.
+    ///
+    /// It holds the [`Effect`] itself rather than an argv, and that is what
+    /// lets one mode stand in front of every key that needs it. The first one
+    /// guarded `X`, whose whole content is a command, so an argv was the
+    /// obvious payload — and it then could not be reached for by `S`, which
+    /// starts an agent ([`Effect::Spawn`]), or by `f`, which types into a pane
+    /// ([`Effect::Tell`]) and runs no command at all. Carrying the deed means
+    /// the question is about *the thing the key was going to do*, whatever
+    /// shape that is, and `y` is the key pressing itself again.
+    ///
+    /// Everything that used to be spelled out beside the argv — the stronger
+    /// form to offer if the CLI refuses, the sentence an agent is owed once a
+    /// claim lands — is inside [`Effect::Run`] already, and travels across the
+    /// question by travelling with the deed.
     Confirm {
-        argv: Vec<String>,
         question: String,
-        /// What to offer if `argv` is refused. The panel does not decide on
-        /// your behalf that a refusal should be overridden — it puts the
-        /// refusal on screen and asks again.
-        escalate: Option<Vec<String>>,
-        /// Carried across the question, because a confirmed claim is still a
-        /// claim: the agent has to be told either way. Dropping it here left
-        /// the one case that most needs the sentence — work taken by force —
-        /// as the one case with nobody told about it.
-        then: Option<Tell>,
+        deed: Box<Effect>,
     },
 }
 
@@ -513,10 +519,12 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("e n", "retitle, note"),
                 ("t", "tags: ␣ picks, ↵ saves"),
                 ("!", "high, low, normal"),
-                ("m c f", "move, claim, find work"),
-                ("C", "hand it to a spare agent"),
-                ("u", "take the work back, clear"),
-                ("O S", "a terminal, an agent"),
+                ("m", "move it"),
+                ("c f", "claim, find work · y/n"),
+                ("C", "hand to a spare · y/n"),
+                ("u", "take the work back · y/n"),
+                ("O", "a terminal here"),
+                ("S", "an agent on it · y/n"),
                 ("T", "say it to a project's governor"),
                 ("x", "lower a raised flag"),
                 ("↵", "on a flag: the card again"),
@@ -554,6 +562,11 @@ pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
 }
 
 /// What a key asked for beyond changing the view.
+///
+/// Comparable and cloneable because [`Mode::Confirm`] holds one: a deed put
+/// behind a y/n is the same value the key would have returned, kept until the
+/// answer comes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Effect {
     None,
     Refetch,
@@ -595,9 +608,18 @@ pub(crate) enum Effect {
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.
     ///
+    /// `escalate` is the stronger form to offer if the CLI refuses this one.
+    /// The panel does not decide on your behalf that a refusal should be
+    /// overridden — it puts what the CLI said on screen as the next question,
+    /// which is why the refusal is worded by the code that knows the rule.
+    ///
     /// `then` is what to say to an agent once it has worked — a claim that
     /// nobody tells the agent about leaves it sitting idle on work it now
     /// holds. Withheld if the command is refused: the sentence would be a lie.
+    /// It rides here rather than beside the question in [`Mode::Confirm`], so
+    /// that a claim confirmed is still a claim with somebody told about it —
+    /// dropping it across the question once left the one case that most needs
+    /// the sentence, work taken by force, as the one case with nobody told.
     Run { argv: Vec<String>, escalate: Option<Vec<String>>, then: Option<Tell> },
     /// Type into an agent's pane. The only effect that changes nothing at all
     /// in the store — what it changes is what an agent is about to do.
@@ -775,8 +797,21 @@ pub(super) fn pick_key(k: Key, ui: &mut Ui, view: &mut View, verb: Pick) -> Effe
                 // in an argv.
                 let then = pick_tell(&verb, &ui.selected_target(), ui);
                 let escalate = verb.escalate(&argv);
-                view.mode = Mode::Browse;
-                Effect::Run { argv, escalate, then }
+                let question = verb.confirm(&ui.selected_target());
+                let deed = Effect::Run { argv, escalate, then };
+                match question {
+                    // The pick closes either way. A y/n drawn over a tree that
+                    // is still hunting would be two questions on one line, and
+                    // `n` has to land somewhere that is not another `↵`.
+                    Some(q) => {
+                        view.mode = Mode::Confirm { question: q, deed: Box::new(deed) };
+                        Effect::None
+                    }
+                    None => {
+                        view.mode = Mode::Browse;
+                        deed
+                    }
+                }
             }
             // Not a destination, but not nothing either: a `⋯`, or a branch
             // that is folded, is a row whose whole purpose is to be opened —
@@ -954,18 +989,11 @@ pub(super) fn card_key(k: Key, ui: &mut Ui, view: &mut View, card: Card) -> Effe
     }
 }
 
-pub(super) fn confirm_key(
-    k: Key,
-    ui: &mut Ui,
-    view: &mut View,
-    argv: Vec<String>,
-    escalate: Option<Vec<String>>,
-    then: Option<Tell>,
-) -> Effect {
+pub(super) fn confirm_key(k: Key, ui: &mut Ui, view: &mut View, deed: Effect) -> Effect {
     match k {
         Key::Char('y') | Key::Char('Y') => {
             view.mode = Mode::Browse;
-            Effect::Run { argv, escalate, then }
+            deed
         }
         Key::Char('n') | Key::Char('N') | Key::Esc | Key::Interrupt | Key::Enter => {
             view.mode = Mode::Browse;
@@ -1398,14 +1426,9 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 view.mode = Mode::Card(card.clone());
                 card_key(k, ui, view, card)
             }
-            Mode::Confirm { argv, question, escalate, then } => {
-                view.mode = Mode::Confirm {
-                    argv: argv.clone(),
-                    question,
-                    escalate: escalate.clone(),
-                    then: then.clone(),
-                };
-                confirm_key(k, ui, view, argv, escalate, then)
+            Mode::Confirm { question, deed } => {
+                view.mode = Mode::Confirm { question, deed: deed.clone() };
+                confirm_key(k, ui, view, *deed)
             }
         }
     };

@@ -712,7 +712,7 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .to_pane("w4:p2")
             .key(Key::Char('f'))
-            .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command."),
+            .scene("Letting it choose for itself", "The other half of the same idea. `c` hands over a task you picked; `f` hands over a *project* and lets the agent pick inside it — and asks first, because everything that aims an agent does. Say yes and the panel types `wsp next` into the pane and leaves. The project comes from the same chain the agent's own `wsp where` would use, so the panel can never send a pane somewhere it would disagree it is. Shells are refused and a working agent is left alone: a sentence typed into the wrong pane is a command, and a refusal puts up no question at all."),
     );
 
     out.push(
@@ -1004,6 +1004,13 @@ fn scenes() -> Vec<Scene> {
             .down_to(panel::RowKind::Agent)
             .key(Key::Char('c'))
             .scene("Migrating an agent", "The same key from the pane row. Landing on a task moves the agent to it: the task being left keeps its status — work underway with nobody on it is a real state — and gives up its claim, keeping the record of who had it. The cursor is on the pane row, and the pane row is what the tree carries to wherever it lands."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .to_pane("w2:p1")
+            .key(Key::Char('u'))
+            .scene("Before taking work back", "The five keys that generate or re-aim an agent — S C c f u — all ask, the way X does. Nothing here is a record you can retype: u releases the claim *and* empties the window, and an emptied context does not come back. The question names the agent rather than the pane id, and says whether it is still mid-task, which is the fact you want before answering and the one the tree does not show you."),
     );
 
     out.extend(detail_scenes(&w));
@@ -3157,6 +3164,32 @@ mod tests {
         panel::apply_key(Key::Char(c), ui, view)
     }
 
+    /// Press a key that asks first, and say yes.
+    ///
+    /// Every key that generates or re-aims an agent goes behind a y/n, so the
+    /// tests that are about *what the key does* would otherwise all be about
+    /// the question instead. This asserts the question happened — a key that
+    /// stopped asking fails here — and then answers it, so what comes back is
+    /// the deed, exactly as the un-guarded press used to return it.
+    fn confirmed(ui: &mut panel::Ui, view: &mut panel::View, c: char) -> panel::Effect {
+        match panel::apply_key(Key::Char(c), ui, view) {
+            panel::Effect::None => {}
+            _ => panic!("{c} should ask before it acts, not act"),
+        }
+        assert!(matches!(view.mode, panel::Mode::Confirm { .. }), "{c} put up no question");
+        press(ui, view, 'y')
+    }
+
+    /// The same, for the `↵` that finishes a pick onto an agent.
+    fn confirmed_enter(ui: &mut panel::Ui, view: &mut panel::View) -> panel::Effect {
+        match panel::apply_key(Key::Enter, ui, view) {
+            panel::Effect::None => {}
+            _ => panic!("a pick onto an agent should ask before it acts"),
+        }
+        assert!(matches!(view.mode, panel::Mode::Confirm { .. }), "the pick put up no question");
+        press(ui, view, 'y')
+    }
+
     /// Open the agents section past the five it keeps on screen, the way `→` on
     /// its `⋯` does. A test that wants the sixth agent has to ask for it exactly
     /// as a person would — and the last overflow row in the tree is the
@@ -3234,7 +3267,7 @@ mod tests {
                 break;
             }
         }
-        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+        match confirmed_enter(&mut ui, &mut view) {
             panel::Effect::Run { argv, .. } => {
                 assert_eq!(argv, vec!["claim", "t-108", "--pane", "w4:p2"]);
             }
@@ -3285,7 +3318,7 @@ mod tests {
                 break;
             }
         }
-        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+        match confirmed_enter(&mut ui, &mut view) {
             panel::Effect::Run { argv, .. } => {
                 assert_eq!(argv, vec!["claim", "t-020", "--pane", "w4:p2"]);
             }
@@ -3341,7 +3374,7 @@ mod tests {
             panel::Effect::Spawn { argv, .. } => assert_eq!(argv, ["spawn", "t-003", "--focus"]),
             _ => panic!("O on a task opens a workspace for it"),
         }
-        match press(&mut ui, &mut view, 'S') {
+        match confirmed(&mut ui, &mut view, 'S') {
             panel::Effect::Spawn { argv, .. } => {
                 assert_eq!(argv, ["spawn", "t-003", "--agent"])
             }
@@ -3354,7 +3387,7 @@ mod tests {
         // the panel's job here rather than the CLI's: the panel knows which row
         // it is standing on.
         on_target(&mut ui, panel::Target::Project("verb".into()));
-        match press(&mut ui, &mut view, 'S') {
+        match confirmed(&mut ui, &mut view, 'S') {
             panel::Effect::Spawn { argv, .. } => {
                 assert_eq!(argv, ["spawn", "-p", "verb", "--agent"])
             }
@@ -3377,7 +3410,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         on_pane(&mut ui, "w4:p2");
-        match press(&mut ui, &mut view, 'f') {
+        match confirmed(&mut ui, &mut view, 'f') {
             panel::Effect::Tell(t) => {
                 assert_eq!(t.pane, "w4:p2");
                 let said = t.text.clone().expect("a sentence, not just a clear");
@@ -3398,7 +3431,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         on_pane(&mut ui, "w4:p2");
-        match press(&mut ui, &mut view, 'f') {
+        match confirmed(&mut ui, &mut view, 'f') {
             panel::Effect::Tell(t) => {
                 let said = t.text.clone().expect("a sentence, not just a clear");
                 assert!(said.contains("wsp next -p verb"), "said: {said}");
@@ -3415,15 +3448,24 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
 
+        // Refused, not asked. `f` returns `Effect::None` both when it declines
+        // and when it has put its y/n up, so the mode is what tells the two
+        // apart — and a refusal that left a question standing would be a key
+        // that says no and then offers to do it anyway.
+        let refused = |ui: &mut panel::Ui, view: &mut panel::View| {
+            let e = press(ui, view, 'f');
+            matches!(e, panel::Effect::None) && matches!(view.mode, panel::Mode::Browse)
+        };
+
         on_pane(&mut ui, "w5:p1"); // a shell standing in ~/claude/wsp
-        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+        assert!(refused(&mut ui, &mut view));
 
         show_all_agents(&w, &mut ui, &mut view);
         on_pane(&mut ui, "w3:p1"); // an agent working, holding no task
-        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+        assert!(refused(&mut ui, &mut view));
 
         on_pane(&mut ui, "w1:p1"); // an agent already holding t-001
-        assert!(matches!(press(&mut ui, &mut view, 'f'), panel::Effect::None));
+        assert!(refused(&mut ui, &mut view));
     }
 
     /// The other door to the same place. A claim is a fact in the store and
@@ -3444,7 +3486,7 @@ mod tests {
         }
         press(&mut ui, &mut view, 'c');
         on_pane(&mut ui, "w4:p2");
-        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+        match confirmed_enter(&mut ui, &mut view) {
             panel::Effect::Run { argv, then, .. } => {
                 assert_eq!(argv, vec!["claim", "t-020", "--pane", "w4:p2"]);
                 let t = then.expect("an idle agent handed a task is told about it");
@@ -3477,7 +3519,7 @@ mod tests {
             }
             press(&mut ui, &mut view, 'c');
             on_pane(&mut ui, "w4:p2");
-            match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+            match confirmed_enter(&mut ui, &mut view) {
                 panel::Effect::Run { then, .. } => then.expect("an idle agent is told").clear,
                 _ => panic!("the pick should run a claim"),
             }
@@ -3514,7 +3556,7 @@ mod tests {
                 break;
             }
         }
-        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+        match confirmed_enter(&mut ui, &mut view) {
             panel::Effect::Run { argv, then, .. } => {
                 assert_eq!(argv, vec!["mandate", "verb", "-w", "w6"]);
                 let t = then.expect("and it is told to go and look");
@@ -3563,7 +3605,7 @@ mod tests {
         }
         press(&mut ui, &mut view, 'c');
         on_pane(&mut ui, "w4:p2");
-        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+        match confirmed_enter(&mut ui, &mut view) {
             panel::Effect::Run { argv, escalate, .. } => {
                 assert_eq!(argv, vec!["claim", "t-020", "--pane", "w4:p2"]);
                 assert_eq!(
@@ -3590,7 +3632,7 @@ mod tests {
                 break;
             }
         }
-        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+        match confirmed_enter(&mut ui, &mut view) {
             panel::Effect::Run { argv, escalate, .. } => {
                 assert_eq!(argv, vec!["mandate", "verb", "-w", "w6"]);
                 assert!(escalate.is_none());
@@ -3619,7 +3661,7 @@ mod tests {
         // pick, or some of them can never be handed anything.
         show_all_agents(&w, &mut ui, &mut view);
         on_pane(&mut ui, "w3:p1");
-        match panel::apply_key(Key::Enter, &mut ui, &mut view) {
+        match confirmed_enter(&mut ui, &mut view) {
             panel::Effect::Run { argv, then, .. } => {
                 assert_eq!(argv, vec!["claim", "t-020", "--pane", "w3:p1"]);
                 assert!(then.is_none(), "a working agent is not typed into");
@@ -3641,7 +3683,7 @@ mod tests {
         let mut ui = ui_of(&w, &view);
         // A task in `trance`, and w4:p2 is the spare agent standing there.
         on_task(&mut ui, "t-001");
-        match press(&mut ui, &mut view, 'C') {
+        match confirmed(&mut ui, &mut view, 'C') {
             panel::Effect::Run { argv, escalate, then } => {
                 assert_eq!(argv, vec!["claim", "t-001", "--pane", "w4:p2"]);
                 assert_eq!(
@@ -3673,7 +3715,7 @@ mod tests {
 
         let pane_for = |ui: &mut panel::Ui, view: &mut panel::View, task: &str| -> String {
             on_task(ui, task);
-            match press(ui, view, 'C') {
+            match confirmed(ui, view, 'C') {
                 panel::Effect::Run { argv, .. } => argv[3].clone(),
                 _ => panic!("C should claim onto a spare agent"),
             }
@@ -3706,7 +3748,7 @@ mod tests {
             "the review filter is the case: no agent row is on screen at all",
         );
         on_task(&mut ui, "t-004");
-        match press(&mut ui, &mut view, 'C') {
+        match confirmed(&mut ui, &mut view, 'C') {
             panel::Effect::Run { argv, .. } => {
                 assert_eq!(argv, vec!["claim", "t-004", "--pane", "w6:p1"]);
             }
@@ -3772,7 +3814,7 @@ mod tests {
         // w2:p1 is idle on t-003 — the "needs you" case, and the one you most
         // want this key for.
         on_pane(&mut ui, "w2:p1");
-        match press(&mut ui, &mut view, 'u') {
+        match confirmed(&mut ui, &mut view, 'u') {
             panel::Effect::Run { argv, escalate, then } => {
                 assert_eq!(argv, vec!["release", "--pane", "w2:p1"]);
                 assert!(escalate.is_none(), "release has nothing to refuse on");
@@ -3795,7 +3837,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         on_task(&mut ui, "t-003");
-        match press(&mut ui, &mut view, 'u') {
+        match confirmed(&mut ui, &mut view, 'u') {
             panel::Effect::Run { argv, then, .. } => {
                 assert_eq!(argv, vec!["release", "--pane", "w2:p1"]);
                 assert!(then.is_some(), "the agent it names is idle, so it is cleared");
@@ -3814,7 +3856,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         on_pane(&mut ui, "w1:p1"); // working, holding t-001
-        match press(&mut ui, &mut view, 'u') {
+        match confirmed(&mut ui, &mut view, 'u') {
             panel::Effect::Run { argv, then, .. } => {
                 assert_eq!(argv, vec!["release", "--pane", "w1:p1"]);
                 assert!(then.is_none(), "a working agent is not typed into");
@@ -3837,7 +3879,7 @@ mod tests {
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
         on_pane(&mut ui, "w2:p1");
-        match press(&mut ui, &mut view, 'u') {
+        match confirmed(&mut ui, &mut view, 'u') {
             panel::Effect::Run { argv, then, .. } => {
                 assert_eq!(argv, vec!["release", "--pane", "w2:p1"]);
                 assert!(then.is_none(), "nothing to clear and nothing to say");
@@ -3868,6 +3910,119 @@ mod tests {
             }
         }
         assert!(matches!(press(&mut ui, &mut view, 'u'), panel::Effect::None));
+    }
+
+    // ---- the question in front of all five ---------------------------------
+
+    /// The five keys that make an agent or move one all ask before they act.
+    ///
+    /// They are the only keys in the panel whose damage cannot be typed back:
+    /// `S` spends a context window, `C`, `c` and `f` aim one at work, and `u`
+    /// empties one. Everything else here writes a field that another key
+    /// rewrites. And each sits one shift or one finger from something harmless
+    /// — `s`, `c`, `d`, `i` — so this is a list of what a slip costs, written
+    /// out by name rather than left to whichever test happens to press each
+    /// key.
+    #[test]
+    fn every_key_that_makes_or_moves_an_agent_asks_first() {
+        let w = world();
+
+        // Each key with a row it would actually work on: the question only
+        // comes up where the key does something, and a refusal is not a
+        // question — see `nothing_is_typed_into_a_shell_or_a_busy_agent`.
+        let asks = |aim: &dyn Fn(&mut panel::Ui), k: char| {
+            let mut view = panel::View::default();
+            let mut ui = ui_of(&w, &view);
+            aim(&mut ui);
+            assert!(
+                matches!(press(&mut ui, &mut view, k), panel::Effect::None),
+                "{k} acted instead of asking",
+            );
+            match &view.mode {
+                panel::Mode::Confirm { question, .. } => question.clone(),
+                other => panic!("{k} left the panel in {other:?} rather than asking"),
+            }
+        };
+
+        // `S`, on a task: a model and a context window.
+        assert!(asks(&|ui| on_task(ui, "t-003"), 'S').contains("t-003"));
+        // `C`, on a task in a project with somebody spare: the panel picked the
+        // pane, so the question is the only place that name is shown.
+        assert!(asks(&|ui| on_task(ui, "t-001"), 'C').contains("t-001"));
+        // `u`, on an agent holding work.
+        assert!(asks(&|ui| on_pane(ui, "w2:p1"), 'u').contains("t-003"));
+        // `f`, on an idle agent standing in a project it can be sent into.
+        assert!(asks(&|ui| on_pane(ui, "w4:p2"), 'f').contains("trance"));
+
+        // `c` is the odd one: the key opens a pick and the deed is the `↵` that
+        // ends it, so the question belongs on the second act rather than the
+        // first. Asking twice would make the pick itself the thing you confirm.
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_task(&mut ui, "t-020");
+        press(&mut ui, &mut view, 'c');
+        assert!(matches!(view.mode, panel::Mode::Pick { .. }), "c opens the pick without asking");
+        on_pane(&mut ui, "w4:p2");
+        assert!(matches!(panel::apply_key(Key::Enter, &mut ui, &mut view), panel::Effect::None));
+        match &view.mode {
+            panel::Mode::Confirm { question, .. } => assert!(question.contains("t-020")),
+            other => panic!("the pick landed on a pane and did not ask: {other:?}"),
+        }
+    }
+
+    /// And the cheap neighbours do not, because a y/n on every keystroke is a
+    /// y/n nobody reads. `O` costs a directory; `m` writes a field that `m`
+    /// puts back.
+    #[test]
+    fn the_keys_that_cost_nothing_irreversible_do_not_ask() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_task(&mut ui, "t-003");
+        assert!(matches!(press(&mut ui, &mut view, 'O'), panel::Effect::Spawn { .. }));
+        assert!(matches!(view.mode, panel::Mode::Browse));
+
+        press(&mut ui, &mut view, 'm');
+        on_kind(&mut ui, panel::RowKind::Project);
+        assert!(matches!(
+            panel::apply_key(Key::Enter, &mut ui, &mut view),
+            panel::Effect::Run { .. }
+        ));
+        assert!(matches!(view.mode, panel::Mode::Browse), "a move is not worth a question");
+    }
+
+    /// `n` is the whole point of the question: the deed is held on the mode and
+    /// nothing outside it ever saw it, so refusing drops it. The bug this
+    /// guards against is a confirm that closes and runs anyway — which is what
+    /// an argv passed to the effect *before* the question would have done.
+    #[test]
+    fn saying_no_drops_the_deed_rather_than_deferring_it() {
+        let w = world();
+        for k in ['S', 'C', 'u', 'f'] {
+            let mut view = panel::View::default();
+            let mut ui = ui_of(&w, &view);
+            match k {
+                'S' | 'C' => on_task(&mut ui, "t-001"),
+                'u' => on_pane(&mut ui, "w2:p1"),
+                _ => on_pane(&mut ui, "w4:p2"),
+            }
+            press(&mut ui, &mut view, k);
+            assert!(matches!(view.mode, panel::Mode::Confirm { .. }), "{k} did not ask");
+            assert!(
+                matches!(press(&mut ui, &mut view, 'n'), panel::Effect::None),
+                "{k} did it anyway after n",
+            );
+            assert!(matches!(view.mode, panel::Mode::Browse), "{k} left the question up");
+            // And `esc` is the same answer, because a question you walk away
+            // from is one you have not said yes to.
+            press(&mut ui, &mut view, k);
+            assert!(
+                matches!(panel::apply_key(Key::Esc, &mut ui, &mut view), panel::Effect::None),
+                "{k} did it anyway after esc",
+            );
+            assert!(matches!(view.mode, panel::Mode::Browse));
+        }
     }
 
     /// A project that holds nothing keeps its row. The quiet-branch filter is

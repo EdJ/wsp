@@ -779,9 +779,11 @@ pub(super) fn event_loop(
                         (Err(e), Some(more)) => {
                             view.mode = Mode::Confirm {
                                 question: e,
-                                argv: more,
-                                escalate: None,
-                                then,
+                                deed: Box::new(Effect::Run {
+                                    argv: more,
+                                    escalate: None,
+                                    then,
+                                }),
                             };
                         }
                         (Err(e), None) => say(&mut ui, e),
