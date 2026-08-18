@@ -248,6 +248,64 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The DECISIONS block of [`show`], as lines. Split out to be asserted on: the
+/// mark is the whole point of the block and printing straight to stdout would
+/// have left it untestable.
+///
+/// An index of first sentences has one failure mode, and it is what the id
+/// column is here for: a decision that a later one supersedes states the
+/// *wrong* rule, with the correction some rows below and nothing joining them.
+/// Read whole, the reader hits "until wsp-029 narrows it…" and knows to look;
+/// abridged, they do not. So a superseded entry is struck *and* named —
+/// `superseded by d4` — because the strike is invisible under `NO_COLOR` and to
+/// whatever is reading this through a pipe, and the id column is what makes
+/// `d4` a row you can find.
+///
+/// Struck rather than dropped. This is the command you come to for the record,
+/// and a record with the withdrawn entries quietly gone is exactly the tidied
+/// conclusion append-only exists to prevent — what a reader needs is that it
+/// was decided, and that it no longer holds. The brief is the other way round
+/// (`model::live_decisions`): it lists what binds now and has four lines to do
+/// it in.
+fn decision_lines(p: &Paint, decided: &[crate::model::Decision], full: bool, id: &str) -> Vec<String> {
+    let over = crate::model::supersessions(decided);
+    let mut out = Vec::with_capacity(decided.len() + 1);
+    let mut cut = 0;
+    for (d, superseded) in decided.iter().zip(&over) {
+        let head = format!("  {}  {}", p.dim(&util::pad(&d.when, 10)), p.dim(&util::pad(&d.id, 3)));
+        let text = if full {
+            d.text.clone()
+        } else {
+            let lead = util::first_sentence(&d.text);
+            if lead.len() < d.text.trim_end().len() {
+                cut += 1;
+            }
+            util::truncate(lead, 96).to_string()
+        };
+        // The back-reference goes on the superseded line rather than on the one
+        // doing it. A reader scanning down meets the withdrawn rule first,
+        // which is the moment the warning is worth its width; on the later
+        // entry it would be bookkeeping printed for every reader for ever.
+        out.push(match superseded {
+            Some(by) => {
+                format!("{head}  {}{}", p.strike(&text), p.dim(&format!("  · superseded by {by}")))
+            }
+            None => format!("{head}  {text}"),
+        });
+    }
+    // Never trim quietly: an entry cut to its first sentence reads exactly like
+    // an entry that was only ever one, and the difference is the reasoning
+    // somebody is about to re-derive.
+    if cut > 0 {
+        out.push(format!(
+            "  {}  {}",
+            util::pad("", 10),
+            p.dim(&format!("{cut} of {} abridged · wsp project show {id} --decisions", decided.len()))
+        ));
+    }
+    out
+}
+
 pub fn show(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
         eprintln!("usage: wsp project show <id> [--decisions] [--handbook]");
@@ -317,31 +375,14 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // index made of first sentences is a reader's whole question answered:
     // which of these did I mean. `--decisions` prints the block as it was
     // written, for when the answer is "that one, and I need to know why".
-    let decided = crate::model::decisions(&proj.body);
-    let full = args.has("decisions");
+    //
+    // What that index cannot say on its own is that a rule was withdrawn, which
+    // is what the marks in `decision_lines` are for.
+    let decided = crate::model::decisions_of(&proj.body);
     if !decided.is_empty() {
         println!("\n{}", p.dim("DECISIONS"));
-        let mut cut = 0;
-        for (when, what) in &decided {
-            if full {
-                println!("  {}  {}", p.dim(&util::pad(when, 10)), what);
-                continue;
-            }
-            let lead = util::first_sentence(what);
-            if lead.len() < what.trim_end().len() {
-                cut += 1;
-            }
-            println!("  {}  {}", p.dim(&util::pad(when, 10)), util::truncate(lead, 96));
-        }
-        // Never trim quietly: an entry cut to its first sentence reads exactly
-        // like an entry that was only ever one, and the difference is the
-        // reasoning somebody is about to re-derive.
-        if cut > 0 {
-            println!(
-                "  {}  {}",
-                util::pad("", 10),
-                p.dim(&format!("{cut} of {} abridged · wsp project show {} --decisions", decided.len(), proj.id))
-            );
+        for line in decision_lines(&p, &decided, args.has("decisions"), &proj.id) {
+            println!("{line}");
         }
     }
 
@@ -658,6 +699,50 @@ mod tests {
         assert_eq!(parent_of("alpha"), Some("delta".into()));
         assert_eq!(set(&["set", "alpha", "parent=none"]), 0, "and back out again");
         assert_eq!(parent_of("alpha"), None);
+    }
+
+    /// The live example this was written from. `wsp project show` abridges each
+    /// decision to its first sentence — the rule — so the entry 11eb4ac
+    /// withdrew went on stating "the store autocommits with `git add -A`" as
+    /// current, with the correction two rows below and nothing joining them.
+    /// Unabridged the reader reaches "until wsp-029 narrows it…" and knows to
+    /// check; abridged, they do not.
+    ///
+    /// Both marks are asserted, because they fail separately: colour is off
+    /// here — under `NO_COLOR`, in a pipe, in this test — and the strike is
+    /// then invisible, so the words have to carry it.
+    #[test]
+    fn a_superseded_decision_is_marked_in_the_abridged_block() {
+        let mut body = String::new();
+        let old = crate::model::append_decision(
+            &mut body,
+            "an uncommitted file in ~/wsp is not yours. The store autocommits with git add -A.",
+            &[],
+        );
+        crate::model::append_decision(
+            &mut body,
+            "the commit is scoped to the paths a command wrote. Anything else you commit yourself.",
+            &[old],
+        );
+
+        let p = Paint::new();
+        let decided = crate::model::decisions_of(&body);
+        let lines = decision_lines(&p, &decided, false, "wsp");
+
+        assert!(lines[0].contains("d1"), "the id is the handle the mark needs:\n{lines:#?}");
+        assert!(
+            lines[0].contains("superseded by d2"),
+            "the withdrawn rule is named as withdrawn:\n{lines:#?}"
+        );
+        assert!(
+            lines[0].contains("an uncommitted file in ~/wsp is not yours."),
+            "and it is still shown — this is the record, not a tidied conclusion:\n{lines:#?}"
+        );
+        assert!(!lines[1].contains("superseded"), "the live rule reads as live:\n{lines:#?}");
+        assert!(
+            lines[2].contains("2 of 2 abridged"),
+            "and the count is unchanged by any of it:\n{lines:#?}"
+        );
     }
 
     /// `Handbook` is the one section a project has and a task does not, and the

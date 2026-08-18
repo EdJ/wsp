@@ -759,6 +759,13 @@ impl Paint {
     pub fn cyan(&self, s: &str) -> String {
         self.wrap("36", s)
     }
+    /// Struck through, for a line that is in the record and no longer true —
+    /// a superseded decision. Never the only mark: SGR 9 is well supported but
+    /// not universal, and `NO_COLOR` turns it off entirely, so every caller
+    /// also says in words what the strike means.
+    pub fn strike(&self, s: &str) -> String {
+        self.wrap("9", s)
+    }
 }
 
 /// Size and mtime of the binary we are running. Cheap enough to check on every

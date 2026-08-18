@@ -301,6 +301,8 @@ pub(crate) struct Brief {
     /// `--json` carries all of it; [`Brief::shown`] is where the text stops.
     pub open: Vec<(Task, usize)>,
     pub shown: usize,
+    /// What is settled and still binds, oldest first — superseded entries are
+    /// not in it. [`Brief::dropped`] is how many of the record are not here.
     pub decided: Vec<(String, String)>,
     pub dropped: usize,
     /// Panes that can reach the files under your hands, and everyone else.
@@ -434,12 +436,31 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     });
     let shown = open.len().min(MAX_TASKS);
 
-    let decided: Vec<(String, String)> = path
+    // What binds, not the whole record. A decision a later one supersedes has
+    // been withdrawn, and four lines of a briefing spent stating a rule that no
+    // longer holds is worse than spending nothing — the reader acts on it. The
+    // record itself is intact and one command away, which is where the count
+    // below points; `project show` prints the withdrawn entries struck through
+    // rather than dropping them, because that is the view you go to for the
+    // history rather than for the rules.
+    //
+    // Per project and then flattened, never the other way round: an id names a
+    // decision within one file, so `d2` on `wsp` and `d2` on `render` are two
+    // different decisions and a supersession must not reach across.
+    let all: Vec<(String, String)> = path
         .iter()
         .filter_map(|id| index.get(id))
         .flat_map(|proj| crate::model::decisions(&proj.body))
         .collect();
-    let dropped = decided.len().saturating_sub(MAX_DECISIONS);
+    let decided: Vec<(String, String)> = path
+        .iter()
+        .filter_map(|id| index.get(id))
+        .flat_map(|proj| crate::model::live_decisions(&proj.body))
+        .map(|d| (d.when, d.text))
+        .collect();
+    // Everything not printed here, superseded entries included, so the pointer
+    // to the full block appears whenever there is more of it to read.
+    let dropped = all.len() - decided.len().min(MAX_DECISIONS);
 
     // Everyone else, nearest first. `standing_beside` is the one definition of
     // that reckoning, so the brief's only job is deciding what a briefing shows
@@ -481,8 +502,14 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         .and_then(|t| t.parent.as_ref())
         .and_then(|id| tasks.iter().find(|x| &x.id == id));
 
-    let parent_decided: Vec<(String, String)> =
-        parent.map(|p| crate::model::decisions(&p.body)).unwrap_or_default();
+    // Live only, for the reason the project's are: this is direction handed
+    // down, and direction that was withdrawn is not direction.
+    let parent_decided: Vec<(String, String)> = parent
+        .map(|p| crate::model::live_decisions(&p.body))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| (d.when, d.text))
+        .collect();
 
     let mine_log: Vec<String> = mine
         .and_then(|t| crate::model::section_of(&t.body, "Log"))
@@ -865,7 +892,9 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // The whole chain, not just this project: a decision made on `wsp` binds
     // what is picked up in `data`, exactly as a tag does, and for the same
     // reason — the work is inside it.
-    for (i, (when, what)) in r.decided.iter().skip(r.dropped).enumerate() {
+    for (i, (when, what)) in
+        r.decided.iter().skip(r.decided.len().saturating_sub(MAX_DECISIONS)).enumerate()
+    {
         row(
             if i == 0 { "decided" } else { "" },
             format!("{} {}", p.dim(when), util::truncate(what, 56)),
@@ -1393,6 +1422,30 @@ mod tests {
             }
         }
         b
+    }
+
+    /// A brief lists what binds *now*. A decision a later one supersedes has
+    /// been withdrawn, so stating it in four lines that every session re-reads
+    /// is worse than saying nothing — the reader acts on it. It is not lost:
+    /// the count says the record is longer than this, and `project show` prints
+    /// the withdrawn entries struck through rather than dropping them.
+    #[test]
+    fn a_brief_states_the_rules_in_force_and_not_the_ones_withdrawn() {
+        let mut b = with_work();
+        let mut wsp = Project::new("wsp");
+        wsp.body = "## Decisions\n\
+                    - 2026-08-16T09:00:00Z (d1) the store autocommits with git add -A\n\
+                    - 2026-08-17T09:00:00Z (d2 supersedes d1) the commit is scoped to what was written\n"
+            .into();
+        b.world.index = crate::resolve::Index::new(vec![wsp]);
+        b.project = Some("wsp".into());
+
+        let r = compose(&b);
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("the commit is scoped"), "the rule in force is stated:\n{text}");
+        assert!(!text.contains("git add -A"), "the withdrawn one is not:\n{text}");
+        assert_eq!(r.dropped, 1, "and the record is named as longer than this");
+        assert!(text.contains("1 earlier · wsp project show wsp"), "{text}");
     }
 
     /// The rule the whole mode exists to keep: **plain `wsp brief` does not

@@ -628,6 +628,233 @@ pub fn localise_dates(body: &str) -> String {
     out
 }
 
+/// One entry of `## Decisions`, taken apart.
+///
+/// The stored line is `- <instant> (<id>[ supersedes <id>…]) <text>`, and the
+/// parenthesised head is the identity this type exists for. Before it there was
+/// none: entries are dated bullets, several share a date, and a later entry
+/// therefore had no way to name the earlier one it replaces. The index in
+/// `project show` prints the first sentence of each entry — the rule — so a
+/// superseded entry stated the *wrong* rule with the correction some lines
+/// below and nothing joining them. The link has to be in the record, not
+/// worked out by the reader.
+///
+/// Stored in the line rather than beside it, because the line is what is
+/// committed, what `--decisions` prints as written, and what somebody reads in
+/// the file with no wsp to hand. A sidecar would be a second truth to keep.
+///
+/// The head is parsed strictly — `d` and digits, then optionally the literal
+/// `supersedes` and more of the same — so a decision that merely opens with a
+/// parenthesis is text, not a malformed head.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Decision {
+    /// The date it was taken, in the reader's zone. See [`decisions`].
+    pub when: String,
+    /// `d4`, or empty for an entry written before ids existed and not yet
+    /// touched by [`append_decision`].
+    pub id: String,
+    /// Ids this entry replaces. Almost always one.
+    pub supersedes: Vec<String>,
+    /// The decision itself, with the head taken off.
+    pub text: String,
+}
+
+/// Is this an id we minted — `d` and at least one digit, nothing else?
+fn is_decision_id(s: &str) -> bool {
+    matches!(s.strip_prefix('d'), Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `d4` → `4`, for the max-so-far scan. Anything else → `None`.
+fn id_number(s: &str) -> Option<u32> {
+    s.strip_prefix('d').and_then(|n| n.parse().ok())
+}
+
+/// Read `<id>` back to the shape it is stored in, from whatever was typed:
+/// `d4` and `4` are the same reference, and refusing the second would be a
+/// rule with nothing behind it.
+pub fn decision_ref(s: &str) -> Option<String> {
+    let n: u32 = s.trim().trim_start_matches('d').parse().ok()?;
+    Some(format!("d{n}"))
+}
+
+/// Split `(d4 supersedes d1) text` into its head and its text. Returns `None`
+/// when there is no head, which is every line written before ids and every
+/// line somebody wrote by hand.
+fn split_head(s: &str) -> Option<(String, Vec<String>, &str)> {
+    let (inner, rest) = s.strip_prefix('(')?.split_once(')')?;
+    let mut words = inner.split_whitespace();
+    let id = words.next().filter(|w| is_decision_id(w))?.to_string();
+    let supersedes: Vec<String> = match words.next() {
+        None => Vec::new(),
+        Some("supersedes") => {
+            let ids: Vec<String> = words.map(|w| w.to_string()).collect();
+            if ids.is_empty() || !ids.iter().all(|w| is_decision_id(w)) {
+                return None;
+            }
+            ids
+        }
+        Some(_) => return None,
+    };
+    Some((id, supersedes, rest.trim_start()))
+}
+
+/// The `## Decisions` entries, oldest first and taken apart. See [`Decision`].
+///
+/// The one parser: [`decisions`] is this with the head thrown away, so a caller
+/// that only wants the sentence cannot see a stale second copy of the format.
+/// `model::PROSE` is in this file for the same reason, and the comment on it
+/// says what the third list cost.
+pub fn decisions_of(body: &str) -> Vec<Decision> {
+    section_of(body, "Decisions")
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (when, rest) = match l.split_once(' ') {
+                Some((d, rest)) if util::is_stamp(d) => (util::local_ymd(d), rest.trim()),
+                _ => (String::new(), l.as_str()),
+            };
+            match split_head(rest) {
+                Some((id, supersedes, text)) => Decision {
+                    when,
+                    id,
+                    supersedes,
+                    text: text.to_string(),
+                },
+                None => Decision { when, text: rest.to_string(), ..Default::default() },
+            }
+        })
+        .collect()
+}
+
+/// For each entry, the id of the entry that superseded it, if any — the
+/// back-reference, which is the direction every reader needs and the one the
+/// record does not store. Parallel to `all`.
+///
+/// The last superseder wins, and an entry that supersedes something already
+/// superseded does not undo the mark: both lines are struck, which is the
+/// truth. Self-reference is ignored rather than refused; the writer will not
+/// produce it and a hand-edit that does should not make the block unreadable.
+pub fn supersessions(all: &[Decision]) -> Vec<Option<String>> {
+    all.iter()
+        .map(|d| {
+            if d.id.is_empty() {
+                return None;
+            }
+            all.iter()
+                .filter(|o| o.id != d.id && o.supersedes.iter().any(|s| *s == d.id))
+                .next_back()
+                .map(|o| o.id.clone())
+        })
+        .collect()
+}
+
+/// The entries that still bind: everything [`decisions_of`] returns that
+/// nothing later replaced.
+///
+/// For the abridged views — the brief prints the four most recent as the rules
+/// in force, and a rule that was withdrawn is not one of them. `project show`
+/// deliberately does *not* use this: it is the place you go to read the record,
+/// and a record with the withdrawn entries quietly removed is the tidied
+/// conclusion the append-only rule exists to prevent.
+pub fn live_decisions(body: &str) -> Vec<Decision> {
+    let all = decisions_of(body);
+    let over = supersessions(&all);
+    all.into_iter().zip(over).filter(|(_, o)| o.is_none()).map(|(d, _)| d).collect()
+}
+
+/// Write ids onto the entries that have none, in place, and say whether
+/// anything changed.
+///
+/// Called by [`append_decision`], so a file gets numbered the first time a
+/// decision is taken on it after this shipped. That is the one edit to an
+/// existing decision line this code makes, and it is defensible where a
+/// rewrite of the text would not be: it adds the handle and changes not one
+/// word of what was decided, it lands in the same commit as a decision the
+/// author is making anyway, and it is the only thing that makes `--supersedes`
+/// usable against the entries already in the store. The alternative — numbering
+/// by position at read time — is an id that moves when a line above it is
+/// edited away, which is a reference that silently points at the wrong
+/// decision.
+///
+/// Conservative on purpose: the id is inserted after the stamp and nothing else
+/// on the line is touched, so a bullet somebody wrote by hand comes back in the
+/// shape they wrote it.
+pub fn number_decisions(body: &mut String) -> bool {
+    let Some(text) = section_of(body, "Decisions") else {
+        return false;
+    };
+    let mut next = next_decision_number(&text);
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let bare = line.trim().trim_start_matches("- ").trim();
+        let rest = match bare.split_once(' ') {
+            Some((d, r)) if util::is_stamp(d) => r.trim_start(),
+            _ => bare,
+        };
+        if bare.is_empty() || split_head(rest).is_some() {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // Split at the text, wherever it starts, and put the head in front of
+        // it: whatever came before — the bullet, the stamp — is copied across
+        // untouched.
+        let at = line.len() - rest.len();
+        out.push_str(&line[..at]);
+        out.push_str(&format!("(d{next}) "));
+        out.push_str(rest);
+        out.push('\n');
+        next += 1;
+        changed = true;
+    }
+    if changed {
+        set_section_in(body, "Decisions", &out);
+    }
+    changed
+}
+
+/// One past the highest id in a `## Decisions` section, which is the next one
+/// to hand out. Reads the ids rather than counting the lines, so an entry
+/// deleted by hand does not hand its id to something else.
+fn next_decision_number(text: &str) -> u32 {
+    text.lines()
+        .filter_map(|l| {
+            let bare = l.trim().trim_start_matches("- ").trim();
+            let rest = match bare.split_once(' ') {
+                Some((d, r)) if util::is_stamp(d) => r.trim_start(),
+                _ => bare,
+            };
+            split_head(rest).and_then(|(id, _, _)| id_number(&id))
+        })
+        .max()
+        .map_or(1, |n| n + 1)
+}
+
+/// Append a decision with an identity, and return the id it was given.
+///
+/// Two writers for one section would be two formats within the month, so this
+/// is [`append_dated`] with a head on the front rather than a second path to
+/// the file.
+///
+/// Nothing checks that `supersedes` names entries that exist — the caller does,
+/// where it can say what is there instead. A duplicate id could only come from
+/// two agents deciding on the same file at once, which is a lost update that
+/// would already have cost one of the decisions entirely.
+pub fn append_decision(body: &mut String, text: &str, supersedes: &[String]) -> String {
+    number_decisions(body);
+    let id = format!("d{}", next_decision_number(&section_of(body, "Decisions").unwrap_or_default()));
+    let head = if supersedes.is_empty() {
+        id.clone()
+    } else {
+        format!("{id} supersedes {}", supersedes.join(" "))
+    };
+    append_dated(body, "Decisions", &format!("({head}) {text}"));
+    id
+}
+
 /// The `## Decisions` entries, oldest first, as `(date, text)`.
 ///
 /// Split here rather than in the renderers: every one of them wants to dim the
@@ -644,19 +871,13 @@ pub fn localise_dates(body: &str) -> String {
 /// here rather than in the writers: the record keeps the instant it was taken
 /// at, and the one place that already takes a stored line apart for display is
 /// the one place that has to put it back together in the reader's calendar.
+///
+/// The identity head comes off with the date — a caller that wants the sentence
+/// wants the sentence, and `(d4 supersedes d1)` in front of it would be four
+/// tokens of bookkeeping in the brief. [`decisions_of`] is the same parse with
+/// the head kept, and this is written in terms of it so there is one format.
 pub fn decisions(body: &str) -> Vec<(String, String)> {
-    section_of(body, "Decisions")
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
-        .filter(|l| !l.is_empty())
-        .map(|l| match l.split_once(' ') {
-            Some((d, rest)) if util::is_stamp(d) => {
-                (util::local_ymd(d), rest.trim().to_string())
-            }
-            _ => (String::new(), l),
-        })
-        .collect()
+    decisions_of(body).into_iter().map(|d| (d.when, d.text)).collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1104,6 +1325,83 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0.len(), 10, "a yyyy-mm-dd date");
         assert_eq!(got[0].1, "render and data are separate sub-projects");
+    }
+
+    /// The defect this whole shape exists for: `project show` abridges each
+    /// decision to its first sentence, so an entry a later one supersedes
+    /// states the withdrawn rule with nothing saying so. The link has to be in
+    /// the record, which means the earlier entry needs a name.
+    #[test]
+    fn a_decision_can_name_the_one_it_supersedes() {
+        let mut b = String::new();
+        let first = append_decision(&mut b, "the store commits with git add -A", &[]);
+        let second =
+            append_decision(&mut b, "the commit is scoped to the paths a command wrote", &[first.clone()]);
+        assert_eq!((first.as_str(), second.as_str()), ("d1", "d2"), "ids in the order taken");
+
+        let all = decisions_of(&b);
+        assert_eq!(all[1].supersedes, vec!["d1"]);
+        assert_eq!(all[0].text, "the store commits with git add -A", "the head is not the text");
+        assert_eq!(
+            supersessions(&all),
+            vec![Some("d2".to_string()), None],
+            "the back-reference is what a reader needs, and only the renderer can work it out"
+        );
+        assert_eq!(live_decisions(&b).len(), 1, "one rule binds, and it is the later one");
+        assert_eq!(live_decisions(&b)[0].id, "d2");
+    }
+
+    /// A decision taken before ids existed is still a decision, and the point
+    /// of `--supersedes` is naming exactly those. So the first write after this
+    /// shipped hands them their ids, and nothing else about the line moves.
+    #[test]
+    fn entries_written_before_ids_get_one_when_the_next_decision_is_taken() {
+        let mut b = String::from(
+            "## Decisions\n- 2026-08-15 an uncommitted file in ~/wsp is not yours\n\
+             - 2026-08-16T09:00:00Z measure it, do not assume it\n",
+        );
+        let id = append_decision(&mut b, "the commit is scoped to what a command wrote", &["d1".into()]);
+        assert_eq!(id, "d3");
+        let all = decisions_of(&b);
+        let ids: Vec<&str> = all.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["d1", "d2", "d3"], "numbered oldest first");
+        assert_eq!(all[0].text, "an uncommitted file in ~/wsp is not yours", "text untouched");
+        assert_eq!(all[0].when, "2026-08-15", "and so is a bare date from before instants");
+        assert_eq!(supersessions(&all)[0], Some("d3".to_string()));
+    }
+
+    /// The head is `(d4 …)` and nothing else is. A decision that happens to
+    /// open with a parenthesis is prose, and reading it as an identity would
+    /// lose the front of the sentence.
+    #[test]
+    fn a_leading_parenthesis_is_not_an_identity() {
+        let b = String::from(
+            "## Decisions\n- 2026-08-15 (provisionally) we ship the smaller half first\n\
+             - 2026-08-16 (see wsp-012) and then the rest\n",
+        );
+        let all = decisions_of(&b);
+        assert_eq!(all[0].text, "(provisionally) we ship the smaller half first");
+        assert_eq!(all[1].text, "(see wsp-012) and then the rest");
+        assert!(all.iter().all(|d| d.id.is_empty()), "no head, so no id");
+    }
+
+    /// Ids are read back, not counted. An entry deleted by hand must not hand
+    /// its number to the next decision, or a `supersedes` written yesterday
+    /// starts pointing at something written today.
+    #[test]
+    fn a_deleted_entry_does_not_hand_its_id_on() {
+        let mut b = String::from("## Decisions\n- 2026-08-15T09:00:00Z (d7) the one that is left\n");
+        assert_eq!(append_decision(&mut b, "and the next", &[]), "d8");
+    }
+
+    /// `d4` and `4` are the same reference. The strictness that matters is on
+    /// what goes *into* the file.
+    #[test]
+    fn a_reference_is_taken_in_either_shape_and_stored_in_one() {
+        assert_eq!(decision_ref("4").as_deref(), Some("d4"));
+        assert_eq!(decision_ref(" d4 ").as_deref(), Some("d4"));
+        assert_eq!(decision_ref("d4x"), None);
+        assert_eq!(decision_ref(""), None);
     }
 
     /// The hour is the whole fix. A dated line used to store a UTC *date*, so

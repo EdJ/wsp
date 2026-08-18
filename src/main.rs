@@ -130,6 +130,20 @@ const GLOBAL_FLAGS: &[&str] = &["json", "help", "version", "no-commit", "terse",
 const LITERAL_AFTER: &[(&str, usize)] =
     &[("note", 1), ("block", 1), ("park", 1), ("decide", 1), ("rename", 1), ("tag", 1)];
 
+/// Flags a [`LITERAL_AFTER`] command owns, which therefore go on being read
+/// inside its payload.
+///
+/// The rule above stops flag parsing at the subject *because* none of those
+/// five owned a flag of its own. `wsp decide <id> "…" --supersedes d1` is the
+/// first that does, and the two ways out of that were both worse: dropping
+/// `decide` from the list puts prose beginning `--parent` back in reach of the
+/// flag parser, which is the defect the list was written for, and demanding
+/// the flag before the subject is a word order nobody types.
+///
+/// The cost is exact and small — a decision whose text is the bare word
+/// `--supersedes` — and `--` still ends flag parsing everywhere.
+const OWNED_AFTER: &[(&str, &str)] = &[("decide", "supersedes")];
+
 pub struct Args {
     pub cmd: String,
     pub rest: Vec<String>,
@@ -144,14 +158,16 @@ impl Args {
         // pass hands back as a positional, but neither pass can turn a
         // different token into the verb — the verb is the first bare word
         // either way.
-        let cmd = Args::scan(&argv, None).cmd;
+        let cmd = Args::scan(&argv, None, &[]).cmd;
         let literal_after = LITERAL_AFTER.iter().find(|(c, _)| *c == cmd).map(|(_, n)| *n);
-        Args::scan(&argv, literal_after)
+        let owned: Vec<&str> =
+            OWNED_AFTER.iter().filter(|(c, _)| *c == cmd).map(|(_, f)| *f).collect();
+        Args::scan(&argv, literal_after, &owned)
     }
 
     /// One pass over argv. `literal_after`, when set, is how many positionals
     /// this command parses normally before the rest of the line is its payload.
-    fn scan(argv: &[String], literal_after: Option<usize>) -> Args {
+    fn scan(argv: &[String], literal_after: Option<usize>, owned: &[&str]) -> Args {
         let mut positional: Vec<String> = Vec::new();
         let mut flags: HashMap<String, Vec<String>> = HashMap::new();
         let mut i = 0;
@@ -168,7 +184,10 @@ impl Args {
             // subject, a listed command reads only the flags that mean the
             // same thing inside a payload as outside one.
             let is_flag = |name: &str| {
-                !name.contains(char::is_whitespace) && (!past_subject || GLOBAL_FLAGS.contains(&name))
+                !name.contains(char::is_whitespace)
+                    && (!past_subject
+                        || GLOBAL_FLAGS.contains(&name)
+                        || owned.contains(&name))
             };
 
             if let Some(body) = a.strip_prefix("--") {
@@ -524,6 +543,7 @@ fn help() {
                                     it back. Open work, sorted last and drawn
                                     quiet, and not counted as wanting you
   wsp decide <task|proj> "…"      record what was settled, and why
+  wsp decide <t|p> "…" --supersedes d1   …and which earlier one it replaces
   wsp note <id> "text"              append to the log
   wsp note <id> - | --from FILE     …or from stdin, or a file; one entry is one
                                     line, so what arrives on several is folded
@@ -828,6 +848,15 @@ mod tests {
             assert_eq!(a.text(1), "-p is not a thing on this command", "{verb}");
             assert!(!a.has("project"), "{verb} lost its payload to a flag");
         }
+
+        // …and a flag the command owns is still its flag inside the payload,
+        // which is the one exception. `decide` is the only command with one.
+        let a = parse(&["decide", "wsp", "the store is the only writer", "--supersedes", "d1"]);
+        assert_eq!(a.text(1), "the store is the only writer", "the prose kept the flag out");
+        assert_eq!(a.get("supersedes").as_deref(), Some("d1"));
+        // Nobody else's flag becomes readable by being on the list.
+        let a = parse(&["note", "028", "text", "--supersedes", "d1"]);
+        assert!(!a.has("supersedes"), "`note` does not own it, so it is payload");
 
         // `add` keeps ordinary parsing — its flags come *after* the title —
         // so what saves it is that no flag name has a space in it.

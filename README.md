@@ -1141,6 +1141,38 @@ run — for the reason the rules cap has: prose that stops early reads exactly
 like prose that ends there, and here the missing half is the reasoning somebody
 is otherwise about to re-derive.
 
+The later entry says which earlier one it replaces, and that is what a decision
+has an id for:
+
+```sh
+wsp decide wsp "the commit is scoped to the paths a command wrote" --supersedes d1
+```
+
+```
+DECISIONS
+  2026-08-15  d1   An uncommitted file in ~/wsp is not yours…  · superseded by d3
+  2026-08-17  d3   The commit is scoped to the paths a command wrote.
+```
+
+Without that link the index above is actively wrong: a decision that a later
+one withdrew goes on stating the withdrawn rule, with the correction some rows
+down and nothing joining them. Read whole you reach "until wsp-029 narrows it…"
+and know to check; abridged, you do not. Struck and named rather than dropped:
+`project show` is where you come for the record, and a record with the
+withdrawn entries quietly gone is the tidied conclusion this whole rule is
+against. `wsp brief` is the other way round — it lists what binds *now*, in
+four lines every session re-reads, so a withdrawn rule is left out of it and
+counted in the `N earlier` that points back here.
+
+The id is `d1`, `d2`, … within one file, written into the line as
+`- <instant> (d3 supersedes d1) …`, and `d3` and `3` are the same reference to
+type. Entries taken before ids existed are numbered the next time a decision is
+taken on that file — the one edit made to an existing decision line, and it
+adds the handle without changing a word of what was decided. Numbering by
+position instead would have been free and wrong: an id that moves when a line
+above it is edited away is a reference that silently points at the wrong
+decision.
+
 `wsp edit --decisions` exists anyway, and the two are not in conflict once the
 rule is stated precisely. What append-only protects is that a decision cannot be
 **quietly** rewritten — not that the text is immutable, which no file on disk

@@ -534,11 +534,25 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // Decisions first and in their own block: on a task they are what was
     // settled about this work, and burying them mid-body between Details and
     // the log is how a reader misses the one line that would have stopped them.
-    let decided = crate::model::decisions(&t.body);
+    //
+    // Marked the way `project show` marks them, and for the same reason: an
+    // entry a later one supersedes still states its rule, and a reader who
+    // stops at the first line that answers their question stops at the wrong
+    // one. The id column is what makes `superseded by d2` a row you can find.
+    let decided = crate::model::decisions_of(&t.body);
+    let over = crate::model::supersessions(&decided);
     if !decided.is_empty() {
         println!("\n{}", p.dim("DECISIONS"));
-        for (when, what) in &decided {
-            println!("  {}  {}", p.dim(&util::pad(when, 10)), what);
+        for (d, superseded) in decided.iter().zip(&over) {
+            let head = format!("{}  {}", p.dim(&util::pad(&d.when, 10)), p.dim(&util::pad(&d.id, 3)));
+            match superseded {
+                Some(by) => println!(
+                    "  {head}  {}{}",
+                    p.strike(&d.text),
+                    p.dim(&format!("  · superseded by {by}"))
+                ),
+                None => println!("  {head}  {}", d.text),
+            }
         }
     }
     // `## Log` goes out with the rest of the body, so the stamps in it are
@@ -781,6 +795,31 @@ pub fn note(store: &Store, args: &Args) -> i32 {
     mutate_saying(store, args, "note", said.as_deref(), |t| t.log(&text))
 }
 
+/// Refuse a `--supersedes` that names nothing on this body.
+///
+/// Numbers the section first, because the ids a caller is about to name are the
+/// ones `show` printed — and `show` prints what is stored, so an unnumbered
+/// file has none to name yet. Working on a copy: this is the check, and the
+/// write that follows numbers the real body itself.
+fn check_supersedes(body: &str, supersedes: &[String], id: &str) -> Result<(), i32> {
+    if supersedes.is_empty() {
+        return Ok(());
+    }
+    let mut copy = body.to_string();
+    crate::model::number_decisions(&mut copy);
+    let have: Vec<String> = crate::model::decisions_of(&copy).into_iter().map(|d| d.id).collect();
+    for want in supersedes {
+        if !have.iter().any(|h| h == want) {
+            eprintln!(
+                "wsp: no decision `{want}` on {id} — it has {}",
+                if have.is_empty() { "none".to_string() } else { have.join(" ") }
+            );
+            return Err(1);
+        }
+    }
+    Ok(())
+}
+
 /// `wsp decide <id> "…"` — record what was settled, on a task or a project.
 ///
 /// Takes either, because the two are the same act at different heights: a
@@ -799,8 +838,20 @@ pub fn note(store: &Store, args: &Args) -> i32 {
 /// two are one act at different heights and an agent that has learned `-` on
 /// one will type it on the other; a verb that answered `-` with a decision
 /// whose whole text was `-` would be the same defect one file along.
+///
+/// `--supersedes <id>` is how the later entry names the earlier one it
+/// replaces, and it is the whole reason a decision has an id. Without it the
+/// correction and the thing corrected are two dated bullets that only a reader
+/// of the full text can join — and `project show` abridges to the first
+/// sentence, so the withdrawn rule reads as the live one. Recorded in the line,
+/// so the link is in the file rather than in a renderer.
+///
+/// The reference is checked against the entries actually there. A typo that
+/// wrote itself into the record as `supersedes d9` would mark nothing, look
+/// exactly like a decision that supersedes nothing, and be found by whoever
+/// wondered why the old rule was still printed.
 pub fn decide(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "wsp decide <task|project> \"what was settled, and why\"   (or `-` for stdin)";
+    const USAGE: &str = "wsp decide <task|project> \"what was settled, and why\" [--supersedes <id>]";
     let (text, from) = match prose_payload(args, USAGE) {
         Ok(v) => v,
         Err(code) => return code,
@@ -809,11 +860,24 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: {USAGE}");
         return 2;
     };
+    let mut supersedes: Vec<String> = Vec::new();
+    for raw in args.all("supersedes") {
+        match crate::model::decision_ref(&raw) {
+            Some(id) => supersedes.push(id),
+            None => {
+                eprintln!("wsp: `{raw}` is not a decision id — they look like `d4`");
+                return 2;
+            }
+        }
+    }
 
-    if store.find_task(&needle).is_some() {
+    if let Some(t) = store.find_task(&needle) {
+        if let Err(code) = check_supersedes(&t.body, &supersedes, &t.id) {
+            return code;
+        }
         let said = from.map(|src| format!("{} characters from {src}", text.len()));
         return mutate_saying(store, args, "decided", said.as_deref(), |t| {
-            crate::model::append_dated(&mut t.body, "Decisions", &text)
+            crate::model::append_decision(&mut t.body, &text, &supersedes);
         });
     }
 
@@ -822,7 +886,10 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no task or project matching `{needle}`");
         return 1;
     };
-    crate::model::append_dated(&mut p.body, "Decisions", &text);
+    if let Err(code) = check_supersedes(&p.body, &supersedes, &p.id) {
+        return code;
+    }
+    crate::model::append_decision(&mut p.body, &text, &supersedes);
     if let Err(e) = store.save_project(&p) {
         eprintln!("wsp: write failed: {e}");
         return 1;
@@ -2224,5 +2291,45 @@ mod tests {
         let d = t.section("Decisions").unwrap_or_default();
         assert_eq!(d.lines().filter(|l| !l.trim().is_empty()).count(), 1, "{d}");
         assert!(d.contains("Store UTC, render local. The instant is the record."), "{d}");
+    }
+
+    /// The link is written into the record, not worked out by a renderer — so
+    /// it has to survive being read back out of the file, and a reference to
+    /// something that is not there has to be refused at the point somebody can
+    /// still fix it. `supersedes d9` in the file would mark nothing, look
+    /// exactly like a decision that supersedes nothing, and be found by
+    /// whoever wondered why the old rule was still printed.
+    #[test]
+    fn a_decision_names_the_one_it_replaces_and_a_reference_to_nothing_is_refused() {
+        let store = scratch("decide-supersedes");
+        task_with(&store, "t-260815-047", "normal");
+
+        assert_eq!(decide(&store, &parse(&["decide", "047", "worktrees are not for now"])), 0);
+        // Before it exists, and in the shape a typo takes.
+        assert_eq!(
+            decide(&store, &parse(&["decide", "047", "…", "--supersedes", "d9"])),
+            1,
+            "a reference to nothing is not written"
+        );
+        assert_eq!(
+            decide(&store, &parse(&["decide", "047", "…", "--supersedes", "later"])),
+            2,
+            "and neither is one that is not an id"
+        );
+        assert_eq!(
+            decide(&store, &parse(&["decide", "047", "one tree per task", "--supersedes", "1"])),
+            0,
+            "`1` and `d1` are the same reference"
+        );
+
+        let t = store.find_task("047").expect("the task");
+        let all = crate::model::decisions_of(&t.body);
+        assert_eq!(all.len(), 2, "the refusals wrote nothing: {}", t.body);
+        assert_eq!(all[1].supersedes, vec!["d1"]);
+        assert_eq!(
+            crate::model::supersessions(&all)[0],
+            Some("d2".to_string()),
+            "and the older entry can be marked from what is in the file"
+        );
     }
 }
