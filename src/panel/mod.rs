@@ -55,6 +55,7 @@ mod render;
 mod rows;
 mod run;
 mod shared;
+mod surface;
 mod verbs;
 
 pub(crate) use keys::{apply_key, Effect, View};
@@ -126,3 +127,6 @@ pub(crate) use run::{stty, term_size};
 pub(crate) use verbs::{inspect, pop_out, run_wsp};
 pub use install::{install, install_if_adopted, uninstall};
 pub use run::run;
+// The same panel, drawn by a host that owns the cells — herdr's forked sidebar
+// today. See `surface.rs` for why the frame is built here and not there.
+pub use surface::run as surface;

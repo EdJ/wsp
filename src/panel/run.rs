@@ -118,6 +118,71 @@ pub(crate) fn term_size() -> (usize, usize) {
     (26, 40)
 }
 
+/// Where the panel is drawn, and what herdr can tell us about it.
+///
+/// The panel used to *be* a pane: it measured `/dev/tty`, painted escapes onto
+/// it, and asked herdr which pane had the keyboard. herdr's sidebar is the
+/// first place it is drawn that is none of those things — no tty, no pane id,
+/// no workspace — and this is the whole of the difference, held in three
+/// methods so that [`event_loop`] does not know which one it is driving.
+///
+/// It is not a second renderer. `frame` still builds the same [`Line`]s, and a
+/// screen only decides how many cells there are and where the rows go.
+///
+/// [`Line`]: super::render::Line
+pub(super) trait Screen {
+    /// Columns and rows to build the next frame for.
+    fn size(&self) -> (usize, usize);
+
+    /// Put a frame on it. Answers the size it drew at, which is the size the
+    /// tick decides the panel's *shape* from — a second measurement between the
+    /// frame and that decision can disagree with the frame, and mid-drag it
+    /// will.
+    fn paint(&mut self, lines: &[super::render::Line], w: usize, h: usize) -> (usize, usize);
+
+    /// The two focus questions, asked together because they are one picture:
+    /// whether the keyboard is here, which decides what a click means, and
+    /// whether this is on screen, which decides the cadence.
+    ///
+    /// Answered from herdr's census for a pane, because a pane has to ask. A
+    /// surface drawn as chrome does not: it is always on screen, and whether it
+    /// has the keyboard is something its host says outright.
+    fn focus(&self, live: &live::Live, me: Option<&str>, ws: Option<&str>) -> (bool, bool) {
+        (live.has_keyboard(me), live.on_screen(ws))
+    }
+}
+
+/// The panel in a herdr pane: a tty it measures, and escapes painted onto it.
+///
+/// `last` is the frame already on screen. A panel redraws on every tick and
+/// most ticks change nothing, so the comparison is what keeps a quiet panel
+/// from writing its whole frame to a pty five times a second.
+pub(super) struct Tty {
+    last: String,
+}
+
+impl Tty {
+    pub(super) fn new() -> Tty {
+        Tty { last: String::new() }
+    }
+}
+
+impl Screen for Tty {
+    fn size(&self) -> (usize, usize) {
+        term_size()
+    }
+
+    fn paint(&mut self, lines: &[super::render::Line], w: usize, h: usize) -> (usize, usize) {
+        let painted = to_ansi(lines, w, h);
+        if painted != self.last {
+            print!("{painted}");
+            let _ = std::io::stdout().flush();
+            self.last = painted;
+        }
+        (w, h)
+    }
+}
+
 pub(super) fn spawn_input(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let Ok(mut tty) = File::open("/dev/tty") else { return };
@@ -417,7 +482,7 @@ pub fn run(store: &Store, full: bool) -> i32 {
     let _ = std::io::stdout().flush();
     stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
-    let outcome = event_loop(store, &tx, &rx, self_ws.as_deref(), full);
+    let outcome = event_loop(store, &tx, &rx, self_ws.as_deref(), full, &mut Tty::new());
 
     stty(&["sane"]);
     // Off in the reverse order, and before the alternate screen goes: a pane
@@ -490,6 +555,7 @@ pub(super) fn event_loop(
     rx: &Receiver<Msg>,
     self_ws: Option<&str>,
     full: bool,
+    screen: &mut dyn Screen,
 ) -> Outcome {
     let started_as = exe_stamp();
     let mut view = View::default();
@@ -526,14 +592,13 @@ pub(super) fn event_loop(
     //
     // Neither is drawn, which is why neither is in the [`Snapshot`]: see
     // `crate::live`, and `crate::draw`'s "focus is not an input".
-    let mut keyboard = live.has_keyboard(me.as_deref());
-    let mut self_focused = live.on_screen(self_ws);
+    let (mut keyboard, mut self_focused) = screen.focus(&live, me.as_deref(), self_ws);
     let snap = Snapshot::live(store, live.panes);
     // What shape of thing this pane is, before the rows are built from it: a
     // page shows a project's tasks all of them and a sidebar shows six. See
     // [`View::wide`], and the tick below, which is where a pane that changes
     // shape under a running panel is noticed.
-    let mut drawn_size = term_size();
+    let mut drawn_size = screen.size();
     view.fit_to_pane(drawn_size.0);
     let mut ui = collect(&snap, &view);
     if point_at(&mut ui, &want) {
@@ -542,7 +607,6 @@ pub(super) fn event_loop(
     if agreed.is_empty() {
         agreed = shared::rendered(&shared::Shared::of(&view, ui.cursor()));
     }
-    let mut last = String::new();
     let mut dirty = false;
     let mut last_fetch = Instant::now();
     // A scroll is a burst of events, and focus is a socket round-trip. Take it
@@ -566,21 +630,11 @@ pub(super) fn event_loop(
     // `&mut` on the view because the frame is where the tree's scroll offset
     // is decided, and the view keeps it: the click handler two branches below
     // has to read the offset the pane in front of the reader is drawn with.
-    // Answers the size it drew at, and that is the size the tick decides shape
-    // from: a second measurement between the frame and that decision can
-    // disagree with the frame — mid-drag it will — and then a sidebar's rows
-    // are in front of the reader with a page's width, or the reverse.
-    let draw = |ui: &Ui, view: &mut View, last: &mut String| -> (usize, usize) {
-        let (w, h) = term_size();
-        let painted = to_ansi(&frame(ui, view, w, h), w, h);
-        if painted != *last {
-            print!("{painted}");
-            let _ = std::io::stdout().flush();
-            *last = painted;
-        }
-        (w, h)
-    };
-    drawn_size = draw(&ui, &mut view, &mut last);
+    fn draw(screen: &mut dyn Screen, ui: &Ui, view: &mut View) -> (usize, usize) {
+        let (w, h) = screen.size();
+        screen.paint(&frame(ui, view, w, h), w, h)
+    }
+    drawn_size = draw(screen, &ui, &mut view);
 
     loop {
         let mut msg = match carry.pop_front() {
@@ -618,7 +672,7 @@ pub(super) fn event_loop(
         }
 
         if let Msg::Key(Key::Click { x, y }) = msg {
-            let (w, h) = term_size();
+            let (w, h) = screen.size();
             match super::keys::click(&mut ui, &mut view, w, h, x, y, had_keyboard) {
                 super::keys::Hit::Activate => msg = Msg::Key(Key::Enter),
                 // A mark in the strip is an agent, and going there is the whole
@@ -633,7 +687,7 @@ pub(super) fn event_loop(
                 super::keys::Hit::Rest => msg = Msg::Key(Key::Char('w')),
                 super::keys::Hit::Select => {
                     shared::share(store, &view, ui.cursor(), &mut agreed);
-                    drawn_size = draw(&ui, &mut view, &mut last);
+                    drawn_size = draw(screen, &ui, &mut view);
                     continue;
                 }
                 // The pane was not the one being worked in, and now it is. That
@@ -653,10 +707,10 @@ pub(super) fn event_loop(
         // pane you cannot scroll without clicking into it first is worse at the
         // one thing the panel is for — being read from across the screen.
         if let Msg::Key(Key::Wheel { up }) = msg {
-            let (w, h) = term_size();
+            let (w, h) = screen.size();
             super::keys::wheel(&mut ui, &mut view, w, h, up);
             shared::share(store, &view, ui.cursor(), &mut agreed);
-            drawn_size = draw(&ui, &mut view, &mut last);
+            drawn_size = draw(screen, &ui, &mut view);
             continue;
         }
 
@@ -951,8 +1005,7 @@ pub(super) fn event_loop(
             // workspace is on screen" out of. Both are read here rather than off
             // the frame, because a frame is what a renderer draws and neither of
             // these is ever drawn.
-            keyboard = live.has_keyboard(me.as_deref());
-            self_focused = live.on_screen(self_ws);
+            (keyboard, self_focused) = screen.focus(&live, me.as_deref(), self_ws);
             let snap = Snapshot::live(store, live.panes);
             // Likewise free, and it has to be taken from the same list the frame
             // is drawn from: the poll asks whether herdr has moved on from what
@@ -973,7 +1026,7 @@ pub(super) fn event_loop(
         if is_key {
             shared::share(store, &view, ui.cursor(), &mut agreed);
         }
-        drawn_size = draw(&ui, &mut view, &mut last);
+        drawn_size = draw(screen, &ui, &mut view);
     }
 }
 

@@ -496,6 +496,10 @@ fn main() {
             // width of the workspace, and quit rather than kept.
             _ => panel::run(&store, args.has("full")),
         },
+        // The same panel, drawn by a host that owns the cells rather than by a
+        // terminal: JSON in on stdin, frames out on stdout. Not for people —
+        // herdr's forked sidebar spawns it.
+        "surface" => panel::surface(&store),
 
         other => {
             eprintln!("wsp: unknown command `{other}`. Try `wsp help`.");
@@ -647,6 +651,9 @@ fn help() {
                                     K in the panel opens it in a tab
   wsp panel install [--all]         split it into a workspace, or all of them
   wsp panel uninstall [-w ws]       take it back out
+  wsp surface                       the panel for a host that owns the cells:
+                                    one JSON object per line each way, frames
+                                    out. Started by herdr, not by a person
   wsp sync [--force]                push tokens to herdr once
   wsp daemon [-v]                   events + refresh loop (herdr [[startup]])
   wsp hook <event>                  herdr event-hook entrypoint

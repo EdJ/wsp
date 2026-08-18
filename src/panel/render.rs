@@ -1217,6 +1217,24 @@ pub(crate) fn ansi_of(style: Style) -> &'static str {
     }
 }
 
+/// The same colour, as three numbers.
+///
+/// A third surface — herdr's sidebar drawn natively — is handed cells rather
+/// than escapes, because a colour that only exists as an escape sequence is a
+/// colour only a terminal can be told. This is the same table as [`ansi_of`]
+/// and not a second one: the test below parses that function's output and
+/// fails if the two ever disagree, which is the only way a table copied by
+/// hand stays copied correctly.
+pub(crate) fn rgb_of(style: Style) -> Option<(u8, u8, u8)> {
+    match style {
+        Style::Plain | Style::Dim | Style::Bold => None,
+        Style::Muted => Some((125, 140, 150)),
+        Style::Accent => Some((95, 191, 164)),
+        Style::Warn => Some((224, 138, 75)),
+        Style::Query => Some((176, 140, 217)),
+    }
+}
+
 /// What the live panel prints.
 ///
 /// The one-cell case of [`crate::draw::Ansi`], and delegating rather than
@@ -1296,6 +1314,42 @@ mod tests {
     use super::*;
     use crate::model::Status;
     use crate::panel::rows::status_mark;
+
+    /// A colour has one definition, whichever surface asks for it.
+    ///
+    /// `ansi_of` and `rgb_of` are two spellings of one table, and a table
+    /// spelled twice drifts the first time somebody adjusts a hue in the one
+    /// they happen to be reading. This parses the escape the terminal is sent
+    /// and asserts the numbers a cell-based surface is handed are the same
+    /// ones, so the drift fails here instead of showing up as a sidebar that
+    /// is a slightly different green from the panel beside it.
+    #[test]
+    fn a_style_is_the_same_colour_whether_it_is_drawn_as_an_escape_or_as_cells() {
+        for style in [
+            Style::Plain,
+            Style::Dim,
+            Style::Bold,
+            Style::Muted,
+            Style::Accent,
+            Style::Warn,
+            Style::Query,
+        ] {
+            let escape = ansi_of(style);
+            let from_escape = escape.strip_prefix("\x1b[38;2;").and_then(|rest| {
+                let mut n = rest.trim_end_matches('m').split(';');
+                Some((
+                    n.next()?.parse().ok()?,
+                    n.next()?.parse().ok()?,
+                    n.next()?.parse().ok()?,
+                ))
+            });
+            assert_eq!(
+                from_escape,
+                rgb_of(style),
+                "{style:?} is a different colour depending on which surface asks"
+            );
+        }
+    }
 
     /// The group drifted once already: it described the first column as the
     /// agent's state long after `render_row` had gone back to drawing the
