@@ -222,23 +222,74 @@ pub(crate) fn my_pane() -> Option<String> {
 /// paragraph on the wire as a name.
 const LABEL_MAX: usize = 44;
 
-/// What you would type to mean this task, with the project it is in:
-/// `render/109` — which is the whole id, written with a slash. The panel's
-/// `ident_of` splits the same id in the same place and for the same reason:
-/// the number is what `wsp show 109` resolves, and the prefix is what says
-/// which project it is numbered within.
+/// What you would type to mean this task: its id, `render-109`, printed as it
+/// is stored.
 ///
-/// Both halves, always. The panel can drop the prefix because a row sits under
-/// a node that spells the project out; a label has nothing above it, and it is
-/// read at a glance in a column of other labels — `render/109` beside
-/// `robustness/109` is two agents told apart before the title is reached,
-/// where `109` beside `109` is not.
+/// It used to be composed — the project the task is in *now*, a slash, the
+/// number off the end of the id — and that composes a name the CLI rejects. An
+/// id keeps the prefix it was numbered under when the task moves project, by
+/// decision on t-260815-004, because an id must never change under a claim, a
+/// parent link or a log line: `wsp-077` can end up living in `batch`. The
+/// label said `batch/077`, `wsp show batch-077` found nothing, and the thirty
+/// or so tasks moved when `batch` and `fork` were made all displayed a name
+/// that does not exist.
+///
+/// Worse than a plain mismatch, because it looks right: a project beside a
+/// bare number is the pre-t-260815-004 ambiguity — the one that had Ed reading
+/// the wrong `022` — wearing the new scheme's clothes, and the two agree only
+/// by coincidence, for a task that has never moved.
+///
+/// Both halves are still here, which was the whole argument for composing one:
+/// `render-109` beside `robustness-109` is two agents told apart in ten columns
+/// where `109` beside `109` is not. They are simply the two halves the store
+/// wrote down, rather than one of them and a guess.
 pub fn task_scope(task: &Task) -> String {
-    let ident = task.id.rsplit('-').next().unwrap_or(&task.id);
-    match &task.project {
-        Some(p) if !p.is_empty() => format!("{p}/{ident}"),
-        _ => ident.to_string(),
+    task.id.clone()
+}
+
+/// Every scope a label of ours might be wearing, today's first: the id, then
+/// the composed shapes claims wrote before it.
+///
+/// Nothing renames the world. Every pane and workspace named before this
+/// change carries `<project>/<n>`, and both ends of the naming pair ask one
+/// question of a label — [`named_after_task`], to take the work's name back
+/// off a released pane, and [`pane_rename`], to put the right one on. A
+/// matcher that knew only the id form would answer no to both: a pane claimed
+/// yesterday would keep its unresolvable name until somebody typed a new one,
+/// and `release` would leave the work's name on an agent holding nothing,
+/// which is the bug [`unname_after_task`] exists to prevent.
+///
+/// Two projects, because the shape was composed from wherever the task sat at
+/// the time: where it is now, and where its id was numbered. The bare ident is
+/// what a task with no project got.
+///
+/// The old shapes are ambiguous — that is the defect — so `batch/077` could be
+/// two tasks. It costs nothing here: both callers ask this about a pane or a
+/// workspace already bound to the task, so the only question is whether *this*
+/// name was written for *this* binding, and a name never written by any claim
+/// still matches none of the shapes.
+fn scopes_of(task: &Task) -> Vec<String> {
+    let ident = task.id.rsplit('-').next().unwrap_or(&task.id).to_string();
+    let numbered_in = task.id.rsplit_once('-').map(|(p, _)| p.to_string());
+    let mut out = vec![task_scope(task)];
+    for p in [task.project.clone(), numbered_in].into_iter().flatten() {
+        let legacy = format!("{p}/{ident}");
+        if !p.is_empty() && !out.contains(&legacy) {
+            out.push(legacy);
+        }
     }
+    if !out.contains(&ident) {
+        out.push(ident);
+    }
+    out
+}
+
+/// The scope a label of ours is wearing, or `None` if the label is not one of
+/// ours. Anchored at the front and taking the separator with it, so a scope
+/// only ever matches where a claim would have written one.
+fn scope_worn(label: &str, task: &Task) -> Option<String> {
+    let label = label.trim();
+    scopes_of(task).into_iter().find(|s| label.starts_with(&format!("{s} ·")))
 }
 
 /// The name a task lends the workspace and pane holding it, or `None` if it
@@ -248,7 +299,7 @@ pub fn task_scope(task: &Task) -> String {
 /// collapsed sidebar is a rail a few columns wide. Three agents in one tree all
 /// wearing a title that starts "let's add the …" are three agents you cannot
 /// tell apart without widening the sidebar and reading to the end of each one;
-/// `render/109` in front of it is the whole answer in ten columns, and it is
+/// `render-109` in front of it is the whole answer in ten columns, and it is
 /// also what you would type to go and look at the work.
 pub fn task_label(task: &Task) -> Option<String> {
     said_label(task, &task.title)
@@ -337,17 +388,17 @@ fn name_after_task(pane: &str, workspace: &str, task: &Task, ws_label: &str) -> 
 ///
 /// Two shapes wear the same scope and only one of them is the title. `claim`
 /// writes [`task_label`], and every `wsp say` since has written a
-/// [`said_label`] over it — the same `render/047 ·` in front, a different
+/// [`said_label`] over it — the same `render-047 ·` in front, a different
 /// sentence behind. Matching the title alone meant that an agent which had
 /// said anything at all kept the work's name for ever after handing it back,
 /// which is every agent that follows the brief.
 ///
 /// The scope is what wsp owns and the only part of either shape that is not a
-/// sentence somebody chose: a project and an ident, and nothing a person types
-/// by hand looks like it. So the scope is what is recognised, and a name that
+/// sentence somebody chose: it is the task's id, and nothing a person types by
+/// hand looks like it. So the scope is what is recognised, and a name that
 /// does not carry it is somebody else's and is left alone.
 fn named_after_task(label: &str, task: &Task) -> bool {
-    label.trim().starts_with(&format!("{} ·", task_scope(task)))
+    scope_worn(label, task).is_some()
 }
 
 /// What [`name_bound`] should rename a bound pane to, or `None` to leave the
@@ -377,10 +428,19 @@ fn named_after_task(label: &str, task: &Task) -> bool {
 /// happening in there now", and a sentence is a better answer to that than a
 /// title. `claim` and `wsp say --clear` both write the new title back.
 fn pane_rename(pane_label: &str, task: &Task) -> Option<String> {
-    if named_after_task(pane_label, task) {
-        return None;
+    match scope_worn(pane_label, task) {
+        Some(worn) if worn == task_scope(task) => None,
+        // Ours, in a shape that names nothing. Only the scope is wrong, so
+        // only the scope is rewritten and the sentence behind it is carried
+        // across — it is the agent's, and it is newer than anything reconcile
+        // knows. Writing the title back here would be the erasure this
+        // function exists to stop, arriving by the other door.
+        Some(worn) => {
+            let said = pane_label.trim().strip_prefix(&format!("{worn} ·")).unwrap_or("").trim();
+            said_label(task, said).or_else(|| task_label(task))
+        }
+        None => task_label(task),
     }
-    task_label(task)
 }
 
 /// Take the task's name back off the pane and the workspace that held it.
@@ -3499,12 +3559,12 @@ mod tests {
     /// being worked through — the scope is not.
     #[test]
     fn a_pane_holding_work_wears_the_scope_of_it() {
-        let mut t = Task::new("let's add the task scope to the agent window", "t-260815-109");
+        let mut t = Task::new("let's add the task scope to the agent window", "render-109");
         t.project = Some("render".into());
 
         assert_eq!(
             task_label(&t),
-            Some("render/109 · let's add the task scope to th…".to_string())
+            Some("render-109 · let's add the task scope to th…".to_string())
         );
         // Still the one width, prefix and all: it is a name on a wire, not a
         // paragraph.
@@ -3514,14 +3574,32 @@ mod tests {
         // not cost the pane its place in the list.
         assert_eq!(
             said_label(&t, "reading the claim guard"),
-            Some("render/109 · reading the claim guard".to_string())
+            Some("render-109 · reading the claim guard".to_string())
         );
         assert_eq!(said_label(&t, "   "), None);
 
-        // An inbox task has no project to name, and its ident alone still
-        // separates it from every other pane.
-        let loose = Task::new("something nobody has filed", "t-260815-004");
-        assert_eq!(task_label(&loose), Some("004 · something nobody has filed".to_string()));
+        // An unfiled task is numbered in the inbox, and that is an id like any
+        // other — so it is printed like any other.
+        let loose = Task::new("something nobody has filed", "inbox-004");
+        assert_eq!(task_label(&loose), Some("inbox-004 · something nobody has filed".to_string()));
+    }
+
+    /// The defect: the label was composed from the project the task is in
+    /// *now*, so the thirty-odd tasks moved when `batch` and `fork` were made
+    /// went on wearing a name that resolves to nothing. Ed read one off a pane
+    /// and typed it, and `wsp show` said no such task.
+    #[test]
+    fn a_task_that_moved_project_is_labelled_by_the_id_it_kept() {
+        let mut moved = Task::new("a pane's label names a task that does not exist", "wsp-077");
+        moved.project = Some("batch".into());
+
+        // The id, whole, and nothing reconstructed from where it sits today.
+        assert_eq!(task_scope(&moved), "wsp-077");
+        assert!(task_label(&moved).unwrap().starts_with("wsp-077 ·"));
+        assert!(
+            !task_label(&moved).unwrap().contains("batch/077"),
+            "the composed name is the one the CLI rejects"
+        );
     }
 
     /// What a release is entitled to take back. The bug it fixes: `u` on an
@@ -3531,7 +3609,7 @@ mod tests {
     /// for somebody holding neither.
     #[test]
     fn a_release_takes_back_the_scope_and_nothing_else() {
-        let mut t = Task::new("When unassigning an agent via u", "t-260816-047");
+        let mut t = Task::new("When unassigning an agent via u", "render-047");
         t.project = Some("render".into());
 
         // Both shapes a claim leaves behind: the title it wrote, and whatever
@@ -3542,14 +3620,55 @@ mod tests {
         // Somebody else's name, and another task's. Neither is ours to take.
         assert!(!named_after_task("Trance Video", &t));
         assert!(!named_after_task("", &t));
-        let mut other = Task::new("something else entirely", "t-260816-030");
+        let mut other = Task::new("something else entirely", "render-030");
         other.project = Some("render".into());
         assert!(!named_after_task(&task_label(&other).unwrap(), &t));
 
-        // The scope is a project and an ident together: the same ident under a
-        // different project is a different piece of work.
-        let elsewhere = Task::new("same ident, no project", "t-260816-047");
+        // The scope is the whole id: the same number under another project is
+        // a different piece of work.
+        let mut elsewhere = Task::new("same number, another project", "robustness-047");
+        elsewhere.project = Some("robustness".into());
         assert!(!named_after_task(&task_label(&t).unwrap(), &elsewhere));
+    }
+
+    /// What a release has to take back off panes named before the label was
+    /// the id — which is every pane and workspace standing when this shipped.
+    /// Missing them would leave an agent holding nothing wearing the work,
+    /// which is the whole reason [`unname_after_task`] exists.
+    #[test]
+    fn a_release_still_recognises_the_names_written_before_the_id_was_the_label() {
+        let mut moved = Task::new("a pane's label names a task that does not exist", "wsp-077");
+        moved.project = Some("batch".into());
+
+        // Composed where it is now, and composed where it was numbered: the
+        // same claim wrote both, on either side of the move.
+        assert!(named_after_task("batch/077 · a pane's label names a task…", &moved));
+        assert!(named_after_task("wsp/077 · a pane's label names a task…", &moved));
+        // And the bare form an unfiled task's claim wrote.
+        assert!(named_after_task("077 · a pane's label names a task…", &moved));
+
+        // Still nobody else's. A number that is not this task's is not ours by
+        // any of the shapes.
+        assert!(!named_after_task("batch/078 · something else", &moved));
+        assert!(!named_after_task("Trance Video", &moved));
+    }
+
+    /// The other half of the same transition: reconcile has to *replace* the
+    /// old shape, or a name that resolves to nothing outlives the fix. What it
+    /// must not do is take the sentence with it — the scope is what was wrong.
+    #[test]
+    fn reconcile_rewrites_a_composed_name_and_keeps_what_the_agent_said() {
+        let mut moved = Task::new("a pane's label names a task that does not exist", "wsp-077");
+        moved.project = Some("batch".into());
+
+        assert_eq!(
+            pane_rename("batch/077 · reading rows.rs for ident_of", &moved),
+            Some("wsp-077 · reading rows.rs for ident_of".to_string())
+        );
+        // Nothing said yet, so the title is what there is to put back.
+        assert_eq!(pane_rename("batch/077 · ", &moved), task_label(&moved));
+        // Already the id. Reconcile has nothing to do, sentence or not.
+        assert_eq!(pane_rename("wsp-077 · reading rows.rs", &moved), None);
     }
 
     /// The defect: `reconcile` renamed on any label that differed from the
@@ -3558,7 +3677,7 @@ mod tests {
     /// reading as a row of titles nobody had said anything about.
     #[test]
     fn reconcile_leaves_a_sentence_where_the_agent_put_it() {
-        let mut t = Task::new("The three-module partition: core records", "t-260816-083");
+        let mut t = Task::new("The three-module partition: core records", "robustness-083");
         t.project = Some("robustness".into());
 
         // What an agent is saying right now. Reconcile has no business here:
@@ -3574,7 +3693,7 @@ mod tests {
         // and one still wearing the task it was moved off.
         assert_eq!(pane_rename("claude", &t), task_label(&t));
         assert_eq!(pane_rename("", &t), task_label(&t));
-        let mut old = Task::new("something else entirely", "t-260816-030");
+        let mut old = Task::new("something else entirely", "robustness-030");
         old.project = Some("robustness".into());
         let stale = said_label(&old, "still on the old one").unwrap();
         assert_eq!(pane_rename(&stale, &t), task_label(&t));

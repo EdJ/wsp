@@ -460,7 +460,7 @@ impl std::fmt::Display for Seat {
 ///
 /// `label` is not decoration and not a key. It is what a person reading a list
 /// of seats has to go on, and every backend has some list — a sidebar, a
-/// process table, a page. wsp writes `render/109 · <title>` into it
+/// process table, a page. wsp writes `render-109 · <title>` into it
 /// (`cmd_agent::task_label`) because that is legible in ten columns. What it is
 /// *not*, after this port lands, is how wsp finds the seat again; see [`Seat`].
 #[derive(Debug, Clone, Default)]

@@ -1309,13 +1309,16 @@ now*. Putting both on the workspace would lose the name of the work every time
 somebody started a build. A claim resets the pane to the task title, so there
 is always a way home.
 
-Every name wsp writes leads with the task's scope — `render/109 · reading the
+Every name wsp writes leads with the task's scope — `render-109 · reading the
 claim guard` — because a collapsed sidebar is a rail a few columns wide, and the
 right-hand end is what it cuts. Three agents working through one project all
 wore titles that began the same way, and telling them apart meant widening the
 sidebar and reading each one to the end. Ten columns answer it instead, and they
-are the ten you would type to go and look: `wsp show 109`. The sentence keeps the
-scope too — saying something should not cost a pane its place in the list — and
+are the ten you would type to go and look: `wsp show render-109`. The scope is
+the **id, printed as it is stored** — never composed from the project the task
+is in now, because a task keeps the prefix it was numbered under when it moves,
+and `batch/077` for `wsp-077` is a name the CLI rejects. Anything drawn where an
+id goes has to resolve. The sentence keeps the scope too — saying something should not cost a pane its place in the list — and
 a pane holding no task has none to wear, which is itself the difference between
 an agent on a piece of work and an agent between two. The same string goes out
 as the `$scope` token, for a sidebar row that would rather carry it on its own.

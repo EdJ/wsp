@@ -214,7 +214,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             ("task", t.map(|t| util::truncate(&t.title, 44))),
             ("taskid", t.map(|t| t.id.clone())),
             ("seat", seat.clone()),
-            // `render/109`: which piece of work this is, in the ten columns a
+            // `render-109`: which piece of work this is, in the ten columns a
             // narrow sidebar has for it, and what you would type to open it.
             // The pane's label leads with the same thing — this is for a row
             // that would rather carry it on its own.

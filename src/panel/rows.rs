@@ -1001,6 +1001,13 @@ pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, 
 /// search, a dock, a task shown under some other project — the prefix is the
 /// fact you need, so it stays.
 ///
+/// Which makes the question the *id's* prefix, not the task's project. They
+/// part company the moment a task moves: `wsp-077` sitting in `batch` is drawn
+/// under a node saying `batch`, and dropping the prefix there leaves `077`
+/// under a word that would reconstruct `batch-077` — a name that resolves to
+/// nothing, or worse, to somebody else's work. The node above only spells out
+/// the prefix for a task still numbered in it.
+///
 /// The bare suffix is not always unique across the store, so `wsp start 010`
 /// may name two. That is [`crate::store::Found::Ambiguous`]'s job and it
 /// answers with the candidates; the alternative was showing the full id on
@@ -1014,10 +1021,13 @@ fn ident_of(task: &Task, under: Option<&str>) -> String {
     if !task.status().is_open() {
         return task.id.clone();
     }
-    if task.project.as_deref() != under {
-        return task.id.clone();
+    // The inbox is a node with no project, and `inbox` is the code its ids are
+    // numbered under — so it answers this question like any other node.
+    let node = under.unwrap_or(crate::store::INBOX_CODE);
+    match task.id.rsplit_once('-') {
+        Some((prefix, ident)) if prefix == node => ident.to_string(),
+        _ => task.id.clone(),
     }
-    task.id.rsplit('-').next().unwrap_or(&task.id).to_string()
 }
 
 /// Rows for the tasks of one project — or, when `project` is `None`, the tasks
@@ -2744,6 +2754,20 @@ mod tests {
     fn a_finished_task_is_named_in_full_because_its_number_resolves_to_nothing() {
         let t = task("render-014", Some("render"), "done");
         assert_eq!(ident_of(&t, Some("render")), "render-014");
+    }
+
+    /// A task keeps the prefix it was numbered under when it moves, so the
+    /// node above it stops being the word its id begins with. Dropping the
+    /// prefix there would draw `077` under `batch` — which reads as
+    /// `batch-077`, a task that does not exist.
+    #[test]
+    fn a_task_that_moved_project_keeps_the_prefix_its_id_was_numbered_under() {
+        let t = task("wsp-077", Some("batch"), "todo");
+        assert_eq!(ident_of(&t, Some("batch")), "wsp-077");
+        assert_eq!(ident_of(&t, None), "wsp-077");
+
+        // …and one that never moved is unaffected: the node is the prefix.
+        assert_eq!(ident_of(&task("batch-077", Some("batch"), "todo"), Some("batch")), "077");
     }
 
     /// Two projects both reach `010`, and both rows say `010` — under
