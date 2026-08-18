@@ -413,7 +413,7 @@ fn pane_rename(pane_label: &str, task: &Task) -> Option<String> {
 /// The workspace waits on the last binding in it. Two agents in one tree are
 /// rare and one of them finishing is not a reason to unname the room they are
 /// both standing in.
-fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
+pub(crate) fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
     if !herdr::available() {
         return;
     }
@@ -1260,6 +1260,18 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         // somebody's hands is a question about the past.
         store.clear_flag(&t.id);
     });
+
+    // The panes this claim displaced lose the name along with the binding.
+    // What displaced them is that they were bound to *this* task, so the name
+    // they are wearing is this task's and comes off by the same rule `release`
+    // uses. Their workspace keeps its name if the claiming pane is standing in
+    // it, because the binding written just above is one that counts.
+    //
+    // Outside the lock: this is socket round-trips, and the next claim in
+    // should not be made to wait on a rename any more than on a commit.
+    for other in &displaced {
+        unname_after_task(store, other, &t.id);
+    }
 
     // `hand_off` wrote to the tasks it released, and one of them may be this
     // one — a re-claim of work the same agent put down. Re-read rather than

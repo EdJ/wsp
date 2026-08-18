@@ -655,7 +655,17 @@ pub fn done(store: &Store, args: &Args) -> i32 {
             return 1;
         }
         for pane in store.panes_for_task(&t.id) {
-            store.clear_binding(&pane);
+            if store.clear_binding(&pane) {
+                // And the name with it. This is the commonest way work is put
+                // down — an agent finishing and going spare is exactly the row
+                // the agents panel exists to draw — and until now it was the
+                // one door that left the pane wearing the task, so the panel
+                // showed the free agent still holding what it had just
+                // finished. While the task is still readable: the name only
+                // comes off where it is one we wrote, which is a question
+                // about the title.
+                crate::cmd_agent::unname_after_task(store, &pane, &t.id);
+            }
         }
         crate::cmd_agent::hand_off(store, &t.id, None, "done");
     }
