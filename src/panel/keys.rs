@@ -21,7 +21,7 @@ use crate::input::Key;
 use crate::live::AgentRef;
 use crate::util;
 
-use super::rows::{Card, Request, Row, Ui};
+use super::rows::{Card, Request, Row, Target, Ui};
 use super::verbs::{browse_key, pick_tell, Ask, Pick, Tell};
 
 /// What the viewer has folded, unfolded, or asked to see more of. Held by the
@@ -523,9 +523,55 @@ pub(super) fn tags_key(k: Key, ui: &mut Ui, view: &mut View, mut t: Tags) -> Eff
     }
 }
 
-/// Every key the panel answers to. Keys that do the same kind of thing share a
+/// What the cursor has to be on for a row's keys to do more than print a
+/// refusal. `browse_key` already knows this, row by row — "only a task can be
+/// blocked", "a board is a project's" — and [`keymap`] reads the same rule
+/// back, so the popout stops advertising a fifth of itself as keys that do
+/// nothing from here.
+///
+/// A pair sharing a line — `c f` is a claim made either end of it — is scoped
+/// to the union of what its keys need, because the line is read and pressed
+/// as the one idea the doc comment beside it already grouped them as.
+#[derive(Clone, Copy)]
+enum Scope {
+    /// Every target, including the group headings and the empty selection —
+    /// the only honest scope for a key like `P`, which never refuses.
+    Always,
+    Task,
+    TaskOrProject,
+    /// A task, or the agent's own pane — the two ends of a claim.
+    TaskOrPane,
+    /// A board is a project's; a task or the inbox hand one over instead of
+    /// refusing.
+    Board,
+    Seat,
+    /// An agent, wherever it is standing — a pane in the tree, or a seat it
+    /// fills.
+    Agent,
+    Flagged,
+}
+
+impl Scope {
+    fn shown(self, target: &Target, flagged: bool) -> bool {
+        match self {
+            Scope::Always => true,
+            Scope::Flagged => flagged,
+            Scope::Task => matches!(target, Target::Task(_)),
+            Scope::TaskOrProject => matches!(target, Target::Task(_) | Target::Project(_)),
+            Scope::TaskOrPane => matches!(target, Target::Task(_) | Target::Pane(_)),
+            Scope::Board => matches!(target, Target::Task(_) | Target::Project(_) | Target::Inbox),
+            Scope::Seat => matches!(target, Target::Seat(_)),
+            Scope::Agent => matches!(target, Target::Pane(_) | Target::Seat(_)),
+        }
+    }
+}
+
+/// Every key the panel answers to, cut down to the ones that mean something
+/// where the cursor is standing. Keys that do the same kind of thing share a
 /// line — `s v` is one idea, not two — because the map is read in a column
-/// thirty-four wide, and length is what pushes the tree off the screen.
+/// thirty-four wide, and length is what pushes the tree off the screen; the
+/// same reasoning is why an inert third of it is worth hiding rather than
+/// scrolling past.
 ///
 /// The verbs come first. Movement is the half you can find by pressing an arrow
 /// and watching; `X` is not. So when a short pane can only fit part of this,
@@ -533,58 +579,70 @@ pub(super) fn tags_key(k: Key, ui: &mut Ui, view: &mut View, mut t: Tags) -> Eff
 ///
 /// Descriptions are written to fit that column. Anything longer is a sentence,
 /// and a sentence belongs on the row it describes, not here.
-pub(crate) fn keymap() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
-    vec![
+pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    let sections: Vec<(&'static str, Vec<(&'static str, &'static str, Scope)>)> = vec![
         (
             "change",
             vec![
-                ("a P", "add task, project"),
-                ("s v", "start, review"),
-                ("d o", "done, reopen"),
-                ("b p", "block: why · park: until"),
-                ("e n", "retitle, note"),
-                ("t", "tags: ␣ picks, ↵ saves"),
-                ("!", "high, low, normal"),
-                ("m", "move it"),
-                ("c f", "claim, find work · y/n"),
-                ("C", "hand to a spare · y/n"),
-                ("u", "take the work back · y/n"),
-                ("O", "a terminal here"),
-                ("S", "an agent on it · y/n"),
-                ("T", "say it to a project's governor"),
-                ("x", "lower a raised flag"),
-                ("↵", "on a flag: the card again"),
-                ("X", "remove, after y/n"),
+                ("a P", "add task, project", Scope::Always),
+                ("s v", "start, review", Scope::Task),
+                ("d o", "done, reopen", Scope::Task),
+                ("b p", "block: why · park: until", Scope::Task),
+                ("e n", "retitle, note", Scope::TaskOrProject),
+                ("t", "tags: ␣ picks, ↵ saves", Scope::Task),
+                ("!", "high, low, normal", Scope::Task),
+                ("m", "move it", Scope::TaskOrProject),
+                ("c f", "claim, find work · y/n", Scope::TaskOrPane),
+                ("C", "hand to a spare · y/n", Scope::Task),
+                ("u", "take the work back · y/n", Scope::TaskOrPane),
+                ("O", "a terminal here", Scope::TaskOrProject),
+                ("S", "an agent on it · y/n", Scope::TaskOrProject),
+                ("T", "say it to a project's governor", Scope::Seat),
+                ("x", "lower a raised flag", Scope::Flagged),
+                ("↵", "on a flag: the card again", Scope::Flagged),
+                ("X", "remove, after y/n", Scope::TaskOrProject),
             ],
         ),
         (
             "look",
             vec![
-                ("↵ esc", "open it, close it"),
-                ("/", "find: any word, anywhere"),
-                ("F", "the title in full, docked"),
-                ("Z", "the whole tree, in a tab"),
-                ("E", "edit in a tab"),
-                ("K", "the board, in a tab"),
-                ("A i r", "show done, ids, sync"),
-                ("R", "only what needs review"),
-                ("w", "the agents, not the work"),
-                ("W", "its task, in the tree"),
-                ("q", "quit"),
+                ("↵ esc", "open it, close it", Scope::Always),
+                ("/", "find: any word, anywhere", Scope::Always),
+                ("F", "the title in full, docked", Scope::Always),
+                ("Z", "the whole tree, in a tab", Scope::Always),
+                ("E", "edit in a tab", Scope::TaskOrProject),
+                ("K", "the board, in a tab", Scope::Board),
+                ("A i r", "show done, ids, sync", Scope::Always),
+                ("R", "only what needs review", Scope::Always),
+                ("w", "the agents, not the work", Scope::Always),
+                ("W", "its task, in the tree", Scope::Agent),
+                ("q", "quit", Scope::Always),
             ],
         ),
         (
             "move",
             vec![
-                ("j k ↑ ↓", "up, down"),
-                ("h l ← →", "fold, unfold"),
-                ("< >", "…and all inside it"),
-                ("H L", "…the whole tree"),
-                ("g G ⇱ ⇲", "first, last row"),
-                ("1-9", "jump to a terminal"),
+                ("j k ↑ ↓", "up, down", Scope::Always),
+                ("h l ← →", "fold, unfold", Scope::Always),
+                ("< >", "…and all inside it", Scope::Always),
+                ("H L", "…the whole tree", Scope::Always),
+                ("g G ⇱ ⇲", "first, last row", Scope::Always),
+                ("1-9", "jump to a terminal", Scope::Always),
             ],
         ),
-    ]
+    ];
+
+    sections
+        .into_iter()
+        .filter_map(|(section, keys)| {
+            let keys: Vec<(&'static str, &'static str)> = keys
+                .into_iter()
+                .filter(|(_, _, scope)| scope.shown(target, flagged))
+                .map(|(k, what, _)| (k, what))
+                .collect();
+            (!keys.is_empty()).then_some((section, keys))
+        })
+        .collect()
 }
 
 /// What a key asked for beyond changing the view.

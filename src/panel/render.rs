@@ -304,10 +304,15 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
     ]
 }
 
-/// The key map as rows. A heading rules off to the edge rather than sitting
-/// above a blank line: a sidebar is short, and separation has to cost nothing.
-pub(super) fn help_lines(w: usize) -> Vec<Line> {
-    let keyw = keymap()
+/// The key map as rows, cut to what the cursor's own row can use — see
+/// [`super::keys::keymap`]. A heading rules off to the edge rather than
+/// sitting above a blank line: a sidebar is short, and separation has to cost
+/// nothing.
+pub(super) fn help_lines(ui: &Ui, w: usize) -> Vec<Line> {
+    let target = ui.selected_target();
+    let flagged = ui.selected_flag().is_some();
+    let map = keymap(&target, flagged);
+    let keyw = map
         .iter()
         .flat_map(|(_, keys)| keys.iter())
         .map(|(k, _)| k.chars().count())
@@ -315,7 +320,7 @@ pub(super) fn help_lines(w: usize) -> Vec<Line> {
         .unwrap_or(0);
 
     let mut out = Vec::new();
-    for (section, keys) in keymap() {
+    for (section, keys) in map {
         let mut head = Line::default();
         head.push(Style::Bold, section);
         head.push(Style::Plain, " ");
@@ -688,7 +693,7 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
     const FOOTER: usize = 3;
     let room = h.saturating_sub(HEAD + FOOTER);
     let map_rows = if view.help {
-        help_lines(w).len().min(room.saturating_sub(MIN_TREE_ROWS))
+        help_lines(ui, w).len().min(room.saturating_sub(MIN_TREE_ROWS))
     } else {
         0
     };
@@ -907,7 +912,7 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     // The map takes the rows it needs out of the tree's, never the other way
     // about, and its first line is a ruled heading — so it needs no separator
     // of its own and costs the tree nothing but its own height.
-    let map = if view.help { help_lines(w) } else { Vec::new() };
+    let map = if view.help { help_lines(ui, w) } else { Vec::new() };
     let map_rows = g.map_rows;
     let keys = hotkeys(ui);
 
@@ -1325,7 +1330,51 @@ pub(crate) fn to_html(frame: &[Line], w: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::Status;
-    use crate::panel::rows::status_mark;
+    use crate::panel::rows::{status_mark, Target};
+
+    /// Whether some section of the map lists this key, however it is
+    /// grouped with another one on the same line — `has(&map, "s")` also
+    /// matches a row written `"s v"`.
+    fn has(map: &[(&str, Vec<(&str, &str)>)], key: &str) -> bool {
+        map.iter()
+            .flat_map(|(_, keys)| keys.iter())
+            .any(|(k, _)| k.split_whitespace().any(|w| w == key))
+    }
+
+    /// The map is read to press a key on the row under the cursor, and a
+    /// refusal is not a key: `s`/`v` mean nothing until the cursor is on a
+    /// task, so away from one they have no business in the list, while `P`
+    /// — which never refuses — stays no matter what is selected.
+    #[test]
+    fn the_key_map_hides_a_task_only_key_when_nothing_is_selected() {
+        let map = keymap(&Target::Nothing, false);
+        assert!(!has(&map, "s"), "start/review only means anything on a task");
+        assert!(has(&map, "P"), "P never refuses, whatever is selected");
+    }
+
+    /// `T` talks to a project's governor and nothing else answers to it, so
+    /// it has no business on a task's row — and the reverse holds too.
+    #[test]
+    fn the_key_map_offers_the_governors_key_on_a_seat_and_not_on_a_task() {
+        let on_task = keymap(&Target::Task("t1".into()), false);
+        assert!(has(&on_task, "s"));
+        assert!(!has(&on_task, "T"), "a task has no governor to talk to");
+
+        let on_seat = keymap(&Target::Seat("proj".into()), false);
+        assert!(has(&on_seat, "T"));
+        assert!(!has(&on_seat, "s"), "a seat is not a task to start or review");
+    }
+
+    /// `x` lowers a flag that is actually up — offering it over a task with
+    /// nothing raised is the one entry the row itself cannot tell you is
+    /// wrong, since `x` on nothing does the same as `q` on nothing: prints a
+    /// message and changes nothing.
+    #[test]
+    fn the_key_map_only_offers_to_lower_a_flag_that_is_raised() {
+        let target = Target::Task("t1".into());
+        assert!(!has(&keymap(&target, false), "x"));
+        assert!(has(&keymap(&target, true), "x"));
+    }
 
     /// A colour has one definition, whichever surface asks for it.
     ///
