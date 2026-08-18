@@ -150,6 +150,23 @@ pub(super) trait Screen {
     fn focus(&self, live: &live::Live, me: Option<&str>, ws: Option<&str>) -> (bool, bool) {
         (live.has_keyboard(me), live.on_screen(ws))
     }
+
+    /// What herdr is running, for the frame about to be built.
+    ///
+    /// A pane asks, because a pane is a tenant of herdr and has no other way to
+    /// know: two socket round-trips, every time the loop decides the picture
+    /// might have moved. A surface does not have to. Its host **is** herdr, and
+    /// herdr knows the instant an agent changes what it is doing, because it is
+    /// the thing that noticed — so it pushes the answer down the pipe the
+    /// surface is already on and this returns what it was told. See
+    /// `super::surface`.
+    ///
+    /// The seam is here, at the point of use, rather than at a flag the loop
+    /// reads: the loop should not know which of the two it is driving, which is
+    /// the whole reason this trait exists.
+    fn live(&self) -> live::Live {
+        live::read()
+    }
 }
 
 /// The panel in a herdr pane: a tty it measures, and escapes painted onto it.
@@ -343,6 +360,13 @@ fn status_changed(seen: &mut HashMap<String, String>, d: &Value) -> bool {
     }
 }
 
+/// Subscribe to herdr's event stream, and mark the panel dirty on what comes
+/// out of it.
+///
+/// This is how a panel in a *pane* learns that something moved: it is a tenant
+/// of herdr with no other way to know. A surface has one — its host is herdr,
+/// and pushes the answer outright — so it starts this only for a host that
+/// turns out not to. See [`super::surface`].
 pub(super) fn spawn_events(tx: Sender<Msg>) {
     std::thread::spawn(move || loop {
         let tx2 = tx.clone();
@@ -622,7 +646,7 @@ pub(super) fn event_loop(
     // because a surface's environment is herdr's and says nothing true about
     // where the surface is.
     let (self_ws, me) = (here.ws(), here.pane());
-    let live = live::read();
+    let live = screen.live();
     // The two focus questions, asked of the reading the frame is built from and
     // kept by the loop rather than carried in the view.
     //
@@ -1046,7 +1070,7 @@ pub(super) fn event_loop(
             if taken.target != Target::Nothing {
                 want = taken;
             }
-            let live = live::read();
+            let live = screen.live();
             // Free: the panes were fetched for the frame either way, and this is
             // the same reading herdr answers "who has the keyboard" and "which
             // workspace is on screen" out of. Both are read here rather than off

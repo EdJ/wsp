@@ -247,7 +247,7 @@ pub fn answered(e: &std::io::Error) -> bool {
 /// Mirrors herdr's wire payload; fields we don't read yet are kept so the
 /// struct stays a faithful record of what the server sends.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Workspace {
     pub id: String,
     pub label: String,
@@ -261,7 +261,7 @@ pub struct Workspace {
 /// The panel needs both, because a shell sitting in a project is a fact about
 /// that project whether or not an agent ever attaches to it.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pane {
     pub pane_id: String,
     /// herdr's own label for the pane — `wsp` marks one of our panels.
@@ -344,6 +344,45 @@ fn everywhere<T>(one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>) -> std::
     Ok(out)
 }
 
+/// Ask every machine **but** this one.
+///
+/// For a reader that already has this machine's answer some other way and
+/// still has to reach the ones only a socket can answer for. herdr's forked
+/// sidebar is the one: its host pushes the panes it is itself running, which
+/// is every pane on this machine and none of the ones anywhere else, so what
+/// is left to ask for is exactly this.
+///
+/// Errors are dropped rather than returned, which is [`everywhere`]'s rule for
+/// a far machine with the local half removed: a partition is not a failure,
+/// and there is no local answer left in here for its absence to matter to.
+fn beyond<T>(one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>) -> Vec<T> {
+    let mut out = Vec::new();
+    for m in fanout() {
+        if let Ok(mut more) = one(Some(&m)) {
+            out.append(&mut more);
+        }
+    }
+    out
+}
+
+/// Every pane on every machine except this one. See [`beyond`].
+pub fn panes_elsewhere() -> Vec<Pane> {
+    beyond(|m| panes_on(m, "pane.list", "panes"))
+}
+
+/// Every workspace on every machine except this one. See [`beyond`].
+pub fn workspaces_elsewhere() -> Vec<Workspace> {
+    beyond(workspaces_on)
+}
+
+/// Whether there is anywhere else to ask at all.
+///
+/// A single-machine wsp — which is most of them — should not pay a thread and
+/// a clock for a fan-out that would return nothing.
+pub fn anywhere_else() -> bool {
+    !fanout().is_empty()
+}
+
 /// How long a machine gets to answer a listing.
 ///
 /// This machine keeps [`call`]'s three seconds: a local `pane.list` that has
@@ -360,20 +399,31 @@ fn patience(machine: Option<&str>) -> Duration {
     }
 }
 
+/// One `workspace.list` row.
+///
+/// Public for the same reason [`parse_pane`] is: a workspace does not only
+/// arrive as an answer to a question. herdr's forked sidebar pushes the same
+/// rows down its own pipe rather than making the surface ask for them, and a
+/// second way of reading them would be a second set of field names to keep
+/// true.
+pub fn parse_workspace(w: &Value) -> Workspace {
+    Workspace {
+        id: sget(w, "workspace_id"),
+        label: sget(w, "label"),
+        number: w.get("number").and_then(|n| n.as_i64()).unwrap_or(0),
+        focused: w.get("focused").and_then(|b| b.as_bool()).unwrap_or(false),
+        agent_status: sget(w, "agent_status"),
+        tokens: w.get("tokens").cloned().unwrap_or(Value::Null),
+    }
+}
+
 fn workspaces_on(machine: Option<&str>) -> std::io::Result<Vec<Workspace>> {
     let r = call_on(machine, "workspace.list", json!({}), patience(machine))?;
     let arr = r.get("workspaces").and_then(|w| w.as_array()).cloned().unwrap_or_default();
     Ok(arr
         .iter()
         .map(|w| {
-            let mut ws = Workspace {
-                id: sget(w, "workspace_id"),
-                label: sget(w, "label"),
-                number: w.get("number").and_then(|n| n.as_i64()).unwrap_or(0),
-                focused: w.get("focused").and_then(|b| b.as_bool()).unwrap_or(false),
-                agent_status: sget(w, "agent_status"),
-                tokens: w.get("tokens").cloned().unwrap_or(Value::Null),
-            };
+            let mut ws = parse_workspace(w);
             if let Some(m) = machine {
                 qualify(&mut ws.id, m);
             }

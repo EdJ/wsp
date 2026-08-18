@@ -26,13 +26,30 @@
 //! nicety.
 //!
 //! In: `host` (the cells there are, whether the keyboard is here), `key` as it
-//! was **typed**, `mouse` in the surface's own coordinates. A key arrives as a
-//! code and a character rather than as [`Key`], deliberately: binding Tab here
-//! tomorrow must not need a new host.
+//! was **typed**, `mouse` in the surface's own coordinates, and `live` — what
+//! the host is running. A key arrives as a code and a character rather than as
+//! [`Key`], deliberately: binding Tab here tomorrow must not need a new host.
 //!
 //! Out: `frame`, as rows of spans carrying **attributes** rather than style
 //! names, for the mirror-image reason — the palette is wsp's, and changing it
 //! must not need a new host either.
+//!
+//! # Told what is running, rather than asking
+//!
+//! `live` is the one that changes the shape of the thing. A panel in a pane is
+//! a tenant of herdr and has to *ask* what is running — `workspace.list` and
+//! `pane.list`, on a clock, whether or not anything moved. A surface's host
+//! **is** herdr, and herdr knows the instant an agent starts, stops or asks a
+//! question, because it is the thing that noticed. So it pushes the same rows
+//! down this pipe when they change, and the surface stops asking: no socket
+//! round-trips and no event subscription, which measured 6.9% of a core down
+//! to 2.3% in a live herdr on 2026-08-18. See [`Running`].
+//!
+//! It removes **one of the two clocks**, and the honest version says which.
+//! What a task is, whether it is claimed, whether somebody raised a hand — all
+//! of that is in the store, nothing in herdr knows it changed, and no event
+//! could carry it. So the store is still polled, and what is left of the 2.3%
+//! is very nearly all of that.
 //!
 //! # What it is not
 //!
@@ -70,8 +87,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use crate::herdr::{Pane, Workspace};
 use crate::input::Key;
-use crate::live::Live;
+use crate::live::{self, Live};
 use crate::store::Store;
 
 use super::render::{rgb_of, Line, Style};
@@ -81,6 +99,27 @@ use super::run::{event_loop, Msg, Outcome, Screen, Where};
 /// backwards compatible; most additions are not, because unknown messages are
 /// dropped on both sides.
 const PROTOCOL: u32 = 1;
+
+/// How long the surface waits to be told what herdr is running before it goes
+/// back to asking.
+///
+/// A host that pushes the census sends it in the same breath as the first
+/// `host` message, so this is not a wait anybody sees — it is how the surface
+/// tells the two kinds of host apart without either having to declare itself.
+/// An older herdr, or no host at all, simply never says, and after this the
+/// surface subscribes to herdr's event stream and polls exactly as a pane
+/// panel does. Nobody has to upgrade the two binaries in step.
+const TOLD_BY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often the surface asks the *other* machines what they are running.
+///
+/// A host can only push what it is. wsp can be pointed at other machines and
+/// joins their panes into the same tree, and no herdr on this one has anything
+/// to say about those — so they keep a clock, and it is the slow one: a far
+/// listing crosses a tunnel, and a pane on another laptop that turns up three
+/// seconds late is nobody's complaint. Skipped entirely when there are no far
+/// machines, which is the usual case.
+const FAR_POLL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Size to draw at before the host has said. It is `term_size`'s own fallback,
 /// for the same reason: a first frame at a nonsense width is worse than a
@@ -98,9 +137,32 @@ struct Host {
     focused: bool,
 }
 
+/// What is running, as far as this surface knows.
+///
+/// The point of `fork-001`, held in one struct. A panel in a pane learns what
+/// herdr is running by **asking** — `workspace.list` and `pane.list`, four
+/// times a second, whether or not anything moved — which is a child
+/// interrogating its own parent, and it was most of what a surface cost while
+/// showing a picture that never changed. A surface is *told* instead: its host
+/// is herdr, herdr knows the moment an agent starts, stops or asks something,
+/// and it pushes the same rows down the pipe the frames come back on.
+///
+/// Two fields because there are two sources and only one of them can push.
+#[derive(Debug, Default)]
+struct Running {
+    /// The host's own machine, as the host last said it. `None` until it says
+    /// anything, which is also how a host that does not push is recognised —
+    /// see [`TOLD_BY`].
+    here: Option<(Vec<Workspace>, Vec<Pane>)>,
+    /// Everywhere else. Nothing can push these, so they are polled; see
+    /// [`FAR_POLL`].
+    far: (Vec<Workspace>, Vec<Pane>),
+}
+
 /// The panel drawn into a host's cells.
 struct Wire {
     host: Arc<Mutex<Host>>,
+    running: Arc<Mutex<Running>>,
     /// The frame already sent. A tick that changes nothing is most ticks, and
     /// a surface that resent its whole frame five times a second would put the
     /// cost the tty screen avoids onto a pipe instead.
@@ -129,6 +191,30 @@ impl Screen for Wire {
     fn focus(&self, _live: &Live, _me: Option<&str>, _ws: Option<&str>) -> (bool, bool) {
         let focused = self.host.lock().map(|host| host.focused).unwrap_or(false);
         (focused, true)
+    }
+
+    /// What the host has said, joined with what only a socket can answer for.
+    ///
+    /// No round-trip in the ordinary case, which is the whole of `fork-001`:
+    /// the rows were pushed when they changed and this hands back the last
+    /// ones, so a frame built while nothing is happening costs a clone.
+    ///
+    /// A host that has never said anything is an older herdr, or no host at
+    /// all, and then this asks exactly as a pane panel would. That is the only
+    /// compatibility either binary needs: the two can be upgraded in either
+    /// order, and the older pair simply keeps the older cost.
+    fn live(&self) -> Live {
+        let Ok(running) = self.running.lock() else {
+            return live::read();
+        };
+        let Some((workspaces, panes)) = running.here.as_ref() else {
+            return live::read();
+        };
+        let (far_workspaces, far_panes) = &running.far;
+        live::of(
+            workspaces.iter().chain(far_workspaces).cloned().collect(),
+            panes.iter().chain(far_panes).cloned().collect(),
+        )
     }
 }
 
@@ -179,7 +265,12 @@ fn span(style: Style, text: &str, selected: bool) -> Value {
 /// Every message is a `Msg::Tick` as well as whatever else it is: a host
 /// message changes the size the next frame is built for, and a tick is how the
 /// loop is told to build one without inventing a second kind of wake-up.
-fn read_host(reader: impl BufRead, host: Arc<Mutex<Host>>, tx: Sender<Msg>) {
+fn read_host(
+    reader: impl BufRead,
+    host: Arc<Mutex<Host>>,
+    running: Arc<Mutex<Running>>,
+    tx: Sender<Msg>,
+) {
     let mut said_protocol = false;
     for line in reader.lines().map_while(Result::ok) {
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -211,6 +302,35 @@ fn read_host(reader: impl BufRead, host: Arc<Mutex<Host>>, tx: Sender<Msg>) {
                     host.focused = message.get("focused").and_then(Value::as_bool).unwrap_or(false);
                 }
             }
+            // What herdr is running, pushed rather than asked for. See
+            // [`Running`], and `wsp_sidebar.rs` in the fork for the half that
+            // decides when to send one.
+            //
+            // It goes on to the loop as a herdr event of the kind that cannot
+            // wait, because that is exactly what it is: the host does not send
+            // one unless something moved, so every one of these is news. The
+            // rows are read by the same parsers a socket answer is, and a
+            // message with neither list is still an answer — a host with no
+            // panes at all is a herdr somebody just closed everything in.
+            Some("live") => {
+                let workspaces = message
+                    .get("workspaces")
+                    .and_then(Value::as_array)
+                    .map(|rows| rows.iter().map(crate::herdr::parse_workspace).collect())
+                    .unwrap_or_default();
+                let panes = message
+                    .get("panes")
+                    .and_then(Value::as_array)
+                    .map(|rows| rows.iter().map(crate::herdr::parse_pane).collect())
+                    .unwrap_or_default();
+                if let Ok(mut running) = running.lock() {
+                    running.here = Some((workspaces, panes));
+                }
+                if tx.send(Msg::Herdr(told())).is_err() {
+                    return;
+                }
+                continue;
+            }
             Some("key") => {
                 if let Some(key) = key_of(&message) {
                     if tx.send(Msg::Key(key)).is_err() {
@@ -239,6 +359,16 @@ fn read_host(reader: impl BufRead, host: Arc<Mutex<Host>>, tx: Sender<Msg>) {
     // end, and it is the only one that can — dropping this sender does *not*
     // end the loop's `recv`, because the ticker holds a sender of its own.
     // Reading it as if it did is how a surface came to outlive its host.
+}
+
+/// What the loop is handed when the host says what is running.
+///
+/// The loop's own vocabulary, and the urgent end of it: `shape` is the flag
+/// that means *refetch now* rather than *at the next cadence*, and a pushed
+/// census earns it by construction — the host sends one only when something it
+/// draws has changed. It names no workspace because it is about all of them.
+fn told() -> super::run::HerdrEvent {
+    super::run::HerdrEvent { workspace: None, shape: true, focus: false }
 }
 
 /// A typed key, given wsp's meaning.
@@ -316,8 +446,8 @@ pub fn run(store: &Store) -> i32 {
         return 1;
     }
     let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+    let running = Arc::new(Mutex::new(Running::default()));
     let (tx, rx) = std::sync::mpsc::channel::<Msg>();
-    super::run::spawn_events(tx.clone());
     {
         let tx = tx.clone();
         std::thread::spawn(move || loop {
@@ -329,10 +459,59 @@ pub fn run(store: &Store) -> i32 {
     }
     {
         let host = Arc::clone(&host);
+        let running = Arc::clone(&running);
         let tx = tx.clone();
         std::thread::spawn(move || {
-            read_host(std::io::stdin().lock(), host, tx);
+            read_host(std::io::stdin().lock(), host, running, tx);
             stop("the host closed its end");
+        });
+    }
+    // Subscribing to herdr's event stream is what a panel does to find out
+    // that something changed, and a surface whose host pushes the answer
+    // outright has no use for it: the stream's job was to say *look again*,
+    // and there is nothing left to look at. `pane.updated` alone is two events
+    // a second per working agent, each one a full pane parsed out of JSON, and
+    // each one used to mark the panel dirty and buy a full refetch on the next
+    // tick — which is where most of what this task removed actually went.
+    //
+    // So it is started only for a host that turns out not to push. Waiting is
+    // the way to tell, because the message that says so is the one that never
+    // comes; see [`TOLD_BY`].
+    {
+        let running = Arc::clone(&running);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(TOLD_BY);
+            if running.lock().is_ok_and(|running| running.here.is_none()) {
+                super::run::spawn_events(tx);
+            }
+        });
+    }
+    // The machines the host cannot speak for. One thread, one slow clock, and
+    // only when there is somewhere else to ask; see [`FAR_POLL`].
+    if crate::herdr::anywhere_else() {
+        let running = Arc::clone(&running);
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(FAR_POLL);
+            let far = (
+                crate::herdr::workspaces_elsewhere(),
+                crate::herdr::panes_elsewhere(),
+            );
+            let moved = match running.lock() {
+                Ok(mut running) if running.far != far => {
+                    running.far = far;
+                    true
+                }
+                Ok(_) => false,
+                Err(_) => return,
+            };
+            // Only when it moved. A far machine sitting still should cost the
+            // rows nothing: waking the loop would rebuild every row and read
+            // the whole store to draw the same frame.
+            if moved && tx.send(Msg::Herdr(told())).is_err() {
+                return;
+            }
         });
     }
 
@@ -341,7 +520,7 @@ pub fn run(store: &Store) -> i32 {
     // to whatever pane herdr itself was started from. What a key acts *on* is
     // resolved from the workspace on screen at the moment it is pressed — see
     // `stage` in [`super::verbs`].
-    let mut screen = Wire { host, last: String::new() };
+    let mut screen = Wire { host, running, last: String::new() };
     match event_loop(store, &tx, &rx, &Where::nowhere(), false, &mut screen) {
         // Exit, where a panel re-execs. The host is already watching for a
         // surface that ended and already starts another; re-execing here would
@@ -369,6 +548,12 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    /// A surface nobody has told anything: what a host that does not push
+    /// leaves behind, and what every test about the *other* messages wants.
+    fn nothing_told() -> Arc<Mutex<Running>> {
+        Arc::new(Mutex::new(Running::default()))
+    }
+
     /// The failure this is against is not a wrong picture, it is a process.
     /// Measured 2026-08-18: every herdr exit left a surface reparented to init,
     /// spinning on a pipe with nobody at the other end, and neither side said
@@ -384,7 +569,7 @@ mod tests {
         let (done, ended) = std::sync::mpsc::channel::<()>();
 
         std::thread::spawn(move || {
-            read_host("{\"t\":\"host\",\"cols\":30,\"rows\":40}\n".as_bytes(), host, tx);
+            read_host("{\"t\":\"host\",\"cols\":30,\"rows\":40}\n".as_bytes(), host, nothing_told(), tx);
             let _ = done.send(());
         });
 
@@ -411,7 +596,7 @@ mod tests {
         assert!(arm.contains("stop("), "a new binary has to end the surface");
 
         let after = SRC
-            .split("read_host(std::io::stdin().lock(), host, tx);")
+            .split("read_host(std::io::stdin().lock(), host, running, tx);")
             .nth(1)
             .expect("the reader thread moved");
         assert!(
@@ -431,6 +616,7 @@ mod tests {
     fn a_surface_is_on_screen_so_a_new_binary_is_seen_within_a_tick_of_install() {
         let wire = Wire {
             host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            running: nothing_told(),
             last: String::new(),
         };
 
@@ -438,6 +624,103 @@ mod tests {
 
         assert!(on_screen, "a surface is drawn by its host or it is not running");
         assert!(!keyboard, "and whether it has the keyboard is the host's word");
+    }
+
+    /// `fork-001`, from this side: the rows arrive down the pipe the frames go
+    /// back on, and are read by the parser a socket answer is read by.
+    ///
+    /// The event that goes with them is the urgent kind on purpose. A pushed
+    /// census only exists because something moved — the host does not send one
+    /// otherwise — so waiting for the next cadence to redraw would be waiting
+    /// for news already in hand.
+    #[test]
+    fn what_the_host_is_running_arrives_down_the_pipe_rather_than_over_a_socket() {
+        let running = nothing_told();
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+
+        read_host(
+            concat!(
+                r#"{"t":"live","workspaces":[{"workspace_id":"w9","label":"fork","focused":true}],"#,
+                r#""panes":[{"pane_id":"w9:p1","workspace_id":"w9","label":"fork-001","#,
+                r#""agent":"claude","agent_status":"working","cwd":"/tmp","focused":true}]}"#,
+                "\n",
+            )
+            .as_bytes(),
+            Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            Arc::clone(&running),
+            tx,
+        );
+
+        let told = running.lock().unwrap();
+        let (workspaces, panes) = told.here.as_ref().expect("the host said what it is running");
+        assert_eq!(workspaces[0].label, "fork");
+        assert_eq!(panes[0].pane_id, "w9:p1");
+        assert_eq!(panes[0].agent_status, "working");
+        assert!(
+            matches!(rx.recv(), Ok(Msg::Herdr(e)) if e.shape),
+            "a census is news, and the kind that redraws now rather than at the next tick",
+        );
+    }
+
+    /// The saving, stated as a behaviour: a surface that has been told does not
+    /// ask. The ids below exist on no herdr on this machine, so an answer
+    /// carrying them can only have come from what the host said.
+    ///
+    /// The far machine is in the same reading because a host can only push
+    /// what it is: wsp joins other machines' panes into the same tree, and
+    /// nothing on this one can speak for those — see [`FAR_POLL`].
+    #[test]
+    fn a_surface_that_has_been_told_what_is_running_does_not_ask_for_it() {
+        let running = nothing_told();
+        {
+            let mut told = running.lock().unwrap();
+            told.here = Some((
+                vec![Workspace { id: "w9".into(), label: "here".into(), ..Workspace::default() }],
+                vec![Pane { pane_id: "w9:p1".into(), workspace_id: "w9".into(), ..Pane::default() }],
+            ));
+            told.far = (
+                vec![Workspace { id: "w2@far".into(), label: "far".into(), ..Workspace::default() }],
+                vec![Pane {
+                    pane_id: "w2:p1@far".into(),
+                    workspace_id: "w2@far".into(),
+                    ..Pane::default()
+                }],
+            );
+        }
+        let wire = Wire {
+            host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            running,
+            last: String::new(),
+        };
+
+        let live = wire.live();
+
+        let panes: Vec<&str> = live.panes.iter().map(|p| p.pane.as_str()).collect();
+        assert_eq!(panes, vec!["w9:p1", "w2:p1@far"]);
+        assert_eq!(
+            live.panes[0].workspace_label, "here",
+            "and the join against the workspace list is the one live.rs already does",
+        );
+        assert_eq!(live.panes[1].workspace_label, "far");
+    }
+
+    /// A host with nothing running is a herdr somebody has just closed
+    /// everything in, and it has to be readable as an answer. Read as silence
+    /// instead, the surface would go on asking for ever — and worse, would
+    /// keep drawing panes that are gone.
+    #[test]
+    fn a_host_running_nothing_has_still_said_so() {
+        let running = nothing_told();
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+
+        read_host(
+            "{\"t\":\"live\",\"panes\":[],\"workspaces\":[]}\n".as_bytes(),
+            Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            Arc::clone(&running),
+            tx,
+        );
+
+        assert!(running.lock().unwrap().here.is_some());
     }
 
     #[test]
@@ -485,7 +768,7 @@ mod tests {
             "{{\"t\":\"host\",\"protocol\":{PROTOCOL},\"cols\":34,\"rows\":50,\"focused\":true}}\n"
         );
 
-        read_host(line.as_bytes(), Arc::clone(&host), tx);
+        read_host(line.as_bytes(), Arc::clone(&host), nothing_told(), tx);
 
         let told = host.lock().unwrap();
         assert_eq!(told.size, (34, 50));
@@ -504,6 +787,7 @@ mod tests {
         read_host(
             "{\"t\":\"host\",\"cols\":4,\"rows\":2}\n".as_bytes(),
             Arc::clone(&host),
+            nothing_told(),
             tx,
         );
 
@@ -523,6 +807,7 @@ mod tests {
             )
             .as_bytes(),
             Arc::clone(&host),
+            nothing_told(),
             tx,
         );
 

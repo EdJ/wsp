@@ -265,8 +265,22 @@ impl Live {
 /// because a pane carries the name of the workspace it stands in and only the
 /// workspace list has it.
 pub(crate) fn read() -> Live {
-    let workspaces = herdr::workspaces().unwrap_or_default();
-    let panes = herdr::panes().unwrap_or_default();
+    of(
+        herdr::workspaces().unwrap_or_default(),
+        herdr::panes().unwrap_or_default(),
+    )
+}
+
+/// The same reading, from rows somebody already has.
+///
+/// Split out of [`read`] because asking is not the only way to come by them.
+/// herdr's forked sidebar is **told**: the host it is drawn in is the thing
+/// running the agents, so it pushes its own `pane.list` rows down the pipe the
+/// surface is already on rather than answering the same question four times a
+/// second — see `panel::surface`. The rows are herdr's either way, parsed by
+/// the same [`crate::herdr::parse_pane`], and the join below is the one this
+/// file exists to be the only copy of.
+pub(crate) fn of(workspaces: Vec<herdr::Workspace>, panes: Vec<herdr::Pane>) -> Live {
     let label = |id: &str| -> String {
         workspaces.iter().find(|w| w.id == id).map(|w| w.label.clone()).unwrap_or_default()
     };
