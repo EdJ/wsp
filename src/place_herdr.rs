@@ -9,20 +9,30 @@
 //!
 //! # The seat is the pane id, and that is a debt rather than a design
 //!
-//! [`Place::open`] returns one handle and herdr has two ids: a workspace, which
-//! survives a session restore, and a pane, which is reissued on every restart.
-//! This adapter answers with the **pane id**, because that is what every verb
-//! underneath takes — `agent.start` takes a `pane_id`, `agent.prompt` a
+//! [`Place::open`] returns one handle and herdr has two ids: a workspace and a
+//! pane. This adapter answers with the **pane id**, because that is what every
+//! verb underneath takes — `agent.start` takes a `pane_id`, `agent.prompt` a
 //! `target`, and `wsp claim --pane` takes the same string. A workspace-id seat
 //! would have to be resolved back to its root pane on every call, and the claim
 //! would have to be handed something else.
 //!
-//! So the durability [`Seat`] promises is not yet kept here. `place.rs` names
-//! the means — re-find the seat by its label, which is what `workspace_label`
-//! already does for claims — and that work belongs with the claim's own
-//! migration (`cmd_agent.rs`), because the label is written and matched there.
-//! Until then this adapter is exactly as durable as today's code, which is to
-//! say: a claim survives a restart and a binding does not.
+//! **Both ids are durable, and that is not the reassurance it sounds like.**
+//! Measured against upstream 0.8.0 on 2026-08-19 (`robustness-062`): across
+//! three server restarts in one day herdr reissued neither. `session.json`
+//! persists a workspace's `id` and its `public_pane_numbers` behind a
+//! `next_public_pane_number` that only advances, and `w1:p6` has been `w1:p6`
+//! since 2026-08-15. What *is* reissued is herdr's internal pane id, which
+//! nothing here ever sees. So the older note in this file — that a pane id is
+//! reissued on every restart — was wrong, and so is anything that inherited it.
+//!
+//! The catch is the reason [`Seat`] still wants corroborating rather than
+//! trusting. The same restart **kills every agent process**: eleven panes for
+//! eleven, respawned as fresh shells, each handed back its transcript by
+//! `claude --resume`. So the handle outlives the thing behind it, and a seat id
+//! that still resolves is not evidence that it names the same agent. The
+//! durability [`Seat`] promises is therefore about corroboration and not about
+//! the handle — `robustness-058`'s design, reached for the opposite reason from
+//! the one written down here before.
 //!
 //! # herdr's name for the seat an occupant is in is `HERDR_PANE_ID`
 //!
@@ -59,7 +69,10 @@
 //!    starting from `ready == Some(false)`, a reading herdr does not send: for
 //!    3.3 seconds after `agent.start` the answer is `agent_status: "idle"` with
 //!    `launch_pending: true` and *no* `interactive_ready` field, and then the
-//!    two swap. Absence is the signal in both directions. [`state_of_agent`]
+//!    two swap — and `launch_pending` goes *absent* rather than `false`, so the
+//!    pair swaps by presence and not by value. Confirmed unchanged on upstream
+//!    0.8.0, 2026-08-19: 199 samples over 12s, the swap at 3.0s, never `false`.
+//!    Absence is the signal in both directions. [`state_of_agent`]
 //!    reads what is sent, and takes a reply rather than three loose arguments so
 //!    that no test can pin a shape herdr has never produced — which is how this
 //!    survived being written down twice.
@@ -70,10 +83,17 @@
 //!    `pane.list` and its *states* from `agent.list`, and the port's asymmetry
 //!    is between panes and agents rather than between one and many.
 //! 3. **`agent.start` returns before the agent exists.** Its reply carries
-//!    `launch_pending: true`, `agent_status: "unknown"` and no agent name; the
-//!    name appears about three tenths of a second later. `Place::start` promises
-//!    the caller that the agent exists when it returns, so [`Herdr::start`]
-//!    waits for it — and that wait is where the retype lives.
+//!    `launch_pending: true` and `agent_status: "unknown"`, and the pane does
+//!    not yet report an agent *kind*. `Place::start` promises the caller that
+//!    the agent exists when it returns, so [`Herdr::start`] waits for the kind
+//!    — and that wait is where the retype lives.
+//!
+//!    Re-measured against upstream 0.8.0 on 2026-08-19 (`robustness-062`), and
+//!    one half of the 0.7.5 reading no longer holds: the **name** is in
+//!    `agent.start`'s own reply, immediately, so it is not the thing to wait
+//!    for. What still arrives late is the detected kind, about 180ms behind.
+//!    [`look`] reads `"agent"` and not `"name"`, so the loop below was already
+//!    waiting on the right field; only the sentence describing it was wrong.
 //!
 //! # Ending a seat is `pane.close`, and the workspace goes with it
 //!
