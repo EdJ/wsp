@@ -6,12 +6,31 @@ use crate::util;
 
 pub const SCHEMA: &str = "1";
 
+/// Where a task is, and — for the two that are not moving — *why* it is not.
+///
+/// `blocked` and `parked` are both stopped work and they are not the same
+/// thing, which is the distinction this vocabulary went a long time without.
+/// `blocked` is addressed to a person: a decision is owed, and until it is
+/// given nobody can proceed. `parked` is addressed to nobody: it is a judgement
+/// that the moment is wrong, and what it wants written down is the *trigger*
+/// that should bring it back. Conflating them let the second kind rot —
+/// t-260816-022 sat red on the panel for a day, its three revisit conditions
+/// all come true in the log, looking exactly like work that wanted an answer.
+///
+/// So they part everywhere the two readings differ: `blocked` is loud, first in
+/// `rank`, counted in the panel footer and in `wip`'s list of work waiting on a
+/// person; `parked` is quiet, last of the open statuses, dim wherever it draws,
+/// and absent from every count of what wants attention. Both are open — `parked`
+/// work is work, and a claim, a worktree and a suffix lookup all still find it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Inbox,
     Todo,
     Doing,
     Blocked,
+    /// Deliberately not yet: nobody is owed anything, and the reason on it is a
+    /// condition rather than a question.
+    Parked,
     Review,
     Done,
 }
@@ -23,6 +42,10 @@ impl Status {
             "todo" | "open" => Some(Status::Todo),
             "doing" | "wip" | "started" => Some(Status::Doing),
             "blocked" => Some(Status::Blocked),
+            // `paused` and `later` because the thing has three names in the
+            // wild and the store should not be the place you have to remember
+            // which one it picked.
+            "parked" | "park" | "paused" | "later" => Some(Status::Parked),
             "review" => Some(Status::Review),
             "done" | "closed" => Some(Status::Done),
             _ => None,
@@ -34,6 +57,7 @@ impl Status {
             Status::Todo => "todo",
             Status::Doing => "doing",
             Status::Blocked => "blocked",
+            Status::Parked => "parked",
             Status::Review => "review",
             Status::Done => "done",
         }
@@ -42,6 +66,11 @@ impl Status {
         !matches!(self, Status::Done)
     }
     /// Sort weight for listings: attention first.
+    ///
+    /// `parked` sorts below `inbox` and above `done` — the far end of the open
+    /// work, which is the whole of what parking a task buys you. Unfiled work
+    /// is still work somebody may pick up today; parked work is work somebody
+    /// has already decided not to.
     pub fn rank(&self) -> u8 {
         match self {
             Status::Blocked => 0,
@@ -49,7 +78,8 @@ impl Status {
             Status::Doing => 2,
             Status::Todo => 3,
             Status::Inbox => 4,
-            Status::Done => 5,
+            Status::Parked => 5,
+            Status::Done => 6,
         }
     }
 }
@@ -975,6 +1005,36 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The distinction the vocabulary went without: `blocked` and `parked` are
+    /// both stopped and they ask for opposite things. This pins the three
+    /// facts every surface reads off the enum — that they are separate values,
+    /// that `parked` is still open work, and that it sorts to the far end of
+    /// the open statuses where nothing looking for something to do will find
+    /// it first.
+    #[test]
+    fn parked_is_open_work_that_sorts_out_of_the_way() {
+        assert_ne!(Status::parse("parked"), Status::parse("blocked"));
+        assert_eq!(Status::parse("parked"), Some(Status::Parked));
+        // Three names in the wild, one status. `wsp ls -s paused` is a
+        // question somebody will ask, and being told there is no such status
+        // teaches nothing.
+        for spelling in ["park", "paused", "later", "PARKED", " parked "] {
+            assert_eq!(Status::parse(spelling), Some(Status::Parked), "{spelling}");
+        }
+        assert_eq!(Status::Parked.as_str(), "parked", "the on-disk word");
+
+        assert!(Status::Parked.is_open(), "parked work is unfinished work");
+        assert!(
+            Status::Parked.rank() > Status::Inbox.rank(),
+            "below even unfiled work: nobody has decided not to do that yet"
+        );
+        assert!(Status::Parked.rank() < Status::Done.rank(), "and above what is over");
+        assert!(
+            Status::Blocked.rank() < Status::Parked.rank(),
+            "blocked is first because somebody owes it an answer; parked is last because nobody does"
+        );
+    }
 
     /// The reason a search over titles alone would have been a waste of the
     /// afternoon: the title says "basic search" and everything that tells you

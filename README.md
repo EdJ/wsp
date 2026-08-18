@@ -88,6 +88,7 @@ wsp find tuning             # …and the ones a word is in, title or prose
 wsp inbox                   # tasks with no project
 wsp start 003               # ids accept a bare suffix or a title substring
 wsp block 003 "waiting on the tuning table decision"
+wsp park 003 "when the SIMD path lands"   # not yet, deliberately
 wsp prio 003 high           # what comes first inside its project
 wsp done 003
 wsp tree                    # hierarchy with rolled-up counts
@@ -175,7 +176,7 @@ have to get up. The store holds the other half, so the two become four:
 | Mark | What it is waiting for |
 |---|---|
 | `←` | stopped, holding a task that is still live — you are the blocker |
-| `?` | stopped, on a task parked with a question written on it |
+| `?` | stopped, on a task blocked with a question written on it |
 | `●` | running |
 | `○` | spare — stopped and holding nothing at all |
 | `·` | herdr says neither, usually a pane that has not spoken since it started |
@@ -779,7 +780,9 @@ absent, and its absence is the whole point: `Status::rank` puts review ahead of
 both, so it did not merely appear in the list, it won — the first thing `f`
 ever did was hand an agent back the task it had just finished and given to a
 person. `blocked` is absent for the neighbouring reason: a decision is owed,
-and that is not an agent's to make. Nor does `next` name work another live
+and that is not an agent's to make. `parked` is absent for the opposite one:
+somebody has decided the moment is wrong, and an agent is not who un-decides
+that. Nor does `next` name work another live
 agent is holding, because `claim` refuses exactly that — the two share one
 definition of "somebody else has this" — and three idle agents set going at
 once would otherwise all be handed the same task and all three bounce. Work in
@@ -803,13 +806,14 @@ prompt unsent, which looks exactly like an agent that read it and ignored it.
 | `·` | todo | `▾` `▸` | unfolded / folded |
 | `▸` | doing | `7` | open tasks, rolled up |
 | `■` | blocked | `▸3` | tasks in flight |
-| `◆` | in review | `■1` | tasks blocked |
+| `▪` | parked | `■1` | tasks blocked |
+| `◆` | in review | | |
 | `✓` | done — only under `A` | `✓` | all work here is finished |
 | | | `●2` | panes standing here |
 
 A pane gets its own row, drawn with the same mark and the same colour the strip
 and the agents view give it: `●` working, `←` stopped in front of you, `?`
-parked on a question, `○` spare, `·` not saying, and `▫` a shell with no agent
+stopped on a question, `○` spare, `·` not saying, and `▫` a shell with no agent
 in it — never started, as against an idle agent that stopped. A task keeps its
 own status glyph even when claimed, because the pane is on the row beneath
 rather than borrowing the task's.
@@ -831,7 +835,9 @@ reserved to say so is two of the thirty-four a sidebar has. See
 
 A task with work under it carries the same right-hand counts a project does —
 open, `▸` in flight, `■` blocked, `✓` when everything beneath it is finished.
-Same numbers, one level down.
+Same numbers, one level down. Parked work has no count of its own in either
+place: it is inside `open`, and this column is read for what to do about a
+branch, where the answer to a parked task is nothing.
 
 A branch with no open work folds itself away until `A` asks for it. A project
 holding *nothing at all* is the exception and always shows: there is no work
@@ -885,7 +891,7 @@ count of tasks in flight on the right.
 
 ### The raised hand
 
-An agent cannot point. It can write a task up, claim it, park it with a
+An agent cannot point. It can write a task up, claim it, block it with a
 question on it — and all of that lands somewhere you have to go and look. What
 it could not do was say *this row, now*, which is the difference between a
 backlog read at the end of the day and a question that gets answered.
@@ -1619,7 +1625,7 @@ Nothing enforces this and nothing should: `wsp done` works from anywhere, and a
 rule that has to be policed by a permission is a rule nobody believes in. What
 makes it hold is that it is stated in `agents.md`, where every session reads it,
 and that stopping is *visible* — `wsp wip` grows a `REVIEW` block beside
-`BLOCKED`, and the panel footer counts it beside the blocked count. Work parked
+`BLOCKED`, and the panel footer counts it beside the blocked count. Work stopped
 where you cannot see it is the failure this guards against, not disobedience.
 
 `R` in the panel narrows the tree to exactly that work, and is the answer to
@@ -1725,6 +1731,37 @@ project by a half-applied move is precisely the state the rule exists to
 prevent. `counts_under` and the carry walk the tree through one shared function
 for the same reason `tally` is shared: two walks are two chances to disagree
 about what "beneath" means.
+
+## Stopped, and the two reasons
+
+```sh
+wsp block <id> "which offset source?"      # somebody owes this an answer
+wsp park  <id> "when the SIMD path lands"  # not yet, deliberately
+```
+
+Both are stopped work and they want opposite things, which is why they are two
+statuses rather than one with a reason on it. `blocked` is addressed to a
+person: until the answer comes nobody can proceed, so it is first in
+`Status::rank`, red on every row it draws, counted in the panel footer and
+listed in `wsp wip` under `BLOCKED`. `parked` is addressed to nobody: it is a
+judgement that the moment is wrong, so what it asks for is not a question but a
+*trigger* — the condition that should make it live again — and it then gets out
+of the way. Last of the open statuses, dim, at the foot of its project, in no
+count of what wants attention, and never offered by `wsp next`.
+
+It is still open work, and that half matters as much: a parked task keeps its
+place in `open`, so a parent cannot be finished over it, `wsp checkout --rm`
+will not sweep its tree, and a bare suffix still resolves to it.
+
+One status was doing both jobs and the second kind quietly rotted. t-260816-022
+was parked with its three revisit conditions written out, all three came true
+in its own log, and nobody noticed — because to the panel, to `wsp ls`, to
+`wsp next` and to an agent reading `wsp brief` it was one more red row that was
+not actionable. Conflated, the loud kind trains you to skip the quiet kind.
+
+In the panel they sit under adjacent keys: `b` asks *why*, `p` asks *until*.
+Both insist on a sentence, for the reason `wsp block` always has — stopped work
+that does not say why is the work you cannot act on later.
 
 ## Priority
 

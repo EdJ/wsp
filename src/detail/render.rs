@@ -30,6 +30,7 @@ fn field(label: &str, value: &str, style: Style) -> Line {
 fn status_style(s: Status) -> Style {
     match s {
         Status::Blocked => Style::Warn,
+        Status::Parked => Style::Dim,
         Status::Doing => Style::Accent,
         Status::Review => Style::Muted,
         Status::Done => Style::Dim,
@@ -376,6 +377,11 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         totals.push(Style::Dim, " · ");
         totals.push(Style::Warn, format!("{} blocked", c.blocked));
     }
+    // Dim, and after the blocked count: it is part of the open number above
+    // and the one part of it nobody has to do anything about.
+    if c.parked > 0 {
+        totals.push(Style::Dim, format!(" · {} parked", c.parked));
+    }
     if c.done > 0 {
         totals.push(Style::Dim, format!(" · {} done", c.done));
     }
@@ -431,6 +437,7 @@ fn glyph_for(s: Status) -> &'static str {
     use panel::glyph as g;
     match s {
         Status::Blocked => g::BLOCKED,
+        Status::Parked => g::PARKED,
         Status::Review => g::REVIEW,
         Status::Doing => g::DOING,
         Status::Done => g::DONE,

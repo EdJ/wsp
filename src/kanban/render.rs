@@ -96,7 +96,7 @@ pub(super) fn window(len: usize, body: usize, row: usize) -> (usize, usize, usiz
 /// The board's columns already say what the status is, so the mark is free to
 /// answer the question they cannot: who is on it, and has it stopped. When
 /// nobody is, it falls back to the task's own status — which is only ever news
-/// in the `doing` column, where it is the ■ that separates parked work from
+/// in the `doing` column, where it is the ■ that separates blocked work from
 /// work in hand.
 fn mark(card: &Card) -> (Style, &'static str) {
     match card.agent {
@@ -147,6 +147,7 @@ fn card_line(card: &Card, w: usize, here: bool, project: Option<&str>) -> Line {
     let ink = match (card.agent, card.status) {
         (Some(crate::panel::AgentState::Asking), _) => Style::Warn,
         (_, Status::Blocked) => Style::Warn,
+        (_, Status::Parked) => Style::Dim,
         (_, Status::Done) => Style::Dim,
         (Some(_), _) => Style::Plain,
         _ => Style::Muted,

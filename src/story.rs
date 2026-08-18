@@ -155,6 +155,10 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         },
         task("t-004", "Ship the release notes", Some("verb"), "review"),
         task("t-006", "Waiting on the tuning table decision", Some("verb"), "blocked"),
+        // Beside it, the other kind of stopped: nobody owes this one anything.
+        // In the fixture because the pair is only legible together — one row
+        // red and loud, the next dim and at the foot of its project.
+        task("t-007", "Port the tank to the new SIMD path", Some("verb"), "parked"),
         task("t-005", "Design workspace management system", Some("tooling"), "doing"),
         // A decomposed task: what an agent given direction on t-005 would
         // make for itself, and the case the tree has to render without the
@@ -922,6 +926,14 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('b'))
             .type_in("waiting on the tuning table")
             .scene("Blocking, with a reason", "b asks why. `wsp block` requires a reason and so does the panel — a blocked task that does not say why is the one you cannot act on later."),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .down_to(panel::RowKind::Task)
+            .key(Key::Char('p'))
+            .type_in("when the SIMD path lands")
+            .scene("Parking, until something", "p is the other half of b. Blocked is addressed to a person — an answer is owed, and the row is red until it comes. Parked is addressed to nobody: it is a decision that the moment is wrong, so the prompt asks for the condition that would change that, and the row goes dim and sinks to the foot of its project."),
     );
 
     out.push(
@@ -2001,7 +2013,7 @@ mod tests {
 
         // Idle, holding a task that is still doing: you are the blocker.
         assert!(row("Verb UI").contains(panel::glyph::NEEDS_YOU));
-        // Idle, holding a task parked with a question on it — waiting on an
+        // Idle, holding a task blocked with a question on it — waiting on an
         // answer that is at least written down.
         assert!(row("waiting on the tuning").contains(panel::glyph::QUESTION));
         // Idle, holding nothing at all: a person's worth of attention going spare.

@@ -20,7 +20,7 @@ pub(super) const WARN: &str = "\x1b[38;2;224;138;75m";
 pub(super) const MUTED: &str = "\x1b[38;2;125;140;150m";
 
 /// A question somebody has written down. Its own hue rather than a second use
-/// of [`WARN`]: an agent stopped in front of you and an agent parked behind a
+/// of [`WARN`]: an agent stopped in front of you and an agent stopped behind a
 /// question are two different calls on your time, and one colour for both made
 /// the pair unreadable in the tree, where they sit a row apart.
 pub(super) const QUERY: &str = "\x1b[38;2;176;140;217m";
@@ -127,7 +127,12 @@ pub(crate) mod glyph {
     pub const IDLE: &str = "○";
     pub const QUIET: &str = "·";
     pub const BLOCKED: &str = "■";
-    /// An agent parked behind a question. The task's own `■` says the work is
+    /// Deliberately not yet. The same square as `BLOCKED` because the work is
+    /// stopped either way, and smaller and dim because nobody is owed anything
+    /// — the shape is what the two states share, the weight is what tells them
+    /// apart at a glance down the column.
+    pub const PARKED: &str = "▪";
+    /// An agent stopped behind a question. The task's own `■` says the work is
     /// stopped; this says there is a sentence on it addressed to you, which is
     /// the half a square never managed to say.
     pub const QUESTION: &str = "?";
@@ -195,7 +200,8 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
             vec![
                 mark(&[(Style::Dim, g::QUIET)], "not started", "todo, or still in the inbox — one mark for both, because where it is filed is what the tree is already saying"),
                 mark(&[(Style::Accent, g::DOING)], "doing", "started, and in hand"),
-                mark(&[(Style::Warn, g::BLOCKED)], "blocked", "parked, with a reason on the task"),
+                mark(&[(Style::Warn, g::BLOCKED)], "blocked", "stopped, and somebody owes it an answer — the reason is on the task"),
+                mark(&[(Style::Dim, g::PARKED)], "parked", "deliberately not yet, with the thing that would bring it back written on it — open work, and the quietest row here on purpose"),
                 mark(&[(Style::Muted, g::REVIEW)], "review", "done enough to look at"),
                 mark(&[(Style::Dim, g::DONE)], "done", "finished — only shown under A"),
             ],
@@ -222,7 +228,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::CLOSED)], "folded", "← hides them, → brings them back"),
                 mark(&[(Style::Dim, "7")], "open", "tasks not yet done, including everything below"),
                 mark(&[(Style::Accent, g::DOING), (Style::Accent, "3")], "in flight", "tasks someone has started"),
-                mark(&[(Style::Warn, g::BLOCKED), (Style::Warn, "1")], "blocked", "tasks parked and waiting"),
+                mark(&[(Style::Warn, g::BLOCKED), (Style::Warn, "1")], "blocked", "tasks stopped and waiting on an answer. Parked ones are inside the open number and get no mark of their own here: this column is what to do about a project, and the answer to a parked task is nothing"),
                 mark(&[(Style::Dim, g::DONE)], "all clear", "there is work here and all of it is finished"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Accent, "2")], "panes", "panes standing in this project, agent or not"),
             ],
@@ -250,7 +256,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
             vec![
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "an idle agent on a task that is still doing — it has stopped and you are the blocker"),
                 mark(&[(Style::Warn, g::NEEDS_YOU), (Style::Accent, g::WORKING), (Style::Muted, g::IDLE)], "the strip", "the same question in the header, once per agent — see below"),
-                mark(&[(Style::Query, g::QUESTION)], "a question", "an agent parked on a task with a question written on it — drawn wherever that agent is, tree or strip"),
+                mark(&[(Style::Query, g::QUESTION)], "a question", "an agent stopped on a task with a question written on it — drawn wherever that agent is, tree or strip"),
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Accent, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in — the same mark and the same colour the agents view gives it, so one pane does not read two ways in one glance"),
                 mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
@@ -274,7 +280,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
              working. Each mark is clickable and goes to that terminal.",
             vec![
                 mark(&[(Style::Warn, g::NEEDS_YOU)], "wants you", "stopped, holding work that is still live — you are the blocker"),
-                mark(&[(Style::Query, g::QUESTION)], "blocked", "stopped, on a task parked with a question written on it — its own colour, because it wants an answer rather than a nudge"),
+                mark(&[(Style::Query, g::QUESTION)], "blocked", "stopped, on a task blocked with a question written on it — its own colour, because it wants an answer rather than a nudge"),
                 mark(&[(Style::Accent, g::WORKING)], "working", "running"),
                 mark(&[(Style::Muted, g::IDLE)], "spare", "stopped, holding nothing — a person's worth of attention going spare"),
                 mark(&[(Style::Accent, g::SEAT)], "coordinating", "stopped, and in a project's governor slot — a governor is idle between the agents it starts, which is most of the night, and none of that idleness is you being the blocker"),
@@ -291,7 +297,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, "dim")], "structure", "carets, counts, punctuation, finished work"),
                 mark(&[(Style::Bold, "bold")], "project", "project names only"),
                 mark(&[(Style::Accent, "accent")], "live", "running agents and work in flight"),
-                mark(&[(Style::Warn, "warn")], "waiting on you", "an agent stopped in front of you, and work parked without a question"),
+                mark(&[(Style::Warn, "warn")], "waiting on you", "an agent stopped in front of you, and work blocked without a question"),
                 mark(&[(Style::Query, "query")], "a question", "somebody has written one down and is waiting on the answer"),
             ],
         ),
@@ -1305,17 +1311,19 @@ mod tests {
             Status::Todo,
             Status::Doing,
             Status::Blocked,
+            Status::Parked,
             Status::Review,
             Status::Done,
         ];
         for s in every {
-            // No wildcard: a seventh status has to be listed above before
+            // No wildcard: an eighth status has to be listed above before
             // this compiles, which is how it gets looked at here at all.
             match s {
                 Status::Inbox
                 | Status::Todo
                 | Status::Doing
                 | Status::Blocked
+                | Status::Parked
                 | Status::Review
                 | Status::Done => {}
             }

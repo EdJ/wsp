@@ -65,16 +65,20 @@ impl Lane {
 
     /// Which column a status belongs in.
     ///
-    /// Six statuses and four columns, because two of them are not places in the
-    /// flow. `inbox` is `todo` that nobody has filed, and it sorts as todo
+    /// Seven statuses and four columns, because three of them are not places in
+    /// the flow. `inbox` is `todo` that nobody has filed, and it sorts as todo
     /// everywhere else. `blocked` is `doing` that has stopped: the work is in
-    /// hand and parked, so a column of its own would add a fifth state to a
-    /// system that is deliberately four — and would put the cards you most need
-    /// to see off in a siding. The card keeps its own ■ instead, so the column
-    /// simplifies the layout without swallowing the fact.
+    /// hand and waiting on an answer, so a column of its own would add a fifth
+    /// state to a system that is deliberately four — and would put the cards you
+    /// most need to see off in a siding. `parked` is the mirror of that
+    /// argument: it is `todo` that has been deliberately not started, it is the
+    /// one kind of card nobody needs to see, and a siding is what it deserves —
+    /// but not at the price of a fifth column, so it sits at the foot of `todo`
+    /// where `Status::rank` puts it. Each card keeps its own mark instead, so
+    /// the column simplifies the layout without swallowing the fact.
     pub(crate) fn of(status: Status) -> Lane {
         match status {
-            Status::Inbox | Status::Todo => Lane::Todo,
+            Status::Inbox | Status::Todo | Status::Parked => Lane::Todo,
             Status::Doing | Status::Blocked => Lane::Doing,
             Status::Review => Lane::Review,
             Status::Done => Lane::Done,
@@ -484,7 +488,7 @@ mod tests {
 
     /// The ordering the board was asked for. Priority first inside a column,
     /// which is the only place priority has ever meant anything — and status
-    /// beneath it, so a parked card sits above a running one it is level with.
+    /// beneath it, so a blocked card sits above a running one it is level with.
     #[test]
     fn a_column_is_ordered_by_priority_then_by_what_is_asking() {
         let c = ctx(vec![
@@ -568,11 +572,11 @@ mod tests {
         };
         let mut c = ctx(vec![
             task("t-01", "in hand", Some("wsp"), "doing", "normal"),
-            task("t-02", "parked", Some("wsp"), "blocked", "normal"),
+            task("t-02", "stopped", Some("wsp"), "blocked", "normal"),
         ]);
         c.panes = vec![
             pane("w1:p1", "working", "in hand"),
-            pane("w1:p2", "idle", "parked"),
+            pane("w1:p2", "idle", "stopped"),
             pane("w1:p3", "idle", "Verb UI"),
             // A shell is a fact about a place, not a person. It is not capacity
             // and it is not in the census.
@@ -590,7 +594,7 @@ mod tests {
             [AgentState::Blocked, AgentState::Spare, AgentState::Working],
         );
         // And only the one holding nothing is offered as capacity — an idle
-        // agent parked on a blocked task is stopped, not free.
+        // agent holding a blocked task is stopped, not free.
         let spare: Vec<&str> = b.spare().iter().map(|a| a.name.as_str()).collect();
         assert_eq!(spare, ["Verb UI"]);
     }

@@ -209,6 +209,11 @@ pub struct Counts {
     pub open: usize,
     pub doing: usize,
     pub blocked: usize,
+    /// Open, and deliberately not being worked. Counted apart from `blocked`
+    /// so a surface can show what wants an answer without showing what wants
+    /// nothing — the two were one number, and the badge read as five things
+    /// waiting on you when four of them were waiting on a date.
+    pub parked: usize,
     pub review: usize,
     pub done: usize,
 }
@@ -224,6 +229,14 @@ fn tally(c: &mut Counts, t: &Task) {
         }
         Status::Blocked => {
             c.blocked += 1;
+            c.open += 1;
+        }
+        // Open: parked work is unfinished work, and everything that walks the
+        // sub-tree to ask whether it can finish a parent, sweep a worktree or
+        // resolve a bare suffix has to keep seeing it. What parking changes is
+        // where it sorts and how loudly it draws, not whether it exists.
+        Status::Parked => {
+            c.parked += 1;
             c.open += 1;
         }
         Status::Review => {
@@ -347,6 +360,7 @@ pub fn counts_by_project(index: &Index, tasks: &[Task]) -> BTreeMap<String, Coun
                 total.open += c.open;
                 total.doing += c.doing;
                 total.blocked += c.blocked;
+                total.parked += c.parked;
                 total.review += c.review;
                 total.done += c.done;
             }
@@ -475,6 +489,26 @@ pub fn resolve(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Parked work is open work that wants nothing. Both halves matter: a
+    /// parent with a parked child still has a child, so `wsp done` goes on
+    /// refusing and a worktree sweep goes on leaving it alone — and the count
+    /// that surfaces draw in red stops including it, which is what stopped a
+    /// project reading as five things waiting on you when four of them were
+    /// waiting on a date.
+    #[test]
+    fn parked_counts_as_open_and_not_as_waiting_on_anyone() {
+        let mut kid = task("t-2", "vst", "parked");
+        kid.parent = Some("t-1".into());
+        let mut owed = task("t-3", "vst", "blocked");
+        owed.parent = Some("t-1".into());
+        let tasks = vec![task("t-1", "vst", "doing"), kid, owed];
+
+        let c = counts_under(&tasks, "t-1");
+        assert_eq!(c.open, 2, "parked work is unfinished, and a parent cannot be finished over it");
+        assert_eq!(c.parked, 1);
+        assert_eq!(c.blocked, 1, "the two are counted apart, or neither number means anything");
+    }
 
     /// The world this exists for: eleven workspaces whose shells all started in
     /// one folder, each holding a claim on work in a different project.

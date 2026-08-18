@@ -450,7 +450,7 @@ fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
 /// `wsp flag <id> "why"` — an agent raises a hand about one task.
 ///
 /// The thing an agent cannot do from inside its own pane is point. It can write
-/// the task up, it can claim it, it can park it with a question on it — and all
+/// the task up, it can claim it, it can block it with a question on it — and all
 /// of that lands somewhere a person has to go and look. What it could not do
 /// was say *this row, now*, which is the difference between a backlog somebody
 /// reads at the end of the day and a question that gets answered.

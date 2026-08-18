@@ -599,6 +599,7 @@ where
         let mark = match t.status() {
             Status::Done => p.green("✓"),
             Status::Blocked => p.red("■"),
+            Status::Parked => p.dim("▪"),
             Status::Doing => p.cyan("▸"),
             _ => p.dim("·"),
         };
@@ -659,6 +660,28 @@ pub fn block(store: &Store, args: &Args) -> i32 {
     mutate(store, args, "blocked", |t| {
         t.set_status(Status::Blocked);
         t.log(&format!("blocked: {}", reason.trim()));
+    })
+}
+
+/// Deliberately not yet — the other half of what `block` used to mean.
+///
+/// Demands a reason for the same procedural reason `block` does, and wants a
+/// different kind of sentence: not the question somebody owes you, but the
+/// condition that should bring the task back. Writing that down was already
+/// the habit before there was a status for it — t-260816-022 recorded its
+/// three revisit conditions unprompted, and then nothing read them, because to
+/// every list on the machine it was one more red row. It is a log line here
+/// too, and the status is what makes the log line findable: `wsp ls -s parked`
+/// is now a question you can ask.
+pub fn park(store: &Store, args: &Args) -> i32 {
+    let reason = args.text(1);
+    if reason.trim().is_empty() {
+        eprintln!("usage: wsp park <id> \"what would bring it back\"");
+        return 2;
+    }
+    mutate(store, args, "parked", |t| {
+        t.set_status(Status::Parked);
+        t.log(&format!("parked: {}", reason.trim()));
     })
 }
 
@@ -1991,11 +2014,29 @@ mod tests {
                 open_task("t-003", "a todo, normal", "todo", "normal"),
                 open_task("t-004", "finished, waiting on a person", "review", "high"),
                 open_task("t-005", "waiting on a decision", "blocked", "high"),
+                open_task("t-006", "not yet, deliberately", "parked", "high"),
             ],
             bindings,
             panes: vec![live_pane("w1:p1"), live_pane("w2:p1")],
             me: Some("w1:p1".into()),
         }
+    }
+
+    /// `next` is the question an agent with nothing to do asks, and parked
+    /// work is the one answer that can never be right: somebody has already
+    /// decided the moment is wrong, and an agent is not who un-decides that.
+    /// High priority in the fixture on purpose — priority orders the
+    /// candidates and does not choose them, so a `high` parked task is the
+    /// shape that would win if the status were not filtering first.
+    #[test]
+    fn next_never_hands_out_work_somebody_has_parked() {
+        let mut alone = backlog();
+        alone.tasks.retain(|t| matches!(t.status_raw.as_str(), "parked"));
+        let p = pick(&alone, None);
+        assert!(p.task.is_none(), "parked work is not a candidate, whatever its priority");
+        // And it is not one of the excuses either: `nothing actionable` names
+        // what it stepped over, and a parked task was stepped over by nobody.
+        assert_eq!(nothing_because(&p), "");
     }
 
     /// The failure this filter exists to stop: three idle agents set going at

@@ -76,7 +76,7 @@ pub(super) const MAX_AGENTS_DOCKED: usize = 5;
 pub(crate) enum AgentState {
     /// Stopped, on a task that is still `doing`. You are what it is waiting for.
     Asking,
-    /// Stopped, on a task it has parked with a question written on it.
+    /// Stopped, on a task blocked with a question written on it.
     Blocked,
     /// In a project's slot: a custodian, between the agents it is sequencing.
     ///
@@ -175,8 +175,11 @@ pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>, seat: bool) 
         "idle" | "done" => match holds {
             Some(Status::Blocked) => AgentState::Blocked,
             // A claim left on finished work is not work: the agent is free
-            // whatever the binding still says.
-            Some(Status::Done) | None => AgentState::Spare,
+            // whatever the binding still says. Nor is a claim on work somebody
+            // has decided not to do yet — an agent stopped on a parked task is
+            // not waiting on you, and drawing it as `←` would put the loudest
+            // mark on the screen on the one task nobody meant to be doing.
+            Some(Status::Done) | Some(Status::Parked) | None => AgentState::Spare,
             // Everything else is a task in its hands with the hands stopped —
             // `doing` most of the time, `todo` for the moment between a claim
             // landing and the agent starting, `review` when it has handed the
@@ -268,7 +271,7 @@ pub(super) enum Row {
     /// `state` is what the pane is waiting for, and is carried on every agent
     /// row rather than only the ones standing alone: the tree used to draw an
     /// agent from herdr's two words, so a pane stopped in front of you and a
-    /// pane parked behind a question both came out as the same grey `○` —
+    /// pane stopped behind a question both came out as the same grey `○` —
     /// the answer the agents view had all along, two lines further down.
     ///
     /// `census` is set only in the agents view, where the row stands on its
@@ -2527,6 +2530,7 @@ pub(crate) fn word(state: AgentState) -> &'static str {
 pub(crate) fn status_mark(status: Status) -> (Style, &'static str) {
     match status {
         Status::Blocked => (Style::Warn, glyph::BLOCKED),
+        Status::Parked => (Style::Dim, glyph::PARKED),
         Status::Review => (Style::Muted, glyph::REVIEW),
         Status::Done => (Style::Dim, glyph::DONE),
         Status::Doing => (Style::Accent, glyph::DOING),
@@ -2564,6 +2568,29 @@ pub(super) fn hotkeys(ui: &Ui) -> Vec<Option<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An idle agent still holding a task is usually you being the blocker.
+    /// Parked work is the exception, and it is the loudest mark on the panel
+    /// that it would otherwise earn: `←` on a task somebody deliberately shelved
+    /// is the panel asking a person to go and look at the one row that was put
+    /// there to stop being looked at.
+    #[test]
+    fn an_agent_left_on_parked_work_is_holding_nothing_that_wants_you() {
+        assert_eq!(agent_state("idle", Some(Status::Parked), false), AgentState::Spare);
+        assert_eq!(
+            agent_state("idle", Some(Status::Doing), false),
+            AgentState::Asking,
+            "and live work in the same hands still asks"
+        );
+        assert_eq!(
+            agent_state("idle", Some(Status::Blocked), false),
+            AgentState::Blocked,
+            "as does a question, in its own colour"
+        );
+        // The mark is the task's own status, not the agent's: dim, and the
+        // same square as blocked at half the weight.
+        assert_eq!(status_mark(Status::Parked), (Style::Dim, glyph::PARKED));
+    }
 
     fn task(id: &str, project: Option<&str>, status: &str) -> Task {
         let mut t = Task::new("one working tree per task", id);

@@ -184,6 +184,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             ("todo", nonzero(c.open)),
             ("doing", nonzero(c.doing)),
             ("blocked", nonzero(c.blocked)),
+            ("parked", nonzero(c.parked)),
             ("review", nonzero(c.review)),
         ];
 

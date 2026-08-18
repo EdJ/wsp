@@ -30,6 +30,11 @@ pub(crate) enum Ask {
     AddTask { project: Option<String>, parent: Option<String> },
     NewProject { parent: Option<String> },
     Block { task: String },
+    /// The other half of `Block`, and a different question: not what somebody
+    /// owes you, but what would make this worth starting. The prompt asks for
+    /// it in one word — `until` — because a park with nothing written on it is
+    /// the state this status exists to end.
+    Park { task: String },
     /// `from` is the title the prompt opened with. Carried so pressing `↵` on
     /// an untouched line can be nothing rather than a rename to the same
     /// words — which is a log entry, an event and a commit saying nothing.
@@ -60,6 +65,7 @@ impl Ask {
             Ask::AddTask { .. } => "task".into(),
             Ask::NewProject { .. } => "project".into(),
             Ask::Block { .. } => "why".into(),
+            Ask::Park { .. } => "until".into(),
             Ask::Rename { .. } => "title".into(),
             Ask::RenameProject { .. } => "name".into(),
             Ask::Note { .. } => "note".into(),
@@ -106,6 +112,7 @@ impl Ask {
             }
             Ask::NewProject { parent: None } => vec!["project".into(), "add".into(), v],
             Ask::Block { task } => vec!["block".into(), task.clone(), v],
+            Ask::Park { task } => vec!["park".into(), task.clone(), v],
             Ask::Rename { task, .. } => vec!["rename".into(), task.clone(), v],
             // One argv element, spaces and all: `project set` splits on the
             // first `=` and takes the rest whole, so a name is never quoted
@@ -1323,6 +1330,24 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             }
             _ => {
                 say(ui, "only a task can be blocked");
+                Effect::None
+            }
+        },
+        // Beside `b`, and asking for a sentence rather than doing it silently,
+        // for `b`'s reason: a stopped task that does not say why is the one you
+        // cannot act on later. Here the sentence is a condition rather than a
+        // question, which is the whole difference between the two keys.
+        Key::Char('p') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Prompt {
+                    verb: Ask::Park { task: id.clone() },
+                    buffer: String::new(),
+                    armed: false,
+                };
+                Effect::None
+            }
+            _ => {
+                say(ui, "only a task can be parked");
                 Effect::None
             }
         },

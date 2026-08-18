@@ -127,7 +127,8 @@ const GLOBAL_FLAGS: &[&str] = &["json", "help", "version", "no-commit", "terse",
 /// `--` still ends flag parsing everywhere, and is still the answer for the
 /// case no rule can reach: a payload that is a single flag-shaped word on a
 /// command that owns that flag.
-const LITERAL_AFTER: &[(&str, usize)] = &[("note", 1), ("block", 1), ("decide", 1), ("rename", 1), ("tag", 1)];
+const LITERAL_AFTER: &[(&str, usize)] =
+    &[("note", 1), ("block", 1), ("park", 1), ("decide", 1), ("rename", 1), ("tag", 1)];
 
 pub struct Args {
     pub cmd: String,
@@ -409,6 +410,7 @@ fn main() {
         "start" | "doing" => cmd_task::set_status(&store, &args, model::Status::Doing),
         "done" | "close" => cmd_task::done(&store, &args),
         "block" => cmd_task::block(&store, &args),
+        "park" | "pause" => cmd_task::park(&store, &args),
         "review" => cmd_task::set_status(&store, &args, model::Status::Review),
         "reopen" | "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
@@ -517,7 +519,10 @@ fn help() {
   wsp show <id>                     full task, including notes
   wsp start|review|reopen <id>      move through the workflow
   wsp done <id> [--force]           complete; --force over open sub-tasks
-  wsp block <id> "reason"           park it, and say why
+  wsp block <id> "reason"           stop it: somebody owes you an answer
+  wsp park <id> "reason"            not yet, deliberately — say what brings
+                                    it back. Open work, sorted last and drawn
+                                    quiet, and not counted as wanting you
   wsp decide <task|proj> "…"      record what was settled, and why
   wsp note <id> "text"              append to the log
   wsp note <id> - | --from FILE     …or from stdin, or a file; one entry is one
@@ -818,7 +823,7 @@ mod tests {
         assert_eq!(a.text(1), "--parent exists only on wsp add");
         assert!(!a.has("parent"), "the prose was read as a flag");
 
-        for verb in ["block", "decide", "rename"] {
+        for verb in ["block", "park", "decide", "rename"] {
             let a = parse(&[verb, "028", "-p is not a thing on this command"]);
             assert_eq!(a.text(1), "-p is not a thing on this command", "{verb}");
             assert!(!a.has("project"), "{verb} lost its payload to a flag");
