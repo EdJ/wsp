@@ -338,6 +338,20 @@ pub(crate) fn scratch(store: &Store, repo: &Path, key: &str) -> Scratch {
 /// — cannot work that out from the checkout it is standing in.
 pub(crate) const BUILT_AT: &str = "built-at";
 
+/// What the last build here wrote down, or `None` if none has — or if it names
+/// a tree that has since gone, which `--rm` makes ordinary rather than exotic.
+///
+/// Named rather than read twice, because `install` asks the same question for a
+/// second reason: whether it may name a path in "nothing built to install". A
+/// build lands in whichever warm tree was free, so the only path anybody can
+/// honestly name is the one a build wrote down.
+pub(crate) fn built_at(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(dir.join(BUILT_AT))
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_dir())
+}
+
 /// Where the last build here put its target directory, for a caller that wants
 /// the artefacts rather than a place to build.
 ///
@@ -346,11 +360,7 @@ pub(crate) const BUILT_AT: &str = "built-at";
 /// a checkout that has never run a build.
 pub(crate) fn last_build(store: &Store, repo: &Path, key: &str) -> Scratch {
     let sc = scratch(store, repo, key);
-    let named = std::fs::read_to_string(sc.dir.join(BUILT_AT))
-        .ok()
-        .map(|s| PathBuf::from(s.trim()))
-        .filter(|p| p.is_dir());
-    match named {
+    match built_at(&sc.dir) {
         Some(target) => {
             let tree = target.parent().map_or_else(|| sc.tree.clone(), |d| d.join("tree"));
             Scratch { tree, target, ..sc }

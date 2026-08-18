@@ -549,6 +549,7 @@ fn place(bytes: &[u8], dst: &Path) -> Result<(), String> {
 // ---- the command -------------------------------------------------------
 
 /// A binary to install, and the tree it came out of.
+#[derive(Debug)]
 struct Source {
     path: PathBuf,
     /// The checkout it was built from, when that is knowable — see
@@ -583,13 +584,22 @@ fn source(store: &Store, args: &Args) -> Result<Source, String> {
     let repo = toplevel(&cwd).ok_or_else(|| {
         format!("{} is not in a git repository — name the binary to install", util::contract(&cwd))
     })?;
+    built_here(store, &repo)
+}
 
+/// The same order, asked of one tree.
+///
+/// Split from [`source`] so the question can be put from a per-task checkout
+/// without a process-wide `chdir`. Which tree it is asked of is the whole of
+/// robustness-057 — the answer differs between the trunk and a checkout, and a
+/// test that cannot choose the tree cannot catch it going wrong again.
+fn built_here(store: &Store, repo: &Path) -> Result<Source, String> {
     // Asked of `verify` rather than worked out here. Computing it locally meant
     // computing it from the tree this is standing in, and inside a per-task
     // checkout that is not the trunk — so this looked for a release build under
     // a name `verify` never writes, found nothing, and fell through to the
     // shared `target/release` while reporting it as shared.
-    let sc = crate::cmd_verify::last_build(store, &repo, &agent_key());
+    let sc = crate::cmd_verify::last_build(store, repo, &agent_key());
     let mine = sc.target.join("release/wsp");
     if mine.is_file() {
         return Ok(Source { path: mine, tree: Some(sc.tree), origin: "verify" });
@@ -602,12 +612,20 @@ fn source(store: &Store, args: &Args) -> Result<Source, String> {
         // is a warning that is wrong in the alarming direction — which is the
         // kind `cmd_checkout` argues gets ignored along with the true ones.
         let origin = if sc.checkout.is_some() { "own" } else { "shared" };
-        return Ok(Source { path: beside, tree: Some(repo), origin });
+        return Ok(Source { path: beside, tree: Some(repo.to_path_buf()), origin });
     }
-    Err(format!(
-        "nothing built to install — `wsp verify --release` builds it at {}",
-        util::contract(&mine)
-    ))
+    // The path is only worth naming once a build has written one down. Without
+    // that pointer `mine` is this agent's own cold tree, and a build now lands
+    // in whichever warm tree was free — so naming it would be the same lie in
+    // miniature as the lookup above once was: a sentence telling you to run a
+    // command that will not write the file it names.
+    Err(match crate::cmd_verify::built_at(&sc.dir) {
+        Some(_) => format!(
+            "nothing built to install — `wsp verify --release` builds it at {}",
+            util::contract(&mine)
+        ),
+        None => "nothing built to install — `wsp verify --release` builds it".to_string(),
+    })
 }
 
 pub fn install(store: &Store, args: &Args) -> i32 {
@@ -1238,6 +1256,69 @@ mod tests {
         assert_eq!(
             record_path(Path::new("/Users/x/.local/bin/wsp")),
             PathBuf::from("/Users/x/.local/bin/.wsp.install.json")
+        );
+    }
+
+    /// robustness-057, from the checkout side. `install` used to work the build
+    /// tree's name out itself, from the tree it was standing in — which inside
+    /// `.worktrees/<task>` is the task and not the repository — so it looked
+    /// where `verify` never writes. The visible failure was not an error: it
+    /// fell through to the `target/release` lying beside it and reported that
+    /// as the build you had just made. So the neighbour is planted here too,
+    /// and finding it is the failure this asserts against.
+    #[test]
+    fn from_a_checkout_install_looks_where_verify_actually_built() {
+        let iso = util::isolated("install-from-checkout");
+        let store = Store::at(iso.home(), iso.state());
+        let checkout = iso.path("wsp/.worktrees/robustness-057");
+
+        let warm = iso.path("state/warm/wsp-0/target/release");
+        fs::create_dir_all(&warm).unwrap();
+        fs::write(warm.join("wsp"), b"the build verify made").unwrap();
+        let sc = crate::cmd_verify::scratch(&store, &checkout, &agent_key());
+        fs::create_dir_all(&sc.dir).unwrap();
+        fs::write(
+            sc.dir.join(crate::cmd_verify::BUILT_AT),
+            format!("{}\n", warm.parent().unwrap().display()),
+        )
+        .unwrap();
+
+        let beside = checkout.join("target/release");
+        fs::create_dir_all(&beside).unwrap();
+        fs::write(beside.join("wsp"), b"whatever was lying about").unwrap();
+
+        let found = built_here(&store, &checkout).expect("install found nothing to install");
+        assert_eq!(found.path, warm.join("wsp"), "install looked somewhere verify never wrote");
+        assert_eq!(found.origin, "verify", "somebody else's build, reported as this agent's");
+    }
+
+    /// The other half of the same complaint: the sentence you get when there is
+    /// nothing to install told you to run a command at a path that command
+    /// would not write, because a build lands in whichever warm tree is free.
+    /// A path is named when a build wrote one down, and not otherwise.
+    #[test]
+    fn a_path_is_named_only_when_a_build_has_written_one_down() {
+        let iso = util::isolated("install-nothing-built");
+        let store = Store::at(iso.home(), iso.state());
+        let checkout = iso.path("wsp/.worktrees/robustness-057");
+
+        let err = built_here(&store, &checkout).expect_err("something was installable");
+        assert!(err.starts_with("nothing built to install"), "{err}");
+        assert!(!err.contains('/'), "named a path nothing has written: {err}");
+
+        // Now a build has been here — the tree it used is a fact, and worth
+        // saying, even though this run of it produced no release binary.
+        let warm = iso.path("state/warm/wsp-0/target");
+        fs::create_dir_all(&warm).unwrap();
+        let sc = crate::cmd_verify::scratch(&store, &checkout, &agent_key());
+        fs::create_dir_all(&sc.dir).unwrap();
+        fs::write(sc.dir.join(crate::cmd_verify::BUILT_AT), format!("{}\n", warm.display()))
+            .unwrap();
+
+        let err = built_here(&store, &checkout).expect_err("something was installable");
+        assert!(
+            err.ends_with(&util::contract(&warm.join("release/wsp"))),
+            "the tree the build actually used went unsaid: {err}"
         );
     }
 }
