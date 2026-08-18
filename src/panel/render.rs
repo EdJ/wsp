@@ -428,13 +428,22 @@ pub(super) fn tags_lines(t: &super::keys::Tags, w: usize, room: usize) -> Vec<Li
     out
 }
 
-/// The most rows a card will take out of the tree behind it.
+/// The most of the paragraph a card will put over the tree behind it.
 ///
 /// A card is a knock on the door, not a document: the paragraph an agent wrote
 /// may be long and what is worth reading over somebody else's tree is the top
-/// of it. What is cut says so, and `o` opens the task in the detail pane, which
-/// is the surface with room.
-pub(super) const CARD_MAX: usize = 14;
+/// of it. What is cut says how much of it was, and `o` opens the task in the
+/// detail pane, which is the surface with room.
+///
+/// In characters rather than in rows, and that is the fix. A row is not the
+/// same amount of reading on every surface: this budget is fourteen rows at
+/// [`CARD_W`], which is where it was chosen, and the same fourteen rows in a
+/// thirty-four-column sidebar are two hundred characters — a fifth of it. One
+/// number served both and only one of them had room, so a card in the sidebar
+/// stopped a fifth of the way into a paragraph it had been given the rows to
+/// finish. Held as characters, a sidebar spends the budget on eighteen short
+/// rows and a zoomed pane on seven long ones, and they are the same paragraph.
+pub(super) const CARD_CHARS: usize = 500;
 
 /// And the widest. A sidebar is never this wide and a zoomed pane always is:
 /// the card is one paragraph and a question, and a line of it running the whole
@@ -452,6 +461,16 @@ pub(super) const CARD_W: usize = 76;
 /// Inset by a column so the rows behind it show at both edges. That gap is the
 /// whole difference between a card lying on top of the tree and a pane that has
 /// replaced it, and it costs two columns of a pane that has thirty-four.
+///
+/// `room` is what the tree has, not what a card is allowed: how tall this one
+/// gets is decided here, out of [`CARD_CHARS`] and the width, and `room` is the
+/// wall it cannot go through.
+///
+/// Nothing here says how many other asks are behind this one, and that is on
+/// purpose: the footer says it, in the one arm it draws while a card is up, and
+/// a card that also said it would be a second copy of one fact in one frame —
+/// worded differently, because it would have had to be, and two phrasings of
+/// the same number is how a reader learns to trust neither.
 pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec<Line> {
     let box_w = w.saturating_sub(2).max(12);
     // Two for the border, two for the padding inside it.
@@ -511,16 +530,27 @@ pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec
     inner.push(Line::default());
 
     // Two rules, the heading, and the blank line either side of the body, plus
-    // however many lines the tail needs.
-    let body_room = room.saturating_sub(5 + tail.len()).max(1);
+    // however many lines the tail needs — and then, of what is left, no more
+    // paragraph than the budget buys at this width.
+    let budget = CARD_CHARS.div_ceil(text_w).max(3);
+    let avail = room.saturating_sub(5 + tail.len()).max(1).min(budget);
     let wrapped = util::wrap(&card.body, text_w);
-    let cut = wrapped.len() > body_room;
-    for (i, t) in wrapped.into_iter().take(body_room).enumerate() {
-        let last = cut && i + 1 == body_room;
-        inner.push(line(
-            Style::Plain,
-            if last { util::truncate(&format!("{t} …"), text_w) } else { t },
-        ));
+    let cut = wrapped.len() > avail;
+    // One row of the paragraph goes to saying how much of it is not here. That
+    // is the row it is worth: ` …` told you it had been cut and left you no way
+    // to know whether the rest was a sentence or a page, which is the decision
+    // the card is here to support — a thousand words behind an `o` is worth a
+    // pane and forty are not.
+    let shown = if cut { avail - 1 } else { avail };
+    for t in wrapped.iter().take(shown) {
+        inner.push(line(Style::Plain, t.clone()));
+    }
+    if cut {
+        let n = wrapped.len() - shown;
+        let mut l = Line::default();
+        l.push(Style::Muted, format!("… {n} more line{} · ", if n == 1 { "" } else { "s" }));
+        l.push(Style::Accent, "o");
+        inner.push(l);
     }
 
     inner.push(Line::default());
@@ -976,7 +1006,11 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     // by hiding the queue behind it. Centred in what is left, because a card
     // pinned to the top edge reads as a header and this is not one.
     if let Mode::Card(card) = mode {
-        let room = tree_rows.min(CARD_MAX);
+        // Everything the tree has. What a card is *allowed* is decided inside
+        // [`card_lines`], where the width is known — this is only the wall, and
+        // handing it a cap worked out here would be handing it the constant
+        // that could not tell a sidebar from a zoomed pane.
+        let room = tree_rows;
         // A card is a paragraph somebody wrote, and a paragraph does not want a
         // hundred and fifty columns: past about seventy the eye loses the start
         // of the next line. So it stops growing and is centred in what is left,
@@ -1179,14 +1213,23 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         // What the footer is worth here is the queue: answering one of three
         // and finding another underneath is fine, and being surprised by it is
         // not.
+        //
+        // Counted off what is *unread*, not off what is raised. It used to be
+        // `ui.flagged`, which is every hand still up — so a panel with one ask
+        // waiting and two already read said `1 of 3 raised` and promised two
+        // cards that were never coming, and a second ask arriving behind the
+        // one on screen moved a number that was already wrong. The word changed
+        // with the count: `raised` is the census and it is up in the header and
+        // in the section; this line is the only place that says how many of
+        // them are still a question.
         Mode::Card(_) => {
             let mut l = Line::default();
             l.push(Style::Warn, format!("{} ", glyph::FLAG));
             l.push(
                 Style::Muted,
-                match ui.flagged {
+                match ui.waiting {
                     0 | 1 => "raised".to_string(),
-                    n => format!("1 of {n} raised"),
+                    n => format!("1 of {n} unread"),
                 },
             );
             l

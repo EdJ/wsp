@@ -431,6 +431,20 @@ impl Request {
     }
 }
 
+/// The most of a flag's body a card carries.
+///
+/// A guard against a pasted log, not a decision about how much to show — that
+/// decision is the card's, and it is made against the width of the pane it is
+/// being drawn in. It used to be six hundred here, which was fine while the
+/// card could only draw two hundred and became the thing that cut once it could
+/// draw more: worse than the cut it replaced, because the count the card now
+/// prints — *how many lines are behind the `o`* — would have been counted off a
+/// body already shortened, and a card that lies about the size of what it is
+/// hiding is worse than one that says nothing. Wide enough that no flag anybody
+/// writes reaches it, and narrow enough that an agent pasting a build log does
+/// not get re-wrapped on every frame of every panel.
+const BODY_MAX: usize = 4_000;
+
 impl Card {
     /// The task this ask is about. The only field anything outside the panel
     /// has business with — it is what a test checks a card against, and what
@@ -477,7 +491,7 @@ impl Card {
             task: task.to_string(),
             title,
             said,
-            body: util::truncate(body.trim(), 600),
+            body: util::truncate(body.trim(), BODY_MAX),
             who: field("pane"),
             ask: Request::parse(&field("ask")),
             seen: f.get("seen").and_then(|x| x.as_bool()).unwrap_or(false),
@@ -581,6 +595,15 @@ pub(crate) struct Ui {
     /// them. The footer says this number for the pane too short to show the
     /// section at all.
     pub(super) flagged: usize,
+    /// Of those, the ones nobody has read yet — [`Ui::pending`] is the oldest
+    /// of them and the rest are behind it.
+    ///
+    /// Separate from `flagged` because they answer different questions. The
+    /// footer's count is *how much work is waiting on you*, and a hand you have
+    /// read is still up until somebody deals with it; this one is *how many
+    /// more of these are about to arrive*, which is the only thing the card in
+    /// front of you can say about the queue it is at the head of.
+    pub(super) waiting: usize,
     /// The ask that has not been read yet, waiting to come up over the tree.
     /// Held on the `Ui` rather than decided in the event loop so the storyboard
     /// reaches the same state the live panel does, through the same rebuild.
@@ -1995,6 +2018,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         rows,
         dock,
         flagged: snap.flags.len(),
+        waiting: waiting(snap),
         pending: pending_card(snap),
         census: census.into_iter().map(|(state, _, a)| (state, a)).collect(),
         agents: view.agents,
@@ -2144,6 +2168,19 @@ pub(super) fn pending_card(snap: &Snapshot) -> Option<Card> {
         .rev()
         .map(|(id, f)| Card::of(id, f, &snap.tasks))
         .find(|c| !c.seen)
+}
+
+/// How many asks are unread — [`pending_card`] is the oldest of them.
+///
+/// Read off the flags for the same reason the card is: the queue is what the
+/// file says, not what any one panel remembers about it. Two agents raising a
+/// hand a minute apart is the case this exists for, and the panel that was
+/// showing the first has to be able to say the second is there.
+fn waiting(snap: &Snapshot) -> usize {
+    snap.flags
+        .values()
+        .filter(|f| !f.get("seen").and_then(|x| x.as_bool()).unwrap_or(false))
+        .count()
 }
 
 /// The raised hands, as a section pinned above the agents.

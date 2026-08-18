@@ -5723,6 +5723,205 @@ mod tests {
         );
     }
 
+    /// Two hands up, both unread, and the first is the length flags really are.
+    ///
+    /// The two Ed could not read were 1,903 and 1,515 characters — this is in
+    /// that range and it is one paragraph, because the fault was never the
+    /// shape of the prose. Generated rather than written out, so what a test
+    /// asserts about it can be counted rather than guessed at, and the
+    /// sentences are numbered so a run of rows can be told from the same run
+    /// cut somewhere else.
+    ///
+    /// Neither is read, which is the other half of the same complaint: two
+    /// arrived within a minute and the second was as lost as the first was
+    /// truncated.
+    fn long_flag_world() -> Snapshot {
+        let mut s = flagged_world();
+        let body: String = (1..=20)
+            .map(|i| format!("Sentence {i} of the paragraph an agent wrote, where the reason lives. "))
+            .collect();
+        if let Some(m) = s.flags.get_mut("t-105").and_then(|f| f.as_object_mut()) {
+            m.insert("body".into(), json!(body));
+        }
+        // The one `flagged_world` leaves read, raised again with something to say:
+        // an ask nobody has looked at, waiting behind the one on screen.
+        s.flags.insert(
+            "t-004".to_string(),
+            json!({
+                "said": "and this is the one that arrived a minute later",
+                "body": "The second ask. Short, so anything a test says about being cut is \
+    about the first one.",
+                "pane": "w2:p1",
+                "at": "2026-08-16T09:42:00Z",
+            }),
+        );
+        s
+    }
+
+    /// The rows of the paragraph a card is actually showing, off a real frame.
+    ///
+    /// The card is a run of bordered rows: a heading, a blank, the paragraph, a
+    /// blank, and the tail. This takes the middle — everything between the two
+    /// blanks — so a test can weigh what a reader got rather than what the
+    /// renderer was asked for.
+    fn card_body(snap: &Snapshot, w: usize, h: usize) -> Vec<String> {
+        let (ui, mut view) = showing(snap, &[]);
+        let drawn = panel::frame(&ui, &mut view, w, h);
+        let inside: Vec<String> = drawn
+            .iter()
+            .map(|l| l.text())
+            .filter(|t| t.contains('\u{2502}'))
+            .map(|t| t.trim().trim_matches('\u{2502}').trim().to_string())
+            .collect();
+        assert!(!inside.is_empty(), "no card at {w}x{h}");
+        // Past the heading and its blank line, and stop at the blank before the
+        // tail.
+        let start = inside.iter().position(|t| t.is_empty()).expect("a blank under the heading") + 1;
+        let rest = &inside[start..];
+        let end = rest.iter().position(|t| t.is_empty()).unwrap_or(rest.len());
+        rest[..end].to_vec()
+    }
+
+    /// A sidebar and a zoomed pane show the same amount of the paragraph.
+    ///
+    /// This is the whole complaint. The cap used to be fourteen *rows*, and a
+    /// row is not the same amount of reading on every surface: fourteen rows at
+    /// seventy columns is most of a flag and the same fourteen in a
+    /// thirty-four-column sidebar is about two hundred characters — a fifth of
+    /// what an agent wrote, which is not enough to decide whether the rest is
+    /// worth an `o`, and deciding that is the only reason the card exists.
+    ///
+    /// So the budget is held in characters and spent at whatever width the pane
+    /// has. Neither number here is the point on its own; the point is that they
+    /// are close, and that the small one is no longer a fifth of the big one.
+    #[test]
+    fn a_card_shows_as_much_of_a_paragraph_in_a_sidebar_as_in_a_pane() {
+        let f = long_flag_world();
+        let read = |w, h| -> usize { card_body(&f, w, h).iter().map(|t| t.chars().count()).sum() };
+
+        let side = read(W, 60);
+        let zoom = read(153, 50);
+        assert!(side > 400, "a sidebar card is {side} characters of the paragraph");
+        assert!(
+            side * 2 > zoom && zoom * 2 > side,
+            "the two surfaces show different paragraphs: {side} in a sidebar, {zoom} zoomed",
+        );
+
+        // And the pane too short for either is still honest about it: the wall
+        // is the tree's own height, and a card is never allowed through it.
+        let (ui, mut view) = showing(&f, &[]);
+        let short = panel::frame(&ui, &mut view, W, H);
+        assert!(
+            short.iter().filter(|l| l.text().contains('\u{2502}')).count() < 14,
+            "a card grew past the tree it is lying on",
+        );
+    }
+
+    /// What is cut says how much of it there is, not merely that there was some.
+    ///
+    /// ` …` told you the paragraph had been trimmed and left you no way to know
+    /// whether the rest was a sentence or a page — which is exactly the
+    /// decision the card is there to support, because a thousand words behind
+    /// an `o` are worth opening a pane for and forty are not. The number costs
+    /// the row the ellipsis already cost, so it is free, and it has to be true:
+    /// a card that misreports the size of what it is hiding is worse than one
+    /// that says nothing.
+    #[test]
+    fn a_cut_card_says_how_many_lines_are_behind_the_o() {
+        let f = long_flag_world();
+        let body = card_body(&f, W, 60);
+        let last = body.last().expect("a card with a paragraph in it").clone();
+        let n: usize = last
+            .split_whitespace()
+            .nth(1)
+            .and_then(|w| w.parse().ok())
+            .unwrap_or_else(|| panic!("no count on the cut card: {last:?}"));
+        assert!(last.ends_with("· o"), "the count does not say what opens it: {last:?}");
+
+        // The count is the rest of the paragraph at the width it would be read
+        // at — the same wrap the card itself did, over the whole body.
+        let whole = crate::util::wrap(
+            match f.flags["t-105"]["body"].as_str() {
+                Some(b) => b,
+                None => panic!("the fixture lost its body"),
+            },
+            W - 6,
+        );
+        assert_eq!(body.len() - 1 + n, whole.len(), "{n} more lines is not what is left");
+
+        // A flag that fits gets no such row: the card only spends it on a
+        // paragraph it is actually holding something back from.
+        let short = card_body(&one_short_ask_world(), 153, 50);
+        assert!(
+            !short.iter().any(|t| t.contains('\u{2026}')),
+            "a card that showed the whole paragraph still claimed to have cut it: {short:?}",
+        );
+    }
+
+    /// One ask that fits in any card, so nothing is held back.
+    fn one_short_ask_world() -> Snapshot {
+        let mut s = world();
+        s.flags.insert(
+            "t-105".to_string(),
+            json!({
+                "said": "a short one",
+                "body": "Two lines at most, wherever it is drawn.",
+                "pane": "w4:p2",
+                "at": "2026-08-16T09:41:00Z",
+            }),
+        );
+        s
+    }
+
+    /// The second hand is not lost behind the first: it is counted while the
+    /// first is up, and it comes up when the first is answered.
+    ///
+    /// Two arrived within a minute and Ed got neither to the end — half of that
+    /// is the truncation above and half is this. The card is derived from
+    /// `flags.json` rather than remembered, so there is no queue to lose: the
+    /// oldest unread ask is the card, and answering it makes the next one the
+    /// card. What was missing is that a reader could not see it coming, so the
+    /// one footer arm drawn while a card is up says how many are still unread —
+    /// unread rather than raised, because a hand already read is still up and
+    /// promising a card for it would promise one that is never coming.
+    #[test]
+    fn a_second_ask_is_counted_under_the_first_and_comes_up_after_it() {
+        let f = long_flag_world();
+        let (ui, mut view) = showing(&f, &[]);
+        let first = match &view.mode {
+            panel::Mode::Card(c) => c.task().to_string(),
+            _ => panic!("no card came up"),
+        };
+        assert_eq!(first, "t-105", "the oldest ask first — a queue is answered in order");
+
+        let foot = panel::frame(&ui, &mut view, W, 60).last().expect("a footer").text();
+        assert!(foot.contains("1 of 2 unread"), "the footer hid the second ask: {foot:?}");
+
+        // Answering it is a write to the flags, so the next frame is drawn from
+        // a store where it has been read — and that is what brings the next one
+        // up, on this panel and on the other twenty-one at the same time.
+        let mut after = long_flag_world();
+        if let Some(m) = after.flags.get_mut("t-105").and_then(|x| x.as_object_mut()) {
+            m.insert("seen".into(), json!(true));
+        }
+        let (mut ui, mut view) = showing(&f, &[Key::Esc]);
+        panel::refetch_into(&mut ui, &after, &mut view);
+        // The draw, because that is where an unread ask is put up: the one step
+        // every path takes — live loop, storyboard, test — where the view can
+        // be written to.
+        panel::place(&ui, &mut view, W, 60);
+        match &view.mode {
+            panel::Mode::Card(c) => assert_eq!(c.task(), "t-004", "the wrong ask came up next"),
+            m => panic!("the second ask never arrived: {m:?}"),
+        }
+
+        // And with only one of them left unread the footer stops counting: `1
+        // of 1` is a sentence about a queue that is not there.
+        let (ui, mut view) = showing(&after, &[]);
+        let foot = panel::frame(&ui, &mut view, W, 60).last().expect("a footer").text();
+        assert!(foot.contains("raised") && !foot.contains(" of "), "still counting: {foot:?}");
+    }
+
     /// It waits for the panel to be idle. Somebody else's question landing on a
     /// half-typed title would take the keys meant for the title and answer the
     /// question with them.
