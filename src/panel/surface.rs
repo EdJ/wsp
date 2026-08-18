@@ -40,6 +40,29 @@
 //! runs, with a different [`Screen`] under it; the rows, the keys, the verbs
 //! and the effects are the ones `wsp panel` has. If this file ever grows a
 //! decision about what to draw, it is in the wrong place.
+//!
+//! # When it stops
+//!
+//! Two things end a surface, and both end it by **exiting**: the host starts a
+//! surface that has exited again, so an exit is the only restart either side
+//! has to build.
+//!
+//! - **stdin reached EOF.** The host has gone — closed the pipe on its way out,
+//!   or died and had it closed by the kernel. Nothing will read another frame
+//!   and nothing is left to reap us. Measured on 2026-08-18: a surface that
+//!   drew on through this was reparented to init and spun at about 4% of a core
+//!   for as long as the machine stayed up, once per herdr exit, reported by
+//!   nobody. herdr does kill a child that ignores the EOF, but only over the
+//!   two seconds it is alive to do it, and SIGKILL is the case no side can
+//!   handle from over there. So it is handled here, where a read simply ends.
+//! - **The binary changed on disk.** `wsp install` under a running herdr is the
+//!   property the whole split above was chosen for, and it is not delivered
+//!   until the process drawing the sidebar is the new one. The check is the
+//!   loop's, and is the one every pane panel already makes; what differs is the
+//!   answer. A panel re-execs, because it owns a pane and a tty it would lose;
+//!   a surface owns nothing, so it goes and comes back as the new binary. Until
+//!   it does, the host draws its own sidebar — see `sync` in herdr's
+//!   `wsp_sidebar.rs`, where the wait before the restart is decided.
 
 use std::io::{BufRead, Write};
 use std::sync::mpsc::Sender;
@@ -52,7 +75,7 @@ use crate::live::Live;
 use crate::store::Store;
 
 use super::render::{rgb_of, Line, Style};
-use super::run::{event_loop, Msg, Screen};
+use super::run::{event_loop, Msg, Outcome, Screen};
 
 /// The wire version this build speaks. Bumped only when a change is not
 /// backwards compatible; most additions are not, because unknown messages are
@@ -211,7 +234,11 @@ fn read_host(reader: impl BufRead, host: Arc<Mutex<Host>>, tx: Sender<Msg>) {
             return;
         }
     }
-    // The host has gone. Dropping the sender ends the loop's `recv`.
+    // The host has gone, or the loop it was being fed has. Returning is all
+    // this does with either: the caller is what knows there is a process to
+    // end, and it is the only one that can — dropping this sender does *not*
+    // end the loop's `recv`, because the ticker holds a sender of its own.
+    // Reading it as if it did is how a surface came to outlive its host.
 }
 
 /// A typed key, given wsp's meaning.
@@ -271,6 +298,17 @@ fn mouse_of(message: &Value) -> Option<Key> {
     })
 }
 
+/// End the process, saying why where the host will see it.
+///
+/// Both exits come through here: stderr is piped and logged by the host, and
+/// the one thing a person wants after a sidebar has blinked is a line saying
+/// what took it away. Exiting rather than returning because one of the two
+/// happens on a thread with nothing to return to.
+fn stop(why: &str) -> ! {
+    eprintln!("wsp surface: {why}");
+    std::process::exit(0)
+}
+
 /// Run the panel against a host on stdin and stdout.
 pub fn run(store: &Store) -> i32 {
     if !crate::herdr::available() {
@@ -292,22 +330,111 @@ pub fn run(store: &Store) -> i32 {
     {
         let host = Arc::clone(&host);
         let tx = tx.clone();
-        std::thread::spawn(move || read_host(std::io::stdin().lock(), host, tx));
+        std::thread::spawn(move || {
+            read_host(std::io::stdin().lock(), host, tx);
+            stop("the host closed its end");
+        });
     }
 
     // No workspace and no pane: that is what a surface *is*, and every effect
     // that would have named one already takes an `Option`.
     let mut screen = Wire { host, last: String::new() };
-    event_loop(store, &tx, &rx, None, false, &mut screen);
-    0
+    match event_loop(store, &tx, &rx, None, false, &mut screen) {
+        // Exit, where a panel re-execs. The host is already watching for a
+        // surface that ended and already starts another; re-execing here would
+        // be a second way to do the same thing, and the one the host cannot
+        // see. Reached with the loop finished and the last frame flushed, so
+        // what the host has on screen when its own sidebar takes over is a
+        // whole frame rather than half of one.
+        Outcome::Reload => stop("the wsp binary changed on disk, exiting for a new one"),
+        Outcome::Quit => 0,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// The source of this file, for the one test below that is about *where* a
+    /// line sits rather than what it computes — read the way `run.rs` reads its
+    /// own tick arm.
+    const SRC: &str = include_str!("surface.rs");
 
     fn message(text: &str) -> Value {
         serde_json::from_str(text).unwrap()
+    }
+
+    /// The failure this is against is not a wrong picture, it is a process.
+    /// Measured 2026-08-18: every herdr exit left a surface reparented to init,
+    /// spinning on a pipe with nobody at the other end, and neither side said
+    /// anything about it. The read ending is the only notice a child gets of a
+    /// host that was killed, so it has to end rather than block for ever.
+    #[test]
+    fn a_host_that_has_gone_ends_the_read_rather_than_leaving_a_surface_behind() {
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        // Held, so the read ends because stdin did and not because the loop it
+        // sends to went away first — which is the other way out of `read_host`
+        // and would pass this test without testing anything.
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let (done, ended) = std::sync::mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            read_host("{\"t\":\"host\",\"cols\":30,\"rows\":40}\n".as_bytes(), host, tx);
+            let _ = done.send(());
+        });
+
+        assert!(
+            ended.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the reader has to come back when the host's end closes: it is what \
+             the caller turns into an exit, and nothing else ever will",
+        );
+    }
+
+    /// Both exits are the process ending, and the second one is easy to get
+    /// wrong by copying: a pane panel answers the same reload by re-execing
+    /// itself, because it owns a pane and a tty it would otherwise lose. A
+    /// surface owns neither, and its host already watches for a child that
+    /// ended and starts another — so replacing ourselves here would be a
+    /// restart the host cannot see, beside the one it can.
+    #[test]
+    fn a_new_binary_ends_the_surface_where_it_would_replace_a_panel() {
+        let arm = SRC
+            .split("Outcome::Reload =>")
+            .nth(1)
+            .expect("the reload arm moved");
+        let arm = &arm[..arm.find("Outcome::Quit").expect("the quit arm moved")];
+        assert!(arm.contains("stop("), "a new binary has to end the surface");
+
+        let after = SRC
+            .split("read_host(std::io::stdin().lock(), host, tx);")
+            .nth(1)
+            .expect("the reader thread moved");
+        assert!(
+            after.trim_start().starts_with("stop("),
+            "a read that has ended has to end the process on the next line, or \
+             the ticker goes on waking a loop drawing into a closed pipe",
+        );
+    }
+
+    /// What makes the reload prompt rather than eventual. The loop checks the
+    /// binary on the fast cadence and only there — 250ms when the panel is on
+    /// screen, thirty seconds when it is not — and a surface is chrome, so it
+    /// is on screen whenever anything at all is drawn. Answer this `false` and
+    /// `wsp install` takes up to half a minute to reach the sidebar somebody is
+    /// looking at while they change it.
+    #[test]
+    fn a_surface_is_on_screen_so_a_new_binary_is_seen_within_a_tick_of_install() {
+        let wire = Wire {
+            host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            last: String::new(),
+        };
+
+        let (keyboard, on_screen) = wire.focus(&Live::default(), None, None);
+
+        assert!(on_screen, "a surface is drawn by its host or it is not running");
+        assert!(!keyboard, "and whether it has the keyboard is the host's word");
     }
 
     #[test]
