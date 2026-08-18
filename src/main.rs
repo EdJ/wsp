@@ -532,7 +532,8 @@ fn help() {
                                     work is for, and which file in the repo
                                     holds the map of the code
   wsp project set <id> k=v…         name/parent/status/brief/tags/roots
-  wsp project rm <id> [--force]     remove; --force orphans what it held
+  wsp project rm <id> [--force]     retire it to the archive; --force orphans
+                                    the tasks and children it still held
 
 {tasks}
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]

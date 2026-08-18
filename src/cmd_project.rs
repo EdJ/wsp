@@ -313,7 +313,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     };
     let index = Index::new(store.projects());
     let Some(proj) = index.find(&needle).cloned() else {
-        eprintln!("wsp: no such project `{needle}`");
+        eprintln!("{}", no_project(store, &needle));
         return 1;
     };
 
@@ -446,10 +446,49 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// What to say when a project is not there.
+///
+/// A removal now files the project in the archive instead of deleting it, and
+/// the person typing `wsp project show batch` a month later is usually typing
+/// it *because* it is gone from every list. "no such project" is then a true
+/// sentence that sends them away from a file that is sitting right there with
+/// the handbook in it, so the archive is checked before the answer is given.
+fn no_project(store: &Store, needle: &str) -> String {
+    // Through `Index` rather than by comparing slugs here, so a name, an id or
+    // a unique prefix finds the archived project on exactly the terms it would
+    // have found the live one.
+    let archived = store.archived_projects();
+    let index = Index::new(archived.iter().map(|(p, _)| p.clone()).collect());
+    let Some(found) = index.find(needle) else {
+        return format!("wsp: no project matching `{needle}`");
+    };
+    let path = archived
+        .iter()
+        .find(|(p, _)| p.id == found.id)
+        .map(|(_, path)| util::contract(path))
+        .unwrap_or_default();
+    format!("wsp: `{}` was removed — the archive still holds it at {path}", found.id)
+}
+
 /// Remove a project. Refuses while anything still points at it, because the
 /// alternative is silently orphaning work. `--force` does the orphaning
 /// explicitly: tasks fall back to the inbox, children reparent to whatever the
 /// removed project hung from.
+///
+/// The file is retired to the archive rather than deleted, and the prose it
+/// carried is named on the way out. Removing a project used to be the one
+/// operation in the store that destroyed writing nothing else held: tasks are
+/// moved out first and take their overviews with them, but a handbook, a brief
+/// and a decision log have no `wsp mv` — they live in this file and nowhere
+/// else. `wsp project rm batch` took an eleven-lane table with it, said
+/// `removed project batch`, and was recoverable only because the store happens
+/// to be a git repository and somebody thought to look. That is luck, not a
+/// recovery path.
+///
+/// So this does what `wsp rm` has always done for a task: retire, do not
+/// delete. Refusing outright would be wrong — emptying a project and removing
+/// it is the correct flow, and it was followed. The bug was that one field went
+/// quietly, which is why the line it prints now says what was kept and where.
 pub fn rm(store: &Store, args: &Args) -> i32 {
     // rest[0] is the `rm` subcommand itself; the id follows it.
     let Some(needle) = args.rest.get(1).cloned() else {
@@ -458,7 +497,7 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
     };
     let index = Index::new(store.projects());
     let Some(p) = index.find(&needle).cloned() else {
-        eprintln!("wsp: no project matching `{needle}`");
+        eprintln!("{}", no_project(store, &needle));
         return 1;
     };
 
@@ -493,23 +532,63 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         }
     }
 
-    let path = store.projects_dir().join(format!("{}.md", p.id));
-    if let Err(e) = std::fs::remove_file(&path) {
-        eprintln!("wsp: {}: {e}", path.display());
-        return 1;
-    }
-    // Removed here rather than through the store, so the commit has to be told
-    // about it — the tasks and children rewritten above said so themselves.
-    store.wrote(path);
+    let kept = prose_in(&p);
+    let filed = match store.archive_project(&p) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("wsp: archive failed: {e}");
+            return 1;
+        }
+    };
     store.log_event("project-removed", json!({ "id": p.id, "parent": p.parent }));
     store.git_commit(&format!("wsp: project rm {}", p.id));
 
     if args.json() {
-        println!("{}", json!({ "removed": p.id }));
+        println!(
+            "{}",
+            json!({ "removed": p.id, "archived": true, "filed_as": filed, "kept": kept })
+        );
+    } else if kept.is_empty() {
+        println!("removed project {} (archived)", p.id);
     } else {
-        println!("removed project {}", p.id);
+        // The prose is the whole reason this is an archive and not a delete,
+        // so it is named rather than counted: a reader six weeks later is
+        // looking for the handbook, and this is the line that tells them it
+        // still exists and which file it is in.
+        println!(
+            "removed project {} — {} kept in archive/projects/{filed}.md",
+            p.id,
+            kept.join(", ")
+        );
     }
     0
+}
+
+/// The prose a project would take with it, section by section, for the line
+/// `rm` prints.
+///
+/// Sections come from [`crate::model::PROJECT_PROSE`] rather than a list here,
+/// so a section added to the vocabulary cannot go missing from the sentence
+/// that exists to account for it. `brief` is frontmatter and has no heading,
+/// which is exactly why it is easy to forget it is prose too.
+fn prose_in(p: &Project) -> Vec<String> {
+    let mut out = Vec::new();
+    if !p.brief.trim().is_empty() {
+        out.push("brief".to_string());
+    }
+    for name in crate::model::PROJECT_PROSE {
+        let text = crate::model::section_of(&p.body, name).unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let n = text.trim().lines().count();
+        out.push(format!(
+            "{} ({n} line{})",
+            name.to_ascii_lowercase(),
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    out
 }
 
 /// Edit a project's prose, on the same terms as a task's: the body only, never
@@ -524,7 +603,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     };
     let index = Index::new(store.projects());
     let Some(p) = index.find(&needle).cloned() else {
-        eprintln!("wsp: no project matching `{needle}`");
+        eprintln!("{}", no_project(store, &needle));
         return 1;
     };
     crate::cmd_task::edit_prose(
@@ -547,7 +626,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
     };
     let index = Index::new(store.projects());
     let Some(mut proj) = index.find(&needle).cloned() else {
-        eprintln!("wsp: no such project `{needle}`");
+        eprintln!("{}", no_project(store, &needle));
         return 1;
     };
 
@@ -661,6 +740,89 @@ mod tests {
         let mut p = Project::new(id);
         p.parent = parent.map(|s| s.to_string());
         store.save_project(&p).unwrap();
+    }
+
+    /// The bug this file exists to have fixed: `wsp project rm batch` deleted
+    /// the project file, and with it an eleven-lane table that existed nowhere
+    /// else, while printing `removed project batch`. The tasks had been moved
+    /// out first and were fine — a task carries its own prose — so every
+    /// visible thing was right, and the one field with no `wsp mv` was gone.
+    ///
+    /// Three things are asserted because they fail separately: the prose is
+    /// still readable afterwards, the live file is gone (retiring that left a
+    /// project in two places would be its own bug), and the removal *names*
+    /// what it kept — a silent archive is only half an answer to a silent
+    /// deletion, since nobody goes looking in a directory they were never told
+    /// about.
+    #[test]
+    fn removing_a_project_retires_its_prose_instead_of_destroying_it() {
+        let store = scratch("project-rm-archive");
+        let mut p = Project::new("batch");
+        p.brief = "parallel work, grouped by file".into();
+        p.body = "## Handbook\none lane per file\ntwo agents never share one\n".into();
+        store.save_project(&p).unwrap();
+
+        assert_eq!(rm(&store, &Args::synth("project", &["rm", "batch"], &[])), 0);
+
+        assert!(store.project("batch").is_none(), "and it is gone from the live store");
+        let archived = store.archived_projects();
+        assert_eq!(archived.len(), 1, "retired, not deleted");
+        assert!(
+            archived[0].0.body.contains("one lane per file"),
+            "the handbook is the part nothing else holds:\n{}",
+            archived[0].0.body
+        );
+        assert_eq!(archived[0].0.brief, "parallel work, grouped by file");
+
+        assert_eq!(
+            prose_in(&p),
+            vec!["brief".to_string(), "handbook (2 lines)".to_string()],
+            "and the line it prints says what it kept"
+        );
+    }
+
+    /// A project with nothing written on it says so plainly rather than
+    /// claiming to have saved prose that was never there. The summary is what
+    /// decides which sentence `rm` prints, so it is the thing to assert.
+    #[test]
+    fn a_project_with_no_prose_has_nothing_to_account_for() {
+        assert!(prose_in(&Project::new("empty")).is_empty());
+    }
+
+    /// Retirement must not become deletion by another route. A slug can be
+    /// used again — `batch` removed, `batch` created, `batch` removed — and an
+    /// archive keyed by id would file the second one on top of the first,
+    /// which is the exact failure the task archive already carries scars from.
+    #[test]
+    fn the_archive_never_files_a_project_on_top_of_an_earlier_one() {
+        let store = scratch("project-rm-twice");
+        for handbook in ["the first argument", "the second argument"] {
+            let mut p = Project::new("batch");
+            p.body = format!("## Handbook\n{handbook}\n");
+            store.save_project(&p).unwrap();
+            assert_eq!(rm(&store, &Args::synth("project", &["rm", "batch"], &[])), 0);
+        }
+        let bodies: Vec<String> = store.archived_projects().into_iter().map(|(p, _)| p.body).collect();
+        assert_eq!(bodies.len(), 2, "both are kept");
+        assert!(bodies.iter().any(|b| b.contains("the first argument")), "{bodies:#?}");
+        assert!(bodies.iter().any(|b| b.contains("the second argument")), "{bodies:#?}");
+    }
+
+    /// "no such project" is a true sentence that sends someone away from a
+    /// file sitting right there — and they are usually asking *because* it has
+    /// left every list. The answer has to name where it went.
+    #[test]
+    fn a_project_that_was_removed_says_where_it_went() {
+        let store = scratch("project-rm-miss");
+        let mut p = Project::new("batch");
+        p.body = "## Handbook\none lane per file\n".into();
+        store.save_project(&p).unwrap();
+        rm(&store, &Args::synth("project", &["rm", "batch"], &[]));
+
+        let said = no_project(&store, "batch");
+        assert!(said.contains("was removed"), "{said}");
+        assert!(said.contains("archive/projects/batch.md"), "{said}");
+        assert!(no_project(&store, "nothing-like-it").contains("no project matching"));
     }
 
     /// The failure this guard is for is a silent one. Every walk over the

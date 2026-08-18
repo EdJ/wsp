@@ -203,6 +203,9 @@ impl Store {
     pub fn archive_dir(&self) -> PathBuf {
         self.root.join("archive/tasks")
     }
+    pub fn archive_projects_dir(&self) -> PathBuf {
+        self.root.join("archive/projects")
+    }
 
     pub fn exists(&self) -> bool {
         self.projects_dir().is_dir() || self.tasks_dir().is_dir()
@@ -764,6 +767,31 @@ impl Store {
         out
     }
 
+    /// The projects the archive holds, each with the file it is in.
+    ///
+    /// Read when a project cannot be found: "no project matching `batch`" is
+    /// the wrong answer when `batch` is sitting in the archive with its
+    /// handbook intact, and the person asking is usually asking *because* it
+    /// is gone from the live list.
+    pub fn archived_projects(&self) -> Vec<(Project, PathBuf)> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(self.archive_projects_dir()) else { return out };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else { continue };
+            // `batch~2` is still `batch`'s record, filed beside an earlier one.
+            let id = stem.split('~').next().unwrap_or(stem).to_string();
+            if let Ok(text) = fs::read_to_string(&path) {
+                out.push((Project::from_doc(&fm::parse(&text), &id), path));
+            }
+        }
+        out.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        out
+    }
+
     /// Ids the archive holds. `doctor` reads it to catch a name that belongs to
     /// two pieces of work.
     pub fn archived_ids(&self) -> Vec<String> {
@@ -856,6 +884,36 @@ impl Store {
     }
 
     /// Retire a task to `archive/tasks/YYYY-MM/`, and return the name it took.
+    /// A month directory because tasks arrive in their hundreds and carry the
+    /// date to file by; see [`Store::file_away`] for the rest.
+    pub fn archive_task(&self, t: &Task) -> std::io::Result<String> {
+        let month = if t.updated.len() >= 7 { &t.updated[0..7] } else { "unknown" };
+        let dir = self.archive_dir().join(month);
+        self.file_away(&dir, &t.id, &t.render(), self.task_path(&t.id))
+    }
+
+    /// Retire a project to `archive/projects/`, on the same terms as a task.
+    ///
+    /// A project file is the only place its handbook, its decisions and its
+    /// brief exist — tasks carry their own prose out with them under `wsp mv`,
+    /// and those three fields have no such escape. Deleting the file was
+    /// therefore the one removal in the store that destroyed writing nobody
+    /// could get back, and it said nothing while doing it: `wsp project rm
+    /// batch` took an eleven-lane table with it and reported success. So the
+    /// container is retired rather than deleted, which is what `wsp rm` has
+    /// always done for the smaller thing it held.
+    ///
+    /// No month directory here. Tasks are archived in their hundreds and are
+    /// dated by `updated`; projects are few and have no such field, so a flat
+    /// directory is both the honest shape and the one you can read with `ls`.
+    pub fn archive_project(&self, p: &Project) -> std::io::Result<String> {
+        let dir = self.archive_projects_dir();
+        let live = self.projects_dir().join(format!("{}.md", p.id));
+        self.file_away(&dir, &p.id, &p.render(), live)
+    }
+
+    /// Copy a rendered record into `dir` under a name nothing there is using,
+    /// remove the live file, and return the name it took.
     ///
     /// Never overwrites. The archive is keyed by id, so an id handed out twice
     /// filed the second task directly on top of the first — which is how four
@@ -863,32 +921,36 @@ impl Store {
     /// from git. Ids are unique going forward, but an archive that can destroy
     /// the record it exists to keep should not be one bug away from doing it,
     /// so a name already taken gets a `~2` rather than a casualty.
-    pub fn archive_task(&self, t: &Task) -> std::io::Result<String> {
-        let month = if t.updated.len() >= 7 { &t.updated[0..7] } else { "unknown" };
-        let dir = self.archive_dir().join(month);
-        fs::create_dir_all(&dir)?;
+    fn file_away(
+        &self,
+        dir: &Path,
+        id: &str,
+        rendered: &str,
+        live: PathBuf,
+    ) -> std::io::Result<String> {
+        fs::create_dir_all(dir)?;
 
-        let mut name = t.id.clone();
+        let mut name = id.to_string();
         for n in 2..100 {
             if !dir.join(format!("{name}.md")).exists() {
                 break;
             }
-            name = format!("{}~{n}", t.id);
+            name = format!("{id}~{n}");
         }
         if dir.join(format!("{name}.md")).exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                format!("archive already holds {} and 98 renamings of it", t.id),
+                format!("archive already holds {id} and 98 renamings of it"),
             ));
         }
 
         let filed = dir.join(format!("{name}.md"));
-        write_atomic(&filed, &t.render())?;
-        let _ = fs::remove_file(self.task_path(&t.id));
+        write_atomic(&filed, rendered)?;
+        let _ = fs::remove_file(&live);
         // Both halves of the move. A commit holding the arrival without the
-        // departure is a store with the task in two places.
+        // departure is a store with the record in two places.
         self.wrote(filed);
-        self.wrote(self.task_path(&t.id));
+        self.wrote(live);
         Ok(name)
     }
 

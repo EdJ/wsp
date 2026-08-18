@@ -36,6 +36,7 @@ Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` a
 | `~/wsp/projects/<slug>.md` | one project per file: parent, tags, roots, brief |
 | `~/wsp/tasks/<id>.md` | one task per file: `<project>-NNN`, or `inbox-NNN` |
 | `~/wsp/archive/tasks/YYYY-MM/` | swept `done` tasks |
+| `~/wsp/archive/projects/` | removed projects, handbook and decisions intact |
 | `~/wsp/ids.json` | retired id → the id it became, so old ones still resolve |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
 | `~/.local/state/wsp/` | claims, bindings, pins, mandates, `said.json`, `worked.json`, `events.jsonl` — machine-local, not in git |
@@ -3222,6 +3223,13 @@ fast builds are a feature here, because a session-start hook runs this binary.
   three of them recoverable only from git. A name already taken now gets a
   `~2`, and `wsp rm` says so. Ids are unique going forward; an archive that can
   destroy the record it exists to keep should not be one bug away from it.
+- **A container is retired, not deleted.** `wsp rm` archives a task and
+  `wsp project rm` archives the project. Tasks move out of a project before it
+  goes and take their overviews with them; a handbook, a brief and a decision
+  log have no `wsp mv` and live in that one file, so deleting it destroyed
+  writing nothing else held — silently, while reporting success. Removal names
+  what it kept and where, and `wsp project show` on a removed slug answers with
+  the archive path rather than "no such project".
 - **An id is never handed out twice.** `t-YYMMDD-NNN` is allocated past
   everything the day has already used, live *or* archived — not into the first
   free filename. Archiving moves a task out of `tasks/`, so the old probe gave
