@@ -620,7 +620,9 @@ fn help() {
                                     --model fable|opus|sonnet|haiku, any with
                                     [1m], and --effort low|medium|high|xhigh|max
                                     say what tier to start it at; say neither and
-                                    it starts on your settings file, as before
+                                    it starts on your settings file, as before.
+                                    haiku opens in manual mode, so it is refused
+                                    unless --focus says you will be at the pane
   wsp despawn <id> | --pane <seat>  the other end of it: end the agent working
                                     that task, then release the claim — a seat
                                     that will not close keeps its claim

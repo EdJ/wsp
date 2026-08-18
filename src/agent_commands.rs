@@ -255,6 +255,40 @@ pub trait Kind {
     /// catalogue of any other kind belongs to that kind.
     fn tier(&self, model: Option<&str>, effort: Option<&str>) -> std::result::Result<(), String>;
 
+    /// Why this tier cannot be left to work on its own, if it cannot.
+    ///
+    /// Separate from [`Kind::tier`] because it answers a different question.
+    /// `tier` asks whether the runtime will *accept* the words; this asks
+    /// whether the session they start can be walked away from — and a tier can
+    /// pass the first and fail the second, which is exactly the case that was
+    /// paid for.
+    ///
+    /// **Measured 2026-08-18, Claude Code 2.1.234**, two spawns into herdr panes
+    /// differing in nothing but `--model`, on the same task and the same
+    /// worktree path minutes apart. The Sonnet 5 pane opened on `auto mode on
+    /// (shift+tab to cycle)`; the Haiku 4.5 pane opened on `manual mode on`,
+    /// with no cycle hint offered and no effort indicator beside the composer.
+    /// wsp sends no `--permission-mode` — [`Kind::args`] sends the trim, the
+    /// name and the tier and nothing else — so a pane gets Claude Code's own
+    /// default, and that default is not the same for the two tiers.
+    ///
+    /// What that costs is the reason this is a refusal and not a footnote. A
+    /// manual-mode pane with nobody in front of it runs only what
+    /// `~/.claude/settings.json` already allows, and that allow-list is written
+    /// around the wsp verbs. The haiku run stopped twenty-five seconds in, on
+    /// its third action, reaching into `~/wsp` with `find` for a record its
+    /// brief already held; herdr reported the pane blocked and nothing said why.
+    /// A spawn that produces that is worse than a refused flag, because the
+    /// refusal is read in the second it is typed and the hang is found later by
+    /// somebody wondering why a lane went quiet.
+    ///
+    /// `None` for a kind that has nothing to say, which is every kind but
+    /// `claude` — the honest answer where nobody has measured, and the same
+    /// answer [`Kind::running`] gives for the same reason.
+    fn unattended(&self, _model: Option<&str>) -> Option<String> {
+        None
+    }
+
     /// What this agent's own runtime calls the agent in this seat, if it can be
     /// found out.
     ///
@@ -569,6 +603,14 @@ const MODELS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
 /// runtime about a combination that costs nothing.
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// The tiers whose panes open in manual mode, and so cannot be left alone.
+///
+/// One entry, and the list is a list rather than an `if` because the next
+/// Claude Code release could move a tier either way and the measurement in
+/// [`Kind::unattended`] is what would move it. Matched on the alias with any
+/// `[1m]` already stripped, the way [`MODELS`] is.
+const NO_AUTO_MODE: &[&str] = &["haiku"];
+
 impl Kind for Claude {
     /// The trim, the name, and the tier.
     ///
@@ -645,6 +687,25 @@ impl Kind for Claude {
             }
         }
         Ok(())
+    }
+
+    /// [`NO_AUTO_MODE`], and the measurement behind it is on the trait method.
+    ///
+    /// The sentence names the three things a person needs and no more: which
+    /// tier, what is missing, and the two ways on. `--focus` is a real way on
+    /// rather than a hedge — a focused spawn puts you at the pane, and the
+    /// whole of the objection is that nobody is there.
+    fn unattended(&self, model: Option<&str>) -> Option<String> {
+        let alias = model?;
+        let alias = alias.strip_suffix("[1m]").unwrap_or(alias);
+        NO_AUTO_MODE.contains(&alias).then(|| {
+            format!(
+                "a `{alias}` pane opens in manual mode and stops at the first command \
+                 the settings file does not already allow — measured 2026-08-18, and \
+                 nothing clears it but a person at the tty. Spawn it with --focus if \
+                 you mean to sit there, or --model sonnet to leave it working"
+            )
+        })
     }
 
     /// What wsp called it, confirmed alive if the runtime will confirm it — or,
@@ -1535,6 +1596,27 @@ mod tests {
 
         assert!(of("codex").tier(Some("opus"), None).is_err(), "Plain::args would send nothing on");
         assert!(of("codex").tier(None, None).is_ok(), "and an unflagged spawn on any kind is untouched");
+    }
+
+    /// Accepting the words and being able to walk away are two different
+    /// questions, and haiku answers them differently.
+    ///
+    /// It is a real alias — `tier` takes it, and has to, because a person at a
+    /// pane can use it — so the second question cannot be folded into the
+    /// first. A kind wsp has not measured says nothing rather than guessing,
+    /// which is what `Plain` does everywhere else it is asked something only a
+    /// measurement could answer.
+    #[test]
+    fn a_tier_the_runtime_accepts_can_still_be_one_nobody_can_leave_alone() {
+        assert!(of("claude").tier(Some("haiku"), None).is_ok(), "haiku is a model claude takes");
+
+        let why = of("claude").unattended(Some("haiku")).expect("and one that stops at the first prompt");
+        assert!(why.contains("manual mode"), "the sentence says what is missing: {why}");
+        assert!(of("claude").unattended(Some("haiku[1m]")).is_some(), "a bigger window is the same tier");
+
+        assert!(of("claude").unattended(Some("sonnet")).is_none(), "and the others are left alone");
+        assert!(of("claude").unattended(None).is_none(), "as is a spawn that states no tier at all");
+        assert!(of("codex").unattended(Some("haiku")).is_none(), "a kind nobody has measured says nothing");
     }
 
     /// Two ways back to the whole preamble, and both are needed.

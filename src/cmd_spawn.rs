@@ -228,6 +228,12 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
 /// - **Refused without `--agent`, not dropped.** `--model haiku` on a bare
 ///   workspace is a sentence about an agent that is never started, and a flag
 ///   that does nothing in silence is the failure the checking is for.
+/// - **Refused when nobody will be there to unblock it.** A tier
+///   [`agent_commands::Kind::unattended`] names cannot be walked away from, and
+///   the default spawn is a background one — so the flag is refused unless
+///   `--focus` says you are going to the pane. That check is second because it
+///   is about this *spawn* and the one above it is about the words; a typo
+///   should learn it is a typo before it learns anything else.
 ///
 /// `--on <machine>` is orthogonal and stays that way: the flag states the tier,
 /// and that machine's `claude` has its own version and its own settings.
@@ -240,7 +246,13 @@ fn tier(args: &Args, kind: &str, agent: bool) -> Result<(Option<String>, Option<
     if !agent {
         return Err("--model and --effort say how to start an agent — add --agent".into());
     }
-    agent_commands::of(kind).tier(model.as_deref(), effort.as_deref())?;
+    let kind = agent_commands::of(kind);
+    kind.tier(model.as_deref(), effort.as_deref())?;
+    if !args.has("focus") {
+        if let Some(why) = kind.unattended(model.as_deref()) {
+            return Err(why);
+        }
+    }
     Ok((model, effort))
 }
 
@@ -1148,6 +1160,34 @@ mod tests {
 
         let err = tier(&Args::synth("spawn", &["t-1"], &[("model", "opus")]), "codex", true).unwrap_err();
         assert!(err.contains("claude"), "wsp does not know how codex spells a model: {err}");
+    }
+
+    /// A tier nobody can leave alone is refused for the spawn that would leave
+    /// it alone, and allowed for the one that would not.
+    ///
+    /// Both halves, because a refusal with no way through is a dead end and the
+    /// way through is the half that will be doubted. The measurement is on
+    /// `Kind::unattended`; what is asserted here is only that a background spawn
+    /// reads it and a focused one does not, and that the sentence a person gets
+    /// names the tier they typed rather than the rule that caught it.
+    #[test]
+    fn a_tier_that_cannot_be_left_alone_is_refused_unless_somebody_is_going_to_the_pane() {
+        let background = |m: &str| {
+            tier(&Args::synth("spawn", &["t-1"], &[("model", m)]), "claude", true)
+        };
+
+        let err = background("haiku").unwrap_err();
+        assert!(err.contains("haiku"), "the tier that was typed: {err}");
+        assert!(err.contains("manual mode"), "and what is actually missing on it: {err}");
+        assert!(err.contains("--focus") && err.contains("sonnet"), "and both ways on: {err}");
+
+        assert!(background("haiku[1m]").is_err(), "a bigger window is the same tier");
+        assert!(background("sonnet").is_ok(), "the tiers that hold their own are untouched");
+        assert!(background("opus[1m]").is_ok(), "including with the suffix on");
+
+        let flags = [("model", "haiku"), ("focus", "true")];
+        let focused = tier(&Args::synth("spawn", &["t-1"], &flags), "claude", true);
+        assert!(focused.is_ok(), "somebody is going to the pane: {focused:?}");
     }
 
     /// And the refusal happens before `place.open`, which is the whole reason
