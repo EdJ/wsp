@@ -138,7 +138,9 @@ pub(crate) struct Column {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Agent {
     pub(crate) state: AgentState,
-    /// The pane's own name — see [`crate::live::pane_name`].
+    /// The pane's own name — see [`crate::live::pane_name`] — with the post in
+    /// front of it for a custodian, as the panel's census draws it. A governor
+    /// holds no task, so the post is the only thing that places its row here.
     pub(crate) name: String,
     pub(crate) pane: String,
     /// The task in its hands, if it has one. `None` is the whole point of the
@@ -246,6 +248,9 @@ pub(crate) struct Ctx {
     pub bindings: BTreeMap<String, Value>,
     /// task -> the claim on it, read for `claimed_at`.
     pub claims: BTreeMap<String, Value>,
+    /// Every pane on the machine, with the store's half already filled: see
+    /// [`Ctx::live`] for `seat`, which is the one field a runner cannot answer
+    /// and both readers below need.
     pub panes: Vec<AgentRef>,
 }
 
@@ -258,9 +263,30 @@ impl Ctx {
             claims: store.claims(),
             // A herdr that is not answering costs the agent marks and nothing
             // else. The durable half is the board.
-            panes: live::panes(),
+            panes: seated(live::panes(), &store.governors()),
         }
     }
+}
+
+/// Fill in the one half of a pane row a runner cannot answer: which project's
+/// slot it is sitting in.
+///
+/// The same join `panel::rows::collect` makes, and it has to be made here too
+/// because `crate::live` sees terminals and a seat is a fact the store keeps.
+/// Without it every pane the board drew carried `seat: None`, and an idle
+/// custodian holding no task came out as `○ spare hands` — the busiest agent on
+/// the machine advertised as free to be given something, while the panel and
+/// `wsp wip` beside it said `▣`. See [`crate::panel::agent_state`], which is
+/// where a seat changes what silence means.
+///
+/// Done as the pane list is built rather than at the two places `seat` is read,
+/// so [`collect`] stays a pure function of [`Ctx`] and a fixture seats an agent
+/// by saying so on the pane.
+pub(crate) fn seated(panes: Vec<AgentRef>, governors: &BTreeMap<String, Value>) -> Vec<AgentRef> {
+    panes
+        .into_iter()
+        .map(|p| AgentRef { seat: crate::cmd_govern::governs(governors, &p.workspace), ..p })
+        .collect()
 }
 
 /// Build the columns.
@@ -355,7 +381,7 @@ pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
             let held = held_of(&p.pane);
             Agent {
                 state: crate::panel::agent_state(&p.state, held.map(|t| t.status()), p.seat.is_some()),
-                name: p.where_(),
+                name: p.census_name(),
                 pane: p.pane.clone(),
                 task: held.map(|t| t.id.clone()),
                 held: held
@@ -565,6 +591,56 @@ mod tests {
         );
         // And only the one holding nothing is offered as capacity — an idle
         // agent parked on a blocked task is stopped, not free.
+        let spare: Vec<&str> = b.spare().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(spare, ["Verb UI"]);
+    }
+
+    /// A custodian is the most assigned agent on the machine, and the board
+    /// used to draw it as the freest.
+    ///
+    /// `Ctx` never read the governors map, so every pane it built carried
+    /// `seat: None` and an idle governor — which is a governor between the
+    /// agents it is sequencing, most of the night — came out as `spare hands`.
+    /// The seam is [`seated`]: the join happens once, on the way in, and both
+    /// readers get it. The side list then names the post for free, because a
+    /// governor holds no task and the post is the only thing that places it.
+    #[test]
+    fn a_governor_is_seated_on_the_board_and_is_not_offered_as_capacity() {
+        let mut c = ctx(vec![task("t-01", "in hand", Some("wsp"), "doing", "normal")]);
+        let pane = |id: &str, ws: &str, label: &str| AgentRef {
+            pane: id.into(),
+            workspace: ws.into(),
+            agent: true,
+            kind: "claude".into(),
+            state: "idle".into(),
+            label: label.into(),
+            ..Default::default()
+        };
+        let governors = BTreeMap::from([(
+            "wsp".to_string(),
+            serde_json::json!({ "workspace": "w2", "pane": "w2:p1" }),
+        )]);
+        c.panes = seated(
+            vec![
+                // What the custodian's pane wears from its first `wsp say`: the
+                // sentence alone, with nothing in front of it.
+                pane("w2:p1", "w2", "restarted after herdr died; 02 is next"),
+                pane("w1:p1", "w1", "Verb UI"),
+            ],
+            &governors,
+        );
+
+        let b = collect(&c, &Scope::Project("wsp".into()), true);
+        let custodian = b.agents.iter().find(|a| a.pane == "w2:p1").expect("in the census");
+        assert_eq!(custodian.state, AgentState::Seated, "an idle custodian is seated, not spare");
+        assert!(
+            custodian.name.contains("governor · wsp"),
+            "the row never says whose voice it is: {}",
+            custodian.name,
+        );
+
+        // And the seat is the whole of the difference: the ordinary agent in the
+        // next workspace is idle on nothing, and that is what capacity means.
         let spare: Vec<&str> = b.spare().iter().map(|a| a.name.as_str()).collect();
         assert_eq!(spare, ["Verb UI"]);
     }

@@ -1083,7 +1083,10 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
         // claim prints how long it has been held, and a fixture that says
         // "356d" is a fixture whose age is showing.
         claims: BTreeMap::new(),
-        panes: w.panes.clone(),
+        // Seated the way `Ctx::live` seats them, so a custodian in the fixture
+        // draws on the board as it draws in the panel rather than as a spare
+        // pair of hands.
+        panes: kanban::seated(w.panes.clone(), &w.governors),
     };
 
     let shot = |title: &str, caption: &str, scope: Scope, cur: Cursor, done: bool, note: &str| {
