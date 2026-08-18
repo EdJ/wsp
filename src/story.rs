@@ -314,6 +314,34 @@ fn quiet_world() -> Snapshot {
     s
 }
 
+/// Five agents, one of them alone in its project and the rest together in
+/// another — the arrangement Ed's short pane cut in the wrong place.
+///
+/// The shape is the point: the foot draws a heading, one agent, a second
+/// heading, and the rest under it, so the row a short pane stops after is a
+/// heading rather than an agent. A fixture whose agents are all in one project
+/// has no such row and cannot show the bug at any height.
+#[cfg(test)]
+fn crowded_world() -> Snapshot {
+    let mut s = world();
+    // Nobody holding anything: what is under test is where the agents are, and
+    // a claim would put half of them in the tree as well.
+    s.bindings.clear();
+    s.panes = vec![{
+        let mut a = agent("w1:p1", "w1", "idle", "spare hands");
+        a.cwd = "~/claude/trance".into();
+        a
+    }];
+    // Spare sorts before working, so the one on its own is first in the census
+    // and its heading is first in the foot.
+    for i in 1..=4 {
+        let mut a = agent(&format!("w2:p{i}"), "w2", "working", "on the panel");
+        a.cwd = "~/claude/wsp".into();
+        s.panes.push(a);
+    }
+    s
+}
+
 /// Two agents asking to be looked at.
 ///
 /// One is the case the feature was asked for — an agent that has found work it
@@ -683,7 +711,7 @@ fn scenes() -> Vec<Scene> {
     out.push(
         Driver::new(&w)
             .to_pane("w2:p1")
-            .scene("The agents, always on", "Under a rule of its own at the foot: the agents, five of them, picked in the order the strip is drawn in — what wants you, what is free, what is busy — and then stood under the project each one is in, the same runs `w` draws at length. Which five is a question about who has stopped; where they sit is a question about the tree, and neither answer is allowed to be the other's. Pinned, so the tree above scrolls and this does not, because who has stopped is the question you ask between reading anything else and it must not be a keystroke away. The headings cost the foot a row each and give the rows back the column the project used to be repeated down — a pane's name has half the width here that it has in the tree, and it is the same name. The section's heading counts them all, so the sixth is never silently absent, and 1-9 start here rather than in the tree: a digit you can always see is worth more than one in row order."),
+            .scene("The agents, always on", "Under a rule of its own at the foot: five rows of agents, picked in the order the strip is drawn in — what wants you, what is free, what is busy — and then stood under the project each one is in, the same runs `w` draws at length. Which of them is a question about who has stopped; where they sit is a question about the tree, and neither answer is allowed to be the other's. Pinned, so the tree above scrolls and this does not, because who has stopped is the question you ask between reading anything else and it must not be a keystroke away. Five rows and not five agents: the headings are rows like any other, and a section that grew with the number of projects its agents were in was one a short pane could not draw. What they buy is the column the project used to be repeated down — a pane's name has half the width here that it has in the tree, and it is the same name. The section's heading counts every agent, so the ones the rows could not take are never silently absent, and 1-9 start here rather than in the tree: a digit you can always see is worth more than one in row order."),
     );
 
     out.push(
@@ -2230,9 +2258,9 @@ mod tests {
     /// it has in the tree.
     ///
     /// What the cap means is unchanged, and that is the half worth pinning
-    /// down: the five on screen are still the five the census puts first, so an
-    /// agent asking for you is never displaced by one that is merely busy in a
-    /// project the tree happens to walk sooner. The cap picks; the tree only
+    /// down: the agents on screen are still the ones the census puts first, so
+    /// an agent asking for you is never displaced by one that is merely busy in
+    /// a project the tree happens to walk sooner. The cap picks; the tree only
     /// arranges what it picked.
     #[test]
     fn the_section_at_the_foot_is_grouped_the_same_way() {
@@ -2255,15 +2283,34 @@ mod tests {
             }
         }
 
-        assert_eq!(headings, ["trance", "verb", "no project"], "the tree's order, in the foot");
-        let first_five: Vec<String> =
-            census.iter().take(5).map(|(_, a)| a.pane.clone()).collect();
+        assert_eq!(headings, ["verb", "no project"], "the tree's order, in the foot");
+        let first: Vec<String> =
+            census.iter().take(panes.len()).map(|(_, a)| a.pane.clone()).collect();
         let mut sorted = panes.clone();
         sorted.sort();
-        let mut want = first_five.clone();
+        let mut want = first.clone();
         want.sort();
-        assert_eq!(sorted, want, "the five the census puts first, whatever the tree does");
-        assert_ne!(panes, first_five, "and stood in runs rather than left in that order");
+        assert_eq!(sorted, want, "the ones the census puts first, whatever the tree does");
+
+        // That they are *arranged* rather than listed takes more of them than
+        // the cap can afford here — three agents in two projects come out in
+        // the order the census already had them. With the tail opened the whole
+        // census is in the foot, and there the two orders visibly differ.
+        {
+            let mut view = panel::View::default();
+            let mut ui = ui_of(&w, &view);
+            show_all_agents(&w, &mut ui, &mut view);
+            let mut opened = Vec::new();
+            for i in ui.rows_for_test() - ui.dock_for_test()..ui.rows_for_test() {
+                ui.select_for_test(i);
+                if let panel::Target::Pane(p) = ui.selected_target() {
+                    opened.push(p);
+                }
+            }
+            let by_census: Vec<String> = census.iter().map(|(_, a)| a.pane.clone()).collect();
+            assert_eq!(opened.len(), by_census.len(), "all of them, once asked");
+            assert_ne!(opened, by_census, "and stood in runs rather than left in that order");
+        }
 
         // The heading says the project, so the rows do not — the width goes to
         // the name, which in this pane is what was being cut.
@@ -2279,8 +2326,17 @@ mod tests {
 
     /// The section keeps a few on screen and says how many there are, so the
     /// ones it cannot fit are never silently absent.
+    ///
+    /// Five *rows*, headings included, and that is the fix: it was five agents,
+    /// and the headings were rows nobody had budgeted for — five agents in five
+    /// projects cost eleven of them. A section that grows with the number of
+    /// projects its agents happen to be in is a section a short pane cannot
+    /// draw, and what it loses there is the agents rather than the headings —
+    /// see [`a_short_pane_never_ends_the_foot_on_a_heading`]. So the headings
+    /// come out of the five, the same way the tail does, and the `⋯` counts
+    /// what they displaced exactly as it counts what the cap did.
     #[test]
-    fn the_section_keeps_five_and_counts_them_all() {
+    fn the_section_is_five_rows_and_counts_every_agent() {
         let w = world();
         let (mut ui, mut view) = showing(&w, &[]);
         let census = ui.census_for_test().len();
@@ -2288,13 +2344,21 @@ mod tests {
 
         let docked = ui.dock_for_test();
         let mut agents = 0;
+        let mut headings = 0;
         for i in ui.rows_for_test() - docked..ui.rows_for_test() {
             ui.select_for_test(i);
-            if ui.selected_kind() == panel::RowKind::Agent {
-                agents += 1;
+            match ui.selected_kind() {
+                panel::RowKind::Agent => agents += 1,
+                panel::RowKind::Group => headings += 1,
+                _ => {}
             }
         }
-        assert_eq!(agents, 5, "five agents pinned, and a `⋯` for the rest");
+        assert!(headings > 1, "the fixture has to spread them across projects to test this");
+        assert_eq!(headings + agents, 5, "five rows of census, headings and all");
+        assert!(agents < census, "so a `⋯` says how many did not fit");
+        // A heading, five rows and the `⋯`: what the section cost when there
+        // were no headings in it, which is what a short pane was built around.
+        assert_eq!(docked, 7, "the section is no taller than it was before the headings");
         // The heading counts every one of them, whatever it could draw.
         let head = panel::render_row_for_test(&ui, ui.rows_for_test() - docked, W);
         assert!(head.text().contains("agents") && head.text().contains(&census.to_string()));
@@ -2313,6 +2377,53 @@ mod tests {
             }
         }
         assert_eq!(agents, census, "all of them, once asked");
+    }
+
+    /// Ed, at a pane sixteen rows tall: the foot drew `agents 5`, `fork 1`, one
+    /// agent, and then the `wsp 4` heading with nothing under it.
+    ///
+    /// The geometry grants the dock what the pane can spare and the frame draws
+    /// the *first* of what it was granted, so the cut lands where the rows
+    /// happen to put it — and a group heading is the one row it must not land
+    /// after. A heading on its own says a project has agents and then shows
+    /// none of them, which is a worse use of the row than giving it back to the
+    /// tree. Budgeting the section by rows made this rarer and could not make
+    /// it impossible: a pane can always be one row shorter than the section.
+    #[test]
+    fn a_short_pane_never_ends_the_foot_on_a_heading() {
+        const SHORT: usize = 16;
+        let w = crowded_world();
+        let (ui, view) = showing(&w, &[]);
+
+        let drawn: Vec<usize> =
+            (0..SHORT).filter_map(|y| panel::row_at(&ui, &view, W, SHORT, y)).collect();
+        let from = ui.rows_for_test() - ui.dock_for_test();
+        let foot: Vec<usize> = drawn.iter().copied().filter(|&i| i >= from).collect();
+        assert!(
+            foot.len() < ui.dock_for_test(),
+            "the pane has to be too short for the whole section to test this",
+        );
+
+        let mut probe = ui.clone();
+        let kind = |probe: &mut panel::Ui, i: usize| {
+            probe.select_for_test(i);
+            probe.selected_kind()
+        };
+        let last = *foot.last().expect("the dock is drawn at all");
+        assert_ne!(
+            kind(&mut probe, last),
+            panel::RowKind::Group,
+            "the section ended on a heading with nothing under it",
+        );
+        assert!(
+            foot.iter().any(|&i| kind(&mut probe, i) == panel::RowKind::Agent),
+            "and the rows it kept are agents rather than headings alone",
+        );
+        // The row the guard gave up is the tree's now, and not a blank: a dock
+        // that shrank without the tree growing would be the same clip with a
+        // hole in it. Two rows of title, three of footer and one rule over the
+        // dock; every other line of a pane this short is a row you can click.
+        assert_eq!(drawn.len(), SHORT - 6, "the row goes back to the tree, not to nobody");
     }
 
     /// A digit is an address for a terminal. The pinned rows take them first
@@ -3229,10 +3340,10 @@ mod tests {
         press(ui, view, 'y')
     }
 
-    /// Open the agents section past the five it keeps on screen, the way `→` on
-    /// its `⋯` does. A test that wants the sixth agent has to ask for it exactly
-    /// as a person would — and the last overflow row in the tree is the
-    /// section's, since it is the last thing in the list.
+    /// Open the agents section past the five rows it keeps on screen, the way
+    /// `→` on its `⋯` does. A test that wants an agent the foot could not fit
+    /// has to ask for it exactly as a person would — and the last overflow row
+    /// in the tree is the section's, since it is the last thing in the list.
     fn show_all_agents(snap: &Snapshot, ui: &mut panel::Ui, view: &mut panel::View) {
         let mut probe = ui.clone();
         let more = (0..ui.rows_for_test())
@@ -3288,6 +3399,7 @@ mod tests {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
         on_pane(&mut ui, "w4:p2");
         press(&mut ui, &mut view, 'c');
 
@@ -3323,6 +3435,7 @@ mod tests {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
         on_kind(&mut ui, panel::RowKind::Project);
         step(&w, &mut ui, &mut view, Key::Left);
         let under = panel::Target::Task("t-001".into());
@@ -3448,6 +3561,7 @@ mod tests {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
         on_pane(&mut ui, "w4:p2");
         match confirmed(&mut ui, &mut view, 'f') {
             panel::Effect::Tell(t) => {
@@ -3510,6 +3624,7 @@ mod tests {
         w.mandates.insert("w4".into(), json!({ "project": "verb" }));
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
         on_pane(&mut ui, "w4:p2");
         match confirmed(&mut ui, &mut view, 'f') {
             panel::Effect::Tell(t) => {
@@ -3556,6 +3671,7 @@ mod tests {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
 
         // `c` on a task turns the tree into the picker; the pick lands on a pane.
         for i in 0..500 {
@@ -3591,6 +3707,7 @@ mod tests {
         let clear_before_the_claim = |w: &Snapshot| -> Option<&'static str> {
             let mut view = panel::View::default();
             let mut ui = ui_of(w, &view);
+            show_all_agents(w, &mut ui, &mut view);
             for i in 0..500 {
                 ui.select_for_test(i);
                 if ui.selected_target() == panel::Target::Task("t-020".into()) {
@@ -3677,6 +3794,7 @@ mod tests {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
         for i in 0..500 {
             ui.select_for_test(i);
             if ui.selected_target() == panel::Target::Task("t-020".into()) {
@@ -3869,6 +3987,7 @@ mod tests {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
         on_kind(&mut ui, panel::RowKind::Project);
         assert!(matches!(press(&mut ui, &mut view, 'C'), panel::Effect::None));
         on_pane(&mut ui, "w4:p2");
@@ -3976,6 +4095,7 @@ mod tests {
         let w = world();
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
 
         on_pane(&mut ui, "w4:p2"); // idle, spare, bound to nothing
         assert!(matches!(press(&mut ui, &mut view, 'u'), panel::Effect::None));
@@ -4013,6 +4133,7 @@ mod tests {
         let asks = |aim: &dyn Fn(&mut panel::Ui), k: char| {
             let mut view = panel::View::default();
             let mut ui = ui_of(&w, &view);
+            show_all_agents(&w, &mut ui, &mut view);
             aim(&mut ui);
             assert!(
                 matches!(press(&mut ui, &mut view, k), panel::Effect::None),
@@ -4039,6 +4160,7 @@ mod tests {
         // first. Asking twice would make the pick itself the thing you confirm.
         let mut view = panel::View::default();
         let mut ui = ui_of(&w, &view);
+        show_all_agents(&w, &mut ui, &mut view);
         on_task(&mut ui, "t-020");
         press(&mut ui, &mut view, 'c');
         assert!(matches!(view.mode, panel::Mode::Pick { .. }), "c opens the pick without asking");
@@ -4082,6 +4204,7 @@ mod tests {
         for k in ['S', 'C', 'u', 'f'] {
             let mut view = panel::View::default();
             let mut ui = ui_of(&w, &view);
+            show_all_agents(&w, &mut ui, &mut view);
             match k {
                 'S' | 'C' => on_task(&mut ui, "t-001"),
                 'u' => on_pane(&mut ui, "w2:p1"),

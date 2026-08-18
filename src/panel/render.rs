@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::util;
 
 use super::keys::{keymap, Mode, View};
-use super::rows::{hotkeys, render_row, Ui};
+use super::rows::{hotkeys, render_row, Row, Ui};
 
 pub(super) const ACCENT: &str = "\x1b[38;2;95;191;164m";
 
@@ -720,12 +720,24 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
         0
     };
     let body_rows = room - map_rows - tags_rows - focus_rows;
-    let dock_rows = if ui.dock == 0 {
+    let tree_len = ui.rows.len() - ui.dock;
+    let mut dock_rows = if ui.dock == 0 {
         0
     } else {
         (ui.dock + 1).min(body_rows.saturating_sub(MIN_TREE_ROWS))
     };
-    let tree_len = ui.rows.len() - ui.dock;
+    // What is granted is drawn from the top of the dock, so a pane too short
+    // for the whole of it cuts the tail — and the tail of a run is its agents.
+    // A group heading left standing with nothing beneath it is the one row the
+    // section must never end on: it says a project has agents and then hides
+    // every one of them, which is worse than the pane being short. Hand that
+    // row back to the tree instead. The heading over the section still counts
+    // the census in full, so nothing goes missing without saying so.
+    while dock_rows > 1
+        && matches!(ui.rows.get(tree_len + dock_rows - 2), Some(Row::Group { .. }))
+    {
+        dock_rows -= 1;
+    }
     let tree_rows = body_rows - dock_rows;
     let scroll = match view.scroll {
         // The cursor pulls the view only when the cursor is what moved. A

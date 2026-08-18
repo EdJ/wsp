@@ -54,10 +54,18 @@ pub(super) const FLAGS_KEY: &str = "(flagged)";
 /// the pane it is pinned to.
 pub(super) const MAX_FLAGS_DOCKED: usize = 3;
 
-/// How many agents the foot keeps on screen before the rest need `w`. Five is
-/// what a pane can spare beside a tree and still be a tree — the strip in the
-/// header carries the census in full, and this carries the top of it in the
+/// How many rows the foot spends on the agents before the rest need `w`. Five
+/// is what a pane can spare beside a tree and still be a tree — the strip in
+/// the header carries the census in full, and this carries the top of it in the
 /// form you can aim a verb at.
+///
+/// Rows, not agents. It counted agents until the group headings went in, and
+/// then a five-agent census in five projects cost eleven rows: the geometry
+/// grants the dock `MIN_TREE_ROWS` short of the body and the frame draws the
+/// *first* of what it was given, so a short pane kept every heading and lost
+/// every agent under them. Budgeting the height instead puts the section back
+/// at what it cost before there were headings, and [`Row::More`] says how many
+/// the headings displaced, exactly as it says how many the cap did.
 pub(super) const MAX_AGENTS_DOCKED: usize = 5;
 
 /// What an agent is waiting for, as far as anything here can tell.
@@ -794,12 +802,25 @@ impl Ui {
         self.sel
     }
 
-    /// The row for a pane, wherever in the tree it is drawn. A claim names a
-    /// pane that may be nowhere near the cursor — `c` on a task picks one from
-    /// the dock — so the pane has to be found rather than read off the
-    /// selection.
+    /// The agent in a pane, wherever it is drawn and whether or not it is.
+    ///
+    /// A claim names a pane that may be nowhere near the cursor — `c` on a task
+    /// picks one from the dock, a card names the pane that raised the hand — so
+    /// the pane has to be found rather than read off the selection.
+    ///
+    /// The census first, for the reason [`Ui::agent_on_task`] gives: whether an
+    /// agent is told what it now holds is a fact about the agent, and reading
+    /// it off the rows made it a fact about the foot's budget instead — a
+    /// project heading in the section was enough to cost an agent its row, and
+    /// with it the sentence answering the flag it had raised. The rows still
+    /// answer for what the census leaves out, which is the shells: a pane with
+    /// nobody in it is not an agent, and `u` on one still knows what it is.
     pub(super) fn agent_at_pane(&self, pane: &str) -> Option<&AgentRef> {
-        self.rows.iter().filter_map(|r| r.agent()).find(|a| a.pane == pane)
+        self.census
+            .iter()
+            .map(|(_, a)| a)
+            .chain(self.rows.iter().filter_map(|r| r.agent()))
+            .find(|a| a.pane == pane)
     }
 
     /// The agent holding a task, if one is.
@@ -1869,13 +1890,13 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             //
             // In runs, like the view `w` gives — one surface over the census,
             // so it is arranged one way. The cap still picks by state, so the
-            // five on screen are the five that most want you; the tree only
-            // says where they sit once picked. The headings are rows the foot
-            // did not spend before, and they are what the right-hand column
-            // used to spend on saying the same project down every line.
+            // agents on screen are the ones that most want you; the tree only
+            // says where they sit once picked. The headings come out of the
+            // cap, and what they buy is the width the right-hand column used
+            // to spend on saying the same project down every line.
             let before = rows.len();
             let more = view.expanded.contains(AGENTS_KEY);
-            let shown = if more { census.len() } else { census.len().min(MAX_AGENTS_DOCKED) };
+            let shown = if more { census.len() } else { docked(&census, &index) };
             let take: Vec<usize> = (0..shown).collect();
             for (project, depth, group) in by_project(&census, &index, &take) {
                 // A step in on the section's own indent, where the view that
@@ -1948,6 +1969,27 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         review_only: view.review_only,
         filter: view.filter.clone(),
     }
+}
+
+/// How much of the census the foot can draw inside [`MAX_AGENTS_DOCKED`] rows.
+///
+/// The arrangement decides the price: the same five agents cost five rows in
+/// one project and ten in five, so what fits cannot be known without asking
+/// [`by_project`] what it would draw. Asked from the top down, because the
+/// count of headings only falls as agents are dropped — the first height that
+/// fits is the most agents that fit.
+///
+/// Which agents is still the census's question and not the tree's: this drops
+/// from the tail of the census, so an agent asking for you is never the one
+/// displaced to make room for a heading.
+fn docked(census: &[(AgentState, Census, AgentRef)], index: &Index) -> usize {
+    (1..=census.len().min(MAX_AGENTS_DOCKED))
+        .rev()
+        .find(|&n| {
+            let take: Vec<usize> = (0..n).collect();
+            by_project(census, index, &take).len() + n <= MAX_AGENTS_DOCKED
+        })
+        .unwrap_or(0)
 }
 
 /// The census in runs, one per project: the heading, how deep it sits, and

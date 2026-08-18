@@ -198,12 +198,15 @@ which is what the rest of them are. One click from a panel you are working in,
 that is: the first click on a panel you are not brings the keyboard here and
 does nothing else — see *How the tree scrolls*, below.
 
-Beneath the tree, under a rule of its own, the first five agents are pinned in
+Beneath the tree, under a rule of its own, five rows of agents are pinned in
 that same order: who has stopped and who is free is the question you ask between
-reading anything else, and it should not be a keystroke away. The heading counts
-them all, so a sixth is never silently absent; `→` on its `⋯` opens the tail in
-place, and the digits `1`-`9` start here rather than in the tree, because a
-digit you can always see is worth more than one in row order. A pane drawn twice
+reading anything else, and it should not be a keystroke away. Five rows and not
+five agents — the project headings are rows the pane pays for like any other,
+and a section whose height followed how many projects its agents were spread
+over was one a short pane could not draw. The heading counts every agent, so the
+ones the rows could not take are never silently absent; `→` on its `⋯` opens the
+tail in place, and the digits `1`-`9` start here rather than in the tree, because
+a digit you can always see is worth more than one in row order. A pane drawn twice
 — under its task and again in the section — spends only one of the nine.
 
 `w` gives the same agents the whole pane and three lines each: what it is
