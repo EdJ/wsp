@@ -75,6 +75,35 @@
 //! one is reported forever rather than swept: it is indistinguishable from the
 //! tree made thirty seconds ago for an agent that has not typed yet.
 //!
+//! # Looked for where the work lives, not only where you are standing
+//!
+//! Both verbs used to compute exactly one path — the repository the caller's
+//! cwd is in, and the task id under its `.worktrees` — and answer for that path
+//! alone. Right for an agent, which is standing in the tree it is asking about.
+//! Wrong for everybody else, and in particular for a governor, which sits in
+//! its project's seat and cleans up after tasks in lanes rooted in other
+//! repositories. Run from the `wsp` seat, `wsp checkout fork-009 --rm` looked
+//! under `~/claude/wsp`, found nothing, printed `no tree for fork-009` and
+//! exited 0 — while the tree stood in `~/claude/herdr/.worktrees/fork-009`.
+//! Two survived that way on 2026-08-18 and were found by a `git worktree list`
+//! run for an unrelated reason; both happened to be clean.
+//!
+//! So the search takes two candidates in order: the repository the caller is
+//! standing in, and the repository the store says the task's project is worked
+//! in — [`crate::resolve::Index::root_of`], which is the same answer
+//! [`crate::cmd_spawn`] hands [`tree_for`] when it makes the tree. Where wsp
+//! put it is now a place wsp looks.
+//!
+//! Only the *looking* widens. A tree is still made in the first candidate, so
+//! `checkout` in a repository puts the tree in that repository, because a task
+//! can genuinely be worked in two at once — `fork-006` had one tree in herdr for
+//! its UI and one in wsp for the panel, on the day this was written — and where
+//! you are standing is the only statement of which you meant.
+//!
+//! When neither candidate has a tree, the answer names both. `no tree for X` on
+//! its own is indistinguishable from "there was nothing to do", which is the
+//! whole of why nobody looked again.
+//!
 //! # Under the root, gitignored
 //!
 //! The third question t-260815-022 carried. [`crate::resolve::Index::project_for_cwd`]
@@ -503,18 +532,106 @@ struct Where {
     branch: String,
     task: String,
     dir: PathBuf,
+    /// Every trunk a tree for this task was looked for under, in the order
+    /// tried. Carried on the answer rather than dropped because the message it
+    /// is wanted for is the one printed when the search found nothing.
+    looked: Vec<PathBuf>,
+}
+
+impl Where {
+    /// Where wsp looked, as a reader wants to read it.
+    fn searched(&self) -> String {
+        self.looked.iter().map(|t| util::contract(t)).collect::<Vec<_>>().join(" or ")
+    }
+}
+
+/// The repositories a tree for `task` could be in, in the order to try them.
+///
+/// Two facts, and they disagree exactly when it matters. Where the caller is
+/// standing is what an agent means: it is inside the tree it is asking about.
+/// Where the store says the task's project is worked is what everybody else
+/// means, and a governor cleaning up after a lane is never standing in it.
+///
+/// Deduplicated through [`util::real`], because the overwhelmingly common case
+/// is the two agreeing and neither the search nor the "where I looked" message
+/// should say the same repository twice.
+fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut add = |repo: Option<PathBuf>| {
+        let Some(repo) = repo else { return };
+        let real = util::real(&repo.display().to_string());
+        if !out.iter().any(|x| util::real(&x.display().to_string()) == real) {
+            out.push(repo);
+        }
+    };
+    add(toplevel(cwd));
+    let root = store
+        .task(task)
+        .and_then(|t| t.project)
+        .and_then(|p| crate::resolve::Index::new(store.projects()).root_of(&p))
+        .map(|r| util::expand(&r));
+    add(root.as_deref().and_then(toplevel));
+    out
+}
+
+/// The first candidate that already holds this task's tree — or, when none
+/// does, the first that could hold one.
+///
+/// The two halves of that sentence are the whole design. Searching every
+/// candidate is what stops `--rm` reporting success on its own arithmetic while
+/// a tree stands in the next repository along. Falling back to the *first* is
+/// what keeps `checkout` making the tree where you are standing, which is the
+/// only way to say which repository you meant when a task is worked in two.
+///
+/// A candidate that is not a usable repository is skipped rather than fatal,
+/// and its reason is kept for the case where no candidate works out: a stale
+/// project root should not stop a caller who is standing in the right place.
+fn pick(repos: Vec<PathBuf>, task: &str) -> Result<Where, String> {
+    let mut looked: Vec<PathBuf> = Vec::new();
+    let mut fallback: Option<Where> = None;
+    let mut refused: Option<String> = None;
+
+    for repo in repos {
+        let Some(trunk) = trunk(&repo) else {
+            refused.get_or_insert_with(|| {
+                format!("cannot find the main working tree of {}", util::contract(&repo))
+            });
+            continue;
+        };
+        let Some(branch) = trunk_branch(&trunk) else {
+            refused.get_or_insert_with(|| {
+                format!("{} is on a detached HEAD — there is no trunk to branch from", util::contract(&trunk))
+            });
+            continue;
+        };
+        looked.push(trunk.clone());
+        let dir = checkout_dir(&trunk, task);
+        let found = dir.join(".git").exists();
+        let w = Where { repo, trunk, branch, task: task.to_string(), dir, looked: Vec::new() };
+        if found {
+            return Ok(Where { looked, ..w });
+        }
+        fallback.get_or_insert(w);
+    }
+
+    match fallback {
+        Some(w) => Ok(Where { looked, ..w }),
+        None => Err(refused.unwrap_or_else(|| "no repository to look in".to_string())),
+    }
 }
 
 fn locate(store: &Store, args: &Args) -> Result<Where, String> {
     let cwd = std::env::current_dir().map_err(|_| "cannot read the current directory".to_string())?;
-    let repo = toplevel(&cwd).ok_or_else(|| format!("{} is not in a git repository", util::contract(&cwd)))?;
-    let trunk = trunk(&repo).ok_or_else(|| "cannot find the repository's main working tree".to_string())?;
-    let branch = trunk_branch(&trunk).ok_or_else(|| {
-        format!("{} is on a detached HEAD — there is no trunk to branch from", util::contract(&trunk))
-    })?;
+    // The task first, because it is what says which repositories to consider.
     let task = task_of(store, args)?;
-    let dir = checkout_dir(&trunk, &task);
-    Ok(Where { repo, trunk, branch, task, dir })
+    let repos = candidates(store, &cwd, &task);
+    if repos.is_empty() {
+        return Err(format!(
+            "{} is not in a git repository, and no project root says where {task} is worked",
+            util::contract(&cwd)
+        ));
+    }
+    pick(repos, &task)
 }
 
 pub fn checkout(store: &Store, args: &Args) -> i32 {
@@ -555,10 +672,24 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
         if args.json() {
             println!(
                 "{}",
-                json!({"removed": r.existed, "branch_kept": r.branch_kept, "path": util::contract(&w.dir)})
+                json!({
+                    "removed": r.existed,
+                    "branch_kept": r.branch_kept,
+                    "path": util::contract(&w.dir),
+                    "looked": w.looked.iter().map(|t| util::contract(t)).collect::<Vec<_>>(),
+                })
             );
         } else if !r.existed {
-            println!("no tree for {}", w.task);
+            // Two lines for the answer nobody acts on, because the one line it
+            // used to be read as "there was nothing to do" and the reader had
+            // no reason to look again. Naming the repositories searched turns
+            // it into a fact somebody can check, and the hint points at the one
+            // place that knows about a tree wsp does not: git itself.
+            println!("no tree for {} under {}", w.task, w.searched());
+            println!(
+                "{}",
+                p.dim("nothing removed — if it was worked in another repository, `git worktree list` there names it")
+            );
         } else {
             println!("removed {}", util::contract(&w.dir));
             if r.branch_kept {
@@ -718,7 +849,7 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     };
 
     if !w.dir.join(".git").exists() {
-        eprintln!("wsp: no tree for {} — nothing to land", w.task);
+        eprintln!("wsp: no tree for {} under {} — nothing to land", w.task, w.searched());
         return 2;
     }
     // Committing is the agent's act and stays the agent's act: what is
@@ -937,6 +1068,89 @@ mod tests {
         let closed = stale(&dir, &|id: &str| id == "t-busy");
         assert_eq!(closed[0].task, "t-busy");
         assert_eq!(closed[0].why, Why::Closed, "a closed task's tree was named for the wrong reason");
+    }
+
+    /// A repository with a project rooted at it, and a task in that project.
+    fn lane(env: &util::Isolated, name: &str, task: &str) -> PathBuf {
+        let dir = env.path(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        repo(&dir);
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut p = crate::model::Project::new(name);
+        p.roots = vec![dir.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut t = crate::model::Task::new("a task", task);
+        t.project = Some(name.to_string());
+        store.save_task(&t).unwrap();
+        dir
+    }
+
+    /// The failure this whole search exists for: the caller is standing in one
+    /// repository and the tree is in the one the task's project is worked in.
+    ///
+    /// A governor is always in this position — it sits in its project's seat and
+    /// cleans up after lanes rooted elsewhere — so the old answer, computed from
+    /// cwd alone, was `no tree` for a tree that was plainly on disk. Twice on
+    /// 2026-08-18, and silently, because that sentence is what a repository with
+    /// nothing to clean up says too.
+    #[test]
+    fn a_tree_in_the_tasks_own_repository_is_found_from_a_different_one() {
+        let (env, seat) = scratch("cross-repo");
+        repo(&seat);
+        let lane = lane(&env, "lane", "lane-1");
+        let store = Store::open();
+
+        // Where spawn would have put it: under the project's root, not the seat.
+        ensure(&lane, &checkout_dir(&lane, "lane-1"), "lane-1", "master").unwrap();
+
+        let repos = candidates(&store, &seat, "lane-1");
+        assert_eq!(repos.len(), 2, "the task's own repository was not a candidate: {repos:?}");
+
+        let w = pick(repos, "lane-1").expect("a tree that is on disk is findable");
+        let want = util::real(&checkout_dir(&lane, "lane-1").display().to_string());
+        assert_eq!(util::real(&w.dir.display().to_string()), want, "the search answered for the wrong repository");
+        assert_eq!(
+            util::real(&w.repo.display().to_string()),
+            util::real(&lane.display().to_string()),
+            "the tree was found but the repository it lives in was not"
+        );
+        assert_eq!(w.looked.len(), 2, "the seat was not searched first");
+    }
+
+    /// Widening the search must not move where a tree is made, because a task
+    /// can be worked in two repositories at once — `fork-006` had a tree in each
+    /// on the day this was written — and standing in one is the only way to say
+    /// which is meant. So the tree you are standing next to wins, and when
+    /// neither has one the first candidate is still where `checkout` will make
+    /// it.
+    #[test]
+    fn standing_in_a_repository_still_decides_which_one_gets_the_tree() {
+        let (env, seat) = scratch("cwd-wins");
+        repo(&seat);
+        let lane = lane(&env, "lane", "lane-2");
+        let store = Store::open();
+
+        // Neither has a tree yet: the answer is the repository the caller is in,
+        // which is the one `checkout` is about to make it in.
+        let repos = candidates(&store, &seat, "lane-2");
+        let w = pick(repos.clone(), "lane-2").expect("somewhere to make it");
+        assert_eq!(
+            util::real(&w.repo.display().to_string()),
+            util::real(&seat.display().to_string()),
+            "a tree with no home was placed away from the caller"
+        );
+        assert_eq!(w.searched().matches(" or ").count(), 1, "the failure message names one place, not both");
+
+        // And with a tree in both, still the one the caller is standing in.
+        ensure(&seat, &checkout_dir(&seat, "lane-2"), "lane-2", "master").unwrap();
+        ensure(&lane, &checkout_dir(&lane, "lane-2"), "lane-2", "master").unwrap();
+        let w = pick(repos, "lane-2").expect("a tree in both");
+        assert_eq!(
+            util::real(&w.dir.display().to_string()),
+            util::real(&checkout_dir(&seat, "lane-2").display().to_string()),
+            "the caller's own tree lost to the project root's"
+        );
     }
 
     fn names(found: &[Stale]) -> Vec<&str> {

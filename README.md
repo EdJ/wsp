@@ -3100,6 +3100,14 @@ has uncommitted work in, `-n` to look first. That is the same shape as `wsp
 archive` for tasks and `wsp reconcile --reap` for claims, and it exists for the
 same reason both of those do.
 
+Both verbs look for the tree in two places: the repository you are standing in,
+and the one the task's project is rooted at. They used to compute one path from
+cwd alone, so a governor cleaning up after another lane got `no tree for
+fork-009` — exit 0, indistinguishable from nothing to do — for a tree that was
+sitting on disk in the other repository (`wsp-093`). Only the looking widened:
+a tree is still *made* where you are standing, because a task can genuinely be
+worked in two repositories at once and that is the only way to say which.
+
 What it costs is a second checkout and a second `target/` per agent, and one
 more thing that can be left behind — which is what the sweep and `wsp doctor`
 between them are for. The reasoning is in `src/cmd_checkout.rs` and on
