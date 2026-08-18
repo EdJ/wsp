@@ -50,6 +50,18 @@
 //! One id a person names is the other door, and it may reach further: see
 //! [`Source`]. A list is never built that way.
 //!
+//! # And the snapshot is checked again before it is acted on
+//!
+//! The census being a snapshot is right. Treating the *offer* built from it as
+//! still true is not, and `render-077` is what that cost: a picker left open
+//! across a rebuild re-spawned two agents onto work that had landed, been
+//! reviewed and been cleaned up. Every row is therefore re-checked at the
+//! moment it is answered rather than at the moment it is drawn — [`Stale`] —
+//! and a row that no longer holds is refused with its reason rather than
+//! dropped. The rule generalises past this file: anything holding a roster of
+//! "who was live" has the same problem, and the answer is always the second
+//! lookup rather than a fresher snapshot.
+//!
 //! # Nothing is resumed without being asked for
 //!
 //! Ed, same day: *"it is not automatic: on load, ask the user."* The daemon
@@ -100,6 +112,7 @@ use crate::cmd_govern;
 use crate::cmd_spawn;
 use crate::herdr;
 use crate::input::{Key, Keys};
+use crate::model::Status;
 use crate::place::{Agent, Order, Place, Seat};
 use crate::place_herdr::Herdr;
 use crate::resolve::Index;
@@ -270,6 +283,133 @@ pub fn resumable(store: &Store) -> Vec<Thread> {
         .filter(|t| !still_running(&live, t))
         .filter(Thread::here)
         .collect()
+}
+
+// ---- what is no longer true -----------------------------------------------
+
+/// Why a row that was true at the restart is not true now.
+///
+/// The roster is a snapshot of what was live at the restart, and that is
+/// deliberate: nothing is written at shutdown, so the last census is the only
+/// honest one. The **offer** built from it is a decision taken later, and
+/// between the two agents finish, tasks move to `review` and worktrees are
+/// removed. The longer the picker sits, the more of it is false.
+///
+/// `render-077`, on a picker left open across a herdr rebuild: by the time it
+/// was answered the two agents it offered had landed, been reviewed and been
+/// cleaned up. Answering it re-spawned both onto finished work, dragged their
+/// tasks back from `review` to `doing`, and both came up stuck on Claude Code's
+/// folder-trust modal because their trees had been removed underneath them. It
+/// also cost a false accusation: the seat that saw it read it as another
+/// governor spawning on completed tasks, and said so.
+///
+/// So: **re-check at answer time, not at open time**. Two lookups, no new
+/// state. And a row that fails the check is *refused with the reason*, never
+/// quietly dropped — a picker that silently loses rows makes exactly that kind
+/// of misreading more likely rather than less.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    /// The work is finished: `review` or `done`. On its own this is a default
+    /// rather than a refusal — wanting a finished agent back to ask it what it
+    /// did is legitimate — so the row says so and starts unticked.
+    Moved(Status),
+    /// The task is not in the store at all any more.
+    Forgotten,
+    /// The recorded tree is not there. This one is always a refusal: a
+    /// `--resume` into a directory that no longer exists raises the
+    /// folder-trust modal and hangs there (`robustness-035`), which is worse
+    /// than failing, because it looks from outside like an agent that started.
+    Gone,
+}
+
+impl Stale {
+    /// The reason, in the same words on the row and in the refusal, so that
+    /// what a person read before answering is what they are told afterwards.
+    fn why(self) -> String {
+        match self {
+            Stale::Moved(s) => format!("now at {}", s.as_str()),
+            Stale::Forgotten => "no longer in the store".to_string(),
+            Stale::Gone => "its tree is gone".to_string(),
+        }
+    }
+
+    /// Whether this is the kind that cannot be overridden by ticking the box.
+    fn fatal(self) -> bool {
+        matches!(self, Stale::Gone)
+    }
+}
+
+/// What is no longer true about a thread, asked now.
+///
+/// One task lookup and one `stat`, which is what makes this affordable at the
+/// moment of acting rather than only at the moment of drawing.
+///
+/// Two checks rather than one, because finishing and clearing up are separate
+/// events and either happens without the other: a task reaches `review` while
+/// its tree stands, and `wsp checkout --rm` takes a tree away — properly, since
+/// `wsp-093` — while the task is still open. The first makes a row unwanted and
+/// the second makes it unrunnable.
+pub fn stale(store: &Store, t: &Thread) -> Option<Stale> {
+    if let Some(id) = &t.task {
+        match store.task(id) {
+            None => return Some(Stale::Forgotten),
+            Some(task) => match task.status() {
+                s @ (Status::Review | Status::Done) => return Some(Stale::Moved(s)),
+                _ => {}
+            },
+        }
+    }
+    // Only for a path this machine would actually run in. Another host's tree
+    // is not ours to stat, and a missing directory here would say nothing true
+    // about the machine the row belongs to — which is why `here()` is the same
+    // test that decides whether we would start it at all.
+    match t.here() && !t.cwd.is_empty() && !std::path::Path::new(&util::expand(&t.cwd)).is_dir() {
+        true => Some(Stale::Gone),
+        false => None,
+    }
+}
+
+/// One row of the offer: a thread, and what the check said when the row was put
+/// in front of a person.
+///
+/// Keeping what was *shown* is the whole of the distinction the fix turns on. A
+/// row ticked while it said `now at review` is a deliberate answer and is
+/// honoured; a row that was clean when it was drawn and is finished by the time
+/// `↵` is pressed was never answered at all, and is refused.
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub thread: Thread,
+    pub stale: Option<Stale>,
+    pub on: bool,
+}
+
+impl Row {
+    /// Check a thread and start it ticked only if there is nothing to say
+    /// against it.
+    fn new(store: &Store, thread: Thread) -> Row {
+        let stale = stale(store, &thread);
+        Row { on: stale.is_none(), thread, stale }
+    }
+
+    /// The reason, as a tail on a printed line. Empty for a row with nothing
+    /// against it, so every listing can append it unconditionally.
+    fn note(&self) -> String {
+        match self.stale {
+            Some(s) => format!(" · {}", s.why()),
+            None => String::new(),
+        }
+    }
+
+    /// The door left open when a row is refused, which is never "nothing".
+    fn door(&self) -> String {
+        match (self.stale, &self.thread.task) {
+            (Some(Stale::Gone), Some(task)) => {
+                format!("`wsp checkout {task}` makes the tree, then `wsp resume {task}`")
+            }
+            (Some(Stale::Gone), None) => format!("{} is not there", self.thread.cwd),
+            _ => format!("`wsp resume {}` brings it back anyway", self.thread.what),
+        }
+    }
 }
 
 // ---- one id a person names ------------------------------------------------
@@ -551,19 +691,22 @@ pub enum Step {
 /// to walk away from all of it. Nothing happens until `↵`, which is what makes
 /// exploring it safe and why a fumble that ends where it started costs nothing.
 ///
-/// Everything starts **on**. What is being offered is what was running a minute
-/// ago, so the common answer is "yes, all of that" and the interesting one is
-/// "all of it except the two I have changed my mind about" — which is one
-/// keypress each from here, and eleven from an empty list.
+/// A row starts **on** unless [`stale`] has something to say against it. What
+/// is being offered is what was running a minute ago, so the common answer is
+/// "yes, all of that" and the interesting one is "all of it except the two I
+/// have changed my mind about" — which is one keypress each from here, and
+/// eleven from an empty list. A row whose task has since gone to `review` is
+/// the same shape of exception, decided by the store instead of by the person,
+/// and it is *shown* rather than removed so that the exception can be argued
+/// with.
 pub struct Picker {
-    pub rows: Vec<Thread>,
-    pub on: Vec<bool>,
+    pub rows: Vec<Row>,
     pub sel: usize,
 }
 
 impl Picker {
-    pub fn new(rows: Vec<Thread>) -> Picker {
-        Picker { on: vec![true; rows.len()], rows, sel: 0 }
+    pub fn new(rows: Vec<Row>) -> Picker {
+        Picker { rows, sel: 0 }
     }
 
     pub fn press(&mut self, key: Key) -> Step {
@@ -574,12 +717,12 @@ impl Picker {
             Key::Home | Key::Char('g') => self.sel = 0,
             Key::End | Key::Char('G') => self.sel = last,
             Key::Char(' ') | Key::Char('x') => {
-                if let Some(on) = self.on.get_mut(self.sel) {
-                    *on = !*on;
+                if let Some(r) = self.rows.get_mut(self.sel) {
+                    r.on = !r.on;
                 }
             }
-            Key::Char('a') => self.on.iter_mut().for_each(|o| *o = true),
-            Key::Char('n') => self.on.iter_mut().for_each(|o| *o = false),
+            Key::Char('a') => self.rows.iter_mut().for_each(|r| r.on = true),
+            Key::Char('n') => self.rows.iter_mut().for_each(|r| r.on = false),
             Key::Enter => return Step::Take,
             Key::Esc | Key::Interrupt | Key::Char('q') => return Step::Walk,
             _ => {}
@@ -589,8 +732,8 @@ impl Picker {
 
     /// What `↵` takes. Empty is a real answer and means the same as `esc`: the
     /// person looked and wanted none of it.
-    pub fn chosen(&self) -> Vec<&Thread> {
-        self.rows.iter().zip(&self.on).filter(|(_, on)| **on).map(|(t, _)| t).collect()
+    pub fn chosen(&self) -> Vec<&Row> {
+        self.rows.iter().filter(|r| r.on).collect()
     }
 }
 
@@ -609,16 +752,23 @@ fn draw(p: &Paint, picker: &Picker, when: &str) {
         "{}\r\n\r\n",
         p.dim("␣ toggle · a all · n none · ↵ resume the ticked · esc none of them")
     ));
-    for (i, (t, on)) in picker.rows.iter().zip(&picker.on).enumerate() {
+    for (i, r) in picker.rows.iter().enumerate() {
         let cursor = match i == picker.sel {
             true => "▸",
             false => " ",
         };
-        let box_ = match on {
+        let box_ = match r.on {
             true => "[x]",
             false => "[ ]",
         };
-        out.push_str(&format!("{cursor} {box_} {}\r\n", t.row()));
+        // The reason is on the row and not in a footnote: an unticked box with
+        // nothing beside it reads as a mistake somebody should correct, which
+        // is the opposite of what it means here.
+        let why = match r.stale {
+            Some(s) => format!("  {}", p.dim(&s.why())),
+            None => String::new(),
+        };
+        out.push_str(&format!("{cursor} {box_} {}{why}\r\n", r.thread.row()));
     }
     let _ = std::io::stderr().write_all(out.as_bytes());
     let _ = std::io::stderr().flush();
@@ -688,15 +838,22 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
         return 0;
     }
 
+    // Checked here, which is the moment a person is looking at the list rather
+    // than the moment the roster was written — see [`Stale`]. Every branch
+    // below reads the same answer, because a `--json` caller and a person at a
+    // picker are owed the same news.
+    let rows: Vec<Row> = threads.into_iter().map(|t| Row::new(store, t)).collect();
+
     if args.json() {
-        let rows: Vec<Value> = threads.iter().map(as_json).collect();
+        let rows: Vec<Value> = rows.iter().map(as_json).collect();
         println!("{}", Value::Array(rows));
         return 0;
     }
     if args.has("print") {
-        for t in &threads {
-            println!("{}  {}", p.bold(&t.row()), p.dim(t.from.as_str()));
-            println!("  {}", t.by_hand());
+        for r in &rows {
+            let from = format!("{}{}", r.thread.from.as_str(), r.note());
+            println!("{}  {}", p.bold(&r.thread.row()), p.dim(&from));
+            println!("  {}", r.thread.by_hand());
         }
         return 0;
     }
@@ -705,10 +862,10 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
     // one that has to be confirmed, and `--yes` is for the caller that has
     // already been asked — a panel key, a script — rather than a way to skip
     // the question.
-    let chosen: Vec<Thread> = match args.rest.first().is_some() || args.has("yes") {
-        true => threads,
+    let chosen: Vec<Row> = match args.rest.first().is_some() || args.has("yes") {
+        true => rows,
         false => {
-            let mut picker = Picker::new(threads);
+            let mut picker = Picker::new(rows);
             match ask(&mut picker, &store.held_at()) {
                 // Answered, either way: the held census is dropped, because a
                 // question that goes on being asked after it has been answered
@@ -731,8 +888,9 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
                         "{} — run `wsp resume` in a terminal to pick, or `wsp resume <id>`",
                         p.bold(&format!("{} agent(s) can be resumed", picker.rows.len()))
                     );
-                    for t in &picker.rows {
-                        println!("  {}  {}", t.row(), p.dim(t.from.as_str()));
+                    for r in &picker.rows {
+                        let from = format!("{}{}", r.thread.from.as_str(), r.note());
+                        println!("  {}  {}", r.thread.row(), p.dim(&from));
                     }
                     return 0;
                 }
@@ -749,13 +907,47 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
     }
 
     let mut failed = 0;
-    for t in &chosen {
+    let (mut resumed, mut refused) = (0, 0);
+    for r in &chosen {
+        let t = &r.thread;
         if !t.here() {
             // Not a failure and not attempted. The id is another machine's, the
             // tunnel is for herdr rather than for the agent's own runtime, and
             // the honest answer is the line to run over there.
             println!("{} is on {} — {}", p.bold(&t.what), t.host, t.by_hand());
             continue;
+        }
+        // The second check, and the one that matters: the tick was given to a
+        // list that may be hours old. What was true when the row was drawn is
+        // in `r.stale`; what is true now is asked again here, and the two
+        // together are what separates a deliberate answer from an obsolete one.
+        match stale(store, t) {
+            // Never, however deliberately it was asked for. There is no tree to
+            // resume into and the agent would sit on a trust modal looking
+            // started.
+            Some(s) if s.fatal() => {
+                println!("{} not resumed — {}. {}", p.bold(&t.row()), s.why(), r.door());
+                refused += 1;
+                continue;
+            }
+            // Finished *since the row was drawn*, so nobody said yes to this:
+            // the question that was answered is not the one now being asked.
+            // This is the render-077 case exactly.
+            Some(s) if r.stale.is_none() => {
+                println!(
+                    "{} not resumed — {} since the list was drawn. {}",
+                    p.bold(&t.row()),
+                    s.why(),
+                    r.door()
+                );
+                refused += 1;
+                continue;
+            }
+            // Ticked, or named, in full knowledge. Said again on the way past,
+            // because the reason a person read a minute ago is worth having in
+            // the transcript beside what it did.
+            Some(s) => println!("{} — {}, resuming anyway", p.bold(&t.row()), p.dim(&s.why())),
+            None => {}
         }
         match bring_back(store, &Herdr::new(), t) {
             Ok(seat) => {
@@ -764,6 +956,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
                 // better answer than waiting for it to turn up in a census
                 // under the same id.
                 store.forget_held(&t.session);
+                resumed += 1;
                 println!("{} resumed in {seat}", p.bold(&t.row()));
             }
             Err(e) => {
@@ -773,13 +966,19 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
             }
         }
     }
-    match failed {
-        0 => 0,
+    // A refusal is the command working, not failing — one stale row out of six
+    // is the whole point. It only becomes a non-zero exit when it is *all* that
+    // happened, which is the `wsp resume <id>` case: asked for one thing, did
+    // none of it, and a script has to be able to tell.
+    match (failed, resumed, refused) {
+        (0, 0, n) if n > 0 => 1,
+        (0, _, _) => 0,
         _ => 1,
     }
 }
 
-fn as_json(t: &Thread) -> Value {
+fn as_json(r: &Row) -> Value {
+    let t = &r.thread;
     serde_json::json!({
         "what": t.what,
         "task": t.task,
@@ -790,6 +989,9 @@ fn as_json(t: &Thread) -> Value {
         "kind": t.kind,
         "from": t.from.as_str(),
         "by_hand": t.by_hand(),
+        // Null for a row with nothing against it, so a caller can branch on
+        // presence rather than on parsing a sentence.
+        "stale": r.stale.map(Stale::why),
     })
 }
 
@@ -867,6 +1069,12 @@ mod tests {
         let store = Store::open();
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// A row as the picker would hold it with nothing said against it — what
+    /// every offer looked like before `render-077`.
+    fn clean(rows: Vec<Thread>) -> Vec<Row> {
+        rows.into_iter().map(|t| Row { thread: t, stale: None, on: true }).collect()
     }
 
     fn row(what: &str, session: &str) -> Value {
@@ -1089,6 +1297,117 @@ mod tests {
         assert!(store.held().is_empty(), "and answering the question drops the rest");
     }
 
+    /// A thread, as the census gives one, standing in a directory that exists.
+    fn thread(task: &str, cwd: &std::path::Path) -> Thread {
+        let mut t = of_row(&row(task, "s1")).unwrap();
+        t.cwd = cwd.display().to_string();
+        t
+    }
+
+    fn task_at(store: &Store, id: &str, status: Status) {
+        let mut t = crate::model::Task::new("a task", id);
+        t.set_status(status);
+        store.save_task(&t).unwrap();
+    }
+
+    /// The `render-077` incident, as the check that would have caught it. The
+    /// roster said these two were running because they were, at the restart;
+    /// by the time anybody answered they had landed and gone to review.
+    #[test]
+    fn a_row_whose_task_has_gone_to_review_is_said_so_and_starts_unticked() {
+        let (env, store) = store("resume-stale-review");
+        let tree = env.path("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        task_at(&store, "wsp-079", Status::Doing);
+        task_at(&store, "fork-009", Status::Review);
+
+        let live = Row::new(&store, thread("wsp-079", &tree));
+        assert_eq!(live.stale, None);
+        assert!(live.on, "work still in progress is the default yes it has always been");
+
+        let done = Row::new(&store, thread("fork-009", &tree));
+        assert_eq!(done.stale, Some(Stale::Moved(Status::Review)));
+        assert_eq!(done.stale.unwrap().why(), "now at review");
+        assert!(!done.on, "finished work is not resumed by default");
+        assert!(
+            done.door().contains("wsp resume fork-009"),
+            "and the way to ask for it anyway is on the row: {}",
+            done.door()
+        );
+    }
+
+    /// The second half of the same incident: both agents came up on Claude
+    /// Code's folder-trust modal, because the trees they were told to resume
+    /// into had been removed underneath them.
+    #[test]
+    fn a_row_whose_tree_has_been_removed_is_never_resumed() {
+        let (env, store) = store("resume-stale-tree");
+        task_at(&store, "wsp-079", Status::Doing);
+        let t = thread("wsp-079", &env.path("tree-that-was-removed"));
+        let r = Row::new(&store, t);
+        assert_eq!(r.stale, Some(Stale::Gone));
+        assert!(!r.on);
+        assert!(
+            r.stale.unwrap().fatal(),
+            "a directory that is not there cannot be resumed into however hard it is asked for"
+        );
+        assert!(r.door().contains("wsp checkout wsp-079"), "{}", r.door());
+    }
+
+    /// A task deleted out from under a row is stale for the same reason a
+    /// finished one is, and must not read as `doing`.
+    #[test]
+    fn a_row_whose_task_is_gone_from_the_store_is_stale() {
+        let (env, store) = store("resume-stale-forgotten");
+        let tree = env.path("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let r = Row::new(&store, thread("render-999", &tree));
+        assert_eq!(r.stale, Some(Stale::Forgotten));
+        assert!(!r.on);
+    }
+
+    /// Another machine's path is not ours to stat. Without this every row from
+    /// a second host reads as a removed tree, which is the false refusal that
+    /// mirrors the false resume.
+    #[test]
+    fn a_thread_on_another_host_is_not_judged_by_this_machines_filesystem() {
+        let (env, store) = store("resume-stale-host");
+        task_at(&store, "wsp-079", Status::Doing);
+        let mut t = thread("wsp-079", &env.path("not-here"));
+        t.host = "some-other-mac".to_string();
+        assert_eq!(stale(&store, &t), None);
+    }
+
+    /// The distinction the fix turns on, stated as the two answers it
+    /// separates. Both rows are stale by the time they are acted on; only one
+    /// of them was stale when the person looked, and only that one was
+    /// answered.
+    #[test]
+    fn a_row_ticked_knowing_it_was_finished_is_a_different_answer_from_one_that_finished_since() {
+        let (env, store) = store("resume-stale-since");
+        let tree = env.path("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        task_at(&store, "wsp-079", Status::Doing);
+
+        // Drawn while the work was still in flight, and ticked as such.
+        let drawn = Row::new(&store, thread("wsp-079", &tree));
+        assert_eq!(drawn.stale, None);
+        // …and landed while the list sat open.
+        task_at(&store, "wsp-079", Status::Review);
+        let now = stale(&store, &drawn.thread);
+        assert_eq!(now, Some(Stale::Moved(Status::Review)));
+        assert!(
+            now.is_some() && drawn.stale.is_none(),
+            "nobody said yes to this: the question answered is not the one now being asked"
+        );
+
+        // Whereas a row that already said `now at review` and was ticked anyway
+        // is a person asking for a finished agent back, which is allowed.
+        let deliberate = Row::new(&store, thread("wsp-079", &tree));
+        assert_eq!(deliberate.stale, now, "shown and now are the same, so nothing has changed");
+        assert!(!deliberate.stale.unwrap().fatal());
+    }
+
     /// A census row with no session cannot be offered: the row would fail the
     /// moment it was taken.
     #[test]
@@ -1103,12 +1422,12 @@ mod tests {
     fn the_list_opens_with_everything_ticked_and_esc_takes_none_of_it() {
         let rows: Vec<Thread> =
             [row("a", "s1"), row("b", "s2"), row("c", "s3")].iter().filter_map(of_row).collect();
-        let mut p = Picker::new(rows);
+        let mut p = Picker::new(clean(rows));
         assert_eq!(p.chosen().len(), 3);
 
         assert_eq!(p.press(Key::Down), Step::Stay);
         assert_eq!(p.press(Key::Char(' ')), Step::Stay);
-        let names: Vec<&str> = p.chosen().iter().map(|t| t.what.as_str()).collect();
+        let names: Vec<&str> = p.chosen().iter().map(|r| r.thread.what.as_str()).collect();
         assert_eq!(names, ["a", "c"], "the row under the cursor came off and nothing else moved");
 
         assert_eq!(p.press(Key::Esc), Step::Walk);
@@ -1121,7 +1440,7 @@ mod tests {
     #[test]
     fn none_then_enter_resumes_nothing() {
         let rows: Vec<Thread> = [row("a", "s1"), row("b", "s2")].iter().filter_map(of_row).collect();
-        let mut p = Picker::new(rows);
+        let mut p = Picker::new(clean(rows));
         p.press(Key::Char('n'));
         assert_eq!(p.press(Key::Enter), Step::Take);
         assert!(p.chosen().is_empty());
