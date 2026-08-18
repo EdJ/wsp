@@ -141,11 +141,12 @@ impl AgentState {
 /// view, rather than nested under the task or project that explains it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Census {
-    /// Where its work lives: the project of the task it holds, else the one it
-    /// is standing in or pointed at. The tree says this by where it draws the
-    /// row, and the agents view by which heading the row is under — so there it
-    /// is what the runs are cut on, and the row itself carries `None`. The dock
-    /// has neither a branch nor a heading, and is where it is drawn in words.
+    /// Which project it is working for: the one it governs if it holds a seat,
+    /// else the project of the task it holds, else the one it is standing in
+    /// or pointed at. The tree says this by where it draws the row, and the
+    /// agents view by which heading the row is under — so there it is what the
+    /// runs are cut on, and the row itself carries `None`. The dock has
+    /// neither a branch nor a heading, and is where it is drawn in words.
     pub(super) project: Option<String>,
     /// The task in its hands, as the panel would draw it anywhere else.
     pub(super) task: Option<(Status, String)>,
@@ -1496,10 +1497,26 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             census.push((
                 agent_state(&a.state, holds.map(|t| t.status()), row.seat.is_some()),
                 Census {
-                    // Where it stands, before where it is aimed: a pane holding
-                    // a task is placed by that task's project, and only one
-                    // with no work of its own is described by its direction.
-                    project: r.project.clone().or_else(|| direction.clone()),
+                    // The seat first, then where it stands, then where it is
+                    // aimed. A custodian holds no task on purpose — `wsp
+                    // govern` has it release the claim — so the two rules
+                    // below have nothing to place it by, and the `fork`
+                    // governor was filed under `batch`, which is where its
+                    // window happened to be cut. The seat is the one fact that
+                    // says which project the agent is working *for*, and it is
+                    // already on the row: `census_name` reads it to draw
+                    // `governor · fork` a column to the left of the heading
+                    // that disagreed with it.
+                    //
+                    // Above the task and not merely behind it, so the row and
+                    // the heading are never two answers: a seat that borrowed
+                    // a task to have somewhere to stand is still the custodian
+                    // of its project, and that is what its name says.
+                    project: row
+                        .seat
+                        .clone()
+                        .or_else(|| r.project.clone())
+                        .or_else(|| direction.clone()),
                     task: holds.map(|t| (t.status(), t.title.clone())),
                     // From the claim rather than the binding: a binding is
                     // remade whenever a pane is, and would reset the clock on
@@ -2780,6 +2797,50 @@ mod tests {
         let t = task("robustness-010", Some("robustness"), "todo");
         assert_eq!(ident_of(&t, Some("render")), "robustness-010");
         assert_eq!(ident_of(&t, None), "robustness-010");
+    }
+
+    /// A custodian holds no task on purpose — `wsp govern` has it hand its
+    /// claim back — so every rule that places an ordinary agent has nothing to
+    /// place it by, and the row fell to wherever its window happened to be
+    /// cut. Seen on 2026-08-18: the `fork` governor, drawn `governor · fork`,
+    /// sitting under the heading `batch`. The row and the heading were two
+    /// answers to the same question, and only one of them was right.
+    #[test]
+    fn a_seated_agent_is_grouped_under_the_project_it_governs() {
+        let mut snap = tree();
+        snap.projects.push(project("fork", Some("wsp"), ""));
+        snap.projects.push(project("batch", Some("wsp"), ""));
+        snap.governors.insert("fork".to_string(), serde_json::json!({"workspace": "w3E"}));
+        // Standing in `batch` by every measure the panel has: the window is
+        // pinned there, which is the strongest of them.
+        snap.pins.insert("w3E".to_string(), "batch".to_string());
+        snap.panes.push(AgentRef {
+            pane: "w3E:p1".to_string(),
+            workspace: "w3E".to_string(),
+            label: "076 landed + reviewed".to_string(),
+            state: "idle".to_string(),
+            agent: true,
+            ..Default::default()
+        });
+
+        let ui = collect(&snap, &View { agents: true, ..Default::default() });
+        let at = ui
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Agent { .. }))
+            .expect("the agent went missing");
+        match &ui.rows[at] {
+            Row::Agent { title, .. } => assert_eq!(title, "governor · fork · 076 landed + reviewed"),
+            other => panic!("not an agent: {other:?}"),
+        }
+        match &ui.rows[at - 1] {
+            Row::Group { project, .. } => assert_eq!(
+                project.as_deref(),
+                Some("fork"),
+                "the heading disagrees with the name on the row under it"
+            ),
+            other => panic!("no heading above the agent: {other:?}"),
+        }
     }
 
     /// The inbox is a node like any other, and the tasks under it share the
