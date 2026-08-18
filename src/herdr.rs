@@ -387,6 +387,21 @@ pub fn workspaces() -> std::io::Result<Vec<Workspace>> {
     everywhere(workspaces_on)
 }
 
+/// The workspace on screen here, if there is one.
+///
+/// **This machine only**, where [`workspaces`] asks every reachable one. The
+/// caller is somebody about to split a pane or open a tab, and every mutation
+/// goes down the local socket: an id qualified with a far machine's name is
+/// not one `pane.split` here can take, so a remote workspace holding the
+/// keyboard on its own screen would be an id that fails rather than an answer.
+///
+/// Asked at the moment it is needed and never kept. Which workspace is focused
+/// is the fastest-moving fact herdr has — it changes on every click into
+/// another pane — so a copy taken at start-up is wrong by the first keypress.
+pub fn focused_workspace() -> Option<String> {
+    workspaces_on(None).ok()?.into_iter().find(|w| w.focused).map(|w| w.id)
+}
+
 /// One row of `pane.list`, `agent.list` or `agent.get`.
 ///
 /// The last three fields are on herdr's `AgentInfo` and on nothing else, so a

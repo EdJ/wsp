@@ -659,7 +659,10 @@ fn help() {
   wsp view [<id>]                   detail pane; follows the panel unless given an id
   wsp kanban|board [<proj>] [--done]  the work as todo/doing/review/done columns;
                                     K in the panel opens it in a tab
-  wsp panel install [--all]         split it into a workspace, or all of them
+  wsp panel install [--all]         split it into a workspace, or all of them —
+                                    the way it works without a herdr that draws
+                                    the sidebar itself; skipped automatically
+                                    while `wsp surface` is running
   wsp panel uninstall [-w ws]       take it back out
   wsp surface                       the panel for a host that owns the cells:
                                     one JSON object per line each way, frames

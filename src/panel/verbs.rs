@@ -19,7 +19,7 @@ use crate::live::AgentRef;
 use crate::model::Priority;
 use crate::store::Store;
 
-use super::install::list_panes;
+use super::install::{list_panes, widest, PaneInfo};
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
 use super::rows::{hotkeys, Target, Ui};
@@ -753,6 +753,40 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
     Effect::Refetch
 }
 
+/// The workspace an action opens into.
+///
+/// A panel is *in* one. It was split into a workspace, the panes it draws are
+/// that workspace's, and `↵` puts the detail pane beside itself; asking any
+/// other question would be answering about somewhere it is not.
+///
+/// A surface is in none — herdr's sidebar belongs to no workspace, which is
+/// the property the fork exists to get — so what it acts on is the workspace
+/// **on screen**: the one the reader is looking at as they press the key. That
+/// is the same answer a person would give if asked where they expected the
+/// view to open, and it is why every verb below still opens a real pane in a
+/// real workspace rather than needing somewhere new to put things.
+///
+/// Asked here, at the key, and never carried. Which workspace is on screen is
+/// the fastest-moving fact herdr has, and a surface outlives all of them; one
+/// resolved when the sidebar started would be right until the first click
+/// elsewhere and quietly wrong after that, splitting panes into a workspace
+/// nobody is looking at.
+///
+/// It does move under you. Measured 2026-08-18 against the live server: herdr
+/// raises `workspace.focused` on its own — an agent coming back, a hover on
+/// its own sidebar — and the focused workspace changed twice in a few minutes
+/// with nobody typing. That is not a reason to hold one instead. A workspace
+/// herdr has put on screen *is* what the reader is looking at, so opening
+/// there is right by the same argument; and the alternative, a workspace
+/// chosen when the sidebar started, is wrong in exactly the cases this one is
+/// right in.
+///
+/// `None` means herdr has no workspace at all — its start screen — and the
+/// callers say so rather than guessing at one.
+fn stage(self_ws: Option<&str>) -> Option<String> {
+    self_ws.map(str::to_string).or_else(herdr::focused_workspace)
+}
+
 /// The detail pane this panel opened, if it has one.
 ///
 /// Ours means *in this tab*, not merely in this workspace: `pane.list` is per
@@ -772,7 +806,8 @@ fn my_view(ws: &str, me: Option<&str>) -> Option<String> {
 
 /// Shut this panel's detail pane, if it has one.
 pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>) -> bool {
-    let Some(ws) = self_ws else { return false };
+    let Some(ws) = stage(self_ws) else { return false };
+    let ws = ws.as_str();
     crate::detail::set_focus(store, ws, &crate::detail::Focus::Nothing);
     match my_view(ws, me) {
         Some(pane) => herdr::call("pane.close", json!({ "pane_id": pane })).is_ok(),
@@ -796,8 +831,17 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 /// One at a time. A second one would be a second window onto a view both of
 /// them read out of the same file, so pressing `Z` again from the sidebar goes
 /// to the one that is open rather than making another.
+///
+/// **From a surface this is still a tab, and it is the one thing on this page
+/// that ought not to be.** `Z` from a sidebar should widen the sidebar: the
+/// whole tree in place, at the width the reader already has their eyes on.
+/// That takes a message this side does not have — the host owns the rect, and
+/// today the wire runs one way for anything but frames — so `Z` opens the tab
+/// it has always opened rather than becoming a key that does nothing. When the
+/// host can be asked, this is where the asking goes.
 pub(super) fn open_full(self_ws: Option<&str>) -> String {
-    let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
+    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
+    let ws = ws.as_str();
 
     if let Some(open) = list_panes(ws).ok().and_then(|ps| ps.into_iter().find(|p| p.label == FULL_LABEL)) {
         let _ = herdr::call("tab.focus", json!({ "tab_id": open.tab }));
@@ -838,6 +882,10 @@ pub(super) fn open_full(self_ws: Option<&str>) -> String {
 /// No splits, no editors, no marker files — a board wants the whole width and
 /// draws its own screen.
 ///
+/// A tab from a surface too, and deliberately: a board is columns of cards
+/// across a workspace, and a sidebar is one column of anything. This is the
+/// same asymmetry [`pop_out`] argues, for the same reason.
+///
 /// `exec`, so the command *is* the pane: when it quits the pane goes, and the
 /// tab with it. A shell left behind would be a tab you have to close twice.
 ///
@@ -848,7 +896,8 @@ pub(super) fn open_full(self_ws: Option<&str>) -> String {
 /// and what stops the panel drawing a board as a shell standing in the very
 /// project it is a board of.
 pub(super) fn open_board(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
-    let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
+    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
+    let ws = ws.as_str();
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "wsp".into());
@@ -889,8 +938,18 @@ pub(super) fn open_board(argv: &[String], label: &str, self_ws: Option<&str>) ->
 /// A tab rather than a split: the store is Markdown and editing a task means
 /// its whole body — notes, acceptance criteria, the log — which wants width,
 /// and a tab gives that without disturbing a layout you will come back to.
+///
+/// **Still a tab from a surface, and that is not an oversight.** Everything
+/// else the sidebar rents is being given back — the panel itself is drawn by
+/// the host now, and `↵` opens a pane beside the work rather than one this
+/// process owns — but an editor is not chrome. `wsp edit` runs `$EDITOR` on
+/// prose in the reader's own terminal, and prose in a thirty-column strip is
+/// worse than prose in a tab, whoever is drawing the strip. The rule under
+/// both: the panel stops renting screen for *itself*, and goes on opening the
+/// full-size things a person asked for.
 pub(crate) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
-    let Some(ws) = self_ws else { return "no workspace to open a tab in".into() };
+    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
+    let ws = ws.as_str();
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "wsp".into());
@@ -981,6 +1040,36 @@ pub(crate) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> St
     format!("editing {label}")
 }
 
+/// The pane the detail is split off.
+///
+/// Three answers, in the order they stop being true:
+///
+/// 1. **Our own pane.** The detail shares the panel's column and the pane
+///    being worked in beside it is never touched. By pane id rather than by
+///    label, because the fullscreen panel `Z` opens is not the pane labelled
+///    `wsp` and a detail split off the sidebar two tabs away is one it cannot
+///    see. Checked against this workspace's panes: a pane id from somewhere
+///    else is not one to split here — see [`super::run::Where`] for how a
+///    surface comes to be handed one.
+/// 2. **The pane labelled `wsp`**, for a caller with no pane of its own. A
+///    board hands a task to the *sidebar's* detail pane and then closes.
+/// 3. **The widest pane that is not ours**, which is what a surface gets and
+///    is the same choice `panel install` makes about where a sidebar goes. The
+///    detail belongs beside the work, and from outside every workspace the
+///    only thing that says where the work is, is how much room it was given.
+///
+/// `None` is an empty workspace: nothing to split, and nothing to say about it
+/// beyond that.
+fn view_target(ws: &str, me: Option<&str>, panes: &[PaneInfo]) -> Option<String> {
+    if let Some(mine) = me.filter(|id| panes.iter().any(|p| p.id == *id)) {
+        return Some(mine.to_string());
+    }
+    if let Some(panel) = panes.iter().find(|p| p.label == PANEL_LABEL) {
+        return Some(panel.id.clone());
+    }
+    widest(ws, panes).map(|p| p.id.clone())
+}
+
 /// Point the workspace's detail pane at something, making one if there is not
 /// one yet.
 ///
@@ -995,29 +1084,26 @@ pub(crate) fn inspect(
     focus: &crate::detail::Focus,
     me: Option<&str>,
 ) -> String {
-    let Some(ws) = self_ws else {
-        return "no workspace to open a view in".into();
+    let Some(ws) = stage(self_ws) else {
+        return "no workspace on screen to open a view in".into();
     };
+    let ws = ws.as_str();
     crate::detail::set_focus(store, ws, focus);
 
     if my_view(ws, me).is_some() {
         return String::new();
     }
 
-    // Split downward off our own pane, so the detail shares the panel's column
-    // and the working pane beside it is never touched. Our own by pane id where
-    // we know it — the fullscreen panel is not the pane labelled `wsp`, and a
-    // detail pane split off the sidebar two tabs away is one it cannot see.
-    // The label is the fallback for a caller with no pane of its own to split:
-    // the board hands a task to the *sidebar's* detail pane and then closes.
-    let Some(me) = me.map(|s| s.to_string()).or_else(|| {
-        list_panes(ws).ok()?.into_iter().find(|p| p.label == PANEL_LABEL).map(|p| p.id)
-    }) else {
-        return "cannot find the panel pane".into();
+    let panes = match list_panes(ws) {
+        Ok(panes) => panes,
+        Err(e) => return e,
+    };
+    let Some(target) = view_target(ws, me, &panes) else {
+        return "no pane there to open a view beside".into();
     };
     let res = herdr::call(
         "pane.split",
-        json!({ "direction": "down", "target_pane_id": me, "ratio": 0.45, "focus": false }),
+        json!({ "direction": "down", "target_pane_id": target, "ratio": 0.45, "focus": false }),
     );
     let Ok(r) = res else { return "could not split a view pane".into() };
     let Some(pane) = r.get("pane").and_then(|p| p.get("pane_id")).and_then(|x| x.as_str()) else {
@@ -1767,3 +1853,86 @@ pub(super) fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(id: &str, label: &str) -> PaneInfo {
+        PaneInfo { id: id.into(), label: label.into(), tab: "t1".into() }
+    }
+
+    /// The panel's own column, which is what makes `↵` cheap: the detail
+    /// arrives under the tree and the pane somebody is working in beside it is
+    /// not touched at all.
+    #[test]
+    fn a_panel_splits_its_own_pane_so_the_detail_lands_under_the_tree() {
+        let panes = vec![pane("w1:p1", ""), pane("w1:p2", PANEL_LABEL)];
+
+        assert_eq!(view_target("w1", Some("w1:p2"), &panes).as_deref(), Some("w1:p2"));
+    }
+
+    /// The `Z` panel is a panel and is not the pane labelled `wsp`, so the
+    /// label alone would send its detail to a sidebar two tabs away — a key
+    /// that appears to do nothing.
+    #[test]
+    fn the_fullscreen_panel_splits_itself_rather_than_the_sidebar_it_came_from() {
+        let panes = vec![pane("w1:p2", PANEL_LABEL), pane("w1:p7", FULL_LABEL)];
+
+        assert_eq!(view_target("w1", Some("w1:p7"), &panes).as_deref(), Some("w1:p7"));
+    }
+
+    /// The environment lies to a surface, and this is where the lie would do
+    /// damage: herdr hands its child its own environment, so a herdr started
+    /// from inside a herdr pane gives the sidebar a `HERDR_PANE_ID` belonging
+    /// to a pane in some other workspace. Splitting that would put a detail
+    /// pane in front of whoever is working there. See [`super::run::Where`].
+    #[test]
+    fn a_pane_id_that_is_not_in_this_workspace_is_not_one_to_split() {
+        let panes = vec![pane("w1:p1", "")];
+
+        assert_eq!(view_target("w1", Some("w9:p4"), &panes).as_deref(), Some("w1:p1"));
+    }
+
+    /// What a surface gets, and the reason `↵` works from a sidebar that is in
+    /// no workspace at all: the detail goes beside the work. Our own panes are
+    /// never the answer — a detail split off a detail is seven characters wide,
+    /// which is how this was found the first time.
+    #[test]
+    fn a_surface_has_no_pane_so_the_detail_goes_beside_the_work() {
+        let panes = vec![
+            pane("w1:p1", ""),
+            pane("w1:p3", VIEW_LABEL),
+            pane("w1:p4", BOARD_LABEL),
+        ];
+
+        assert_eq!(view_target("w1", None, &panes).as_deref(), Some("w1:p1"));
+    }
+
+    /// The board's case: it opens a task in the *sidebar's* detail pane and
+    /// then closes itself, so it asks with no pane of its own to offer.
+    #[test]
+    fn a_caller_with_no_pane_of_its_own_hands_the_task_to_the_sidebar() {
+        let panes = vec![pane("w1:p1", ""), pane("w1:p2", PANEL_LABEL)];
+
+        assert_eq!(view_target("w1", None, &panes).as_deref(), Some("w1:p2"));
+    }
+
+    /// A workspace whose only panes are ours. Nothing to split, and the caller
+    /// says so rather than sending `pane.split` an id it invented.
+    #[test]
+    fn a_workspace_with_nothing_but_our_own_panes_has_nowhere_to_put_a_view() {
+        let panes = vec![pane("w1:p3", VIEW_LABEL)];
+
+        assert_eq!(view_target("w1", None, &panes), None);
+    }
+
+    /// A panel acts on the workspace it is in, and never asks which one is on
+    /// screen: it is looking at its own workspace's panes, and answering about
+    /// the one somebody has just clicked into would split a pane in a tree it
+    /// is not drawing. The laziness here is the whole of that guarantee — with
+    /// no herdr to ask, this test only passes because the question is not put.
+    #[test]
+    fn a_panel_acts_on_its_own_workspace_and_not_on_whichever_is_focused() {
+        assert_eq!(stage(Some("w4")).as_deref(), Some("w4"));
+    }
+}

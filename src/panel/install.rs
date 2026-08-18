@@ -4,6 +4,29 @@
 //! pane in it gets a fresh terminal, which takes down any agent running in the
 //! workspace. So this reaches for `pane.split` and swaps the new pane into the
 //! narrow slot itself.
+//!
+//! # Why this is still here
+//!
+//! It is the old way. A forked herdr draws the panel itself, in a sidebar that
+//! belongs to no workspace — see [`super::surface`] — and against that herdr a
+//! panel split into a pane is a second panel beside the real one, costing a
+//! column of somebody's screen for a copy of what is already on it.
+//!
+//! **It stays while the fork is unproven, and it stays whole.** The fork is one
+//! person's build of one terminal: it can be rolled back to an upstream release
+//! in a minute, and the wsp that talks to that release is this same binary —
+//! stage 1 of the conversion measured it, and nothing in `src/protocol`,
+//! `src/api` or the schema differs between the two. So the fallback is real
+//! rather than notional, and `--all` stays with it: against un-forked herdr
+//! there genuinely is one panel per workspace, and a fallback missing the
+//! command that sets it up on a fresh machine is half a fallback.
+//!
+//! What does *not* stay is both at once. [`install_if_adopted`] refuses while a
+//! surface is drawing, because that is the one path nobody chooses — the plugin
+//! fires `workspace.created` and a panel appears in a workspace somebody's
+//! agent was opened in, dragging the screen with it. Typing `wsp panel install`
+//! is a person asking, and gets what they asked for with a word about the
+//! surface that is already up.
 
 use std::collections::HashSet;
 
@@ -202,8 +225,23 @@ pub fn install_one(store: &Store, ws_id: &str, ratio: f64) -> Result<bool, Strin
 
 /// Auto-install for a newly created workspace — but only once the panel is
 /// actually in use, so linking the plugin never surprises anyone.
+///
+/// And not at all while a surface is drawing. This is the only path that
+/// installs a panel nobody asked for at that moment, so it is the only one
+/// where "there is already a panel on this screen" has to win: under a forked
+/// herdr with the plugin still linked, every `O` and every `wsp spawn` would
+/// otherwise put a second panel into the workspace it just made — and put it
+/// there through the swap that steals the screen, so an agent opened in the
+/// background arrives in front of you.
+///
+/// The state file is left exactly as it is. A person who goes back to upstream
+/// herdr has their workspaces still listed and their panels still installed;
+/// nothing here decides that the fork is permanent.
 pub fn install_if_adopted(store: &Store, ws_id: &str) {
     if panels_state(store).is_empty() {
+        return;
+    }
+    if crate::daemon::surface_drawing(&store.state) {
         return;
     }
     let _ = install_one(store, ws_id, 0.22);
@@ -224,6 +262,14 @@ pub fn install(store: &Store, args: &crate::Args) -> i32 {
     if !all && only.is_none() {
         eprintln!("wsp: not inside a herdr pane — pass --workspace <id> or --all");
         return 1;
+    }
+
+    // Said, not refused. `wsp panel install` is somebody typing it, and the
+    // fork is one build of one terminal — the reason to run both at once is
+    // that you are checking one against the other, which is most of what this
+    // fallback is for.
+    if crate::daemon::surface_drawing(&store.state) {
+        eprintln!("wsp: a surface is already drawing the sidebar — installing a panel beside it");
     }
 
     let workspaces = herdr::workspaces().unwrap_or_default();

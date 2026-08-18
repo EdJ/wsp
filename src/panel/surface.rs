@@ -75,7 +75,7 @@ use crate::live::Live;
 use crate::store::Store;
 
 use super::render::{rgb_of, Line, Style};
-use super::run::{event_loop, Msg, Outcome, Screen};
+use super::run::{event_loop, Msg, Outcome, Screen, Where};
 
 /// The wire version this build speaks. Bumped only when a change is not
 /// backwards compatible; most additions are not, because unknown messages are
@@ -336,10 +336,13 @@ pub fn run(store: &Store) -> i32 {
         });
     }
 
-    // No workspace and no pane: that is what a surface *is*, and every effect
-    // that would have named one already takes an `Option`.
+    // No workspace and no pane: that is what a surface *is*, and it is said
+    // here rather than read from the environment, which is herdr's and belongs
+    // to whatever pane herdr itself was started from. What a key acts *on* is
+    // resolved from the workspace on screen at the moment it is pressed — see
+    // `stage` in [`super::verbs`].
     let mut screen = Wire { host, last: String::new() };
-    match event_loop(store, &tx, &rx, None, false, &mut screen) {
+    match event_loop(store, &tx, &rx, &Where::nowhere(), false, &mut screen) {
         // Exit, where a panel re-execs. The host is already watching for a
         // surface that ended and already starts another; re-execing here would
         // be a second way to do the same thing, and the one the host cannot

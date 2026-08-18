@@ -440,6 +440,50 @@ fn tell(t: Tell, ui: &mut Ui, tx: &Sender<Msg>) {
     });
 }
 
+/// The pane a panel *is*, and the workspace it is in.
+///
+/// A panel in a pane has both, and reads them where every wsp process reads
+/// them: the environment herdr sets on the pane's shell. A surface has
+/// neither — it is a child of herdr drawing chrome that belongs to no
+/// workspace — and **it has to say so rather than find out**, which is the
+/// only reason this is a type and not two arguments read from the environment
+/// at the top of the loop.
+///
+/// The failure it is against is specific and is the way this fork is built:
+/// herdr passes its own environment to the surface it spawns, and a herdr
+/// started from a terminal inside another herdr — which is how the fork is
+/// developed, and how it is installed — hands its sidebar a `HERDR_PANE_ID`
+/// and a `HERDR_WORKSPACE_ID` belonging to whichever pane it was launched
+/// from. A surface that read those would split its detail pane into another
+/// workspace, take that pane's focus on every key that creates something, and
+/// close a view somebody else was reading.
+#[derive(Default)]
+pub(super) struct Where {
+    workspace: Option<String>,
+    pane: Option<String>,
+}
+
+impl Where {
+    /// A panel in a pane: it is where the environment says it is.
+    pub(super) fn env() -> Where {
+        let env = herdr::Env::read();
+        Where { workspace: env.workspace_id, pane: env.pane_id }
+    }
+
+    /// A panel that is in no pane and no workspace, and knows it.
+    pub(super) fn nowhere() -> Where {
+        Where::default()
+    }
+
+    fn ws(&self) -> Option<&str> {
+        self.workspace.as_deref()
+    }
+
+    fn pane(&self) -> Option<&str> {
+        self.pane.as_deref()
+    }
+}
+
 /// Why the loop stopped.
 pub(super) enum Outcome {
     Quit,
@@ -457,7 +501,7 @@ pub fn run(store: &Store, full: bool) -> i32 {
         eprintln!("wsp: no herdr socket");
         return 1;
     }
-    let self_ws = herdr::Env::read().workspace_id;
+    let here = Where::env();
 
     let (tx, rx) = mpsc::channel::<Msg>();
     spawn_input(tx.clone());
@@ -482,7 +526,7 @@ pub fn run(store: &Store, full: bool) -> i32 {
     let _ = std::io::stdout().flush();
     stty(&["raw", "-echo", "min", "0", "time", "1"]);
 
-    let outcome = event_loop(store, &tx, &rx, self_ws.as_deref(), full, &mut Tty::new());
+    let outcome = event_loop(store, &tx, &rx, &here, full, &mut Tty::new());
 
     stty(&["sane"]);
     // Off in the reverse order, and before the alternate screen goes: a pane
@@ -553,7 +597,7 @@ pub(super) fn event_loop(
     store: &Store,
     tx: &Sender<Msg>,
     rx: &Receiver<Msg>,
-    self_ws: Option<&str>,
+    here: &Where,
     full: bool,
     screen: &mut dyn Screen,
 ) -> Outcome {
@@ -573,8 +617,11 @@ pub(super) fn event_loop(
     // disk before they did.
     let mut want = adopt(store, &mut view, &mut agreed);
     // Who we are, for taking focus when the mouse says the reader is here, and
-    // for knowing whether it was already here when they clicked.
-    let me = herdr::Env::read().pane_id;
+    // for knowing whether it was already here when they clicked. Both come off
+    // the [`Where`] the caller handed in rather than out of the environment,
+    // because a surface's environment is herdr's and says nothing true about
+    // where the surface is.
+    let (self_ws, me) = (here.ws(), here.pane());
     let live = live::read();
     // The two focus questions, asked of the reading the frame is built from and
     // kept by the loop rather than carried in the view.
@@ -592,7 +639,7 @@ pub(super) fn event_loop(
     //
     // Neither is drawn, which is why neither is in the [`Snapshot`]: see
     // `crate::live`, and `crate::draw`'s "focus is not an input".
-    let (mut keyboard, mut self_focused) = screen.focus(&live, me.as_deref(), self_ws);
+    let (mut keyboard, mut self_focused) = screen.focus(&live, me, self_ws);
     let snap = Snapshot::live(store, live.panes);
     // What shape of thing this pane is, before the rows are built from it: a
     // page shows a project's tasks all of them and a sidebar shows six. See
@@ -664,7 +711,7 @@ pub(super) fn event_loop(
             && took_focus.elapsed() > Duration::from_millis(400)
         {
             took_focus = Instant::now();
-            focus_self(me.as_deref(), self_ws);
+            focus_self(me, self_ws);
             // `focus_self` is a round-trip that has already returned, so this is
             // not a guess: the keyboard is here, and the next click within the
             // 400ms above — which does not ask herdr again — knows it.
@@ -741,7 +788,7 @@ pub(super) fn event_loop(
                     refetch = true;
                 }
                 Effect::Inspect(focus) => {
-                    let msg = inspect(store, self_ws, &focus, me.as_deref());
+                    let msg = inspect(store, self_ws, &focus, me);
                     if msg.is_empty() {
                         view.showing = Some(focus);
                     } else {
@@ -749,7 +796,7 @@ pub(super) fn event_loop(
                     }
                 }
                 Effect::CloseView => {
-                    if close_view(store, self_ws, me.as_deref()) {
+                    if close_view(store, self_ws, me) {
                         say(&mut ui, "closed");
                     }
                     view.showing = None;
@@ -815,7 +862,7 @@ pub(super) fn event_loop(
                                     // click landing straight after does not ask
                                     // herdr twice.
                                     took_focus = Instant::now();
-                                    focus_self(me.as_deref(), self_ws);
+                                    focus_self(me, self_ws);
                                     keyboard = true;
                                 }
                                 None => say(&mut ui, m.label),
@@ -1005,7 +1052,7 @@ pub(super) fn event_loop(
             // workspace is on screen" out of. Both are read here rather than off
             // the frame, because a frame is what a renderer draws and neither of
             // these is ever drawn.
-            (keyboard, self_focused) = screen.focus(&live, me.as_deref(), self_ws);
+            (keyboard, self_focused) = screen.focus(&live, me, self_ws);
             let snap = Snapshot::live(store, live.panes);
             // Likewise free, and it has to be taken from the same list the frame
             // is drawn from: the poll asks whether herdr has moved on from what
