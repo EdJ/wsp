@@ -622,6 +622,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // `--no-focus` is still parsed (`main::BOOL_FLAGS`) and now asks for what
     // already happens: dropping it outright would make an old invocation swallow
     // the id after it rather than fail, which is a worse way to learn.
+    //
+    // The ask below is honoured and the screen still moves, which is not this
+    // line's doing: herdr's `workspace.created` runs wsp's own plugin hook, the
+    // hook installs the panel, and the `pane.swap` it needs focuses with no way
+    // to decline. See `panel::install::install_one` and `fork-002`.
     let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"));
     let seat = match place.open(&order) {
         Ok(v) => v,
@@ -1730,7 +1735,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// A spawn leaves the screen where it was unless somebody asked for it.
+    /// A spawn asks for the screen only when somebody asked for it.
+    ///
+    /// *Asks*, and the distinction is load-bearing: the ask is honoured all the
+    /// way down and the screen moves anyway, because the panel installed into
+    /// the new workspace swaps a pane and `pane.swap` focuses unconditionally.
+    /// That is `fork-002` and it cannot be tested here — this test owns what
+    /// wsp requests, which is the only half wsp decides.
     ///
     /// This line read `!args.has("no-focus")` until 2026-08-17, so the screen
     /// moved onto every new seat unless the caller remembered to say otherwise —

@@ -178,6 +178,17 @@ pub fn install_one(store: &Store, ws_id: &str, ratio: f64) -> Result<bool, Strin
         })
         .ok_or_else(|| "split reported no new pane".to_string())?;
 
+    // **This swap steals the screen, and there is no way to ask it not to.**
+    // `handle_pane_swap` calls `switch_workspace_tab` unconditionally and
+    // `pane.swap` is the one mutation in herdr's API with no `focus` field —
+    // `workspace.create`, `pane.split`, `pane.move` and `layout.apply` all have
+    // one, defaulting to false. So a workspace opened deliberately in the
+    // background is dragged onto the screen 34 ms later by its own panel being
+    // installed, which is the whole of why `robustness-069` looked unfixed
+    // after `spawn` stopped opting into focus. Measured, with the chain and the
+    // line, on `fork-002`; nothing above can be reordered around it, because
+    // `SplitDirection` is `right|down` and `pane.move` refuses a move within
+    // one tab.
     let _ = herdr::call(
         "pane.swap",
         json!({ "source_pane_id": target.id, "target_pane_id": new_pane }),
