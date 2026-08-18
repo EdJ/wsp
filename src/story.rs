@@ -298,6 +298,12 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // the one that shows the section, so every other frame goes on saying
         // what the panel says on an ordinary afternoon.
         flags: BTreeMap::new(),
+        // No long names kept: every label in this world is short enough to be
+        // its own whole, which is what a fixture wants — a frame that showed a
+        // name being expanded would be showing the machinery rather than the
+        // panel. `render-066`'s test in `cmd_agent` is where the expansion is
+        // checked.
+        said: BTreeMap::new(),
         // Nobody coordinating, which is the ordinary state and the one the
         // storyboard is for. A seat changes one judgement on one row — see
         // [`crate::cmd_govern`] — and a world that had one would be showing

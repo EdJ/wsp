@@ -103,6 +103,21 @@ pub(crate) struct AgentRef {
     ///
     /// The store's half of the row, like `task` above.
     pub(crate) project: Option<String>,
+    /// The whole of the name this pane's label is a cut-down of, when there is
+    /// one and a surface has room for it.
+    ///
+    /// A label goes over the wire cut to `cmd_agent::LABEL_MAX` — a herdr
+    /// sidebar is 26 columns, and the rule is right. It was also the only copy,
+    /// so `panel --full`, which is the whole tree at the width of the workspace,
+    /// drew forty-four characters into a hundred columns and there was nothing
+    /// longer anywhere to draw. This is the longer thing: the store's own copy
+    /// of the task's title, or the sentence `wsp say` kept beside the label it
+    /// was cut to.
+    ///
+    /// The store's half of the row, like `task` above — [`read`] leaves it
+    /// empty, because the runner has only what it was told — and `None` for
+    /// most panes, which wear a name that was never cut.
+    pub(crate) full: Option<String>,
     /// The project this pane's workspace is the custodian of — `wsp govern` —
     /// and `None` for every ordinary agent, which is nearly all of them.
     ///
@@ -156,9 +171,19 @@ impl Claimed {
 }
 
 impl AgentRef {
-    /// What to call it — see [`pane_name`].
+    /// What to call it — see [`pane_name`], and [`AgentRef::full`] for the
+    /// longer answer that outranks it.
+    ///
+    /// Uncut, whatever the surface. The cut belongs to whoever is drawing: the
+    /// renderer already fits every row to the width of its pane and draws its
+    /// own ellipsis, so a name arriving short is a name no wide surface can
+    /// make whole again, while a name arriving whole is one every narrow
+    /// surface shortens exactly as it did before.
     pub(crate) fn where_(&self) -> String {
-        pane_name(&self.label, &self.title, &self.workspace_label)
+        match &self.full {
+            Some(full) => full.clone(),
+            None => pane_name(&self.label, &self.title, &self.workspace_label),
+        }
     }
 
     /// The same name with the post in front of it, for a pane that holds one.
@@ -301,6 +326,7 @@ pub(crate) fn of(workspaces: Vec<herdr::Workspace>, panes: Vec<herdr::Pane>) -> 
                 kind: p.agent.clone(),
                 task: None,
                 project: None,
+                full: None,
                 seat: None,
             })
             .collect(),

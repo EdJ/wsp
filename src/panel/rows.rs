@@ -956,6 +956,10 @@ pub struct Snapshot {
     /// said why. Machine-local state like the claims beside it, and the one
     /// input here that arrives from outside the person's own hands.
     pub flags: std::collections::BTreeMap<String, serde_json::Value>,
+    /// pane id -> what its label was cut from, when the store kept a longer
+    /// copy. Read by [`crate::cmd_agent::full_name`], which is the only thing
+    /// that knows what a wire label is and is not evidence of.
+    pub said: std::collections::BTreeMap<String, serde_json::Value>,
     /// project id -> seat. Read for one question — whether an idle agent is a
     /// coordinating seat between agents rather than a worker that has stopped —
     /// which the panel would otherwise draw as the loudest row on the screen.
@@ -989,6 +993,7 @@ impl Snapshot {
             mandates: store.mandates(),
             claims: store.claims(),
             flags: store.flags(),
+            said: store.said(),
             governors: store.governors(),
             panes,
         }
@@ -1367,18 +1372,32 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // usually just resolved for its own reasons — passed in rather than worked
     // out again here, because resolution canonicalises every project root and
     // this runs four times a second against every pane on the machine.
-    let as_ref = |a: &AgentRef, project: Option<String>| AgentRef {
-        // The status beside the id, because a verb aimed at the pane has to
-        // tell an agent mid-task from one that has handed its work back. `None`
-        // for a binding whose task the store no longer has — see
-        // [`live::Claimed::status`].
-        task: bound_task_of_pane(&a.pane).map(|id| live::Claimed {
-            status: tasks.iter().find(|t| t.id == id).map(|t| t.status()),
-            id,
-        }),
-        project,
-        seat: crate::cmd_govern::governs(&snap.governors, &a.workspace),
-        ..a.clone()
+    let as_ref = |a: &AgentRef, project: Option<String>| {
+        // Looked up once and used twice below, because this runs against every
+        // pane on the machine four times a second.
+        let bound = bound_task_of_pane(&a.pane);
+        let held = bound.as_ref().and_then(|id| tasks.iter().find(|t| &t.id == id));
+        AgentRef {
+            // The status beside the id, because a verb aimed at the pane has to
+            // tell an agent mid-task from one that has handed its work back.
+            // `None` for a binding whose task the store no longer has — see
+            // [`live::Claimed::status`].
+            task: bound
+                .clone()
+                .map(|id| live::Claimed { status: held.map(|t| t.status()), id }),
+            project,
+            // The name at full length, for the surfaces that have room for one.
+            // Here because this is the join — the store's copy of a title and
+            // the sentence it kept beside a label are both store facts, and a
+            // row that reached a renderer without them would be a row no
+            // renderer could fix. `where_()` is asked rather than the label,
+            // because that is the name this row would otherwise draw: a pane
+            // wearing no label of ours is still named after its workspace, and
+            // that name was cut by the same rule.
+            full: crate::cmd_agent::full_name(&snap.said, &a.pane, &a.where_(), held),
+            seat: crate::cmd_govern::governs(&snap.governors, &a.workspace),
+            ..a.clone()
+        }
     };
 
     // The slots, joined to whoever is standing in them at this tick.
@@ -2708,6 +2727,7 @@ mod tests {
             mandates: Default::default(),
             claims: Default::default(),
             flags: Default::default(),
+            said: Default::default(),
             governors: Default::default(),
             panes: vec![],
         }
@@ -2843,6 +2863,97 @@ mod tests {
             ),
             other => panic!("no heading above the agent: {other:?}"),
         }
+    }
+
+    /// What `Z` is for. The label herdr holds is 44 characters because a
+    /// sidebar is 26 columns wide; the row is built at full length and the
+    /// renderer cuts it to whatever the pane it is drawn in has, which for
+    /// `panel --full` is the width of the whole workspace.
+    ///
+    /// Seen on 2026-08-17: `robustness/078 · build a design artefact fo…` in a
+    /// hundred columns, because the only copy of that name was the cut one.
+    #[test]
+    fn a_row_carries_the_whole_name_and_lets_the_surface_do_the_cutting() {
+        let said = "reading how the sidebar names a pane that holds no task at all";
+        let wire = crate::util::truncate(said, 44);
+
+        let mut snap = tree();
+        snap.said.insert(
+            "w1:p1".to_string(),
+            serde_json::json!({ "label": wire, "full": said }),
+        );
+        snap.panes.push(AgentRef {
+            pane: "w1:p1".to_string(),
+            workspace: "w1".to_string(),
+            label: wire.clone(),
+            state: "working".to_string(),
+            agent: true,
+            ..Default::default()
+        });
+
+        let ui = collect(&snap, &View { agents: true, ..Default::default() });
+        let title = ui
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Agent { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .expect("the agent went missing");
+        assert_eq!(title, said, "the row got the cut copy, and no width can undo that");
+
+        // And the guard that makes the long copy safe to keep: it describes one
+        // label, so a pane wearing anything else is drawn as what it wears. A
+        // name that disagrees with herdr's is worse than a short one.
+        snap.panes[0].label = "claude".to_string();
+        let ui = collect(&snap, &View { agents: true, ..Default::default() });
+        let title = ui
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Agent { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .expect("the agent went missing");
+        assert_eq!(title, "claude");
+    }
+
+    /// The half that needs nothing kept anywhere: a pane named after its task
+    /// is named after a title the store still holds, whole. So the join reads
+    /// the task rather than a copy, and a pane claimed before any of this
+    /// shipped expands as well as one claimed since.
+    #[test]
+    fn a_pane_named_after_its_task_is_drawn_by_the_title_the_store_holds() {
+        let mut snap = tree();
+        snap.tasks[0].title =
+            "Labels are truncated on the wire, so the full name is gone before anything wide"
+                .to_string();
+        let label = crate::cmd_agent::task_label(&snap.tasks[0]).unwrap();
+        assert!(label.ends_with('…'), "the label a claim wrote is the cut one");
+
+        snap.bindings.insert(
+            "w1:p1".to_string(),
+            serde_json::json!({ "task_id": snap.tasks[0].id }),
+        );
+        snap.panes.push(AgentRef {
+            pane: "w1:p1".to_string(),
+            workspace: "w1".to_string(),
+            label,
+            state: "working".to_string(),
+            agent: true,
+            ..Default::default()
+        });
+
+        let ui = collect(&snap, &View { agents: true, ..Default::default() });
+        let title = ui
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Agent { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .expect("the agent went missing");
+        assert_eq!(title, crate::cmd_agent::task_full(&snap.tasks[0]).unwrap());
     }
 
     /// The inbox is a node like any other, and the tasks under it share the

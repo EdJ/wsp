@@ -38,7 +38,7 @@ Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` a
 | `~/wsp/archive/tasks/YYYY-MM/` | swept `done` tasks |
 | `~/wsp/ids.json` | retired id → the id it became, so old ones still resolve |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
-| `~/.local/state/wsp/` | claims, bindings, pins, mandates, `worked.json`, `events.jsonl` — machine-local, not in git |
+| `~/.local/state/wsp/` | claims, bindings, pins, mandates, `said.json`, `worked.json`, `events.jsonl` — machine-local, not in git |
 
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
@@ -1347,6 +1347,20 @@ id goes has to resolve. The sentence keeps the scope too — saying something sh
 a pane holding no task has none to wear, which is itself the difference between
 an agent on a piece of work and an agent between two. The same string goes out
 as the `$scope` token, for a sidebar row that would rather carry it on its own.
+
+A name goes onto the wire cut to 44 characters, and that rule stays: a herdr
+sidebar is 26 columns and draws its own ellipsis, so what the cut is really for
+is not putting a paragraph on the wire as a name. What changed is that the cut
+copy is no longer the *only* copy. Names are built whole and shortened once, at
+the edge; a surface with room asks for the whole one back and does its own
+cutting to its own width, which is what `panel --full` — the tree at the width
+of the workspace — exists to have. Most names need nothing kept anywhere, since
+a pane holding a task is named after the task and the title is in the store; the
+one string with no other home is the sentence from `wsp say`, and that is what
+`said.json` holds, beside the label it was cut to. Beside, because the long copy
+is only used while the pane is still wearing that exact label — a rename by
+anyone, for any reason, falls back to what herdr says, and a short name is a far
+better answer than a long one that disagrees with the sidebar.
 
 One sentence an agent does not have to remember to say: while it is looking for
 work, `wsp next` and `wsp brief` say it for it — `looking for work in render`,

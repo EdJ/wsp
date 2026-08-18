@@ -1314,6 +1314,69 @@ impl Store {
         dropped
     }
 
+    // ---- what a pane is called, at full length ----------------------------
+    //
+    // A label on the wire is cut to `cmd_agent::LABEL_MAX`, and the rule is
+    // right: a herdr sidebar is 26 columns, and a paragraph is not a name. What
+    // was wrong is that the cut copy was the *only* copy — the pane label, the
+    // workspace name and the `task` token all held 44 characters and the store
+    // held nothing longer, so `panel --full`, which has a hundred columns to
+    // draw in, had nothing longer to draw.
+    //
+    // Most names have another home already: a pane holding a task is named
+    // after the task, and the task's title is in the store, whole. The one
+    // string with nowhere else to live is a sentence from `wsp say`, and this
+    // is where it lives — the agent module's ephemeral state, by the decision
+    // recorded on t-260816-083.
+    //
+    // Keyed on the pane, which is exactly as perishable as the label it is the
+    // long form of, and holding both halves: `label` is what was put on the
+    // wire and `full` is what it was cut from. A reader compares `label`
+    // against what the pane is wearing *now* and uses `full` only if they
+    // agree, so anything that renames a pane — a person, a claim, a release,
+    // another tool — invalidates this by construction rather than by our
+    // having remembered to clear it. The failure is then a truncated name,
+    // which is what every surface had before, rather than a wrong one.
+
+    /// pane id -> `{ label, full }`
+    pub fn said(&self) -> BTreeMap<String, Value> {
+        match self.read_json("said.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    /// Record what a pane's label was cut from. Nothing is stored when the
+    /// label is already whole: an entry that says the same as the wire is one
+    /// more thing to keep in step for no reading.
+    pub fn set_said(&self, pane: &str, label: &str, full: &str) {
+        if label == full {
+            self.clear_said(pane);
+            return;
+        }
+        self.update_json("said.json", |s| {
+            s.insert(pane.to_string(), json!({ "label": label, "full": full }));
+        });
+    }
+
+    pub fn clear_said(&self, pane: &str) -> bool {
+        let mut removed = false;
+        self.update_json("said.json", |s| removed = s.remove(pane).is_some());
+        removed
+    }
+
+    /// Drop the long names of panes that are gone, on the same evidence and
+    /// with the same reservation as [`Store::reap_bindings`].
+    pub fn reap_said(&self, live_panes: &[String]) -> usize {
+        let mut dropped = 0;
+        self.update_json("said.json", |s| {
+            let before = s.len();
+            s.retain(|pane, _| live_panes.iter().any(|p| p == pane));
+            dropped = before - s.len();
+        });
+        dropped
+    }
+
     /// workspace_id -> project_id
     pub fn pins(&self) -> BTreeMap<String, String> {
         match self.read_json("pins.json") {

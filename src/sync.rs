@@ -38,8 +38,13 @@ pub struct Report {
     pub reaped: usize,
 }
 
-/// Which bindings survive a sync: the ones herdr just named, plus every one on
+/// Which pane keys survive a sync: the ones herdr just named, plus every one on
 /// a machine that did not answer.
+///
+/// Written for the bindings and asked for `said.json` too, because the question
+/// is about the key rather than the record — anything filed under a pane id is
+/// entitled to survive on the same evidence, and two rules for that would be
+/// two chances to reap on silence.
 ///
 /// **Unreachable is not empty**, one layer over `reconcile --reap`, and the same
 /// judgement rather than a second one — `answered_by_machine` and `may_reap` are
@@ -154,6 +159,12 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
                 crate::cmd_agent::answered_by_machine(live.iter().map(|s| s.as_str()));
             let keep = kept_bindings(&live, bindings.keys(), &answered);
             let dropped = store.reap_bindings(&keep);
+            // The long names go with them, on the same evidence: `said.json` is
+            // keyed on a pane exactly as the bindings are, so an unreachable
+            // machine must not empty it either. Not counted in `reaped`, which
+            // is a count of claims-to-panes and is read as one.
+            let said = store.said();
+            store.reap_said(&kept_bindings(&live, said.keys(), &answered));
             // The one reading of herdr that happens on every tick, and it
             // already carries `agent_session` on the rows that have one. A
             // binding cannot record the session at the moment it is written —

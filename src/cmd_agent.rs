@@ -220,7 +220,18 @@ pub(crate) fn my_pane() -> Option<String> {
 /// already gives the `task` token. A herdr sidebar is 26 columns and draws its
 /// own ellipsis, so this is not about what fits: it is about not putting a
 /// paragraph on the wire as a name.
+///
+/// It is the width of the *wire* and of nothing else. Every name below is
+/// built whole and cut here, on the last line before it is sent, so a surface
+/// with room — `panel --full` is a hundred columns of it — can read the whole
+/// one back out of [`full_name`] and do its own cutting to its own width. The
+/// rule this constant states was never the mistake; being the only copy was.
 const LABEL_MAX: usize = 44;
+
+/// The one cut, and the only place a name of ours is shortened for herdr.
+fn on_the_wire(full: &str) -> String {
+    util::truncate(full, LABEL_MAX)
+}
 
 /// What you would type to mean this task: its id, `render-109`, printed as it
 /// is stored.
@@ -302,22 +313,37 @@ fn scope_worn(label: &str, task: &Task) -> Option<String> {
 /// `render-109` in front of it is the whole answer in ten columns, and it is
 /// also what you would type to go and look at the work.
 pub fn task_label(task: &Task) -> Option<String> {
-    said_label(task, &task.title)
+    task_full(task).map(|full| on_the_wire(&full))
 }
 
-/// The same label, with something an agent said in place of the task's title.
+/// The same name with nothing taken out of it.
+///
+/// The store's own copy, and the reason a pane holding a task needs nothing
+/// remembered anywhere: the title is in the task file, whole, and a surface
+/// wide enough to draw it can rebuild the name from what the label was made of
+/// rather than from the label.
+pub(crate) fn task_full(task: &Task) -> Option<String> {
+    said_full(task, &task.title)
+}
+
+/// The same name, with something an agent said in place of the task's title,
+/// and every word of it.
 ///
 /// The scope belongs to the pane for as long as it holds the task, not just
 /// until the first `wsp say` — the sentence is what changed, and losing which
 /// piece of work it is about was the cost of saying anything at all.
-fn said_label(task: &Task, said: &str) -> Option<String> {
+///
+/// Nothing is cut here. Cutting the sentence to the room left by the scope and
+/// cutting the finished string to [`LABEL_MAX`] come to the same characters —
+/// the scope is short and survives either way — so the two-step form the label
+/// used to be built in bought nothing and cost the only copy of the sentence.
+/// One string is built here, and whoever sends it puts it [`on_the_wire`].
+fn said_full(task: &Task, said: &str) -> Option<String> {
     let said = said.trim();
     if said.is_empty() {
         return None;
     }
-    let scope = task_scope(task);
-    let room = LABEL_MAX.saturating_sub(scope.chars().count() + 3);
-    Some(format!("{scope} · {}", util::truncate(said, room)))
+    Some(format!("{} · {said}", task_scope(task)))
 }
 
 /// What a pane wears once the work has been taken back off it.
@@ -330,21 +356,68 @@ fn said_label(task: &Task, said: &str) -> Option<String> {
 /// reading that list to find: nobody has given this agent anything.
 pub(crate) const UNASSIGNED_LABEL: &str = "unassigned";
 
-/// A label for a pane holding no task, which is the only kind that has to be
+/// A name for a pane holding no task, which is the only kind that has to be
 /// checked for a name of ours.
 ///
 /// `wsp` and `wsp:view` are withheld. They are how the panel finds its own
 /// panes, and `install` adopts a stray pane labelled `wsp` as a panel it lost
 /// track of — an agent that said "wsp" would be adopted as furniture. Nothing
 /// scoped can collide: a scope carries a `/` and those two do not.
-fn plain_label(said: &str) -> Option<String> {
-    let label = util::truncate(said.trim(), LABEL_MAX);
-    match label.as_str() {
+///
+/// Withheld here rather than after the cut: all three are short words, so the
+/// check reads the same on either side of it, and this side is the string
+/// somebody actually typed.
+fn plain_full(said: &str) -> Option<String> {
+    match said.trim() {
         "" | crate::panel::PANEL_LABEL | crate::panel::VIEW_LABEL | crate::panel::FULL_LABEL => {
             None
         }
-        _ => Some(label),
+        said => Some(said.to_string()),
     }
+}
+
+/// The whole of the name a pane is wearing a cut-down of, or `None` when what
+/// it is wearing is already the whole of it.
+///
+/// The one reader of everything above, and the answer every wide surface wants.
+/// `name` is what the surface would otherwise draw — a pane's label, or the
+/// workspace's when the pane has none — and the two ways back to the long form
+/// are asked in the order of how much they are worth:
+///
+/// 1. **What the store kept.** A sentence from `wsp say` exists nowhere else,
+///    so `said.json` holds it beside the label it was cut to. It is used only
+///    while the pane is still wearing that label: anything that renamed the
+///    pane since — a person, a claim, another tool — means the sentence is not
+///    what is on screen, and a long name that disagrees with the short one is
+///    worse than the short one.
+/// 2. **What the task says.** A pane named after its task needs nothing
+///    remembered: the title is in the store, and rebuilding the name from it is
+///    exactly what [`task_label`] did before cutting. Matched against the cut
+///    form, so a title edited since the claim does not expand into a name the
+///    pane is not wearing — that stale label is [`pane_rename`]'s trade, and
+///    this is not the place to take a different one.
+///
+/// `None` when neither answers, which is most panes: a shell's own title, a
+/// name somebody typed, `unassigned`. Nothing there was ever cut, so there is
+/// nothing to give back.
+pub(crate) fn full_name(
+    said: &BTreeMap<String, Value>,
+    pane: &str,
+    name: &str,
+    held: Option<&Task>,
+) -> Option<String> {
+    let str_at = |v: &Value, k: &str| v.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let cached = said
+        .get(pane)
+        .filter(|v| str_at(v, "label") == name)
+        .map(|v| str_at(v, "full"))
+        .filter(|full| !full.is_empty());
+    cached
+        .or_else(|| match held {
+            Some(t) if task_label(t).as_deref() == Some(name) => task_full(t),
+            _ => None,
+        })
+        .filter(|full| full != name)
 }
 
 /// Put the task's name on the workspace and the pane that took it up. Returns
@@ -427,7 +500,15 @@ fn named_after_task(label: &str, task: &Task) -> bool {
 /// workspace is where "what is this work" is read; the pane answers "what is
 /// happening in there now", and a sentence is a better answer to that than a
 /// title. `claim` and `wsp say --clear` both write the new title back.
-fn pane_rename(pane_label: &str, task: &Task) -> Option<String> {
+///
+/// The name it answers with is the whole one; [`name_bound`] cuts it for the
+/// wire. `full` is what the pane's label was cut from, when the store kept it —
+/// carried in so a rename reads the sentence at full length and puts it back at
+/// full length. Take it from the label instead and reconcile quietly cuts the
+/// sentence a second time, wearing down what an agent said one rewrite at a
+/// time, which is a slower version of the erasure this function was written to
+/// stop.
+fn pane_rename(pane_label: &str, full: Option<&str>, task: &Task) -> Option<String> {
     match scope_worn(pane_label, task) {
         Some(worn) if worn == task_scope(task) => None,
         // Ours, in a shape that names nothing. Only the scope is wrong, so
@@ -436,10 +517,11 @@ fn pane_rename(pane_label: &str, task: &Task) -> Option<String> {
         // knows. Writing the title back here would be the erasure this
         // function exists to stop, arriving by the other door.
         Some(worn) => {
-            let said = pane_label.trim().strip_prefix(&format!("{worn} ·")).unwrap_or("").trim();
-            said_label(task, said).or_else(|| task_label(task))
+            let wearing = full.unwrap_or(pane_label);
+            let said = wearing.trim().strip_prefix(&format!("{worn} ·")).unwrap_or("").trim();
+            said_full(task, said).or_else(|| task_full(task))
         }
-        None => task_label(task),
+        None => task_full(task),
     }
 }
 
@@ -871,12 +953,18 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     // A sentence said by a pane holding work is scoped to that work, so the
     // rail still says which of the agents this is while it talks. A pane
     // holding none has nothing to scope it by, and says only what it said.
-    let label = match (said.is_empty() || args.has("clear"), &held) {
-        (true, Some(t)) => task_label(t),
+    //
+    // Built whole, and cut once below. The whole one is the sentence an agent
+    // typed, which is the string this verb exists to publish and the only one
+    // in the system with no other home — the task's title is in the store and
+    // this is not.
+    let full = match (said.is_empty() || args.has("clear"), &held) {
+        (true, Some(t)) => task_full(t),
         (true, None) => None,
-        (false, Some(t)) => said_label(t, said),
-        (false, None) => plain_label(said),
+        (false, Some(t)) => said_full(t, said),
+        (false, None) => plain_full(said),
     };
+    let label = full.as_deref().map(on_the_wire);
 
     let r = match &label {
         Some(l) => herdr::rename_pane(&pane, l),
@@ -885,6 +973,19 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     if let Err(e) = r {
         eprintln!("wsp: {e}");
         return 1;
+    }
+
+    // Kept only once herdr has taken the name, and only when there is more of
+    // it than went over: what is stored is a statement about the label the pane
+    // is wearing, and a rename that failed leaves it wearing the old one.
+    // `set_said` keeps nothing when the two agree, so `--clear` on a short
+    // title and a pane whose label went away both end with no entry, which is
+    // the state that means "what is on the wire is the whole of it".
+    match (&label, &full) {
+        (Some(l), Some(f)) => store.set_said(&pane, l, f),
+        _ => {
+            store.clear_said(&pane);
+        }
     }
 
     if args.json() {
@@ -1903,6 +2004,7 @@ fn name_bound(
     workspaces: &[herdr::Workspace],
 ) -> usize {
     let tasks = store.tasks();
+    let said = store.said();
     let mut named = 0;
     for (pane_id, b) in store.bindings() {
         let Some(task) = b
@@ -1916,8 +2018,17 @@ fn name_bound(
         let Some(pane) = panes.iter().find(|p| p.pane_id == pane_id) else { continue };
 
         let mut touched = false;
-        if let Some(name) = pane_rename(&pane.label, task) {
-            touched |= herdr::rename_pane(&pane.pane_id, &name).is_ok();
+        let worn = full_name(&said, &pane_id, &pane.label, Some(task));
+        if let Some(name) = pane_rename(&pane.label, worn.as_deref(), task) {
+            let wire = on_the_wire(&name);
+            if herdr::rename_pane(&pane.pane_id, &wire).is_ok() {
+                touched = true;
+                // The entry follows the label it describes. It is keyed on what
+                // the pane wears, so leaving the old one behind would leave a
+                // long name matching nothing — harmless, and it would also mean
+                // the sentence we just carried across being read as gone.
+                store.set_said(&pane_id, &wire, &name);
+            }
         }
         // A workspace nobody named reads back as the agent or the folder, so
         // the comparison can never say "already right" — it says "not the task
@@ -3749,17 +3860,18 @@ mod tests {
     /// the tree — the panel filters its own panes out of it.
     #[test]
     fn a_pane_never_takes_the_panels_own_name() {
-        assert_eq!(plain_label("wsp"), None);
-        assert_eq!(plain_label("  wsp  "), None);
-        assert_eq!(plain_label("wsp:view"), None);
-        assert_eq!(plain_label(""), None);
+        assert_eq!(plain_full("wsp"), None);
+        assert_eq!(plain_full("  wsp  "), None);
+        assert_eq!(plain_full("wsp:view"), None);
+        assert_eq!(plain_full(""), None);
 
-        // Anything else is itself, and a long one is cut to the width `sync`
-        // already uses for the same title.
-        assert_eq!(plain_label("wsp panel"), Some("wsp panel".to_string()));
+        // Anything else is itself, whole — and cut to the width `sync` already
+        // uses for the same title only on the way to herdr.
+        assert_eq!(plain_full("wsp panel"), Some("wsp panel".to_string()));
         let long = "Agents should rename as they pick up new tasks, and say so";
-        assert_eq!(plain_label(long).unwrap().chars().count(), LABEL_MAX);
-        assert!(plain_label(long).unwrap().ends_with('…'));
+        assert_eq!(plain_full(long), Some(long.to_string()));
+        assert_eq!(on_the_wire(long).chars().count(), LABEL_MAX);
+        assert!(on_the_wire(long).ends_with('…'));
     }
 
     /// What the sidebar has to answer in the first ten columns: which of these
@@ -3781,15 +3893,67 @@ mod tests {
         // A sentence keeps the scope the title had, so saying something does
         // not cost the pane its place in the list.
         assert_eq!(
-            said_label(&t, "reading the claim guard"),
+            said_full(&t, "reading the claim guard"),
             Some("render-109 · reading the claim guard".to_string())
         );
-        assert_eq!(said_label(&t, "   "), None);
+        assert_eq!(said_full(&t, "   "), None);
 
         // An unfiled task is numbered in the inbox, and that is an id like any
         // other — so it is printed like any other.
         let loose = Task::new("something nobody has filed", "inbox-004");
         assert_eq!(task_label(&loose), Some("inbox-004 · something nobody has filed".to_string()));
+    }
+
+    /// The whole name, given back to a surface that has room for it — and
+    /// withheld the moment it would be a name the pane is not wearing.
+    ///
+    /// `render-066`: the label is cut on the wire and the cut copy was the only
+    /// copy, so `panel --full` drew 44 characters into a hundred columns. The
+    /// two ways back are worth different things and are asked in that order:
+    /// what the store kept for a sentence that lives nowhere else, then the
+    /// task's own title, which was never lost in the first place.
+    #[test]
+    fn a_name_cut_for_the_wire_can_be_had_whole_again() {
+        let mut t = Task::new(
+            "Labels are truncated on the wire, so the full name is gone",
+            "render-066",
+        );
+        t.project = Some("render".into());
+
+        let full = said_full(&t, "reading cmd_agent.rs for where the cut happens").unwrap();
+        let wire = on_the_wire(&full);
+        assert!(wire.ends_with('…'), "the case this is about is a label that was cut");
+
+        let mut said = BTreeMap::new();
+        said.insert("w1:p1".to_string(), json!({ "label": wire, "full": full }));
+
+        // The sentence, which exists in the store and nowhere else.
+        assert_eq!(full_name(&said, "w1:p1", &wire, Some(&t)), Some(full.clone()));
+
+        // The same entry against a pane wearing something else: a person
+        // renamed it, or a claim did. What is on screen wins, always — a long
+        // name that disagrees with herdr's is a worse answer than a short one.
+        assert_eq!(full_name(&said, "w1:p1", "claude", Some(&t)), None);
+        assert_eq!(full_name(&said, "w9:p9", &wire, Some(&t)), None, "another pane's sentence");
+
+        // The title needs nothing kept: the store has it, so a pane wearing the
+        // name a claim wrote expands out of the task itself. This is every
+        // pane claimed before any of this shipped.
+        let claimed = task_label(&t).unwrap();
+        assert_eq!(full_name(&BTreeMap::new(), "w1:p1", &claimed, Some(&t)), task_full(&t));
+
+        // And nothing is invented. A short name, a shell's own title, a pane
+        // holding no task — none of them were ever cut.
+        assert_eq!(full_name(&BTreeMap::new(), "w1:p1", "claude", Some(&t)), None);
+        assert_eq!(full_name(&BTreeMap::new(), "w1:p1", &claimed, None), None);
+        let mut short = Task::new("short enough", "render-002");
+        short.project = Some("render".into());
+        let whole = task_label(&short).unwrap();
+        assert_eq!(
+            full_name(&BTreeMap::new(), "w1:p1", &whole, Some(&short)),
+            None,
+            "a name that fits is its own whole, and saying so twice helps nobody"
+        );
     }
 
     /// The defect: the label was composed from the project the task is in
@@ -3823,7 +3987,10 @@ mod tests {
         // Both shapes a claim leaves behind: the title it wrote, and whatever
         // has been said over it since.
         assert!(named_after_task(&task_label(&t).unwrap(), &t));
-        assert!(named_after_task(&said_label(&t, "reading how release names panes").unwrap(), &t));
+        assert!(named_after_task(
+            &on_the_wire(&said_full(&t, "reading how release names panes").unwrap()),
+            &t
+        ));
 
         // Somebody else's name, and another task's. Neither is ours to take.
         assert!(!named_after_task("Trance Video", &t));
@@ -3870,13 +4037,38 @@ mod tests {
         moved.project = Some("batch".into());
 
         assert_eq!(
-            pane_rename("batch/077 · reading rows.rs for ident_of", &moved),
+            pane_rename("batch/077 · reading rows.rs for ident_of", None, &moved),
             Some("wsp-077 · reading rows.rs for ident_of".to_string())
         );
         // Nothing said yet, so the title is what there is to put back.
-        assert_eq!(pane_rename("batch/077 · ", &moved), task_label(&moved));
+        assert_eq!(pane_rename("batch/077 · ", None, &moved), task_full(&moved));
         // Already the id. Reconcile has nothing to do, sentence or not.
-        assert_eq!(pane_rename("wsp-077 · reading rows.rs", &moved), None);
+        assert_eq!(pane_rename("wsp-077 · reading rows.rs", None, &moved), None);
+    }
+
+    /// And it rewrites the scope on the sentence the store kept, not on the
+    /// forty-four characters of it herdr was given.
+    ///
+    /// The defect this is the guard for is a slow one: reconcile read the
+    /// sentence off the label, so every rewrite put back what was already cut
+    /// and the ellipsis crept left. An agent's status line would wear down to
+    /// nothing over a week of daemon restarts, and nothing would look broken at
+    /// any single step.
+    #[test]
+    fn reconcile_rewrites_the_scope_on_the_whole_sentence() {
+        let mut moved = Task::new("a pane's label names a task that does not exist", "wsp-077");
+        moved.project = Some("batch".into());
+
+        let said = "reading rows.rs for what places a pane against a project";
+        let full = format!("batch/077 · {said}");
+        let wire = on_the_wire(&full);
+        assert!(wire.ends_with('…'), "the label herdr holds is the cut one");
+
+        assert_eq!(
+            pane_rename(&wire, Some(&full), &moved),
+            Some(format!("wsp-077 · {said}")),
+            "the scope is what was wrong, and the sentence comes through whole"
+        );
     }
 
     /// The defect: `reconcile` renamed on any label that differed from the
@@ -3890,21 +4082,21 @@ mod tests {
 
         // What an agent is saying right now. Reconcile has no business here:
         // the sentence is newer than anything reconcile knows.
-        let said = said_label(&t, "reading place.rs for what the port owes say").unwrap();
-        assert_eq!(pane_rename(&said, &t), None);
+        let said = said_full(&t, "reading place.rs for what the port owes say").unwrap();
+        assert_eq!(pane_rename(&on_the_wire(&said), Some(&said), &t), None);
 
         // The name the claim wrote, and still wearing it. Nothing to do.
-        assert_eq!(pane_rename(&task_label(&t).unwrap(), &t), None);
+        assert_eq!(pane_rename(&task_label(&t).unwrap(), None, &t), None);
 
         // The cases name_bound exists for, all intact: a pane from before any
         // of this, one whose claim-time rename was dropped on a slow socket,
         // and one still wearing the task it was moved off.
-        assert_eq!(pane_rename("claude", &t), task_label(&t));
-        assert_eq!(pane_rename("", &t), task_label(&t));
+        assert_eq!(pane_rename("claude", None, &t), task_full(&t));
+        assert_eq!(pane_rename("", None, &t), task_full(&t));
         let mut old = Task::new("something else entirely", "robustness-030");
         old.project = Some("robustness".into());
-        let stale = said_label(&old, "still on the old one").unwrap();
-        assert_eq!(pane_rename(&stale, &t), task_label(&t));
+        let stale = said_full(&old, "still on the old one").unwrap();
+        assert_eq!(pane_rename(&stale, None, &t), task_full(&t));
     }
 
     /// The compatibility rule `--model` itself keeps, at the other end of it: a
