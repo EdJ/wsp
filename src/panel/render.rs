@@ -184,16 +184,19 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
     vec![
         (
             "On a task",
-            "The first column. When an agent is on the task it shows the agent's \
-             state — so the task's own status is not drawn, and a claimed task \
-             looks the same whether it is todo or doing.",
+            "The first column in the tree, and it is the task's own status — an \
+             agent on the task never displaces it. The agent hangs on its own \
+             row beneath, wearing the agent marks further down, so the two \
+             questions get a row each rather than fighting over one column. \
+             That there is an agent at all is in the ink: a claimed task is \
+             plain, an unclaimed one muted. On the board it is the other way \
+             about — the columns have already said the status, so a card wears \
+             its agent's mark and falls back to these.",
             vec![
-                mark(&[(Style::Accent, g::WORKING)], "working", "an agent is on this task and busy"),
-                mark(&[(Style::Muted, g::IDLE)], "idle", "an agent is on this task and waiting"),
-                mark(&[(Style::Dim, g::QUIET)], "no agent", "nobody has picked this up"),
+                mark(&[(Style::Dim, g::QUIET)], "not started", "todo, or still in the inbox — one mark for both, because where it is filed is what the tree is already saying"),
+                mark(&[(Style::Accent, g::DOING)], "doing", "started, and in hand"),
                 mark(&[(Style::Warn, g::BLOCKED)], "blocked", "parked, with a reason on the task"),
                 mark(&[(Style::Muted, g::REVIEW)], "review", "done enough to look at"),
-                mark(&[(Style::Accent, g::DOING)], "doing", "started — the task's own state, which it keeps even when claimed"),
                 mark(&[(Style::Dim, g::DONE)], "done", "finished — only shown under A"),
             ],
         ),
@@ -1268,4 +1271,66 @@ pub(crate) fn to_html(frame: &[Line], w: usize) -> String {
     }
     out.push_str("</pre>");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Status;
+    use crate::panel::rows::status_mark;
+
+    /// The group drifted once already: it described the first column as the
+    /// agent's state long after `render_row` had gone back to drawing the
+    /// task's own status, and three of its seven marks were of a column
+    /// nobody could see any more. Prose cannot be checked, but the marks can
+    /// — so they are pinned to the function the column is actually drawn
+    /// from, and a status that gains, loses or changes its mark takes the
+    /// legend with it or fails here.
+    #[test]
+    fn the_on_a_task_marks_are_exactly_what_the_first_column_can_draw() {
+        let every = [
+            Status::Inbox,
+            Status::Todo,
+            Status::Doing,
+            Status::Blocked,
+            Status::Review,
+            Status::Done,
+        ];
+        for s in every {
+            // No wildcard: a seventh status has to be listed above before
+            // this compiles, which is how it gets looked at here at all.
+            match s {
+                Status::Inbox
+                | Status::Todo
+                | Status::Doing
+                | Status::Blocked
+                | Status::Review
+                | Status::Done => {}
+            }
+        }
+        let mut drawn: Vec<(Style, &str)> = every.iter().map(|s| status_mark(*s)).collect();
+        drawn.sort_by_key(|(_, g)| *g);
+        drawn.dedup();
+
+        let group = legend()
+            .into_iter()
+            .find(|(name, ..)| *name == "On a task")
+            .expect("the legend still has an On a task group");
+        let mut listed: Vec<(Style, &str)> = group
+            .2
+            .iter()
+            .map(|m| {
+                let [span] = &m.sample.spans[..] else {
+                    panic!("{}: a status mark is one glyph in one style", m.name)
+                };
+                (span.style, span.text.as_str())
+            })
+            .collect();
+        listed.sort_by_key(|(_, g)| *g);
+
+        assert_eq!(
+            drawn, listed,
+            "the legend lists marks the first column does not draw, or misses ones it does"
+        );
+    }
 }
