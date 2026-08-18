@@ -39,6 +39,7 @@ mod place;
 mod place_herdr;
 mod place_super;
 mod resolve;
+mod sharing;
 mod story;
 mod store;
 mod sync;

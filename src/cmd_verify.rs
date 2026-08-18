@@ -115,6 +115,14 @@
 //! decided by the run that failed; the re-run alone is evidence printed beside
 //! it, never a second opinion that overrules it.
 //!
+//! # The trees are separate; the machine is not
+//!
+//! Separate trees mean N agents run N full builds, each `cargo` taking `-j8` as
+//! though it owned the laptop — load 468 and twenty-one `rustc` on 2026-08-17.
+//! What this command shares, and what it refuses to, is [`crate::sharing`]: a
+//! compiler cache keyed on inputs, and a budget of cores. The isolation above
+//! is untouched by both, which is the property they were chosen to keep.
+//!
 //! # Outside a checkout, nothing changes
 //!
 //! The trunk is still shared — the coordination seat stands there, and so does
@@ -129,6 +137,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
+use crate::sharing::{self, Share};
 use crate::store::Store;
 use crate::util;
 use crate::Args;
@@ -479,7 +488,7 @@ fn ensure_tree(repo: &Path, tree: &Path, head: &str) -> Result<bool, String> {
 /// Two threads rather than one [`Command::output`] call, which would be
 /// simpler and would print nothing until cargo exited — for a 25s test run
 /// that is the difference between watching a build and watching a cursor.
-fn cargo(tree: &Path, target: &Path, argv: &[&str], echo: bool) -> (bool, String) {
+fn cargo(tree: &Path, target: &Path, argv: &[&str], echo: bool, share: &Share) -> (bool, String) {
     let mut cmd = Command::new("cargo");
     cmd.args(argv)
         .current_dir(tree)
@@ -487,6 +496,12 @@ fn cargo(tree: &Path, target: &Path, argv: &[&str], echo: bool) -> (bool, String
         .env_remove("GIT_INDEX_FILE")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The one thing this build does not decide for itself: how much of the
+    // machine it may have, and where the compiler cache is. See
+    // [`crate::sharing`] — the target directory above is still its own, and the
+    // cache is keyed on inputs rather than on paths, so neither can make this
+    // build tell the truth about somebody else's tree.
+    share.apply(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -647,14 +662,14 @@ fn assertion(block: &[&str]) -> Option<String> {
 ///
 /// `None` is "not measured", which is not the same as passing and is printed as
 /// nothing at all rather than as a green word.
-fn rerun_alone(tree: &Path, target: &Path, name: &str) -> Option<bool> {
+fn rerun_alone(tree: &Path, target: &Path, name: &str, share: &Share) -> Option<bool> {
     // A doc test is named `src/store.rs - Store::at (line 12)`, which is not
     // something libtest can be handed as an exact filter. Anything with a space
     // in it is left alone rather than guessed at.
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return None;
     }
-    let (ok, text) = cargo(tree, target, &["test", "--quiet", "--", "--exact", name], false);
+    let (ok, text) = cargo(tree, target, &["test", "--quiet", "--", "--exact", name], false, share);
     if !ok {
         return Some(false);
     }
@@ -819,13 +834,23 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         steps.push(("release", vec!["build", "--release", "--quiet"]));
     }
 
+    // Registered here rather than at the top of the command: the share is
+    // held for as long as it is being used, so a verify that spends a minute
+    // resolving a patch is not counted against the builds running while it does.
+    let share = sharing::take(&store.state);
+    if !json_out {
+        if let Some(note) = share.note() {
+            println!("{} {}", p.dim("machine"), p.dim(&note));
+        }
+    }
+
     let mut failed: Option<&str> = None;
     let mut output = String::new();
     for (name, argv) in &steps {
         if !json_out {
             println!("{} cargo {}", p.dim("→"), argv.join(" "));
         }
-        let (ok, text) = cargo(&tree, &target, argv, !json_out);
+        let (ok, text) = cargo(&tree, &target, argv, !json_out, &share);
         output.push_str(&text);
         if !ok {
             failed = Some(name);
@@ -849,7 +874,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         }
         failed_tests = failures(&output);
         if let Some(first) = failed_tests.first() {
-            alone = rerun_alone(&tree, &target, &first.name);
+            alone = rerun_alone(&tree, &target, &first.name, &share);
         }
     }
 
@@ -875,6 +900,9 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     .map(|f| json!({"test": f.name, "at": f.at, "message": f.message}))
                     .collect::<Vec<_>>(),
                 "alone": alone,
+                "jobs": share.jobs,
+                "cores": share.cores,
+                "builds": share.live,
                 "seconds": (secs * 10.0).round() / 10.0,
                 "output": tail.join("\n"),
             })
@@ -1264,7 +1292,11 @@ mod tests {
     #[test]
     fn a_name_libtest_cannot_filter_on_is_not_rerun_at_all() {
         let nowhere = Path::new("/nowhere");
-        assert_eq!(rerun_alone(nowhere, nowhere, "src/store.rs - Store::at (line 12)"), None);
-        assert_eq!(rerun_alone(nowhere, nowhere, ""), None);
+        let share = sharing::unregistered();
+        assert_eq!(
+            rerun_alone(nowhere, nowhere, "src/store.rs - Store::at (line 12)", &share),
+            None
+        );
+        assert_eq!(rerun_alone(nowhere, nowhere, "", &share), None);
     }
 }

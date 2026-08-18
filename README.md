@@ -2640,6 +2640,42 @@ reruns the old binary. Observed on 2026-08-17: 482 tests green for source that
 had never been compiled. A target directory each, and the saving comes from
 bounding how many there are rather than from sharing one.
 
+The trees stay separate; the **machine** is shared, and until 2026-08-18 nothing
+said so. A tree each means a cold build each, and every `cargo` reads the core
+count and takes `-j8` as though it owned the laptop: load 468 and twenty-one
+`rustc` on 2026-08-17, with Ed sitting at it.
+
+What is shared now is **a budget of cores**. Every build registers a pid file
+under `<state>/building/` while it runs and takes `cores / builds` jobs, so four
+agents ask for eight compile jobs between them rather than thirty-two. Export
+`CARGO_BUILD_JOBS` and that is obeyed instead: what the budget stops is the
+*unknowing* saturation. `wsp verify` prints `machine 2 of 8 jobs · 4 builds
+here` when there is more than one, which is the answer to why today's verify
+took four minutes and yesterday's took one.
+
+What is **not** shared is a compiler cache, and that is a measurement rather
+than a preference. `sccache` was the obvious candidate. Two worktrees of the
+same commit, same compiler, same flags, built one after the other into one
+`SCCACHE_DIR`: **0 hits, 5 misses**. Give the second tree the first tree's
+target directory *path* and the same five compilations hit 5 out of 5 — so its
+key turns on the target directory, which is exactly what two isolated builds
+cannot share (cargo puts `-L dependency=<target>/…` and `OUT_DIR=<target>/…` on
+the rustc command line and they are in the hash). `SCCACHE_BASEDIR` does not
+rescue it: also measured, also 0 hits. On a full miss the wrapper costs about
+8%, so a cache that cannot be hit is worse than none.
+
+What the cold build is actually worth is the other measurement, 2026-08-18, one
+tree, `cargo test --no-run`: **23s** into an empty target directory, **3s** for
+the same tree reset to HEAD with somebody else's patch applied. Nearly eight to
+one — so the thing worth sharing is the build tree itself, exclusively, one
+build in it at a time. That is `robustness-070` and it is not finished.
+
+What is deliberately *not* budgeted is the test run. `cargo test` takes a thread
+per core and that is load too — but test parallelism is not a resource knob
+here, it changes what the suite exercises, and `robustness-072` measured a test
+that fails 48 times in 50 alone and passes under load. Quietly rescheduling the
+tests would move that ground while other tasks are standing on it.
+
 It also prints what changed that you did **not** name. Naming paths keeps the
 other agent's work out of your build, which is the point — and it lets you leave
 out something of your own, which fails in the worst direction: a patch holding a
@@ -2999,6 +3035,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
 | `src/cmd_machine.rs` | the machines agents can be run on |
+| `src/sharing.rs` | what every build on this machine shares: one compiler cache, one pool of cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |
 | `src/cmd_*.rs` | the commands |
