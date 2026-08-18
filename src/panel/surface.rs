@@ -25,14 +25,19 @@
 //! either order, which given that one of them is expensive to rebuild is not a
 //! nicety.
 //!
-//! In: `host` (the cells there are, whether the keyboard is here), `key` as it
-//! was **typed**, `mouse` in the surface's own coordinates, and `live` — what
-//! the host is running. A key arrives as a code and a character rather than as
+//! In: `host` (the cells there are, the most it could give, whether the
+//! keyboard is here), `key` as it was **typed**, `mouse` in the surface's own
+//! coordinates, and `live` — what the host is running. A key arrives as a code and a character rather than as
 //! [`Key`], deliberately: binding Tab here tomorrow must not need a new host.
 //!
 //! Out: `frame`, as rows of spans carrying **attributes** rather than style
 //! names, for the mirror-image reason — the palette is wsp's, and changing it
-//! must not need a new host either.
+//! must not need a new host either. And `width`, the one thing this side ever
+//! *asks* for: a number of columns, never a reason. wsp has three things it
+//! wants room for — the tree, a task written up, a board — and an `expand`, an
+//! `edit` and a `board` message would each be a host release standing in front
+//! of a wsp change. The host is told a size and hands back cells; what goes in
+//! them stays on this side of the pipe. See [`Wire::ask_width`].
 //!
 //! # Told what is running, rather than asking
 //!
@@ -147,6 +152,16 @@ struct Host {
     /// simply told — which is the one place this is *better* than a pane and
     /// not merely different.
     focused: bool,
+    /// The widest the host says it will draw this surface if asked, and `None`
+    /// for a host that has never said.
+    ///
+    /// Two things in one field, on purpose. It is the ceiling, so a surface can
+    /// see that asking for a page is worth doing before it asks; and its
+    /// absence is how a host that cannot be asked at all is recognised — an
+    /// older herdr, or something else entirely — the same way [`Running::here`]
+    /// recognises a host that does not push. Neither side has to declare what
+    /// it speaks, and neither binary has to be upgraded before the other.
+    widest: Option<usize>,
 }
 
 /// What is running, as far as this surface knows.
@@ -236,6 +251,45 @@ impl Screen for Wire {
             panes.iter().chain(far_panes).cloned().collect(),
         )
     }
+
+    /// Ask the host for cells, on the pipe the frames go back on.
+    ///
+    /// The first message this surface has ever *sent* that is not a picture,
+    /// and the traffic runs this way for one reason: the host owns the rect.
+    /// Everything else a panel wants of herdr it asks for over herdr's socket,
+    /// as any client would — but the sidebar's width is not something herdr's
+    /// API has a word for, because until this fork nothing but herdr decided
+    /// it. So it is asked for here, and the answer comes back as the size of
+    /// the next frame rather than as a reply.
+    ///
+    /// Not written through [`Wire::last`]. That guard is there to stop a frame
+    /// that has not changed being resent, and this is not a frame — it is a
+    /// request made once, by a keystroke, and dropping the second of two would
+    /// be dropping the one that gives the room back.
+    fn ask_width(&mut self, cols: usize) -> bool {
+        // A host that has never said how wide it could draw us cannot be asked.
+        // Answered here rather than by printing hopefully, because the caller's
+        // fallback — a tab, for `Z` — is only correct if this is honest: a
+        // surface that reported success against an older herdr would leave the
+        // key doing nothing at all.
+        if self.host.lock().ok().and_then(|host| host.widest).is_none() {
+            return false;
+        }
+        println!("{}", width_json(cols));
+        let _ = std::io::stdout().flush();
+        true
+    }
+
+}
+
+/// A request for cells, as the host reads it.
+///
+/// Separate from [`Wire::ask_width`] for the same reason [`frame_json`] is
+/// separate from [`Wire::paint`]: this is the half the two binaries have to
+/// agree on, and a `println!` is not something a test can look at. `0` is the
+/// room given back — one message rather than a release verb.
+fn width_json(cols: usize) -> String {
+    json!({ "t": "width", "cols": cols }).to_string()
 }
 
 /// A frame, as the host reads it.
@@ -438,6 +492,14 @@ fn read_host(
                     if let Some(f) = message.get("focused").and_then(Value::as_bool) {
                         host.focused = f;
                     }
+                    // Absent means unchanged here too, and *never* said means
+                    // a host with no width to give. The two are the same
+                    // `None` only until the first host message that carries
+                    // one, which a host that has it sends before the surface
+                    // has drawn anything.
+                    if let Some(max) = message.get("max_cols").and_then(Value::as_u64) {
+                        host.widest = Some(max as usize);
+                    }
                 }
             }
             // What herdr is running, pushed rather than asked for. See
@@ -596,7 +658,7 @@ pub fn run(store: &Store) -> i32 {
             }
         });
     }
-    let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+    let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
     let running = Arc::new(Mutex::new(Running::default()));
     let (tx, rx) = std::sync::mpsc::channel::<Msg>();
     {
@@ -713,7 +775,7 @@ mod tests {
     /// host that was killed, so it has to end rather than block for ever.
     #[test]
     fn a_host_that_has_gone_ends_the_read_rather_than_leaving_a_surface_behind() {
-        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
         // Held, so the read ends because stdin did and not because the loop it
         // sends to went away first — which is the other way out of `read_host`
         // and would pass this test without testing anything.
@@ -767,7 +829,7 @@ mod tests {
     #[test]
     fn a_surface_is_on_screen_so_a_new_binary_is_seen_within_a_tick_of_install() {
         let wire = Wire {
-            host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None })),
             running: nothing_told(),
             last: String::new(),
             frame_file: PathBuf::new(),
@@ -799,7 +861,7 @@ mod tests {
                 "\n",
             )
             .as_bytes(),
-            Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None })),
             Arc::clone(&running),
             tx,
         );
@@ -813,6 +875,60 @@ mod tests {
             matches!(rx.recv(), Ok(Msg::Herdr(e)) if e.shape),
             "a census is news, and the kind that redraws now rather than at the next tick",
         );
+    }
+
+    /// The capability the whole fallback rests on. A host that has never said
+    /// how wide it could draw us is one that will not answer, and saying so
+    /// here is what lets `Z` open a tab instead of asking into the dark — see
+    /// [`super::verbs::open_full`]. Reported honestly rather than hopefully:
+    /// a surface that claimed success against an older herdr would leave the
+    /// key doing nothing at all.
+    #[test]
+    fn a_host_that_never_said_how_wide_it_could_draw_us_cannot_be_asked() {
+        let mut wire = Wire {
+            host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None })),
+            running: nothing_told(),
+            last: String::new(),
+            frame_file: PathBuf::new(),
+        };
+
+        assert!(!wire.ask_width(96), "there is nobody to ask");
+
+        let mut wire = Wire {
+            host: Arc::new(Mutex::new(Host { size: (26, 40), focused: false, widest: Some(200) })),
+            running: nothing_told(),
+            last: String::new(),
+            frame_file: PathBuf::new(),
+        };
+
+        assert!(wire.ask_width(96), "a host that said what it could give can be asked");
+    }
+
+    /// The ceiling arrives on the message that already carries the cells, so a
+    /// host that takes widths is recognised by the first thing it ever says and
+    /// nothing has to declare what it speaks.
+    #[test]
+    fn the_widest_a_host_will_draw_us_is_read_off_the_host_message() {
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+
+        read_host(
+            "{\"t\":\"host\",\"cols\":26,\"rows\":40,\"max_cols\":200}\n".as_bytes(),
+            Arc::clone(&host),
+            nothing_told(),
+            tx,
+        );
+
+        assert_eq!(host.lock().unwrap().widest, Some(200));
+    }
+
+    /// The wire, as the host parses it. Both halves of one message: `0` is the
+    /// room given back, and a host reading it as a width of zero would leave a
+    /// sidebar nobody could see.
+    #[test]
+    fn a_width_request_is_a_number_of_columns_and_zero_gives_them_back() {
+        assert_eq!(width_json(96), r#"{"cols":96,"t":"width"}"#);
+        assert_eq!(width_json(0), r#"{"cols":0,"t":"width"}"#);
     }
 
     /// The saving, stated as a behaviour: a surface that has been told does not
@@ -841,7 +957,7 @@ mod tests {
             );
         }
         let wire = Wire {
-            host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            host: Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None })),
             running,
             last: String::new(),
             frame_file: PathBuf::new(),
@@ -869,7 +985,7 @@ mod tests {
 
         read_host(
             "{\"t\":\"live\",\"panes\":[],\"workspaces\":[]}\n".as_bytes(),
-            Arc::new(Mutex::new(Host { size: UNTOLD, focused: false })),
+            Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None })),
             Arc::clone(&running),
             tx,
         );
@@ -916,7 +1032,7 @@ mod tests {
 
     #[test]
     fn a_host_message_sets_the_size_the_next_frame_is_built_for() {
-        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let line = format!(
             "{{\"t\":\"host\",\"protocol\":{PROTOCOL},\"cols\":34,\"rows\":50,\"focused\":true}}\n"
@@ -944,7 +1060,7 @@ mod tests {
     /// somebody points at the sidebar and nothing happens.
     #[test]
     fn the_keyboard_arriving_and_leaving_the_sidebar_is_told_by_the_host() {
-        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
         let wire = || Wire {
             host: Arc::clone(&host),
             running: nothing_told(),
@@ -972,7 +1088,7 @@ mod tests {
     /// outside, as a click that did not register.
     #[test]
     fn a_host_that_only_says_the_size_does_not_move_the_keyboard() {
-        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
 
         read_host(
@@ -991,7 +1107,7 @@ mod tests {
 
     #[test]
     fn a_narrow_host_gets_a_clipped_frame_rather_than_a_layout_in_four_columns() {
-        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
 
         read_host(
@@ -1006,7 +1122,7 @@ mod tests {
 
     #[test]
     fn a_message_from_a_newer_host_is_ignored_rather_than_fatal() {
-        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
+        let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false, widest: None }));
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
 
         read_host(

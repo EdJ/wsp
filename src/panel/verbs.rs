@@ -23,6 +23,7 @@ use super::install::{list_panes, widest, PaneInfo};
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
 use super::rows::{hotkeys, Target, Ui};
+use super::run::Screen;
 use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -815,6 +816,38 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
     }
 }
 
+/// Ask the host for room, and remember what was asked for.
+///
+/// The whole of a panel changing its own size, and it is three lines because
+/// the host is the one deciding: this says what would be useful, the host gives
+/// what it has, and the next frame is built for whatever came back. Nothing
+/// here waits for an answer and nothing reads one — [`View::wide`] is derived
+/// from the width the frame is drawn at, so a panel that asked for a page and
+/// was given sixty columns draws sixty columns of sidebar and is correct.
+///
+/// `cols` of `None` gives the room back.
+///
+/// `false` is a host with no rect to negotiate — a tty panel, or a herdr from
+/// before this existed. The caller keeps whatever it did before; for `Z` that
+/// is [`open_full`], and the asking is what makes the tab a fallback rather
+/// than the design.
+///
+/// **This is the seam every later expansion goes through.** A task written up
+/// and a board are the same request with a different number and a different
+/// thing drawn in the room; neither is a new message, a new host, or a herdr
+/// release. If a second function ever appears beside this one, the wire has
+/// grown a verb and the argument above has been lost.
+///
+/// [`View::wide`]: super::keys::View::wide
+pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usize>) -> bool {
+    // Zero is how the wire spells giving it back; see herdr's `wsp_sidebar`.
+    if !screen.ask_width(cols.unwrap_or(0)) {
+        return false;
+    }
+    view.asked_width = cols;
+    true
+}
+
 /// The whole tree, in a tab of its own.
 ///
 /// The panel drawn at the width of the workspace rather than of a sidebar: the
@@ -832,13 +865,14 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 /// them read out of the same file, so pressing `Z` again from the sidebar goes
 /// to the one that is open rather than making another.
 ///
-/// **From a surface this is still a tab, and it is the one thing on this page
-/// that ought not to be.** `Z` from a sidebar should widen the sidebar: the
-/// whole tree in place, at the width the reader already has their eyes on.
-/// That takes a message this side does not have — the host owns the rect, and
-/// today the wire runs one way for anything but frames — so `Z` opens the tab
-/// it has always opened rather than becoming a key that does nothing. When the
-/// host can be asked, this is where the asking goes.
+/// **From a surface this is the fallback, and it stays one.** A host that owns
+/// the rect can now be asked for it — see [`expand`] — and `Z` in a sidebar
+/// widens the sidebar rather than opening anything. What is here is what
+/// happens when there is nobody to ask: a tty panel, which is its pane's size,
+/// and a herdr too old to have said it takes widths. Both still open the tree,
+/// which is what makes the wsp half of this shippable against a herdr that has
+/// not been rebuilt — and there is no version of the sidebar's `Z` where the
+/// key does nothing.
 pub(super) fn open_full(self_ws: Option<&str>) -> String {
     let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
     let ws = ws.as_str();
@@ -1203,6 +1237,12 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::Refetch
         }
         Key::Char('q') | Key::Esc if view.showing.is_some() => Effect::CloseView,
+        // A sidebar widened in place is the next thing in front of you, and
+        // giving the room back is the same effect that took it — see
+        // [`expand`]. Above the tab below for the same reason the tab is above
+        // the refusal: these keys close the nearest thing, and the room a panel
+        // is borrowing is nearer than the process it is running in.
+        Key::Char('q') | Key::Esc if view.asked_width.is_some() => Effect::Full,
         // …and in the tab `Z` opened, the panel itself is what is in front of
         // you, so the same keys close that. It is not installed furniture —
         // nothing is lost by quitting it and `Z` opens it again — and a
@@ -1389,9 +1429,11 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             say(ui, if view.focus { "titles in full" } else { "titles as they fit" });
             Effect::None
         }
-        // The whole tree, in a tab. From the tab itself the same key is the way
-        // out — one key for one idea, and a fullscreen that opens with `Z` and
-        // closes with something else is a fullscreen you leave open.
+        // The whole tree. In a sidebar it is the sidebar that widens and the
+        // same key that gives the room back; where there is nobody to ask for
+        // room it is a tab, and from inside that tab the same key is the way
+        // out. One key for one idea in all three, because a fullscreen that
+        // opens with `Z` and closes with something else is one you leave open.
         Key::Char('Z') if view.full => Effect::Quit,
         Key::Char('Z') => Effect::Full,
         // Nothing else changes while it is up: the tree keeps the cursor, and
@@ -1859,6 +1901,36 @@ mod tests {
 
     fn pane(id: &str, label: &str) -> PaneInfo {
         PaneInfo { id: id.into(), label: label.into(), tab: "t1".into() }
+    }
+
+    /// A screen with nobody to ask: what a tty panel is, and what a herdr from
+    /// before widths existed looks like from in here.
+    struct Silent;
+
+    impl Screen for Silent {
+        fn size(&self) -> (usize, usize) {
+            (26, 40)
+        }
+
+        fn paint(&mut self, _lines: &[super::super::render::Line], w: usize, h: usize) -> (usize, usize) {
+            (w, h)
+        }
+    }
+
+    /// The fallback, stated where it can be broken. `Z` has to keep opening the
+    /// tree, and the *only* thing that decides which way is whether there was
+    /// anybody to ask — so a refusal must be reported as one and must leave
+    /// nothing behind. A remembered width against a host that never took it
+    /// would make the next `Z` a key that gives back room nobody ever gave.
+    #[test]
+    fn a_host_with_no_room_to_give_is_told_apart_from_one_that_gave_it() {
+        let mut view = View::default();
+
+        assert!(!expand(&mut Silent, &mut view, Some(96)));
+        assert_eq!(
+            view.asked_width, None,
+            "nothing was asked of anybody, so there is nothing to give back"
+        );
     }
 
     /// The panel's own column, which is what makes `↵` cheap: the detail

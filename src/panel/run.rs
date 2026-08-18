@@ -25,7 +25,9 @@ use super::keys::{apply_input, say, Effect, Input, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, Cursor, Snapshot, Target, Ui};
 use super::shared;
-use super::verbs::{close_view, inspect, open_board, open_full, pop_out, run_wsp, send_tell, Tell};
+use super::verbs::{
+    close_view, expand, inspect, open_board, open_full, pop_out, run_wsp, send_tell, Tell,
+};
 
 pub(super) enum Msg {
     Key(Key),
@@ -166,6 +168,33 @@ pub(super) trait Screen {
     /// the whole reason this trait exists.
     fn live(&self) -> live::Live {
         live::read()
+    }
+
+    /// Ask the host to draw this panel `cols` wide, and say whether there was
+    /// anybody to ask. `0` gives the room back.
+    ///
+    /// The one thing a panel can ask its host for, and deliberately the only
+    /// one. A panel has three reasons to want more room than a sidebar has —
+    /// the whole tree, a task written up, a board — and if each of them were a
+    /// verb on the wire, each would be a herdr release standing between wsp and
+    /// a change to its own surface. So the host is told a number of columns and
+    /// never what is going in them, and the next caller is one line here rather
+    /// than a message on both sides.
+    ///
+    /// **Nothing is promised.** The host owns the rect, gives what it has, and
+    /// reports what it gave as the size of the next frame — which it already
+    /// does on every resize, so there is no reply to wait for and no second
+    /// state to keep in step. A caller draws whatever it is given: the rows
+    /// already decide what they show from the width they are built at, which is
+    /// why asking is the whole of the change.
+    ///
+    /// `false` is a host that cannot be asked — a tty panel, which is its
+    /// pane's size and has nothing to negotiate with, and any host too old to
+    /// have said it takes widths. A caller that gets it falls back to whatever
+    /// it did before, which is what keeps this shippable against a herdr that
+    /// has not been rebuilt: see [`super::verbs::open_full`].
+    fn ask_width(&mut self, _cols: usize) -> bool {
+        false
     }
 }
 
@@ -786,9 +815,32 @@ pub(super) fn event_loop(
                 Effect::Board { argv, label } => {
                     say(&mut ui, open_board(&argv, &label, self_ws));
                 }
+                // `Z`, both ways. A host that owns the rect is asked for the
+                // room and asked to take it back again, which is one key and
+                // one field rather than a mode; a host that cannot be asked
+                // opens the tab it always opened. See [`expand`].
                 Effect::Full => {
-                    let m = open_full(self_ws);
-                    say(&mut ui, m);
+                    let want = view
+                        .asked_width
+                        .is_none()
+                        .then_some(super::render::PAGE_MIN);
+                    if expand(screen, &mut view, want) {
+                        // Nothing is refetched and nothing is redrawn here. The
+                        // host answers by resizing us, the tick notices the new
+                        // shape, and the rows are rebuilt then — see
+                        // [`View::fit_to_pane`]. Doing it now would build them
+                        // for a width we have only asked for.
+                        say(
+                            &mut ui,
+                            match want {
+                                Some(_) => "the whole tree",
+                                None => "the sidebar",
+                            },
+                        );
+                    } else {
+                        let m = open_full(self_ws);
+                        say(&mut ui, m);
+                    }
                 }
                 // Off the loop, deliberately. `wsp spawn --agent` creates a
                 // workspace, claims into it, waits for an agent to boot and

@@ -184,6 +184,18 @@ pub(crate) struct View {
     /// pane and takes the cursor out of the tree. This reads it where you are
     /// and follows the cursor, so it is scrolling rather than looking things up.
     pub(super) focus: bool,
+    /// The width this panel has asked its host for, if it is asking.
+    ///
+    /// Not the width it *has* — that is [`super::run::Screen::size`], and the
+    /// host may have given less. This is only the memory of having asked, and
+    /// the one thing it decides is what the same key does next: `Z` widens the
+    /// sidebar and `Z` gives the room back, which is one field rather than a
+    /// mode. See [`super::run::Screen::ask_width`].
+    ///
+    /// A fact about this pane and not about the work, so it is not carried
+    /// between panels — the same reason [`View::wide`] is not. A second panel
+    /// on the same tree has its own rect and its own host.
+    pub(super) asked_width: Option<usize>,
     /// The ask this panel last put up, so it puts it up once.
     ///
     /// Without it a card that was dismissed would come straight back: the flag
@@ -609,7 +621,7 @@ pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(
                 ("↵ esc", "open it, close it", Scope::Always),
                 ("/", "find: any word, anywhere", Scope::Always),
                 ("F", "the title in full, docked", Scope::Always),
-                ("Z", "the whole tree, in a tab", Scope::Always),
+                ("Z", "the whole tree, and back", Scope::Always),
                 ("E", "edit in a tab", Scope::TaskOrProject),
                 ("K", "the board, in a tab", Scope::Board),
                 ("A i r", "show done, ids, sync", Scope::Always),
