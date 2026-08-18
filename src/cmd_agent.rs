@@ -3228,10 +3228,16 @@ fn store_uncommitted(root: &std::path::Path) -> Vec<String> {
 /// with nothing is a herdr running with no agents in it — which reads exactly
 /// like the second one if you only look at the length of the list, and is the
 /// confusion the reap guard exists to survive.
+///
+/// `Up` carries both listings, because neither alone can tell a pane that is
+/// gone from a pane whose agent is. `agent.list` drops a pane the moment the
+/// process inside it exits; `pane.list` keeps it, because the pane is still
+/// there holding the shell the agent was started from. Asking only the first
+/// is what made `doctor` call an emptied pane a dead one — see [`Bound`].
 pub(crate) enum Probe {
     Down,
     Unreachable(String),
-    Up(Vec<herdr::Pane>),
+    Up { agents: Vec<herdr::Pane>, panes: Vec<herdr::Pane> },
 }
 
 impl Probe {
@@ -3240,9 +3246,68 @@ impl Probe {
             return Probe::Down;
         }
         match herdr::agents() {
-            Ok(agents) => Probe::Up(agents),
+            // A pane listing that fails leaves `panes` empty, which reads below
+            // as "no machine answered" and says nothing about any binding.
+            // Silence is not evidence, and this is the judgement `sync` already
+            // makes before it reaps — the two have to agree, or `doctor` is back
+            // to advising a sweep that will not happen.
+            Ok(agents) => Probe::Up { agents, panes: herdr::panes().unwrap_or_default() },
             Err(e) => Probe::Unreachable(e.to_string()),
         }
+    }
+}
+
+/// Which of four states a bound pane is in, and the middle one is the point.
+///
+/// `doctor` used to ask a single question — "is this pane in `agent.list`" —
+/// and report every `No` as a dead pane needing `wsp sync`. `sync` reaps
+/// against `pane.list`, so for the commoner `No` of the two it correctly reapt
+/// nothing, and `doctor` printed the same line on the next run, and the run
+/// after that, indefinitely. The fault was the diagnosis rather than the sweep.
+///
+/// So the fix is a name for the state that had none: the pane is alive and the
+/// agent inside it exited. That is not an absent pane, it is an *emptied* one,
+/// and it is worth showing rather than reaping — it means an agent stopped
+/// mid-task with its claim still held and its worktree still on disk.
+enum Bound {
+    /// An agent is running in the pane. Nothing to say.
+    Working,
+    /// The pane is listed and no agent is in it. `despawn`, then decide.
+    Emptied,
+    /// The pane is not listed, and its machine did answer. `sync` reaps it.
+    Gone,
+    /// The machine this pane is on said nothing, so nothing is known.
+    Unheard,
+}
+
+fn bound_state(
+    pane: &str,
+    agents: &[herdr::Pane],
+    panes: &[herdr::Pane],
+    answered: &std::collections::BTreeMap<&str, usize>,
+) -> Bound {
+    if agents.iter().any(|a| a.pane_id == pane) {
+        return Bound::Working;
+    }
+    if panes.iter().any(|p| p.pane_id == pane) {
+        return Bound::Emptied;
+    }
+    match may_reap(answered, pane) {
+        true => Bound::Gone,
+        false => Bound::Unheard,
+    }
+}
+
+/// A few of the names in a line, with the rest counted.
+///
+/// A machine that lost eight agents at once is exactly when this line matters,
+/// and exactly when naming all eight would bury the sentence after it.
+fn few(named: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let head = named.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    match named.len() > SHOWN {
+        true => format!("{head} and {} more", named.len() - SHOWN),
+        false => head,
     }
 }
 
@@ -3254,11 +3319,38 @@ fn herdr_health(
     notes: &mut Vec<String>,
 ) {
     match probe {
-        Probe::Up(agents) => {
-            let live: Vec<&String> = agents.iter().map(|a| &a.pane_id).collect();
-            let stale = bindings.keys().filter(|p| !live.contains(p)).count();
-            if stale > 0 {
-                notes.push(format!("{stale} binding(s) on dead panes — `wsp sync` reaps them"));
+        Probe::Up { agents, panes } => {
+            let answered = answered_by_machine(panes.iter().map(|p| p.pane_id.as_str()));
+            let (mut emptied, mut gone) = (Vec::new(), Vec::new());
+            for (pane, b) in bindings {
+                // Named by the work rather than by the pane, because the work
+                // is what the reader has to decide about and what the verb
+                // underneath takes.
+                let task = b.get("task_id").and_then(|x| x.as_str()).unwrap_or("");
+                let named = match task.is_empty() {
+                    true => pane.clone(),
+                    false => format!("{task} ({pane})"),
+                };
+                match bound_state(pane, agents, panes, &answered) {
+                    Bound::Emptied => emptied.push(named),
+                    Bound::Gone => gone.push(named),
+                    Bound::Working | Bound::Unheard => {}
+                }
+            }
+            if !emptied.is_empty() {
+                notes.push(format!(
+                    "{} pane(s) alive with the agent gone — {} — claim and worktree \
+                     still held, and `wsp sync` will not touch these. `wsp despawn <id>` \
+                     gives one up; `wsp spawn <id>` puts a fresh agent on it",
+                    emptied.len(),
+                    few(&emptied)
+                ));
+            }
+            if !gone.is_empty() {
+                notes.push(format!(
+                    "{} binding(s) on panes herdr no longer lists — `wsp sync` reaps them",
+                    gone.len()
+                ));
             }
             notes.push(format!("herdr up, {} agents", agents.len()));
         }
@@ -3527,7 +3619,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     crate::daemon::health(
         store.daemon_holder().map(|(pid, _)| pid),
         crate::daemon::running(&store.state).as_deref(),
-        matches!(probe, Probe::Up(_)),
+        matches!(probe, Probe::Up { .. }),
         &mut problems,
         &mut notes,
     );
@@ -4547,16 +4639,131 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("connection refused")), "{problems:?}");
         assert!(notes.is_empty(), "{notes:?}");
 
-        // Answering with nothing. Not a problem either — but the binding it
-        // does not account for is now stale, and saying so is the point.
-        let (problems, notes) = say(Probe::Up(Vec::new()));
+        // Answering with nothing. Not a problem either — a herdr with no panes
+        // in it is a herdr. And it says nothing about the binding, because a
+        // machine that listed no panes is a machine that has not been heard
+        // from: that is the judgement `sync` makes before it reaps, and the two
+        // have to agree or `doctor` advises a sweep that will not happen.
+        let (problems, notes) = say(Probe::Up { agents: Vec::new(), panes: Vec::new() });
         assert!(problems.is_empty(), "an empty herdr is a running herdr: {problems:?}");
-        assert!(notes.iter().any(|n| n.contains("1 binding(s) on dead panes")), "{notes:?}");
+        assert!(!notes.iter().any(|n| n.contains("binding")), "silence is not evidence: {notes:?}");
         assert!(notes.iter().any(|n| n == "herdr up, 0 agents"), "{notes:?}");
 
         // And answering with the pane the binding names: nothing stale.
-        let (_, notes) = say(Probe::Up(vec![wip_agent("w1:p1", "w1", "working", "")]));
-        assert!(!notes.iter().any(|n| n.contains("dead panes")), "{notes:?}");
+        let busy = wip_agent("w1:p1", "w1", "working", "");
+        let (_, notes) = say(Probe::Up { agents: vec![busy.clone()], panes: vec![busy] });
+        assert!(!notes.iter().any(|n| n.contains("binding")), "{notes:?}");
+        assert!(!notes.iter().any(|n| n.contains("agent gone")), "{notes:?}");
+    }
+
+    /// The one note that mentions a thing, or the whole list to read when there
+    /// is none — the useful half of a failure here is what `doctor` said instead.
+    fn note_about<'a>(notes: &'a [String], word: &str) -> &'a str {
+        match notes.iter().find(|n| n.contains(word)) {
+            Some(n) => n,
+            None => panic!("nothing about `{word}` in {notes:?}"),
+        }
+    }
+
+    /// The bug the whole distinction exists for. `doctor` asked `agent.list`
+    /// alone and called every miss a dead pane needing `wsp sync`; `sync` reaps
+    /// against `pane.list`, found the pane alive, and reapt nothing — so the
+    /// line printed again on every run, indefinitely.
+    ///
+    /// Asserted as three states rather than as "not the old wording", because
+    /// what went wrong was the diagnosis: a pane that is gone and a pane whose
+    /// agent is gone need different sentences and different verbs, and the
+    /// emptied one must not be sent to the sweep that ignores it.
+    #[test]
+    fn a_pane_whose_agent_exited_is_not_reported_as_a_dead_pane() {
+        let mut bindings = std::collections::BTreeMap::new();
+        for (pane, task) in [("w1:p1", "t-001"), ("w2:p1", "t-002"), ("w3:p1", "t-003")] {
+            bindings.insert(pane.to_string(), json!({ "task_id": task }));
+        }
+
+        // w1:p1 has an agent in it. w2:p1 is the emptied one — herdr still
+        // lists the pane, holding the shell the agent was started from, and
+        // `agent.list` has dropped it. w3:p1 herdr does not list at all.
+        let busy = wip_agent("w1:p1", "w1", "working", "");
+        let emptied = labelled("w2:p1", "w2", "");
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        let probe = Probe::Up { agents: vec![busy.clone()], panes: vec![busy, emptied] };
+        herdr_health(&probe, &bindings, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let gone = note_about(&notes, "no longer lists");
+        assert!(gone.starts_with("1 binding(s)"), "{gone}");
+        assert!(gone.contains("wsp sync"), "the sweep is right for a pane that is gone: {gone}");
+
+        let empty = note_about(&notes, "agent gone");
+        assert!(empty.starts_with("1 pane(s)"), "{empty}");
+        assert!(empty.contains("t-002 (w2:p1)"), "named by the work to decide about: {empty}");
+        assert!(!empty.contains("t-001"), "an agent that is working is not emptied: {empty}");
+        assert!(!empty.contains("t-003"), "an absent pane is the other state: {empty}");
+        assert!(empty.contains("wsp despawn"), "the instruction has to be one that works: {empty}");
+        assert!(empty.contains("wsp spawn"), "and the decision after it is spawn, or not: {empty}");
+        assert!(empty.contains("claim"), "nothing here throws a claim away silently: {empty}");
+    }
+
+    /// The same states read off a socket rather than handed in, which is where
+    /// the fault actually was: a probe that asks herdr once could pass every
+    /// assertion above and still report an emptied pane as a dead one, because
+    /// nothing above makes the two listings come from the same server.
+    ///
+    /// The fake carries the asymmetry as a live herdr gave it on 2026-08-17 —
+    /// an agent that has gone leaves its pane in `pane.list`, holding the shell
+    /// it was started from, and drops out of `agent.list`.
+    #[test]
+    fn a_probe_over_the_socket_sees_the_pane_the_agent_listing_dropped() {
+        let env = util::isolated("doctor-emptied");
+        let stage = crate::fake::Stage::of(vec![
+            crate::fake::Spot::agent("w1:p1", "claude", "t-001", crate::place::State::Working),
+            crate::fake::Spot::agent("w2:p1", "claude", "t-002", crate::place::State::Gone),
+        ]);
+        let fake = crate::fake::Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let mut bindings = std::collections::BTreeMap::new();
+        for (pane, task) in [("w1:p1", "t-001"), ("w2:p1", "t-002"), ("w3:p1", "t-003")] {
+            bindings.insert(pane.to_string(), json!({ "task_id": task }));
+        }
+
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        herdr_health(&Probe::live(), &bindings, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(notes.iter().any(|n| n == "herdr up, 1 agents"), "{notes:?}");
+
+        let empty = note_about(&notes, "agent gone");
+        assert!(empty.contains("t-002 (w2:p1)"), "{empty}");
+        assert!(empty.contains("wsp despawn"), "{empty}");
+        // The line the bug printed forever, and the reason it never came true.
+        assert!(!empty.contains("wsp sync` reaps"), "{empty}");
+
+        let gone = note_about(&notes, "no longer lists");
+        assert!(gone.starts_with("1 binding(s)"), "only w3:p1 is actually gone: {gone}");
+    }
+
+    /// A machine that said nothing is not a machine whose agents stopped — the
+    /// reap guard, asked one layer up. `doctor` has to make the same call as
+    /// `sync` or it goes back to advising a sweep that correctly refuses.
+    #[test]
+    fn a_binding_on_a_machine_that_did_not_answer_is_not_reported_at_all() {
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert("w0:p1@mb2".to_string(), json!({ "task_id": "t-001" }));
+        bindings.insert("w9:p9".to_string(), json!({ "task_id": "t-002" }));
+
+        // Only this machine listed panes, so only this machine's bindings are
+        // examined — and `w9:p9` is not among the panes it listed.
+        let here = wip_agent("w1:p1", "w1", "working", "");
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        let probe = Probe::Up { agents: vec![here.clone()], panes: vec![here] };
+        herdr_health(&probe, &bindings, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let gone = note_about(&notes, "no longer lists");
+        assert!(gone.starts_with("1 binding(s)"), "mb2 was never heard from: {gone}");
+        assert!(!gone.contains("mb2"), "{gone}");
     }
 
     fn labelled(pane: &str, ws: &str, label: &str) -> herdr::Pane {
