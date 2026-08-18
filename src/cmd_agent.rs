@@ -1806,8 +1806,8 @@ fn release_here(store: &Store, args: &Args) -> i32 {
 fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
     if let Some(pane) = args.get("pane") {
         eprintln!("wsp: name a task or a pane, not both");
-        eprintln!("  wsp release {needle}          the claim on that task, wherever it is");
-        eprintln!("  wsp release --pane {pane}   whatever that pane is holding");
+        eprintln!("  wsp release {needle} — the claim on that task, wherever it is");
+        eprintln!("  wsp release --pane {pane} — whatever that pane is holding");
         return 2;
     }
     let t = match store.task_or_why(needle) {
@@ -1865,12 +1865,18 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
 }
 
 /// Where a claim says the work is, for one line of output.
+///
+/// The id rather than the label, which is the opposite of what a list wants.
+/// A workspace holding a task is *named after* it — `002 · the probe task
+/// claimed onto anot…` — so the label restates the id already in the sentence
+/// and arrives elided, with the ellipsis landing mid-clause. The id is the part
+/// the reader cannot reconstruct: it says which screen to go and look at.
 fn claim_where(claim: &serde_json::Value) -> String {
     let get = |k: &str| claim.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let (label, id) = (get("workspace_label"), get("workspace_id"));
-    match (label.is_empty(), id.is_empty()) {
-        (false, _) => label.to_string(),
-        (true, false) => id.to_string(),
+    match (id.is_empty(), label.is_empty()) {
+        (false, _) => id.to_string(),
+        (true, false) => label.to_string(),
         (true, true) => "somewhere it did not record".to_string(),
     }
 }
