@@ -210,6 +210,40 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
     }
 }
 
+/// Which tier the agent is to be started at, checked before anything is opened.
+///
+/// Asked and never inferred, like [`placement`] — and here that is a park
+/// rather than a principle: the decision of 2026-08-17 stood a routing
+/// heuristic down on the evidence of its own dry runs and left this flag as the
+/// whole mechanism, so whoever spawns states the tier when they already know it.
+/// [`agent_commands::Kind::tier`] holds why the words are checked at all, and
+/// [`agent_commands::EFFORTS`] why `--effort` is the one to reach for first.
+///
+/// What is decided *here* is only where and whether:
+///
+/// - **Before `place.open`.** A tier caught after the workspace exists has
+///   already cost a workspace, a claim and a worktree, and now needs a
+///   `wsp despawn` before it can be retyped. Nothing above this line has
+///   written anything down.
+/// - **Refused without `--agent`, not dropped.** `--model haiku` on a bare
+///   workspace is a sentence about an agent that is never started, and a flag
+///   that does nothing in silence is the failure the checking is for.
+///
+/// `--on <machine>` is orthogonal and stays that way: the flag states the tier,
+/// and that machine's `claude` has its own version and its own settings.
+fn tier(args: &Args, kind: &str, agent: bool) -> Result<(Option<String>, Option<String>), String> {
+    let model = args.get("model");
+    let effort = args.get("effort");
+    if model.is_none() && effort.is_none() {
+        return Ok((None, None));
+    }
+    if !agent {
+        return Err("--model and --effort say how to start an agent — add --agent".into());
+    }
+    agent_commands::of(kind).tier(model.as_deref(), effort.as_deref())?;
+    Ok((model, effort))
+}
+
 /// herdr's default when nobody says which agent. Every other kind it knows is
 /// spelt the way its own CLI spells it and passed straight through — an
 /// unknown one is refused by herdr with the whole catalogue in the message,
@@ -595,6 +629,17 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
     };
 
+    // Both read before anything is opened, so a mistyped alias costs a line of
+    // output instead of a workspace to tear down again.
+    let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
+    let (model, effort) = match tier(args, &kind, args.has("agent") || args.has("govern")) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+
     // A slot is on a project, so `--govern` on a task is a sentence with no
     // meaning rather than a near miss — and the near miss it would otherwise
     // become is the expensive one: an agent claimed onto a task and told it is
@@ -726,7 +771,6 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let mut told = false;
     let mut ordered = false;
     if args.has("agent") || governing.is_some() {
-        let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
         let name = work.task.clone().or_else(|| work.project.clone()).unwrap_or_default();
         let how = agent_commands::of(&kind);
         // The seat is passed in because the agent is named after it, and it can
@@ -734,7 +778,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // a seat from starting an agent in it, so wsp holds the seat before
         // there is anything sitting there to ask. That ordering is what makes
         // the handle knowable in advance rather than discovered afterwards.
-        let spawn = agent_commands::Spawn { full: args.has("full"), name: &name, seat: &seat, resume: None };
+        let spawn = agent_commands::Spawn {
+            full: args.has("full"),
+            name: &name,
+            seat: &seat,
+            model: model.as_deref(),
+            effort: effort.as_deref(),
+            resume: None,
+        };
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Whatever a backend
@@ -1050,6 +1101,67 @@ mod tests {
         store
     }
 
+    /// Every way the tier can be wrong, and the fact that none of them costs a
+    /// workspace.
+    ///
+    /// The three refusals are three different mistakes. A typo is the one the
+    /// flag exists to catch early, because the alternative is an agent that
+    /// starts, is refused its model by Claude Code in a pane nobody is watching
+    /// and is reported here as never having become ready. A tier without
+    /// `--agent` is a sentence about an agent that is never started, and
+    /// dropping it silently is exactly the failure mode of the `--effort`
+    /// warning this validation was written against. A tier on a kind wsp has no
+    /// vocabulary for would be passed on by nobody: `Plain::args` sends
+    /// nothing, so accepting it would be wsp saying it started `codex` on haiku
+    /// and starting it on whatever codex defaults to.
+    #[test]
+    fn a_mistyped_tier_is_refused_before_anything_is_opened() {
+        let none = |flags: &[(&str, &str)]| tier(&Args::synth("spawn", &["t-1"], flags), "claude", true);
+
+        assert_eq!(none(&[]).unwrap(), (None, None), "no flag must send no argument at all");
+        assert_eq!(
+            none(&[("model", "opus[1m]"), ("effort", "low")]).unwrap(),
+            (Some("opus[1m]".into()), Some("low".into())),
+            "what was typed is what is passed on"
+        );
+
+        let err = none(&[("model", "opsu")]).unwrap_err();
+        assert!(err.contains("opsu") && err.contains("sonnet"), "the typo and the list: {err}");
+        let err = none(&[("model", "claude-opus-5")]).unwrap_err();
+        assert!(err.contains("claude-opus-5"), "a full name is not an alias: {err}");
+        let err = none(&[("effort", "hi")]).unwrap_err();
+        assert!(err.contains("xhigh"), "an ignored effort is a session that lied: {err}");
+
+        let err = tier(&Args::synth("spawn", &["t-1"], &[("model", "opus")]), "claude", false).unwrap_err();
+        assert!(err.contains("--agent"), "a tier with nothing to start it: {err}");
+
+        let err = tier(&Args::synth("spawn", &["t-1"], &[("model", "opus")]), "codex", true).unwrap_err();
+        assert!(err.contains("claude"), "wsp does not know how codex spells a model: {err}");
+    }
+
+    /// And the refusal happens before `place.open`, which is the whole reason
+    /// it is read at the top of `place_work` rather than where the agent starts.
+    ///
+    /// A tier checked after the workspace exists has already cost a workspace, a
+    /// claim and a worktree, and the person now has to `wsp despawn` before they
+    /// can retype the word. `Opens` panics in `start`, so this also asserts
+    /// nothing tried to run an agent at a tier that was refused.
+    #[test]
+    fn a_refused_tier_leaves_no_workspace_behind() {
+        let _guard = no_backend();
+        let store = seat("tier");
+        store.save_project(&Project::new("robustness")).unwrap();
+
+        let place = Opens(std::cell::RefCell::new(Vec::new()));
+        let flags = [("project", "robustness"), ("agent", "true"), ("model", "opsu")];
+        let code = place_work(&place, &store, &Args::synth("spawn", &[], &flags));
+
+        assert_eq!(code, 2, "a mistyped tier is a usage error");
+        assert!(place.0.borrow().is_empty(), "a workspace was opened for a spawn that cannot start");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     /// Every way `--on` can be wrong, and the sentence each one earns.
     ///
     /// They are four different problems — a typo, a machine you retired, a
@@ -1339,6 +1451,9 @@ mod tests {
         fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
             Vec::new()
         }
+        fn tier(&self, _: Option<&str>, _: Option<&str>) -> std::result::Result<(), String> {
+            Ok(())
+        }
         fn address(
             &self,
             _: &dyn Place,
@@ -1368,7 +1483,8 @@ mod tests {
         seat: &Seat,
         clock: &util::Dial,
     ) -> Result<(), String> {
-        let spawn = agent_commands::Spawn { full: false, name: "t-260817-010", seat, resume: None };
+        let spawn =
+            agent_commands::Spawn { full: false, name: "t-260817-010", seat, model: None, effort: None, resume: None };
         let wait = Patience {
             ready: READY,
             taken: TAKEN,
@@ -1552,6 +1668,9 @@ mod tests {
         fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
             Vec::new()
         }
+        fn tier(&self, _: Option<&str>, _: Option<&str>) -> std::result::Result<(), String> {
+            Ok(())
+        }
         fn address(
             &self,
             _: &dyn Place,
@@ -1566,7 +1685,14 @@ mod tests {
 
     fn handing_over(place: &Composer, clock: &util::Dial) -> Result<(), String> {
         let seat = Seat::new("w3M:p1");
-        let spawn = agent_commands::Spawn { full: false, name: "robustness-035", seat: &seat, resume: None };
+        let spawn = agent_commands::Spawn {
+            full: false,
+            name: "robustness-035",
+            seat: &seat,
+            model: None,
+            effort: None,
+            resume: None,
+        };
         let wait = Patience {
             ready: READY,
             taken: TAKEN,

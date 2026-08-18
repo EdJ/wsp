@@ -479,7 +479,16 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
     let how = agent_commands::of(&kind);
     let name = t.what.clone();
     let spawn =
-        agent_commands::Spawn { full: false, name: &name, seat: &seat, resume: Some(&t.session) };
+        // No tier: a resumed session picks up the thread it was on, and the
+        // model it was started with is that session's, not this command's.
+        agent_commands::Spawn {
+            full: false,
+            name: &name,
+            seat: &seat,
+            model: None,
+            effort: None,
+            resume: Some(&t.session),
+        };
     let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
     place
         .start(&seat, &agent)

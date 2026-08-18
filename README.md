@@ -1500,6 +1500,41 @@ artefact is a spawn on this backlog rather than a hypothesis. The trim applies
 to `--kind claude` only; these are Claude Code's flag spellings and handing them
 to `codex` buys a workspace with a shell in it and no agent.
 
+### What tier it starts at
+
+```sh
+wsp spawn <id> --agent --effort low            # the cheaper knob, turned alone
+wsp spawn <id> --agent --model haiku           # the ladder
+wsp spawn <id> --agent --model opus[1m] --effort max
+```
+
+`--model` takes `fable`, `opus`, `sonnet` or `haiku`, any of them with `[1m]`
+for the 1M context window; `--effort` takes `low`, `medium`, `high`, `xhigh` or
+`max`. Aliases rather than full model names, because an alias names the latest
+model of its family and follows an upgrade, where `claude-opus-5` is a string
+that goes stale in a file nobody greps.
+
+**Neither flag has a default and absent sends no argument at all**, so a spawn
+that says nothing is byte-for-byte the spawn wsp did before these existed —
+whatever `~/.claude/settings.json` says, at whatever effort the model defaults
+to. That is the rule `--on` already keeps.
+
+Reach for `--effort` first: it is the same capability class for less spend and
+adds no new failure mode. The ladder underneath it is not linear — Haiku 4.5
+takes no effort parameter at all and caps at 200K against Opus 5's 1M.
+
+A word wsp does not know is refused before anything is opened. It has to be:
+Claude Code refuses an unknown model *in the pane*, which reaches wsp as "claude
+started but never became ready for input", and it does not refuse an unknown
+effort at all — it warns, ignores it and runs at the default, so `--effort max`
+with a typo in it is a session that ran cheap and said it ran expensive. The
+vocabulary is per kind, beside the flag spellings, in `agent_commands::Kind::tier`,
+which carries the measurements; `--kind codex` is refused a tier rather than
+handed one wsp cannot spell.
+
+`--on <machine>` is orthogonal. The flag states the tier; it does not guarantee
+the remote seat can honour it.
+
 ### Looking at a pane
 
 ```sh

@@ -138,9 +138,12 @@
 //!   changes when nothing is started.
 //! - **t-260816-068, `--resume`.** Recording a session id against a task so an
 //!   agent can be picked up again. The same field this file already reads.
-//! - **t-260816-088, `--model` and `--effort`.** More of [`Kind::args`], and the
-//!   reason that verb takes a description of the spawn rather than a bare flag
-//!   when it grows.
+//! - ~~**t-260816-088, `--model` and `--effort`.**~~ Landed as `wsp-059`, and it
+//!   arrived as predicted — more of [`Kind::args`], reading two more fields of
+//!   the [`Spawn`] that verb takes instead of a bare flag. What it added that
+//!   the prediction did not have is [`Kind::tier`]: a vocabulary is per-kind in
+//!   the same way a flag spelling is, so the *check* belongs beside the
+//!   spelling and not in `cmd_spawn`.
 //!
 //! # Minting, which is what the lookup turned out to be a fallback for
 //!
@@ -222,6 +225,36 @@ pub trait Kind {
     /// it is a function of the task and the seat.
     fn args(&self, spawn: &Spawn) -> Vec<String>;
 
+    /// Whether this kind will accept the tier it has been asked for, and why
+    /// not if it will not.
+    ///
+    /// The gate in front of [`Spawn::model`] and [`Spawn::effort`], and it is
+    /// here for two reasons that pull the same way.
+    ///
+    /// **An unknown tier fails late and in the wrong place.** herdr starts the
+    /// process happily whatever is on its command line; what refuses is the
+    /// agent, in a pane nobody is looking at, and `cmd_spawn` reports that as
+    /// "claude started but never became ready for input" — a sentence about
+    /// readiness for what is a typo. Worse, measured 2026-08-18 against Claude
+    /// Code 2.1.234: an unknown `--model` at least refuses, but an unknown
+    /// `--effort` prints *"Warning: Unknown --effort value 'bogus' — ignoring
+    /// it and using the default effort"* and carries on. So `--effort max` with
+    /// a typo in it is a session that ran at default effort and said it ran at
+    /// max, which no failure path anywhere would ever have caught. Checking at
+    /// this end is what puts the typo in the sentence.
+    ///
+    /// **And these are the arguments an agent could compose.** `wsp spawn` is a
+    /// verb agents drive, so a value that reached the command line unexamined
+    /// would be an injection surface with wsp's own hands on it. A fixed
+    /// vocabulary per kind, not a passthrough: that is the decision the spawn
+    /// strategy already recorded about command templates, applied to the first
+    /// flags to test it.
+    ///
+    /// Both are per-kind facts, which is why this is a trait method and not a
+    /// check in `cmd_spawn`: `claude` spells its tiers one way, and the
+    /// catalogue of any other kind belongs to that kind.
+    fn tier(&self, model: Option<&str>, effort: Option<&str>) -> std::result::Result<(), String>;
+
     /// What this agent's own runtime calls the agent in this seat, if it can be
     /// found out.
     ///
@@ -273,9 +306,11 @@ pub trait Kind {
 
 /// What is about to be started, as much of it as a kind is allowed to know.
 ///
-/// Three fields and no store, no `Args`, no task: a kind decides flags, and a
-/// kind that could read the task would start deciding other things. `full` was
-/// the whole of this parameter before minting needed the other two.
+/// No store, no `Args`, no task: a kind decides flags, and a kind that could
+/// read the task would start deciding other things. `full` was the whole of
+/// this parameter before minting needed the seat and the name, and `model` and
+/// `effort` are the third thing to arrive that way — every one of them a fact
+/// about *this* spawn that only the kind knows how to spell.
 ///
 /// `name` is the task or project id — the same string [`crate::place::Agent`]
 /// carries for the backend's own naming — and `seat` is where it is about to be
@@ -286,6 +321,21 @@ pub struct Spawn<'a> {
     pub full: bool,
     pub name: &'a str,
     pub seat: &'a Seat,
+    /// The tier this spawn was asked for: which model, and how hard it thinks.
+    ///
+    /// Two `Option`s rather than one enum with a default, because **absent must
+    /// send no argument at all**. A spawn that names neither is byte-for-byte
+    /// the spawn wsp did before this existed — whatever `~/.claude/settings.json`
+    /// says, at whatever effort the model defaults to — and that is the same
+    /// compatibility rule `--on` keeps. A default spelled here would be wsp
+    /// quietly overriding a person's settings file the first time they upgraded.
+    ///
+    /// Validated before they arrive: see [`Kind::tier`]. Nothing between there
+    /// and the agent's command line inspects them again.
+    pub model: Option<&'a str>,
+    /// How hard, of [`EFFORTS`] — the cheaper knob and the one to reach for
+    /// first, being the same capability class for less spend.
+    pub effort: Option<&'a str>,
     /// A session to pick up where it left off, rather than a new one.
     ///
     /// t-260816-068 above, arriving as `render-061`: the id is wsp's — read off
@@ -346,6 +396,21 @@ pub struct Plain;
 impl Kind for Plain {
     fn args(&self, _spawn: &Spawn) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Refused rather than dropped.
+    ///
+    /// `codex` and `gemini` both have models; wsp does not know how either
+    /// spells one, and [`Plain::args`] passes nothing on. Accepting the flag
+    /// and starting the agent anyway would be a spawn that says it is running
+    /// haiku and is not — the same invisible failure the effort warning is,
+    /// with wsp doing it on purpose. So say so, and the day somebody measures a
+    /// kind's spelling it stops being true.
+    fn tier(&self, model: Option<&str>, effort: Option<&str>) -> std::result::Result<(), String> {
+        match model.is_some() || effort.is_some() {
+            true => Err("wsp knows no tier vocabulary for this kind — only `--kind claude`".into()),
+            false => Ok(()),
+        }
     }
 
     fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<Address> {
@@ -438,8 +503,37 @@ pub struct Claude;
 /// improvise around an absence it cannot see.
 const TRIM: &[&str] = &["--strict-mcp-config", "--disallowedTools", "Agent", "Workflow"];
 
+/// The model aliases `wsp spawn --model` takes, and the whole of the list.
+///
+/// Aliases and not full names, on purpose. `claude --help` says an alias names
+/// *the latest* model of that family — so `opus` follows the upgrade and
+/// `claude-opus-5` pins wsp to a string that goes stale the week after it is
+/// written, in a file nobody would think to grep. What a person means when they
+/// type `--model haiku` is the tier, and the tier is what an alias says.
+///
+/// `[1m]` may be appended to any of them, which is Claude Code's own spelling
+/// for the 1M context window (`~/.claude/settings.json` here says `opus[1m]`);
+/// it is a property of the session, not a fifth model, so it is a suffix here
+/// too rather than four more entries.
+///
+/// Measured 2026-08-18 against Claude Code 2.1.234: all four, and all four with
+/// `[1m]`, are recognised — an unrecognised name prints *"is not a model this
+/// version of Claude Code recognizes"* and the session then fails to start, so
+/// the list is exactly what does not do that.
+const MODELS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
+
+/// The effort levels, straight off `claude --help`.
+///
+/// The cheaper of the two knobs and the one to reach for first: the same
+/// capability class for less spend, with no new failure mode. Not every model
+/// has one — Haiku 4.5 takes no effort parameter at all — but the pair is not
+/// refused here, because Claude Code 2.1.234 accepts `--model haiku --effort
+/// high` without complaint and it is not wsp's business to be stricter than the
+/// runtime about a combination that costs nothing.
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 impl Kind for Claude {
-    /// The trim, and the name.
+    /// The trim, the name, and the tier.
     ///
     /// `-n` is outside the `full` arm on purpose. [`TRIM`] is a capability
     /// change and `--full` is the way back from it; a handle is not a
@@ -466,6 +560,17 @@ impl Kind for Claude {
             argv.push("-n".into());
             argv.push(handle);
         }
+        // The tier, if one was asked for, and nothing at all if not — which is
+        // what keeps an unflagged spawn identical to the spawn wsp did before
+        // these existed. Both were validated by `tier` before this was reached.
+        if let Some(model) = spawn.model {
+            argv.push("--model".into());
+            argv.push(model.to_string());
+        }
+        if let Some(effort) = spawn.effort {
+            argv.push("--effort".into());
+            argv.push(effort.to_string());
+        }
         // Last, after the name, for the reason the name is last: `--resume`
         // takes a value, so nothing may follow it that could be eaten as one.
         // It is not conditional on `full` — a resumed session is a *thread*
@@ -476,6 +581,33 @@ impl Kind for Claude {
             argv.push(session.to_string());
         }
         argv
+    }
+
+    /// [`MODELS`], with an optional `[1m]`, and [`EFFORTS`].
+    ///
+    /// The refusal carries the whole list, because the person reading it has
+    /// just mistyped one of four words and the cost of printing them is nothing
+    /// against another round trip. A full model name — `claude-opus-5` — is
+    /// refused by the same line and learns the same way; see [`MODELS`] for why
+    /// the list is aliases.
+    fn tier(&self, model: Option<&str>, effort: Option<&str>) -> std::result::Result<(), String> {
+        if let Some(m) = model {
+            // The suffix is stripped before the lookup rather than being four
+            // more entries: `opus[1m]` is opus, asked for with a bigger window.
+            let alias = m.strip_suffix("[1m]").unwrap_or(m);
+            if !MODELS.contains(&alias) {
+                return Err(format!(
+                    "no model `{m}` — claude takes {}, any of them with [1m] for the 1M window",
+                    MODELS.join(", ")
+                ));
+            }
+        }
+        if let Some(e) = effort {
+            if !EFFORTS.contains(&e) {
+                return Err(format!("no effort `{e}` — claude takes {}", EFFORTS.join(", ")));
+            }
+        }
+        Ok(())
     }
 
     /// What wsp called it, confirmed alive if the runtime will confirm it — or,
@@ -1115,7 +1247,12 @@ mod tests {
     /// ~28K, and a trim that pushes work into Bash costs more than it saves.
     /// A spawn description, so the tests below argue about one thing each.
     fn spawn<'a>(full: bool, name: &'a str, seat: &'a Seat) -> Spawn<'a> {
-        Spawn { full, name, seat, resume: None }
+        Spawn { full, name, seat, model: None, effort: None, resume: None }
+    }
+
+    /// The same, at a stated tier.
+    fn at<'a>(name: &'a str, seat: &'a Seat, model: Option<&'a str>, effort: Option<&'a str>) -> Spawn<'a> {
+        Spawn { model, effort, ..spawn(false, name, seat) }
     }
 
     #[test]
@@ -1129,6 +1266,69 @@ mod tests {
         for kept in ["Bash", "Read", "Edit", "Write"] {
             assert!(!trim.contains(&kept.to_string()), "{kept} is how the work gets done: {trim:?}");
         }
+    }
+
+    /// A spawn that names no tier is the spawn wsp did before tiers existed.
+    ///
+    /// The compatibility rule, asserted rather than trusted: absent flags send
+    /// no argument at all, so the model is still whatever
+    /// `~/.claude/settings.json` says and the effort is still the default. A
+    /// tier spelled here as a default would be wsp overriding a person's
+    /// settings file, silently, on the day they upgraded the binary.
+    #[test]
+    fn a_spawn_that_states_no_tier_states_nothing() {
+        let seat = Seat::new("w2J:p1");
+        let argv = of("claude").args(&spawn(false, "t-1", &seat));
+        assert!(!argv.contains(&"--model".to_string()), "{argv:?}");
+        assert!(!argv.contains(&"--effort".to_string()), "{argv:?}");
+    }
+
+    /// And a spawn that names one puts it on the command line, as a pair.
+    ///
+    /// The value follows its own flag and neither knob implies the other:
+    /// `--effort` alone is the common case, being the same capability class for
+    /// less spend. Position matters only in that nothing may follow `--resume`,
+    /// which is why both sit above it.
+    #[test]
+    fn the_tier_asked_for_reaches_the_agents_command_line() {
+        let seat = Seat::new("w2J:p1");
+
+        let argv = of("claude").args(&at("t-1", &seat, Some("haiku"), Some("low")));
+        let pair = |flag: &str, value: &str| {
+            let i = argv.iter().position(|a| a == flag).unwrap_or_else(|| panic!("no {flag}: {argv:?}"));
+            assert_eq!(argv.get(i + 1).map(String::as_str), Some(value), "{argv:?}");
+        };
+        pair("--model", "haiku");
+        pair("--effort", "low");
+
+        let effort_only = of("claude").args(&at("t-1", &seat, None, Some("max")));
+        assert!(effort_only.contains(&"--effort".to_string()), "{effort_only:?}");
+        assert!(!effort_only.contains(&"--model".to_string()), "the cheaper knob turns alone: {effort_only:?}");
+    }
+
+    /// The vocabulary, and the two shapes that are not in it.
+    ///
+    /// `[1m]` is a suffix on any alias rather than a fifth model, because it is
+    /// a property of the session's context window and not of the model; a full
+    /// name is refused so that the list stays aliases, which is what follows an
+    /// upgrade. Measured against Claude Code 2.1.234 on 2026-08-18 — every name
+    /// this accepts is one that build recognises.
+    #[test]
+    fn the_tier_vocabulary_is_four_aliases_and_five_levels() {
+        let ok = |m: Option<&str>, e: Option<&str>| of("claude").tier(m, e);
+        for alias in MODELS {
+            assert!(ok(Some(alias), None).is_ok(), "{alias}");
+            assert!(ok(Some(&format!("{alias}[1m]")), None).is_ok(), "{alias}[1m]");
+        }
+        for level in EFFORTS {
+            assert!(ok(None, Some(level)).is_ok(), "{level}");
+        }
+        assert!(ok(Some("claude-opus-5"), None).is_err(), "an alias follows the upgrade, a full name does not");
+        assert!(ok(Some("opus[2m]"), None).is_err(), "only the window Claude Code spells");
+        assert!(ok(None, Some("higher")).is_err(), "an unknown effort is warned about and ignored");
+
+        assert!(of("codex").tier(Some("opus"), None).is_err(), "Plain::args would send nothing on");
+        assert!(of("codex").tier(None, None).is_ok(), "and an unflagged spawn on any kind is untouched");
     }
 
     /// Two ways back to the whole preamble, and both are needed.

@@ -609,11 +609,16 @@ fn help() {
   wsp sandbox ls|rm [<name>] [--all]  what is up, and how to drop it
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
+                 [--model <m>] [--effort <e>]
                                     open a workspace on it, claim it there, and
                                     start an agent in it; --focus to go there,
                                     --on to run it on another machine, --full to
                                     start it with sub-agents, workflows and the
-                                    MCP servers it is otherwise spawned without
+                                    MCP servers it is otherwise spawned without.
+                                    --model fable|opus|sonnet|haiku, any with
+                                    [1m], and --effort low|medium|high|xhigh|max
+                                    say what tier to start it at; say neither and
+                                    it starts on your settings file, as before
   wsp despawn <id> | --pane <seat>  the other end of it: end the agent working
                                     that task, then release the claim — a seat
                                     that will not close keeps its claim
