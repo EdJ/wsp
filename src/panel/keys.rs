@@ -181,6 +181,14 @@ pub(crate) enum Mode {
     Prompt {
         verb: Ask,
         buffer: String,
+        /// One `esc` has been pressed on a line with something on it, and the
+        /// next one throws the line away.
+        ///
+        /// It rides on the mode rather than on [`View`] so that it cannot
+        /// outlive the prompt it belongs to: a prompt that closes takes the
+        /// half-pressed cancel with it, and there is no flag left set for the
+        /// *next* prompt's first `esc` to fire.
+        armed: bool,
     },
     /// Navigation still moves the cursor; `↵` takes whatever it lands on.
     Pick {
@@ -601,24 +609,57 @@ pub(super) fn say(ui: &mut Ui, m: impl Into<String>) {
 
 /// Typing a value. Every printable key is text here — including `q`, which is
 /// why the input layer stopped deciding what keys mean.
-pub(super) fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut buffer: String) -> Effect {
+///
+/// `esc` on a line with something typed on it does not cancel: it arms, the
+/// line says `esc again`, and the second press throws the typing away. The
+/// hands that reach this prompt come from vim, where `esc` is how you *stop*
+/// typing — so it arrives here as a reflex, aimed at a mode this panel does
+/// not have, and it was costing whole titles and notes that had to be typed
+/// again from memory. A press that undoes a reflex has to be a press you meant.
+///
+/// Two things keep the cost of that at nothing. An empty line cancels on the
+/// first press, because there is nothing to lose and "I opened this by
+/// mistake" is the other common reason to hit `esc` here. And `ctrl-c` always
+/// cancels outright: nobody types it by reflex, so it stays the one-key way
+/// out for anyone who wants one.
+pub(super) fn prompt_key(
+    k: Key,
+    ui: &mut Ui,
+    view: &mut View,
+    verb: Ask,
+    mut buffer: String,
+    armed: bool,
+) -> Effect {
     match k {
         Key::Char(c) => {
             buffer.push(c);
-            view.mode = Mode::Prompt { verb, buffer };
+            view.mode = Mode::Prompt { verb, buffer, armed: false };
             Effect::None
         }
         Key::Backspace => {
             buffer.pop();
-            view.mode = Mode::Prompt { verb, buffer };
+            view.mode = Mode::Prompt { verb, buffer, armed: false };
             Effect::None
         }
         Key::KillLine => {
             buffer.clear();
-            view.mode = Mode::Prompt { verb, buffer };
+            view.mode = Mode::Prompt { verb, buffer, armed: false };
             Effect::None
         }
-        Key::Esc | Key::Interrupt => {
+        // Armed by the press before this one, so this is the second `esc` and
+        // it means it. Anything else in between disarms — see the arms above
+        // and the fall-through below — which makes the rule one sentence: the
+        // two presses have to be next to each other.
+        Key::Esc if armed || buffer.is_empty() => {
+            view.mode = Mode::Browse;
+            say(ui, "cancelled");
+            Effect::None
+        }
+        Key::Esc => {
+            view.mode = Mode::Prompt { verb, buffer, armed: true };
+            Effect::None
+        }
+        Key::Interrupt => {
             view.mode = Mode::Browse;
             say(ui, "cancelled");
             Effect::None
@@ -649,7 +690,14 @@ pub(super) fn prompt_key(k: Key, ui: &mut Ui, view: &mut View, verb: Ask, mut bu
             view.mode = Mode::Browse;
             Effect::Run { argv, escalate: None, then: None }
         }
-        _ => Effect::None,
+        // A key the prompt has no use for still disarms. It does nothing to the
+        // line, but it is a press between the two `esc`s, and a rule with an
+        // exception in it — "the next key, unless it was one I ignored" — is a
+        // rule nobody can hold while typing.
+        _ => {
+            view.mode = Mode::Prompt { verb, buffer, armed: false };
+            Effect::None
+        }
     }
 }
 
@@ -1329,9 +1377,9 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // Taken rather than borrowed: every branch may replace it.
         match std::mem::take(&mut view.mode) {
             Mode::Browse => browse_key(k, ui, view),
-            Mode::Prompt { verb, buffer } => {
-                view.mode = Mode::Prompt { verb: verb.clone(), buffer: buffer.clone() };
-                prompt_key(k, ui, view, verb, buffer)
+            Mode::Prompt { verb, buffer, armed } => {
+                view.mode = Mode::Prompt { verb: verb.clone(), buffer: buffer.clone(), armed };
+                prompt_key(k, ui, view, verb, buffer, armed)
             }
             Mode::Pick { verb } => {
                 view.mode = Mode::Pick { verb: verb.clone() };

@@ -894,6 +894,15 @@ fn scenes() -> Vec<Scene> {
 
     out.push(
         Driver::new(&w)
+            .down_to(panel::RowKind::Project)
+            .key(Key::Char('a'))
+            .type_in("Retune the plate decay")
+            .key(Key::Esc)
+            .scene("Half a cancel", "`esc` on a line with something typed on it arms rather than cancelling, and the second press throws the typing away. The hands that reach this field come from vim, where `esc` is how you stop typing — so it lands here as a reflex, aimed at a mode the panel does not have, and it was costing whole titles that had to be typed again from memory. The two presses have to be next to each other: anything in between disarms. An empty line still closes on the first press, because there is nothing to lose, and `ctrl-c` cancels outright for anyone who wants one key."),
+    );
+
+    out.push(
+        Driver::new(&w)
             .key(Key::Char('a'))
             .type_in("Pick up milk")
             .scene("Adding to the inbox", "The same key on the inbox group. The scope is deliberately no project, which is what the inbox means."),
@@ -4019,6 +4028,79 @@ mod tests {
         panel::apply_key(Key::KillLine, &mut ui, &mut view);
         let shown = panel::frame(&ui, &mut view, W, H)[H - 1].text();
         assert!(!shown.contains(&tail), "ctrl-u should clear the line: {shown}");
+    }
+
+    /// The hands that reach this prompt come from vim, where `esc` is how you
+    /// stop typing. It arrived here as a reflex, aimed at a mode the panel does
+    /// not have, and threw away titles and notes that then had to be typed
+    /// again from memory. So a line with something on it takes two presses.
+    #[test]
+    fn a_typed_line_is_not_thrown_away_by_one_escape() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_project(&mut ui, "audio");
+        panel::apply_key(Key::Char('a'), &mut ui, &mut view);
+        for c in "Retune the plate".chars() {
+            panel::apply_key(Key::Char(c), &mut ui, &mut view);
+        }
+
+        panel::apply_key(Key::Esc, &mut ui, &mut view);
+        assert!(matches!(view.mode, panel::Mode::Prompt { .. }), "one esc threw the line away");
+        // And the panel says it heard the key. A first press that changed
+        // nothing on screen reads as a panel that has stopped listening —
+        // which is the reflex pressing itself harder.
+        let shown = panel::frame(&ui, &mut view, W, H)[H - 1].text();
+        assert!(shown.contains("Retune the plate"), "the line went missing: {shown}");
+        assert!(shown.contains("esc again"), "nothing said the cancel was armed: {shown}");
+
+        panel::apply_key(Key::Esc, &mut ui, &mut view);
+        assert!(matches!(view.mode, panel::Mode::Browse), "the second esc should cancel");
+    }
+
+    /// The two presses have to be next to each other, or the rule is "esc, then
+    /// some time later esc" — which is the reflex again with a delay in it.
+    #[test]
+    fn a_key_between_the_two_escapes_disarms_the_cancel() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        on_project(&mut ui, "audio");
+        panel::apply_key(Key::Char('a'), &mut ui, &mut view);
+        panel::apply_key(Key::Char('x'), &mut ui, &mut view);
+
+        for k in [Key::Char('y'), Key::Backspace, Key::Up] {
+            panel::apply_key(Key::Esc, &mut ui, &mut view);
+            panel::apply_key(k, &mut ui, &mut view);
+            panel::apply_key(Key::Esc, &mut ui, &mut view);
+            assert!(
+                matches!(view.mode, panel::Mode::Prompt { .. }),
+                "{k:?} between the presses should have disarmed the cancel",
+            );
+            panel::apply_key(Key::Char('x'), &mut ui, &mut view);
+        }
+    }
+
+    /// Two presses cost nothing when there is nothing to lose, and cost too
+    /// much when the way out has to be quick. So an empty line goes on
+    /// closing on the first `esc` — "I opened this by mistake" is the other
+    /// reason the key gets pressed here — and `ctrl-c`, which nobody types by
+    /// reflex, stays the one-key way out of a line that has been typed.
+    #[test]
+    fn an_empty_line_and_ctrl_c_still_close_on_one_press() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        on_project(&mut ui, "audio");
+        panel::apply_key(Key::Char('a'), &mut ui, &mut view);
+        panel::apply_key(Key::Esc, &mut ui, &mut view);
+        assert!(matches!(view.mode, panel::Mode::Browse), "nothing typed, nothing to protect");
+
+        panel::apply_key(Key::Char('a'), &mut ui, &mut view);
+        panel::apply_key(Key::Char('x'), &mut ui, &mut view);
+        panel::apply_key(Key::Interrupt, &mut ui, &mut view);
+        assert!(matches!(view.mode, panel::Mode::Browse), "ctrl-c should cancel outright");
     }
 
     /// Put the cursor on a project row by id, for the same reason `on_task`

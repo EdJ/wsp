@@ -1052,20 +1052,32 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
     // The last line belongs to whatever the panel is waiting for: a value, an
     // answer, a destination — and only otherwise a message or the key hint.
     lines.push(match mode {
-        Mode::Prompt { verb, buffer } => {
+        Mode::Prompt { verb, buffer, armed } => {
             let mut l = Line::default();
             l.push(Style::Accent, format!("{}> ", verb.label()));
             // A prompt that opens holding a value needs to say how to be rid
             // of it — backspacing a title away is not an edit anyone makes
             // twice. Only while there is something to clear, and only when
             // the pane is wide enough that the hint is not eating the value.
+            //
+            // A half-pressed cancel takes the same slot and takes it first: it
+            // is the answer to a key pressed a moment ago, not a standing
+            // offer, and an `esc` that changed nothing on the line would read
+            // as a panel that had stopped listening — which is the reflex
+            // being fixed pressing itself harder. Loud, for the same reason.
             const CLEAR: &str = "  ^U";
-            let hint = !buffer.is_empty() && w > l.width() + CLEAR.chars().count() + 12;
+            const AGAIN: &str = "  esc again";
+            let hint = match (armed, buffer.is_empty()) {
+                (true, _) => Some((Style::Warn, AGAIN)),
+                (false, false) => Some((Style::Dim, CLEAR)),
+                (false, true) => None,
+            }
+            .filter(|(_, text)| w > l.width() + text.chars().count() + 12);
             // Show the tail once the value outruns the pane, so the caret is
             // always the thing you can see.
             let room = w
                 .saturating_sub(l.width() + 1)
-                .saturating_sub(if hint { CLEAR.chars().count() } else { 0 });
+                .saturating_sub(hint.map_or(0, |(_, text)| text.chars().count()));
             let shown: String = if buffer.chars().count() > room {
                 buffer.chars().skip(buffer.chars().count() - room).collect()
             } else {
@@ -1073,8 +1085,8 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             };
             l.push(Style::Plain, shown);
             l.push(Style::Accent, "▌");
-            if hint {
-                l.push(Style::Dim, CLEAR);
+            if let Some((style, text)) = hint {
+                l.push(style, text);
             }
             l
         }

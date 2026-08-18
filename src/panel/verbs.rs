@@ -1249,6 +1249,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                         parent: Some(id.clone()),
                     },
                     buffer: String::new(),
+                    armed: false,
                 };
                 Effect::None
             }
@@ -1257,6 +1258,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                     view.mode = Mode::Prompt {
                         verb: Ask::AddTask { project, parent: None },
                         buffer: String::new(),
+                        armed: false,
                     };
                     Effect::None
                 }
@@ -1271,7 +1273,11 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 Target::Project(p) => Some(p.clone()),
                 _ => None,
             };
-            view.mode = Mode::Prompt { verb: Ask::NewProject { parent }, buffer: String::new() };
+            view.mode = Mode::Prompt {
+                verb: Ask::NewProject { parent },
+                buffer: String::new(),
+                armed: false,
+            };
             Effect::None
         }
 
@@ -1308,8 +1314,11 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // ---- typed ----
         Key::Char('b') => match &target {
             Target::Task(id) => {
-                view.mode =
-                    Mode::Prompt { verb: Ask::Block { task: id.clone() }, buffer: String::new() };
+                view.mode = Mode::Prompt {
+                    verb: Ask::Block { task: id.clone() },
+                    buffer: String::new(),
+                    armed: false,
+                };
                 Effect::None
             }
             _ => {
@@ -1335,6 +1344,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 view.mode = Mode::Prompt {
                     verb: Ask::Rename { task: id.clone(), from: from.clone() },
                     buffer: from,
+                    armed: false,
                 };
                 Effect::None
             }
@@ -1343,6 +1353,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 view.mode = Mode::Prompt {
                     verb: Ask::RenameProject { project: p.clone(), from: from.clone() },
                     buffer: from,
+                    armed: false,
                 };
                 Effect::None
             }
@@ -1390,8 +1401,11 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         },
         Key::Char('n') => match &target {
             Target::Task(id) => {
-                view.mode =
-                    Mode::Prompt { verb: Ask::Note { task: id.clone() }, buffer: String::new() };
+                view.mode = Mode::Prompt {
+                    verb: Ask::Note { task: id.clone() },
+                    buffer: String::new(),
+                    armed: false,
+                };
                 Effect::None
             }
             _ => {
@@ -1461,6 +1475,7 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
                 view.mode = Mode::Prompt {
                     verb: Ask::Tell { project: project.clone() },
                     buffer: String::new(),
+                    armed: false,
                 };
                 Effect::None
             }
