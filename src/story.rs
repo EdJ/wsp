@@ -2434,6 +2434,22 @@ mod tests {
         out
     }
 
+    /// The panes the pinned section at the foot is drawing — the census, not
+    /// the copies of it the tree keeps under the work each one holds.
+    fn docked_panes(d: &mut Driver) -> Vec<String> {
+        let at = d.ui.selected_index();
+        let tree = d.ui.rows_for_test() - d.ui.dock_for_test();
+        let mut out = Vec::new();
+        for i in tree..d.ui.rows_for_test() {
+            d.ui.select_for_test(i);
+            if let panel::Target::Pane(p) = d.ui.selected_target() {
+                out.push(p);
+            }
+        }
+        d.ui.select_for_test(at);
+        out
+    }
+
     /// `h` folds one row, and the store is thirty-one projects: getting back to
     /// a tree you can read a branch at a time is the walk `H` is for. What it
     /// leaves is the top of the tree and nothing hanging off it.
@@ -2451,6 +2467,29 @@ mod tests {
             !projects.contains(&"vst".to_string()),
             "a project inside a folded one is still drawn: {projects:?}"
         );
+    }
+
+    /// The dock under the tree is not part of the tree, and `H` is a key about
+    /// the tree.
+    ///
+    /// Ed, 2026-08-18: "I can't see any agents in the wsp inline agents panel."
+    /// The stored view had `(agents)` folded in the same set as the twenty-odd
+    /// projects he had just put away with one press, and a folded section is a
+    /// heading with a count and a `▸` — so the panel went on saying five agents
+    /// and drew none of them, with nothing on screen to say which key had done
+    /// it or which would undo it. The census at the foot is pinned precisely so
+    /// that who is running survives whatever the tree is doing; folding it as a
+    /// side effect of tidying something else is the one thing that must not
+    /// happen to it. `h` on the section is still how a person puts it away.
+    #[test]
+    fn folding_the_whole_tree_leaves_the_census_pinned_under_it() {
+        let w = world();
+        let mut d = Driver::new(&w);
+        let before = docked_panes(&mut d);
+        assert!(!before.is_empty(), "the fixture has nobody at the foot to lose");
+
+        d.key(Key::Char('H'));
+        assert_eq!(docked_panes(&mut d), before, "`H` took the agents dock with the tree");
     }
 
     /// And `L` reaches folds it cannot see. It clears the set rather than

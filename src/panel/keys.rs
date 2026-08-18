@@ -1238,10 +1238,25 @@ pub(super) fn fold_branch(fold: bool, ui: &mut Ui, view: &mut View) -> Effect {
 /// still there if you go back down to it — the alternative is this reducer
 /// holding a second copy of the project tree to walk, which is the store's
 /// answer to a question about the view.
+///
+/// **The tree, and not the dock pinned under it.** `H` is the key for putting
+/// thirty-one projects away, and it used to take the census at the foot with
+/// them — the one list on the panel that exists so that who is running survives
+/// whatever the tree is doing. Nothing said so afterwards but a `▸` on one row,
+/// and folds are shared and persisted, so a single press left every panel on
+/// the machine with no view of the fleet until somebody guessed. Reported by Ed
+/// 2026-08-18 as "I can't see any agents in the inline agents panel", and the
+/// stored view had `(agents)` sitting in the same set as every project he had
+/// just folded. The flags share the dock and so shared the fault: `H` could put
+/// a raised hand off the screen, which is the one thing that section exists to
+/// make impossible. `h` on the section itself still puts either away, which is
+/// a person answering for the dock rather than for the tree, and `L` still
+/// opens it.
 pub(super) fn fold_tree(fold: bool, ui: &mut Ui, view: &mut View) -> Effect {
     let mut moved = false;
     if fold {
-        let keys: Vec<String> = ui.rows.iter().filter_map(fold_key).cloned().collect();
+        let tree = ui.tree_len();
+        let keys: Vec<String> = ui.rows[..tree].iter().filter_map(fold_key).cloned().collect();
         for k in keys {
             moved = fold_one(view, &k) || moved;
         }
