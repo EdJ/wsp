@@ -321,11 +321,21 @@ fn is_daemon(rest: &str) -> bool {
 /// is not the daemon — see [`surface_drawing`], which is the other long-lived
 /// wsp process on a machine.
 fn is_wsp(rest: &str, sub: &str) -> bool {
-    let mut words = rest.split_whitespace().take_while(|w| !is_env_word(w));
-    let argv0 = words.next().unwrap_or("");
-    let exe = argv0.rsplit('/').next().unwrap_or("");
+    let mut words = argv(rest);
     // `-v` and anything after it are somebody's flags, not our business.
-    exe == "wsp" && words.next() == Some(sub)
+    is_exe(words.next()) && words.next() == Some(sub)
+}
+
+/// The words of that field that are argv: everything before the first
+/// `KEY=value`, which is where the command stops and `ps -E`'s environment
+/// begins.
+fn argv(rest: &str) -> impl Iterator<Item = &str> {
+    rest.split_whitespace().take_while(|w| !is_env_word(w))
+}
+
+/// Is that argv0 this binary, under whatever path it was started from?
+fn is_exe(argv0: Option<&str>) -> bool {
+    argv0.and_then(|a| a.rsplit('/').next()) == Some("wsp")
 }
 
 fn is_env_word(w: &str) -> bool {
@@ -392,6 +402,53 @@ pub(crate) fn surface_drawing(state: &Path) -> bool {
     crate::cmd_sandbox::processes()
         .iter()
         .any(|(_, _, rest)| is_wsp(rest, "surface") && for_store(rest, state))
+}
+
+/// The panes of this machine that still have a wsp of this store's running in
+/// them, or `None` when the process list could not be read at all.
+///
+/// The question behind it is "is this pane still a panel, or only the shape one
+/// left" — a husk, in `render-074`'s words. herdr restores a *layout* across a
+/// restart, so a pane labelled `wsp` outlives the panel that was in it, and
+/// there is nothing in herdr's answer to tell the two apart: the label is the
+/// same, the tab is the same, and the pane is the same size it always was.
+///
+/// A running process is the fact that does distinguish them, and the panel puts
+/// one in the pane it owns — `install_one` `exec`s over the shell, and a reload
+/// `exec`s again over itself, so from the pane's first frame to its last there
+/// is a `wsp` there with `HERDR_PANE_ID` in its environment. `ps -E` prints
+/// that environment beside the command, which is what makes this answerable
+/// without asking herdr anything it does not know.
+///
+/// **`None` is not "no panes".** The one caller closes panes on the strength of
+/// this, and a `ps` that would not answer must never read as "nothing is
+/// running anywhere" — that is a list of every panel on the machine to close.
+/// Same rule, same reason, as [`running`].
+pub(crate) fn wsp_panes(state: &Path) -> Option<std::collections::HashSet<String>> {
+    let all = crate::cmd_sandbox::processes();
+    if all.is_empty() {
+        return None;
+    }
+    Some(manned(&all, state))
+}
+
+/// That reading of a process list, without the list. Any subcommand, not just
+/// `panel`: the detail pane, the board and the fullscreen tree are ours too and
+/// are drawn by other words, and what is being asked is whether *anything* of
+/// ours is alive in there.
+fn manned(all: &[(u32, u32, String)], state: &Path) -> std::collections::HashSet<String> {
+    all.iter()
+        .filter(|(_, _, rest)| is_exe(argv(rest).next()) && for_store(rest, state))
+        .filter_map(|(_, _, rest)| pane_of(rest))
+        .collect()
+}
+
+/// The pane a process is running in, from the environment `ps -E` appends.
+fn pane_of(rest: &str) -> Option<String> {
+    rest.split_whitespace()
+        .find_map(|w| w.strip_prefix("HERDR_PANE_ID="))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,
@@ -695,6 +752,41 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The husk test's evidence, and the field it is read out of: `ps -E`
+    /// prints the command and the environment as one blob, so the pane a
+    /// process is in is there to be had without asking herdr — which could not
+    /// answer it anyway, since herdr's pane knows its label and not what is
+    /// running inside it.
+    #[test]
+    fn a_panel_is_found_by_the_pane_its_environment_names() {
+        let state = Store::default_state();
+        let line = |s: &str| vec![(1u32, 1u32, s.to_string())];
+
+        assert_eq!(
+            manned(&line("/usr/local/bin/wsp panel HERDR_PANE_ID=w1:p2 SHELL=/bin/zsh"), &state),
+            ["w1:p2".to_string()].into_iter().collect()
+        );
+        // The board, the detail pane and the fullscreen tree are ours too, and
+        // are not `wsp panel`. Anything of ours in the pane holds it.
+        assert_eq!(
+            manned(&line("wsp detail t-1 HERDR_PANE_ID=w1:p3"), &state).len(),
+            1
+        );
+        // Somebody else's binary in a pane of ours says nothing about ours.
+        assert!(manned(&line("/bin/zsh -l HERDR_PANE_ID=w1:p6G"), &state).is_empty());
+        // A sandbox's panel is not this store's, and its pane is not one this
+        // store may close — the same filter that keeps `doctor` from crying
+        // wolf about a second daemon.
+        assert!(manned(
+            &line("wsp panel WSP_STATE=/tmp/sandbox/state HERDR_PANE_ID=w1:p2"),
+            &state
+        )
+        .is_empty());
+        // A wsp with no pane in its environment is a wsp somebody typed at a
+        // shell outside herdr. It holds nothing.
+        assert!(manned(&line("wsp panel"), &state).is_empty());
+    }
 
     /// The guard that would have stopped t-260816-076 on its own.
     ///

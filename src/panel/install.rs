@@ -97,6 +97,13 @@ pub(super) fn list_panes(ws_id: &str) -> Result<Vec<PaneInfo>, String> {
         .collect())
 }
 
+/// Is this herdr label one of ours — the sidebar itself, or one of the three
+/// surfaces it opens? Furniture, in [`super`]'s word for it, and the answer to
+/// both "what may this be split off" and "what is there to take back out".
+pub(super) fn is_ours(label: &str) -> bool {
+    [PANEL_LABEL, VIEW_LABEL, BOARD_LABEL, FULL_LABEL].contains(&label)
+}
+
 /// The pane a panel should be split off: the widest one that is not ours.
 /// Width comes from herdr's layout, because "first in the list" is an
 /// arbitrary answer that happens to be right only when there is one pane.
@@ -105,10 +112,7 @@ pub(super) fn widest<'a>(ws_id: &str, panes: &'a [PaneInfo]) -> Option<&'a PaneI
     // is per *workspace*, so a board or a fullscreen panel open in another tab
     // is in this list too, and splitting the sidebar off one of those would put
     // it in a tab nobody has the sidebar open in.
-    let mine = |p: &PaneInfo| {
-        [PANEL_LABEL, VIEW_LABEL, BOARD_LABEL, FULL_LABEL].contains(&p.label.as_str())
-    };
-    let candidates: Vec<&PaneInfo> = panes.iter().filter(|p| !mine(p)).collect();
+    let candidates: Vec<&PaneInfo> = panes.iter().filter(|p| !is_ours(&p.label)).collect();
     if candidates.len() <= 1 {
         return candidates.into_iter().next();
     }
@@ -302,37 +306,223 @@ pub fn install(store: &Store, args: &crate::Args) -> i32 {
     0
 }
 
+/// Take the panel back out of a workspace, or out of all of them.
+///
+/// **By label, not by the state file.** This used to walk `panels.json` and
+/// close the pane id recorded there, which is the same as trusting a note we
+/// wrote to still describe the room: a panel installed by a wsp that crashed
+/// before it saved, a workspace herdr restored with the pane in it and no entry
+/// for it, or an id that has since been reused, are all panes standing in front
+/// of somebody with nothing here able to see them. `render-074` is that: `wsp
+/// panel uninstall -w w1` answered `removed from 0 workspace(s)` about a pane
+/// that was on the screen, and it took `herdr pane close` to shift.
+///
+/// So what is closed is what herdr says is there wearing one of our labels, and
+/// the state file is only the record that is tidied afterwards.
+///
+/// And a zero says which zero it is. "There is no panel in this workspace" and
+/// "there is no such workspace" were one line and one exit code, which reads as
+/// the first while being the second — the reading that sends somebody looking
+/// for a pane wsp has already told them it removed.
 pub fn uninstall(store: &Store, args: &crate::Args) -> i32 {
+    if !herdr::available() {
+        eprintln!("wsp: no herdr socket");
+        return 1;
+    }
     let mut panels = panels_state(store);
     let only = args.get("workspace");
-    let mut removed = 0;
-    let targets: Vec<(String, String)> = panels
-        .iter()
-        .filter(|(ws, _)| only.as_ref().map(|o| *ws == o).unwrap_or(true))
-        .map(|(a, b)| (a.clone(), b.clone()))
-        .collect();
 
-    for (ws, pane) in targets {
-        if herdr::call("pane.close", json!({ "pane_id": pane })).is_ok() {
-            removed += 1;
+    // Where to look: every workspace herdr has, plus any the state file still
+    // names. A workspace that has gone took its panes with it, but its entry is
+    // ours to forget, and a run that never visits it never forgets it.
+    let mut targets: Vec<String> =
+        herdr::workspaces().unwrap_or_default().into_iter().map(|w| w.id).collect();
+    for ws in panels.keys() {
+        if !targets.contains(ws) {
+            targets.push(ws.clone());
         }
-        // The view pane is ours too, and so is a fullscreen panel in a tab of
-        // its own. Leaving either behind orphans a pane nothing will reclaim —
-        // and in the second case, a panel in a workspace somebody has just said
-        // they want no panel in.
-        if let Ok(ps) = list_panes(&ws) {
-            for v in ps.iter().filter(|p| p.label == VIEW_LABEL || p.label == FULL_LABEL) {
-                let _ = herdr::call("pane.close", json!({ "pane_id": v.id }));
+    }
+    if let Some(want) = &only {
+        targets.retain(|ws| ws == want);
+        if targets.is_empty() {
+            eprintln!(
+                "wsp: no workspace `{want}` — herdr does not list it, and nothing is recorded there"
+            );
+            return 1;
+        }
+    }
+
+    let mut cleared = 0;
+    let mut closed = 0;
+    let mut bare: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+
+    for ws in &targets {
+        let panes = match list_panes(ws) {
+            Ok(panes) => panes,
+            // Said, never swallowed. This is the other silent zero: a
+            // workspace we could not look inside is not a workspace with
+            // nothing in it.
+            Err(e) => {
+                failed.push(format!("{ws}: {e}"));
+                continue;
+            }
+        };
+        // The recorded id as well as the labels, for the one pane a label
+        // cannot find: a rename by hand, or a herdr that lost the label across
+        // a restart. It costs one comparison and it closes a pane that would
+        // otherwise be nobody's to close.
+        let recorded = panels.get(ws).cloned();
+        let mut here = 0;
+        let mine = |p: &&PaneInfo| is_ours(&p.label) || Some(&p.id) == recorded.as_ref();
+        for pane in panes.iter().filter(mine) {
+            match herdr::call("pane.close", json!({ "pane_id": pane.id })) {
+                Ok(_) => here += 1,
+                Err(e) => failed.push(format!("{}: {e}", pane.id)),
             }
         }
-        panels.remove(&ws);
+        panels.remove(ws);
+        closed += here;
+        if here > 0 {
+            cleared += 1;
+        } else {
+            bare.push(ws.clone());
+        }
     }
     save_panels(store, &panels);
 
     if args.json() {
-        println!("{}", json!({ "removed": removed }));
+        println!(
+            "{}",
+            json!({ "removed": cleared, "panes": closed, "empty": bare, "failed": failed })
+        );
+    } else if closed > 0 {
+        println!("panel removed from {cleared} workspace(s), {closed} pane(s) closed");
+    } else if let Some(want) = &only {
+        println!("nothing of ours is open in {want} — no panel to remove");
     } else {
-        println!("panel removed from {removed} workspace(s)");
+        println!("nothing of ours is open in any of {} workspace(s)", targets.len());
     }
-    0
+    for f in &failed {
+        eprintln!("wsp: {f}");
+    }
+    i32::from(!failed.is_empty())
+}
+
+/// Close the panel panes an older wsp left standing, and say how many.
+///
+/// The conversion to the fork is what this is for. herdr restores the pane
+/// *layout* it had before the restart, so every workspace that had a panel
+/// installed comes back with a pane in the sidebar's slot — and nothing refills
+/// it, because [`install_if_adopted`] stands down while a surface is drawing,
+/// which is correct and is why they are empty. What a person sees on their
+/// first fork is the new sidebar working beside a dead pane that should not be
+/// there, and reads it as the fork being broken. It is the last thing standing
+/// between a conversion and a clean first impression (`render-074`).
+///
+/// **A husk is a pane of ours with no wsp left in it**, which is the honest
+/// test rather than "a pane of ours while a surface is up". `panel install` is
+/// deliberately still allowed beside a surface — one build of one terminal is
+/// the fallback, and checking one against the other is most of what it is for —
+/// so a panel somebody has just asked for must survive this. It does: the panel
+/// `exec`s over its pane's shell and `exec`s again over itself on reload, so a
+/// live one is always a `wsp` with that pane's id in its environment. See
+/// [`crate::daemon::wsp_panes`], which is also where a process list that will
+/// not answer stops this dead rather than emptying every workspace.
+///
+/// This machine only, for the same reason: the evidence is a local `ps`, and a
+/// far machine's pane labelled `wsp` is one this cannot see the process for.
+///
+/// `panels.json` is deliberately left alone. It records that the panel was
+/// adopted here, not that these particular panes exist, and somebody who rolls
+/// back to an upstream herdr should find their panels install again as they
+/// always did — nothing here decides that the fork is permanent.
+pub(super) fn sweep_husks(state: &std::path::Path) -> usize {
+    let Some(manned) = crate::daemon::wsp_panes(state) else {
+        return 0;
+    };
+    let Ok(workspaces) = herdr::workspaces() else {
+        return 0;
+    };
+    let mut closed = 0;
+    for ws in workspaces.iter().filter(|w| herdr::host_of(&w.id).is_none()) {
+        let Ok(panes) = list_panes(&ws.id) else { continue };
+        for pane in husks(&panes, &manned) {
+            if herdr::call("pane.close", json!({ "pane_id": pane })).is_ok() {
+                closed += 1;
+            }
+        }
+    }
+    closed
+}
+
+/// Which of a workspace's panes are husks: ours by label, with nothing of ours
+/// running in them.
+pub(super) fn husks<'a>(panes: &'a [PaneInfo], manned: &HashSet<String>) -> Vec<&'a str> {
+    panes
+        .iter()
+        .filter(|p| is_ours(&p.label) && !manned.contains(&p.id))
+        .map(|p| p.id.as_str())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(id: &str, label: &str) -> PaneInfo {
+        PaneInfo { id: id.into(), label: label.into(), tab: "t1".into() }
+    }
+
+    fn manned(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The conversion, exactly as it was found: herdr restored the pane and
+    /// nothing refilled it, so the label says panel and no process backs it.
+    /// That pane is what a person sees beside their new sidebar, and it is the
+    /// whole of what the sweep is for.
+    #[test]
+    fn a_pane_of_ours_with_nothing_running_in_it_is_a_husk() {
+        let panes = vec![pane("w1:p1", ""), pane("w1:p6G", PANEL_LABEL)];
+
+        assert_eq!(husks(&panes, &manned(&[])), vec!["w1:p6G"]);
+    }
+
+    /// `panel install` beside a surface is somebody checking one against the
+    /// other, and it is the fallback the fork is allowed to be rolled back to.
+    /// A sweep that closed it would take the panel out from under them on the
+    /// next restart, with a message about panes an older wsp left behind.
+    #[test]
+    fn a_panel_somebody_is_still_running_survives_the_sweep() {
+        let panes = vec![pane("w1:p1", ""), pane("w1:p2", PANEL_LABEL)];
+
+        assert!(husks(&panes, &manned(&["w1:p2"])).is_empty());
+    }
+
+    /// A pane with nothing running in it is the *normal* state of a pane: a
+    /// shell at a prompt, an agent that has finished, a window somebody left
+    /// open. Only the label makes one ours, and only a pane of ours may be
+    /// closed by anything a person did not type.
+    #[test]
+    fn an_idle_pane_that_is_not_ours_is_not_a_husk() {
+        let panes = vec![pane("w1:p1", ""), pane("w1:p4", "shell")];
+
+        assert!(husks(&panes, &manned(&[])).is_empty());
+    }
+
+    /// The three surfaces the panel opens are furniture like the sidebar, and
+    /// a conversion leaves them behind the same way. A board two tabs over
+    /// with nothing drawing it is a pane nothing will ever reclaim.
+    #[test]
+    fn the_detail_the_board_and_the_full_tree_are_swept_like_the_sidebar() {
+        let panes = vec![
+            pane("w1:p2", PANEL_LABEL),
+            pane("w1:p3", VIEW_LABEL),
+            pane("w1:p7", BOARD_LABEL),
+            pane("w1:p9", FULL_LABEL),
+        ];
+
+        assert_eq!(husks(&panes, &manned(&["w1:p2"])).len(), 3);
+    }
 }

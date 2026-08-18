@@ -121,6 +121,17 @@ const TOLD_BY: std::time::Duration = std::time::Duration::from_secs(1);
 /// machines, which is the usual case.
 const FAR_POLL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long after the sidebar comes up to look for panel panes an older wsp
+/// left behind.
+///
+/// Slack rather than a measurement. herdr restores its workspaces, tabs and
+/// panes and starts this surface, and nothing here is told which of those
+/// finished first — a sweep that ran before the layout came back would find
+/// nothing to sweep. Being early costs a husk that stays until the next start;
+/// being late costs nothing at all, because it runs on a thread nobody is
+/// waiting for. See [`super::install::sweep_husks`].
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Size to draw at before the host has said. It is `term_size`'s own fallback,
 /// for the same reason: a first frame at a nonsense width is worse than a
 /// first frame at a plausible one.
@@ -444,6 +455,19 @@ pub fn run(store: &Store) -> i32 {
     if !crate::herdr::available() {
         eprintln!("wsp: no herdr socket");
         return 1;
+    }
+    // The conversion's tidy-up, on a thread of its own: closing somebody else's
+    // dead panes is not what the person watching this sidebar come up is
+    // waiting for, and it must not be able to delay the first frame.
+    {
+        let state = store.state.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(SETTLE);
+            match super::install::sweep_husks(&state) {
+                0 => {}
+                n => eprintln!("wsp surface: closed {n} panel pane(s) an older wsp left behind"),
+            }
+        });
     }
     let host = Arc::new(Mutex::new(Host { size: UNTOLD, focused: false }));
     let running = Arc::new(Mutex::new(Running::default()));
