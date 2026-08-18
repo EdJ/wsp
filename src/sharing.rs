@@ -151,6 +151,18 @@ pub(crate) fn warm_each(state: &Path, repo: &Path, slots: usize) -> Vec<Warm> {
     (0..slots).filter_map(|n| claim_at(&root, &repo, n, alive)).collect()
 }
 
+/// One named warm tree, if nobody is building in it.
+///
+/// For `wsp verify --rm`, which knows exactly which tree it wants: the one this
+/// agent's last build went to, read back off the pointer that build left. A
+/// held tree comes back `None` and stays where it is.
+pub(crate) fn warm_named(dir: &Path) -> Option<Warm> {
+    let root = dir.parent()?;
+    let name = dir.file_name()?.to_str()?;
+    let (repo, slot) = name.rsplit_once('-')?;
+    claim_at(root, repo, slot.parse().ok()?, alive)
+}
+
 /// The claim itself, with liveness passed in so that it can be tested.
 fn claim(
     root: &Path,
@@ -179,9 +191,10 @@ fn claim_at(
             Ok(mut f) => {
                 use std::io::Write;
                 let _ = writeln!(f, "{}", std::process::id());
-                let dir = root.join(format!("{repo}-{slot}"));
-                let _ = std::fs::create_dir_all(&dir);
-                return Some(Warm { dir, slot, lock });
+                // The lock is made, the directory is not: whoever builds
+                // here creates it, and `--rm` wants to know the difference
+                // between a tree it removed and a slot that was never used.
+                return Some(Warm { dir: root.join(format!("{repo}-{slot}")), slot, lock });
             }
             Err(_) if attempt == 0 => {
                 let held = std::fs::read_to_string(&lock).ok().and_then(|s| s.trim().parse().ok());
@@ -524,6 +537,26 @@ mod tests {
             claim(&root, "wsp", 1, |_| HashSet::from([424242])).is_none(),
             "somebody else is building in it"
         );
+    }
+
+    #[test]
+    fn the_tree_a_build_went_to_can_be_named_and_taken_back() {
+        let iso = crate::util::isolated("warm-named");
+        let root = iso.path("warm");
+        let dir = {
+            let held = claim(&root, "wsp", 3, all).unwrap();
+            held.dir.clone()
+        };
+        let again = warm_named(&dir).expect("the pointer names a free tree");
+        assert_eq!(again.dir, dir);
+        assert!(warm_named(&dir).is_none(), "and it is held while somebody holds it");
+    }
+
+    #[test]
+    fn a_pointer_at_something_that_is_not_a_warm_tree_names_nothing() {
+        let iso = crate::util::isolated("warm-nonsense");
+        assert!(warm_named(&iso.path("warm/wsp-nine")).is_none(), "no slot number in it");
+        assert!(warm_named(&iso.path("warm")).is_none());
     }
 
     #[test]

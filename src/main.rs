@@ -588,10 +588,11 @@ fn help() {
                                     trunk onto it; prints what actually moved.
                                     The tree stays — landing is not finishing
   wsp verify [<path>…] [--check] [--release] [--rm [--all]]
-                                    build and test your change at HEAD, in a
-                                    scratch tree inside your checkout that goes
-                                    when it does; --rm --all also clears the
-                                    trees older workspaces left behind
+                                    build and test your change at HEAD, in one
+                                    of a few warm trees this machine shares —
+                                    yours alone while it builds, and cold only
+                                    when they are all busy; --rm drops the one
+                                    you built in, --all every free one
   wsp install [<path>] [--why "…"] [-n] [--force] [--to PATH]
                                     put that build at ~/.local/bin/wsp, one
                                     install at a time — the one file nothing can

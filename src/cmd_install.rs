@@ -589,7 +589,7 @@ fn source(store: &Store, args: &Args) -> Result<Source, String> {
     // checkout that is not the trunk — so this looked for a release build under
     // a name `verify` never writes, found nothing, and fell through to the
     // shared `target/release` while reporting it as shared.
-    let sc = crate::cmd_verify::scratch(store, &repo, &agent_key());
+    let sc = crate::cmd_verify::last_build(store, &repo, &agent_key());
     let mine = sc.target.join("release/wsp");
     if mine.is_file() {
         return Ok(Source { path: mine, tree: Some(sc.tree), origin: "verify" });

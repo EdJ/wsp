@@ -2645,13 +2645,52 @@ said so. A tree each means a cold build each, and every `cargo` reads the core
 count and takes `-j8` as though it owned the laptop: load 468 and twenty-one
 `rustc` on 2026-08-17, with Ed sitting at it.
 
-What is shared now is **a budget of cores**. Every build registers a pid file
-under `<state>/building/` while it runs and takes `cores / builds` jobs, so four
+Two things are shared now. The first is **the build tree itself**: three per
+repository, at fixed paths under `<state>/warm/`, each handed to one build at a
+time behind a pid lock. A verify takes a free one, resets it to *its* HEAD,
+applies *its* patch and builds — and finds the dependencies and most of the
+crate already compiled, because the last build in that tree was at nearly the
+same commit. Nobody queues: when all three are busy the build takes the private
+cold tree it would have had anyway, so this is warmth where there is some and
+yesterday's behaviour where there is not.
+
+Exclusive is what makes it safe, and it is a different thing from the shared
+target directory above. That failed because *two* trees pointed at one target
+directory, where cargo's fingerprints name absolute paths and answer for the
+wrong tree. One tree, one target directory, one build in it at a time, reset to
+your HEAD and carrying your patch — that is exactly the arrangement your own
+checkout is, and cargo judges freshness on the files it is about to compile.
+
+Measured on the real command, 2026-08-18: **40s cold, 19s warm**, of which 15.7s
+is the test run itself, so the build fell from ~25s to ~3s. Changing a
+*different* file, the way a second agent's patch would, is 19s again.
+
+And four agents deep, which is the case that took the machine down — four
+worktrees, a patch each, `cargo test` in all four at once:
+
+| four agents verifying | each | wall | peak load |
+|---|---|---|---|
+| before: four cold trees, `-j8` each | 86, 88, 98, 99s | 100s | 20.7 |
+| after: three warm, one cold, `-j2` each | 29, 36, 40, **75s** | 75s | 17.2 |
+
+The 75s is the fourth agent, which found no free tree and took the private cold
+one — the fallback, working, and still faster than any of the four before it
+because the machine around it is quieter.
+
+The second is **a budget of cores**. Every build registers a pid file under
+`<state>/building/` while it runs and takes `cores / builds` jobs, so four
 agents ask for eight compile jobs between them rather than thirty-two. Export
 `CARGO_BUILD_JOBS` and that is obeyed instead: what the budget stops is the
 *unknowing* saturation. `wsp verify` prints `machine 2 of 8 jobs · 4 builds
 here` when there is more than one, which is the answer to why today's verify
 took four minutes and yesterday's took one.
+
+`wsp verify --rm` removes this agent's private tree and the warm tree its last
+build actually went to — which the build wrote down, so it is not a guess — and
+`--rm --all` takes every free one for the repository. A tree somebody is
+building in is never removed, and is free again the moment that build ends. `wsp install` is told where the artefacts went by a `built-at`
+pointer in the agent's own directory, because after this a build no longer lands
+anywhere the checkout can work out.
 
 What is **not** shared is a compiler cache, and that is a measurement rather
 than a preference. `sccache` was the obvious candidate. Two worktrees of the
@@ -2667,8 +2706,7 @@ rescue it: also measured, also 0 hits. On a full miss the wrapper costs about
 What the cold build is actually worth is the other measurement, 2026-08-18, one
 tree, `cargo test --no-run`: **23s** into an empty target directory, **3s** for
 the same tree reset to HEAD with somebody else's patch applied. Nearly eight to
-one — so the thing worth sharing is the build tree itself, exclusively, one
-build in it at a time. That is `robustness-070` and it is not finished.
+one, and it is why the tree rather than a cache is the thing that is shared.
 
 What is deliberately *not* budgeted is the test run. `cargo test` takes a thread
 per core and that is load too — but test parallelism is not a resource knob
@@ -3035,7 +3073,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
 | `src/cmd_machine.rs` | the machines agents can be run on |
-| `src/sharing.rs` | what every build on this machine shares: one compiler cache, one pool of cores |
+| `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |
 | `src/cmd_*.rs` | the commands |

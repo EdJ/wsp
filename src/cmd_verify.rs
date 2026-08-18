@@ -117,11 +117,19 @@
 //!
 //! # The trees are separate; the machine is not
 //!
-//! Separate trees mean N agents run N full builds, each `cargo` taking `-j8` as
-//! though it owned the laptop — load 468 and twenty-one `rustc` on 2026-08-17.
-//! What this command shares, and what it refuses to, is [`crate::sharing`]: a
-//! compiler cache keyed on inputs, and a budget of cores. The isolation above
-//! is untouched by both, which is the property they were chosen to keep.
+//! A tree per task means a *cold* build per task, and each `cargo` takes `-j8`
+//! as though it owned the laptop — load 468 and twenty-one `rustc` on
+//! 2026-08-17. So the tree this builds in is no longer always the private one
+//! above: [`crate::sharing`] lends it one of a few warm trees kept per
+//! repository, exclusively, and hands it a share of the cores. Measured on this
+//! command, 40s cold against 19s warm.
+//!
+//! The isolation is untouched, which is the property that made the warm tree
+//! the shareable thing and the target directory not: what arrives is a tree
+//! reset to *this* agent's HEAD with *this* agent's patch on it, with nobody
+//! else in it while the build runs. Only the tree and its target move; the
+//! private index, the patch and the failing run's log stay in this agent's own
+//! directory, where two agents cannot overwrite each other's.
 //!
 //! # Outside a checkout, nothing changes
 //!
@@ -320,6 +328,74 @@ pub(crate) fn scratch(store: &Store, repo: &Path, key: &str) -> Scratch {
     let named_for = crate::cmd_checkout::trunk(repo).unwrap_or_else(|| repo.to_path_buf());
     let dir = build_dir(store, &named_for, key);
     Scratch { tree: dir.join("tree"), target: dir.join("target"), dir, checkout: None }
+}
+
+/// The file naming where the last build here actually put its artefacts.
+///
+/// One line, in the agent's own scratch directory. It exists because the answer
+/// stopped being derivable: a build now lands in whichever warm tree was free,
+/// and `wsp install` — which looks for the release binary this command produced
+/// — cannot work that out from the checkout it is standing in.
+pub(crate) const BUILT_AT: &str = "built-at";
+
+/// Where the last build here put its target directory, for a caller that wants
+/// the artefacts rather than a place to build.
+///
+/// Falls back to [`scratch`] when there is no pointer or it names something
+/// gone, which is both the pre-warm-tree arrangement and the honest answer for
+/// a checkout that has never run a build.
+pub(crate) fn last_build(store: &Store, repo: &Path, key: &str) -> Scratch {
+    let sc = scratch(store, repo, key);
+    let named = std::fs::read_to_string(sc.dir.join(BUILT_AT))
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_dir());
+    match named {
+        Some(target) => {
+            let tree = target.parent().map_or_else(|| sc.tree.clone(), |d| d.join("tree"));
+            Scratch { tree, target, ..sc }
+        }
+        None => sc,
+    }
+}
+
+/// Remove warm trees: the one this agent last built in, or with `--all` every
+/// one for this repository that nobody is building in.
+///
+/// The default is the narrow one deliberately. `--rm` means "the tree I have
+/// been building in has gone wrong", and after this change that tree is shared
+/// — so throwing away all three on the way past would hand every other agent a
+/// cold build to fix one agent's problem. Which one it was is not a guess: the
+/// build wrote it down.
+///
+/// A tree somebody is building in is never removed, and the git worktree
+/// registration goes with the directory. A directory removed without it makes
+/// the next `worktree add` refuse, with a message that reads like a bug in this
+/// command rather than a stale registration.
+fn clear_warm(store: &Store, repo: &Path, named_for: &Path, dir: &Path, all: bool) -> usize {
+    let mine = std::fs::read_to_string(dir.join(BUILT_AT))
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .and_then(|target| target.parent().map(Path::to_path_buf))
+        .filter(|d| d.starts_with(store.state.join("warm")))
+        .and_then(|d| crate::sharing::warm_named(&d));
+    let claimed = if all {
+        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES)
+    } else {
+        mine.into_iter().collect()
+    };
+    let mut gone = 0;
+    for w in claimed {
+        if !w.dir.exists() {
+            continue;
+        }
+        let _ = git(repo, &["worktree", "remove", "--force", &w.tree().display().to_string()]);
+        if std::fs::remove_dir_all(&w.dir).is_ok() {
+            gone += 1;
+        }
+        let _ = git(repo, &["worktree", "prune"]);
+    }
+    gone
 }
 
 /// The paths whose change is under test, as `git add` pathspecs.
@@ -697,12 +773,20 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // comes from and where the worktree is added; `scratch` decides where the
     // build goes from what kind of tree that is.
     let Scratch { dir, tree, target, checkout } = scratch(store, &repo, &key);
+    // The warm pool is keyed on the repository, and inside a checkout `repo` is
+    // named for the task rather than the repository — `.worktrees/robustness-070`
+    // — so the trunk is what names it. Otherwise every task would have a pool of
+    // its own, which is the cold build this is trying to stop having.
+    let named_for = crate::cmd_checkout::trunk(&repo).unwrap_or_else(|| repo.clone());
 
     // `--rm` before anything else: the point of it is a tree you can drop when
     // it has gone wrong, and needing a working repository to drop it would be
     // exactly backwards.
     if args.has("rm") {
         let existed = tree.exists();
+        // The warm tree first, because which one it was is written down *in*
+        // the directory the next line removes.
+        let warm = clear_warm(store, &repo, &named_for, &dir, args.has("all"));
         let _ = git(&repo, &["worktree", "remove", "--force", &tree.display().to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = git(&repo, &["worktree", "prune"]);
@@ -722,7 +806,12 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         if json_out {
             println!(
                 "{}",
-                json!({"removed": existed, "path": util::contract(&dir), "also": residue.len()})
+                json!({
+                    "removed": existed,
+                    "path": util::contract(&dir),
+                    "also": residue.len(),
+                    "warm": warm,
+                })
             );
         } else {
             if existed {
@@ -739,6 +828,9 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
             }
             if !residue.is_empty() {
                 println!("removed {} left by earlier workspaces", residue.len());
+            }
+            if warm > 0 {
+                println!("removed {warm} warm build tree(s) — the next build here is cold");
             }
         }
         return 0;
@@ -803,6 +895,22 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
             }
         }
     }
+
+    // A warm tree if there is one free, and the private cold one if there is
+    // not — see [`crate::sharing`] for the 23s against 3s that makes this the
+    // whole point of the command, and for why nobody queues for it. Held until
+    // the build is done, and only the tree and its target move: the index, the
+    // patch and the log stay in this agent's own directory, where two agents
+    // cannot overwrite each other's.
+    let warm = sharing::warm(&store.state, &named_for, sharing::WARM_TREES);
+    let (tree, target) = match &warm {
+        Some(w) => (w.tree(), w.target()),
+        None => (tree, target),
+    };
+    // Where this build put its artefacts, for `wsp install` to read: it looks
+    // for the release binary this command produced, and after this change that
+    // is no longer a path it can work out from the checkout alone.
+    let _ = std::fs::write(&dir.join(BUILT_AT), format!("{}\n", target.display()));
 
     let started = Instant::now();
     let fresh = match ensure_tree(&repo, &tree, &head) {
@@ -903,6 +1011,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 "jobs": share.jobs,
                 "cores": share.cores,
                 "builds": share.live,
+                "warm": warm.as_ref().map(|w| w.slot),
                 "seconds": (secs * 10.0).round() / 10.0,
                 "output": tail.join("\n"),
             })
@@ -940,11 +1049,16 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     None => {}
                 }
             }
+            // "left at" is now only true until somebody else claims that tree
+            // and resets it to their HEAD, which is the price of it being warm.
+            // What survives is the log and the patch: they are written in this
+            // agent's own directory precisely so that a red run's evidence does
+            // not depend on a tree it does not own.
             match &log {
                 Some(l) => println!(
                     "{}",
                     p.dim(&format!(
-                        "tree left at {} — cargo output {}, patch {}",
+                        "built in {} — cargo output {}, patch {}",
                         util::contract(&tree),
                         util::contract(l),
                         util::contract(&patch_path)
@@ -953,7 +1067,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 None => println!(
                     "{}",
                     p.dim(&format!(
-                        "tree left at {} — the patch is {}",
+                        "built in {} — the patch is {}",
                         util::contract(&tree),
                         util::contract(&patch_path)
                     ))
@@ -1182,6 +1296,45 @@ mod tests {
             sc.target
         );
         assert_eq!(sc.target, sc.dir.join("target"), "the trunk shares its target dir");
+    }
+
+    /// A build no longer lands where the checkout says it does — it lands in
+    /// whichever warm tree was free — so the one caller that wants the
+    /// *artefacts* rather than a place to build has to be told, and this is the
+    /// telling. `wsp install` looking in the wrong place is not a small bug:
+    /// it falls through to `target/release` and installs somebody else's build
+    /// while reporting it as yours.
+    #[test]
+    fn install_is_told_which_tree_the_build_actually_went_to() {
+        let iso = util::isolated("verify-built-at");
+        let store = Store::at(iso.home(), iso.state());
+        let repo = iso.path("wsp");
+        let sc = scratch(&store, &repo, "w1");
+        std::fs::create_dir_all(&sc.dir).unwrap();
+        let warm = iso.path("state/warm/wsp-0/target");
+        std::fs::create_dir_all(&warm).unwrap();
+        std::fs::write(sc.dir.join(BUILT_AT), format!("{}\n", warm.display())).unwrap();
+
+        let found = last_build(&store, &repo, "w1");
+        assert_eq!(found.target, warm, "install would have looked in the private tree");
+        assert_eq!(found.tree, warm.parent().unwrap().join("tree"), "the tree beside it");
+        assert_eq!(found.dir, sc.dir, "the patch and the log are still this agent's own");
+    }
+
+    /// And a pointer at a tree that has been removed is not an answer. `--rm`
+    /// takes warm trees away, so the pointer outliving one is ordinary rather
+    /// than exotic — and "no build" is the right answer then, not a path that
+    /// no longer exists.
+    #[test]
+    fn a_pointer_at_a_tree_that_is_gone_falls_back_to_this_agents_own() {
+        let iso = util::isolated("verify-built-gone");
+        let store = Store::at(iso.home(), iso.state());
+        let repo = iso.path("wsp");
+        let sc = scratch(&store, &repo, "w1");
+        std::fs::create_dir_all(&sc.dir).unwrap();
+        std::fs::write(sc.dir.join(BUILT_AT), "/tmp/warm-tree-that-was-removed/target\n").unwrap();
+
+        assert_eq!(last_build(&store, &repo, "w1").target, sc.target);
     }
 
     /// The residue of keying on the workspace, and the only command that can
