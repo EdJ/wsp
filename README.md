@@ -2645,6 +2645,19 @@ it. That happened while this was being written, a green build in 7s for a change
 that did not build. Most of what is listed will be somebody else's and correctly
 excluded; the value is seeing at a glance whether one of them is yours.
 
+A red run keeps what only it knows. It used to print `error: test failed, to
+rerun pass \`--bin wsp\`` and nothing else, which is expensive rather than untidy
+on a suite that fails intermittently: verify goes red, you re-run to find out
+what broke, the re-run is green, and the name is gone. It cost the name twice on
+2026-08-18. So a failing run now names the test and what its assertion said,
+writes the whole cargo output to `cargo.log` beside `patch.diff` in the tree it
+already leaves standing, and re-runs that one test **alone, once** — "failed in
+the suite, passed alone" is the signature of a shared-state flake, and it is the
+measurement `robustness-068` needs on every occurrence rather than when somebody
+happens to be watching. It does not re-run the *suite*: a flake that is
+automatically swallowed stops being observable, and the exit status stays the
+failing run's.
+
 What it does not do is commit. Steps 1, 2 and 4 are still yours, and the
 `read-tree` immediately before the commit is still the one that stops a silent
 revert.

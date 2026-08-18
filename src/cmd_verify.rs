@@ -81,6 +81,40 @@
 //! it saves. So the trees get a target directory each, and the saving here is
 //! from *bounding* the number of them rather than from sharing one.
 //!
+//! # A red run is the only run that knows what was red
+//!
+//! Until 2026-08-18 a failing test run printed this and nothing else:
+//!
+//! ```text
+//! error: test failed, to rerun pass `--bin wsp`
+//! ✗ cargo test failed in 25s
+//! ```
+//!
+//! The name was never in it. That is expensive rather than untidy because this
+//! suite fails intermittently — five red-then-greens on unmodified trees, the
+//! last two at load average ~10 — so the sequence is always: verify goes red,
+//! you re-run to find out what broke, the re-run is green, and the name is
+//! gone. It cost the name twice in one day. You cannot ask a green run what was
+//! red, and `robustness-068` cannot progress without the names.
+//!
+//! So a failing run keeps three things it used to throw away:
+//!
+//! - The test path and what its assertion said, parsed out of libtest's own
+//!   report and printed by this command rather than left to scrollback.
+//! - The whole cargo output, on disk beside `patch.diff`, with the path in the
+//!   error line. The tree is already left standing on failure; the run that
+//!   produced it is the only one that can be kept.
+//! - One re-run of the named test *alone*, and whether it passed there. That
+//!   single line — "failed in the suite, passed alone" — is the signature of a
+//!   shared-state flake, and taking it on every occurrence is the difference
+//!   between a measurement and somebody happening to be watching.
+//!
+//! What it deliberately does not do is re-run the *suite* and report green. A
+//! flake that is automatically swallowed stops being observable, and this one is
+//! the most interesting unexplained thing in the repository. The exit status is
+//! decided by the run that failed; the re-run alone is evidence printed beside
+//! it, never a second opinion that overrules it.
+//!
 //! # Outside a checkout, nothing changes
 //!
 //! The trunk is still shared — the coordination seat stands there, and so does
@@ -430,33 +464,204 @@ fn ensure_tree(repo: &Path, tree: &Path, head: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// One cargo run. Inherits stdio unless the caller wants JSON, because the
-/// compiler's own output is the thing being asked for — a summary of a build
-/// failure is worth nothing next to the error.
-fn cargo(tree: &Path, target: &Path, argv: &[&str], capture: bool) -> (bool, String) {
+/// One cargo run: echoed as it arrives, and kept.
+///
+/// It is echoed because the compiler's own output is the thing being asked for
+/// — a summary of a build failure is worth nothing next to the error — and
+/// `echo` is off only for `--json`, where the caller wants one object rather
+/// than a build log with an object at the end of it.
+///
+/// It is kept unconditionally, which it was not before: the run that fails is
+/// the only run that knows what failed, and on this suite the next one is
+/// usually green. Nothing here decides that a run is interesting; by the time
+/// anything could, the output would be gone.
+///
+/// Two threads rather than one [`Command::output`] call, which would be
+/// simpler and would print nothing until cargo exited — for a 25s test run
+/// that is the difference between watching a build and watching a cursor.
+fn cargo(tree: &Path, target: &Path, argv: &[&str], echo: bool) -> (bool, String) {
     let mut cmd = Command::new("cargo");
     cmd.args(argv)
         .current_dir(tree)
         .env("CARGO_TARGET_DIR", target)
-        .env_remove("GIT_INDEX_FILE");
-    if capture {
-        match cmd.output() {
-            Ok(out) => {
-                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                (out.status.success(), text)
-            }
-            Err(e) => (false, format!("cargo: {e}")),
-        }
-    } else {
-        match cmd.status() {
-            Ok(st) => (st.success(), String::new()),
-            Err(e) => {
+        .env_remove("GIT_INDEX_FILE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            if echo {
                 eprintln!("wsp: cargo: {e}");
-                (false, String::new())
+            }
+            return (false, format!("cargo: {e}"));
+        }
+    };
+    // Both streams are drained concurrently because a pipe nobody reads fills
+    // and stops the writer: reading stdout to the end first would deadlock the
+    // moment cargo wrote more warnings than a pipe buffer holds.
+    let out = child.stdout.take().map(|s| std::thread::spawn(move || pump(s, echo, false)));
+    let err = child.stderr.take().map(|s| std::thread::spawn(move || pump(s, echo, true)));
+    let ok = child.wait().map(|st| st.success()).unwrap_or(false);
+    let mut text = out.and_then(|t| t.join().ok()).unwrap_or_default();
+    text.push_str(&err.and_then(|t| t.join().ok()).unwrap_or_default());
+    (ok, text)
+}
+
+/// Read one of cargo's streams to the end, passing it on as it arrives.
+fn pump(mut r: impl std::io::Read, echo: bool, is_err: bool) -> String {
+    use std::io::Write;
+    let mut kept: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                kept.extend_from_slice(&buf[..n]);
+                if echo {
+                    // Flushed per chunk: cargo's progress is only progress if
+                    // it arrives while the build is still running.
+                    if is_err {
+                        let mut h = std::io::stderr();
+                        let _ = h.write_all(&buf[..n]);
+                        let _ = h.flush();
+                    } else {
+                        let mut h = std::io::stdout();
+                        let _ = h.write_all(&buf[..n]);
+                        let _ = h.flush();
+                    }
+                }
             }
         }
     }
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// One test the run reported as failed: where it panicked, and what it said.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Failure {
+    pub name: String,
+    pub at: Option<String>,
+    pub message: Option<String>,
+}
+
+/// The failing tests, out of a cargo test run's own report.
+///
+/// Two things in libtest's output name a failure and neither is enough alone.
+/// The trailing `failures:` list is the authoritative set — every failed test
+/// is in it, in one place, whatever the format — but it carries no message. The
+/// `---- <name> stdout ----` blocks above it carry the panic and the assertion
+/// but are the part a harness is free to shorten. So the list decides who
+/// failed, the blocks say what they said, and a name in the list with no block
+/// is still reported by name.
+///
+/// A compile failure names nothing here, deliberately. Cargo has already
+/// printed the error, in full, and inventing a test name for it would be worse
+/// than the silence this replaces.
+fn failures(output: &str) -> Vec<Failure> {
+    let lines: Vec<&str> = output.lines().collect();
+
+    let mut detail: Vec<Failure> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let head = lines[i].trim();
+        let Some(name) = head.strip_prefix("---- ").and_then(|r| r.strip_suffix(" stdout ----"))
+        else {
+            i += 1;
+            continue;
+        };
+        let mut block: Vec<&str> = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() {
+            let l = lines[j].trim();
+            if l.starts_with("---- ") || l == "failures:" || l.starts_with("test result:") {
+                break;
+            }
+            block.push(lines[j]);
+            j += 1;
+        }
+        detail.push(Failure {
+            name: name.trim().to_string(),
+            at: panic_site(&block),
+            message: assertion(&block),
+        });
+        i = j;
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k < lines.len() {
+        if lines[k].trim() != "failures:" {
+            k += 1;
+            continue;
+        }
+        k += 1;
+        // The detail section also opens with `failures:`, and what follows it
+        // is a blank line and an unindented `----` header — so the indent test
+        // ends that one immediately and only the real list is collected.
+        while k < lines.len() && lines[k].starts_with("    ") && !lines[k].trim().is_empty() {
+            let n = lines[k].trim().to_string();
+            if !names.contains(&n) {
+                names.push(n);
+            }
+            k += 1;
+        }
+    }
+
+    if names.is_empty() {
+        return detail;
+    }
+    names
+        .into_iter()
+        .map(|n| match detail.iter().find(|f| f.name == n) {
+            Some(f) => f.clone(),
+            None => Failure { name: n, at: None, message: None },
+        })
+        .collect()
+}
+
+/// `src/panel/keys.rs:412:9`, out of the panic line.
+fn panic_site(block: &[&str]) -> Option<String> {
+    let line = block.iter().find(|l| l.contains("panicked at "))?;
+    let rest = line.split("panicked at ").nth(1)?.trim().trim_end_matches(':');
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// What the assertion said — the line under the panic, or failing that the
+/// first thing the test printed, which is where a `Result`-returning test's
+/// error ends up.
+fn assertion(block: &[&str]) -> Option<String> {
+    let after = block.iter().position(|l| l.contains("panicked at ")).map(|p| p + 1).unwrap_or(0);
+    block[after.min(block.len())..]
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with("note: "))
+        .map(|l| l.to_string())
+}
+
+/// Run one named test by itself, once, and say whether it passed there.
+///
+/// `Some(true)` is the whole signature of a shared-state flake and the
+/// measurement `robustness-068` wants on every occurrence. It is evidence
+/// printed beside the failure and never a verdict: the suite failed, and the
+/// exit status is still the suite's.
+///
+/// `None` is "not measured", which is not the same as passing and is printed as
+/// nothing at all rather than as a green word.
+fn rerun_alone(tree: &Path, target: &Path, name: &str) -> Option<bool> {
+    // A doc test is named `src/store.rs - Store::at (line 12)`, which is not
+    // something libtest can be handed as an exact filter. Anything with a space
+    // in it is left alone rather than guessed at.
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return None;
+    }
+    let (ok, text) = cargo(tree, target, &["test", "--quiet", "--", "--exact", name], false);
+    if !ok {
+        return Some(false);
+    }
+    // A filter that matched nothing exits green. Reporting that as "passed
+    // alone" would invent the measurement instead of taking it, so the pass has
+    // to be one test actually having run.
+    text.contains("1 passed; 0 failed").then_some(true)
 }
 
 pub fn verify(store: &Store, args: &Args) -> i32 {
@@ -620,7 +825,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         if !json_out {
             println!("{} cargo {}", p.dim("→"), argv.join(" "));
         }
-        let (ok, text) = cargo(&tree, &target, argv, json_out);
+        let (ok, text) = cargo(&tree, &target, argv, !json_out);
         output.push_str(&text);
         if !ok {
             failed = Some(name);
@@ -628,6 +833,25 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         }
     }
     let secs = started.elapsed().as_secs_f64();
+
+    // Everything a red run knows, taken before anything else can happen to it.
+    // The log goes beside `patch.diff` in the scratch directory — which the
+    // tree it belongs to already owns and already removes — so keeping it costs
+    // nothing that was not already being kept, and a path in the error line is
+    // worth more than any summary printed in its place.
+    let mut log: Option<PathBuf> = None;
+    let mut failed_tests: Vec<Failure> = Vec::new();
+    let mut alone: Option<bool> = None;
+    if failed.is_some() {
+        let path = dir.join("cargo.log");
+        if std::fs::write(&path, &output).is_ok() {
+            log = Some(path);
+        }
+        failed_tests = failures(&output);
+        if let Some(first) = failed_tests.first() {
+            alone = rerun_alone(&tree, &target, &first.name);
+        }
+    }
 
     if json_out {
         // The tail rather than the whole thing: a failing cargo run is
@@ -645,6 +869,12 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 "tree": util::contract(&tree),
                 "checkout": checkout.as_deref().map(util::contract),
                 "patch": util::contract(&patch_path),
+                "log": log.as_deref().map(util::contract),
+                "failures": failed_tests
+                    .iter()
+                    .map(|f| json!({"test": f.name, "at": f.at, "message": f.message}))
+                    .collect::<Vec<_>>(),
+                "alone": alone,
                 "seconds": (secs * 10.0).round() / 10.0,
                 "output": tail.join("\n"),
             })
@@ -660,7 +890,47 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         }
         Some(step) => {
             println!("{} cargo {step} failed in {:.0}s", p.red("✗"), secs);
-            println!("{}", p.dim(&format!("tree left at {} — the patch is {}", util::contract(&tree), util::contract(&patch_path))));
+            for f in &failed_tests {
+                match &f.at {
+                    Some(at) => println!("  {} {}", p.bold(&f.name), p.dim(at)),
+                    None => println!("  {}", p.bold(&f.name)),
+                }
+                if let Some(m) = &f.message {
+                    println!("    {}", util::truncate(m, 200));
+                }
+            }
+            if let Some(first) = failed_tests.first() {
+                match alone {
+                    // The flake signature, and the reason the re-run happens at
+                    // all. Yellow because it is the interesting answer, not
+                    // green: the suite is still red and still failed.
+                    Some(true) => println!(
+                        "{}",
+                        p.yellow(&format!("{} failed in the suite, passed alone", first.name))
+                    ),
+                    Some(false) => println!("{}", p.dim(&format!("{} fails alone too", first.name))),
+                    None => {}
+                }
+            }
+            match &log {
+                Some(l) => println!(
+                    "{}",
+                    p.dim(&format!(
+                        "tree left at {} — cargo output {}, patch {}",
+                        util::contract(&tree),
+                        util::contract(l),
+                        util::contract(&patch_path)
+                    ))
+                ),
+                None => println!(
+                    "{}",
+                    p.dim(&format!(
+                        "tree left at {} — the patch is {}",
+                        util::contract(&tree),
+                        util::contract(&patch_path)
+                    ))
+                ),
+            }
             1
         }
     }
@@ -938,5 +1208,63 @@ mod tests {
         // machine with no agents on it, and its trees are residue.
         assert_eq!(clear_build_dirs(&store, Some(&[]), Path::new("/nowhere")).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Everything this command was failing to say, said. A run that goes red on
+    /// this suite is usually the only run that will — the next one is green —
+    /// so the name and the assertion have to come out of the output that
+    /// already exists rather than out of a second run that no longer fails.
+    ///
+    /// The fixture is a real `cargo test --quiet` run, verbatim, because what
+    /// is being parsed is somebody else's format and a fixture we wrote to suit
+    /// the parser would prove only that the parser matches itself.
+    #[test]
+    fn a_red_run_names_the_test_and_what_its_assertion_said() {
+        let out = "\nrunning 2 tests\n. 1/2\nt::a_thing_that_does_not_hold --- FAILED\n\nfailures:\n\n---- t::a_thing_that_does_not_hold stdout ----\n\nthread 't::a_thing_that_does_not_hold' (104182998) panicked at src/main.rs:7:39:\nassertion `left == right` failed: the counts differ\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    t::a_thing_that_does_not_hold\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `--bin q`\n";
+
+        let f = failures(out);
+        assert_eq!(f.len(), 1, "the failing test was not found: {f:?}");
+        assert_eq!(f[0].name, "t::a_thing_that_does_not_hold");
+        assert_eq!(f[0].at.as_deref(), Some("src/main.rs:7:39"));
+        assert_eq!(
+            f[0].message.as_deref(),
+            Some("assertion `left == right` failed: the counts differ"),
+            "the assertion was dropped and only the name kept"
+        );
+    }
+
+    /// The list is the authoritative set and the blocks are not: a harness that
+    /// prints one and shortens the other still has to leave a name behind. A
+    /// failure reported by name alone is worth having — it is the thing you
+    /// cannot get back from a green re-run.
+    #[test]
+    fn a_failure_with_no_detail_block_is_still_named() {
+        let out = "\nfailures:\n    panel::keys::a_key_that_moves\n    store::an_id_is_never_reissued\n\ntest result: FAILED. 480 passed; 2 failed; 0 ignored\n";
+        let f = failures(out);
+        assert_eq!(
+            f.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
+            vec!["panel::keys::a_key_that_moves", "store::an_id_is_never_reissued"]
+        );
+        assert!(f[0].message.is_none(), "a message was invented for a test that printed none");
+    }
+
+    /// A compile failure names no test, and must not appear to. Cargo has
+    /// already printed the error in full; a fabricated test path beside it
+    /// would be worse than the silence this replaces.
+    #[test]
+    fn a_build_that_did_not_compile_invents_no_test_name() {
+        let out = "error[E0425]: cannot find value `rows` in this scope\n  --> src/panel/rows.rs:12:9\nerror: could not compile `wsp` (bin \"wsp\") due to 1 previous error\n";
+        assert!(failures(out).is_empty(), "a compile error was reported as a failing test");
+    }
+
+    /// The re-run alone is a measurement, so it declines to guess. A doc test
+    /// is named `src/store.rs - Store::at (line 12)`, which libtest cannot be
+    /// handed as an exact filter — handing it over anyway would run the whole
+    /// suite again under the name of one test, which is the retry this command
+    /// exists not to do.
+    #[test]
+    fn a_name_libtest_cannot_filter_on_is_not_rerun_at_all() {
+        let nowhere = Path::new("/nowhere");
+        assert_eq!(rerun_alone(nowhere, nowhere, "src/store.rs - Store::at (line 12)"), None);
+        assert_eq!(rerun_alone(nowhere, nowhere, ""), None);
     }
 }
