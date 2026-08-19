@@ -703,10 +703,11 @@ fn help() {
   wsp wip                           everything in flight, with agents
   wsp watch [<project>] [<signal>…]  the few facts a governor acts on, as they
                                     become true: needs-a-person, review,
-                                    blocked, flag, agent-gone. No arguments is
-                                    this seat's whole scope. It says what it is
-                                    watching, one line per change, a heartbeat
-                                    while nothing happens, and why it stopped
+                                    blocked, flag, unanswered, agent-gone. No
+                                    arguments is this seat's whole scope. It
+                                    says what it is watching, one line per
+                                    change, a heartbeat while nothing happens,
+                                    and why it stopped
   wsp watch --now                   …or the level read on its own: everything
                                     up right now, correct after any restart —
                                     the one call that says "nothing is up"

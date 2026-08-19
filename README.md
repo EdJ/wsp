@@ -1884,13 +1884,34 @@ chmod +x ~/wsp/hooks/on-attention-raised
 and never anything in between — it is a level, so it is said once and does not
 repeat on a timer. `.data` carries `kind`, which is the field to filter on:
 `direction` is the reading a keypress repairs (an agent stopped on a permission
-prompt), everything else is `note`. `to` is the seat that answers for it, or
-`everyone`.
+prompt), `stop` and the rest are whatever the asker said, and a derived level
+with nobody behind it is `note`. `to` is the seat that answers for it, or
+`everyone`. On an `unanswered` level `.data.id` is the question's message id, so
+a hook can print what to type: `wsp answer <id> "…"`.
 
 Nothing is shipped enabled, and `wsp doctor` says so while `hooks/` is empty —
 what may interrupt you at 3am is not a tool's decision, but a delivery path with
 nothing at the end of it should not read as working. The argument for all of it
 is in `src/attention.rs`.
+
+The same level set reaches the surface that is on screen the whole time. Ed,
+2026-08-17: *"when the agent raises questions to the user, we don't see a flag
+or any similar notification in the UI, nor are you notified."* The tokens `sync`
+publishes described which piece of work a pane held — `scope`, `task`, `taskid`,
+`tstatus` — and an agent stopped with a question drew identically to one
+mid-turn. So a pane whose task has a level standing on it now carries a fifth:
+
+```
+scope=worklist/051  taskid=robustness-051  tstatus=doing  needs=unanswered
+```
+
+The value is the signal's own word, so the sidebar and `wsp watch` say the same
+thing and learning one is learning both. It is read off the pass's ledger rather
+than recomputed — the third consumer of one derivation, after the stream and the
+hook — which is why a stall inside its settle window is correctly absent, and
+why the token cannot go stale behind the sidebar: the process that writes the
+ledger is the process that publishes the tokens. Nothing standing is no token at
+all, which is the common case and costs the row nothing.
 
 ## Sub-tasks
 
@@ -2275,7 +2296,7 @@ thing any of those six monitors reported was `worklist-004`: task status
 `doing` and says nothing, because nothing changed. A watch on the agent sees
 `blocked` and cannot tell it from a seat idling between the agents it is
 sequencing. Only the conjunction is a signal — and wsp already had it, as
-`cmd_govern::needs_a_person`. So the vocabulary is five named predicates and no
+`cmd_govern::needs_a_person`. So the vocabulary is six named predicates and no
 row selectors:
 
 ```
@@ -2283,8 +2304,20 @@ needs-a-person   a task still open whose agent has stopped turning
 review           finished, and waiting on you
 blocked          stopped on a question
 flag             a hand up, addressed to this seat
+unanswered       a question somebody asked and nobody has answered
 agent-gone       a binding whose pane is gone, or alive with the agent gone
 ```
+
+`unanswered` is the only one of the six whose subject wrote itself down. The
+others are wsp inferring from state that a person is probably wanted; this one
+is an agent having said so, in words, with `message::Waiting` naming the pane
+that is sitting still until it is answered — so the line carries the question
+rather than the task's title, and the id `wsp answer` takes. It is keyed on the
+message and not on the task, which is what makes two questions about one task
+two facts rather than one that silently replaces the other. And nothing lowers
+it: `worklist-013`'s question was answered in minutes and its raised hand stood
+for 2h14m, because the answer and the record were two acts and only one was on
+the path of getting the work moving.
 
 `wsp watch <project>` and `--about <id>` narrow the *subject*, which is a filter
 and not a subscription. There is a sixth word, `blind`, which you cannot

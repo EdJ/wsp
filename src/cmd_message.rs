@@ -74,7 +74,11 @@
 //!   question closes. That is what a watcher subscribes to, per `wsp-095`
 //!   Part 13, and it is why the hand goes down here *because the question
 //!   closed* rather than because somebody remembered to lower it. 2h14m is the
-//!   measured cost of the other arrangement.
+//!   measured cost of the other arrangement. The subscriber is
+//!   [`crate::cmd_watch::Kind::Unanswered`], and the population it reads is
+//!   [`crate::message::Message::wants_answering`] — the same one [`open`]
+//!   lists, asked once, so the verb and the watch cannot come to disagree about
+//!   whether the fleet is quiet.
 //! - **The answer is an EDGE.** `message-answered` in `events.jsonl`, so
 //!   `~/wsp/hooks/on-message-answered` is a desktop notification away and a
 //!   watcher's liveness stream carries it. An answer is a moment and cannot be
@@ -319,8 +323,14 @@ pub fn ack(store: &Store, args: &Args) -> i32 {
 /// between a watcher that is quiet and one that is broken.
 fn open(store: &Store, args: &Args) -> i32 {
     let all = message::all(store);
-    let questions: Vec<&Message> =
-        all.iter().filter(|m| m.shape() == Some(Shape::Question) && m.is_open()).collect();
+    // The two halves of `Message::wants_answering`, which is the population
+    // `wsp watch unanswered` reports off the same predicate — split here
+    // because a person reads sections and a level set does not have any.
+    let questions: Vec<&Message> = all
+        .iter()
+        .filter(|m| m.wants_answering())
+        .filter(|m| m.shape() == Some(Shape::Question) && m.is_open())
+        .collect();
     // Records this build cannot read. They are listed rather than counted and
     // rather than dropped: see `Message::needs_attention` — reporting "nothing
     // is up" when the honest answer is "there is something here I cannot read"
@@ -328,7 +338,7 @@ fn open(store: &Store, args: &Args) -> i32 {
     // routinely not the tree.
     let unreadable: Vec<&Message> = all
         .iter()
-        .filter(|m| m.needs_attention())
+        .filter(|m| m.wants_answering())
         .filter(|m| m.shape().is_none() || m.state().is_none())
         .collect();
     let replies: Vec<&Message> =

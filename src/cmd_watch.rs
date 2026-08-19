@@ -44,6 +44,25 @@
 //! (`--about`, `-p`), which is a different thing from being what is subscribed
 //! to.
 //!
+//! # The one predicate whose subject wrote itself down
+//!
+//! [`Kind::Unanswered`] is `robustness-051`'s own half and it is the odd one
+//! here. Every other variant is wsp *inferring* from joined state that a person
+//! is probably wanted; this one is an agent having said so, in words, through
+//! `wsp ask` — with [`crate::message::Waiting`] naming the pane that is sitting
+//! still until it is answered. So the line carries the question rather than the
+//! task's title, and the id `wsp answer` takes.
+//!
+//! It also settles the question `worklist-013` cost 2h14m: the answer and the
+//! record were two acts and only one of them was on the path of getting the
+//! work moving, so the hand stayed up on finished work while that seat's own
+//! watch went on reporting it. A level cannot have that failure — nothing
+//! lowers it, it stops being true — and `cmd_message`'s module docs make the
+//! same argument from the other end. [`crate::message::open_questions`] wrote
+//! the join and named this task in its docstring; this is the caller it wanted,
+//! and the one thing added to it is the census, which is what says whether the
+//! asker is still turning.
+//!
 //! And the conjunction itself is not re-derived here. [`Kind::NeedsAPerson`]
 //! reads `needs_you` off the rows [`crate::cmd_agent::wip_rows`] builds — the
 //! same rows `wsp wip --json` serialises — so there is one definition of the
@@ -199,7 +218,8 @@ pub(crate) const STALE_TICKS: i64 = 3;
 ///
 /// `core-003`'s five requirements and `worklist-007`'s five moments are the
 /// starting vocabulary and adding to it later is a new variant rather than a
-/// new interface. Four of `core-003`'s five are below. The fifth — *something
+/// new interface — as [`Kind::Unanswered`] was, once the message record existed
+/// to be read. Four of `core-003`'s five are below. The fifth — *something
 /// landed on the trunk touching a file my lane is in* — is deliberately absent;
 /// see the module-level note on scope at the foot of this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -215,6 +235,19 @@ pub(crate) enum Kind {
     Blocked,
     /// A hand is up on a task this seat is the addressee for.
     Flag,
+    /// A question raised through `wsp ask` that nobody has answered, and any
+    /// record beside it this build cannot read.
+    ///
+    /// **The one predicate here whose subject wrote itself down.** Every other
+    /// variant is wsp inferring from state that somebody is probably wanted;
+    /// this one is an agent having said so, in words, with
+    /// [`crate::message::Waiting`] naming the pane that is sitting still until
+    /// it is answered. `worklist-013`'s question was answered in minutes and
+    /// its raised hand stood for 2h14m, because the answer and the record were
+    /// two acts and only one of them was on the path of getting the work
+    /// moving; a level cannot have that failure, because it goes down when the
+    /// question closes and there is nothing to remember to lower.
+    Unanswered,
     /// A binding whose pane herdr no longer lists, or whose pane is alive with
     /// the agent gone. Covers *an agent died* and *an agent never started*,
     /// which look identical from here and want the same first move.
@@ -234,6 +267,7 @@ impl Kind {
             Kind::Review => "review",
             Kind::Blocked => "blocked",
             Kind::Flag => "flag",
+            Kind::Unanswered => "unanswered",
             Kind::AgentGone => "agent-gone",
             Kind::Blind => "blind",
         }
@@ -241,7 +275,14 @@ impl Kind {
 
     /// Everything a bare `wsp watch` subscribes to.
     pub(crate) fn every() -> Vec<Kind> {
-        vec![Kind::NeedsAPerson, Kind::Review, Kind::Blocked, Kind::Flag, Kind::AgentGone]
+        vec![
+            Kind::NeedsAPerson,
+            Kind::Review,
+            Kind::Blocked,
+            Kind::Flag,
+            Kind::Unanswered,
+            Kind::AgentGone,
+        ]
     }
 
     fn parse(word: &str) -> Option<Kind> {
@@ -260,7 +301,10 @@ impl Kind {
     /// `review` is nearly always the reader having just closed it, and a line
     /// saying so is the surface telling you what you did.
     fn clears(&self) -> bool {
-        matches!(self, Kind::NeedsAPerson | Kind::Flag | Kind::AgentGone | Kind::Blind)
+        matches!(
+            self,
+            Kind::NeedsAPerson | Kind::Flag | Kind::Unanswered | Kind::AgentGone | Kind::Blind
+        )
     }
 
     /// Whether evaluating this predicate needs herdr to answer.
@@ -288,7 +332,7 @@ impl Kind {
             Kind::NeedsAPerson | Kind::AgentGone => true,
             // The store answers these whether or not anything else does, which
             // is what makes saying `blind` worth anything at all.
-            Kind::Review | Kind::Blocked | Kind::Flag => false,
+            Kind::Review | Kind::Blocked | Kind::Flag | Kind::Unanswered => false,
             // Its own evidence.
             Kind::Blind => false,
         }
@@ -330,9 +374,28 @@ pub(crate) struct Signal {
     /// titles*, because a governor knows its own ids and pays for every line on
     /// every request of every session.
     pub(crate) detail: String,
-    /// This reading is loud enough to be `direction` rather than `note`: a
-    /// modal has the keyboard and one keypress fixes it.
-    pub(crate) loud: bool,
+    /// The record this level is a reading of, when it is a reading of one.
+    ///
+    /// A message id, and it is here for two reasons a task id cannot serve.
+    /// **It is part of [`Signal::key`]**, so two questions about one task are
+    /// two facts rather than one that silently replaces the other — which is
+    /// `worklist-017`'s finding about the flag record, kept out of this one by
+    /// construction. And it is what the reader needs *in hand* to act: the
+    /// subject says which work, the record says which question, and
+    /// `wsp answer` takes the second.
+    pub(crate) record: Option<String>,
+    /// How much of the reader's time this may take, when it is not the kind's
+    /// own default.
+    ///
+    /// `None` is [`Kind::loudness`] — `note`, because a derived level is
+    /// nobody's request. It is overridden for exactly two readings and both are
+    /// facts about the *reading* rather than about the predicate: herdr's
+    /// `blocked`, a modal on the keyboard that one keypress fixes, which
+    /// `quiet_note` already promotes past the hour for the same reason; and a
+    /// question, which carries the asker's own [`crate::message::Kind`] because
+    /// **the sender already said how loud it was** and deriving a second answer
+    /// beside it is the two-vocabularies fault this file keeps refusing.
+    pub(crate) loud: Option<crate::message::Kind>,
     /// This one may be emitted the instant it is seen. False for the states
     /// that flap — an agent is briefly "stopped" between every pair of turns —
     /// and true for the ones that do not.
@@ -345,23 +408,52 @@ impl Signal {
             kind,
             subject: subject.to_string(),
             detail: detail.to_string(),
-            loud: false,
+            record: None,
+            loud: None,
             at_once: true,
         }
     }
 
-    fn settling(mut self) -> Signal {
+    pub(crate) fn settling(mut self) -> Signal {
         self.at_once = false;
         self
     }
 
     pub(crate) fn loud(mut self) -> Signal {
-        self.loud = true;
+        self.loud = Some(crate::message::Kind::Direction);
         self
     }
 
+    /// Said as loud as whoever wrote the record asked for.
+    fn as_loud_as(mut self, k: crate::message::Kind) -> Signal {
+        self.loud = Some(k);
+        self
+    }
+
+    /// The message this is a reading of. See [`Signal::record`].
+    fn of(mut self, record: &str) -> Signal {
+        self.record = Some(record.to_string());
+        self
+    }
+
+    /// How loud this reading is, which is the kind's default unless the
+    /// reading overrode it.
+    pub(crate) fn loudness(&self) -> crate::message::Kind {
+        self.loud.unwrap_or_else(|| self.kind.loudness())
+    }
+
+    /// Whether this is worth the red column rather than the yellow one.
+    fn shouts(&self) -> bool {
+        self.loudness() < crate::message::Kind::Note
+    }
+
+    /// What the ledger diffs on: the predicate, what it is about, and — when
+    /// there is one — the record it read. See [`Signal::record`].
     pub(crate) fn key(&self) -> String {
-        format!("{}:{}", self.kind.word(), self.subject)
+        match &self.record {
+            Some(r) => format!("{}:{}:{}", self.kind.word(), self.subject, r),
+            None => format!("{}:{}", self.kind.word(), self.subject),
+        }
     }
 
     /// The signal as `wsp-095` Part 4's envelope.
@@ -381,14 +473,10 @@ impl Signal {
     /// field is a constant, and it is present so the second value is a value
     /// rather than a schema change.
     pub(crate) fn envelope(&self, edge: Edge, to: &str, at: &str) -> Value {
-        json!({
+        let mut v = json!({
             "shape": crate::message::Shape::Signal.as_str(),
             "signal": self.kind.word(),
-            "kind": match self.loud {
-                true => crate::message::Kind::Direction,
-                false => self.kind.loudness(),
-            }
-            .as_str(),
+            "kind": self.loudness().as_str(),
             "edge": edge.word(),
             "from": "wsp",
             "to": to,
@@ -396,7 +484,20 @@ impl Signal {
             "about": self.subject,
             "at": at,
             "text": self.detail,
-        })
+        });
+        // Part 4's `id`, and the one field a level normally has no business
+        // carrying — *"stable, so a resend is idempotent and an answer can find
+        // its way home"*. A level has no id of its own and still does not; this
+        // is the id of the **record it is a reading of**, present only when
+        // there is one, and it is what turns a hook from a thing that says
+        // somebody is waiting into a thing that says what to type. Absent
+        // rather than null for the reason every other optional here is: the
+        // reader is a shell script, and a field that can never be filled is
+        // noise on a wire.
+        if let (Some(r), Some(o)) = (&self.record, v.as_object_mut()) {
+            o.insert("id".into(), json!(r));
+        }
+        v
     }
 }
 
@@ -551,6 +652,19 @@ impl Ledger {
         self.up.len()
     }
 
+    /// Every level that has actually been said, for a surface that draws the
+    /// set rather than the news.
+    ///
+    /// **`told` and not `up`**, and that is the whole of the method. A level
+    /// still inside its settle window is an agent between turns as far as
+    /// anybody knows; drawing it would put a word on the sidebar for four
+    /// minutes and take it off again, which is the flicker the settle exists to
+    /// prevent and which reads worse on a permanently visible surface than in a
+    /// stream nobody has scrolled back to.
+    pub(crate) fn told(&self) -> impl Iterator<Item = &Signal> {
+        self.up.values().filter(|h| h.told).map(|h| &h.signal)
+    }
+
     pub(crate) fn json(&self) -> Value {
         Value::Object(
             self.up
@@ -562,7 +676,8 @@ impl Ledger {
                             "signal": h.signal.kind.word(),
                             "subject": h.signal.subject,
                             "detail": h.signal.detail,
-                            "loud": h.signal.loud,
+                            "record": h.signal.record,
+                            "loud": h.signal.loud.map(|k| k.as_str()),
                             "at_once": h.signal.at_once,
                             "since": h.since,
                             "told": h.told,
@@ -597,7 +712,22 @@ impl Ledger {
                         kind,
                         subject: rec.get("subject").and_then(Value::as_str).unwrap_or_default().to_string(),
                         detail: rec.get("detail").and_then(Value::as_str).unwrap_or_default().to_string(),
-                        loud: rec.get("loud").and_then(Value::as_bool).unwrap_or(false),
+                        record: rec
+                            .get("record")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        // The word, and a `true` from a build that wrote a bool
+                        // still reads as `direction`. The ledger survives an
+                        // `exec` in the middle of an install, so the file this
+                        // reads is routinely the previous binary's.
+                        loud: rec
+                            .get("loud")
+                            .and_then(|v| match v {
+                                Value::Bool(b) => {
+                                    b.then_some(crate::message::Kind::Direction)
+                                }
+                                _ => v.as_str().and_then(crate::message::Kind::parse),
+                            }),
                         at_once: rec.get("at_once").and_then(Value::as_bool).unwrap_or(true),
                     },
                     since: rec.get("since").and_then(Value::as_i64).unwrap_or(0),
@@ -697,6 +827,72 @@ pub(crate) fn in_scope(
     })
 }
 
+/// One message record, as a level — or nothing, when this build has no reason
+/// to think anybody is waiting on it.
+///
+/// Pure, and separate from [`Poll::sample`] for the reason every other
+/// predicate in this file is not: this one has no herdr in it at all. The
+/// record answers whether a question is open and the census answers whether its
+/// asker is still turning, and both are in hand, so the whole of what a
+/// governor is told about an unanswered question can be driven by a test on a
+/// machine with no socket.
+///
+/// **`needs_attention`, never `is_open`.** A state this build cannot parse is
+/// not *not open*; it is *somebody should look at this*. The installed binary
+/// is routinely older than the tree, and one answering `is_open` here would
+/// report a quiet fleet at the exact moment a newer build had written a
+/// question it could not read — `robustness-051` arriving through the module
+/// built to remove it, which is the argument `Message::needs_attention`'s own
+/// docstring makes and this is the first caller to owe it.
+fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]) -> Option<Signal> {
+    use crate::message::Kind as Loud;
+    // `Message::wants_answering` and not a filter written out here: it is the
+    // same population `wsp ask` lists, asked once, so the verb and the watch
+    // cannot come to disagree about whether the fleet is quiet.
+    if !m.wants_answering() {
+        return None;
+    }
+    let unreadable = m.shape().is_none() || m.state().is_none();
+
+    // The join the record could not make on its own. `Waiting` names the pane;
+    // the census says whether it is still turning, and an asker mid-turn is not
+    // sitting still — it asked and carried on. Said either way, because the
+    // question is unanswered either way: this changes how urgent it reads, not
+    // whether it is true.
+    let pane = m.waiting.as_ref().map(|w| w.pane.as_str()).unwrap_or_default();
+    let who = match rows.iter().find(|r| r.pane == pane) {
+        Some(r) if r.turning => format!("{pane} asked and is still working"),
+        Some(r) => format!("{} waiting", r.pane),
+        None if pane.is_empty() => "nobody is sitting on it".to_string(),
+        None => format!("{pane} asked and is gone"),
+    };
+
+    let s = match unreadable {
+        // Its own sentence rather than the question's, because the words are
+        // the half this build could not read, and `direction` because the
+        // repair is a person's and is one command.
+        true => Signal::new(
+            Kind::Unanswered,
+            subject,
+            &format!(
+                "{who} · this wsp cannot read the record — `wsp ask` lists it, \
+                 and `wsp install` may be what it wants"
+            ),
+        )
+        .loud(),
+        false => Signal::new(
+            Kind::Unanswered,
+            subject,
+            &format!("{who} · {} — wsp answer {} \"…\"", util::truncate(m.title(), 60), m.id),
+        )
+        // The asker's own judgement, read off the record rather than derived
+        // beside it. See [`Signal::loud`]: wsp does not get a second opinion
+        // about how much of somebody's time somebody else's question may take.
+        .as_loud_as(m.kind().unwrap_or(Loud::Note)),
+    };
+    Some(s.of(&m.id))
+}
+
 /// The polling implementation: one store sweep and three herdr calls per tick.
 pub(crate) struct Poll<'a> {
     store: &'a Store,
@@ -789,7 +985,39 @@ impl Source for Poll<'_> {
         // (c) The join, read rather than recomputed. Every row here carries
         // `needs_you` — `stopped && doing && !seat` — computed once by
         // `cmd_govern::needs_a_person` and published by `wsp wip --json`.
-        for r in cmd_agent::wip_rows(&wip) {
+        let rows = cmd_agent::wip_rows(&wip);
+
+        // (b2) Questions nobody has answered, which is the one level here that
+        // somebody wrote down rather than wsp inferring. `open_questions`'
+        // docstring is the specification — *"a caller adds is that pane stopped
+        // and how long has it been, and has `quiet_note`'s conjunction with a
+        // better subject line: it can say WHAT the agent is waiting for"* — and
+        // this is that caller. The population is `wsp ask`'s own, deliberately,
+        // so what the verb lists and what the watch reports are one answer:
+        // open questions, plus records this build cannot read.
+        //
+        // Placed above (c) because the two meet on the same agent and the
+        // second is the weaker reading of it. A stall is *an agent stopped and
+        // wsp does not know why*; this is the same agent with its reason in
+        // words. Both go up — they are different facts and one clears without
+        // the other — but a reader scanning down the column meets the one
+        // carrying the sentence first.
+        for m in self.store.messages().into_values() {
+            // A subject that is a task is what routing and `--about` are made
+            // of; `wsp ask` requires one, so this is every question. A record
+            // without one has no chain to walk and is only the machine pass's —
+            // which is right, and better than dropping it: `Scope::machine` is
+            // the reader that answers for everything.
+            let subject = match m.about.task().and_then(task_of) {
+                Some(t) if mine(t) => t.id.clone(),
+                Some(_) => continue,
+                None if self.scope.all => m.id.clone(),
+                None => continue,
+            };
+            out.extend(asking(&m, &subject, &rows));
+        }
+
+        for r in rows.iter() {
             if !r.needs_you || r.task_id.is_empty() {
                 continue;
             }
@@ -992,7 +1220,7 @@ fn clock(at: i64) -> String {
 fn line(e: &Emit, at: i64, p: &Paint) -> String {
     let word = util::pad(e.signal.kind.word(), 14);
     let head = match e.edge {
-        Edge::Up => match e.signal.loud {
+        Edge::Up => match e.signal.shouts() {
             true => p.red(&word),
             false => p.yellow(&word),
         },
@@ -1545,6 +1773,182 @@ mod tests {
         Signal::new(kind, subject, "because")
     }
 
+    // ---- the questions somebody wrote down ---------------------------------
+
+    use crate::message::{About, Message, Party, Shape, Waiting};
+
+    /// A question asked from `w1:p1`, about `a-1`, by an agent working `a-1`.
+    fn question(text: &str) -> Message {
+        Message::question(
+            Party::pane("w1:p1", "w1"),
+            crate::message::Kind::Note,
+            text,
+            Waiting::new("w1:p1", "a-1"),
+        )
+        .about(About::Task("a-1".into()))
+    }
+
+    /// One census row, with only the fields [`asking`] reads.
+    fn row(pane: &str, turning: bool) -> cmd_agent::WipRow {
+        cmd_agent::WipRow {
+            project: String::new(),
+            task: String::new(),
+            task_id: "a-1".into(),
+            pane: pane.into(),
+            workspace: "w1".into(),
+            state: String::new(),
+            turning,
+            needs_you: false,
+            seat: None,
+        }
+    }
+
+    /// **The thing this task is about.** An agent stopped and asked something;
+    /// until now that reached whoever ran `wsp ask`, and the record's own
+    /// `open_questions` had no caller at all. It is a level, so it needs no
+    /// verb to raise it and none to lower it.
+    #[test]
+    fn a_question_nobody_has_answered_is_a_level_with_the_words_in_it() {
+        let q = question("can I land this?\n\nthe branch is green");
+        let s = asking(&q, "a-1", &[row("w1:p1", false)]).expect("an open question is a level");
+
+        assert_eq!(s.kind, Kind::Unanswered);
+        assert_eq!(s.subject, "a-1", "addressed on the work, so `seat_for` can route it");
+        assert!(s.detail.contains("can I land this?"), "the words, not the task's title: {}", s.detail);
+        assert!(s.detail.contains("w1:p1 waiting"), "and who is sitting still: {}", s.detail);
+        assert!(
+            s.detail.contains(&format!("wsp answer {}", q.id)),
+            "and what to type, which needs the message id and not the task's: {}",
+            s.detail
+        );
+        assert!(s.at_once, "a question does not flap: nobody asks one twice a second");
+    }
+
+    /// `worklist-017`'s finding, kept out of this record by construction. A
+    /// flag is keyed by task id and a second one silently replaces the first;
+    /// a level about a message is keyed by the message, so two questions on one
+    /// task are two facts and answering one leaves the other standing.
+    #[test]
+    fn two_questions_about_one_task_are_two_facts_and_neither_eats_the_other() {
+        let rows = [row("w1:p1", false)];
+        let first = asking(&question("may I land?"), "a-1", &rows).unwrap();
+        let second = asking(&question("and which branch?"), "a-1", &rows).unwrap();
+        assert_ne!(first.key(), second.key(), "the second question overwrote the first");
+
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        assert_eq!(l.advance(&[first.clone(), second.clone()], 60, 0).len(), 2);
+        assert_eq!(l.standing(), 2);
+
+        // The first is answered. The second is untouched and still up.
+        let out = l.advance(&[second], 120, 0);
+        assert_eq!(out.len(), 1, "one clearing, not two");
+        assert_eq!(out[0].edge, Edge::Down);
+        assert_eq!(out[0].signal.record, first.record, "and it is the one that was answered");
+        assert_eq!(l.standing(), 1, "the other question is still waiting on somebody");
+    }
+
+    /// `worklist-013`: the question was answered in minutes and the raised hand
+    /// stood for 2h14m, because the answer and the record were two acts and
+    /// only one of them was on the path of getting the work moving. A level
+    /// cannot have that failure — nothing lowers it, it stops being true.
+    #[test]
+    fn answering_a_question_takes_its_level_down_with_nobody_lowering_anything() {
+        let q = question("may I land?");
+        let up = asking(&q, "a-1", &[row("w1:p1", false)]).unwrap();
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        assert_eq!(l.advance(&[up], 60, 0).len(), 1);
+
+        // `wsp answer` closed it, so it is simply absent from the next read.
+        let mut answered = q.clone();
+        answered.state_raw = "answered".into();
+        assert!(asking(&answered, "a-1", &[]).is_none(), "a closed question is not a level");
+
+        let out = l.advance(&[], 120, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].edge, Edge::Down, "the governor is told it no longer needs them");
+    }
+
+    /// The seat's instruction, as an assertion: `needs_attention`, never
+    /// `is_open`. An older binary meeting a state a newer one wrote must not
+    /// answer *nothing is up* — "I cannot read this" is a first-class reason to
+    /// fetch a person, and reporting it as quiet is this task's own fault
+    /// arriving through the module built to remove it.
+    #[test]
+    fn a_record_this_build_cannot_read_still_fetches_a_person() {
+        let mut q = question("may I land?");
+        q.state_raw = "deferred-until-tuesday".into();
+        assert!(!q.is_open(), "the premise: an unknown state is not open");
+
+        let s = asking(&q, "a-1", &[row("w1:p1", false)]).expect("and it is still somebody's");
+        assert!(s.detail.contains("cannot read"), "and it says which half it could not read");
+        assert_eq!(s.loudness(), crate::message::Kind::Direction, "wsp being confused is a person's job");
+    }
+
+    /// An acknowledged notification is nobody's. Nothing is sitting still
+    /// behind one, and a level nobody is waiting on is a backlog rather than
+    /// attention — the panel-full-of-flags failure, arriving by the one route
+    /// with nobody reading it.
+    #[test]
+    fn a_notification_that_has_been_read_is_not_a_level() {
+        let mut m = Message::new(Party::pane("w1:p1", "w1"), crate::message::Kind::Note, "landed");
+        m.about = About::Task("a-1".into());
+        assert_eq!(m.shape(), Some(Shape::Notification));
+        assert!(m.needs_attention(), "the premise: it is open and wants a disposition");
+        assert!(asking(&m, "a-1", &[]).is_none(), "and it is still not a level");
+
+        m.state_raw = "acknowledged".into();
+        assert!(asking(&m, "a-1", &[]).is_none());
+    }
+
+    /// The sender already said how much of your time this may take, so wsp does
+    /// not get a second opinion. A `stop` question reaching a hook as `note`
+    /// is the difference between a phone that rings and one that does not.
+    #[test]
+    fn a_question_is_as_loud_as_whoever_asked_it_said_it_was() {
+        let mut q = question("do NOT run git stash pop");
+        q.kind_raw = "stop".into();
+        let s = asking(&q, "a-1", &[row("w1:p1", false)]).unwrap();
+        assert_eq!(s.loudness(), crate::message::Kind::Stop);
+        assert_eq!(s.envelope(Edge::Up, "wsp", "")["kind"], "stop");
+
+        let quiet = asking(&question("which of these two?"), "a-1", &[]).unwrap();
+        assert_eq!(quiet.envelope(Edge::Up, "wsp", "")["kind"], "note");
+    }
+
+    /// A hook is handed the envelope and nothing else. Without the record's id
+    /// it can say somebody is waiting and cannot say what to answer, which is
+    /// `worklist-018` — a message stored, listed, reported delivered, and never
+    /// seen by its reader.
+    #[test]
+    fn the_envelope_names_the_question_so_its_reader_can_answer_it() {
+        let q = question("may I land?");
+        let e = asking(&q, "a-1", &[row("w1:p1", false)]).unwrap().envelope(Edge::Up, "wsp", "now");
+        assert_eq!(e["id"], q.id, "the record, so `wsp answer` has an argument");
+        assert_eq!(e["about"], "a-1", "the work, so a person knows where to look");
+        assert_eq!(e["shape"], "signal", "a level: there is no disposition owed on this");
+
+        // And a level with no record behind it carries no id at all, rather
+        // than a null for a shell script to forget to test for.
+        let stall = sig(Kind::NeedsAPerson, "a-1").envelope(Edge::Up, "wsp", "now");
+        assert!(stall.get("id").is_none());
+    }
+
+    /// An agent that asked and carried on is not sitting still, and saying it
+    /// is would train a governor to discount the line. The question is still
+    /// unanswered, so the level is still up — this changes the wording and not
+    /// the fact.
+    #[test]
+    fn an_asker_that_is_still_turning_is_not_reported_as_waiting() {
+        let q = question("when you get a moment, which of these two?");
+        let s = asking(&q, "a-1", &[row("w1:p1", true)]).expect("still unanswered, so still up");
+        assert!(s.detail.contains("still working"), "{}", s.detail);
+
+        let gone = asking(&q, "a-1", &[]).unwrap();
+        assert!(gone.detail.contains("gone"), "an asker that has been despawned: {}", gone.detail);
+    }
+
     /// The bug the second hand-built monitor shipped: `comm` against input that
     /// was not globally sorted reported the whole backlog as new on the first
     /// tick. Priming is the fix, and this asserts the *behaviour* rather than
@@ -1656,7 +2060,10 @@ mod tests {
         let prompt = vec![sig(Kind::NeedsAPerson, "a-1").loud()];
         let out = l.advance(&prompt, 1, 300);
         assert_eq!(out.len(), 1);
-        assert!(out[0].signal.loud, "and it is the loud reading, which the envelope sends as `direction`");
+        assert!(
+            out[0].signal.shouts(),
+            "and it is the loud reading, which the envelope sends as `direction`"
+        );
     }
 
     /// A stall that never settled was never said, so its going away is not news

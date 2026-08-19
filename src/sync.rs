@@ -286,6 +286,12 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         }
     }
 
+    // What is standing, for the one token here that is not about which work
+    // this is. Read once for the whole sweep, off the derivation the daemon's
+    // attention pass already made — see `attention::standing`, which is where
+    // the argument for this token lives.
+    let waiting = crate::attention::standing(store);
+
     let mut pane_count = 0;
     for a in &agents {
         let t = task_for_pane(&a.pane_id);
@@ -307,6 +313,18 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             // that would rather carry it on its own.
             ("scope", t.map(crate::cmd_agent::task_scope).or_else(|| seat.clone())),
             ("tstatus", t.map(|t| t.status().as_str().to_string())),
+            // **The one token that says somebody is waiting**, and the answer
+            // to Ed's *"we don't see a flag or any similar notification in the
+            // UI"*: every other token above describes which piece of work this
+            // is, and an agent stopped with a question drew identically to one
+            // mid-turn. The value is the signal's own word — `unanswered`,
+            // `needs-a-person`, `review` — so the sidebar and `wsp watch` say
+            // the same thing and a person learning one has learned both.
+            //
+            // Absent when nothing is standing, which is the common case and
+            // costs the row nothing: `report_pane_tokens` is given `None` and
+            // the sidebar has no column to keep.
+            ("needs", t.and_then(|t| waiting.get(&t.id)).map(|w| (*w).to_string())),
         ];
         let fingerprint = tokens
             .iter()

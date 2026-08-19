@@ -830,6 +830,31 @@ impl Message {
         self.reply_to.is_some()
     }
 
+    /// Is somebody sitting still behind this?
+    ///
+    /// [`Message::needs_attention`] narrowed by shape, and it is the population
+    /// `wsp ask` lists and `wsp watch unanswered` reports — **one definition,
+    /// because the two must never be able to disagree about whether a fleet is
+    /// quiet.** `cmd_message::open` splits it in three for a person to read;
+    /// `cmd_watch::asking` takes the union, because a level does not have
+    /// sections.
+    ///
+    /// An open *notification* is deliberately outside it. It still owes a
+    /// disposition — `wsp ack` — and nothing is waiting on it, and a level
+    /// nobody is waiting on is a backlog rather than attention. Putting one on
+    /// a notification surface is `robustness-088`'s named failure: a panel full
+    /// of flags nobody reads, which is worse than the silence it replaces.
+    ///
+    /// A record this build cannot read **is** inside it, whatever its shape,
+    /// for [`Message::needs_attention`]'s reason: *"I do not understand this"
+    /// is a first-class reason to fetch a human.*
+    pub fn wants_answering(&self) -> bool {
+        self.needs_attention()
+            && (self.shape() == Some(Shape::Question)
+                || self.shape().is_none()
+                || self.state().is_none())
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "id": self.id,

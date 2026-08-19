@@ -750,9 +750,17 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // One reading of the clock for both, so a tick can never be recorded
         // at a time the due check did not make it due for.
         let now = crate::util::epoch_secs();
+        let mut attention_moved = false;
         if pass.due(now) {
             let mut source = attention::machine_source(store);
             let emits = attention::tick(store, &mut pass, &mut source, now);
+            // An edge is exactly the moment the sidebar's `needs` token
+            // changes, and nothing else below would notice: `store.fingerprint`
+            // walks `projects/` and `tasks/`, and a level going up moves
+            // neither. Without this the token is correct and up to `REFRESH`
+            // late, which on the one signal that is *somebody is waiting on
+            // you* is the fault being fixed with a smaller number on it.
+            attention_moved = !emits.is_empty();
             if verbose {
                 for e in &emits {
                     eprintln!(
@@ -771,7 +779,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         last_fingerprint = fingerprint;
 
         let force = last_refresh.elapsed() >= REFRESH;
-        if !woken && !store_changed && !force {
+        if !woken && !store_changed && !force && !attention_moved {
             continue;
         }
         if force {

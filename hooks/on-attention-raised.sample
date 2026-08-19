@@ -15,19 +15,27 @@
 #   {"ts":…,"kind":"attention-raised","data":{
 #      "shape":"signal",          a level. Nothing to answer, nothing to close.
 #      "signal":"needs-a-person", which predicate — see `wsp watch --help`
-#      "kind":"direction",        how loud. `direction` is the one that earns a
-#                                 noise: a modal has the keyboard and one
-#                                 keypress fixes it. Everything else is `note`.
+#      "kind":"direction",        how loud. `stop` and `direction` earn a noise;
+#                                 `direction` is the reading a keypress repairs
+#                                 (a modal has the keyboard), and `stop` only
+#                                 arrives on `unanswered`, where it is the
+#                                 asker's own word and not wsp's judgement.
+#                                 Everything else is `note`.
 #      "edge":"up",               `attention-cleared` carries "down"
 #      "to":"wsp",                the seat that answers for it, or "everyone"
 #      "about":"robustness-088",  the task
 #      "text":"w4P:p1 · stopped on a prompt only a person can answer — wsp peek <id>",
 #      "held":312,"held_human":"5m"}}
 #
+# On `"signal":"unanswered"` there is one more field, `"id"`, and it is the
+# question's message id rather than anything of the level's own — a level has no
+# id. It is what turns this from a script that says somebody is waiting into one
+# that says what to type: `wsp answer <id> "…"`.
+#
 # Filtering is yours and belongs here rather than in wsp: the pass emits every
 # fact it can stand behind, and this file decides which of them is worth your
-# attention. The default below is the narrowest useful one — make a noise only
-# for the reading a keypress repairs, and log the rest.
+# attention. The default below is the narrowest useful one — make a noise for
+# the two kinds somebody has to act on now, and log the rest.
 
 set -eu
 event=$(cat)
@@ -36,8 +44,8 @@ event=$(cat)
 # installed. Both fields are wsp's own closed vocabularies, so neither is
 # free text that could match by accident.
 case $event in
-  *'"kind":"direction"'*) loud=yes ;;
-  *)                      loud=no  ;;
+  *'"kind":"stop"'*|*'"kind":"direction"'*) loud=yes ;;
+  *)                                        loud=no  ;;
 esac
 
 # Everything, always, so there is a record to read in the morning. Beside the
