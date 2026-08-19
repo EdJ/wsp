@@ -443,7 +443,7 @@ fn child_env(cmd: &mut Command, seat: &Seat, env: &BTreeMap<String, String>) {
 /// the process table looking exactly like a running one. Reporting it as alive
 /// is the same class of defect as robustness-041 with the sign flipped: an agent
 /// declared healthy while its corpse cools.
-fn alive(pids: &[u32]) -> BTreeSet<u32> {
+pub(crate) fn alive(pids: &[u32]) -> BTreeSet<u32> {
     if pids.is_empty() {
         return BTreeSet::new();
     }

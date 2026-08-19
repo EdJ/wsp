@@ -24,6 +24,7 @@ mod cmd_sandbox;
 mod cmd_spawn;
 mod cmd_task;
 mod cmd_verify;
+mod cmd_watch;
 mod cmd_worklist;
 mod daemon;
 mod detail;
@@ -105,6 +106,8 @@ const BOOL_FLAGS: &[&str] = &[
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it.
     "govern", "remove",
+    // And `wsp watch <signal>…`, whose positionals are signal names.
+    "now", "once", "status",
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
     // and the parent, and `worklist show <slug> --log`.
     "sub", "log",
@@ -478,6 +481,7 @@ fn main() {
         "unpin" => cmd_agent::unpin(&store, &args),
         "where" => cmd_agent::where_am_i(&store, &args),
         "wip" | "status" => cmd_agent::wip(&store, &args),
+        "watch" => cmd_watch::watch(&store, &args),
         "overlap" => cmd_agent::overlap(&store, &args),
         "peek" => cmd_agent::peek(&store, &args),
         "sync" => cmd_agent::sync_once(&store, &args),
@@ -683,6 +687,24 @@ fn help() {
   wsp unpin [-w ws]                 take the pin off again
   wsp where                         what project am I in, and why
   wsp wip                           everything in flight, with agents
+  wsp watch [<project>] [<signal>…]  the few facts a governor acts on, as they
+                                    become true: needs-a-person, review,
+                                    blocked, flag, agent-gone. No arguments is
+                                    this seat's whole scope. It says what it is
+                                    watching, one line per change, a heartbeat
+                                    while nothing happens, and why it stopped
+  wsp watch --now                   …or the level read on its own: everything
+                                    up right now, correct after any restart —
+                                    the one call that says "nothing is up"
+                                    rather than merely saying nothing
+  wsp watch --once                  …or one tick against the last one's ledger,
+                                    for a caller that holds no process
+  wsp watch --for 2h | --until <id> | --every 30s | --settle 5m
+                                    when to stop, how often to look, and how
+                                    long a stopped agent must stay stopped
+  wsp watch --status [--forget <k>]   who is watching, and whether they still
+                                    are; a watch whose process died is a line
+                                    in `wsp doctor` rather than a silence
   wsp overlap                       who else is standing in this tree
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,

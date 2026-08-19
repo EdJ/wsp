@@ -2173,6 +2173,137 @@ per agent, and every reader asks *who governs this?* rather than *what does this
 workspace govern*. It is state rather than store for the same reason a claim is: the
 hierarchy is committed and durable, and the agent sitting in it is neither.
 
+## Asking to be told
+
+```sh
+wsp watch                          everything this seat cares about, as it changes
+wsp watch robustness review flag   or one scope, and only two of the signals
+wsp watch --now                    what is up right now, and nothing else
+wsp watch --once                   one tick, for a caller that holds no process
+wsp watch --for 2h --until wsp-061   when to stop
+wsp watch --status                 who is watching, and whether they still are
+```
+
+Two seats built this by hand on 2026-08-19, in a shell, six times between them.
+It was **wrong three times in three different ways**, and every one of them is
+the sort of mistake that is obvious in hindsight and invisible while you are
+making it:
+
+1. **A `while true` loop that only notified on exit.** It watched all night and
+   said nothing, because the thing reporting was the process ending.
+2. **`comm` on input that was not globally sorted.** It reported the whole
+   backlog as new on the first tick.
+3. **Four monitors that re-derived the join by hand**, parsing `wip --json`'s
+   `turning` and the task's status themselves — out of a document that was
+   already carrying `needs_you`, computed correctly, seat exception and all,
+   in the same object.
+
+The third is why this is a verb rather than a snippet in the handbook.
+`robustness-051` describes *a signal wsp computes and never delivers*; this is
+worse and more useful — wsp computes it, delivers it, publishes it in the JSON,
+and a careful consumer standing directly in front of the field still did not use
+it. **That is a discoverability failure, not a plumbing one, and a subscription
+removes it: you name the thing you care about instead of knowing which field
+already answers it.** A correct hand-written loop is still the wrong shape.
+
+**What you subscribe to is a predicate, never a record.** The most valuable
+thing any of those six monitors reported was `worklist-004`: task status
+`doing`, agent stopped on a permission prompt. A watch on the task's status sees
+`doing` and says nothing, because nothing changed. A watch on the agent sees
+`blocked` and cannot tell it from a seat idling between the agents it is
+sequencing. Only the conjunction is a signal — and wsp already had it, as
+`cmd_govern::needs_a_person`. So the vocabulary is five named predicates and no
+row selectors:
+
+```
+needs-a-person   a task still open whose agent has stopped turning
+review           finished, and waiting on you
+blocked          stopped on a question
+flag             a hand up, addressed to this seat
+agent-gone       a binding whose pane is gone, or alive with the agent gone
+```
+
+`wsp watch <project>` and `--about <id>` narrow the *subject*, which is a filter
+and not a subscription. There is a sixth word, `blind`, which you cannot
+subscribe to and cannot switch off: it says wsp has lost sight of the agents,
+and it is the difference between a quiet fleet and half a world.
+
+**It subscribes to the level and streams edges only for liveness.** A poll is
+self-healing and a stream is not — one dropped event leaves a surface silently
+wrong until something unrelated moves — so `--now` is the primitive: a full read
+of what is up, correct after any restart, disconnection or missed tick. The loop
+is that read on a timer with the previous one subtracted. The diffing is inside
+the verb, on a map, so the unsorted-input bug is unrepresentable rather than
+avoided.
+
+**A stall has to hold before it is worth a line.** An agent is "stopped" for a
+few seconds between every pair of turns, so the join alone would fire on nearly
+every agent on nearly every tick. Five minutes, by default, and this is the
+watcher's one advantage over `wsp doctor`: `doctor` has no memory, so it asks a
+proxy — *nothing written to the task for an hour* — where a watch can measure
+how long the predicate has actually been true. The exception is a modal holding
+the keyboard, which is said at once, because waiting to mention a permission
+prompt is waiting to say a word.
+
+### Silence must not look like success, and it lies in five ways
+
+The failure this verb exists to prevent has five separate causes, and a partial
+answer reads exactly like a complete one.
+
+| how silence lies | what answers it |
+|---|---|
+| it never started | the opening line names the scope, the interval and what is already standing |
+| it stopped mid-run | a heartbeat every thirty minutes, carrying the standing count |
+| the process died and nobody is reading the stream | every tick writes the register; `wsp doctor` reports a watch whose pid is gone or whose ticks are stale |
+| it is running and blind | `blind` goes up, and it is the one signal exempt from priming |
+| it ended and did not say why | every exit prints its reason; a fault exits non-zero |
+
+`wsp doctor`'s line is the only check in the tree whose subject is a **reporter**
+rather than a piece of work, and it is the only thing that can tell a fleet with
+nothing to say from a watcher that stopped saying it:
+
+```
+✗ the watch on core (w9:p9) last ticked 40m ago — the process is gone, so
+  silence from it means nothing. `wsp watch --forget w9:p9` clears the record
+```
+
+**An exit condition is part of the subscription.** Each of the four monitors the
+worklist seat ran ended when its group was out rather than staying armed after
+being answered; a subscription with no natural end is one somebody has to
+remember to cancel. `--until` takes a task, a project or a list and ends when it
+is out — no open work *and* nobody holding it — `--for` is a time box, and a
+seat's watch ends when the seat is vacated, which costs nothing.
+
+**What it costs when nothing is happening.** One tick is one store sweep and
+three herdr calls: **45ms** measured on 2026-08-19 against 421 tasks with the
+fleet up, against 20ms for `wsp ls` alone. At the default sixty seconds that is
+under a tenth of a percent of one core, and the reason to say the number rather
+than assume it is that a governor runs this for a night.
+
+**It never types at its governor.** Output goes to stdout and nowhere else.
+Nothing in wsp may push text into a working agent's composer — a message
+delivered to a busy agent sits unsubmitted in it, which cost fifteen of Ed's
+instructions over three days — so a watch is something a governor *runs*, and
+`--once` is there for one that would rather not hold a process.
+
+### Where the events work lands
+
+`wsp watch` polls, and `Source` is the seam: one method, and it asks for the
+level set rather than for the news. A push implementation keeps its own
+predicate set current from whatever transport arrives and answers the same
+question out of what it is holding — so a dropped message costs one stale answer
+rather than a surface that is silently wrong. The caller does not change: it
+stops polling and starts listening, and the lines are the same. The payload is
+already the notification design's envelope rather than a second one, because
+*what crosses the wire* is a question that should be answered once.
+
+One of `core-003`'s five requirements is deliberately not here: *something landed
+on the trunk touching a file my lane is in*. It is the only one that is not a
+predicate over wsp's own state — both halves of it are git — and the event it
+would hang off does not exist yet, since `cmd_checkout.rs` writes no events at
+all and a branch reaching the trunk is invisible to everything in wsp. It lands
+as one more signal name when that line exists, with nothing above it changing.
+
 ## Moving between tasks
 
 One agent works several tasks in a sitting, so `claim` is also the verb for
@@ -3455,6 +3586,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, and the three reasons one is finished with |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
+| `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, and the five ways silence lies |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
 | `src/cmd_machine.rs` | the machines agents can be run on |

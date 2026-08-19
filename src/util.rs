@@ -326,7 +326,17 @@ fn parts(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
 
 /// `2026-08-14T16:22:51Z`
 pub fn now_iso() -> String {
-    let (y, m, d, hh, mm, ss) = parts(epoch_secs());
+    iso_at(epoch_secs())
+}
+
+/// The same stamp for an instant somebody chose.
+///
+/// Split out for the same reason [`ymd_at`] is: everything above that reads the
+/// clock is untestable by construction, and every test that wants a record
+/// written an hour ago otherwise has to build the string by hand — which is how
+/// a test comes to assert a shape the writer never produces.
+pub fn iso_at(secs: i64) -> String {
+    let (y, m, d, hh, mm, ss) = parts(secs);
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
@@ -456,6 +466,18 @@ pub fn local_ymd(stamp: &str) -> String {
 fn ymd_at(secs: i64, offset: i64) -> String {
     let (y, m, d, ..) = parts(secs + offset);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The clock an instant reads at, in the reader's own zone: `14:32`.
+///
+/// Beside [`local_ymd`] because it is the same conversion and the zone handling
+/// is fiddly enough that a second copy of it is a second thing to get wrong.
+/// Hours and minutes only — its reader is a line of watch output, where the
+/// seconds are noise and the date is the one the reader is standing in.
+pub fn local_hm(at: i64) -> String {
+    let secs = at + local_offset(at);
+    let day = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3600, (day % 3600) / 60)
 }
 
 /// The inverse of `civil_from_days`: (year, month, day) -> days since epoch.

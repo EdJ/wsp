@@ -2772,26 +2772,33 @@ impl Wip {
 }
 
 /// One agent, as `wip` wants it.
-struct WipRow {
-    project: String,
-    task: String,
-    task_id: String,
-    pane: String,
-    workspace: String,
-    state: String,
+///
+/// `pub(crate)` for `cmd_watch`, and that is not a convenience. `needs_you` is
+/// a *published* field — `wsp wip --json` has carried it beside `turning` and
+/// `seat` all along — and a watcher that recomputed the conjunction would be
+/// the fourth hand-rolled copy of [`cmd_govern::needs_a_person`] rather than
+/// the first subscriber to it. Two callers of one predicate is fine; three
+/// definitions of it is how the exception for seats gets quietly lost.
+pub(crate) struct WipRow {
+    pub(crate) project: String,
+    pub(crate) task: String,
+    pub(crate) task_id: String,
+    pub(crate) pane: String,
+    pub(crate) workspace: String,
+    pub(crate) state: String,
     /// Whether a turn is actually running in it. Beside `state` rather than
     /// derived from it at the point of drawing, because it is the answer to the
     /// question the heading asks — and because reading it off the word is the
     /// thing four censuses each got wrong in their own way.
-    turning: bool,
-    needs_you: bool,
+    pub(crate) turning: bool,
+    pub(crate) needs_you: bool,
     /// The project this pane's workspace is the governor of, if any — which is
     /// no project for every ordinary agent, and that is nearly all of them.
-    seat: Option<String>,
+    pub(crate) seat: Option<String>,
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
-fn wip_rows(w: &Wip) -> Vec<WipRow> {
+pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     let mut rows: Vec<WipRow> = Vec::new();
     for a in &w.agents {
         let bound = w
@@ -3592,7 +3599,7 @@ impl Probe {
 /// all seven and said `herdr up, 12 agents`. Nothing had been written to a task
 /// in hours. The reading that separates them was on the socket the whole time
 /// (`place::State::turn_in_flight`), and this asks it.
-enum Bound {
+pub(crate) enum Bound {
     /// A turn is in flight. This, and only this, is work happening.
     Turning,
     /// An agent is in the pane and no turn is running. Finished, stopped, or
@@ -3607,7 +3614,7 @@ enum Bound {
     Unheard,
 }
 
-fn bound_state(
+pub(crate) fn bound_state(
     pane: &str,
     agents: &[herdr::Pane],
     panes: &[herdr::Pane],
@@ -4094,6 +4101,11 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
+    // And whether anything that said it was reporting still is. The only check
+    // here whose subject is a *reporter* rather than a piece of work, and the
+    // only place in wsp that can tell a fleet with nothing to say from a
+    // watcher that stopped saying it.
+    crate::cmd_watch::health(store, &mut problems);
 
     if args.json() {
         println!("{}", json!({ "problems": problems, "notes": notes }));

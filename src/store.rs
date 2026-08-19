@@ -1398,6 +1398,41 @@ impl Store {
             .unwrap_or(0)
     }
 
+    // ---- watches ----------------------------------------------------------
+    //
+    // A watch is a process that has said it is reporting. That is a different
+    // kind of fact from everything above it: a flag, a claim and a seat all
+    // describe *work*, and this describes a *reporter* — which is why it is
+    // written down at all. A watcher that has died emits nothing, and nothing
+    // is also what a watcher over a quiet fleet emits. The register is what
+    // separates the two, and it is read by `wsp watch --status` and by
+    // `wsp doctor` rather than by the watcher itself.
+    //
+    // Keyed on the pane the watch was started in, because that is what a person
+    // reading `--status` wants to be told and what they would go and look at.
+    // A watch started outside a pane is keyed on its pid, which is the only
+    // identifier it has.
+
+    /// pane (or `pid:N`) -> watch record: scope, pid, and when it last ticked.
+    pub fn watches(&self) -> BTreeMap<String, Value> {
+        match self.read_json("watches.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_watch(&self, key: &str, value: Value) {
+        self.update_json("watches.json", |w| {
+            w.insert(key.to_string(), value);
+        });
+    }
+
+    pub fn clear_watch(&self, key: &str) -> bool {
+        let mut removed = false;
+        self.update_json("watches.json", |w| removed = w.remove(key).is_some());
+        removed
+    }
+
     pub fn set_claim(&self, task: &str, value: Value) {
         self.update_json("claims.json", |c| {
             c.insert(task.to_string(), value);
