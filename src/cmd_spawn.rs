@@ -593,6 +593,17 @@ pub(crate) fn ready(
 struct Work {
     task: Option<String>,
     project: Option<String>,
+    /// The **worklist** this spawn is being seated on, when `--govern` named
+    /// one rather than a project.
+    ///
+    /// A separate field rather than a scope in `project`, and that is the whole
+    /// reason it exists: `project` is what the pane is *standing in* — it fills
+    /// `WSP_PROJECT`, it resolves the cwd, and every reading of "where am I"
+    /// walks it — and a worklist is none of those things. A slug written into
+    /// it would give the custodian a brief about a project that does not exist,
+    /// which is precisely the near miss the `--govern` guard below refuses to
+    /// make.
+    list: Option<String>,
     /// The workspace's opening name. A claim renames it after the task a
     /// moment later — to the same thing, for a task, so the window does not
     /// change its name under whoever was already looking at it. A project
@@ -609,11 +620,29 @@ struct Work {
 /// being the thing you were just reading.
 fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
     if let Some(p) = args.get("project") {
+        // A worklist, but only for `--govern`. A list is a thing to *run*, not
+        // a place to work: it has no root to stand in and no backlog to claim
+        // out of, so `-p <slug>` on its own would open a workspace that could
+        // not answer the first question asked of it. Under `--govern` it is the
+        // obvious thing and needs no flag of its own — the seat's key is a
+        // scope, so this is the same command it always was pointed at the other
+        // half of one key space.
+        if args.has("govern") {
+            if let Some(w) = store.worklist(&p) {
+                return Ok(Work {
+                    task: None,
+                    project: None,
+                    label: crate::cmd_govern::governor_of(&w.id),
+                    list: Some(w.id),
+                });
+            }
+        }
         let proj = index.find(&p).ok_or_else(|| format!("no project matching `{p}`"))?;
         return Ok(Work {
             task: None,
             project: Some(proj.id.clone()),
             label: proj.name.clone(),
+            list: None,
         });
     }
     let needle = args
@@ -621,11 +650,22 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
         .first()
         .cloned()
         .ok_or_else(|| "usage: wsp spawn <task|-p project> [--agent]".to_string())?;
+    if args.has("govern") {
+        if let Some(w) = store.worklist(&needle) {
+            return Ok(Work {
+                task: None,
+                project: None,
+                label: crate::cmd_govern::governor_of(&w.id),
+                list: Some(w.id),
+            });
+        }
+    }
     if let Some(t) = store.find_task(&needle) {
         return Ok(Work {
             project: t.project.clone(),
             label: cmd_agent::task_label(&t).unwrap_or_else(|| t.title.clone()),
             task: Some(t.id),
+            list: None,
         });
     }
     match index.find(&needle) {
@@ -633,6 +673,7 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
             task: None,
             project: Some(proj.id.clone()),
             label: proj.name.clone(),
+            list: None,
         }),
         None => Err(format!("no task or project matching `{needle}`")),
     }
@@ -701,7 +742,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // become is the expensive one: an agent claimed onto a task and told it is
     // the custodian of everything above it.
     if args.has("govern") && work.task.is_some() {
-        eprintln!("wsp: --govern seats an agent on a project — name one, or use -p");
+        eprintln!("wsp: --govern seats an agent on a project or a worklist — name one, or use -p");
         return 2;
     }
 
@@ -808,8 +849,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // after the agent starts — the agent's `SessionStart` hook runs `wsp
     // brief`, and a slot recorded a second later is a custodian whose first
     // sight of itself is a brief about holding nothing.
+    // The scope the slot is keyed on, which is a project id or a worklist slug
+    // — see [`cmd_govern::seat_for`]. Everything below reads it as a name to
+    // record a seat under and to tell an agent what it is custodian of, and
+    // neither of those cares which of the two it is.
     let governing: Option<String> = match args.has("govern") {
-        true => work.project.clone(),
+        true => work.list.clone().or_else(|| work.project.clone()),
         false => None,
     };
     if let Some(project) = &governing {
@@ -838,7 +883,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let mut told = false;
     let mut ordered = false;
     if args.has("agent") || governing.is_some() {
-        let name = work.task.clone().or_else(|| work.project.clone()).unwrap_or_default();
+        let name = work
+            .task
+            .clone()
+            .or_else(|| work.list.clone())
+            .or_else(|| work.project.clone())
+            .unwrap_or_default();
         let how = agent_commands::of(&kind);
         // The seat is passed in because the agent is named after it, and it can
         // be passed in because `open` has happened above: the port splits opening
@@ -1425,6 +1475,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
+    /// A worklist is something to **govern** and not a place to work, and that
+    /// is the whole of what `--govern` had to learn.
+    ///
+    /// `governors.json` is keyed on a scope now — a project id or a worklist
+    /// slug — so `wsp spawn -p <slug> --govern` is the same command pointed at
+    /// the other half of one key space, and it needs no flag of its own. What
+    /// it must *not* do is write the slug into `project`: that field is what
+    /// the pane is standing in, it fills `WSP_PROJECT` and resolves the cwd,
+    /// and a custodian whose brief was about a project that does not exist is
+    /// the near miss the guard above this refuses to make.
+    #[test]
+    fn a_worklist_is_something_to_govern_rather_than_a_place_to_work() {
+        use crate::model::Worklist;
+        let store = seat("govern-list");
+        store.save_worklist(&Worklist::new("batch", "Overnight batch")).unwrap();
+        store.save_project(&Project::new("robustness")).unwrap();
+        let index = Index::new(store.projects());
+
+        let named = |flags: &[(&str, &str)]| resolve(&store, &Args::synth("spawn", &[], flags), &index);
+        let w = named(&[("project", "batch"), ("govern", "true")]).expect("a list is a scope");
+        assert_eq!(w.list.as_deref(), Some("batch"));
+        assert_eq!(w.project, None, "and not a project to stand in");
+
+        // Bare, it is the same answer: the slug is a name `--govern` knows.
+        let w = resolve(&store, &Args::synth("spawn", &["batch"], &[("govern", "true")]), &index)
+            .expect("named without -p");
+        assert_eq!(w.list.as_deref(), Some("batch"));
+
+        // Without `--govern` it is not a spawn target at all, and the message
+        // says so in the words of the thing that was asked for.
+        let err = named(&[("project", "batch")]).err().expect("a list is not a place to work");
+        assert!(err.contains("batch"), "{err}");
+        // A project still resolves exactly as it did, `--govern` or not.
+        for flags in [vec![("project", "robustness")], vec![("project", "robustness"), ("govern", "true")]] {
+            let w = named(&flags).unwrap();
+            assert_eq!(w.project.as_deref(), Some("robustness"));
+            assert_eq!(w.list, None);
+        }
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     /// Every way `--on` can be wrong, and the sentence each one earns.
     ///
     /// They are four different problems — a typo, a machine you retired, a
@@ -1488,6 +1580,7 @@ mod tests {
             task: Some("t-260817-004".into()),
             project: Some("robustness".into()),
             label: "robustness/004 · a title".into(),
+            list: None,
         };
         let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false);
         assert_eq!(o.label, "robustness/004 · a title");
@@ -1502,7 +1595,8 @@ mod tests {
 
         // A project spawn has no task, and says so by absence rather than by an
         // empty string somebody downstream has to test for.
-        let proj = Work { task: None, project: Some("robustness".into()), label: "robustness".into() };
+        let proj =
+            Work { task: None, project: Some("robustness".into()), label: "robustness".into(), list: None };
         let o = order(&proj, None, None, true);
         assert!(o.env.get("WSP_TASK").is_none());
         assert!(o.on.is_none());
@@ -1520,7 +1614,7 @@ mod tests {
     /// incantation the caller has to remember.
     #[test]
     fn a_spawned_agent_is_not_handed_the_spawning_session() {
-        let work = Work { task: None, project: None, label: "probe".into() };
+        let work = Work { task: None, project: None, label: "probe".into(), list: None };
         let o = order(&work, None, None, false);
         assert_eq!(
             o.env.get(crate::place::CHILD_MARKER).map(String::as_str),

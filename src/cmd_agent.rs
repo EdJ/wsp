@@ -150,6 +150,37 @@ pub(crate) fn standing_in(h: &Here) -> Option<String> {
     h.index.project_for_label(&w.label)
 }
 
+/// The task this pane is holding, out of the two records that say so.
+///
+/// The binding is herdr's live answer and the claim is the durable one, and the
+/// order is that: a binding names the pane in front of you, where a claim keyed
+/// on the workspace survives a restart the daemon has not reconciled yet, so a
+/// session that comes back early still knows what it was doing.
+///
+/// One rule, because there are now two readers of it — the brief, which prints
+/// what you are on, and [`crate::cmd_govern`], whose routing walk starts at the
+/// worklist this task is a member of. Two copies of a precedence rule is how
+/// the two come to disagree about which task a pane is on, and a disagreement
+/// there is a raised hand delivered to the wrong seat.
+pub(crate) fn task_in_hand(
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    claims: &std::collections::BTreeMap<String, serde_json::Value>,
+    pane: Option<&str>,
+    workspace: Option<&str>,
+) -> Option<String> {
+    pane.and_then(|p| bindings.get(p))
+        .and_then(|b| b.get("task_id"))
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            let ws = workspace?;
+            claims
+                .iter()
+                .find(|(_, c)| c.get("workspace_id").and_then(|x| x.as_str()) == Some(ws))
+                .map(|(id, _)| id.clone())
+        })
+}
+
 /// The project the caller is standing in. `-p` always wins; otherwise the
 /// precedence chain is pin > binding > claim > mandate > cwd > label.
 pub fn current_project(
@@ -817,8 +848,17 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
 /// flags to whoever is above it without touching a single flag record.
 fn addressed(store: &Store, task: &Task) -> String {
     let index = Index::new(store.projects());
-    match cmd_govern::seat_for(&store.governors(), &index, task.project.as_deref()) {
-        Some(s) => format!("raised to the {} governor · {} · x there lowers it", s.project, s.workspace),
+    // The list first, and this is the whole of what a worklist changes about a
+    // raised hand: a member of tonight's run is answered for by whoever is
+    // running it, not by whoever governs the project it happens to live in.
+    let lists = crate::worklist::Running::read(store);
+    match cmd_govern::seat_for(
+        &store.governors(),
+        &index,
+        lists.list_of(&task.id),
+        task.project.as_deref(),
+    ) {
+        Some(s) => format!("raised to the {} governor · {} · x there lowers it", s.scope, s.workspace),
         None => "raised on every panel · x there lowers it".into(),
     }
 }
@@ -873,12 +913,15 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     }
     let mut shown = 0;
 
+    // Read once for the whole list rather than per row: the answer is the same
+    // handful of files however many hands are up.
+    let lists = crate::worklist::Running::read(store);
     for (id, f) in rows {
         let task = store.task(id);
-        let seat = task
-            .as_ref()
-            .and_then(|t| cmd_govern::seat_for(&governors, &index, t.project.as_deref()));
-        let held_here = seat.as_ref().map(|s| mine.as_deref() == Some(s.project.as_str())).unwrap_or(false);
+        let seat = task.as_ref().and_then(|t| {
+            cmd_govern::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref())
+        });
+        let held_here = seat.as_ref().map(|s| mine.as_deref() == Some(s.scope.as_str())).unwrap_or(false);
         if only_mine && !held_here {
             continue;
         }
@@ -907,8 +950,8 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         // and already reads as "this is yours" to the person looking at it.
         if let Some(s) = &seat {
             second.push(match held_here {
-                true => format!("{} yours · {}", glyph_seat(), s.project),
-                false => format!("{} {} · {}", glyph_seat(), cmd_govern::governor_of(&s.project), s.workspace),
+                true => format!("{} yours · {}", glyph_seat(), s.scope),
+                false => format!("{} {} · {}", glyph_seat(), cmd_govern::governor_of(&s.scope), s.workspace),
             });
         }
         if !second.is_empty() {

@@ -498,6 +498,12 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         // it has no business knowing the names of.
         v["claim"] = store.claims().get(&t.id).cloned().unwrap_or(json!(null));
         v["worked"] = store.worked().get(&t.id).cloned().unwrap_or(json!(null));
+        // Present only while a list is running, so a reader of this payload
+        // sees what it always saw until there is one — the text half follows
+        // the same rule and for the same reason.
+        if let Some(l) = crate::worklist::Running::read(store).of(&t.id) {
+            v["list"] = json!({ "list": l.list, "group": l.group, "of": l.of });
+        }
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }
@@ -539,6 +545,22 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             p.dim(&k.id),
             p.dim(&util::pad(k.status().as_str(), 8)),
             util::truncate(&k.title, 56)
+        );
+    }
+
+    // And where it sits in the *run*, which is the other structure a task can
+    // be part of and the one the backlog cannot show. `under` says what this
+    // work is for; this says what is waiting on it — a group, a barrier behind
+    // it, and the seat that answers for a hand raised here. One line, and only
+    // while a list is actually running: a plan somebody wrote is not a fact
+    // about this task, and `wsp show` is read often enough that a line costing
+    // nothing when it says nothing is the whole of the bargain.
+    if let Some(l) = crate::worklist::Running::read(store).of(&t.id) {
+        println!(
+            "{} {}  {}",
+            p.dim(&util::pad("list", 9)),
+            l.list,
+            p.dim(&format!("group {} of {}", l.group, l.of))
         );
     }
 

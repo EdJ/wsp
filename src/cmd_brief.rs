@@ -244,6 +244,21 @@ pub(crate) struct Briefing {
     /// because which seat answers for this pane depends on the project the
     /// brief is still working out.
     pub governors: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Every task in a *running* worklist, to where it sits. One read of
+    /// `worklists/`, and empty in the ordinary state — see
+    /// [`crate::worklist::Running`]. Composed against for two different
+    /// questions: which group the task in hand is in, and the front of the
+    /// walk that finds the seat answering for it.
+    pub lists: crate::worklist::Running,
+    /// Where the list this workspace *governs* has got to, when the seat it
+    /// holds is on a worklist rather than a project.
+    ///
+    /// Read here rather than worked out in `compose`, which reads nothing that
+    /// is not in `b`: a position is a walk over the store, and it is the one
+    /// fact in a brief that costs more than a lookup. Nothing is spent on it
+    /// unless this pane is a custodian and the thing it is custodian of is a
+    /// list, which is one pane on the machine on the nights there is one at all.
+    pub seat_at: Option<crate::worklist::Position>,
     /// The store's own rules, already capped.
     pub rules: Option<String>,
     /// Where this pane resolved to. Taken in rather than worked out here: the
@@ -263,10 +278,18 @@ impl Briefing {
     pub(crate) fn live(store: &Store, args: &Args) -> Briefing {
         let world = overlap::World::live(store);
         let env = herdr::Env::read();
+        let governors = store.governors();
+        let seat_at = env
+            .workspace_id
+            .as_deref()
+            .and_then(|ws| cmd_govern::governs(&governors, ws))
+            .and_then(|scope| crate::worklist::running_position(store, &scope));
         Briefing {
             project: current_project(store, args, &world.index).unwrap_or(None),
             mandate: cmd_mandate::current(store, env.workspace_id.as_deref()),
-            governors: store.governors(),
+            lists: crate::worklist::Running::read(store),
+            seat_at,
+            governors,
             rules: rules(store),
             // The seat, through `my_pane`'s one reading of it, so that this
             // answers for an agent a supervisor is hosting as well as one in a
@@ -324,7 +347,17 @@ pub(crate) struct Brief {
     /// thousands of times a night for a fact that is always the same.
     pub seat: Option<(cmd_govern::Seat, bool)>,
 
-    /// The project this pane's workspace is the governor of, if it is one.
+    /// Which group of a running worklist the task in hand is a member of.
+    ///
+    /// One line, and only under a running list: `list  batch  group 2 of 4`.
+    /// It is what an agent cannot work out from anywhere else — that the work
+    /// in its hands is part of a run, that something is waiting at a barrier
+    /// behind it, and which seat its raised hands reach. `None` for every agent
+    /// on every ordinary night, and it draws nothing at all: the same bargain
+    /// [`Brief::seat`] makes, for the same reason.
+    pub list: Option<crate::worklist::Placing>,
+
+    /// The scope this pane's workspace is the governor of, if it is one.
     ///
     /// The second half of the seat, and a different question from it. `seat`
     /// above answers *who coordinates the work in front of me* by walking up
@@ -338,6 +371,14 @@ pub(crate) struct Brief {
     /// and it matters for the same reason: this is the output every request of
     /// every session pays for.
     pub custodian: Option<String>,
+
+    /// Where that list has got to, when what this pane governs is a worklist.
+    ///
+    /// The seat line names the position instead of a project, because for a
+    /// governor of a list *that is the job*: which group is being waited on is
+    /// the whole state of the thing it is holding. `None` when the seat is on a
+    /// project, which is every seat until a list is running.
+    pub seat_at: Option<crate::worklist::Position>,
 
     /// The `wsp checkout` tree this pane is standing in, when it is in one.
     ///
@@ -388,22 +429,13 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     // What this pane is on. The binding is the live answer; the claim is the
     // durable one and outlives a restart, so a session that comes back before
     // the daemon has reconciled still knows what it was doing.
-    let mine: Option<&Task> = b
-        .pane
-        .as_ref()
-        .and_then(|p| b.world.bindings.get(p))
-        .and_then(|x| x.get("task_id"))
-        .and_then(|t| t.as_str())
-        .or_else(|| {
-            b.workspace.as_deref().and_then(|ws| {
-                b.world
-                    .claims
-                    .iter()
-                    .find(|(_, c)| c.get("workspace_id").and_then(|x| x.as_str()) == Some(ws))
-                    .map(|(id, _)| id.as_str())
-            })
-        })
-        .and_then(|id| tasks.iter().find(|t| t.id == id));
+    let mine: Option<&Task> = cmd_agent::task_in_hand(
+        &b.world.bindings,
+        &b.world.claims,
+        b.pane.as_deref(),
+        b.workspace.as_deref(),
+    )
+    .and_then(|id| tasks.iter().find(|t| t.id == id));
 
     // The backlog for this project, minus whatever is already in hand.
     let scope: Option<Vec<String>> = b.project.as_deref().map(|p| index.subtree(p));
@@ -563,10 +595,23 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         // no mandate is left alone: an agent that has to ask before it takes
         // anything is waiting on a person, not looking.
         looking: (mine.is_none() && b.mandate.is_some()).then(|| !open.is_empty()),
-        seat: cmd_govern::seat_for(&b.governors, index, b.project.as_deref()).map(|s| {
+        // The task in hand rather than only the project it lives in, because
+        // the first step of the walk is keyed on the task: an agent working a
+        // member of tonight's list is answered for by whoever is running the
+        // list. With nothing running this is `None` and the walk is the
+        // ancestor walk it was.
+        seat: cmd_govern::seat_for(
+            &b.governors,
+            index,
+            mine.and_then(|t| b.lists.list_of(&t.id)),
+            b.project.as_deref(),
+        )
+        .map(|s| {
             let mine = b.workspace.as_deref() == Some(s.workspace.as_str());
             (s, mine)
         }),
+        list: mine.and_then(|t| b.lists.of(&t.id)).cloned(),
+        seat_at: b.seat_at.clone(),
         custodian: b
             .workspace
             .as_deref()
@@ -611,7 +656,12 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
         "workspace": b.workspace,
         "mandate": r.mandate,
         "seat": r.seat.as_ref().map(|(s, mine)| json!({
-            "project": s.project, "workspace": s.workspace, "pane": s.pane, "mine": mine,
+            // `project` is kept as the key while the value has become a
+            // scope — a project id or a worklist slug. The bar this change is
+            // held to is that with no worklist running every output in this
+            // tree is byte-for-byte what it was, and a renamed key breaks a
+            // reader for the benefit of a word.
+            "project": s.scope, "workspace": s.workspace, "pane": s.pane, "mine": mine,
         })),
         "custodian": r.custodian,
         "task": r.mine.as_ref().map(|t| t.json()),
@@ -622,6 +672,14 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
         "rules": r.rules,
         "tree": r.own_tree,
     });
+    // Written in rather than declared above, so a payload with no worklist
+    // running is byte-for-byte the payload it always was. A `null` here would
+    // be a key of its own kind of lie — the absence of a list is not a list
+    // that is nowhere — and it would be paid for by every reader for the
+    // benefit of none.
+    if let Some(l) = &r.list {
+        v["list"] = json!({ "list": l.list, "group": l.group, "of": l.of });
+    }
     // The same reckoning as the text, and gated the same way — a `--json`
     // caller that grew the payload without asking for it would be the mode
     // split defeated through the other door.
@@ -815,21 +873,38 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // workspace holds, where the seat line can only name the nearest, which for
     // an agent answering for `wsp` while standing in `robustness` is the wrong
     // half of its job.
-    if let Some(proj) = &r.custodian {
+    if let Some(scope) = &r.custodian {
+        // A seat on a worklist says where the run is, because for the agent
+        // holding it that *is* the position: which group is being waited on is
+        // the whole state of the thing in its hands, and it is the one fact
+        // that changes under it while it is not looking. A seat on a project
+        // has no such number and the line is what it always was.
+        let at = r.seat_at.as_ref().map(|pos| match pos.at {
+            Some(at) => format!("group {at} of {}", pos.of),
+            None => "every group finished".to_string(),
+        });
         row(
             "seat",
-            format!(
-                "{}  {}",
-                p.bold(&format!("governor of {proj}")),
-                p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
-            ),
+            match &at {
+                Some(at) => format!(
+                    "{}  {}  {}",
+                    p.bold(&format!("governor of {scope}")),
+                    p.dim(at),
+                    p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
+                ),
+                None => format!(
+                    "{}  {}",
+                    p.bold(&format!("governor of {scope}")),
+                    p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
+                ),
+            },
         );
     } else if let Some((s, mine)) = &r.seat {
         row(
             "seat",
             match mine {
-                true => format!("{}  {}", p.bold(&s.project), p.dim("yours — wsp flag --seat is your inbox")),
-                false => format!("{}  {}", p.bold(&s.project), p.dim("coordinating here · wsp flag <id> reaches it")),
+                true => format!("{}  {}", p.bold(&s.scope), p.dim("yours — wsp flag --seat is your inbox")),
+                false => format!("{}  {}", p.bold(&s.scope), p.dim("coordinating here · wsp flag <id> reaches it")),
             },
         );
     }
@@ -853,6 +928,22 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             }
             if r.under_mine > 0 {
                 row("", p.dim(&format!("{} sub-task(s) open beneath it", r.under_mine)));
+            }
+            // What it is part of the *other* way. `under` is the backlog's
+            // shape and this is the run's: which list picked this task up and
+            // which group of it, so an agent knows there is a barrier behind it
+            // and — with the seat line above — who is standing at it. Nothing
+            // at all on a night with no worklist running, which is every night
+            // so far.
+            if let Some(l) = &r.list {
+                row(
+                    "list",
+                    format!(
+                        "{}  {}",
+                        p.bold(&l.list),
+                        p.dim(&format!("group {} of {}", l.group, l.of))
+                    ),
+                );
             }
         }
         // A custodian holding nothing is not an agent that has failed to claim
@@ -1096,6 +1187,10 @@ mod tests {
                 claims: std::collections::BTreeMap::new(),
             },
             mandate: Some("wsp".into()),
+            // Nothing running, which is the baseline every line below is
+            // measured against.
+            lists: crate::worklist::Running::default(),
+            seat_at: None,
             // Nobody coordinating. The ordinary state, and the baseline the
             // seat tests below add a seat to: the brief has to be identical
             // without one.
@@ -1118,6 +1213,77 @@ mod tests {
         assert!(!text.contains("seat"), "{text}");
     }
 
+    /// The same test, and the same bar, for the worklist line: **with nothing
+    /// running the brief is byte-for-byte the brief it was.** A worklist is a
+    /// thing a handful of nights a month have and every other session does not,
+    /// and this output is paid for on every request of every one of them.
+    #[test]
+    fn a_brief_with_nothing_running_says_nothing_about_a_list() {
+        let r = compose(&briefing());
+        assert!(r.list.is_none(), "nothing is running, so this pane is in no group");
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(!text.contains("list"), "{text}");
+    }
+
+    /// And when there is one, it is one line: which list picked this task up
+    /// and which group of it.
+    ///
+    /// The group is the *membership* rather than where the run has got to —
+    /// what an agent wants to know is that there is a barrier behind the work
+    /// in its hands and who is standing at it, and both of those are facts
+    /// about its own group. Beside `under`, because the two are the same
+    /// question asked of the two structures a task can be in: the backlog says
+    /// what this work is for, the run says what is waiting on it.
+    #[test]
+    fn a_task_in_a_running_list_is_told_which_group_it_is_in() {
+        let mut r = compose(&briefing());
+        r.list = Some(crate::worklist::Placing { list: "batch".into(), group: 2, of: 4 });
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("list"), "{text}");
+        assert!(text.contains("batch"), "{text}");
+        assert!(text.contains("group 2 of 4"), "{text}");
+    }
+
+    /// A governor seated on a worklist is told where the run is, and that is
+    /// the seat line naming the list and its position instead of a project.
+    ///
+    /// For the agent holding it that *is* the position: which group is being
+    /// waited on is the whole state of the thing in its hands, and it is the
+    /// one fact that moves under it while it is not looking. A seat on a
+    /// project has no such number and the line is unchanged.
+    #[test]
+    fn a_governor_of_a_list_is_told_where_the_run_has_got_to() {
+        let mut r = compose(&briefing());
+        r.custodian = Some("batch".into());
+        // `Settled` because that is what a *reading* verb asks — see
+        // `worklist::running_position`, which is where this comes from live.
+        // The two members lists are the barrier's and the sweep's business and
+        // the seat line reads neither.
+        let at = |at| crate::worklist::Position {
+            at,
+            of: 5,
+            members: Vec::new(),
+            passed: Vec::new(),
+            reading: crate::worklist::Reading::Settled,
+        };
+        r.seat_at = Some(at(Some(2)));
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("governor of batch"), "{text}");
+        assert!(text.contains("group 2 of 5"), "{text}");
+
+        // Finished, which is a different thing from the list being `done`:
+        // every group has passed and somebody has to say the run is over.
+        r.seat_at = Some(at(None));
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("every group finished"), "{text}");
+
+        // And a seat on a project says what it always said.
+        r.seat_at = None;
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("governor of batch"), "{text}");
+        assert!(!text.contains("group"), "{text}");
+    }
+
     /// And when there is one, it is one line naming the project rather than the
     /// workspace: an agent does not address a raised hand at a herdr id, it
     /// raises it on a task and the chain decides where that lands.
@@ -1129,7 +1295,7 @@ mod tests {
             json!({ "workspace": "w9", "host": util::hostname() }),
         );
         let r = compose(&b);
-        assert_eq!(r.seat.as_ref().map(|(s, mine)| (s.project.as_str(), *mine)), Some(("wsp", false)));
+        assert_eq!(r.seat.as_ref().map(|(s, mine)| (s.scope.as_str(), *mine)), Some(("wsp", false)));
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("wsp flag <id> reaches it"), "{text}");
     }
@@ -1273,6 +1439,8 @@ mod tests {
                 claims: std::collections::BTreeMap::new(),
             },
             mandate: None,
+            lists: crate::worklist::Running::default(),
+            seat_at: None,
             governors: std::collections::BTreeMap::new(),
             rules: None,
             project: None,

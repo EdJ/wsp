@@ -508,6 +508,102 @@ fn landing(repos: &mut Repos, t: &Task) -> Landing {
     }
 }
 
+// ---- where a task sits in a run -----------------------------------------
+//
+// Membership rather than progress, and the routing step in front of
+// `cmd_govern::seat_for`. Appended as one block: `worklist-005` and
+// `worklist-006` are both adding to this file in the same group, and two
+// blocks at the end of it merge where two sets of interleaved edits do not.
+
+/// Where a task sits in a running worklist: which list, and which of its
+/// groups.
+///
+/// **Membership, not progress.** `group` is the ordinal of the group this task
+/// is a member of, which is what `group 2 of 4` on a task reads off, where
+/// [`position`] answers the different question of which group the *run* has
+/// got to. The two are the same number only while the front of the queue is
+/// what is being worked, and a reader looking at one task wants the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placing {
+    /// The slug, which is also the scope its seat is keyed on — see
+    /// [`crate::cmd_govern::seat_for`], whose first step is this.
+    pub list: String,
+    /// 1-based, because it is the number printed and the number typed.
+    pub group: usize,
+    pub of: usize,
+}
+
+/// Every task in a *running* worklist, and where each one sits.
+///
+/// One read of `worklists/`, asked per task afterwards. Routing wants it once
+/// per raised hand and `wsp flag` once per row, and a lookup that opened the
+/// directory again for every question would read the same handful of files a
+/// hundred times to answer `None` a hundred times.
+///
+/// **The ordinary state is empty and costs a failed `read_dir`.** That is the
+/// same bargain the governors map already makes — no seats anywhere is one
+/// missing file and every behaviour unchanged — and it is what lets the step
+/// this feeds sit in front of routing without being paid for by a tree that
+/// has never made a worklist.
+///
+/// **Only running lists are in it.** A draft or held list is a plan, and a task
+/// may be in as many plans as somebody cares to write; it is the *run* that
+/// gives one of them a claim on where a raised hand goes. A task that somehow
+/// appears in two running lists answers with the first in slug order rather
+/// than with neither — the verbs are what stop that happening, and a routing
+/// question asked at 3am wants an answer, not a diagnosis.
+///
+/// [`Default`] is the ordinary state spelled out: nothing running, every
+/// answer `None`. It is what a caller composing against a fixture wants and
+/// what a store with no `worklists/` reads as.
+#[derive(Default)]
+pub struct Running {
+    at: BTreeMap<String, Placing>,
+}
+
+impl Running {
+    pub fn read(store: &Store) -> Running {
+        let mut at: BTreeMap<String, Placing> = BTreeMap::new();
+        for w in store.worklists().iter().filter(|w| w.status().is_running()) {
+            let groups = w.groups();
+            for (i, g) in groups.iter().enumerate() {
+                for m in &g.members {
+                    at.entry(m.clone()).or_insert(Placing {
+                        list: w.id.clone(),
+                        group: i + 1,
+                        of: groups.len(),
+                    });
+                }
+            }
+        }
+        Running { at }
+    }
+
+    pub fn of(&self, task: &str) -> Option<&Placing> {
+        self.at.get(task)
+    }
+
+    /// The list a task is in, which is the only half routing needs.
+    pub fn list_of(&self, task: &str) -> Option<&str> {
+        self.at.get(task).map(|p| p.list.as_str())
+    }
+}
+
+/// Where the run is up to, for a caller that has a slug rather than a record —
+/// the seat line's half of [`Running`].
+///
+/// `None` where the slug is not a worklist, and where it is one that is not
+/// running: a seat may be taken on a list before it starts, and a list that has
+/// not started is not anywhere yet.
+///
+/// [`Reading::Settled`] because this is a *reading* verb's line. The landed
+/// reading is a git process per member and belongs to the barrier, which is the
+/// one caller whose answer has to be a fact rather than a view.
+pub fn running_position(store: &Store, list: &str) -> Option<Position> {
+    let w = store.worklist(list).filter(|w| w.status().is_running())?;
+    Some(position(store, &w, Reading::Settled))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,5 +975,79 @@ mod tests {
         let p = position(&store, &Worklist::new("batch", "Overnight batch"), Reading::Landed);
         assert!(p.finished());
         assert_eq!(p.of, 0);
+    }
+
+    /// Membership, read the way routing reads it: which list a task is in and
+    /// which group of it — and **only while that list is running**.
+    ///
+    /// The status half is the load-bearing one. A draft list is a plan, and
+    /// somebody planning tomorrow night into a second list must not move where
+    /// tonight's raised hands are delivered; the run is what gives one list a
+    /// claim on a task. `held` is the same rule read from the other end: a run
+    /// somebody stopped has stopped answering for its members too.
+    #[test]
+    fn only_a_running_list_says_where_a_task_sits() {
+        let (_env, store, _repo) = scratch("running");
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            task(&store, id, "todo");
+        }
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
+
+        // Drafted and not started: a plan, and no claim on anything in it.
+        store.save_worklist(&w).unwrap();
+        assert_eq!(Running::read(&store).of("wsp-1"), None, "a draft list is not a run");
+
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let r = Running::read(&store);
+        assert_eq!(
+            r.of("wsp-2"),
+            Some(&Placing { list: "batch".into(), group: 2, of: 2 }),
+            "the group it is a member of, not the group the run is at"
+        );
+        assert_eq!(r.list_of("wsp-1").as_deref(), Some("batch"));
+        assert_eq!(r.of("wsp-9"), None, "a task nobody has listed");
+
+        // Stopped. The members are still written down and the run is not
+        // answering for them any more.
+        w.set_status(crate::model::WorklistStatus::Held);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(Running::read(&store).of("wsp-1"), None, "a held run has stopped answering");
+    }
+
+    /// The ordinary state, which is the one that has to cost nothing: a store
+    /// that has never made a worklist reads as an empty map rather than as an
+    /// error, and every question of it is `None`.
+    #[test]
+    fn a_store_with_no_worklists_is_simply_nothing_running() {
+        let (_env, store, _repo) = scratch("none");
+        task(&store, "wsp-1", "todo");
+        assert_eq!(Running::read(&store).of("wsp-1"), None);
+        assert_eq!(running_position(&store, "batch"), None, "and no list is anywhere");
+    }
+
+    /// Where the *run* is, for a caller holding a slug — and only for a list
+    /// that is running. A seat may be taken on a list before it starts, which
+    /// is how somebody comes to be sitting there to start it, and a list that
+    /// has not started is not anywhere yet.
+    #[test]
+    fn a_run_has_a_position_and_a_plan_does_not() {
+        let (_env, store, _repo) = scratch("run-position");
+        for id in ["wsp-1", "wsp-2"] {
+            task(&store, id, "todo");
+        }
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2\n");
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+
+        let at = running_position(&store, "batch").expect("it is running");
+        assert_eq!((at.at, at.of), (Some(1), 2));
+
+        task(&store, "wsp-1", "review");
+        assert_eq!(running_position(&store, "batch").unwrap().at, Some(2), "and it moves on its own");
+
+        w.set_status(crate::model::WorklistStatus::Draft);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(running_position(&store, "batch"), None, "a plan is not a run");
     }
 }

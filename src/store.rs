@@ -410,7 +410,6 @@ impl Store {
     /// Every worklist in the store, by slug — `done` ones included, for the
     /// reason a retired machine is still a row: a worklist is a plan, and the
     /// history of a plan is the thing worth keeping about it.
-    #[allow(dead_code)] // the verbs that read it are the next group; see `model`
     pub fn worklists(&self) -> Vec<Worklist> {
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(self.worklists_dir()) else {

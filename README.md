@@ -3338,7 +3338,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, and the three reasons one is finished with |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
-| `src/cmd_govern.rs` | the custodial slot on a project: who answers for its raised hands, and how you talk to them |
+| `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
 | `src/cmd_machine.rs` | the machines agents can be run on |

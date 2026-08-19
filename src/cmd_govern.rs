@@ -89,6 +89,33 @@
 //! in this tree unchanged. That is the whole answer to "what happens when there
 //! is no governor", and it is why nothing here has a default to configure.
 //!
+//! # The key is a **scope**, and a running worklist is asked first
+//!
+//! `governors.json` is keyed on a project id *or* a worklist slug, and
+//! [`seat_for`] tries the worklist before the project chain:
+//!
+//!     a task in a *running* worklist  ->  that worklist's seat
+//!     otherwise, its project          ->  that project's seat, then its parents
+//!     otherwise                       ->  every panel
+//!
+//! **The routing had to move with the work, because moving it is what the work
+//! was being moved for.** The `batch` was made a project *because* a governor
+//! seat is per-project and flag routing follows it, which cost 26 tasks a move
+//! into a project and a move back out. A worklist references its members
+//! instead, so a hand raised on `render-071` at 3am reaches whoever is running
+//! the batch tonight rather than whoever governs `render` in general — and
+//! nothing has to be moved for that to be true.
+//!
+//! The step in front is **not** a second escalation policy. It is one more
+//! level on the same walk, and it does not stop at a list nobody is sitting in:
+//! a worklist with no seat falls through to the project chain, which is where a
+//! list composed out of one backlog was being answered for anyway.
+//!
+//! One key space, both ways — `Store::scope_taken` is where that is enforced,
+//! and it is what buys `wsp govern <slug>` with no new flag. Only the *routing*
+//! asks whether a list is running: a seat is taken on a list before it starts,
+//! because that is how somebody comes to be there to start it.
+//!
 //! # A coordination point, not an approval gate
 //!
 //! Nothing in that night's work needed permission from the seat. It needed
@@ -131,14 +158,15 @@ use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
 
-/// A seat, resolved: which project it governs and where it is sitting.
+/// A seat, resolved: which scope it governs and where it is sitting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seat {
-    /// The project the record is filed under — which is the project *governed*,
-    /// and not necessarily the one that was asked about. [`seat_for`] walks up,
-    /// so a flag on a `data` task can resolve to the `wsp` seat, and the reader
-    /// wants to be told which.
-    pub project: String,
+    /// The scope the record is filed under — a project id or a worklist slug —
+    /// and it is the scope *governed*, not necessarily the one that was asked
+    /// about. [`seat_for`] walks, so a flag on a `data` task can resolve to the
+    /// `wsp` seat and a flag on a member of tonight's list to the list's, and
+    /// the reader wants to be told which.
+    pub scope: String,
     pub workspace: String,
     /// The pane the agent was in when it took the seat. Display and the despawn
     /// guard only — it goes stale the moment that agent is restarted, and
@@ -163,7 +191,7 @@ pub struct Seat {
     pub cwd: String,
 }
 
-/// A slot on a project: the position, and whoever is in it now.
+/// A slot on a project or a worklist: the position, and whoever is in it now.
 ///
 /// [`Seat`] is the occupancy and this is the post. The difference is the whole
 /// of "it outlives its occupant": a slot whose agent has gone is a slot with
@@ -172,7 +200,8 @@ pub struct Seat {
 /// went with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
-    pub project: String,
+    /// The scope the post is on — see [`Seat::scope`].
+    pub scope: String,
     /// Filled, on this machine. `None` covers both an empty slot and one held
     /// from another host, which are the same thing from here: nobody you can
     /// reach. `host` below says which.
@@ -208,8 +237,8 @@ impl Slot {
 pub fn slots(governors: &BTreeMap<String, Value>) -> Vec<Slot> {
     governors
         .iter()
-        .map(|(project, rec)| Slot {
-            occupant: seat_of(project, rec),
+        .map(|(scope, rec)| Slot {
+            occupant: seat_of(scope, rec),
             host: rec.get("host").and_then(Value::as_str).unwrap_or_default().to_string(),
             since: rec
                 .get("since")
@@ -217,7 +246,7 @@ pub fn slots(governors: &BTreeMap<String, Value>) -> Vec<Slot> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            project: project.clone(),
+            scope: scope.clone(),
         })
         .collect()
 }
@@ -227,7 +256,7 @@ pub fn slots(governors: &BTreeMap<String, Value>) -> Vec<Slot> {
 /// A workspace id is herdr's and means nothing on another host — the same
 /// reason a claim and a mandate each carry one. A seat on another machine is
 /// not a seat you can reach, so it reads as no seat rather than as a wrong one.
-fn seat_of(project: &str, rec: &Value) -> Option<Seat> {
+fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
     let host = rec.get("host").and_then(Value::as_str).unwrap_or("");
     if !host.is_empty() && host != util::hostname() {
         return None;
@@ -240,7 +269,7 @@ fn seat_of(project: &str, rec: &Value) -> Option<Seat> {
         return None;
     }
     Some(Seat {
-        project: project.to_string(),
+        scope: scope.to_string(),
         workspace: workspace.to_string(),
         pane: rec.get("pane").and_then(Value::as_str).unwrap_or_default().to_string(),
         since: rec.get("since").and_then(Value::as_str).unwrap_or_default().to_string(),
@@ -253,31 +282,44 @@ fn str_at(rec: &Value, key: &str) -> String {
     rec.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
-/// The seat responsible for work in `project`: its own, or the nearest one
-/// above it.
+/// The seat responsible for a piece of work: the running worklist it is in, or
+/// the nearest seat above its project.
 ///
-/// The escalation the task asked about, and it is an ancestor walk rather than
-/// a policy. `robustness` has a seat and `wsp` has a seat: a hand raised in
-/// `robustness` reaches the first, and the same hand raised while that seat is
-/// away reaches the second. Nothing decides to escalate — the walk simply does
-/// not stop at a level that has nobody in it, which is also why standing down
-/// needs no hand-over.
+/// The escalation the task asked about, and it is a walk rather than a policy.
+/// `robustness` has a seat and `wsp` has a seat: a hand raised in `robustness`
+/// reaches the first, and the same hand raised while that seat is away reaches
+/// the second. Nothing decides to escalate — the walk simply does not stop at a
+/// level that has nobody in it, which is also why standing down needs no
+/// hand-over. **The worklist step obeys that same rule and is not an exception
+/// to it**: a list with no seat, or one whose agent has stood down, falls
+/// through to the project chain rather than routing to nobody.
+///
+/// `list` is the front of the walk — the *running* worklist this task is a
+/// member of, and `None` for the ordinary state where nothing is running. It
+/// is a parameter rather than something read here because the rule is a map
+/// lookup repeated over keys in priority order, and holds no store: one read of
+/// `worklists/` ([`crate::worklist::Running`]) serves every question a command
+/// asks, where a store read inside this would repeat it per raised hand.
 pub fn seat_for(
     governors: &BTreeMap<String, Value>,
     index: &Index,
+    list: Option<&str>,
     project: Option<&str>,
 ) -> Option<Seat> {
-    let project = project?;
     if governors.is_empty() {
         return None;
     }
-    std::iter::once(project.to_string())
-        .chain(index.ancestors(project))
-        .find_map(|p| governors.get(&p).and_then(|rec| seat_of(&p, rec)))
+    let above = project
+        .into_iter()
+        .flat_map(|p| std::iter::once(p.to_string()).chain(index.ancestors(p)));
+    list.map(str::to_string)
+        .into_iter()
+        .chain(above)
+        .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
 }
 
-/// The project this workspace is the custodian of, if it is the custodian of
-/// one.
+/// The scope this workspace is the custodian of — a project or a worklist — if
+/// it is the custodian of one.
 ///
 /// **One agent, one governorship.** Ed, 2026-08-17, reversing what
 /// t-260817-013 built for. That task argued a night coordinating `robustness`
@@ -556,12 +598,12 @@ fn stood_down(rec: &Value) -> Value {
 /// filtered out here the way [`seat_of`] filters it — a resume names the host
 /// it is going to, and refusing to *read* a seat on another machine would make
 /// `wsp resume` unable to say "that seat is on mb2" at all.
-pub fn last_seat(governors: &BTreeMap<String, Value>, project: &str) -> Option<Seat> {
-    let rec = governors.get(project)?;
+pub fn last_seat(governors: &BTreeMap<String, Value>, scope: &str) -> Option<Seat> {
+    let rec = governors.get(scope)?;
     let of = |r: &Value| {
         let workspace = str_at(r, "workspace");
         (!workspace.is_empty()).then(|| Seat {
-            project: project.to_string(),
+            scope: scope.to_string(),
             workspace,
             pane: str_at(r, "pane"),
             since: str_at(r, "since"),
@@ -661,7 +703,37 @@ pub fn occupant(seat: &Seat) -> Option<herdr::Pane> {
         .cloned()
 }
 
-/// `wsp govern [<project>] [--clear|--remove|--tell "…"]`
+/// What a name means as a **scope**: a worklist slug, or a project.
+///
+/// One key space, enforced at the moment a name is handed out
+/// (`Store::scope_taken`), so at most one of the two can answer and the order
+/// settles nothing — except between an exact name and a fuzzy one. That is why
+/// the exact worklist is asked before [`Index::find`], whose last resort is a
+/// unique id prefix, and the fuzzy worklist after it: a list called `batch`
+/// must not lose its own name to a project whose id merely begins with it.
+///
+/// **The status is not asked.** A seat is taken on a list before it runs —
+/// that is how somebody comes to be sitting there to start it — and it is only
+/// the routing in [`seat_for`] that cares whether the run has begun.
+fn scope_of(store: &Store, index: &Index, needle: &str) -> Option<String> {
+    let n = needle.trim().to_ascii_lowercase();
+    if n.is_empty() {
+        return None;
+    }
+    if store.worklist(&n).is_some() {
+        return Some(n);
+    }
+    if let Some(proj) = index.find(&n) {
+        return Some(proj.id.clone());
+    }
+    let mut near = store.worklists().into_iter().filter(|w| w.id.starts_with(&n));
+    match (near.next(), near.next()) {
+        (Some(w), None) => Some(w.id),
+        _ => None,
+    }
+}
+
+/// `wsp govern [<scope>] [--clear|--remove|--tell "…"]`
 pub fn govern(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
@@ -681,8 +753,8 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         return report(store, &index, args, workspace.as_deref());
     };
 
-    let Some(proj) = index.find(&needle) else {
-        eprintln!("wsp: no such project `{needle}`");
+    let Some(scope) = scope_of(store, &index, &needle) else {
+        eprintln!("wsp: no such project or worklist `{needle}`");
         return 1;
     };
 
@@ -717,7 +789,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
                 Err(code) => return code,
             },
         };
-        return tell(&governors, &proj.id, &text, args);
+        return tell(&governors, &scope, &text, args);
     }
 
     let Some(ws) = workspace else {
@@ -737,14 +809,19 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     // rather than after it. One agent holds one governorship, so `take` hands
     // the old one back — and a hand-over that happens silently is one you find
     // out about from a panel a day later.
-    let handed_back = governs(&governors, &ws).filter(|p| p != &proj.id);
-    let displaced = take(store, &proj.id, &ws, &pane);
+    let handed_back = governs(&governors, &ws).filter(|p| p != &scope);
+    let displaced = take(store, &scope, &ws, &pane);
 
     if args.json() {
         println!(
             "{}",
             json!({
-                "project": proj.id,
+                // The key keeps the word `project` while the value has become a
+                // scope, on the bar this change is held to: with no worklist
+                // running every output in this tree is byte-for-byte what it
+                // was, and a renamed key is a broken reader for the benefit of
+                // a name.
+                "project": scope,
                 "workspace": ws,
                 "displaced": displaced.map(|s| s.workspace),
                 "stood_down_from": handed_back,
@@ -752,7 +829,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         );
         return 0;
     }
-    println!("{} {}", p.cyan("▣"), p.bold(&proj.id));
+    println!("{} {}", p.cyan("▣"), p.bold(&scope));
     if let Some(was) = displaced {
         println!("  {}", p.dim(&format!("taken from {}", was.workspace)));
     }
@@ -779,7 +856,7 @@ fn told(args: &Args) -> String {
     }
 }
 
-/// `wsp govern <project> --tell "…"` — a sentence for whoever is in the slot.
+/// `wsp govern <scope> --tell "…"` — a sentence for whoever is in the slot.
 ///
 /// The surface the position was missing. A person has been directing the
 /// governor all night through a terminal that happens to contain it, and wsp
@@ -793,7 +870,7 @@ fn told(args: &Args) -> String {
 /// word to one that is in the middle of a night's sequencing. Emptying the
 /// governor's context to speak to it would destroy the one thing the position
 /// exists to hold.
-fn tell(governors: &BTreeMap<String, Value>, project: &str, text: &str, args: &Args) -> i32 {
+fn tell(governors: &BTreeMap<String, Value>, scope: &str, text: &str, args: &Args) -> i32 {
     use crate::place::Seat as Pane;
 
     let text = text.trim();
@@ -801,12 +878,12 @@ fn tell(governors: &BTreeMap<String, Value>, project: &str, text: &str, args: &A
         eprintln!("wsp: nothing to say");
         return 2;
     }
-    let Some(seat) = governors.get(project).and_then(|rec| seat_of(project, rec)) else {
-        eprintln!("wsp: no seat on `{project}` — wsp govern {project} fills it");
+    let Some(seat) = governors.get(scope).and_then(|rec| seat_of(scope, rec)) else {
+        eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} fills it");
         return 1;
     };
     let Some(pane) = occupant(&seat) else {
-        eprintln!("wsp: the {project} seat is empty — nobody is in {} to tell", seat.workspace);
+        eprintln!("wsp: the {scope} seat is empty — nobody is in {} to tell", seat.workspace);
         return 1;
     };
 
@@ -815,14 +892,14 @@ fn tell(governors: &BTreeMap<String, Value>, project: &str, text: &str, args: &A
     match how.tell(&place, &Pane::new(&pane.pane_id), text) {
         Ok(()) => {
             if args.json() {
-                println!("{}", json!({ "project": project, "pane": pane.pane_id, "told": true }));
+                println!("{}", json!({ "project": scope, "pane": pane.pane_id, "told": true }));
             } else {
-                println!("{}", Paint::new().dim(&format!("→ {} · {}", project, pane.pane_id)));
+                println!("{}", Paint::new().dim(&format!("→ {} · {}", scope, pane.pane_id)));
             }
             0
         }
         Err(e) => {
-            eprintln!("wsp: the {project} seat was not told: {e}");
+            eprintln!("wsp: the {scope} seat was not told: {e}");
             1
         }
     }
@@ -845,17 +922,17 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
     let governors = store.governors();
     let remove = args.has("remove");
     let held: Option<String> = match args.rest.first() {
-        Some(needle) => match index.find(needle) {
-            Some(proj) => Some(proj.id.clone()),
+        Some(needle) => match scope_of(store, index, needle) {
+            Some(scope) => Some(scope),
             None => {
-                eprintln!("wsp: no such project `{needle}`");
+                eprintln!("wsp: no such project or worklist `{needle}`");
                 return 1;
             }
         },
         None => match workspace {
             Some(ws) => governs(&governors, ws),
             None => {
-                eprintln!("wsp: no workspace — pass -w, or name the project");
+                eprintln!("wsp: no workspace — pass -w, or name the scope");
                 return 2;
             }
         },
@@ -898,7 +975,10 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>) ->
             .iter()
             .map(|s| {
                 json!({
-                    "project": s.project,
+                    // `project` for the reason the receipt above keeps it: the
+                    // key is what a reader was written against and the value is
+                    // now a scope.
+                    "project": s.scope,
                     "workspace": s.occupant.as_ref().map(|o| o.workspace.clone()),
                     "pane": s.occupant.as_ref().map(|o| o.pane.clone()),
                     "filled": s.filled(),
@@ -912,13 +992,13 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>) ->
     }
 
     if slots.is_empty() {
-        println!("{}", p.dim("no seats — wsp govern <project> takes one"));
+        println!("{}", p.dim("no seats — wsp govern <scope> takes one"));
         return 0;
     }
     // Vacant slots draw too, and that is the point of the list: a position
     // nobody is standing in is the row you are reading this to find.
     for s in &slots {
-        let here = mine.as_deref() == Some(s.project.as_str());
+        let here = mine.as_deref() == Some(s.scope.as_str());
         let mark = if here { p.cyan("▣") } else { p.dim("·") };
         let who = match (&s.occupant, s.elsewhere()) {
             (Some(o) , _) if o.pane.is_empty() => o.workspace.clone(),
@@ -926,15 +1006,27 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>) ->
             (None, true) => format!("on {}", s.host),
             (None, false) => "empty · wsp spawn -p <project> --govern fills it".to_string(),
         };
-        println!("{} {}  {}", mark, p.bold(&s.project), p.dim(&who));
+        println!("{} {}  {}", mark, p.bold(&s.scope), p.dim(&who));
     }
     if mine.is_none() {
         // Where a hand raised *here* would go. The question an agent asks is
         // never "who are the seats" — it is "who is mine" — and the roster
         // above answers the first without answering the second.
         let project = crate::cmd_agent::current_project(store, args, index).ok().flatten();
-        match seat_for(&governors, index, project.as_deref()) {
-            Some(s) => println!("{}", p.dim(&format!("work here reaches the {} seat", s.project))),
+        // The task in hand as well as the project, because the first step of
+        // the walk is keyed on the task: an agent standing on a member of
+        // tonight's list is answered for by the list, and a roster that told it
+        // otherwise would be wrong about the one thing it was asked.
+        let held = crate::cmd_agent::task_in_hand(
+            &store.bindings(),
+            &store.claims(),
+            crate::cmd_agent::my_pane().as_deref(),
+            workspace,
+        );
+        let lists = crate::worklist::Running::read(store);
+        let list = held.as_deref().and_then(|t| lists.list_of(t));
+        match seat_for(&governors, index, list, project.as_deref()) {
+            Some(s) => println!("{}", p.dim(&format!("work here reaches the {} seat", s.scope))),
             None => println!("{}", p.dim("no seat above this pane — raised hands reach a person")),
         }
     }
@@ -994,8 +1086,8 @@ mod tests {
     #[test]
     fn a_hand_raised_in_a_project_with_a_seat_reaches_that_seat() {
         let g = seated(&[("robustness", "w1"), ("wsp", "w9")]);
-        let s = seat_for(&g, &tree(), Some("robustness")).unwrap();
-        assert_eq!((s.project.as_str(), s.workspace.as_str()), ("robustness", "w1"));
+        let s = seat_for(&g, &tree(), None, Some("robustness")).unwrap();
+        assert_eq!((s.scope.as_str(), s.workspace.as_str()), ("robustness", "w1"));
     }
 
     /// The escalation question the overview asks, and the answer is that there
@@ -1003,8 +1095,8 @@ mod tests {
     #[test]
     fn a_hand_raised_where_the_local_seat_is_empty_reaches_the_one_above() {
         let g = seated(&[("wsp", "w9")]);
-        let s = seat_for(&g, &tree(), Some("data")).unwrap();
-        assert_eq!(s.project, "wsp", "past robustness, which has nobody in it");
+        let s = seat_for(&g, &tree(), None, Some("data")).unwrap();
+        assert_eq!(s.scope, "wsp", "past robustness, which has nobody in it");
     }
 
     /// The normal state, and the one that has to stay cheap: no seat anywhere
@@ -1012,8 +1104,8 @@ mod tests {
     /// caller already draws as today's behaviour.
     #[test]
     fn no_seat_anywhere_above_a_project_is_simply_no_seat() {
-        assert_eq!(seat_for(&BTreeMap::new(), &tree(), Some("data")), None);
-        assert_eq!(seat_for(&seated(&[("robustness", "w1")]), &tree(), Some("tooling")), None);
+        assert_eq!(seat_for(&BTreeMap::new(), &tree(), None, Some("data")), None);
+        assert_eq!(seat_for(&seated(&[("robustness", "w1")]), &tree(), None, Some("tooling")), None);
     }
 
     /// A seat is reachable from below and from nowhere else. `robustness` is
@@ -1024,8 +1116,8 @@ mod tests {
     fn a_seat_answers_for_what_is_under_it_and_not_for_its_siblings() {
         let g = seated(&[("robustness", "w1")]);
         let index = tree();
-        assert!(seat_for(&g, &index, Some("data")).is_some());
-        assert_eq!(seat_for(&g, &index, Some("wsp")), None);
+        assert!(seat_for(&g, &index, None, Some("data")).is_some());
+        assert_eq!(seat_for(&g, &index, None, Some("wsp")), None);
     }
 
     /// A workspace id is herdr's, and herdr's ids are per machine. A seat taken
@@ -1037,7 +1129,116 @@ mod tests {
             [("robustness".to_string(), json!({ "workspace": "w1", "host": "somewhere-else" }))]
                 .into_iter()
                 .collect();
-        assert_eq!(seat_for(&g, &tree(), Some("robustness")), None);
+        assert_eq!(seat_for(&g, &tree(), None, Some("robustness")), None);
+    }
+
+    /// The step this task added, and the whole of what it is for: a hand
+    /// raised on a member of tonight's run reaches **whoever is running it**,
+    /// not whoever governs the project the task happens to live in.
+    ///
+    /// The `batch` was made a project to get this answer and it cost 26 tasks a
+    /// move in and a move back out. `render-071` stays in `render` now, and the
+    /// routing is what moves.
+    #[test]
+    fn a_hand_on_a_member_of_a_running_list_reaches_the_lists_seat() {
+        let g = seated(&[("batch", "w7"), ("robustness", "w1"), ("wsp", "w9")]);
+        let s = seat_for(&g, &tree(), Some("batch"), Some("robustness")).unwrap();
+        assert_eq!((s.scope.as_str(), s.workspace.as_str()), ("batch", "w7"));
+
+        // And the same task with nothing running is answered by its project,
+        // which is the sentence above read backwards: the list is the only
+        // thing that changed, so it is the only thing that may change the
+        // answer.
+        let s = seat_for(&g, &tree(), None, Some("robustness")).unwrap();
+        assert_eq!(s.scope, "robustness");
+    }
+
+    /// The worklist step is one more level on the same walk and not a policy of
+    /// its own — so it does not stop at a list nobody is sitting in.
+    ///
+    /// Both shapes of "nobody": a list with no record at all, which is a run
+    /// nobody has taken the seat of, and a list whose slot has been vacated,
+    /// which is the governor that stood down at 4am. Either one falls through
+    /// to the project chain, because the alternative is a raised hand delivered
+    /// to an empty room while a seat that would have answered sits one level up.
+    #[test]
+    fn a_list_with_nobody_in_its_seat_falls_through_to_the_project_chain() {
+        let g = seated(&[("robustness", "w1")]);
+        let s = seat_for(&g, &tree(), Some("batch"), Some("data")).unwrap();
+        assert_eq!(s.scope, "robustness", "past a list with no seat, and past data");
+
+        let (_env, store) = store("fallthrough");
+        take(&store, "batch", "w7", "w7:p1");
+        take(&store, "robustness", "w1", "w1:p1");
+        assert!(vacate(&store, "batch"), "the governor stood down mid-run");
+        let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data")).unwrap();
+        assert_eq!(s.scope, "robustness", "an empty list seat routes nothing, as an empty project one does");
+    }
+
+    /// The bar the whole change is held to, as an assertion about the routing:
+    /// **with nothing running, the walk is the ancestor walk it always was.**
+    /// `list` is `None` in every session that has never made a worklist, and
+    /// `None` costs one `Option` that is not iterated.
+    #[test]
+    fn with_nothing_running_the_walk_is_the_walk_it_was() {
+        let g = seated(&[("robustness", "w1"), ("wsp", "w9")]);
+        let index = tree();
+        for project in ["data", "robustness", "wsp", "tooling"] {
+            assert_eq!(
+                seat_for(&g, &index, None, Some(project)).map(|s| s.scope),
+                std::iter::once(project.to_string())
+                    .chain(index.ancestors(project))
+                    .find(|p| g.contains_key(p)),
+                "{project}"
+            );
+        }
+    }
+
+    /// One key space, so a name is a project **or** a worklist and `wsp govern`
+    /// takes either with no flag to say which.
+    ///
+    /// The order matters in exactly one place, and it is the reason the exact
+    /// worklist is asked first: `Index::find`'s last resort is a unique id
+    /// prefix, so a list called `batch` would otherwise lose its own name to a
+    /// project called `batchelor`. Exact before fuzzy, on both sides.
+    #[test]
+    fn a_scope_is_a_worklist_slug_or_a_project_and_the_exact_name_wins() {
+        let (_env, store) = store("scope");
+        let mut wsp = crate::model::Project::new("wsp");
+        wsp.name = "wsp".into();
+        store.save_project(&wsp).unwrap();
+        store.save_project(&crate::model::Project::new("batchelor")).unwrap();
+        store.save_worklist(&crate::model::Worklist::new("batch", "Overnight batch")).unwrap();
+        let index = Index::new(store.projects());
+
+        assert_eq!(scope_of(&store, &index, "batch").as_deref(), Some("batch"), "its own name");
+        assert_eq!(scope_of(&store, &index, "batchelor").as_deref(), Some("batchelor"));
+        assert_eq!(scope_of(&store, &index, "wsp").as_deref(), Some("wsp"), "a project is still a scope");
+        assert_eq!(scope_of(&store, &index, "bat").as_deref(), Some("batchelor"), "a unique project prefix");
+        assert_eq!(scope_of(&store, &index, "nothing"), None);
+        assert_eq!(scope_of(&store, &index, "  "), None);
+    }
+
+    /// A seat is taken on a list the same way it is taken on a project, because
+    /// it is the same record under the same key — which is what "the key is a
+    /// scope" buys and what makes `wsp govern <slug>` need no new flag.
+    ///
+    /// Including the rule that outlasts the change: one agent holds one of
+    /// them, so a workspace that takes the list's seat hands back the project's.
+    #[test]
+    fn a_seat_on_a_list_is_a_seat_like_any_other() {
+        let (_env, store) = store("list-seat");
+        take(&store, "robustness", "w1", "w1:p1");
+        take(&store, "batch", "w1", "w1:p1");
+
+        assert_eq!(governs(&store.governors(), "w1").as_deref(), Some("batch"));
+        let slots = slots(&store.governors());
+        let robustness = slots.iter().find(|s| s.scope == "robustness").expect("the post stayed");
+        assert!(!robustness.filled(), "and it was handed back, empty");
+        assert_eq!(
+            seat_for(&store.governors(), &tree(), Some("batch"), Some("robustness")).map(|s| s.workspace),
+            Some("w1".to_string())
+        );
     }
 
     /// The `wip` row that was wrong all night. Idle on a `doing` task is a
@@ -1088,7 +1289,7 @@ mod tests {
         take(&store, "wsp", "w1", "w1:p1");
         assert_eq!(governs(&store.governors(), "w1").as_deref(), Some("wsp"), "it moved");
         let slots = slots(&store.governors());
-        let robustness = slots.iter().find(|s| s.project == "robustness").expect("the post stayed");
+        let robustness = slots.iter().find(|s| s.scope == "robustness").expect("the post stayed");
         assert!(!robustness.filled(), "and it is empty rather than gone");
 
         // Another workspace's seat is untouched by either.
@@ -1122,12 +1323,12 @@ mod tests {
     fn standing_down_empties_the_seat_and_leaves_it_standing() {
         let (_env, store) = store("vacate");
         take(&store, "wsp", "w1", "w1:p1");
-        assert!(seat_for(&store.governors(), &tree(), Some("wsp")).is_some());
+        assert!(seat_for(&store.governors(), &tree(), None, Some("wsp")).is_some());
 
         assert!(vacate(&store, "wsp"), "there was somebody in it");
         let g = store.governors();
         assert!(g.contains_key("wsp"), "the position went with the agent");
-        assert_eq!(seat_for(&g, &tree(), Some("wsp")), None, "an empty seat routes nothing");
+        assert_eq!(seat_for(&g, &tree(), None, Some("wsp")), None, "an empty seat routes nothing");
 
         let slots = slots(&g);
         assert_eq!(slots.len(), 1);
@@ -1139,7 +1340,7 @@ mod tests {
         assert!(!vacate(&store, "wsp"), "already empty");
         take(&store, "wsp", "w2", "w2:p1");
         assert_eq!(
-            seat_for(&store.governors(), &tree(), Some("wsp")).map(|s| s.workspace),
+            seat_for(&store.governors(), &tree(), None, Some("wsp")).map(|s| s.workspace),
             Some("w2".to_string())
         );
     }

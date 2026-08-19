@@ -1500,6 +1500,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // is the same custodian, and a room with nobody in it is a vacancy rather
     // than a stale pane id. Built once, because the tree walk asks for it per
     // project and this runs four times a second.
+    // Keyed on the slot's scope, which since worklists is a project id *or* a
+    // worklist slug — and the tree walk below asks it by project, so a seat on
+    // a worklist is not drawn here at all. That is deliberate for now rather
+    // than missed: the panel's worklist row is phase two, and a list drawn as
+    // if it were a project would put a row in the tree under a parent it has
+    // not got.
     let seats: std::collections::BTreeMap<String, (Option<AgentRef>, bool)> =
         crate::cmd_govern::slots(&snap.governors)
             .into_iter()
@@ -1509,9 +1515,9 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                         .iter()
                         .find(|a| a.pane == s.pane && a.agent)
                         .or_else(|| panes.iter().find(|a| a.workspace == s.workspace && a.agent))
-                        .map(|a| as_ref(a, Some(slot.project.clone())))
+                        .map(|a| as_ref(a, Some(slot.scope.clone())))
                 });
-                (slot.project.clone(), (occupant, slot.elsewhere()))
+                (slot.scope.clone(), (occupant, slot.elsewhere()))
             })
             .collect();
     // Which of those the tree draws, which is not all of them.
