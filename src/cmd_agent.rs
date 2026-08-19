@@ -3823,6 +3823,12 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     let mut seen: Vec<std::path::PathBuf> = Vec::new();
     // Read once, not once per root: it walks the task directory and the archive.
     let closed = crate::cmd_checkout::finished(store);
+    // And the other evidence a tree can be finished with on, read once for the
+    // same reason. `doctor` reports rather than removes, but it has to be
+    // answering the same question the sweep acts on — a tree called litter here
+    // and left alone there is how eighteen of them came to be sitting in one
+    // repository with nobody able to say which were safe to take.
+    let passed = crate::worklist::passed_by_running(store);
     for p in &index.projects {
         for r in &p.roots {
             let root = util::real(r);
@@ -3837,7 +3843,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
             // is disk — and never removed from here, because `doctor` looks at
             // every declared root and a command that deletes directories should
             // only ever act on the one you are standing in.
-            for s in crate::cmd_checkout::stale(&root, &closed) {
+            for s in crate::cmd_checkout::stale(&root, &closed, &|t| passed.contains(t)) {
                 // A seat still bound to the task changes the advice rather than
                 // the finding: the tree is litter either way, but a `--rm`
                 // there leaves the agent and the workspace behind it.

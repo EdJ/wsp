@@ -3261,6 +3261,21 @@ has uncommitted work in, `-n` to look first. That is the same shape as `wsp
 archive` for tasks and `wsp reconcile --reap` for claims, and it exists for the
 same reason both of those do.
 
+**And the trees whose group a worklist has passed** (`wsp-092` d3). Nothing here
+ever reaches `done` — everything sits at `review` by design — so "the task is
+closed" almost never arrives, and eighteen worktrees and nineteen orphaned
+workspaces accumulated in one night while every one of them looked merely idle.
+A clean tree level with the trunk is not swept, and must not be: it is what the
+tree made thirty seconds ago for an agent who has not typed yet looks like. A
+worklist supplies the one missing fact — a member of a group it has declared
+finished had an agent put on it and its work is on master — so `Why::Landed` is
+that same idle tree **plus evidence**, narrower than idle rather than broader.
+`wsp worklist go` sweeps the group behind the barrier it just passed, `--keep`
+opts out, and `--sweep` and `wsp doctor` read the same licence off any running
+worklist. Uncommitted work still stops it, and a member still holding its claim
+is named with the `wsp despawn` to run rather than swept: an agent still holding
+its claim is an agent still in the room.
+
 Both verbs look for the tree in two places: the repository you are standing in,
 and the one the task's project is rooted at. They used to compute one path from
 cwd alone, so a governor cleaning up after another lane got `no tree for
@@ -3297,7 +3312,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
-| `src/worklist.rs` | where a worklist is up to: the derived position, and the two readings of finished |
+| `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, and the sweep a passed group licenses |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
 | `src/place_herdr.rs` | that port over herdr: the shell race, the launch window, the retype |
@@ -3321,7 +3336,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, the outcome |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
-| `src/cmd_checkout.rs` | a working tree per task, and landing it back on the trunk |
+| `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, and the three reasons one is finished with |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_govern.rs` | the custodial slot on a project: who answers for its raised hands, and how you talk to them |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |

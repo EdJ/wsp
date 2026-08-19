@@ -65,6 +65,28 @@
 //! It is never removed from the membership: a machine silently editing a plan
 //! is the stale-plan failure with nobody left to notice it.
 //!
+//! # What a passed group licenses, which is the one destructive thing here
+//!
+//! [`sweep`] removes the working trees of the members behind the position, and
+//! it is the only thing in this design that destroys directories on a predicate
+//! without being asked. The evidence for it is exactly the evidence that opened
+//! the barrier, which is why [`Position`] carries the members it passed on its
+//! way through rather than making the sweep go and ask again: two computations
+//! under one act is two answers that can disagree, and the one holding the
+//! `rm -rf` is the wrong one to be second.
+//!
+//! It is [`cmd_checkout::Why::Landed`] and that variant's doc comment is where
+//! the argument lives — the short version is that it is `Why::Idle` plus a
+//! fact, narrower than it rather than broader. What this module contributes is
+//! the fact and the two refusals it does not override: uncommitted work, and a
+//! member still holding its claim, which is named with the `despawn` to run
+//! because an agent still holding its claim is an agent still in the room.
+//!
+//! `Settled` is refused outright as a basis for it. It says a task reached
+//! `review`, which arrives *before* the commit is on the trunk, and removing a
+//! directory on that is the `batch`'s costliest failure with a rm on the end
+//! of it.
+//!
 //! # Why a module and not a method
 //!
 //! Free functions over `&Store` and a `&Worklist`, beside the record rather
@@ -72,7 +94,7 @@
 //! and over git, it is derived and never written, and hung off `Worklist` it
 //! would look exactly like a field somebody could set.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use crate::cmd_checkout;
@@ -82,19 +104,21 @@ use crate::resolve::Index;
 use crate::store::Store;
 use crate::util;
 
-// Every public item below carries `#[allow(dead_code)]`, on the convention the
-// record was built under: the attribute is the marker for "its caller has not
-// landed yet", and `worklist next` and the barrier are group 4. It comes off
-// one item at a time with the `use` that reads it, rather than as a blanket
-// allow over the module that would go on hiding something genuinely dead.
+// The `#[allow(dead_code)]` markers left below are the convention the record
+// was built under: the attribute is the marker for "its caller has not landed
+// yet", and it comes off one item at a time with the `use` that reads it,
+// rather than as a blanket allow over the module that would go on hiding
+// something genuinely dead. Most of them came off when the sweep started
+// calling `position`; what is still marked is what `worklist next` and the
+// barrier will read, which is group 4.
 
 /// Which question is being asked of a member, because the two cost different
 /// amounts and are allowed to give different answers. See the module docs.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reading {
     /// The store alone: a task at `review` or closed is finished with. Free,
     /// and what a surface redrawing four times a second can afford.
+    #[allow(dead_code)]
     Settled,
     /// Git as well: the member's branch is on the trunk. One process per
     /// member, and the only reading a barrier may open on.
@@ -103,7 +127,6 @@ pub enum Reading {
 
 /// What the store says about a member. The free half, and always computed —
 /// it is what settles the ambiguous cases in the expensive half.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
     /// Still somebody's to finish, and the word the store holds for it. A
@@ -121,7 +144,6 @@ pub enum Settlement {
     Gone,
 }
 
-#[allow(dead_code)]
 impl Settlement {
     pub fn settled(&self) -> bool {
         matches!(self, Settlement::Review | Settlement::Closed | Settlement::Gone)
@@ -129,6 +151,7 @@ impl Settlement {
 
     /// The word for a column, which is the status where there is one and the
     /// fact of absence where there is not.
+    #[allow(dead_code)]
     pub fn word(&self) -> &str {
         match self {
             Settlement::Open(s) => s.as_str(),
@@ -140,7 +163,6 @@ impl Settlement {
 }
 
 /// What git says about a member's branch.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
     /// The trunk has everything the branch holds. The only answer a barrier
@@ -164,7 +186,6 @@ pub enum Landing {
 /// One member, read. Both answers where both were asked, so the disagreement
 /// between them is a thing a caller can print rather than a thing it has to
 /// go and reconstruct.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Standing {
     pub id: String,
@@ -174,7 +195,6 @@ pub struct Standing {
     pub landing: Option<Landing>,
 }
 
-#[allow(dead_code)]
 impl Standing {
     /// Whether this member is finished, under the reading it was read with.
     ///
@@ -196,6 +216,7 @@ impl Standing {
     ///
     /// Nothing about the agent: who is standing on it is the claim's to say,
     /// and this module never asks herdr.
+    #[allow(dead_code)]
     pub fn note(&self) -> String {
         match &self.landing {
             Some(Landing::Ahead { commits, trunk }) => {
@@ -215,7 +236,6 @@ impl Standing {
 /// typed at the command line, and it is a *position* rather than an id: it is
 /// rewritten on every write, which is why a log line names the members and not
 /// the number.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
     /// The first group not finished, or `None` when every group is.
@@ -227,18 +247,40 @@ pub struct Position {
     /// under [`Reading::Landed`] asking again is another process per member,
     /// and because "waiting on 2" and the two lines under it are one answer.
     pub members: Vec<Standing>,
+    /// Every member of every group *behind* the position, read.
+    ///
+    /// Carried back for a reason rather than for tidiness: the sweep a passed
+    /// group licenses stands on exactly the fact that opened the barrier —
+    /// the branch is on the trunk **and** a worklist says this group is behind
+    /// it — so one walk has to answer both, or the destructive half is standing
+    /// on a second computation that can disagree with the first.
+    ///
+    /// Every passed group and not only the one immediately behind, because the
+    /// licence is word for word the same for all of them: a run where `--keep`
+    /// was used once, or one that began before any of this existed, would
+    /// otherwise leave trees that nothing ever comes back for. It costs nothing
+    /// — these members were read on the way past.
+    pub passed: Vec<Standing>,
+    /// Which of the two questions was asked.
+    ///
+    /// Carried so that [`sweep`] can refuse the free answer. `Settled` is a
+    /// task's status, which arrives before the commit is on the trunk — that is
+    /// the `batch`'s costliest failure, and it must not be what a directory is
+    /// removed on.
+    pub reading: Reading,
 }
 
-#[allow(dead_code)]
 impl Position {
     /// Every group finished. Not the same as the worklist being `done`, which
     /// is somebody saying there is nothing left to want from it.
+    #[allow(dead_code)]
     pub fn finished(&self) -> bool {
         self.at.is_none()
     }
 
     /// The members holding the current group, in the order the group names
     /// them. What a barrier reports when it will not open.
+    #[allow(dead_code)]
     pub fn holding(&self) -> Vec<&Standing> {
         self.members.iter().filter(|s| !s.finished()).collect()
     }
@@ -254,27 +296,26 @@ impl Position {
 ///
 /// A worklist with no groups is finished, which is the honest answer: there is
 /// nothing left in it to start.
-#[allow(dead_code)]
 pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
     let groups = w.groups();
     let mut repos = Repos::new(store);
+    let mut passed: Vec<Standing> = Vec::new();
     for (i, g) in groups.iter().enumerate() {
         let members = group(store, &mut repos, g, reading);
         if !members.iter().all(Standing::finished) {
-            return Position { at: Some(i + 1), of: groups.len(), members };
+            return Position { at: Some(i + 1), of: groups.len(), members, passed, reading };
         }
+        passed.extend(members);
     }
-    Position { at: None, of: groups.len(), members: Vec::new() }
+    Position { at: None, of: groups.len(), members: Vec::new(), passed, reading }
 }
 
 /// Every member of one group, in the order the group names them.
-#[allow(dead_code)]
 pub fn group(store: &Store, repos: &mut Repos, g: &Group, reading: Reading) -> Vec<Standing> {
     g.members.iter().map(|m| member(store, repos, m, reading)).collect()
 }
 
 /// How one member stands.
-#[allow(dead_code)]
 pub fn member(store: &Store, repos: &mut Repos, id: &str, reading: Reading) -> Standing {
     let task = store.task(id);
     let settlement = match &task {
@@ -314,6 +355,88 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
     out
 }
 
+/// Take away the trees of the members this worklist has passed.
+///
+/// **The one place in this design that destroys directories on a predicate
+/// without being asked**, so read [`cmd_checkout::Why::Landed`] before touching
+/// the predicate: it is `Why::Idle` — nothing uncommitted, nothing the trunk
+/// has not got — plus one piece of evidence, and it is narrower than `Idle`
+/// rather than broader. What the worklist adds is that a member of a group it
+/// has declared finished is not the tree made thirty seconds ago for an agent
+/// who has not typed yet: something put an agent on it, and its work is on the
+/// trunk.
+///
+/// The evidence has to be the expensive reading and the argument is not
+/// symmetrical. `Settled` says a task is at `review`, which arrives *before*
+/// the commit is on the trunk — that is the `batch`'s costliest failure, and it
+/// is not a thing to remove a directory on. So a `Settled` position is refused
+/// here rather than quietly re-read, because re-reading it would put a second
+/// computation under the destructive half that can disagree with the first.
+///
+/// Why this is automatic at all, since it is the question somebody will ask:
+/// it was manual for two nights and happened zero times in them, leaving 18
+/// worktrees and 19 orphaned workspaces in one of them. A procedure run by hand
+/// at the end of a long piece of work is a procedure abandoned halfway when
+/// something more interesting happens, which is the finding `stale`'s own
+/// header already records. The barrier is also the only moment in a run when
+/// nothing is in flight, which is why cleanup belongs here and could not have
+/// belonged anywhere under the lanes this replaces. The caller opts out with
+/// `--keep`, and the two refusals that are not optional — uncommitted work, and
+/// a member still holding its claim — are [`cmd_checkout::sweep_passed`]'s.
+///
+/// Members the store has never heard of, and members with no project to look
+/// in, are passed over: there is no repository to find a tree in. They are
+/// still named by [`dangling`], which is a different question and a different
+/// moment.
+#[allow(dead_code)]
+pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<cmd_checkout::Swept, String> {
+    if p.reading != Reading::Landed {
+        return Err("a tree is removed on the landed reading and never on the settled one".into());
+    }
+    let mut repos = Repos::new(store);
+    let mut members = Vec::new();
+    for s in &p.passed {
+        let Some(project) = store.task(&s.id).and_then(|t| t.project) else { continue };
+        let Some(trunk) = repos.of(&project) else { continue };
+        members.push(cmd_checkout::Passed {
+            task: s.id.clone(),
+            trunk: trunk.dir,
+            trunk_branch: trunk.branch,
+        });
+    }
+    let closed = cmd_checkout::finished(store);
+    let occupied = cmd_checkout::Occupied::now(store);
+    Ok(cmd_checkout::sweep_passed(&members, &closed, &|t, d| occupied.of(t, d), dry))
+}
+
+/// Every task a *running* worklist has passed, and the ids those tasks used to
+/// have.
+///
+/// The same licence [`sweep`] acts on, in the shape `wsp checkout --sweep` and
+/// `wsp doctor` want it: they walk directories and ask about names, where the
+/// barrier walks members. Former ids are in it because a tree made before its
+/// task was renumbered is still named after the id it had then, and a directory
+/// walk only ever sees that name.
+///
+/// **Free when nothing is running**, which is nearly always: the store is read,
+/// no worklist comes back `running`, and not one git process is started. That
+/// is what makes it affordable on a command that is otherwise store-only.
+pub fn passed_by_running(store: &Store) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let running: Vec<Worklist> = store.worklists().into_iter().filter(|w| w.status().is_running()).collect();
+    if running.is_empty() {
+        return out;
+    }
+    let renamed = store.renamed_ids();
+    for w in &running {
+        for s in position(store, w, Reading::Landed).passed {
+            out.extend(renamed.iter().filter(|(_, to)| *to == s.id.as_str()).map(|(from, _)| from.clone()));
+            out.insert(s.id);
+        }
+    }
+    out
+}
+
 /// What the landing question needs and what does not change between members:
 /// the project tree, the repository each project's work lands in, and the
 /// record of what was renumbered into what.
@@ -323,7 +446,6 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
 /// across a group, that is three resolutions instead of twenty-one; held across
 /// a whole position walk it is three for the list. Nothing in it is a cache of
 /// something that changes under it inside one barrier check.
-#[allow(dead_code)]
 pub struct Repos {
     index: Index,
     renamed: BTreeMap<String, String>,
@@ -336,7 +458,6 @@ struct Trunk {
     branch: String,
 }
 
-#[allow(dead_code)]
 impl Repos {
     pub fn new(store: &Store) -> Repos {
         Repos { index: Index::new(store.projects()), renamed: store.renamed_ids(), seen: HashMap::new() }
@@ -674,6 +795,89 @@ mod tests {
             member(&store, &mut Repos::new(&store), "wsp-1", Reading::Settled).landing,
             None,
             "no branch question was asked"
+        );
+    }
+
+    /// The sweep a passed group licenses, end to end, and the two halves of the
+    /// predicate pulled apart. The group behind the barrier is swept; the group
+    /// the barrier is waiting on is not touched, however landed a member of it
+    /// happens to be — being behind the position is half the evidence and there
+    /// is no such thing as three quarters of it.
+    #[test]
+    fn passing_a_barrier_sweeps_the_group_behind_it_and_not_the_one_it_waits_on() {
+        let (_env, store, repo) = scratch("sweep");
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            task(&store, id, "review");
+        }
+        // Group 1 is done with and on the trunk. Group 2 has one member landed
+        // and one still holding commits, so the barrier stays shut.
+        committed(&repo, "wsp-1");
+        land(&repo, "wsp-1");
+        committed(&repo, "wsp-2");
+        land(&repo, "wsp-2");
+        committed(&repo, "wsp-3");
+        let w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
+
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.at, Some(2), "the barrier is where it should be");
+        assert_eq!(p.passed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["wsp-1"]);
+
+        let out = sweep(&store, &p, false).expect("the landed reading licenses it");
+        assert_eq!(out.removed, ["wsp-1"]);
+        assert!(!repo.join(cmd_checkout::WORKTREES).join("wsp-1").exists(), "the passed tree is still here");
+        assert!(
+            repo.join(cmd_checkout::WORKTREES).join("wsp-2").join(".git").exists(),
+            "a member of the group being waited on was swept"
+        );
+    }
+
+    /// The one refusal that is about the *reading* rather than the tree, and it
+    /// is the reason [`Position`] carries which question it answered. `Settled`
+    /// says a task reached `review`, which arrives before the commit is on the
+    /// trunk — the `batch`'s costliest failure — and a directory is not removed
+    /// on that.
+    #[test]
+    fn a_tree_is_never_removed_on_the_free_reading() {
+        let (_env, store, repo) = scratch("sweep-reading");
+        task(&store, "wsp-1", "review");
+        task(&store, "wsp-2", "todo");
+        committed(&repo, "wsp-1");
+        let w = list("- 1  wsp-1\n- 2  wsp-2\n");
+
+        let p = position(&store, &w, Reading::Settled);
+        assert_eq!(p.at, Some(2), "the free reading has moved past a member that has not landed");
+        assert!(sweep(&store, &p, false).is_err(), "a tree was removed on a status");
+        assert!(repo.join(cmd_checkout::WORKTREES).join("wsp-1").join(".git").exists());
+    }
+
+    /// The same licence in the shape a directory walk wants it, and the reason
+    /// it is affordable: a store with nothing running answers without starting
+    /// one git process, which is what lets `wsp checkout --sweep` and `doctor`
+    /// ask the question at all.
+    #[test]
+    fn only_a_running_worklist_licenses_a_sweep_and_a_quiet_store_costs_nothing() {
+        let (_env, store, repo) = scratch("licence");
+        task(&store, "wsp-1", "review");
+        committed(&repo, "wsp-1");
+        land(&repo, "wsp-1");
+        task(&store, "wsp-2", "todo");
+
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2\n");
+        store.save_worklist(&w).unwrap();
+        assert!(passed_by_running(&store).is_empty(), "a draft plan licensed a removal");
+
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(passed_by_running(&store).into_iter().collect::<Vec<_>>(), ["wsp-1"]);
+
+        // The id the task used to have is in it too: a tree made before the
+        // renumbering is named after that one, and a directory walk sees the
+        // name and nothing else.
+        std::fs::write(store.ids_path(), r#"{"old-3":"wsp-1"}"#).unwrap();
+        assert_eq!(
+            passed_by_running(&store).into_iter().collect::<Vec<_>>(),
+            ["old-3", "wsp-1"],
+            "a tree left under an old id is invisible to the sweep that should take it"
         );
     }
 
