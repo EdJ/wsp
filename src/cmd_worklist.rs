@@ -1812,8 +1812,9 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         _ => None,
     };
 
-    // Read before anything is removed, and that ordering is load-bearing: the
-    // report finds a member by its branch tip and the sweep deletes the branch.
+    // Read before anything is removed, though nothing now depends on that
+    // order: the report is off the trunk's reflog, which outlives both the
+    // trees and the branches the sweep takes. See `cmd_checkout::Landings`.
     let overlap = match crossed {
         Some(n) => worklist::overlaps(store, &groups[n - 1].members),
         None => worklist::Overlap::default(),

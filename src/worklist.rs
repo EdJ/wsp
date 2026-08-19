@@ -250,7 +250,16 @@ impl Standing {
             Some(Landing::Nothing) if !self.settlement.settled() => {
                 "nothing committed on its branch — or landed and never marked".into()
             }
-            Some(Landing::NoBranch) if !self.settlement.settled() => "no branch — nothing has run for it".into(),
+            // Both halves here too, and for the reason `Nothing` gives above:
+            // a branch is deleted with `-d`, which succeeds *because* the work
+            // is merged, so a member closed by `wsp despawn` after it landed
+            // arrives here with its task still open. Saying only "nothing has
+            // run for it" sends a reader to spawn work that is on the trunk,
+            // which is the very failure the sentence next door was written to
+            // avoid, and it disagreed with `NoBranch`'s own doc.
+            Some(Landing::NoBranch) if !self.settlement.settled() => {
+                "no branch — nothing has run for it, or it landed and was swept".into()
+            }
             Some(Landing::NoRepo) if !self.settlement.settled() => "no repository to look in".into(),
             _ => String::new(),
         }
@@ -873,10 +882,10 @@ pub struct Overlap {
 /// be acted on. A named pair of members and the file they shared can be.
 ///
 /// It arrives at the barrier because that is when the next group is being
-/// composed, and it is read off the trunk rather than out of the trees, so it
-/// still answers after the trees are gone. Called **before** the sweep all the
-/// same: [`cmd_checkout::Landings::files`] finds a member by its branch tip,
-/// and the sweep deletes the branch.
+/// composed, and it is read off the trunk's reflog rather than out of the
+/// trees or off the branches, so it answers just as well after the sweep as
+/// before it — and after the despawn that ends a member, which is the state it
+/// was silently blind to until `worklist-024`.
 ///
 /// One `git reflog` per repository — a group's members are routinely in two or
 /// three — and one `git diff --name-only` per member, which is the cost the
@@ -1088,6 +1097,86 @@ mod tests {
         assert_eq!(o.unread, ["wsp-1", "wsp-2"], "and not knowing is said, not smoothed over");
     }
 
+    /// The state the report was written for, and the one it could not read: a
+    /// member whose tree was taken away after it landed.
+    ///
+    /// `wsp despawn` ends an agent by removing its tree, and `remove` deletes
+    /// the branch with `git branch -d`, which succeeds *because* the work is
+    /// merged. So the ordinary close of a member's work is exactly the state
+    /// where a branch lookup answers nothing — and the barrier reported the
+    /// one member it could still see as sharing a file with nobody.
+    ///
+    /// The reflog is untouched by any of that, and since `worklist-013` the
+    /// entry names the branch, so the name is the whole lookup.
+    #[test]
+    fn a_member_whose_tree_was_taken_away_after_it_landed_is_still_read() {
+        let (_env, store, repo) = scratch("swept");
+        std::fs::write(repo.join("shared.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git_run(&repo, &["add", "shared.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "shared"]);
+
+        for (id, line) in [("wsp-1", 0usize), ("wsp-2", 9)] {
+            task(&store, id, "review");
+            let dir = committed(&repo, id);
+            let mut lines: Vec<String> =
+                std::fs::read_to_string(dir.join("shared.txt")).unwrap().lines().map(String::from).collect();
+            lines[line] = id.to_string();
+            std::fs::write(dir.join("shared.txt"), lines.join("\n") + "\n").unwrap();
+            git_run(&dir, &["commit", "--quiet", "--all", "--message", "shared"]);
+            git_run(&dir, &["rebase", "--quiet", "master"]);
+            land(&repo, id);
+        }
+        // What `despawn` leaves behind, in the order `remove` does it.
+        let dir = repo.join(cmd_checkout::WORKTREES).join("wsp-1");
+        git_run(&repo, &["worktree", "remove", "--force", &dir.display().to_string()]);
+        git_run(&repo, &["branch", "-d", "wsp-1"]);
+
+        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        assert_eq!(
+            o.shared,
+            vec![("shared.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
+            "the branch is gone and the reflog still names what it landed"
+        );
+        assert!(o.unread.is_empty(), "and nothing about it is unreadable");
+    }
+
+    /// Land, review, land again is the ordinary shape of a member's work, and
+    /// every land is a separate entry in the trunk's reflog. Reading one of
+    /// them reports a fraction of what the member touched — and the fraction
+    /// that is missing is where the overlap was, so a real collision prints as
+    /// `none`, which is the clean bill of health this report exists to refuse.
+    #[test]
+    fn a_member_that_landed_twice_is_read_on_both_of_its_lands() {
+        let (_env, store, repo) = scratch("twice");
+        task(&store, "wsp-1", "review");
+        task(&store, "wsp-2", "review");
+
+        let first = committed(&repo, "wsp-1"); // wsp-1.txt
+        std::fs::write(first.join("early.txt"), "mine\n").unwrap();
+        git_run(&first, &["add", "."]);
+        git_run(&first, &["commit", "--quiet", "-m", "early"]);
+        land(&repo, "wsp-1");
+        // The second land, with a file the companion never touches: the newest
+        // entry alone says these two members share nothing.
+        std::fs::write(first.join("late.txt"), "mine\n").unwrap();
+        git_run(&first, &["add", "."]);
+        git_run(&first, &["commit", "--quiet", "-m", "late"]);
+        land(&repo, "wsp-1");
+
+        let second = committed(&repo, "wsp-2");
+        git_run(&second, &["rebase", "--quiet", "master"]);
+        std::fs::write(second.join("early.txt"), "theirs\n").unwrap();
+        git_run(&second, &["commit", "--quiet", "--all", "--message", "early too"]);
+        land(&repo, "wsp-2");
+
+        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        assert_eq!(
+            o.shared,
+            vec![("early.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
+            "the file they shared is on wsp-1's first land, not its last"
+        );
+    }
+
     /// The whole of what "derived" means, asserted as arithmetic: the position
     /// moves because the *tasks* moved, and nothing wrote it down. This is the
     /// `batch` handbook's failure made impossible rather than warned about —
@@ -1158,7 +1247,7 @@ mod tests {
         let p = position(&store, &w, Reading::Landed);
         assert_eq!(p.at, Some(1), "no branch and no work done is not finished");
         assert_eq!(p.members[0].landing, Some(Landing::NoBranch));
-        assert_eq!(p.members[0].note(), "no branch — nothing has run for it");
+        assert_eq!(p.members[0].note(), "no branch — nothing has run for it, or it landed and was swept");
 
         // The other half of the ambiguity: a branch is deleted with `-d`, which
         // refuses unless the work is merged, so a missing branch on a settled
@@ -1167,8 +1256,18 @@ mod tests {
         land(&repo, "wsp-1");
         git_run(&repo, &["worktree", "remove", "--force", &repo.join(cmd_checkout::WORKTREES).join("wsp-1").display().to_string()]);
         git_run(&repo, &["branch", "-d", "wsp-1"]);
-        task(&store, "wsp-1", "review");
 
+        // Still `todo`, which is the state `wsp despawn` leaves behind when an
+        // agent lands and ends without marking its task — and the state the
+        // note used to describe as work that had never run.
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.members[0].landing, Some(Landing::NoBranch), "the same reading either way");
+        assert!(
+            p.members[0].note().contains("landed and was swept"),
+            "an open task whose branch was swept must not be reported as never started"
+        );
+
+        task(&store, "wsp-1", "review");
         let p = position(&store, &w, Reading::Landed);
         assert!(p.finished(), "a swept tree on a settled task is finished, not started");
     }

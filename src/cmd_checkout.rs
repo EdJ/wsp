@@ -984,12 +984,11 @@ pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String
 /// with an unrelated commit landing between two members and all three rebased:
 /// each member came back with its own files and no one else's.
 ///
-/// **Named, and not merely matched by value.** A branch that has landed
-/// nothing is sitting on the trunk value it was cut from, so a search on the
-/// tip alone finds it in the log and hands it the diff of whatever really
-/// landed there. That is not a near miss: it reported five agents who had
-/// committed nothing at all as having touched one file between them, which is
-/// this report inventing the very evidence it was written to supply.
+/// And the branch itself need not still be there, which is the other half of
+/// why this is not read off a ref: a member is closed by removing its tree,
+/// and [`remove`] then deletes the branch with `git branch -d`, which succeeds
+/// *because* the work is merged. The reflog outlives all of it. See
+/// [`Landings::files`] for the lookup that follows from that.
 ///
 /// The reflog is read **once for the repository** and one `git diff
 /// --name-only` is spent per member, which is what makes this affordable to do
@@ -1026,30 +1025,55 @@ impl Landings {
 
     /// The files `branch` put on the trunk, or `None` where the reflog does not
     /// place it. See the type's docs for why those are two different answers.
+    ///
+    /// **The name is the whole lookup, and every entry carrying it counts.**
+    /// [`land`] fast-forwards the trunk onto the branch and `merge <branch>:`
+    /// is what git writes for that, so the name is written down at every land
+    /// and is the only key needed. It replaces a hash comparison against the
+    /// branch's current tip that was wrong in both of its halves:
+    ///
+    /// - **A landed branch need not exist.** `wsp despawn` ends a member by
+    ///   removing its tree, and [`remove`] then deletes the branch — see the
+    ///   type's docs. So the ordinary close of a member's work was answering
+    ///   `None`, "nobody knows what it changed", for the one state this report
+    ///   was built to survive.
+    /// - **A member lands more than once.** Land, review, land again is the
+    ///   ordinary shape of a member's work — the live trunk holds `merge
+    ///   worklist-011:` three times running — and only the newest entry can
+    ///   hold the branch's current tip. One entry is a fraction of what the
+    ///   member touched, and an overlap sitting in any earlier land printed as
+    ///   `none`: a clean bill of health nothing checked, which is the failure
+    ///   this whole type exists to refuse.
+    ///
+    /// The hash was never the key, but dropping it is not merely a widening —
+    /// matching on it *invents* evidence. A branch `wsp checkout` cut at the
+    /// trunk tip sits on a trunk value it did not put there, so the tip alone
+    /// hands it the diff of whatever really landed at that point: driven on
+    /// 2026-08-19 against five spawned agents with nothing committed, all five
+    /// came back as having touched a file none of them had opened. A branch
+    /// that reached the trunk some other way names nothing and answers `None`,
+    /// which is what this type already promises for a trunk that was reset or
+    /// a land done by hand.
+    ///
+    /// The union is a **set**: a file touched by two lands of one member is
+    /// one file, and listing it twice would have that member overlapping
+    /// itself. And a land whose base is off the bottom of the reflog takes the
+    /// whole answer to `None` rather than reporting the lands above it — a
+    /// partial account of what a member touched is a partial `none`, which is
+    /// the one confusion this type is here to keep out.
     pub(crate) fn files(&self, repo: &Path, branch: &str) -> Option<Vec<String>> {
-        let tip = git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])?;
-        let tip = tip.trim();
-        // **The tip matching is not enough, and the reason is the same one
-        // `worklist::Landing::Nothing` exists for**: a branch `wsp checkout`
-        // cut at the trunk tip sits on a trunk value it did not put there, and
-        // matching on the hash alone hands it the diff of whatever landed at
-        // that point — somebody else's commit, or the trunk's own. Driven on
-        // 2026-08-19 against five spawned agents with nothing committed, all
-        // five were reported as having touched a file none of them had opened.
-        //
-        // So the entry has to *name this branch*, which the reflog says
-        // outright: [`land`] fast-forwards the trunk onto the branch, and
-        // `merge <branch>:` is what git writes for that. A branch that got
-        // there some other way answers `None` — "nobody knows what it changed"
-        // — which is the answer this type already promises for a trunk that was
-        // reset or a land done by hand, and it is the one that cannot be read
-        // as a clean bill of health.
-        let at = self.values.iter().position(|(v, why)| {
-            v == tip && why.strip_prefix("merge ").is_some_and(|r| r.starts_with(&format!("{branch}:")))
-        })?;
-        let (base, _) = self.values.get(at + 1)?;
-        let out = git(repo, &["diff", "--name-only", base, tip])?;
-        Some(out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        let named = format!("merge {branch}:");
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut landed = false;
+        for (at, (tip, _)) in
+            self.values.iter().enumerate().filter(|(_, (_, why))| why.starts_with(&named))
+        {
+            landed = true;
+            let (base, _) = self.values.get(at + 1)?;
+            let diff = git(repo, &["diff", "--name-only", base, tip])?;
+            out.extend(diff.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
+        }
+        landed.then(|| out.into_iter().collect())
     }
 }
 
