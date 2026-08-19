@@ -2303,21 +2303,34 @@ row selectors:
 needs-a-person   a task still open whose agent has stopped turning
 review           finished, and waiting on you
 blocked          stopped on a question
-flag             a hand up, addressed to this seat
-unanswered       a question somebody asked and nobody has answered
+flag             a hand up, addressed to this seat, with nothing owed back
+unanswered       …and one that is waiting for a sentence
 agent-gone       a binding whose pane is gone, or alive with the agent gone
 ```
 
-`unanswered` is the only one of the six whose subject wrote itself down. The
-others are wsp inferring from state that a person is probably wanted; this one
-is an agent having said so, in words, with `message::Waiting` naming the pane
-that is sitting still until it is answered — so the line carries the question
-rather than the task's title, and the id `wsp answer` takes. It is keyed on the
-message and not on the task, which is what makes two questions about one task
-two facts rather than one that silently replaces the other. And nothing lowers
-it: `worklist-013`'s question was answered in minutes and its raised hand stood
-for 2h14m, because the answer and the record were two acts and only one was on
-the path of getting the work moving.
+`flag` and `unanswered` are one population — every raised message — split by
+**shape**, because a notification and a question are different animals: one is
+over when it is sent, the other has a lifecycle and an agent sitting still while
+it is open. One word for both would be lossy in the direction that matters, so
+`wsp flag "…"` arrives as the first and `wsp ask` and `wsp flag --ask claim`
+arrive as the second.
+
+`unanswered` is also the only one of the six whose subject wrote itself down.
+The others are wsp inferring from state that a person is probably wanted; this
+one is an agent having said so, in words, with `message::Waiting` naming the
+pane that is sitting still until it is answered — so the line carries the
+question rather than the task's title, and the id `wsp answer` takes. Both are
+keyed on the message and not on the task, which is what makes two hands on one
+task two facts at the surface as well as in the record. And nothing lowers
+either: `worklist-013`'s question was answered in minutes and its raised hand
+stood for 2h14m, because the answer and the record were two acts and only one
+was on the path of getting the work moving.
+
+A stalled agent that has said why it stopped draws only the `unanswered` line.
+`needs-a-person` is *an agent stopped and wsp cannot see why*, and its repair is
+`wsp tell` — which, sent to an agent waiting on `wsp answer`, is `worklist-013`
+again: the answer going down the channel with no memory while the question stays
+open. A modal holding the keyboard is exempt, because that is a different repair.
 
 `wsp watch <project>` and `--about <id>` narrow the *subject*, which is a filter
 and not a subscription. There is a sixth word, `blind`, which you cannot

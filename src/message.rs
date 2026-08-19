@@ -837,7 +837,9 @@ impl Message {
     /// because the two must never be able to disagree about whether a fleet is
     /// quiet.** `cmd_message::open` splits it in three for a person to read;
     /// `cmd_watch::asking` takes the union, because a level does not have
-    /// sections.
+    /// sections. It is also the line [`raised`] is cut along at a watch: what
+    /// this answers `true` for is a question and arrives as `unanswered`, and
+    /// the rest is a raised hand and arrives as `flag`.
     ///
     /// An open *notification* is deliberately outside it. It still owes a
     /// disposition — `wsp ack` — and nothing is waiting on it, and a level

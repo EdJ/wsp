@@ -233,10 +233,13 @@ pub(crate) enum Kind {
     /// A task in scope is `blocked`: an agent stopped and addressed a question
     /// to whoever answers for it, which under a seat is the seat.
     Blocked,
-    /// A hand is up on a task this seat is the addressee for.
+    /// A hand is up on a task this seat is the addressee for, and **nothing is
+    /// owed back**: somebody wrote it, and reading it is the whole of the
+    /// disposition. [`crate::message::Shape::Notification`].
     Flag,
-    /// A question raised through `wsp ask` that nobody has answered, and any
-    /// record beside it this build cannot read.
+    /// The other half of the same population: a hand that is **waiting for a
+    /// sentence**. [`crate::message::Shape::Question`], and any record beside
+    /// it this build cannot read.
     ///
     /// **The one predicate here whose subject wrote itself down.** Every other
     /// variant is wsp inferring from state that somebody is probably wanted;
@@ -247,6 +250,14 @@ pub(crate) enum Kind {
     /// two acts and only one of them was on the path of getting the work
     /// moving; a level cannot have that failure, because it goes down when the
     /// question closes and there is nothing to remember to lower.
+    ///
+    /// **Two words rather than one, because `wsp-095` Part 3 is that a
+    /// notification and a question are different animals.** Collapsing them
+    /// would be lossy in the direction that matters: a governor reading `flag`
+    /// could not tell whether an agent was sitting still behind it. So
+    /// `wsp flag "…"` arrives as [`Kind::Flag`] and `wsp ask` and
+    /// `wsp flag --ask claim` arrive here, and the word itself says what is
+    /// owed.
     Unanswered,
     /// A binding whose pane herdr no longer lists, or whose pane is alive with
     /// the agent gone. Covers *an agent died* and *an agent never started*,
@@ -844,11 +855,19 @@ pub(crate) fn in_scope(
 /// question it could not read — `robustness-051` arriving through the module
 /// built to remove it, which is the argument `Message::needs_attention`'s own
 /// docstring makes and this is the first caller to owe it.
+///
+/// A record this cannot place — an unreadable shape, or one whose state is a
+/// word from a newer build — is reported **loudly and in its own sentence**,
+/// rather than being drawn as whichever kind it happens to parse closest to. It
+/// is the one case where the words on the record are the half wsp could not
+/// read, so the line says that instead of quoting them.
 fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]) -> Option<Signal> {
     use crate::message::Kind as Loud;
     // `Message::wants_answering` and not a filter written out here: it is the
-    // same population `wsp ask` lists, asked once, so the verb and the watch
-    // cannot come to disagree about whether the fleet is quiet.
+    // same predicate `wsp ask` lists by, asked once, so the verb and the watch
+    // cannot come to disagree about whether the fleet is quiet. Answering
+    // `None` is (b)'s signal to draw the record as a [`Kind::Flag`] instead —
+    // the split is here, in one call, rather than spelled out at the call site.
     if !m.wants_answering() {
         return None;
     }
@@ -883,7 +902,23 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
         false => Signal::new(
             Kind::Unanswered,
             subject,
-            &format!("{who} · {} — wsp answer {} \"…\"", util::truncate(m.title(), 60), m.id),
+            // `ask` is named where there is one, because it is a **capability
+            // of the surface** and not a synonym for the words: it says one
+            // keypress answers this, which changes what the reader does with
+            // the line. `wsp flag --ask claim` would otherwise arrive reading
+            // like any other question.
+            &match m.ask() {
+                Some(crate::message::Ask::Claim) => format!(
+                    "{who} · asking to claim · {} — wsp answer {} \"…\"",
+                    util::truncate(m.title(), 44),
+                    m.id
+                ),
+                _ => format!(
+                    "{who} · {} — wsp answer {} \"…\"",
+                    util::truncate(m.title(), 60),
+                    m.id
+                ),
+            },
         )
         // The asker's own judgement, read off the record rather than derived
         // beside it. See [`Signal::loud`]: wsp does not get a second opinion
@@ -939,8 +974,13 @@ impl Source for Poll<'_> {
         let mine = |t: &Task| in_scope(&self.scope, &wip.index, &wip.governors, &lists, t);
         let task_of = |id: &str| wip.tasks.iter().find(|t| t.id == id);
 
+        // Read once and above everything, because (b) and (c) both want it: (c)
+        // is the census itself, and (b) asks it whether the party a question is
+        // waiting on is still turning.
+        let rows = cmd_agent::wip_rows(&wip);
+
         let mut out: Vec<Signal> = Vec::new();
-        // The panes that have said why they stopped. Filled by (b2), read by
+        // The panes that have said why they stopped. Filled by (b), read by
         // (c), and the reason the two are in this order.
         let mut spoken_for: BTreeSet<String> = BTreeSet::new();
 
@@ -963,68 +1003,66 @@ impl Source for Poll<'_> {
             }
         }
 
-        // (b) Raised hands addressed here. `addressed` is the routing walk and
-        // it is asked rather than reimplemented, so a hand this watch reports
-        // is exactly a hand `wsp flag --seat` would list.
-        for m in crate::message::raised(self.store).iter().filter(|m| !m.is_reply()) {
-            let Some(t) = m.about.task().and_then(task_of) else { continue };
-            if !mine(t) {
-                continue;
-            }
-            let said = m.title();
-            let ask = m.ask().unwrap_or(crate::message::Ask::Nothing).as_str();
-            // The sentence, not the title. A flag with no words is one you have
-            // to go and read either way, and one with words is carrying the
-            // only thing on this line that is not derivable.
-            let detail = match (said.is_empty(), ask.is_empty()) {
-                (true, true) => "a hand is up — wsp flag lists it".to_string(),
-                (true, false) => format!("asking to {ask}"),
-                (false, true) => util::truncate(said, 60),
-                (false, false) => format!("{} · asking to {ask}", util::truncate(said, 48)),
-            };
-            out.push(Signal::new(Kind::Flag, &t.id, &detail));
-        }
-
-        // (c) The join, read rather than recomputed. Every row here carries
-        // `needs_you` — `stopped && doing && !seat` — computed once by
-        // `cmd_govern::needs_a_person` and published by `wsp wip --json`.
-        let rows = cmd_agent::wip_rows(&wip);
-
-        // (b2) Questions nobody has answered, which is the one level here that
-        // somebody wrote down rather than wsp inferring. `open_questions`'
-        // docstring is the specification — *"a caller adds is that pane stopped
-        // and how long has it been, and has `quiet_note`'s conjunction with a
-        // better subject line: it can say WHAT the agent is waiting for"* — and
-        // this is that caller. The population is `wsp ask`'s own, deliberately,
-        // so what the verb lists and what the watch reports are one answer:
-        // open questions, plus records this build cannot read.
+        // (b) Everything somebody wrote down and nobody has dealt with —
+        // `message::raised`, which is the routing population `wsp flag --seat`
+        // lists, asked rather than reimplemented.
         //
-        // Placed above (c) because the two meet on the same agent and the
-        // second is the weaker reading of it. A stall is *an agent stopped and
-        // wsp does not know why*; this is the same agent with its reason in
-        // words. Both go up — they are different facts and one clears without
-        // the other — but a reader scanning down the column meets the one
-        // carrying the sentence first.
-        for m in self.store.messages().into_values() {
-            // A subject that is a task is what routing and `--about` are made
-            // of; `wsp ask` requires one, so this is every question. A record
-            // without one has no chain to walk and is only the machine pass's —
-            // which is right, and better than dropping it: `Scope::machine` is
-            // the reader that answers for everything.
+        // **Split by shape, into the two words that say what is owed back.**
+        // `wsp-095` Part 3 is that a notification and a question are different
+        // animals — *one is over when it is sent, the other has a lifecycle and
+        // an agent sitting still while it is open* — and a vocabulary that gave
+        // them one word would be lossy in the direction that matters: a
+        // governor cannot tell, from `flag`, whether anybody is waiting.
+        //
+        // So `flag` is now exactly *a hand is up and nothing is owed*, and
+        // `unanswered` is *somebody is sitting still until you write a
+        // sentence*. `wsp flag --ask claim` mints a question and therefore
+        // arrives as the second, which is the one behaviour change here worth
+        // knowing about: a seat that names `flag` on the command line rather
+        // than taking the default set no longer sees them.
+        //
+        // Both carry the record's id, which is what makes two hands on one task
+        // two facts in the ledger — `worklist-017` from the reading side. The
+        // record fixed the write; keying the level on the task alone would have
+        // put the same loss straight back at the surface.
+        for m in crate::message::raised(self.store).iter().filter(|m| !m.is_reply()) {
+            // A task subject is what routing and `--about` are made of, and
+            // `wsp ask` and `wsp flag` both require one — so this is every
+            // record in practice. A record whose subject this build cannot read
+            // has no chain to walk and is only the machine pass's, which is
+            // right and is better than dropping it: `Scope::machine` is the
+            // reader that answers for everything, and a record wsp cannot place
+            // is exactly the kind it must not go quiet about.
             let subject = match m.about.task().and_then(task_of) {
                 Some(t) if mine(t) => t.id.clone(),
                 Some(_) => continue,
                 None if self.scope.all => m.id.clone(),
                 None => continue,
             };
-            if let Some(sig) = asking(&m, &subject, &rows) {
+            if let Some(sig) = asking(m, &subject, &rows) {
                 if let Some(w) = &m.waiting {
                     spoken_for.insert(w.pane.clone());
                 }
                 out.push(sig);
+                continue;
             }
+            let said = m.title();
+            let ask = m.ask().unwrap_or(crate::message::Ask::Nothing).as_str();
+            // The sentence, not the title. A flag with no words is one you
+            // have to go and read either way, and one with words is carrying
+            // the only thing on this line that is not derivable.
+            let detail = match (said.is_empty(), ask.is_empty()) {
+                (true, true) => "a hand is up — wsp flag lists it".to_string(),
+                (true, false) => format!("asking to {ask}"),
+                (false, true) => util::truncate(said, 60),
+                (false, false) => format!("{} · asking to {ask}", util::truncate(said, 48)),
+            };
+            out.push(Signal::new(Kind::Flag, &subject, &detail).of(&m.id));
         }
 
+        // (c) The join, read rather than recomputed. Every row here carries
+        // `needs_you` — `stopped && doing && !seat` — computed once by
+        // `cmd_govern::needs_a_person` and published by `wsp wip --json`.
         for r in rows.iter() {
             if !r.needs_you || r.task_id.is_empty() {
                 continue;
@@ -1907,12 +1945,14 @@ mod tests {
         assert_eq!(s.loudness(), crate::message::Kind::Direction, "wsp being confused is a person's job");
     }
 
-    /// An acknowledged notification is nobody's. Nothing is sitting still
-    /// behind one, and a level nobody is waiting on is a backlog rather than
-    /// attention — the panel-full-of-flags failure, arriving by the one route
-    /// with nobody reading it.
+    /// **The split, from the side that decides it.** `asking` answering `None`
+    /// is what sends a record to (b)'s `flag` line instead, so a notification
+    /// — open or acknowledged — is never an `unanswered` level. `wsp-095`
+    /// Part 3: one is over when it is sent, the other has an agent sitting
+    /// still while it is open, and a governor reading one word for both could
+    /// not tell which it had.
     #[test]
-    fn a_notification_that_has_been_read_is_not_a_level() {
+    fn a_notification_is_a_raised_hand_and_never_an_unanswered_one() {
         let mut m = Message::new(Party::pane("w1:p1", "w1"), crate::message::Kind::Note, "landed");
         m.about = About::Task("a-1".into());
         assert_eq!(m.shape(), Some(Shape::Notification));
