@@ -1456,6 +1456,48 @@ fn aside(at: i64, said: &str, p: &Paint) -> String {
     format!("{} {} {}", p.dim(&clock(at)), p.dim(&util::pad("·", 14)), p.dim(said))
 }
 
+/// What `0 standing` means when the scope being watched is a **seat**, said
+/// where the count is already being printed.
+///
+/// worklist-037, and the whole of what that row asked to be built. Two seats
+/// agreed a hand-over by calendar — *"take `worklist` back when phase two is
+/// done"* — and what actually fired was this number: `phase-two` went `done`,
+/// the seat governed a finished list, and the next tick reported **0
+/// standing**. A calendar rule needs somebody to remember it and to judge that
+/// the moment has come; a level nobody has to author cannot be forgotten and is
+/// already computed. It is `wsp-095`'s argument for SIGNAL over NOTIFICATION,
+/// applied to the position rather than to the work.
+///
+/// **It says and it never acts, and that is not timidity.** `robustness-090`
+/// d1 is that destroying a record is asked for and never automatic, and a slot
+/// is a position — vacating one is the same class of act. A seat with nothing
+/// standing is not necessarily a seat that should go: the next group's members
+/// have not started yet, and work arriving one tick later would arrive at
+/// nobody. So this hands a person the sentence at the moment they are already
+/// looking, and `wsp govern --clear` stays something somebody types.
+///
+/// # Why it must stay a statement, which is the half the row did not know
+///
+/// **`0 standing` on a seat does not distinguish *nothing left to answer for*
+/// from *nobody is answering*, and this file cannot tell them apart.** Driven
+/// on a fake herdr: a seated pane alive with its turn abandoned, its member
+/// working normally, `wsp watch --now` printing *nothing is up* and `wsp
+/// doctor* printing *no problems*. The healthy seat and the dead one produce
+/// the identical reading, and the difference between them is whether the seat
+/// is turning — which nothing computes, because
+/// [`cmd_govern::needs_a_person`] exempts a seat by construction and every
+/// [`Kind`] above takes a task as its subject.
+///
+/// So anything that wired this number to an act would stand down a seat for
+/// having died. The exemption is the joint: `standing == 0` is what makes an
+/// idle seat *correct*, and `standing > 0` held past [`SETTLE`] is what would
+/// make it a stall. One predicate, read from its two sides — see
+/// [`crate::attention`], where the missing half belongs.
+fn nothing_addressed(scope: &Scope, standing: usize) -> Option<&'static str> {
+    (scope.seated && standing == 0)
+        .then_some("nothing is addressed to this seat — wsp govern --clear stands it down")
+}
+
 // ---------------------------------------------------------------------------
 // the verb
 // ---------------------------------------------------------------------------
@@ -1721,7 +1763,11 @@ fn level_read(poll: &mut Poll, spec: &Spec) -> i32 {
     }
     let p = Paint::new();
     if now.is_empty() {
-        println!("{}", aside(at, &format!("nothing is up on {} — read just now", spec.scope.name), &p));
+        let said = match nothing_addressed(&spec.scope, 0) {
+            Some(note) => format!("nothing is up on {} — read just now · {note}", spec.scope.name),
+            None => format!("nothing is up on {} — read just now", spec.scope.name),
+        };
+        println!("{}", aside(at, &said, &p));
         return 0;
     }
     for s in &now {
@@ -1832,11 +1878,18 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
             aside(
                 started,
                 &format!(
-                    "watching {} · every {} · {} standing · {}",
+                    "watching {} · every {} · {} standing · {}{}",
                     spec.scope.name,
                     util::duration_human(spec.every),
                     ledger.standing(),
-                    spec.want.iter().map(|k| k.word()).collect::<Vec<_>>().join(" ")
+                    spec.want.iter().map(|k| k.word()).collect::<Vec<_>>().join(" "),
+                    // Only when it is a seat and only at zero — see
+                    // [`nothing_addressed`]. On every other line this is the
+                    // empty string, so a watch on a project is byte-for-byte
+                    // what it was.
+                    nothing_addressed(&spec.scope, ledger.standing())
+                        .map(|note| format!(" · {note}"))
+                        .unwrap_or_default()
                 ),
                 &p
             )
@@ -1876,10 +1929,13 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
                 aside(
                     at,
                     &format!(
-                        "watching {} · {} · {} standing",
+                        "watching {} · {} · {} standing{}",
                         spec.scope.name,
                         util::duration_human(at - started),
-                        ledger.standing()
+                        ledger.standing(),
+                        nothing_addressed(&spec.scope, ledger.standing())
+                            .map(|note| format!(" · {note}"))
+                            .unwrap_or_default()
                     ),
                     &p
                 )
@@ -2053,6 +2109,43 @@ mod tests {
 
     fn sig(kind: Kind, subject: &str) -> Signal {
         Signal::new(kind, subject, "because")
+    }
+
+    // ---- what a seat is told about itself ----------------------------------
+
+    fn scope(name: &str, seated: bool) -> Scope {
+        Scope { name: name.into(), seated, workspace: "w1".into(), pane: "w1:p1".into(), all: false }
+    }
+
+    /// The row worklist-037 was filed on: two seats agreed a hand-over by
+    /// calendar and what fired was this number. It is said at the moment
+    /// somebody is already reading the count, and it names the verb rather
+    /// than running it.
+    #[test]
+    fn a_seat_with_nothing_standing_is_told_what_that_means() {
+        let note = nothing_addressed(&scope("phase-two", true), 0).expect("a seat at zero is told");
+        assert!(note.contains("nothing is addressed to this seat"), "{note}");
+        assert!(note.contains("wsp govern --clear"), "it names the stand-down: {note}");
+    }
+
+    /// And never at the moment it would be wrong. A seat with something up is
+    /// a seat with work to do, and telling it how to vacate is the opposite of
+    /// what the level says.
+    #[test]
+    fn a_seat_with_something_standing_is_not_offered_the_stand_down() {
+        assert_eq!(nothing_addressed(&scope("phase-two", true), 1), None);
+    }
+
+    /// A watch on a project this pane does not sit in gets nothing added, and
+    /// that is not tidiness: `wsp govern --clear` stands *this workspace*
+    /// down, so offering it to a reader who holds no seat would name a verb
+    /// that does nothing — and every existing line stays byte-for-byte what it
+    /// was, which is the bar anything added to a stream a governor runs all
+    /// night is held to.
+    #[test]
+    fn a_watch_on_a_scope_it_does_not_sit_in_is_told_nothing_about_standing_down() {
+        assert_eq!(nothing_addressed(&scope("robustness", false), 0), None);
+        assert_eq!(nothing_addressed(&Scope::machine(), 0), None, "and neither is the daemon's pass");
     }
 
     // ---- the questions somebody wrote down ---------------------------------

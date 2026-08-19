@@ -31,8 +31,29 @@
 //! - *What stops it re-raising every fifteen minutes?* It never re-raises,
 //!   because it never arrives. [`Ledger`] emits on change and never on state.
 //! - *Does it go to a governor that has itself stopped?* [`addressee`] walks
-//!   [`cmd_govern::seat_for`], which terminates at *everyone*; and a stopped
-//!   seat is a subject of the same predicate, so it raises its own hand.
+//!   [`cmd_govern::seat_for`], which terminates at *everyone*, so a signal
+//!   about *work* is delivered to this pass's sink whatever state the seat it
+//!   names is in — the address is a label on a line in `events.jsonl`, not a
+//!   process that has to be alive to receive it.
+//!
+//!   **The second half of that answer used to read *and a stopped seat is a
+//!   subject of the same predicate, so it raises its own hand*. That is false,
+//!   and it is false three times over** — worklist-037, driven on a fake herdr
+//!   with a seated pane running no turn. A custodian holds no task, so it has
+//!   no binding: [`Poll::sample`]'s (c) skips it on `task_id.is_empty()`, its
+//!   `doing` is `false`, and [`cmd_govern::needs_a_person`]'s `!seat` excludes
+//!   it explicitly. `wsp watch --now` in that state printed *nothing is up* and
+//!   `wsp doctor` printed *no problems* while the pane that was supposed to be
+//!   sequencing the run sat there.
+//!
+//!   The cause is structural rather than a missing arm: **every [`Kind`] in
+//!   this vocabulary takes a task as its subject** — `Signal::subject` says so,
+//!   [`cmd_watch::in_scope`] tests a `Task`, and [`addressee`] answers
+//!   `everyone` for anything `store.task()` cannot find. A fact whose subject
+//!   is a *seat* has nowhere to sit. That is worklist-037's decision and the
+//!   predicate it specifies is `stopped && standing > 0 && seat`; nothing here
+//!   computes it yet, and this pass is where it would go, because the one agent
+//!   that cannot report a stalled seat is that seat.
 //! - *Is an hour right unattended?* Not asked here. The pass reads
 //!   [`cmd_watch::Poll`], which measures how long a level has actually held
 //!   rather than guessing from a proxy.
