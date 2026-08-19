@@ -26,6 +26,7 @@ mod cmd_task;
 mod cmd_verify;
 mod daemon;
 mod detail;
+mod detect_override;
 mod draw;
 mod fake;
 mod fm;

@@ -4011,6 +4011,15 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
 
     let probe = Probe::live();
     herdr_health(&probe, &bindings, &tasks, &mut problems, &mut notes);
+    // Detection rules herdr is taking from this machine instead of from
+    // upstream. Silent on a machine with none, which is every machine until
+    // somebody has a fault worth shadowing upstream's fixes to fix.
+    crate::detect_override::health(
+        &crate::detect_override::dirs(),
+        crate::detect_override::ask,
+        &mut problems,
+        &mut notes,
+    );
     // Whether the machine has the one daemon it should have. The probe is passed
     // because a machine with no herdr on it wants no daemon either, and a check
     // that said "no daemon running" there is a check that gets ignored along

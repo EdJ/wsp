@@ -252,7 +252,7 @@ fn path_with(shim: &Path, current: Option<&str>) -> String {
 /// that matters most: a `wsp` started by herdr's own plugin runner inherits
 /// whatever `PATH` herdr was launched with, which is why `run.sh` looks the
 /// binary up by hand rather than trusting it. Same reasoning, same fallback.
-fn herdr_bin() -> PathBuf {
+pub(crate) fn herdr_bin() -> PathBuf {
     if let Some(v) = std::env::var_os("HERDR_BIN") {
         let p = PathBuf::from(v);
         if !p.as_os_str().is_empty() {
