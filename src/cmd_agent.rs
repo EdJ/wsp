@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::cmd_govern;
 use crate::herdr;
+use crate::message::{self, About, Ask, Hand, Kind, Message, Party, Shape, Waiting};
 use crate::model::{Status, Task};
 use crate::place::{Delivery, Place, Refusal, State};
 use crate::place_herdr::Herdr;
@@ -647,12 +648,73 @@ pub(crate) fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
 /// nothing left behind when it is answered. `wsp note` is the verb for the half
 /// of it that is worth keeping.
 ///
-/// The event is the seam for anything louder. `~/wsp/hooks/on-task-flagged`
-/// gets the JSON on stdin, so a desktop notification is an executable file.
+/// # A raised hand is a message, and it is no longer keyed by the task
+///
+/// `worklist-017`, and the answer is that the defect **dissolves** rather than
+/// being repaired. Until this, a flag was a row in `flags.json` keyed by the
+/// task it was about — so `Store::set_flag` inserted by task id, and an agent
+/// raising a second hand on the task it was working **overwrote the first
+/// without saying so**. A seat that did not happen to notice would have lost
+/// the first raised hand and been told nothing, which is this codebase's house
+/// fault in its sharpest form: the near side reporting success on its own
+/// records while the far side lost the thing. `wsp flag` returned cleanly. The
+/// agent believed two hands were up. One was. And the thing lost was *the
+/// request for attention itself* — the mechanism whose entire job is to not be
+/// lost.
+///
+/// The question that had to be answered before touching `set_flag` was whether
+/// a flag is still keyed by a task at all, and it is not. [`crate::message`]
+/// landed with ids of its own, deliberately outside the task id space, and a
+/// flag is one of its three shapes. So a raised hand is a [`Message`]: keyed by
+/// its own id, so **two are two**, with nothing left to overwrite. Repairing
+/// `set_flag` — refusing the second, or keying it by task *and* raiser — would
+/// have been a second keying scheme standing beside the record's, which is one
+/// concept too many for a fault that a record wsp already has does not have.
+///
+/// What each field became, so the mapping is readable in one place:
+///
+/// | was | is |
+/// |---|---|
+/// | the task it was keyed under | [`About::Task`] — the *subject*, from which the address is derived |
+/// | `said` / `--title` / `--body` | one `text`, [`message::compose`]d, headline first |
+/// | `pane` + `workspace` | [`Party::Pane`] — the sender, structured |
+/// | `ask: claim` | [`Ask::Claim`], **and** [`Shape::Question`] |
+/// | `at`, `seen` | unchanged, and they mean the same thing |
+///
+/// Two things fall out that were not asked for and are worth naming. A flag
+/// with `--ask` is now a **question**, so [`Shape::may`] refuses to let it be
+/// cleared: `worklist-004`'s failure, where a seat answered by another route
+/// and then lowered the hand so that *clearing looked like answering*, is now
+/// a refusal rather than a convention. And `--body` with no `--title` can no
+/// longer draw as nothing (`worklist-018`), because [`message::compose`] makes
+/// the first line of `text` non-empty whenever anything at all was given.
+///
+/// The event is the seam for anything louder. `~/wsp/hooks/on-message-raised`
+/// gets the JSON on stdin — the id, the shape, the sender, the subject and the
+/// headline — so a desktop notification is an executable file. It replaces
+/// `on-task-flagged`, which named the record rather than the act and could only
+/// ever have fired for one of the three shapes.
 pub fn flag(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let clearing = args.has("clear");
     let needle = args.rest.first().cloned();
+
+    // Before anything reads or writes: any hand the *installed* binary raised
+    // into `flags.json` is carried across into the record. The installed binary
+    // is routinely not the tree, and a hand that stopped being drawn the moment
+    // this landed would be `worklist-017` committed by the change that fixes
+    // it. Once, then never again — see [`message::adopt_legacy_flags`].
+    let carried = message::adopt_legacy_flags(store);
+    if !carried.is_empty() {
+        eprintln!(
+            "{}",
+            p.dim(&format!(
+                "· carried {} raised hand{} across from flags.json into the message record",
+                carried.len(),
+                if carried.len() == 1 { "" } else { "s" }
+            ))
+        );
+    }
 
     // No id and nothing to clear: what is raised. The question a person asks
     // from a shell is the same one the panel answers by drawing the section,
@@ -665,6 +727,16 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         return list_flags(store, args);
     };
 
+    // `--seen` and `--clear` act on a *raised hand*, and a hand is now named by
+    // an id of its own rather than by the task it is about — so they resolve
+    // the needle against the record and not against the task table. Both still
+    // take a task id, because that is what every surface has been passing them
+    // and because it is what a person says; what they no longer do is guess
+    // when it names more than one.
+    if args.has("seen") || clearing {
+        return dispose(store, args, &needle, clearing);
+    }
+
     let task = match store.task_or_why(&needle) {
         Ok(t) => t,
         Err(why) => {
@@ -672,50 +744,6 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-
-    // Read, and still up. The card is the interruption and the row is the
-    // reminder, so putting the card away has to be a different act from taking
-    // the flag down — `esc` says "not now", `x` says "dealt with", and a panel
-    // that could only do the second would train you to clear things you had not
-    // answered. Written into the flag rather than kept per panel, because there
-    // are twenty-two panels and the card would otherwise pop again on the next
-    // one you switched to.
-    if args.has("seen") {
-        let mut flags = store.flags();
-        let Some(f) = flags.get_mut(&task.id) else {
-            eprintln!("wsp: nothing raised on {}", task.id);
-            return 1;
-        };
-        if let Some(m) = f.as_object_mut() {
-            m.insert("seen".into(), json!(true));
-        }
-        let f = f.clone();
-        store.set_flag(&task.id, f);
-        if args.json() {
-            println!("{}", json!({ "id": task.id, "seen": true }));
-        } else {
-            println!("{} {}  {}", p.dim("·"), p.bold(&task.id), p.dim("seen · still raised"));
-        }
-        return 0;
-    }
-
-    if clearing {
-        let was = store.clear_flag(&task.id);
-        if was {
-            store.log_event(
-                "task-unflagged",
-                json!({ "id": task.id, "project": task.project, "title": task.title }),
-            );
-        }
-        if args.json() {
-            println!("{}", json!({ "id": task.id, "flagged": false, "was": was }));
-        } else if was {
-            println!("{} {}  {}", p.dim("·"), p.bold(&task.id), p.dim("lowered"));
-        } else {
-            println!("{} {}  {}", p.dim("·"), p.bold(&task.id), p.dim("nothing raised"));
-        }
-        return 0;
-    }
 
     // The sentence is optional on purpose: "look at this task" is a complete
     // thing to say, and a verb that refused without a reason would be a verb
@@ -790,29 +818,55 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         return 2;
     }
 
-    store.set_flag(
-        &task.id,
-        json!({
-            "said": said,
-            "title": title,
-            "body": body.trim_end(),
-            "ask": ask,
-            "pane": pane,
-            "workspace": workspace,
-            "at": util::now_iso(),
-        }),
+    // The three inputs become one text, headline first — see
+    // [`message::compose`], which is where the invariant that keeps
+    // `worklist-018` shut lives.
+    let mut raised = Message::new(
+        match pane.is_empty() {
+            // No pane is a person at a shell, and that is the correct reading:
+            // the one channel wsp does not control is a human keyboard, so
+            // unattributed is a person rather than an unknown.
+            true => Party::Human,
+            false => Party::pane(&pane, &workspace),
+        },
+        // `wsp-095` Part 4: every verb's default is the quietest kind that verb
+        // can honestly be, and `wsp flag` is `note`. A raised hand is read at
+        // the reader's next turn boundary; nothing but `stop` interrupts.
+        Kind::Note,
+        &message::compose(said, &title, &body),
     );
-    store.log_event(
-        "task-flagged",
-        json!({
-            "id": task.id,
-            "project": task.project,
-            "status": task.status().as_str(),
-            "title": task.title,
-            "said": said,
-            "pane": pane,
-        }),
-    );
+    raised.about = About::Task(task.id.clone());
+    if ask == "claim" {
+        raised.set_ask(Ask::Claim);
+        // An ask is a **question**, and the shape is what makes it one:
+        // something is now waiting, so it may be answered or abandoned and may
+        // never merely be cleared. A bare flag stays a notification, because a
+        // question commits somebody to answering it and starts a clock, and
+        // that is not a thing to acquire by accident.
+        raised.set_shape(Shape::Question);
+        // Who is sitting still. The pane, and the task that pane is holding —
+        // *not* the task being asked about — because an answer goes home to
+        // the asker and `message::replies_for` finds it by the asker's task.
+        // An agent asking to take something usually holds nothing, and the
+        // subject is then the only task there is to name; `homes_to` would
+        // reach it either way, but `replies_for` would not, and an answer its
+        // asker cannot find is the return path failing quietly.
+        let mine = store
+            .bindings()
+            .get(&pane)
+            .and_then(|b| b.get("task_id"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| task.id.clone());
+        raised.waiting = Some(Waiting::new(&pane, &mine));
+    }
+    // The record refuses what it will not hold, and a verb whose whole effect
+    // is on somebody else's screen has to say when nothing landed.
+    if let Err(why) = message::raise(store, &raised) {
+        eprintln!("wsp: {why}");
+        return 1;
+    }
 
     if args.json() {
         println!(
@@ -830,6 +884,111 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         // Say where it went. A command whose whole effect is on somebody else's
         // screen has to name the screen, or it reads as having done nothing.
         println!("  {}", p.dim(&addressed(store, &task)));
+    }
+    0
+}
+
+/// `--seen` and `--clear`: the two things you can do to a raised hand without
+/// answering it.
+///
+/// # Why this takes an id and may refuse
+///
+/// `worklist-017` from the reading side. Under `flags.json` a task named at
+/// most one raised hand, so `wsp flag --clear <task>` was unambiguous by
+/// construction — and it was unambiguous because the store was *losing* the
+/// second hand, which is the fault this whole change is about. With the hands
+/// kept, a task can name several, and a verb that quietly acted on one of them
+/// would be the same fault wearing the other hat: an act on somebody's raised
+/// hand that nobody was told about.
+///
+/// So a needle resolves to [`Hand`] and the ambiguous case comes back with the
+/// hands listed. That is the cheapest of the three shapes this task's overview
+/// offered — *one per task, but say so* — landing at the one place where the
+/// ambiguity is real rather than at the store, where it would have been a rule
+/// against holding two.
+///
+/// # What `--clear` means now, and the one thing it may not do
+///
+/// It **acknowledges**: *I have this and I am not passing it on*. That is a
+/// real act rather than a dismissal, it is what makes the chain auditable, and
+/// it costs the same one keystroke `x` always did.
+///
+/// It may not close a question. `Shape::may` refuses it, and the refusal is
+/// `worklist-004`: a seat answered a flagged agent's question down a different
+/// channel and then lowered the hand, so **clearing looked like answering** —
+/// to every surface in the system the matter was closed while the asker sat
+/// waiting. A question ends by being answered or abandoned, both of which take
+/// a sentence and both of which reach the asker.
+///
+/// The record is then forgotten, and the two halves are deliberate: the
+/// *disposition* is an event in `events.jsonl`, which is the history and is
+/// append-only, and `messages.json` holds what is still standing. Keeping every
+/// acknowledged hand in the standing set would grow a file that twenty-two
+/// panels stat on every tick, to say something the log already says better.
+fn dispose(store: &Store, args: &Args, needle: &str, clearing: bool) -> i32 {
+    let p = Paint::new();
+    let one = match message::hand(store, needle) {
+        Hand::One(m) => *m,
+        Hand::Nothing => {
+            eprintln!("wsp: nothing raised on {needle}");
+            return 1;
+        }
+        // Not a guess and not a silent pick. The ids are printed because they
+        // are what the caller needs to say next, and this is the only place
+        // most people will ever see one.
+        Hand::Several(up) => {
+            eprintln!("wsp: {} hands are up on {needle} — name the one you mean:", up.len());
+            for m in &up {
+                eprintln!("     {}  {}", m.id, util::truncate(m.title(), 60));
+            }
+            return 2;
+        }
+    };
+    let task = one.about.task().unwrap_or(needle).to_string();
+
+    // Read, and still up. The card is the interruption and the row is the
+    // reminder, so putting the card away has to be a different act from taking
+    // the hand down — `esc` says "not now", `x` says "dealt with", and a panel
+    // that could only do the second would train you to clear things you had not
+    // answered. Written into the record rather than kept per panel, because
+    // there are twenty-two panels and the card would otherwise pop again on the
+    // next one you switched to.
+    if !clearing {
+        if let Err(why) = message::see(store, &one.id) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+        if args.json() {
+            println!("{}", json!({ "id": one.id, "task": task, "seen": true }));
+        } else {
+            println!("{} {}  {}", p.dim("·"), p.bold(&task), p.dim("seen · still raised"));
+        }
+        return 0;
+    }
+
+    let env = herdr::Env::read();
+    let by = match env.pane_id {
+        Some(pane) if !pane.is_empty() => {
+            Party::pane(&pane, &env.workspace_id.unwrap_or_default())
+        }
+        _ => Party::Human,
+    };
+    if let Err(why) = message::acknowledge(store, &one.id, &by) {
+        eprintln!("wsp: {why}");
+        // The sentence `Refused::WrongShape` prints is true and short; this is
+        // the one that says what to do instead, and a person who has just been
+        // stopped from taking a hand down is exactly who needs it.
+        if one.shape() == Some(Shape::Question) {
+            eprintln!("     {}", message::Refused::StillOpen);
+            eprintln!("     wsp answer {} \"…\"  ·  wsp answer {} --abandon \"…\"", one.id, one.id);
+        }
+        return 1;
+    }
+    let _ = store.forget_message(&one.id);
+    if args.json() {
+        println!("{}", json!({ "id": one.id, "task": task, "flagged": false, "was": true }));
+    } else {
+        println!("{} {}  {}", p.dim("·"), p.bold(&task), p.dim("lowered"));
     }
     0
 }
@@ -877,22 +1036,31 @@ fn glyph_seat() -> &'static str {
 }
 
 /// `wsp flag` with nothing to raise: what is already up.
+///
+/// Reads [`message::raised`] rather than `flags.json`, which is the whole of
+/// `worklist-017` arriving at a listing: two hands on one task are two rows,
+/// where before the second had already replaced the first by the time anything
+/// could draw either.
+///
+/// Replies are not in it. An answer is addressed to whoever asked and already
+/// has two deliveries of its own; see [`Message::is_reply`].
 fn list_flags(store: &Store, args: &Args) -> i32 {
-    let flags = store.flags();
+    // Newest first: a flag is an interruption, and the one raised while you
+    // were reading the last one is the one you have not seen. The record is
+    // kept oldest-first, because which end of a queue an interruption is read
+    // from is a decision about a surface.
+    let rows: Vec<Message> =
+        message::raised(store).into_iter().filter(|m| !m.is_reply()).rev().collect();
     if args.json() {
-        println!("{}", serde_json::to_string_pretty(&flags).unwrap_or_default());
+        let out: Vec<serde_json::Value> = rows.iter().map(Message::to_json).collect();
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
     let p = Paint::new();
-    if flags.is_empty() {
+    if rows.is_empty() {
         println!("{}", p.dim("nothing raised"));
         return 0;
     }
-    // Newest first: a flag is an interruption, and the one raised while you
-    // were reading the last one is the one you have not seen.
-    let mut rows: Vec<(&String, &serde_json::Value)> = flags.iter().collect();
-    let at = |v: &serde_json::Value| v.get("at").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    rows.sort_by(|a, b| at(b.1).cmp(&at(a.1)));
 
     // Whose hands these are. The order stays newest-first — an interruption is
     // read in the order it arrived, and re-sorting by addressee would bury the
@@ -916,7 +1084,8 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     // Read once for the whole list rather than per row: the answer is the same
     // handful of files however many hands are up.
     let lists = crate::worklist::Running::read(store);
-    for (id, f) in rows {
+    for m in &rows {
+        let id = m.about.task().unwrap_or_default();
         let task = store.task(id);
         let seat = task.as_ref().and_then(|t| {
             cmd_govern::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref())
@@ -926,7 +1095,6 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
             continue;
         }
         shown += 1;
-        let get = |k: &str| f.get(k).and_then(|x| x.as_str()).unwrap_or("");
         // A flag on a task that has since been retired is a hand raised about
         // nothing. Say so rather than printing a bare id: the fix is to lower
         // it, and nothing else here will.
@@ -936,13 +1104,14 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         };
         println!("{} {}  {}", p.red(glyph_flag()), p.bold(id), title);
         let mut second: Vec<String> = Vec::new();
-        if !get("said").is_empty() {
-            second.push(get("said").to_string());
+        if !m.title().is_empty() {
+            second.push(m.title().to_string());
         }
-        if !get("pane").is_empty() {
-            second.push(get("pane").to_string());
+        let who = m.from.byline();
+        if !who.is_empty() {
+            second.push(who);
         }
-        let held = util::since(get("at"));
+        let held = util::since(&m.at);
         if held > 0 {
             second.push(util::duration_human(held));
         }
@@ -4545,6 +4714,176 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store of our own, with the state beside it — a raised hand lives in
+    /// state, and a test that only moved `WSP_HOME` would put its flags on the
+    /// machine's real panel.
+    fn scratch(tag: &str) -> (crate::util::Isolated, Store) {
+        let env = crate::util::isolated(tag);
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        (env, store)
+    }
+
+    fn a_task(store: &Store, id: &str) -> Task {
+        let mut t = Task::new("the panel work, in order", id);
+        t.project = Some("wsp".into());
+        store.save_task(&t).unwrap();
+        t
+    }
+
+    fn raise_one(store: &Store, args: &[&str], flags: &[(&str, &str)]) -> i32 {
+        flag(store, &Args::synth("flag", args, flags))
+    }
+
+    /// **The fault this whole change exists for**, driven through the verb
+    /// rather than through the record.
+    ///
+    /// `worklist-017`, found live: `store.set_flag` inserted by task id, so an
+    /// agent that raised a second hand on the task it was working overwrote the
+    /// first and was told nothing. `wsp flag` returned cleanly, the agent
+    /// believed two hands were up, and one was. The thing lost was the request
+    /// for attention itself.
+    ///
+    /// Asserted on the *first* hand rather than on the count alone, because a
+    /// count of two would also pass if the second had replaced the first and
+    /// something else had arrived.
+    #[test]
+    fn a_second_hand_on_one_task_does_not_replace_the_first() {
+        let (_env, store) = scratch("flag-two");
+        a_task(&store, "wsp-001");
+
+        for said in ["the index is behind HEAD", "and the tree is shared"] {
+            assert_eq!(raise_one(&store, &["wsp-001", said], &[]), 0);
+        }
+
+        let up = crate::message::about_task(&store, "wsp-001");
+        assert_eq!(up.len(), 2, "the second raised hand replaced the first");
+        assert_eq!(up[0].title(), "the index is behind HEAD", "and the one lost was the older");
+        assert_eq!(up[1].title(), "and the tree is shared");
+        assert_ne!(up[0].id, up[1].id, "two hands sharing an identity is the same fault again");
+    }
+
+    /// And the ambiguity that follows is said out loud rather than guessed at.
+    ///
+    /// The verb that could take a task id and be certain could only be certain
+    /// because the store was losing the second hand. With both kept, a task id
+    /// naming two of them is a question, and the answer is to print them and
+    /// refuse — an exit of 2, which is what wsp says when an argument did not
+    /// name one thing.
+    #[test]
+    fn clearing_by_task_refuses_while_two_hands_are_up_and_works_once_one_is_down() {
+        let (_env, store) = scratch("flag-ambiguous");
+        a_task(&store, "wsp-001");
+        raise_one(&store, &["wsp-001", "the index is behind HEAD"], &[]);
+        raise_one(&store, &["wsp-001", "and the tree is shared"], &[]);
+
+        assert_eq!(
+            raise_one(&store, &["wsp-001"], &[("clear", "true")]),
+            2,
+            "a keypress disposed of one of two raised hands without saying which",
+        );
+
+        // Named, it goes — and only it.
+        let first = crate::message::about_task(&store, "wsp-001")[0].id.clone();
+        assert_eq!(raise_one(&store, &[&first], &[("clear", "true")]), 0);
+        let left = crate::message::about_task(&store, "wsp-001");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title(), "and the tree is shared");
+
+        // With one left, the task names it again and the shorthand works.
+        assert_eq!(raise_one(&store, &["wsp-001"], &[("clear", "true")]), 0);
+        assert!(crate::message::about_task(&store, "wsp-001").is_empty());
+    }
+
+    /// A hand outlives its subject, and a person must still be able to put it
+    /// down.
+    ///
+    /// Found live by `worklist-018` while cleaning up after itself: `flag`
+    /// resolved the needle through `task_or_why` *before* it looked at
+    /// `--clear`, so a hand on a task that no longer existed exited 1 with the
+    /// hand still up, and the panel's `x` built the same argv and failed the
+    /// same way. The file had to be edited by hand. `list_flags` had been
+    /// drawing `(no such task)` on those rows the whole time, saying *the fix
+    /// is to lower it* — which was the one thing that did not work.
+    ///
+    /// It is structural rather than a slip: a raised hand is identified by what
+    /// is raised, and `about` is a subject rather than a foreign key. So the
+    /// resolution goes to the record first and the task table never gets a
+    /// chance to refuse.
+    #[test]
+    fn a_hand_about_a_task_that_no_longer_exists_can_still_be_lowered() {
+        let (_env, store) = scratch("flag-orphan");
+        a_task(&store, "wsp-001");
+        raise_one(&store, &["wsp-001", "the store will not parse"], &[]);
+        std::fs::remove_file(store.task_path("wsp-001")).unwrap();
+        assert!(store.task("wsp-001").is_none(), "the subject is gone");
+
+        assert_eq!(
+            raise_one(&store, &["wsp-001"], &[("clear", "true")]),
+            0,
+            "a hand about a retired task could not be lowered by the verb that exists to lower it",
+        );
+        assert!(crate::message::raised(&store).is_empty());
+    }
+
+    /// `--ask` makes it a question, and a question may not simply be taken
+    /// down.
+    ///
+    /// `worklist-004`: a seat answered a flagged agent's question down a
+    /// different channel and then cleared the flag, so **clearing looked like
+    /// answering** — every surface read the matter as closed while the asker
+    /// sat waiting. Under the record that is not a convention anybody has to
+    /// remember, it is `Shape::may` refusing, and the hand stays up.
+    #[test]
+    fn an_ask_is_a_question_and_x_will_not_close_one() {
+        let (_env, store) = scratch("flag-ask");
+        a_task(&store, "wsp-001");
+        assert_eq!(
+            raise_one(&store, &["wsp-001", "this is next"], &[("ask", "claim"), ("pane", "w4:p2")]),
+            0
+        );
+
+        let up = crate::message::about_task(&store, "wsp-001");
+        assert_eq!(up[0].shape(), Some(crate::message::Shape::Question));
+        assert_eq!(up[0].ask(), Some(crate::message::Ask::Claim));
+        // Who is sitting still, so the answer can find its way back. Nothing
+        // was claimed in this pane, so the subject is the only task to name —
+        // and `message::replies_for` reads exactly this field.
+        assert_eq!(
+            up[0].waiting.as_ref().map(|w| (w.pane.as_str(), w.task.as_str())),
+            Some(("w4:p2", "wsp-001")),
+        );
+
+        assert_eq!(raise_one(&store, &["wsp-001"], &[("clear", "true")]), 1);
+        assert_eq!(
+            crate::message::about_task(&store, "wsp-001").len(),
+            1,
+            "the question was closed by a keystroke that said nothing",
+        );
+    }
+
+    /// The body-only flag, which drew as nothing.
+    ///
+    /// `worklist-018`: a hand raised with `--body` and no sentence showed the
+    /// task's own title and no message, because the field the surfaces drew was
+    /// the empty one. The record has one text and a first line, so there is no
+    /// empty field left to draw — which is the repair belonging at the writer,
+    /// where there is one of it.
+    #[test]
+    fn a_hand_with_only_a_paragraph_still_has_a_headline() {
+        let (_env, store) = scratch("flag-body");
+        a_task(&store, "wsp-001");
+        raise_one(
+            &store,
+            &["wsp-001"],
+            &[("body", "Landed on master, at review — and NOT INSTALLED.\nThe retry hazard is live.")],
+        );
+
+        let up = crate::message::about_task(&store, "wsp-001");
+        assert_eq!(up[0].title(), "Landed on master, at review — and NOT INSTALLED.");
+        assert_eq!(up[0].body(), "The retry hazard is live.");
+    }
 
     /// A row of `agent.list`, and deliberately without `interactive_ready`:
     /// that is how a plugin-reported agent arrives, and a census that could not

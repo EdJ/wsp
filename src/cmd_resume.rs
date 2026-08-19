@@ -1047,41 +1047,58 @@ const HAND: &str = "its agent did not come back after the restart";
 /// per agent rather than one notice, because that is what a person acts on: the
 /// task whose agent is missing, with the door on it.
 ///
-/// **Never over a hand somebody else raised.** A flag is one record per task and
-/// `set_flag` replaces it; clobbering an agent's own question with a restart
-/// notice would lose the more important of the two. The row is still in the
-/// picker either way.
+/// **Never twice for the same restart, and never a word about anybody else's
+/// hand.** This used to be a stronger claim than it needed to be: a flag was one
+/// record per task and `set_flag` replaced it, so raising here at all risked
+/// clobbering an agent's own question with a restart notice — and the guard was
+/// therefore *raise nothing if anything is up*. `worklist-017` removed the
+/// hazard: a hand is a message with an id of its own and there is nothing left
+/// to overwrite, so the guard narrows to what it was always about, which is
+/// idempotence. A daemon that starts twice puts up one notice, and an agent's
+/// own question standing beside it is two hands rather than one lost.
 ///
 /// A seat gets no hand, because a custodian holds no task and there is no row
 /// to raise one on. The workspace label and the daemon's own line are what that
 /// case has, and it is named in the note on `fork-016`.
 fn raise_hands(store: &Store, waiting: &[Thread]) {
-    let already = store.flags();
     for t in waiting {
         let Some(task) = &t.task else { continue };
-        if already.contains_key(task) {
+        if ours(store, task).is_some() {
             continue;
         }
-        store.set_flag(
-            task,
-            serde_json::json!({
-                "said": HAND,
-                "title": "",
-                "body": format!("`wsp resume {task}` brings it back on the thread it was on."),
-                "ask": "",
-                "pane": "",
-                "workspace": "",
-                "at": util::now_iso(),
-            }),
+        // `wsp` and not a pane, because this is the one raised hand on the
+        // machine that no agent put up: the daemon noticed a restart and said
+        // so. A byline naming a pane that no longer exists would be worse than
+        // none, and `Party::Human` would read as Ed having typed it.
+        let mut m = crate::message::Message::new(
+            crate::message::Party::Agent("wsp".into()),
+            crate::message::Kind::Note,
+            &crate::message::compose(
+                HAND,
+                "",
+                &format!("`wsp resume {task}` brings it back on the thread it was on."),
+            ),
         );
-        // The same event `wsp flag` writes, because the seam is the same one:
-        // `~/wsp/hooks/on-task-flagged` is how a restart that lost four agents
-        // becomes a desktop notification rather than a line in a log.
-        store.log_event(
-            "task-flagged",
-            serde_json::json!({ "id": task, "said": HAND, "pane": "" }),
-        );
+        m.about = crate::message::About::Task(task.clone());
+        // The same record and the same event `wsp flag` writes, because the
+        // seam is the same one: `~/wsp/hooks/on-message-raised` is how a
+        // restart that lost four agents becomes a desktop notification rather
+        // than a line in a log.
+        let _ = crate::message::raise(store, &m);
     }
+}
+
+/// The restart notice this file put up on one task, if it is still up.
+///
+/// Recognised by its sentence, which is what [`HAND`] is for: a hand an agent
+/// has since raised on the same task is left exactly where it is, and so is one
+/// a person raised. Under the old record that mattered because there was only
+/// one slot; under this one it still matters, because lowering somebody else's
+/// hand is the act this whole area exists to make impossible.
+fn ours(store: &Store, task: &str) -> Option<crate::message::Message> {
+    crate::message::raised(store)
+        .into_iter()
+        .find(|m| m.about.task() == Some(task) && m.title() == HAND)
 }
 
 /// The offer has been answered: drop the census and lower the hands it raised.
@@ -1104,12 +1121,16 @@ fn answered(store: &Store) {
 }
 
 /// Take one hand down, if it is still the one this file put up.
+///
+/// Acknowledged rather than deleted, which is what lowering a hand means under
+/// the record: *I have this and I am not passing it on*. The disposition is an
+/// event; the record then goes, because what is standing is what a panel draws.
 fn lower_hand(store: &Store, task: &str) {
-    if store.flags().get(task).map(|f| text(f, "said")) != Some(HAND.to_string()) {
-        return;
+    let Some(m) = ours(store, task) else { return };
+    let by = crate::message::Party::Agent("wsp".into());
+    if crate::message::acknowledge(store, &m.id, &by).is_ok() {
+        let _ = store.forget_message(&m.id);
     }
-    store.clear_flag(task);
-    store.log_event("task-unflagged", serde_json::json!({ "id": task, "said": HAND }));
 }
 
 /// Put the question where whoever is there will find it when herdr comes up.
@@ -1439,27 +1460,47 @@ mod tests {
         assert_eq!(offered[0].what, "render-061");
     }
 
-    /// The hand, and the one thing it must never do.
+    /// Every hand this file raised is up, and it stands *beside* the one the
+    /// agent raised for itself rather than on top of it.
+    ///
+    /// `worklist-017` is what changed here, and it is worth the extra
+    /// assertion: under `flags.json` the second of these two would have
+    /// replaced the first and this test could only ever have checked that we
+    /// declined to write. Now both are up, and that is the fact to protect.
+    fn hands_on(store: &Store, task: &str) -> Vec<String> {
+        crate::message::raised(store)
+            .into_iter()
+            .filter(|m| m.about.task() == Some(task))
+            .map(|m| m.title().to_string())
+            .collect()
+    }
+
     #[test]
     fn a_hand_is_raised_per_task_and_never_over_one_somebody_else_raised() {
         let (_env, store) = store("resume-hands");
-        store.set_flag("render-019", json!({ "said": "blocked on you", "ask": "claim" }));
+        let mut theirs = crate::message::Message::new(
+            crate::message::Party::pane("w1:p6", "ws"),
+            crate::message::Kind::Note,
+            "blocked on you",
+        );
+        theirs.about = crate::message::About::Task("render-019".into());
+        crate::message::raise(&store, &theirs).unwrap();
 
         let waiting: Vec<Thread> =
             [row("render-061", "s1"), row("render-019", "s2")].iter().filter_map(of_row).collect();
         raise_hands(&store, &waiting);
 
-        let flags = store.flags();
+        assert_eq!(hands_on(&store, "render-061"), vec![HAND.to_string()], "the row gets the hand");
         assert_eq!(
-            flags.get("render-061").map(|f| text(f, "said")),
-            Some(HAND.to_string()),
-            "the row with nothing on it gets the hand"
+            hands_on(&store, "render-019"),
+            vec!["blocked on you".to_string(), HAND.to_string()],
+            "an agent's own question is untouched, and the restart notice stands beside it",
         );
-        assert_eq!(
-            flags.get("render-019").map(|f| text(f, "said")),
-            Some("blocked on you".to_string()),
-            "and an agent's own question is left exactly where it was"
-        );
+
+        // Twice is once. A daemon that restarts must not put a second copy of
+        // the same notice on a row somebody has not answered yet.
+        raise_hands(&store, &waiting);
+        assert_eq!(hands_on(&store, "render-061"), vec![HAND.to_string()], "raised twice");
     }
 
     /// Answering the question puts the hands down — and only the ones it put
@@ -1468,17 +1509,23 @@ mod tests {
     fn answering_lowers_the_hands_it_raised_and_leaves_the_others() {
         let (_env, store) = store("resume-answered");
         store.set_held(vec![row("render-061", "s1"), row("render-019", "s2")]);
-        store.set_flag("render-019", json!({ "said": "blocked on you" }));
+        let mut theirs = crate::message::Message::new(
+            crate::message::Party::pane("w1:p6", "ws"),
+            crate::message::Kind::Note,
+            "blocked on you",
+        );
+        theirs.about = crate::message::About::Task("render-019".into());
+        crate::message::raise(&store, &theirs).unwrap();
         let waiting: Vec<Thread> = store.held().iter().filter_map(of_row).collect();
         raise_hands(&store, &waiting);
 
         answered(&store);
         assert!(store.held().is_empty(), "the census goes with the answer");
-        assert!(store.flags().get("render-061").is_none(), "our hand comes down");
+        assert!(hands_on(&store, "render-061").is_empty(), "our hand comes down");
         assert_eq!(
-            store.flags().get("render-019").map(|f| text(f, "said")),
-            Some("blocked on you".to_string()),
-            "and somebody else's does not"
+            hands_on(&store, "render-019"),
+            vec!["blocked on you".to_string()],
+            "and somebody else's does not — including the one it was standing beside",
         );
     }
 

@@ -767,13 +767,13 @@ impl Source for Poll<'_> {
         // (b) Raised hands addressed here. `addressed` is the routing walk and
         // it is asked rather than reimplemented, so a hand this watch reports
         // is exactly a hand `wsp flag --seat` would list.
-        for (id, f) in self.store.flags() {
-            let Some(t) = task_of(&id) else { continue };
+        for m in crate::message::raised(self.store).iter().filter(|m| !m.is_reply()) {
+            let Some(t) = m.about.task().and_then(task_of) else { continue };
             if !mine(t) {
                 continue;
             }
-            let said = f.get("said").and_then(Value::as_str).unwrap_or("");
-            let ask = f.get("ask").and_then(Value::as_str).unwrap_or("");
+            let said = m.title();
+            let ask = m.ask().unwrap_or(crate::message::Ask::Nothing).as_str();
             // The sentence, not the title. A flag with no words is one you have
             // to go and read either way, and one with words is carrying the
             // only thing on this line that is not derivable.

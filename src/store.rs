@@ -1444,17 +1444,31 @@ impl Store {
         removed
     }
 
-    // ---- raised hands ---------------------------------------------------
+    // ---- raised hands, as they used to be kept --------------------------
     //
-    // A flag is an agent asking to be looked at: this task, and here is why.
-    // It lives here rather than in the task file because it is addressed to a
+    // A flag is an agent asking to be looked at: this task, and here is why. It
+    // lives in state rather than in the task file because it is addressed to a
     // person *now* — the same kind of fact as a claim or a pin, true while
     // somebody is at the machine and meaningless a week later. Writing it into
     // the store would put an interruption into git and leave it in the history
     // of the work for ever; `wsp note` is the verb for the half of it that is
     // worth keeping.
+    //
+    // **All of that is still true and none of it is here any more.** A raised
+    // hand is a message — see the messages section below and
+    // `cmd_agent::flag`, which carries the argument. What is left of
+    // `flags.json` is a file to drain: it is read once by
+    // `message::adopt_legacy_flags` and emptied, so a hand raised by an older
+    // installed binary is carried into the record rather than dropped on the
+    // day this landed.
+    //
+    // `worklist-017` is why the record moved. `set_flag` inserted by task id,
+    // so a second hand on one task silently replaced the first — and there is
+    // therefore no `set_flag` any more, deliberately: keeping one would be
+    // keeping a second way to write a raised hand, keyed the way that lost one.
 
-    /// task id -> flag record: what was said, and by which pane.
+    /// task id -> flag record, from before a raised hand was a message. Read
+    /// only by the migration, and by the tests that drive it.
     pub fn flags(&self) -> BTreeMap<String, Value> {
         match self.read_json("flags.json") {
             Value::Object(m) => m.into_iter().collect(),
@@ -1462,16 +1476,21 @@ impl Store {
         }
     }
 
-    pub fn set_flag(&self, task: &str, value: Value) {
-        self.update_json("flags.json", |f| {
-            f.insert(task.to_string(), value);
-        });
-    }
-
+    /// Drop one legacy entry. What the migration calls once it has the hand
+    /// safely in the record.
     pub fn clear_flag(&self, task: &str) -> bool {
         let mut removed = false;
         self.update_json("flags.json", |f| removed = f.remove(task).is_some());
         removed
+    }
+
+    /// Put one back, for the tests that drive the migration and for nothing
+    /// else — there is no verb that writes this file any more.
+    #[cfg(test)]
+    pub fn set_legacy_flag(&self, task: &str, value: Value) {
+        self.update_json("flags.json", |f| {
+            f.insert(task.to_string(), value);
+        });
     }
 
     /// Has anybody raised, lowered, answered or said anything since this said
@@ -2299,7 +2318,7 @@ mod tests {
         assert_eq!(store.attention_stamp(), 0, "nothing written yet is the resting state");
         let before = store.fingerprint();
 
-        store.set_flag("t-1", json!({ "said": "can I take this?", "pane": "w1:p6" }));
+        store.set_legacy_flag("t-1", json!({ "said": "can I take this?", "pane": "w1:p6" }));
         assert_eq!(store.fingerprint(), before, "a flag is not a change to the work");
         let raised = store.attention_stamp();
         assert_ne!(raised, 0, "…and it is a change the panel can see");

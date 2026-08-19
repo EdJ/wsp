@@ -814,6 +814,22 @@ impl Message {
         self.is_open() || self.state().is_none()
     }
 
+    /// Is this an answer going home, rather than a hand raised outward?
+    ///
+    /// The one axis a raised-hand surface has to split on. Everything else in
+    /// the record is addressed by [`Message::about`], which is derived to a
+    /// seat and then to a person; a reply is addressed to
+    /// [`Message::waiting`], which is whoever asked, and it already has two
+    /// deliveries of its own — the asker's task log, written before the reply
+    /// was minted, and the asker's own inbox. Drawing one in the flags section
+    /// would put an answer on the panel of the person who wrote it.
+    ///
+    /// The presence of `reply_to` is what makes a message a reply — the same
+    /// test [`replies_for`] uses, so the two cannot come to disagree.
+    pub fn is_reply(&self) -> bool {
+        self.reply_to.is_some()
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "id": self.id,
@@ -1027,6 +1043,12 @@ fn raise_locked(store: &Store, m: &Message) -> Result<(), Refused> {
             "kind": m.kind_raw,
             "from": m.from.to_json(),
             "about": m.about.to_json(),
+            // The headline, because `~/wsp/hooks/on-message-raised` is the
+            // escape to anything louder and a doorbell that has to open
+            // `messages.json` to find out what was said is a doorbell nobody
+            // writes. One line, deliberately: the hook is a notification, not
+            // a reader.
+            "title": m.title(),
             "reply_to": m.reply_to,
         }),
     );
@@ -1338,6 +1360,186 @@ pub fn about_task(store: &Store, task: &str) -> Vec<Message> {
     out
 }
 
+/// Every stored message still wanting somebody, oldest first.
+///
+/// **This is what `Store::flags` was**, and the substitution is the whole of
+/// `worklist-017`: a raised hand used to be a row in `flags.json` keyed by the
+/// task it was about, so a second hand on one task silently replaced the first
+/// — the mechanism whose entire job is to not be lost, losing the request for
+/// attention itself. A message is keyed by its own id, so two are two, and
+/// there is nothing here to overwrite.
+///
+/// [`Message::needs_attention`] and not [`Message::is_open`], because the
+/// question a surface is asking here is *should somebody look at this* and not
+/// *may I act on this*: a record whose state this build cannot parse still
+/// wants a person, and answering `false` for it would be this task's own fault
+/// arriving through the module built to remove it.
+///
+/// Only notifications and questions can be in here — a level is never stored
+/// ([`raise`] and [`Store::save_message`] both refuse one) — so this is exactly
+/// the set the flags section used to draw and nothing wider.
+///
+/// Oldest first, like [`all`] and [`about_task`]. A surface that wants the
+/// newest interruption at the top reverses it, because which end of a queue an
+/// interruption is read from is a decision about a panel and not about a
+/// record.
+pub fn raised(store: &Store) -> Vec<Message> {
+    let mut out: Vec<Message> =
+        store.messages().into_values().filter(Message::needs_attention).collect();
+    out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// What one name resolves to, when a person or a panel says *that one*.
+///
+/// The reason this is three answers and not an [`Option`] is `worklist-017`
+/// again, from the reading side. Under `flags.json` a task id named at most one
+/// raised hand, so every verb that took one — `wsp flag --clear <id>`,
+/// `--seen`, the panel's `x` — could take a task id and be certain. Under the
+/// record a task can carry several, and a verb that quietly picked one would be
+/// the same fault as the store that quietly replaced one: an act on somebody's
+/// raised hand that nobody was told about.
+///
+/// So the ambiguity gets a name and comes back to the caller, which is the
+/// cheapest of the three shapes this task's overview offered — *one per task,
+/// but say so* — arriving at the one place where the ambiguity is real.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hand {
+    /// Exactly one, and this is it.
+    One(Box<Message>),
+    /// Several hands are up about that task. Oldest first, and the caller has
+    /// to say which — printing them is the answer, not picking one.
+    Several(Vec<Message>),
+    /// Nothing raised under that name.
+    Nothing,
+}
+
+/// Find the raised hand a name means: a message id, or a task with one up.
+///
+/// A message id is answered directly and in whatever state it is in, because a
+/// caller holding an id got it from a surface that was looking at that record
+/// and means that record. A task id is answered out of [`raised`] only, because
+/// a hand that has been dealt with is not a hand a task still names.
+///
+/// [`is_message_id`] is what separates the two and it can never be wrong in
+/// either direction — that is the guarantee `new_id` exists to make.
+pub fn hand(store: &Store, needle: &str) -> Hand {
+    if is_message_id(needle) {
+        return match store.message(needle) {
+            Some(m) => Hand::One(Box::new(m)),
+            None => Hand::Nothing,
+        };
+    }
+    let mut up: Vec<Message> =
+        raised(store).into_iter().filter(|m| m.about.task() == Some(needle)).collect();
+    match up.len() {
+        0 => Hand::Nothing,
+        1 => Hand::One(Box::new(up.remove(0))),
+        _ => Hand::Several(up),
+    }
+}
+
+/// The one text field, out of the three a raised hand used to be written in.
+///
+/// `worklist-018` is why this is a function rather than three fields joined at
+/// each call site: a flag raised with a body and no title drew as **nothing**,
+/// because the field the card drew was the empty one and no record forbade
+/// that. [`Message::title`] is `lines().next()`, so the same hole exists here
+/// the moment a `text` is allowed to begin with a blank line — and the repair
+/// belongs at the writer, where there is one of it, rather than at every
+/// surface that draws.
+///
+/// The order is the order the row already read them in: `render_row` drew
+/// `said` and fell back to `title`, so `said` is the headline in practice and
+/// the other two are what goes under it. Empties drop out, which is what makes
+/// the first line non-empty whenever anything at all was given.
+///
+/// Everything given is kept. A refusal would lose the message, and the message
+/// was the point — that is `worklist-018`'s third recommendation and it is
+/// right.
+pub fn compose(said: &str, title: &str, body: &str) -> String {
+    [said.trim(), title.trim(), body.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Carry any hand still up in `flags.json` across into the record, once.
+///
+/// **The migration has to exist, and this task is why.** A raised hand is
+/// machine-local state and meaningless a week later, so the tempting answer is
+/// to let the old file go — but the moment `wsp flag` stops writing it, every
+/// hand the *installed* binary raised stops being drawn, and the installed
+/// binary is routinely not the tree (`cmd_install::health` exists for exactly
+/// that). Dropping them would be `worklist-017` committed by the change that
+/// fixes it: a request for attention lost, with success reported.
+///
+/// Idempotent by emptying the file it read, and safe to call from anywhere for
+/// that reason. Under the state lock so that a `wsp flag` running in another
+/// pane cannot read the same entry and adopt it twice.
+///
+/// `at` and `seen` ride across, because when a hand went up and whether
+/// somebody has already looked at it are the two facts a person acts on and
+/// resetting either would be a lie about the past.
+///
+/// Returns what it adopted, so a caller can say so. Nothing to say is the
+/// overwhelmingly common case, which is why every caller of this is somewhere
+/// a person is already being spoken to.
+pub fn adopt_legacy_flags(store: &Store) -> Vec<Message> {
+    store.locked(|| {
+        let legacy = store.flags();
+        if legacy.is_empty() {
+            return Vec::new();
+        }
+        let mut adopted = Vec::new();
+        for (task, f) in legacy {
+            let field = |k: &str| {
+                f.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string()
+            };
+            let (pane, workspace) = (field("pane"), field("workspace"));
+            let from = match pane.is_empty() {
+                true => Party::Human,
+                false => Party::pane(&pane, &workspace),
+            };
+            let mut m = Message::new(
+                from,
+                Kind::Note,
+                &compose(&field("said"), &field("title"), &field("body")),
+            );
+            m.about = About::Task(task.clone());
+            m.seen = f.get("seen").and_then(Value::as_bool).unwrap_or(false);
+            let at = field("at");
+            if !at.is_empty() {
+                m.at = at;
+            }
+            // An ask is a question, and a question has to name who is sitting
+            // still. The old record named a pane and the CLI required one, so
+            // this is the ordinary case — but a hand-edited file could carry an
+            // ask with nobody behind it, and a question `raise` would refuse is
+            // a hand that would be silently dropped here. It keeps its ask and
+            // stays the shape that owes nothing back.
+            if let Some(Ask::Claim) = Ask::parse(&field("ask")) {
+                m.set_ask(Ask::Claim);
+                if !pane.is_empty() {
+                    m.set_shape(Shape::Question);
+                    m.waiting = Some(Waiting::new(&pane, ""));
+                }
+            }
+            if raise(store, &m).is_ok() {
+                adopted.push(m);
+            }
+        }
+        // Only after every one of them is in the record. A crash between the
+        // two leaves a hand in both places, which a panel draws twice; a crash
+        // the other way round leaves it in neither.
+        for (task, _) in store.flags() {
+            store.clear_flag(&task);
+        }
+        adopted
+    })
+}
+
 /// Every stored message, newest last. A convenience over [`Store::messages`]
 /// for the surfaces that draw a list rather than look one up.
 pub fn all(store: &Store) -> Vec<Message> {
@@ -1645,6 +1847,120 @@ mod tests {
         let both = about_task(&store, "worklist-011");
         assert_eq!(both.len(), 2, "the second raised hand replaced the first");
         assert_ne!(both[0].id, both[1].id);
+    }
+
+    /// One text and one first line, which is the invariant the writer keeps so
+    /// that no surface has to.
+    ///
+    /// `worklist-018`: a hand raised with a body and no title drew as nothing.
+    /// `Message::title` is `lines().next()`, so the same hole exists here the
+    /// moment a `text` is allowed to begin blank — and the case that matters is
+    /// the one that used to fail, a paragraph with nothing said above it.
+    #[test]
+    fn whatever_was_given_the_first_line_is_never_blank() {
+        let cases = [
+            ("said", "title", "body"),
+            ("", "title", "body"),
+            ("", "", "body"),
+            ("said", "", ""),
+            ("", "", "  \n\n  body  "),
+        ];
+        for (said, title, body) in cases {
+            let text = compose(said, title, body);
+            let m = Message::new(Party::seat("wsp"), Kind::Note, &text);
+            assert!(!m.title().is_empty(), "{said:?}/{title:?}/{body:?} has no headline");
+        }
+        // Everything is kept, and in the order a row already read them in: a
+        // refusal would lose the message, and the message was the point.
+        assert_eq!(compose("said", "title", "body"), "said\n\ntitle\n\nbody");
+        // And the one case that is honestly empty — `wsp flag <id>` on its own,
+        // "look at this task, it exists" — stays empty, because a surface
+        // falling back to the task is right and a writer inventing words is
+        // not.
+        assert_eq!(compose("", "", ""), "");
+    }
+
+    /// A name resolves to *the hand meant*, or to a question, and never to a
+    /// guess.
+    ///
+    /// The reading half of `worklist-017`. Under `flags.json` a task named at
+    /// most one raised hand and every verb could take a task id and be certain
+    /// — certain because the store was losing the second. With both kept, a
+    /// verb that quietly picked one would be the same fault wearing the other
+    /// hat.
+    #[test]
+    fn a_task_names_one_raised_hand_until_it_names_two() {
+        let store = scratch("hand");
+        let one = |text: &str| {
+            let mut m = Message::new(Party::pane("w4J:p1", "ws"), Kind::Note, text);
+            m.about = About::Task("worklist-011".into());
+            raise(&store, &m).unwrap();
+            m
+        };
+        assert_eq!(hand(&store, "worklist-011"), Hand::Nothing);
+
+        let first = one("the index is behind HEAD");
+        assert_eq!(hand(&store, "worklist-011"), Hand::One(Box::new(first.clone())));
+        // And by its own id, which is the name that never becomes ambiguous.
+        assert_eq!(hand(&store, &first.id), Hand::One(Box::new(first.clone())));
+
+        one("and the tree is shared");
+        match hand(&store, "worklist-011") {
+            Hand::Several(up) => assert_eq!(up.len(), 2, "one of the two was picked silently"),
+            other => panic!("two hands read as {other:?}"),
+        }
+
+        // A hand that has been dealt with is not one its task still names — but
+        // its own id still finds it, because a caller holding one got it from a
+        // surface that was looking at that record.
+        acknowledge(&store, &first.id, &seat()).unwrap();
+        assert!(matches!(hand(&store, "worklist-011"), Hand::One(_)));
+        assert!(matches!(hand(&store, &first.id), Hand::One(_)));
+        assert_eq!(hand(&store, "m-nothing-p1"), Hand::Nothing);
+    }
+
+    /// The migration, and it exists because the alternative is this task's own
+    /// fault committed by the change that fixes it.
+    ///
+    /// The installed binary is routinely not the tree. On the day `wsp flag`
+    /// stops writing `flags.json`, every hand the installed one raised would
+    /// stop being drawn — a request for attention lost, with success reported
+    /// everywhere. So the old file is drained into the record once, and `at`
+    /// and `seen` ride across: when a hand went up and whether somebody has
+    /// already looked at it are the two facts a person acts on.
+    #[test]
+    fn a_hand_raised_by_the_old_binary_is_carried_across_and_not_dropped() {
+        let store = scratch("adopt");
+        store.set_legacy_flag(
+            "worklist-011",
+            json!({
+                "said": "the index is behind HEAD",
+                "title": "",
+                "body": "and the tree is shared",
+                "ask": "claim",
+                "pane": "w4J:p1",
+                "workspace": "wsp-worklist-011",
+                "at": "2026-08-19T09:12:00Z",
+                "seen": true,
+            }),
+        );
+
+        let carried = adopt_legacy_flags(&store);
+        assert_eq!(carried.len(), 1);
+        let m = &about_task(&store, "worklist-011")[0];
+        assert_eq!(m.title(), "the index is behind HEAD");
+        assert_eq!(m.body(), "and the tree is shared");
+        assert_eq!(m.at, "2026-08-19T09:12:00Z", "the age it is drawn by was reset");
+        assert!(m.seen, "a hand somebody had already read came back as unread");
+        assert_eq!(m.from, Party::pane("w4J:p1", "wsp-worklist-011"));
+        assert_eq!(m.ask(), Some(Ask::Claim));
+        assert_eq!(m.shape(), Some(Shape::Question), "an ask is a question under the record");
+
+        // Once. A second pass over an emptied file is not a second copy of
+        // anybody's raised hand.
+        assert!(store.flags().is_empty(), "the old file was left holding the same hand");
+        assert!(adopt_legacy_flags(&store).is_empty());
+        assert_eq!(about_task(&store, "worklist-011").len(), 1);
     }
 
     /// The renumbering hazard, from the record's side. `Store::rename_tasks`

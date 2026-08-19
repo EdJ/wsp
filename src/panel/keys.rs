@@ -1323,7 +1323,10 @@ pub(super) fn card_key(k: Key, ui: &mut Ui, view: &mut View, card: Card) -> Effe
     let seen = |view: &mut View| {
         view.mode = Mode::Browse;
         Effect::Run {
-            argv: vec!["flag".into(), card.task.clone(), "--seen".into()],
+            // The message and not the task: a task can carry several raised
+            // hands now (`worklist-017`), and the one being put away is this
+            // card's own.
+            argv: vec!["flag".into(), card.id.clone(), "--seen".into()],
             escalate: None,
             then: None,
         }

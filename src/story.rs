@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use crate::live::AgentRef;
+use crate::message;
 use crate::model::{Project, Task};
 use crate::input::Key;
 use crate::panel::{self, Snapshot};
@@ -297,7 +298,7 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // panel looks like when nobody is interrupting — [`flagged_world`] is
         // the one that shows the section, so every other frame goes on saying
         // what the panel says on an ordinary afternoon.
-        flags: BTreeMap::new(),
+        flags: Vec::new(),
         // No long names kept: every label in this world is short enough to be
         // its own whole, which is what a fixture wants — a frame that showed a
         // name being expanded would be showing the machinery rather than the
@@ -390,32 +391,79 @@ fn crowded_world() -> Snapshot {
 /// than as an empty line.
 fn flagged_world() -> Snapshot {
     let mut s = world();
-    s.flags.insert(
-        "t-105".to_string(),
-        json!({
-            "said": "this is next — can I take it?",
-            "title": "the panel work, in order",
-            "body": "Items 1-4 are done and this one is the first that is not. \
+    // Oldest first, which is the order the record is kept in — read, and still
+    // up: the card has been put away and the row is what is left. It is the
+    // older of the two so that the fixture shows the card that comes up *next*
+    // rather than the one somebody has already dealt with.
+    let mut seen = hand("t-004", "w2:p1", "", "2026-08-16T09:12:00Z");
+    seen.seen = true;
+    s.flags.push(seen);
+
+    let mut asking = hand(
+        "t-105",
+        // A spare agent, and idle — which is what makes the sentence reach it
+        // when the ask is answered. herdr calls the pane in w5 neither working
+        // nor idle, and a `y` there would land the claim and go untold, the
+        // same way `c` does on a pane that has not spoken since it started.
+        "w4:p2",
+        &message::compose(
+            "this is next — can I take it?",
+            "the panel work, in order",
+            "Items 1-4 are done and this one is the first that is not. \
 It needs the reducer, which nobody else is in, so it will not collide with \
 anything running.\n\nI have context on it already — I wrote the four above it.",
-            "ask": "claim",
-            // A spare agent, and idle — which is what makes the sentence
-            // reach it when the ask is answered. herdr calls the pane in w5
-            // neither working nor idle, and a `y` there would land the claim
-            // and go untold, the same way `c` does on a pane that has not
-            // spoken since it started.
-            "pane": "w4:p2",
-            "at": "2026-08-16T09:41:00Z",
-        }),
+        ),
+        "2026-08-16T09:41:00Z",
     );
-    // Read, and still up: the card has been put away and the row is what is
-    // left. Also the older of the two, so the fixture shows the card that comes
-    // up *next* rather than the one somebody has already dealt with.
-    s.flags.insert(
-        "t-004".to_string(),
-        json!({ "said": "", "pane": "w2:p1", "at": "2026-08-16T09:12:00Z", "seen": true }),
-    );
+    asking.set_ask(message::Ask::Claim);
+    asking.set_shape(message::Shape::Question);
+    asking.waiting = Some(message::Waiting::new("w4:p2", "t-105"));
+    s.flags.push(asking);
     s
+}
+
+/// One raised hand, for a fixture: a message about a task, from a pane, at a
+/// fixed moment.
+///
+/// The times are written down rather than taken from the clock for the reason
+/// every other field in these fixtures is: a storyboard has to render the same
+/// frame today and next month, and `at` is drawn as an age.
+fn hand(task: &str, pane: &str, text: &str, at: &str) -> message::Message {
+    let mut m =
+        message::Message::new(message::Party::pane(pane, ""), message::Kind::Note, text);
+    m.about = message::About::Task(task.to_string());
+    m.at = at.to_string();
+    m
+}
+
+/// The raised hand a fixture put on one task, to be edited in place.
+///
+/// A fixture holds a list rather than a map keyed by task (`worklist-017`), so
+/// reaching one takes a search — and the search is by subject because that is
+/// what a test means when it says *the ask on `t-105`*.
+#[cfg(test)]
+fn hand_on<'a>(s: &'a mut Snapshot, task: &str) -> &'a mut message::Message {
+    s.flags
+        .iter_mut()
+        .find(|m| m.about.task() == Some(task))
+        .unwrap_or_else(|| panic!("the fixture has no hand on {task}"))
+}
+
+/// The id of that hand, which is what a verb acting on it names.
+#[cfg(test)]
+fn hand_id(s: &Snapshot, task: &str) -> String {
+    s.flags
+        .iter()
+        .find(|m| m.about.task() == Some(task))
+        .unwrap_or_else(|| panic!("the fixture has no hand on {task}"))
+        .id
+        .clone()
+}
+
+/// Take one down, the way `x` or another panel would.
+#[cfg(test)]
+fn lower(s: &mut Snapshot, task: &str) {
+    s.flags.retain(|m| m.about.task() != Some(task));
 }
 
 /// The same asks, every one of them read.
@@ -427,10 +475,8 @@ anything running.\n\nI have context on it already — I wrote the four above it.
 /// one up is a frame where no other key did anything.
 fn read_world() -> Snapshot {
     let mut s = flagged_world();
-    for f in s.flags.values_mut() {
-        if let Some(m) = f.as_object_mut() {
-            m.insert("seen".into(), json!(true));
-        }
+    for m in s.flags.iter_mut() {
+        m.seen = true;
     }
     s
 }
@@ -6272,15 +6318,23 @@ mod tests {
     /// it with. Nothing else takes it down — reading the ask must not be what
     /// clears it, or it is gone from every panel before you have decided
     /// anything about it, including the decision to leave it up.
+    ///
+    /// **The two rows name different things**, and that is `worklist-017`
+    /// arriving at the keyboard. A hand in the section names its own record,
+    /// because a task can now carry several and this key means *this one*. The
+    /// task's own row names the task, because the mark up there says only that
+    /// something is up — and if that is two things, the CLI prints them and
+    /// refuses rather than a keypress disposing of one nobody chose.
     #[test]
     fn x_lowers_a_raised_hand_and_only_a_raised_hand() {
         let f = read_world();
+        let id = hand_id(&f, "t-105");
         let (mut ui, mut view) = showing(&f, &[]);
 
         on_row_kind(&mut ui, panel::RowKind::Flag);
         match panel::apply_key(Key::Char('x'), &mut ui, &mut view) {
             panel::Effect::Run { argv, .. } => {
-                assert_eq!(argv, vec!["flag", "--clear", "t-105"]);
+                assert_eq!(argv, vec!["flag", "--clear", &id]);
             }
             _ => panic!("x on a raised hand should lower it"),
         }
@@ -6290,7 +6344,7 @@ mod tests {
         on_task(&mut ui, "t-105");
         match panel::apply_key(Key::Char('x'), &mut ui, &mut view) {
             panel::Effect::Run { argv, .. } => {
-                assert_eq!(argv, vec!["flag", "--clear", "t-105"]);
+                assert_eq!(argv, vec!["flag", "--clear", "t-105"], "the mark names the task");
             }
             _ => panic!("x on a flagged task should lower it"),
         }
@@ -6327,15 +6381,9 @@ mod tests {
     fn the_flag_section_keeps_three_and_counts_them_all() {
         let mut f = read_world();
         for (i, id) in ["t-001", "t-003", "t-020"].iter().enumerate() {
-            f.flags.insert(
-                (*id).to_string(),
-                json!({
-                    "said": format!("look at this {i}"),
-                    "pane": "w1:p1",
-                    "at": "2026-08-16T08:00:00Z",
-                    "seen": true,
-                }),
-            );
+            let mut m = hand(id, "w1:p1", &format!("look at this {i}"), "2026-08-16T08:00:00Z");
+            m.seen = true;
+            f.flags.push(m);
         }
         let (mut ui, mut view) = showing(&f, &[]);
         let count = |ui: &mut panel::Ui| {
@@ -6468,21 +6516,22 @@ mod tests {
         let body: String = (1..=20)
             .map(|i| format!("Sentence {i} of the paragraph an agent wrote, where the reason lives. "))
             .collect();
-        if let Some(m) = s.flags.get_mut("t-105").and_then(|f| f.as_object_mut()) {
-            m.insert("body".into(), json!(body));
-        }
+        let head = hand_on(&mut s, "t-105").title().to_string();
+        hand_on(&mut s, "t-105").text = message::compose(&head, "", &body);
         // The one `flagged_world` leaves read, raised again with something to say:
         // an ask nobody has looked at, waiting behind the one on screen.
-        s.flags.insert(
-            "t-004".to_string(),
-            json!({
-                "said": "and this is the one that arrived a minute later",
-                "body": "The second ask. Short, so anything a test says about being cut is \
+        lower(&mut s, "t-004");
+        s.flags.push(hand(
+            "t-004",
+            "w2:p1",
+            &message::compose(
+                "and this is the one that arrived a minute later",
+                "",
+                "The second ask. Short, so anything a test says about being cut is \
     about the first one.",
-                "pane": "w2:p1",
-                "at": "2026-08-16T09:42:00Z",
-            }),
-        );
+            ),
+            "2026-08-16T09:42:00Z",
+        ));
         s
     }
 
@@ -6575,13 +6624,8 @@ mod tests {
 
         // The count is the rest of the paragraph at the width it would be read
         // at — the same wrap the card itself did, over the whole body.
-        let whole = crate::util::wrap(
-            match f.flags["t-105"]["body"].as_str() {
-                Some(b) => b,
-                None => panic!("the fixture lost its body"),
-            },
-            W - 6,
-        );
+        let mut f = f;
+        let whole = crate::util::wrap(hand_on(&mut f, "t-105").body(), W - 6);
         assert_eq!(body.len() - 1 + n, whole.len(), "{n} more lines is not what is left");
 
         // A flag that fits gets no such row: the card only spends it on a
@@ -6596,15 +6640,12 @@ mod tests {
     /// One ask that fits in any card, so nothing is held back.
     fn one_short_ask_world() -> Snapshot {
         let mut s = world();
-        s.flags.insert(
-            "t-105".to_string(),
-            json!({
-                "said": "a short one",
-                "body": "Two lines at most, wherever it is drawn.",
-                "pane": "w4:p2",
-                "at": "2026-08-16T09:41:00Z",
-            }),
-        );
+        s.flags.push(hand(
+            "t-105",
+            "w4:p2",
+            &message::compose("a short one", "", "Two lines at most, wherever it is drawn."),
+            "2026-08-16T09:41:00Z",
+        ));
         s
     }
 
@@ -6636,9 +6677,7 @@ mod tests {
         // a store where it has been read — and that is what brings the next one
         // up, on this panel and on the other twenty-one at the same time.
         let mut after = long_flag_world();
-        if let Some(m) = after.flags.get_mut("t-105").and_then(|x| x.as_object_mut()) {
-            m.insert("seen".into(), json!(true));
-        }
+        hand_on(&mut after, "t-105").seen = true;
         let (mut ui, mut view) = showing(&f, &[Key::Esc]);
         panel::refetch_into(&mut ui, &after, &mut view);
         // The draw, because that is where an unread ask is put up: the one step
@@ -6676,11 +6715,12 @@ mod tests {
     #[test]
     fn the_card_has_three_answers_and_they_do_different_things() {
         let f = flagged_world();
+        let id = hand_id(&f, "t-105");
 
         let (mut ui, mut view) = showing(&f, &[]);
         match panel::apply_key(Key::Esc, &mut ui, &mut view) {
             panel::Effect::Run { argv, .. } => {
-                assert_eq!(argv, vec!["flag", "t-105", "--seen"], "esc leaves it raised");
+                assert_eq!(argv, vec!["flag", &id, "--seen"], "esc leaves it raised");
             }
             _ => panic!("esc should mark it read"),
         }
@@ -6705,13 +6745,12 @@ mod tests {
 
         // …and it is the answer to a card that only wanted to be looked at.
         let mut only_looking = flagged_world();
-        only_looking.flags.remove("t-004");
-        if let Some(f) = only_looking.flags.get_mut("t-105").and_then(|f| f.as_object_mut()) {
-            f.insert("ask".into(), json!(""));
-        }
+        lower(&mut only_looking, "t-004");
+        hand_on(&mut only_looking, "t-105").set_ask(message::Ask::Nothing);
+        let id = hand_id(&only_looking, "t-105");
         let (mut ui, mut view) = showing(&only_looking, &[]);
         match panel::apply_key(Key::Enter, &mut ui, &mut view) {
-            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["flag", "t-105", "--seen"]),
+            panel::Effect::Run { argv, .. } => assert_eq!(argv, vec!["flag", &id, "--seen"]),
             _ => panic!("↵ should put away a card with nothing to answer"),
         }
     }
@@ -6818,9 +6857,7 @@ mod tests {
             panel::Effect::Run { .. },
         ));
         let mut answered = flagged_world();
-        if let Some(r) = answered.flags.get_mut("t-105").and_then(|r| r.as_object_mut()) {
-            r.insert("seen".into(), json!(true));
-        }
+        hand_on(&mut answered, "t-105").seen = true;
 
         // The other panel rebuilds on its own tick and puts it away, with
         // nobody having touched that pane.
@@ -6844,7 +6881,7 @@ mod tests {
         assert!(matches!(view.mode, panel::Mode::Card(_)));
 
         let mut lowered = flagged_world();
-        lowered.flags.remove("t-105");
+        lower(&mut lowered, "t-105");
         panel::refetch_into(&mut ui, &lowered, &mut view);
         panel::place(&ui, &mut view, W, H);
         assert!(matches!(view.mode, panel::Mode::Browse), "the card outlived the flag");
@@ -6863,9 +6900,9 @@ mod tests {
         let (mut ui, mut view) = showing(&f, &[]);
 
         let mut again = flagged_world();
-        if let Some(r) = again.flags.get_mut("t-105").and_then(|r| r.as_object_mut()) {
-            r.insert("said".into(), json!("actually the reducer is free now"));
-        }
+        let rest = hand_on(&mut again, "t-105").body().to_string();
+        hand_on(&mut again, "t-105").text =
+            message::compose("actually the reducer is free now", "", &rest);
         panel::refetch_into(&mut ui, &again, &mut view);
         panel::place(&ui, &mut view, W, H);
         match &view.mode {
@@ -6882,14 +6919,12 @@ mod tests {
         // comes up *after*, not instead.
         let queued = || {
             let mut s = flagged_world();
-            s.flags.insert(
-                "t-006".to_string(),
-                json!({
-                    "said": "and this one is still parked",
-                    "pane": "w2:p1",
-                    "at": "2026-08-16T09:55:00Z",
-                }),
-            );
+            s.flags.push(hand(
+                "t-006",
+                "w2:p1",
+                "and this one is still parked",
+                "2026-08-16T09:55:00Z",
+            ));
             s
         };
         let f = queued();
@@ -6900,9 +6935,7 @@ mod tests {
         }
 
         let mut answered = queued();
-        if let Some(r) = answered.flags.get_mut("t-105").and_then(|r| r.as_object_mut()) {
-            r.insert("seen".into(), json!(true));
-        }
+        hand_on(&mut answered, "t-105").seen = true;
         panel::apply_key(Key::Esc, &mut ui, &mut view);
         panel::refetch_into(&mut ui, &answered, &mut view);
         panel::place(&ui, &mut view, W, H);

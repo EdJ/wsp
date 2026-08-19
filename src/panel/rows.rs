@@ -388,6 +388,13 @@ pub(super) enum Row {
 /// another about the same ask.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Card {
+    /// The message this hand is, and what a verb acting on it must name.
+    ///
+    /// `worklist-017`: a task id stopped identifying a raised hand the moment
+    /// two could be up on one task, so `x` and `esc` name this instead. It is
+    /// the record's own id and can never be mistaken for a task id — see
+    /// [`crate::message::new_id`].
+    pub(super) id: String,
     pub(super) task: String,
     /// The card's heading: the agent's own, else the task's title. An agent
     /// gets to name it because the task's title is often the wrong sentence for
@@ -484,23 +491,22 @@ impl Card {
         &self.said
     }
 
-    /// Everything the card needs, out of one flag record and the task it names.
-    fn of(task: &str, f: &serde_json::Value, tasks: &[Task]) -> Card {
-        let field = |k: &str| {
-            f.get(k).and_then(|x| x.as_str()).unwrap_or_default().trim().to_string()
-        };
+    /// Everything the card needs, out of one raised hand and the task it names.
+    fn of(m: &crate::message::Message, tasks: &[Task]) -> Card {
+        let task = m.about.task().unwrap_or_default();
         let found = tasks.iter().find(|t| t.id == task);
-        let said = field("said");
-        let title = match field("title") {
-            t if !t.is_empty() => t,
-            // The id when the task is gone. A hand raised about something that
-            // has since been retired is still a hand raised, and the row has to
+        let said = m.title().to_string();
+        let title = match said.is_empty() {
+            false => said.clone(),
+            // The task's own when the hand carried no words, and the id when
+            // the task is gone as well. A hand raised about something that has
+            // since been retired is still a hand raised, and the row has to
             // stay selectable — `x` on it is the only thing that will ever take
             // it down.
-            _ => found.map(|t| t.title.clone()).unwrap_or_else(|| task.to_string()),
+            true => found.map(|t| t.title.clone()).unwrap_or_else(|| task.to_string()),
         };
-        let body = match (field("body"), said.as_str()) {
-            (b, _) if !b.is_empty() => b,
+        let body = match (m.body(), said.as_str()) {
+            (b, _) if !b.is_empty() => b.to_string(),
             (_, s) if !s.is_empty() => s.to_string(),
             // Neither, which is `wsp flag <id>` on its own — "look at this, it
             // exists". The task's own overview is the honest thing to put under
@@ -511,13 +517,14 @@ impl Card {
                 .unwrap_or_default(),
         };
         Card {
+            id: m.id.clone(),
             task: task.to_string(),
             title,
             said,
             body: util::truncate(body.trim(), BODY_MAX),
-            who: field("pane"),
-            ask: Request::parse(&field("ask")),
-            seen: f.get("seen").and_then(|x| x.as_bool()).unwrap_or(false),
+            who: m.from.byline(),
+            ask: Request::parse(m.ask().unwrap_or(crate::message::Ask::Nothing).as_str()),
+            seen: m.seen,
         }
     }
 }
@@ -801,16 +808,24 @@ impl Ui {
         self.census.clone()
     }
 
-    /// The task the cursor is on, if an agent has raised a hand about it.
+    /// What the cursor is on, if it is a raised hand or a task carrying one.
     ///
     /// Either row answers: the one in the section at the foot and the task's
     /// own row up in the tree, which is the point of marking both. You lower a
     /// flag from wherever you were when you read it — having to walk back down
     /// to the section to be rid of a mark you are looking at is the kind of
     /// thing that leaves flags up.
+    ///
+    /// **The two rows name different things and that is deliberate.** A hand in
+    /// the section is one record and answers with its own id. A task row is a
+    /// mark saying *something is up about this*, and it answers with the task —
+    /// which under `worklist-017` may now be several hands, and `wsp flag
+    /// --clear` prints them and refuses rather than picking one. That refusal
+    /// is the feature: the alternative is a keypress silently disposing of a
+    /// hand somebody raised.
     pub(super) fn selected_flag(&self) -> Option<String> {
         match self.rows.get(self.sel) {
-            Some(Row::Flag { card }) => Some(card.task.clone()),
+            Some(Row::Flag { card }) => Some(card.id.clone()),
             Some(Row::Task { id, flagged: true, .. }) => Some(id.clone()),
             _ => None,
         }
@@ -1003,10 +1018,15 @@ pub struct Snapshot {
     /// pane has been holding what it holds is the difference between an agent
     /// working and an agent stuck, and it is the one fact herdr cannot supply.
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
-    /// task id -> flag record: an agent has raised a hand about this task and
+    /// The raised hands, oldest first: somebody has asked to be looked at, and
     /// said why. Machine-local state like the claims beside it, and the one
     /// input here that arrives from outside the person's own hands.
-    pub flags: std::collections::BTreeMap<String, serde_json::Value>,
+    ///
+    /// A list and not a map keyed by task, which is `worklist-017`: a hand used
+    /// to be a row in `flags.json` keyed by the task it was about, so a second
+    /// hand on one task replaced the first and no surface could have drawn what
+    /// was already gone. A message carries an id of its own, so two are two.
+    pub flags: Vec<crate::message::Message>,
     /// pane id -> what its label was cut from, when the store kept a longer
     /// copy. Read by [`crate::cmd_agent::full_name`], which is the only thing
     /// that knows what a wire label is and is not evidence of.
@@ -1043,7 +1063,10 @@ impl Snapshot {
             pins: store.pins(),
             mandates: store.mandates(),
             claims: store.claims(),
-            flags: store.flags(),
+            flags: crate::message::raised(store)
+                .into_iter()
+                .filter(|m| !m.is_reply())
+                .collect(),
             said: store.said(),
             governors: store.governors(),
             panes,
@@ -2098,7 +2121,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     let mut rows = rows;
     for r in rows.iter_mut() {
         if let Row::Task { id, flagged, .. } = r {
-            *flagged = snap.flags.contains_key(id);
+            *flagged = snap.flags.iter().any(|m| m.about.task() == Some(id.as_str()));
         }
     }
 
@@ -2231,13 +2254,8 @@ fn by_project(
 ///
 /// A flag is an interruption, and the one raised while you were reading the
 /// last one is the one you have not seen.
-fn flags_in_order(snap: &Snapshot) -> Vec<(&String, &serde_json::Value)> {
-    let at = |v: &serde_json::Value| {
-        v.get("at").and_then(|x| x.as_str()).unwrap_or_default().to_string()
-    };
-    let mut list: Vec<(&String, &serde_json::Value)> = snap.flags.iter().collect();
-    list.sort_by(|a, b| at(b.1).cmp(&at(a.1)));
-    list
+fn flags_in_order(snap: &Snapshot) -> Vec<&crate::message::Message> {
+    snap.flags.iter().rev().collect()
 }
 
 /// The card waiting to come up, if one is.
@@ -2254,7 +2272,7 @@ pub(super) fn pending_card(snap: &Snapshot) -> Option<Card> {
     flags_in_order(snap)
         .into_iter()
         .rev()
-        .map(|(id, f)| Card::of(id, f, &snap.tasks))
+        .map(|m| Card::of(m, &snap.tasks))
         .find(|c| !c.seen)
 }
 
@@ -2265,10 +2283,7 @@ pub(super) fn pending_card(snap: &Snapshot) -> Option<Card> {
 /// hand a minute apart is the case this exists for, and the panel that was
 /// showing the first has to be able to say the second is there.
 fn waiting(snap: &Snapshot) -> usize {
-    snap.flags
-        .values()
-        .filter(|f| !f.get("seen").and_then(|x| x.as_bool()).unwrap_or(false))
-        .count()
+    snap.flags.iter().filter(|m| !m.seen).count()
 }
 
 /// The raised hands, as a section pinned above the agents.
@@ -2298,8 +2313,8 @@ fn flag_rows(snap: &Snapshot, view: &View, rows: Vec<Row>, dock: usize) -> (Vec<
     if !folded {
         let more = view.expanded.contains(FLAGS_KEY);
         let shown = if more { list.len() } else { list.len().min(MAX_FLAGS_DOCKED) };
-        for (id, f) in list.iter().take(shown) {
-            out.push(Row::Flag { card: Card::of(id, f, &snap.tasks) });
+        for m in list.iter().take(shown) {
+            out.push(Row::Flag { card: Card::of(m, &snap.tasks) });
         }
         let hidden = list.len() - shown;
         if hidden > 0 {
@@ -2886,7 +2901,7 @@ mod tests {
             pins: Default::default(),
             mandates: Default::default(),
             claims: Default::default(),
-            flags: Default::default(),
+            flags: Vec::new(),
             said: Default::default(),
             governors: Default::default(),
             panes: vec![],

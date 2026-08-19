@@ -919,8 +919,17 @@ backlog read at the end of the day and a question that gets answered.
 wsp flag <id> "this is next — can I take it?"
 wsp flag <id>                # …or just: look at this, it exists
 wsp flag                     # what is raised
-wsp flag --clear <id>        # lower it
+wsp flag --clear <id>        # lower it — by task, or by the hand's own id
 ```
+
+**Two hands on one task are two hands.** A raised hand is a message
+(`src/message.rs`) keyed by an id of its own, not a row keyed by the task it is
+about. Until `worklist-017` it was the latter, so an agent raising a second hand
+on the task it was working **overwrote the first and was told nothing** — `wsp
+flag` returned cleanly and the request for attention was the thing lost. The
+cost is that a task id is no longer certain: `--clear <task>` prints the hands
+and refuses while two are up, and `--clear <message-id>` names one. The panel
+passes the id for you.
 
 It arrives as a section pinned above the agents, in every panel, without
 anybody pressing anything — a panel is already installed in every workspace and
@@ -951,6 +960,9 @@ twenty-one panels with the keyboard in it. So the flag file's timestamp is read
 on every tick, ahead of the gate. It is one `stat`, against the `readdir` of two
 directories and the two socket calls a refetch costs — a hundred a second across
 every panel on the machine, and cheaper than the status poll that already runs.
+`Store::attention_stamp` is the read, and it covers every file a hand can be in
+(`Store::attention_files`) so that adding a record kind is a line there rather
+than a hunt for the gates that need telling.
 
 It is pinned in every view, `R` and `w` included. Those are filters over
 *work*, and a hand raised is somebody asking for you rather than work waiting;
@@ -1042,19 +1054,27 @@ is indistinguishable from an answer that never came. It goes in without a
 hand over new work and want the last task's reasoning out of the way, and this
 one is an answer to a question asked *during* work the agent is still holding.
 
-**A flag is state, not store.** It sits beside the claims and the pins in
-`~/.local/state/wsp`: no commit, nothing in the task file, nothing left in the
-history of the work once it is answered. A raised hand is true while somebody
-is at the machine and meaningless a week later. `wsp note` is the verb for the
-half of it worth keeping — and the two are a pair, not a choice: flag it so it
-is seen today, note it so it is read tomorrow.
+**A flag is state, not store.** It sits in `messages.json` beside the claims and
+the pins in `~/.local/state/wsp`: no commit, nothing in the task file, nothing
+left in the history of the work once it is answered. A raised hand is true while
+somebody is at the machine and meaningless a week later. `wsp note` is the verb
+for the half of it worth keeping — and the two are a pair, not a choice: flag it
+so it is seen today, note it so it is read tomorrow.
+
+**`--clear` acknowledges rather than deletes**, and it cannot close a question.
+`--ask` makes a hand a question, and a question ends by being answered or
+abandoned — both of which take a sentence and both of which reach the asker.
+`worklist-004` is why: a seat answered a flagged agent down another channel and
+then lowered the hand, so *clearing looked like answering* while the asker sat
+waiting. `wsp answer <message-id> "…"` and `wsp answer <message-id> --abandon
+"…"` are the two endings.
 
 Something louder is a hook away, the same seam `review` uses:
 
 ```sh
 #!/bin/sh
-# ~/wsp/hooks/on-task-flagged
-exec terminal-notifier -title "wsp: $(jq -r .data.id)" -message "$(jq -r .data.said)"
+# ~/wsp/hooks/on-message-raised
+exec terminal-notifier -title "wsp: $(jq -r .data.about.task)" -message "$(jq -r .data.title)"
 ```
 
 The panel is the deeplink and this is the doorbell. Which is the honest split:
