@@ -3297,6 +3297,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
+| `src/worklist.rs` | where a worklist is up to: the derived position, and the two readings of finished |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
 | `src/place_herdr.rs` | that port over herdr: the shell race, the launch window, the retype |

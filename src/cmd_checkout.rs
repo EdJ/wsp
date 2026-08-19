@@ -525,7 +525,15 @@ fn dirty(dir: &Path) -> bool {
 }
 
 /// The commits on `branch` that the trunk does not have, newest first.
-fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the worklist barrier, which asks this same question of
+/// every member of a group and opens on the answer. Nothing about it changed
+/// to leave the module — but note what it cannot tell a caller from here: a
+/// branch that does not exist is not an error to `git log`, so the answer for
+/// one is the same empty list as for one that has landed. `land` and [`stale`]
+/// both hold a tree, so a branch is a given for them;
+/// [`crate::worklist::Landing`] does not and asks first.
+pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String> {
     git(repo, &["log", "--format=%h %s", &format!("{trunk_branch}..{branch}")])
         .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default()
