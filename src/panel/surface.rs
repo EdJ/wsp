@@ -252,6 +252,10 @@ impl Screen for Wire {
         )
     }
 
+    fn widest(&self) -> Option<usize> {
+        self.host.lock().ok().and_then(|host| host.widest)
+    }
+
     /// Ask the host for cells, on the pipe the frames go back on.
     ///
     /// The first message this surface has ever *sent* that is not a picture,
@@ -272,7 +276,7 @@ impl Screen for Wire {
         // fallback — a tab, for `Z` — is only correct if this is honest: a
         // surface that reported success against an older herdr would leave the
         // key doing nothing at all.
-        if self.host.lock().ok().and_then(|host| host.widest).is_none() {
+        if self.widest().is_none() {
             return false;
         }
         println!("{}", width_json(cols));

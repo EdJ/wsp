@@ -27,7 +27,7 @@ use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, Cursor, Snapshot, Target, Ui};
 use super::shared;
 use super::verbs::{
-    close_view, expand, inspect, open_board, open_full, pop_out, run_wsp, send_tell, Tell,
+    close_view, cycle, expand, inspect, open_board, open_full, pop_out, run_wsp, send_tell, Tell,
 };
 
 pub(super) enum Msg {
@@ -182,12 +182,20 @@ pub(super) trait Screen {
     /// never what is going in them, and the next caller is one line here rather
     /// than a message on both sides.
     ///
-    /// **Nothing is promised.** The host owns the rect, gives what it has, and
-    /// reports what it gave as the size of the next frame — which it already
-    /// does on every resize, so there is no reply to wait for and no second
-    /// state to keep in step. A caller draws whatever it is given: the rows
-    /// already decide what they show from the width they are built at, which is
-    /// why asking is the whole of the change.
+    /// **It is a command, not a request.** This was built as a negotiation and
+    /// is one no longer: the wsp sidebar is the primary surface of the fork it
+    /// runs in, and a primary surface that has to bargain for room is a guest
+    /// with extra steps. The host grants what is asked.
+    ///
+    /// What the host still does is *say*. Eighty columns cannot be turned into
+    /// two hundred, so it gives what it physically has and reports it as the
+    /// size of the next frame — which it already does on every resize, so there
+    /// is no reply to wait for and no second state to keep in step. That is
+    /// arithmetic and not an opinion, and the distinction is the whole of it:
+    /// the host may not decide, but it must still say. A caller draws whatever
+    /// it is given — the rows already decide what they show from the width they
+    /// are built at — and stays where it is in [`super::verbs::cycle`] either
+    /// way.
     ///
     /// `false` is a host that cannot be asked — a tty panel, which is its
     /// pane's size and has nothing to negotiate with, and any host too old to
@@ -196,6 +204,21 @@ pub(super) trait Screen {
     /// has not been rebuilt: see [`super::verbs::open_full`].
     fn ask_width(&mut self, _cols: usize) -> bool {
         false
+    }
+
+    /// The widest this host says it will draw the panel, and `None` for a host
+    /// that has never said.
+    ///
+    /// The ceiling, and not a permission. Since the surface commands its own
+    /// width there is nothing here to negotiate with — but a terminal of eighty
+    /// columns cannot hand over two hundred, so the host still has to *say* how
+    /// many there are, and a panel that wants half of the screen has to be told
+    /// what the screen is. See [`super::verbs::cycle`], the one caller.
+    ///
+    /// `None` is also how a host that cannot be asked at all is recognised, the
+    /// same fact [`Screen::ask_width`] answers `false` from.
+    fn widest(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -1230,31 +1253,44 @@ pub(super) fn event_loop(
                         say(&mut ui, open_board(&scope, &label, self_ws));
                     }
                 }
-                // `Z`, both ways. A host that owns the rect is asked for the
-                // room and asked to take it back again, which is one key and
-                // one field rather than a mode; a host that cannot be asked
-                // opens the tab it always opened. See [`expand`].
+                // `Z`, one step round. A host that owns the rect is asked for
+                // half of it, then for all of it, then for none of it — one key
+                // and one field rather than a mode; a host that cannot be asked
+                // opens the tab it always opened. See [`super::verbs::cycle`],
+                // which owns the order, and [`expand`], which is still the only
+                // thing either of them says on the wire.
                 Effect::Full => {
-                    let want = view
-                        .asked_width
-                        .is_none()
-                        .then_some(super::render::PAGE_MIN);
+                    let want = cycle(view.asked_width, screen.widest());
                     if expand(screen, &mut view, want) {
                         // Nothing is refetched and nothing is redrawn here. The
                         // host answers by resizing us, the tick notices the new
                         // shape, and the rows are rebuilt then — see
                         // [`View::fit_to_pane`]. Doing it now would build them
                         // for a width we have only asked for.
+                        //
+                        // Said, rather than left to be read off the frame: two
+                        // of the three states can be granted the same columns on
+                        // a screen too narrow to split, and then the only thing
+                        // that says the key did anything is this line.
                         say(
                             &mut ui,
                             match want {
-                                Some(_) => "the whole tree",
+                                Some(super::render::WHOLE_SCREEN) => "the whole screen",
+                                Some(_) => "half the screen",
                                 None => "the sidebar",
                             },
                         );
                     } else {
                         let m = open_full(self_ws);
                         say(&mut ui, m);
+                    }
+                }
+                // `esc` out of a widened sidebar, from whichever width. No
+                // fallback: this is only reached with a width already asked
+                // for, so there was somebody to ask.
+                Effect::Sidebar => {
+                    if expand(screen, &mut view, None) {
+                        say(&mut ui, "the sidebar");
                     }
                 }
                 // Off the loop, deliberately. `wsp spawn --agent` creates a

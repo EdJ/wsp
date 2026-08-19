@@ -47,6 +47,15 @@ impl View {
         self.full = full;
     }
 
+    /// Stand the panel at a width it has already commanded, so a scene can
+    /// press a key from somewhere other than the sidebar. Test-only: the live
+    /// path gets here through [`super::verbs::expand`], which also has a host to
+    /// tell.
+    #[cfg(test)]
+    pub(crate) fn asked_for_width(&mut self, cols: Option<usize>) {
+        self.asked_width = cols;
+    }
+
     /// The key map changes how many rows the tree gets, which changes where a
     /// click lands. Test-only, so a sweep can check both.
     #[cfg(test)]
@@ -195,11 +204,12 @@ pub(crate) struct View {
     pub(super) focus: bool,
     /// The width this panel has asked its host for, if it is asking.
     ///
-    /// Not the width it *has* — that is [`super::run::Screen::size`], and the
-    /// host may have given less. This is only the memory of having asked, and
-    /// the one thing it decides is what the same key does next: `Z` widens the
-    /// sidebar and `Z` gives the room back, which is one field rather than a
-    /// mode. See [`super::run::Screen::ask_width`].
+    /// Not the width it *has* — that is [`super::run::Screen::size`], which is
+    /// what the terminal could actually spare. This is the width that was
+    /// commanded, and it is therefore the position in `Z`'s cycle outright: a
+    /// press moves it whether or not the screen was wide enough for the move to
+    /// show. See [`super::verbs::cycle`] for the order and
+    /// [`super::run::Screen::ask_width`] for the seam.
     ///
     /// A fact about this pane and not about the work, so it is not carried
     /// between panels — the same reason [`View::wide`] is not. A second panel
@@ -630,7 +640,7 @@ pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(
                 ("↵ esc", "open it, close it", Scope::Always),
                 ("/", "find: any word, anywhere", Scope::Always),
                 ("F", "the title in full, docked", Scope::Always),
-                ("Z", "the whole tree, and back", Scope::Always),
+                ("Z", "wider · wider · back", Scope::Always),
                 ("E", "edit in a tab", Scope::TaskOrProject),
                 ("K", "the board, and back", Scope::Board),
                 ("A i r", "show done, ids, sync", Scope::Always),
@@ -710,7 +720,22 @@ pub(crate) enum Effect {
     /// doing that to a workspace. It is a second panel and that costs nothing —
     /// the folds and the cursor live in the store, so the two are the same panel
     /// at two widths.
+    ///
+    /// In a sidebar it is a step round [`super::verbs::cycle`] instead, because
+    /// there is a host to ask: three widths and a key that only goes forward.
     Full,
+    /// All the room back at once, whichever width the cycle was on.
+    ///
+    /// `Z` goes one way round and `esc` is the way out, which is the answer to
+    /// the only question three states raise that two did not: getting back to a
+    /// sidebar must not cost three presses. It is the same `esc` that closes
+    /// the map, the search and the detail pane — the nearest thing you opened —
+    /// and the room a panel is borrowing is the nearest thing there is.
+    ///
+    /// Separate from [`Effect::Full`] rather than a width carried on it: the
+    /// reducer is handed no screen, so it cannot know what half of one is. It
+    /// says which way, and the loop knows how wide.
+    Sidebar,
     /// Argv for this binary. Running the CLI rather than reimplementing it
     /// means the event log, the hooks and the git commit all still happen,
     /// because it is the same code path a person at a shell would take.

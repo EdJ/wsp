@@ -23,6 +23,7 @@ use crate::store::Store;
 use super::install::{list_panes, widest, PaneInfo};
 use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View};
+use super::render::WHOLE_SCREEN;
 use super::rows::{hotkeys, Target, Ui};
 use super::run::Screen;
 use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
@@ -817,18 +818,19 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
     }
 }
 
-/// Ask the host for room, and remember what was asked for.
+/// Tell the host how wide to draw this panel, and remember what was said.
 ///
 /// The whole of a panel changing its own size, and it is three lines because
-/// the host is the one deciding: this says what would be useful, the host gives
-/// what it has, and the next frame is built for whatever came back. Nothing
-/// here waits for an answer and nothing reads one — [`View::wide`] is derived
-/// from the width the frame is drawn at, so a panel that asked for a page and
-/// was given sixty columns draws sixty columns of sidebar and is correct.
+/// there is nothing to negotiate: this says the width, the host gives it as far
+/// as the terminal goes, and the next frame is built for whatever columns
+/// exist. Nothing here waits for an answer and nothing reads one — [`View::wide`]
+/// is derived from the width the frame is drawn at, so a panel that commanded a
+/// page on a sixty-column screen draws sixty columns of sidebar, is correct,
+/// and has still moved — see [`cycle`], where the position is the ask.
 ///
 /// `cols` of `None` gives the room back.
 ///
-/// `false` is a host with no rect to negotiate — a tty panel, or a herdr from
+/// `false` is a host with no rect to hand over — a tty panel, or a herdr from
 /// before this existed. The caller keeps whatever it did before; for `Z` that
 /// is [`open_full`], and the asking is what makes the tab a fallback rather
 /// than the design.
@@ -873,6 +875,62 @@ pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usiz
     }
     view.asked_width = cols;
     true
+}
+
+/// Where `Z` goes next: **sidebar, half the screen, the whole page, sidebar**.
+///
+/// Three widths through the one seam above, which is what [`expand`] was built
+/// for — a third state is a third number and cost herdr nothing.
+///
+/// # The third state is the kanban's, not a second one that looks like it
+///
+/// "The whole page" asks for [`WHOLE_SCREEN`], the same constant `K`'s board
+/// asks for (see `super::run::Page::width`), and what it gets drawn as is
+/// decided by [`is_page`] on the width that came back, exactly as every other
+/// wide frame is. There is no `Z`-shaped fullscreen anywhere: one constant, one
+/// predicate. That matters more now than it did — the host used to be the
+/// shared reference both definitions were measured against, and a surface that
+/// commands its own width has removed it as one, so two definitions of "full"
+/// would have nothing left to pull them back together.
+///
+/// # The position is what was asked for, never what was given
+///
+/// `now` is [`View::asked_width`] and it *is* the place in the cycle. A press
+/// moves it whether or not the terminal was wide enough to matter: clamping
+/// decides how many columns get drawn into, never where we are. So there is no
+/// branch here for a host that gave less than it was asked — the host does not
+/// decide, it only says how many columns exist, and that is what `widest` is.
+///
+/// Reading the position back off the granted width would also be wrong twice
+/// over: two neighbouring states can be granted the same number — half of a
+/// screen and the whole of it agree on a screen too narrow to split — and the
+/// answer arrives a frame late, as a resize.
+///
+/// # Half of what
+///
+/// Of `widest`, the only screen this side is ever told about. Half of the
+/// *current* one, so a terminal dragged wider gives a wider half on the next
+/// press rather than the half it would have had an hour ago.
+///
+/// A host that has never said its width has no half to offer and no room to
+/// give either — [`Screen::ask_width`] refuses it and `Z` opens the tab it
+/// always opened — so the cycle simply has one fewer state to be in.
+///
+/// [`View::asked_width`]: super::keys::View::asked_width
+/// [`is_page`]: super::render::is_page
+/// [`Screen::ask_width`]: super::run::Screen::ask_width
+pub(super) fn cycle(now: Option<usize>, widest: Option<usize>) -> Option<usize> {
+    match now {
+        // The end of it, and the only state named by a constant rather than by
+        // arithmetic — which is why it is the one that can be matched on.
+        Some(WHOLE_SCREEN) => None,
+        Some(_) => Some(WHOLE_SCREEN),
+        // `0` is the wire's word for giving the room back, so a half that
+        // rounded down to it would ask for the sidebar while remembering it had
+        // asked for a page. No terminal is two columns wide; the floor is here
+        // because that number means something else, not because it is likely.
+        None => widest.map(|w| (w / 2).max(1)).or(Some(WHOLE_SCREEN)),
+    }
 }
 
 /// The whole tree, in a tab of its own.
@@ -1284,11 +1342,12 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         }
         Key::Char('q') | Key::Esc if view.showing.is_some() => Effect::CloseView,
         // A sidebar widened in place is the next thing in front of you, and
-        // giving the room back is the same effect that took it — see
-        // [`expand`]. Above the tab below for the same reason the tab is above
-        // the refusal: these keys close the nearest thing, and the room a panel
-        // is borrowing is nearer than the process it is running in.
-        Key::Char('q') | Key::Esc if view.asked_width.is_some() => Effect::Full,
+        // this is the way out of it from any width — `Z` goes one way round the
+        // cycle and `esc` skips the rest of it; see [`cycle`]. Above the tab
+        // below for the same reason the tab is above the refusal: these keys
+        // close the nearest thing, and the room a panel is borrowing is nearer
+        // than the process it is running in.
+        Key::Char('q') | Key::Esc if view.asked_width.is_some() => Effect::Sidebar,
         // …and in the tab `Z` opened, the panel itself is what is in front of
         // you, so the same keys close that. It is not installed furniture —
         // nothing is lost by quitting it and `Z` opens it again — and a
@@ -1475,11 +1534,12 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             say(ui, if view.focus { "titles in full" } else { "titles as they fit" });
             Effect::None
         }
-        // The whole tree. In a sidebar it is the sidebar that widens and the
-        // same key that gives the room back; where there is nobody to ask for
-        // room it is a tab, and from inside that tab the same key is the way
-        // out. One key for one idea in all three, because a fullscreen that
-        // opens with `Z` and closes with something else is one you leave open.
+        // The whole tree. In a sidebar it is the sidebar that widens, one step
+        // at a time — sidebar, half the screen, the whole page and back to the
+        // sidebar, see [`cycle`]; where there is nobody to ask for room it is a
+        // tab, and from inside that tab the same key is the way out. One key
+        // for one idea in all three, because a fullscreen that opens with `Z`
+        // and closes with something else is one you leave open.
         Key::Char('Z') if view.full => Effect::Quit,
         Key::Char('Z') => Effect::Full,
         // Nothing else changes while it is up: the tree keeps the cursor, and
@@ -1988,8 +2048,20 @@ mod tests {
     /// A host that hears everything, so what this side *says* can be read back.
     /// The answer never arrives here — the host replies by resizing us — so
     /// half of the mechanism is exactly this: the number, and nothing else.
-    #[derive(Default)]
-    struct Heard(Vec<usize>);
+    ///
+    /// Two hundred columns is the screen it says it has, so the half a `Z`
+    /// asks for is a round hundred. Read for nothing else; a test that cares
+    /// what the half comes to sets its own.
+    struct Heard {
+        said: Vec<usize>,
+        widest: Option<usize>,
+    }
+
+    impl Default for Heard {
+        fn default() -> Heard {
+            Heard { said: Vec::new(), widest: Some(200) }
+        }
+    }
 
     impl Screen for Heard {
         fn size(&self) -> (usize, usize) {
@@ -2000,8 +2072,12 @@ mod tests {
             (w, h)
         }
 
+        fn widest(&self) -> Option<usize> {
+            self.widest
+        }
+
         fn ask_width(&mut self, cols: usize) -> bool {
-            self.0.push(cols);
+            self.said.push(cols);
             true
         }
     }
@@ -2009,13 +2085,13 @@ mod tests {
     /// The pass condition of the whole seam, written as one sentence: three
     /// pages, one function, and the only thing that differs is a number.
     ///
-    /// The two numbers are different because the reasons are. A tree stops
-    /// abbreviating at [`PAGE_MIN`] and columns past that go into whitespace; a
-    /// board is four titles side by side and has no width that is enough, so it
-    /// asks past the end and takes what the host has. Neither reason is on the
-    /// wire, which is why the second one cost no herdr release.
+    /// The two numbers are different because the reasons are. A task written up
+    /// is prose laid out to a measure and stops needing columns at [`PAGE_MIN`];
+    /// a board is four titles side by side and has no width that is enough, so
+    /// it asks past the end and takes what the host has. Neither reason is on
+    /// the wire, which is why the second one cost no herdr release.
     #[test]
-    fn a_board_asks_for_every_column_there_is_and_the_tree_for_a_page() {
+    fn a_board_asks_for_every_column_there_is_and_a_task_page_for_a_measure() {
         use super::super::render::{PAGE_MIN, WHOLE_SCREEN};
         let mut heard = Heard::default();
         let mut view = View::default();
@@ -2027,7 +2103,7 @@ mod tests {
         assert!(expand(&mut heard, &mut view, None));
 
         assert_eq!(
-            heard.0,
+            heard.said,
             vec![PAGE_MIN, WHOLE_SCREEN, 0],
             "one seam, three asks, and zero is the room going back",
         );
@@ -2035,6 +2111,91 @@ mod tests {
             view.asked_width, None,
             "a page that has closed is not still asking for the room it had",
         );
+    }
+
+    /// `Z`, three times, and back where it started. The whole feature in one
+    /// assertion: what crossed the wire, in order, and where the panel thinks
+    /// it is after each press.
+    ///
+    /// The wire is checked as well as the field because the two are the halves
+    /// that can drift apart — a cycle that advanced without saying anything
+    /// would leave a sidebar that believes it is a page, and a cycle that said
+    /// something without advancing would be a key you press twice.
+    #[test]
+    fn z_goes_round_three_widths_and_comes_back_to_the_sidebar() {
+        use super::super::render::WHOLE_SCREEN;
+        let mut heard = Heard::default();
+        let mut view = View::default();
+
+        for expected in [Some(100), Some(WHOLE_SCREEN), None] {
+            let want = cycle(view.asked_width, heard.widest());
+            assert_eq!(want, expected);
+            assert!(expand(&mut heard, &mut view, want));
+            assert_eq!(view.asked_width, want);
+        }
+
+        assert_eq!(
+            heard.said,
+            vec![100, WHOLE_SCREEN, 0],
+            "half of the two hundred columns it said it had, all of them, none of them",
+        );
+    }
+
+    /// The whole page is the board's fullscreen and not a second one that looks
+    /// like it. One constant on the wire, so there is nothing for two
+    /// definitions of "full" to drift apart into — and with the surface now
+    /// commanding its own width, no host left in the middle to pull them back
+    /// together if they did.
+    #[test]
+    fn the_page_z_ends_on_is_the_one_the_board_asks_for() {
+        use super::super::render::WHOLE_SCREEN;
+        assert_eq!(cycle(Some(96), Some(200)), Some(WHOLE_SCREEN));
+    }
+
+    /// The position is the ask, and clamping is not a vote. A screen too narrow
+    /// to be worth splitting still has three states to be in: what a small
+    /// terminal changes is how many columns get drawn into, never where the
+    /// panel is in the cycle. There is no branch here for a host that gave less
+    /// than it was told, because there is no such event to branch on.
+    #[test]
+    fn a_screen_too_narrow_to_split_still_has_three_states() {
+        use super::super::render::WHOLE_SCREEN;
+        let half = cycle(None, Some(40));
+        assert_eq!(half, Some(20), "half of what there is, however little that is");
+        assert_eq!(cycle(half, Some(40)), Some(WHOLE_SCREEN));
+        assert_eq!(cycle(Some(WHOLE_SCREEN), Some(40)), None);
+    }
+
+    /// Half of the screen there is *now*. The ceiling arrives on every host
+    /// message, so a terminal dragged wider is a wider half on the next press —
+    /// nothing is remembered from the last one but the position.
+    #[test]
+    fn a_terminal_dragged_wider_gives_a_wider_half() {
+        assert_eq!(cycle(None, Some(120)), Some(60));
+        assert_eq!(cycle(None, Some(300)), Some(150));
+    }
+
+    /// Zero is the wire's word for giving the room back — see [`expand`] — so a
+    /// half that rounded down to it would ask for the sidebar while recording
+    /// that it had asked for a page, and the next `Z` would appear to do
+    /// nothing. No terminal is this narrow; the floor is here because that
+    /// number means something else.
+    #[test]
+    fn half_of_almost_nothing_is_never_the_number_that_gives_the_room_back() {
+        assert_eq!(cycle(None, Some(1)), Some(1));
+        assert_eq!(cycle(None, Some(0)), Some(1));
+    }
+
+    /// A host that never said how wide it could draw us has no half to offer.
+    /// It also has no room to give at all — [`Screen::ask_width`] refuses it and
+    /// `Z` opens the tab it always opened — so this is not a state the live
+    /// panel reaches; what it must not do is invent a width for a screen it has
+    /// never been told the size of.
+    #[test]
+    fn a_host_that_never_said_its_width_has_one_fewer_state() {
+        use super::super::render::WHOLE_SCREEN;
+        assert_eq!(cycle(None, None), Some(WHOLE_SCREEN));
+        assert_eq!(cycle(Some(WHOLE_SCREEN), None), None);
     }
 
     /// The board's number has to survive the crossing. `cols` is a `u16` on the

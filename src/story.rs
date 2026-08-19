@@ -505,7 +505,8 @@ fn effect_label(e: &panel::Effect) -> String {
         panel::Effect::CloseView => "close the view".into(),
         panel::Effect::PopOut { label, .. } => format!("pop out {label}"),
         panel::Effect::Board { label, .. } => format!("open {label}"),
-        panel::Effect::Full => "open the tab".into(),
+        panel::Effect::Full => "wider".into(),
+        panel::Effect::Sidebar => "the sidebar again".into(),
         panel::Effect::Run { argv, .. } => format!("run wsp {}", argv.join(" ")),
         panel::Effect::Tell(_) => "tell an agent".into(),
     }
@@ -965,14 +966,16 @@ fn scenes() -> Vec<Scene> {
             .scene("Inbox folded", "← folds a group exactly as it folds a project. The count stays on the heading, so closing it loses nothing — and the tree starts where it would have anyway."),
     );
 
-    // The same fixture, in the pane `Z` leaves behind. Every scene above and
-    // below this one is the same panel at thirty-four columns, which is the
-    // point: there is no second surface here, only a bigger pane and a frame
-    // drawn to it.
+    // The same fixture, in the room `Z` asks for. Every scene above and below
+    // this one is the same panel at thirty-four columns, which is the point:
+    // there is no second surface here, only more columns and a frame drawn to
+    // them. One picture for both of the widened states on purpose — a hundred
+    // and twenty columns is the half of a wide screen and the whole of a
+    // narrower one, and the panel draws the same thing either way.
     out.push(
         Driver::at(&w, 120, 30).scene(
             "The whole tree",
-            "Z opens the panel in a tab of its own, at the width of the workspace. It is a second panel and it costs nothing to be one: the folds, the filters and the cursor live in the store, so this and the sidebar are the same panel at two widths — it opens on the row you pressed Z from. Nothing is laid out differently, either. The tree is the same one row to a line, and every one of those rows is now as wide as the pane, so a title that was twenty-five characters and an ellipsis is a sentence. Two things do change: the six-task cap comes off, because six was what a project could spend of a column that had to hold thirty projects; and the footer says how to leave, because this is a tab somebody opened rather than furniture that is always there.",
+            "Z widens the panel where it stands: half the screen, then all of it, then back to the sidebar, and esc leaves from wherever it has got to. Where there is no host to ask — a panel in a plain terminal — the same key opens it in a tab of its own instead, at the width of the workspace. It is a second panel and it costs nothing to be one: the folds, the filters and the cursor live in the store, so this and the sidebar are the same panel at two widths — it opens on the row you pressed Z from. Nothing is laid out differently, either. The tree is the same one row to a line, and every one of those rows is now as wide as the pane, so a title that was twenty-five characters and an ellipsis is a sentence. Two things do change: the six-task cap comes off, because six was what a project could spend of a column that had to hold thirty projects; and the footer says how to leave, because this is a tab somebody opened rather than furniture that is always there.",
         ),
     );
 
@@ -3528,6 +3531,42 @@ mod tests {
             panel::Effect::None
         ));
         assert!(quits(true, Key::Esc), "and once it is closed, esc means the tab again");
+    }
+
+    /// `Z` only goes one way round, so `esc` has to be the whole way out.
+    ///
+    /// Three states raise exactly one question two did not: getting back to the
+    /// sidebar. Forward-only is the right cycle — the states are few and the
+    /// order reads, sidebar to half to whole — but paying three presses to undo
+    /// one would be inheriting a cost rather than choosing it. So `esc` and `q`
+    /// leave from wherever the cycle is, and this is the reducer half of that:
+    /// which way, not how wide.
+    #[test]
+    fn esc_leaves_a_widened_sidebar_from_any_width_and_z_goes_on_round() {
+        let w = world();
+        let from = |cols: Option<usize>, k: Key| -> panel::Effect {
+            let mut view = panel::View::default();
+            view.asked_for_width(cols);
+            let mut ui = ui_of(&w, &view);
+            panel::apply_key(k, &mut ui, &mut view)
+        };
+
+        for width in [Some(100), Some(u16::MAX as usize)] {
+            for k in [Key::Esc, Key::Char('q')] {
+                assert!(
+                    matches!(from(width, k), panel::Effect::Sidebar),
+                    "{k:?} at {width:?} should give all the room back at once",
+                );
+            }
+            assert!(
+                matches!(from(width, Key::Char('Z')), panel::Effect::Full),
+                "…and Z at {width:?} should go on round rather than collapse",
+            );
+        }
+
+        // In a sidebar that has asked for nothing there is no room to give
+        // back, and `q` says so rather than taking the panel down.
+        assert!(matches!(from(None, Key::Char('q')), panel::Effect::None));
     }
 
     /// A page shows the branch whole; a sidebar shows six of it and says so.
