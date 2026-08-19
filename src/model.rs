@@ -1155,6 +1155,46 @@ pub struct Machine {
     /// agents that ran on it are in the log and a row with a last-seen reads
     /// better than a missing one.
     pub status: String,
+    /// How many agents may be working on this machine at once. `None` is no
+    /// number, which is what every machine has until somebody sets one.
+    ///
+    /// **It is here rather than on the worklist that wants it**, and that is
+    /// the decision (`wsp-092` d2), not an accident of where the field fitted.
+    /// Three reasons, all of them things that have already happened:
+    ///
+    /// 1. It is a fact about the *machine*. The `batch` and `fork` governors
+    ///    were told *4 local, 4 remote, shared between two* by hand, and then
+    ///    had to renegotiate it between themselves because nothing held it.
+    ///    Two worklists each holding a number neither can honour is that same
+    ///    renegotiation with a file behind it.
+    /// 2. [`crate::sharing`] already measured what is scarce here and it is
+    ///    not agents — *"four agents thinking cost nothing, and four agents
+    ///    building is what saturates"* — and what it measured, it measured
+    ///    per machine.
+    /// 3. `data-018` is open and is exactly this question. A copy on the
+    ///    worklist would be the second place it lives, which is the failure
+    ///    the whole worklist design exists to stop.
+    ///
+    /// **What it does not do, said here so it is not assumed.** This counts
+    /// agents, and `data-018` measured that the thing worth counting is
+    /// *builds*: three heavy builds started independently on 2026-08-19 —
+    /// two governors and one agent each deciding correctly, none able to see
+    /// the other two — and `wsp spawn` began failing while it lasted. A cap
+    /// on agents would not have stopped that, because the three were within
+    /// any agent count anybody would have set. (The load averages recorded
+    /// against that incident are load averages and not CPU: processes blocked
+    /// on I/O are in them, every agent was still making progress, and the
+    /// figure should not be requoted as saturation.) So this field is *where
+    /// the number lives*, not the answer — the missing half is a governor
+    /// being able to ask "may I build now" and be told no, and it stays open
+    /// on `data-018`.
+    ///
+    /// The seat has no record here — see [`valid_machine_name`]'s caller in
+    /// `cmd_machine::add` — so today the number can only be set for an
+    /// executor. That is why every reader takes the cap as an
+    /// [`Option<usize>`] rather than a [`Machine`]: wherever the seat's own
+    /// number ends up living, [`Group::parallelism`] is unchanged.
+    pub agents: Option<usize>,
     pub added: String,
     pub body: String,
 }
@@ -1215,6 +1255,12 @@ impl Machine {
             os: doc.str("os"),
             arch: doc.str("arch"),
             status: doc.opt("status").unwrap_or_else(|| "active".into()),
+            // Absent, empty and unreadable all mean *no cap*, which is the
+            // state every machine is in until somebody decides a number. A
+            // default here would be this file inventing a policy, and a
+            // rejected file would be a hand-edit that stops the daemon
+            // reaching a machine over a typo in a field nothing dials.
+            agents: doc.opt("agents").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0),
             added: doc.str("added"),
             body: doc.body.clone(),
         }
@@ -1228,6 +1274,13 @@ impl Machine {
         d.set_str("os", &self.os);
         d.set_str("arch", &self.arch);
         d.set_str("status", &self.status);
+        // Written only when there is one, unlike the fields above it: an
+        // `agents:` on every machine file would say "somebody thought about
+        // this and chose no limit" about records written before the field
+        // existed.
+        if let Some(n) = self.agents {
+            d.set_str("agents", &n.to_string());
+        }
         d.set_str("added", &self.added);
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
@@ -1345,6 +1398,39 @@ pub struct Group {
     /// A start condition on the next group is this, read at the same barrier
     /// by the same reader, which is why there is one field and not two.
     pub stop: String,
+}
+
+#[allow(dead_code)]
+impl Group {
+    /// How many of this group may actually be running at once: **the smaller
+    /// of the group's `xN` and the machine's cap**, and `None` when neither
+    /// side states one — start the whole group, which is what every group in
+    /// all three hand-run lists wanted.
+    ///
+    /// The two numbers are different claims and that is why the smaller wins
+    /// rather than either overriding. `xN` is a cap on *the work* — "only two
+    /// of these at once, they sit near each other" — and it is asked for by
+    /// whoever composed the group. [`Machine::agents`] is what the box will
+    /// bear, and it is not negotiable by a list: two worklists running at
+    /// once have nothing to settle between them because neither can exceed
+    /// it, which is the renegotiation-by-hand that d2 is about.
+    ///
+    /// What that costs, stated so it is chosen rather than discovered: **"run
+    /// this list hard tonight" has no expression on the list.** The only way
+    /// to run one worklist harder is to raise the machine, which raises it for
+    /// everything on the machine. That is the right trade while one laptop is
+    /// the whole estate, and it is the thing to revisit when a worklist is
+    /// running on an executor nobody is sitting at.
+    ///
+    /// The machine's cap is passed in rather than read from a [`Machine`]
+    /// because the machine everything runs on today — the seat — has no
+    /// record to read it off. See [`Machine::agents`].
+    pub fn parallelism(&self, machine_cap: Option<usize>) -> Option<usize> {
+        match (self.cap, machine_cap) {
+            (Some(group), Some(machine)) => Some(group.min(machine)),
+            (group, machine) => group.or(machine),
+        }
+    }
 }
 
 /// The columns a wrapped `stop:` breaks to, and the indent its continuations
@@ -1871,6 +1957,47 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         let round = Machine::from_doc(&fm::parse(&Machine::new("mb2", "mac-mini").render()), "ignored");
         assert_eq!(round.ssh, "mac-mini", "an alias that was given is kept");
         assert_eq!(round.name, "mb2");
+    }
+
+    /// The cap is a number somebody decided, so "nobody has decided" has to
+    /// survive the file. Absent, empty and zero all come back as no cap —
+    /// zero because a record that said `agents: 0` would be read as either
+    /// "no limit" or "run nothing here" depending on who was reading it, and
+    /// the command refuses to write one for the same reason.
+    #[test]
+    fn a_machine_with_no_agent_cap_is_not_a_machine_capped_at_none() {
+        let none = Machine::from_doc(&fm::parse("---\nname: mb2\n---\n"), "mb2");
+        assert_eq!(none.agents, None, "a record written before the field is uncapped");
+        assert!(!none.render().contains("agents"), "and does not gain a line saying so");
+
+        for text in ["---\nname: mb2\nagents:\n---\n", "---\nname: mb2\nagents: 0\n---\n", "---\nname: mb2\nagents: four\n---\n"] {
+            assert_eq!(Machine::from_doc(&fm::parse(text), "mb2").agents, None, "{text}");
+        }
+
+        let mut m = Machine::new("mb2", "mb2");
+        m.agents = Some(4);
+        let round = Machine::from_doc(&fm::parse(&m.render()), "ignored");
+        assert_eq!(round.agents, Some(4), "a number that was decided round-trips");
+    }
+
+    /// The rule d2 turns on, in all four of its states. A group asks and the
+    /// machine grants: neither number overrides the other, because they are
+    /// different claims — `xN` is a cap on the work, the machine's is what the
+    /// box will bear — and the smaller is the only answer that honours both.
+    #[test]
+    fn the_number_that_may_run_is_the_smaller_of_what_the_group_asks_and_the_machine_allows() {
+        let uncapped = Group { members: vec!["a-001".into()], ..Default::default() };
+        let asked = Group { cap: Some(2), ..uncapped.clone() };
+
+        assert_eq!(uncapped.parallelism(None), None, "nobody stated a number: run the group");
+        assert_eq!(uncapped.parallelism(Some(4)), Some(4), "the machine alone still binds it");
+        assert_eq!(asked.parallelism(None), Some(2), "so does the group alone");
+        assert_eq!(asked.parallelism(Some(4)), Some(2), "a group may ask for fewer than it is allowed");
+        assert_eq!(
+            Group { cap: Some(6), ..uncapped }.parallelism(Some(4)),
+            Some(4),
+            "and may not ask for more — this is the renegotiation d2 removes",
+        );
     }
 
     /// The defect this file was fixed for. A brief with its own `## ` headings

@@ -2664,6 +2664,43 @@ when one does come up anyway it is answerable from here, because the pane is in
 the panel like any other: `herdr pane send-keys` over ssh, or `herdr --remote`
 for a real client attached to that server.
 
+### How many agents a machine will bear
+
+```sh
+wsp machine set mb2 agents=4      # four at once on that box
+wsp machine set mb2 agents=       # and back to no cap
+```
+
+The number is on the **machine** and not on whatever asked for it. The `batch`
+and `fork` governors were told *4 local, 4 remote, shared between two* by hand
+and then had to renegotiate it between themselves, because nothing held it; two
+plans each holding a number neither can honour is that same afternoon with a
+file behind it. A worklist group's optional `xN` is a cap on *the work* — "only
+two of these at once, they sit near each other" — and **the effective number is
+the smaller of the two**, so a group may ask for fewer than it is allowed and
+never for more. Two lists running at once have nothing to settle between them.
+
+What that costs, so it is chosen rather than discovered: **"run this list hard
+tonight" has no expression on the list.** The only way to run one harder is to
+raise the machine, which raises it for everything on the machine. Right while
+one laptop is the whole estate; the thing to revisit when a list is running on
+an executor nobody is sitting at.
+
+Two things it does not do, both worth knowing before the number is trusted:
+
+- **The seat has no record**, because the seat is not an executor of itself, so
+  today the cap can only be set for a far machine — while the box that runs
+  almost everything is the one you are sitting at. Every reader takes the cap as
+  an optional number rather than a machine, so wherever the seat's own number
+  ends up living, the rule above is unchanged.
+- **It counts agents, and builds are what saturate.** `data-018` measured it:
+  three heavy builds started independently, two governors and one agent each
+  deciding correctly and none able to see the other two, and `wsp spawn` began
+  failing while it lasted. No agent count anybody would have set would have
+  stopped that. `src/sharing.rs` is the half that bounds builds — warm trees and
+  a `cores / builds` share — and the missing half, a governor able to ask *may I
+  build now*, is still open on `data-018`.
+
 ### What is deliberately not here
 
 - **How code gets to the executor, and how the work comes back.** Undecided.

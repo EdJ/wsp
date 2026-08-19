@@ -375,6 +375,14 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     if !box_line.is_empty() {
         println!("box       {box_line}");
     }
+    // Printed whether or not it is set, because "no cap" is the state this
+    // knob is in on every machine nobody has thought about, and a line that
+    // only appears once somebody has thought about it is a line that never
+    // tells you it is there. See `Machine::agents` for why the number is here.
+    match m.agents {
+        Some(n) => println!("agents    {n} at once"),
+        None => println!("agents    {}", p.dim(&format!("no cap — wsp machine set {} agents=4", m.name))),
+    }
     println!("status    {}", m.status);
     if !m.added.is_empty() {
         println!("added     {}", m.added);
@@ -402,7 +410,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
 pub fn set(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp machine set <name> ssh=… backend_at=… os=… arch=… status=active|retired");
+        eprintln!("usage: wsp machine set <name> ssh=… backend_at=… os=… arch=… agents=N status=active|retired");
         return 2;
     };
     let Some(mut m) = find(store, &needle) else {
@@ -428,6 +436,33 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             }
             "os" => m.os = v.to_string(),
             "arch" => m.arch = v.to_string(),
+            // How many agents this box will bear at once. The argument for it
+            // being a fact about the machine rather than about the list that
+            // wants it is on `Machine::agents`, and so is what it does not
+            // cover — it counts agents, and `data-018` measured that builds
+            // are what saturate.
+            "agents" => match v.trim() {
+                // `agents=` is how a number is taken back off. Absent is a
+                // real state and not a zero: it means nobody has decided,
+                // which is where every machine starts.
+                "" | "none" | "-" => m.agents = None,
+                // Rejected rather than read as either of its two meanings.
+                // "drain this machine" is a plausible reading and so is "no
+                // cap", and a machine silently taking one of them is how you
+                // find out at 3am which one this build chose. Retiring is how
+                // a machine is taken out of use, and it is already a verb.
+                "0" => {
+                    eprintln!("wsp: agents=0 would mean either `no cap` or `drain it`, so it means neither — `agents=` clears the cap, `wsp machine rm {}` retires the machine", m.name);
+                    return 2;
+                }
+                n => match n.parse::<usize>() {
+                    Ok(n) => m.agents = Some(n),
+                    Err(_) => {
+                        eprintln!("wsp: agents is a count, not `{n}`");
+                        return 2;
+                    }
+                },
+            },
             "status" => match v {
                 "active" | "retired" => m.status = v.to_string(),
                 _ => {
@@ -436,7 +471,7 @@ pub fn set(store: &Store, args: &Args) -> i32 {
                 }
             },
             other => {
-                eprintln!("wsp: machines have no `{other}` — ssh, backend_at, os, arch, status");
+                eprintln!("wsp: machines have no `{other}` — ssh, backend_at, os, arch, agents, status");
                 return 2;
             }
         }
@@ -723,6 +758,40 @@ mod tests {
         assert!(!out.join("\n").contains("w1:p2"), "no agents, since none were reported");
     }
 
+    // ---- the cap --------------------------------------------------------
+
+    fn scratch(tag: &str) -> Store {
+        let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        store.ensure_dirs().unwrap();
+        store
+    }
+
+    /// Setting it, clearing it, and the one value that is refused.
+    ///
+    /// `agents=0` is rejected rather than stored because it has two readings —
+    /// *no limit* and *run nothing here* — and a machine that quietly picks
+    /// one of them is a night that either did not start or did not stop. The
+    /// error has to name both ways out, since a refusal that only says no is
+    /// how somebody ends up writing the number down somewhere else.
+    #[test]
+    fn a_machine_takes_an_agent_cap_and_gives_it_back_but_will_not_take_zero() {
+        let store = scratch("machine-agents");
+        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
+        let set_to = |v: &str| set(&store, &Args::synth("machine", &["set", "mb2", &format!("agents={v}")], &[]));
+
+        assert_eq!(set_to("4"), 0);
+        assert_eq!(store.machine("mb2").unwrap().agents, Some(4), "and it is on the file");
+
+        assert_eq!(set_to("0"), 2, "zero is refused rather than guessed at");
+        assert_eq!(store.machine("mb2").unwrap().agents, Some(4), "and changes nothing");
+
+        assert_eq!(set_to("four"), 2, "a count is a count");
+        assert_eq!(set_to(""), 0, "`agents=` is how the number is taken back off");
+        assert_eq!(store.machine("mb2").unwrap().agents, None, "back to nobody having decided");
+    }
+
     /// No machines at all is the common case — one seat, and whatever is on it
     /// — and it must still say what is running here.
     #[test]
@@ -745,6 +814,10 @@ fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
         "os": m.os,
         "arch": m.arch,
         "backend_at": m.backend_at,
+        // Null and not 0 when there is no cap: a governor asking for the
+        // number wants to be able to tell "nobody has decided" from a number,
+        // and `0` is the one answer that reads as an instruction.
+        "agents": m.agents,
         "status": m.status,
         "added": m.added,
         "live": live.map(|l| l.to_value()),
