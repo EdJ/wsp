@@ -2495,16 +2495,41 @@ that reading is charged to its context. 988 `wsp` calls across 221 sessions on
 this machine came to roughly 202,600 tokens of output.
 
 Most of that is content and stays. An `ls` row is twenty-one tokens of id,
-status, priority and title with nothing in it to remove; `show` is the task's
-own prose, which is the work in hand and the one place you want all of it;
-`where`, `doctor`, `overlap` and `next` are already under 500 bytes. Three
-things were not content, and each was dealt with where it was:
+status, priority and title with nothing in it to remove; `where`, `doctor`,
+`overlap` and `next` are already under 500 bytes. Four things were not content,
+and each was dealt with where it was:
 
 | | |
 |---|---|
 | `project show` | the decisions block, printed whole. 4,104 → 1,058 tokens, for every caller |
+| `show` | the task's log, printed whole. **50.1% of every token of prose in the store**, and the only section of a task that grows without bound |
 | `agents.md` | fifty lines of commit ritual (66058d9), then the case for each remaining rule. 434 → 305 tokens, in every session on the machine |
 | the figma plugin | 3,545 tokens of system prompt in a Rust TUI that cannot reach any of it (ee9ae79) |
+
+`show` is on that list against this document's own earlier claim, which was that
+it is the task's own prose and therefore the one place you want all of it. The
+prose is; the log under it is not the same thing. It is every hand-over the task
+has ever had, appended to for as long as the work is open, and a seat runs `wsp
+show` all day — the one that filed this had truncated its output by hand dozens
+of times in a single session. It now prints the last six entries and a line
+saying how many earlier ones there are:
+
+```
+## Log
+18 of 24 earlier · wsp show wsp-088 --log
+```
+
+Six is measured rather than chosen: it leaves 119 of the store's 156 open tasks
+untouched and still drops 41% of every character in every log, because a task
+with many entries is also a task with long ones. Four — what the session brief
+keeps — is where the machine-written lines start to crowd the written ones out,
+since `claimed by pane`, `moved under` and `renamed from` are the last three
+things written to a task somebody has just picked up. Seven prints, because the
+line announcing a single dropped entry is longer than the entry and costs a
+second command on top, and a cap that fires for no gain is one a reader learns
+to type past. Entries and never characters: what a cap costs here is older
+entries, counted and one flag away, and never the second half of a sentence.
+Over the whole store it takes 20.5% off `wsp show`.
 
 What is left is a block you have already read, printed again because the
 command that carries it does not know that. `--terse` — or `WSP_TERSE=1`, set

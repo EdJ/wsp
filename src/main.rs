@@ -579,7 +579,10 @@ fn help() {
                                     hits and says how many more; --full for
                                     all of them
   wsp inbox                         tasks with no project
-  wsp show <id>                     full task, including notes
+  wsp show <id> [--log]             full task, including notes. The log is
+                                    the last few entries and says how many
+                                    earlier ones it did not print; --log for
+                                    all of them
   wsp start|review|reopen <id>      move through the workflow
   wsp done <id> [--force]           complete; --force over open sub-tasks
   wsp block <id> "reason"           stop it: somebody owes you an answer

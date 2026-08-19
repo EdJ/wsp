@@ -481,7 +481,7 @@ fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Ve
 
 pub fn show(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp show <id>");
+        eprintln!("usage: wsp show <id> [--log]");
         return 2;
     };
     let t = match store.task_or_why(&needle) {
@@ -631,10 +631,92 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // arrived at the same way.
     let mut rest = crate::model::localise_dates(&t.body);
     crate::model::set_section_in(&mut rest, "Decisions", "");
+    // Lifted out and printed below rather than with the body, because it is the
+    // one section that is capped. It is last in a body whatever order the file
+    // was in — `set_section_in` above has just re-sorted the sections — so
+    // printing it after the rest is the same page in the same order.
+    let log = crate::model::section_of(&rest, "Log").unwrap_or_default();
+    crate::model::set_section_in(&mut rest, "Log", "");
     if !rest.trim().is_empty() {
         println!("\n{}", rest.trim());
     }
+    if !log.trim().is_empty() {
+        println!("\n## Log");
+        for line in log_lines(&p, &log, &t.id, args.has("log")) {
+            println!("{line}");
+        }
+    }
     0
+}
+
+/// Log entries `wsp show` prints, most recent last.
+///
+/// A count of entries and never a count of characters. `core-005`: *"A brief
+/// cut off at N characters loses the end, and the end is where conclusions
+/// are."* Every entry printed here is printed whole; what the cap costs is
+/// older entries, counted and one flag away, and never the second half of a
+/// sentence.
+///
+/// Six, measured over this store's 421 logged tasks. It is quiet on an ordinary
+/// task and bites on the fat ones, which is the shape a cap wants: 168 of the
+/// 421 are abridged at all — 37 of the 156 still open — and 41% of every
+/// character in every log goes. The two hold together because a task with many
+/// entries is also a task with long ones.
+///
+/// Six rather than four, which is what the session brief keeps
+/// ([`crate::cmd_brief`]), because the machine-written lines cluster at exactly
+/// the end a tail keeps: `claimed by pane`, `moved under`, `renamed from` are
+/// the last three things written to a task that was just picked up. At four,
+/// 38% of tasks would show no written entry at all — the cap spent entirely on
+/// bookkeeping. At six it is 28%, and eight buys one point more, so this is the
+/// knee and not a preference.
+const MAX_LOG: usize = 6;
+
+/// The log as a page: the recent entries whole, and a line saying how many
+/// earlier ones are not on it and what prints them.
+///
+/// The line is `wsp project show --decisions`'s, in the same words and for the
+/// same reason — a log that stops after six entries reads exactly like a log
+/// that has six entries, and the difference is the history somebody is about to
+/// ask an agent to re-derive. Nothing is dropped from the record: this is what
+/// is handed over, and `--log` is the whole of it.
+fn log_lines(p: &Paint, log: &str, id: &str, full: bool) -> Vec<String> {
+    let entries = log_entries(log);
+    // One over is printed rather than announced. The line that would hide a
+    // single entry is 40 characters and a second command; the entry it hides is
+    // a transition of about 50, on the 45 tasks here where this fires. Neither
+    // of those is worth a round trip, and a cap that fires for no gain is the
+    // one a reader learns to type `--log` past every time.
+    if full || entries.len() <= MAX_LOG + 1 {
+        return entries;
+    }
+    let cut = entries.len() - MAX_LOG;
+    let mut out =
+        vec![p.dim(&format!("{cut} of {} earlier · wsp show {id} --log", entries.len()))];
+    out.extend(entries.into_iter().skip(cut));
+    out
+}
+
+/// A log split into entries, one string each.
+///
+/// An entry is a `- ` bullet and every line beneath it. Logs here are mostly one
+/// line per entry — `wsp note` folds what it is given — but 287 lines in this
+/// store are the continuation of the bullet above them, an indented block of
+/// output or a paragraph somebody wrote by hand, and a tail counted in lines
+/// would start mid-entry and print a fragment with no date on it. Anything
+/// before the first bullet is kept as an entry of its own, so prose that
+/// arrived in a shape this did not anticipate is counted rather than dropped.
+fn log_entries(log: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in log.trim().lines() {
+        if line.starts_with("- ") || out.is_empty() {
+            out.push(line.to_string());
+        } else if let Some(prev) = out.last_mut() {
+            prev.push('\n');
+            prev.push_str(line);
+        }
+    }
+    out
 }
 
 /// The hands up about one task: open, or in words this build cannot read.
@@ -2661,5 +2743,89 @@ mod tests {
             Some("d2".to_string()),
             "and the older entry can be marked from what is in the file"
         );
+    }
+
+    /// The whole of what this cap is for, and the thing it must not do.
+    ///
+    /// `wsp show` is the command a seat runs all day and the log was the one
+    /// section with no limit on it: 50.1% of every token of prose in this store,
+    /// and the only part that grows without bound. It is now the recent entries
+    /// — and a log cut short must say so, or six entries read exactly like a
+    /// task that only ever had six, which is the history somebody is about to
+    /// ask an agent to re-derive.
+    #[test]
+    fn a_log_longer_than_the_cap_is_cut_from_the_top_and_says_how_much_it_cut() {
+        let p = Paint::plain();
+        let log: String = (1..=9).map(|i| format!("- 2026-08-19 entry {i}\n")).collect();
+
+        let out = log_lines(&p, &log, "core-008", false);
+        assert_eq!(out.len(), MAX_LOG + 1, "the cap, and the line that owns up to it: {out:?}");
+        assert_eq!(
+            out[0], "3 of 9 earlier · wsp show core-008 --log",
+            "how many are missing, and the one keystroke that prints them",
+        );
+        assert_eq!(out[1], "- 2026-08-19 entry 4", "kept from the recent end");
+        assert_eq!(out[MAX_LOG], "- 2026-08-19 entry 9", "up to and including the last");
+
+        assert_eq!(
+            log_lines(&p, &log, "core-008", true).len(),
+            9,
+            "`--log` is the whole of it, and nothing here ever removed an entry from the record",
+        );
+    }
+
+    /// A cap that fires on every task is a cap somebody turns off. Under it, the
+    /// page is the same page it always was — no notice line, nothing dropped —
+    /// which is most reads: 119 of the 156 open tasks in this store.
+    #[test]
+    fn a_log_inside_the_cap_prints_whole_and_says_nothing() {
+        let p = Paint::plain();
+        let log = "- 2026-08-19 filed\n- 2026-08-19 claimed by pane w4V:p1\n";
+        assert_eq!(
+            log_lines(&p, log, "core-008", false),
+            vec!["- 2026-08-19 filed", "- 2026-08-19 claimed by pane w4V:p1"],
+            "nothing to say, so nothing said",
+        );
+    }
+
+    /// A cap that fires for no gain teaches a reader to type `--log` past it.
+    /// The line announcing a single dropped entry is longer than the entry —
+    /// `→ review`, `claimed by pane w4V:p1` — and costs a second command on top,
+    /// so one over the cap is printed instead of being announced.
+    #[test]
+    fn a_log_one_entry_over_the_cap_prints_that_entry_rather_than_a_line_about_it() {
+        let p = Paint::plain();
+        let log: String = (1..=MAX_LOG + 1).map(|i| format!("- 2026-08-19 entry {i}\n")).collect();
+
+        let out = log_lines(&p, &log, "core-008", false);
+        assert_eq!(out.len(), MAX_LOG + 1, "seven entries, and no notice among them: {out:?}");
+        assert_eq!(out[0], "- 2026-08-19 entry 1", "the oldest is still on the page");
+    }
+
+    /// An entry is a bullet and everything under it. 287 lines in this store are
+    /// the continuation of the one above — an indented block of measured output,
+    /// a paragraph somebody wrote by hand — and a tail counted in lines would
+    /// start in the middle of one and print a fragment with no date on it,
+    /// under a count that had already been told a lie about how many there were.
+    #[test]
+    fn an_entry_is_a_bullet_and_the_lines_beneath_it() {
+        let p = Paint::plain();
+        let log = "- 2026-08-19 one\n- 2026-08-19 two\n    wsp tag verb-001 +dsp\n    exit 0\n- 2026-08-19 three\n";
+
+        let entries = log_entries(log);
+        assert_eq!(entries.len(), 3, "three entries, not five lines: {entries:?}");
+        assert!(entries[1].ends_with("    exit 0"), "the block belongs to the bullet above it");
+
+        let out = log_lines(&p, log, "core-008", false);
+        assert_eq!(out.len(), 3, "and under the cap it is untouched: {out:?}");
+    }
+
+    /// Prose that arrived in a shape nothing anticipated is counted rather than
+    /// dropped. `wsp doctor` folds stray headings back into the log, and what it
+    /// folds does not always begin with a bullet.
+    #[test]
+    fn text_before_the_first_bullet_is_an_entry_of_its_own() {
+        let log = "a line somebody wrote without a bullet\n- 2026-08-19 filed\n";
+        assert_eq!(log_entries(log).len(), 2, "counted, so `--log` is what prints it");
     }
 }
