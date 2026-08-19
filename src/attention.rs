@@ -136,6 +136,15 @@ pub(crate) const KEY: &str = "daemon";
 /// that is not a task at all (`herdr`, for [`Kind::Blind`]) has no chain to
 /// walk and is everybody's by construction, which is correct: wsp being unable
 /// to see the agents is not one seat's problem.
+///
+/// [`Store::task`] and deliberately not [`Store::task_now`], which is the
+/// resolving read every other place that turns a *recorded* id into a task now
+/// uses. A subject arrives here off the ledger, and the ledger persists in
+/// `watches.json` — so this looked like the fourth instance of the raw-read
+/// fault. It is not, because `watches.json` is in
+/// [`Store::state_files_with_ids`]: the ledger's subjects are rewritten by a
+/// renumbering, so an id that misses here is one that has genuinely gone, and a
+/// falling edge on work nobody can find belongs to everybody.
 fn addressee(
     store: &Store,
     index: &Index,
@@ -713,6 +722,52 @@ mod tests {
         let out = tick(&store, &mut after, &mut Fake(vec![]), 180);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].edge, Edge::Down);
+    }
+
+    /// The ledger remembers by id, so a renumbering has to reach it.
+    ///
+    /// Nothing here is emitted twice, and that is the whole assertion. Left
+    /// behind, the ledger's copy of the old id makes the next tick read one
+    /// standing level as two events — a fall under the name that has gone and
+    /// a rise under the one that replaced it — so a person is interrupted
+    /// again about a task they were already told about, and the falling half
+    /// is addressed to everybody because nothing answers to its subject.
+    ///
+    /// Asserted through [`Store::state_files_with_ids`] rather than beside it:
+    /// a test keeping its own copy of a hand-kept list is the same mistake with
+    /// a green tick over it.
+    #[test]
+    fn a_level_standing_when_its_task_is_renumbered_is_not_reported_all_over_again() {
+        assert!(
+            Store::state_files_with_ids().contains(&"watches.json"),
+            "the attention ledger is keyed by task id and lives in this file",
+        );
+
+        let (_env, store) = store("renumbered");
+        task(&store, "t-260815-014", Some("worklist"));
+        let mut pass = Pass::new();
+        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(vec![stall("t-260815-014")]), 60);
+        assert_eq!(store.events_of("attention-raised").len(), 1, "told once, as it should be");
+
+        let map = std::collections::BTreeMap::from([(
+            "t-260815-014".to_string(),
+            "worklist-002".to_string(),
+        )]);
+        store.rename_tasks(&map).unwrap();
+
+        // The source computes its subjects from the store, so after the rename
+        // it says the same thing under the new name.
+        let emits = tick(&store, &mut pass, &mut Fake(vec![stall("worklist-002")]), 120);
+        assert!(
+            emits.is_empty(),
+            "the same level under its new name is not a change: {emits:?}",
+        );
+        assert_eq!(store.events_of("attention-raised").len(), 1, "and nobody is told twice");
+        assert!(
+            store.events_of("attention-cleared").is_empty(),
+            "least of all that the work stopped needing them",
+        );
     }
 
     /// A signal is derived, so it is **never a record**. `wsp-095`'s answer to

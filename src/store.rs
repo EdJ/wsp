@@ -291,6 +291,19 @@ impl Store {
     /// passengers — `daemon.json`, `said.json`, `.lock`. Adding one costs a
     /// read and a token scan of a file that can never match.
     ///
+    /// `watches.json` is here for what is *nested* in it rather than for its
+    /// own keys, which are watch names and scopes. The daemon's attention
+    /// ledger lives inside one of those records, keyed `<level>:<task>` with
+    /// the id repeated in `subject`, and it is the memory of which levels have
+    /// already been told to somebody. Left behind by a renumbering it makes the
+    /// level appear to *fall* under the old id and *rise* under the new one on
+    /// the next tick, so a person is notified twice about one blocked task —
+    /// and the falling half is addressed to everybody, because
+    /// `attention::addressee` cannot find the task it names. Both halves go
+    /// away by rewriting the id, which is why the fix is here and not a
+    /// resolving read at the addressee: a `Down` on a subject that really has
+    /// gone is still addressed to everybody, correctly.
+    ///
     /// `resumable.json` is the one file that carries a `task` and is still
     /// absent on purpose: the daemon overwrites it whole from live bindings on
     /// every tick, so a stale id in it has a life of twenty seconds. Its frozen
@@ -320,6 +333,7 @@ impl Store {
             "panel-view.json",
             "panels.json",
             "resume-held.json",
+            "watches.json",
             "events.jsonl",
         ]
     }
