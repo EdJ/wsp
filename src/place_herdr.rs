@@ -88,7 +88,7 @@
 //! # The three things this fixes rather than ports
 //!
 //! Recorded against a live herdr 0.7.5 and a real Claude Code on 2026-08-17
-//! (t-260816-080), and all three were latent because nothing called `place.rs`:
+//! (robustness-023), and all three were latent because nothing called `place.rs`:
 //!
 //! 1. **`interactive_ready` is never `false`.** The port decided an agent was
 //!    starting from `ready == Some(false)`, a reading herdr does not send: for
@@ -250,7 +250,7 @@ impl Herdr<'static> {
 /// adapter's job and nobody else's: `place.rs` carries the string, the model
 /// stores it, and only this file knows that herdr's is a filesystem path and
 /// that a second machine's is likely to be the same one as ours. It was in
-/// `model.rs` until t-260816-064, where it was the durable entities reaching
+/// `model.rs` until robustness-019, where it was the durable entities reaching
 /// for a concrete backend.
 pub fn mirrored_socket() -> String {
     herdr::socket_path().to_string_lossy().into_owned()
@@ -590,7 +590,7 @@ impl Place for Herdr<'_> {
         let mut params = json!({ "label": order.label, "env": env, "focus": order.show });
         if let Some(c) = &order.cwd {
             // Expanded against *this* machine's home even when the work is
-            // going somewhere else, which is deliberate and is t-260815-060's:
+            // going somewhere else, which is deliberate and is wsp-025's:
             // the machines mirror each other, and host-qualified roots are not
             // smuggled in here.
             params["cwd"] = json!(util::expand(c).display().to_string());
@@ -631,7 +631,7 @@ impl Place for Herdr<'_> {
     /// waited for. Not when it will take a prompt: those are different moments,
     /// three seconds apart, and conflating them is the `agent_not_ready` bug.
     ///
-    /// **What "exists" means is the whole of t-260817-010, and it was wrong
+    /// **What "exists" means is the whole of robustness-041, and it was wrong
     /// here.** This waited for `agent.get` to answer with a record at all, and
     /// during the launch window it answers with a record that names nothing:
     /// `launch_pending: true`, `agent_status: "unknown"`, and no `agent` field —
@@ -1111,7 +1111,7 @@ mod tests {
         assert_eq!(place.state(&seat).unwrap(), State::Idle, "idle in front of its own work order");
     }
 
-    /// **t-260817-010.** An agent that has been started and not yet detected is
+    /// **robustness-041.** An agent that has been started and not yet detected is
     /// not a seat that emptied, and `start` must not come back until the
     /// difference can be seen.
     ///

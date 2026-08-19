@@ -1,7 +1,7 @@
 //! The half of a panel's view that belongs to the person rather than the pane.
 //!
 //! herdr owns panes through workspaces, so a panel cannot be one pane that
-//! follows you — t-260815-040 has the evidence. What it can be is twenty-two
+//! follows you — wsp-015 has the evidence. What it can be is twenty-two
 //! panes nobody can tell apart, and this is the difference between the two: the
 //! folds, the filters and the cursor live in the store, so the panel you switch
 //! into is already showing what the one you left was showing.

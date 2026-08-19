@@ -204,7 +204,7 @@ pub(super) fn save_panels(store: &Store, panels: &Panels) {
 /// machine answering* is how they drift apart. And `sync` runs on every daemon
 /// tick, including the tick one second after herdr came back, when a session
 /// still being restored looks exactly like a mass closure. Destroying a record
-/// is asked for here, never automatic; t-260816-058 is what the other way cost.
+/// is asked for here, never automatic; robustness-015 is what the other way cost.
 pub(crate) fn reap_panels(
     store: &Store,
     workspaces: &[String],
@@ -842,7 +842,7 @@ mod tests {
 
     /// Unreachable is not empty, one file over. A machine that said nothing has
     /// not said its workspaces are gone, and a sweep that cannot tell those
-    /// apart empties the record on the first network blip — t-260816-058 is
+    /// apart empties the record on the first network blip — robustness-015 is
     /// what that cost the bindings.
     #[test]
     fn a_machine_that_said_nothing_keeps_every_record_on_it() {

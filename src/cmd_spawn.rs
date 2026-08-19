@@ -48,7 +48,7 @@ use crate::Args;
 /// what binds it, and what to read are sitting at the top of its context. A
 /// sentence asking it to fetch that again costs a round-trip, and a round-trip
 /// at request 1 is a full context re-read — measured at ~35K on
-/// t-260816-096, against ~700 for the duplicated text itself.
+/// robustness-031, against ~700 for the duplicated text itself.
 ///
 /// [`Handover::Running`] is the panel's. That agent's session began before the
 /// claim existed, so its brief is a brief about holding nothing. It has to
@@ -61,7 +61,7 @@ use crate::Args;
 ///
 /// [`Handover::Custodian`] is the third, and it is a different *job* rather
 /// than a different route to the same one. By the decision of 2026-08-17 on
-/// t-260817-021 an agent can be assigned to a **project**, which is an edge the
+/// robustness-048 an agent can be assigned to a **project**, which is an edge the
 /// model did not have — every other assignment in wsp is agent-to-task — and
 /// what arrives in that slot is not a claimant with a piece of work to finish.
 /// It sequences, directs, reviews and holds the record for everything beneath
@@ -783,7 +783,7 @@ struct Work {
 /// A task, or a project, or nothing that resolves.
 ///
 /// `-p` forces the project reading. Without it a task is tried first and a
-/// project second, which is the order the ids themselves suggest: `t-260815-033`
+/// project second, which is the order the ids themselves suggest: `wsp-014`
 /// can only be a task, and a project slug can only be a project, so the two
 /// collide solely on a title substring — where the task is what was meant, that
 /// being the thing you were just reading.
@@ -918,12 +918,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // Still this machine's paths, deliberately. A project root is a path in the
     // store and `~` expands here, which is right while the machines mirror each
     // other and is exactly what the Linux box breaks; host-qualified roots are
-    // t-260815-060 and are not smuggled in here.
+    // wsp-025 and are not smuggled in here.
     let cwd = args
         .get("cwd")
         .or_else(|| work.project.as_deref().and_then(|p| index.root_of(p)));
 
-    // One tree per agent, which is the whole of t-260815-022 and is done here
+    // One tree per agent, which is the whole of robustness-010 and is done here
     // rather than asked of the agent. Every softer version of it has been tried
     // in this repository and recorded on that task — naming paths, staging by
     // hunk, announcing first — and each failed the same way: an agent that has
@@ -1082,7 +1082,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             Ok(()) => {
                 started = Some(kind.clone());
                 // A task gives an agent something to be told, and so — since
-                // t-260817-021 — does a project it is being made custodian of.
+                // robustness-048 — does a project it is being made custodian of.
                 // A bare project workspace is still what the line here used to
                 // say of all of them: a place to work rather than an
                 // instruction, with `f` in the panel the key that turns one
@@ -1860,7 +1860,7 @@ mod tests {
     /// What it must not say is the thing every other work order says: pick up
     /// this task and finish it. A custodian that claims work is the failure the
     /// position was built out of — the seat on the night this came from
-    /// borrowed t-260816-078 to have somewhere to stand, and every surface in
+    /// borrowed robustness-022 to have somewhere to stand, and every surface in
     /// wsp then described it as an agent working that task.
     #[test]
     fn a_custodian_is_told_the_job_rather_than_handed_a_task() {
@@ -1882,7 +1882,7 @@ mod tests {
 
     /// The work order is ASCII, and it is not a style rule.
     ///
-    /// t-260817-004: a spawned agent sat with its work order typed into the
+    /// robustness-035: a spawned agent sat with its work order typed into the
     /// input box and never submitted. The pane had the text and the agent had
     /// nothing to do, so `wsp wip` showed a healthy spawn doing no work — it
     /// fails open, which is the worst way for the loop's start verb to fail.
@@ -1906,7 +1906,7 @@ mod tests {
     /// A backend reading off a script, one answer per poll, holding the last one
     /// for ever after.
     ///
-    /// The script is the whole point: what killed t-260817-010 was a *sequence*
+    /// The script is the whole point: what killed robustness-041 was a *sequence*
     /// of readings rather than any single one, and a fake that can only be put
     /// in a state cannot express "empty, and then not".
     ///
@@ -2547,7 +2547,7 @@ mod tests {
         }
     }
 
-    /// The whole of t-260815-022, at the one line where it happens.
+    /// The whole of robustness-010, at the one line where it happens.
     ///
     /// Every softer answer to two agents in one checkout has been tried in this
     /// repository and each failed the same way — an agent that has to remember

@@ -121,12 +121,12 @@
 //! Named rather than absorbed, because the layer is worth more than any one of
 //! them and a first pass that took all five would have been unreviewable:
 //!
-//! - **t-260817-010, readiness.** `wait_ready` declares an agent dead while it
+//! - **robustness-041, readiness.** `wait_ready` declares an agent dead while it
 //!   is alive, because herdr's claude detection needs a rendered pane and the
 //!   focus decision forbids rendering one. `claude agents --json` answers
 //!   liveness and `idle`/`busy` per session with no pane involved at all, which
 //!   is a per-kind reading of exactly the sort this trait is for.
-//! - ~~**t-260817-006, environment hygiene.**~~ Refuted, and worth keeping as
+//! - ~~**robustness-037, environment hygiene.**~~ Refuted, and worth keeping as
 //!   the one prediction on this list that was wrong. The guess was that which
 //!   variables a kind must not inherit is a fact about that kind. It is not:
 //!   what leaks is `CLAUDE_CODE_CHILD_SESSION` and the rest of the *caller's*
@@ -136,9 +136,9 @@
 //!   asked once per seat rather than once per agent. A kind-shaped question and
 //!   a spawn-shaped one look alike from here; the test is whether the answer
 //!   changes when nothing is started.
-//! - **t-260816-068, `--resume`.** Recording a session id against a task so an
+//! - **render-061, `--resume`.** Recording a session id against a task so an
 //!   agent can be picked up again. The same field this file already reads.
-//! - ~~**t-260816-088, `--model` and `--effort`.**~~ Landed as `wsp-059`, and it
+//! - ~~**wsp-059, `--model` and `--effort`.**~~ Landed as `wsp-059`, and it
 //!   arrived as predicted — more of [`Kind::args`], reading two more fields of
 //!   the [`Spawn`] that verb takes instead of a bare flag. What it added that
 //!   the prediction did not have is [`Kind::tier`]: a vocabulary is per-kind in
@@ -156,11 +156,11 @@
 //!
 //! What made it worth doing was not the flag working. It was the *reason* the
 //! derived name cannot be relied on, and that reason was nearly missed, because
-//! by the time this ran t-260815-022 had given every task a worktree named after
+//! by the time this ran robustness-010 had given every task a worktree named after
 //! it and Claude Code's own derived name had quietly become **almost right**:
 //!
 //! - A derived name is `<basename of cwd>-<two hex digits>`, stamped
-//!   `"nameSource":"derived"`. Standing in `…/.worktrees/t-260817-014`, an agent
+//!   `"nameSource":"derived"`. Standing in `…/.worktrees/robustness-044`, an agent
 //!   calls itself `t-260817-014-f6` with nobody asking it to. So the task id was
 //!   already the prefix, and minting looked redundant.
 //! - **The suffix is not stable.** Two sessions started in one directory,
@@ -170,7 +170,7 @@
 //!   10% is the part you have to address it by.
 //! - And the prefix agrees with the task id only because a *path convention*
 //!   another task owns says so. wsp would be inferring its addressing scheme
-//!   from the shape of somebody else's directory name, and t-260815-022 is free
+//!   from the shape of somebody else's directory name, and robustness-010 is free
 //!   to rename those trees tomorrow without knowing it had broken this.
 //!
 //! An explicit `-n` overrides derivation completely and leaves `nameSource`
@@ -184,7 +184,7 @@
 //! ambiguous to address — which is the failure [`pick`] already refuses to
 //! commit. The random suffix is derivation's answer to that, and minting a bare
 //! task id would throw it away: `spawn --force` onto a task whose previous agent
-//! is still idle is two live sessions called `t-260817-014`.
+//! is still idle is two live sessions called `robustness-044`.
 //!
 //! So the handle is the task **and** the seat, and neither half is decoration.
 //! The task id is what a person reads; the seat is what makes it unique, because
@@ -401,7 +401,7 @@ pub struct Spawn<'a> {
     pub effort: Option<&'a str>,
     /// A session to pick up where it left off, rather than a new one.
     ///
-    /// t-260816-068 above, arriving as `render-061`: the id is wsp's — read off
+    /// render-061 above, arriving as `render-061`: the id is wsp's — read off
     /// a binding or a seat — and what to *do* with it is the kind's, because
     /// only the kind knows whether its runtime can resume at all. Claude Code
     /// takes `--resume <uuid>`; a kind that cannot ignores this and starts
@@ -507,7 +507,7 @@ pub struct Claude;
 ///
 /// Every request re-reads the whole context, so a token present before the
 /// agent has done anything is paid once per request — ~102 times in the session
-/// t-260816-096 measured. The preamble is the largest single thing in that
+/// robustness-031 measured. The preamble is the largest single thing in that
 /// context and almost none of it is wsp's: `wsp brief --session` is ~3,300
 /// tokens of it, the rest is Claude Code's own.
 ///
@@ -719,7 +719,7 @@ impl Kind for Claude {
     ///
     /// What minting buys here is that the answer is **exact** where [`pick`] can
     /// only be probable. `pick` needs herdr to have seen the session id — which
-    /// is the whole of t-260817-010, and it often has not — and then falls back
+    /// is the whole of robustness-041, and it often has not — and then falls back
     /// to whoever is alone in the tree. A minted name is matched against itself.
     ///
     /// The census is read **once, and only for [`pick`]**. It is the one reading
@@ -1079,7 +1079,7 @@ fn confirmed(live: &[Live], spawn: &Spawn, row: Option<&Seated>) -> Option<Strin
 /// Two keys, and the order is the point. The session id is **exact**: the
 /// backend saw the agent and said which session it is, and no two sessions share
 /// one. The cwd is a fallback for the case that matters most — herdr failing to
-/// detect a live agent is the whole of t-260817-010, and it leaves a seat with a
+/// detect a live agent is the whole of robustness-041, and it leaves a seat with a
 /// cwd and no session — and it answers only when exactly one live session is in
 /// that directory.
 ///
@@ -1266,7 +1266,7 @@ mod tests {
     /// **The measurement this task turned on.** The id wsp holds resolves to the
     /// name the session channel is addressed by.
     ///
-    /// `7a188ba8-…` and `wsp-f3` are the exact pair recorded on t-260817-011 as
+    /// `7a188ba8-…` and `wsp-f3` are the exact pair recorded on robustness-042 as
     /// underivable from each other — the id herdr reported for that agent, and
     /// the name a work order actually reached it under after wsp's own delivery
     /// had failed for the fifth time running. They are one row of one documented
@@ -1291,7 +1291,7 @@ mod tests {
     /// The fallback, and the case it must refuse.
     ///
     /// A seat whose agent herdr cannot see carries a cwd and no session — that
-    /// is the whole of t-260817-010 — and one live session in that directory is
+    /// is the whole of robustness-041 — and one live session in that directory is
     /// an exact answer. Two are not, and this repo normally has three: a
     /// first-match rule would hand back a colleague's handle, and a work order
     /// delivered to the wrong agent is worse than one not delivered.
@@ -1338,7 +1338,7 @@ mod tests {
     /// and it wins in exactly the case the lookup cannot answer.
     ///
     /// The seat here is in `/Users/edjames/claude/wsp` with two other agents, and
-    /// its session id is empty — which is t-260817-010's blind spot, herdr
+    /// its session id is empty — which is robustness-041's blind spot, herdr
     /// unable to see a live agent without a rendered pane. `pick` has nothing to
     /// go on and correctly refuses. A minted handle is matched against itself
     /// and needs neither.
@@ -1398,7 +1398,7 @@ mod tests {
     /// An agent wsp did not start is still found the way it always was.
     ///
     /// The demotion has to be a demotion and not a replacement: `wsp-f3` was
-    /// never minted by anything, and the pair below is the one t-260817-011
+    /// never minted by anything, and the pair below is the one robustness-042
     /// recorded as underivable. It still resolves.
     #[test]
     fn an_agent_wsp_did_not_name_falls_back_to_the_census_lookup() {
@@ -1679,7 +1679,7 @@ mod tests {
         assert_eq!(argv, TRIM, "an unnameable agent is still a trimmed one");
     }
 
-    /// **The second opinion t-260817-010 needed.** A minted handle on the
+    /// **The second opinion robustness-041 needed.** A minted handle on the
     /// runtime's own census answers "is this agent alive" without a pane, a
     /// render or a backend.
     ///

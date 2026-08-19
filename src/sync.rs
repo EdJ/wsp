@@ -51,12 +51,12 @@ pub struct Report {
 /// its, and `sync` hands them pane ids instead of workspace ids. A binding is
 /// keyed on a pane, so the evidence entitling us to drop one is a pane list from
 /// the machine that pane is on. No pane list, no reap; and when panes fan out
-/// across machines (t-260816-037) this partitions itself, because a qualified
+/// across machines (wsp-047) this partitions itself, because a qualified
 /// id carries the machine it came from.
 ///
 /// The case that made this urgent has both halves at once: a `wsp daemon`
 /// started by a sandbox's herdr, holding an empty herdr and the *live* store
-/// (t-260816-076). Every machine says nothing, so nothing is reaped — where
+/// (robustness-021). Every machine says nothing, so nothing is reaped — where
 /// before, every binding on the seat went. A herdr restarting says the same
 /// thing for a moment, which is why the daemon's own startup `reconcile` has
 /// never been allowed to reap either.

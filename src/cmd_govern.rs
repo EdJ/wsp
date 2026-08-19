@@ -37,7 +37,7 @@
 //! 2026-08-17, on holding two governorships from one workspace: *"I don't see
 //! you as governor, I still see you as robustness/078 — and you've not been
 //! moved to sit below the wsp line as I would expect."* The decision on
-//! t-260817-021 settles the shape:
+//! robustness-048 settles the shape:
 //!
 //! **A governor is a slot on a project, and the agent in it is a custodian
 //! rather than a claimant.** It is a third kind of node beside projects and
@@ -65,7 +65,7 @@
 //!   positions is one nothing can draw and nobody can vacate.
 //!
 //! **An agent assigned to a slot gets different instructions.** Not "you have
-//! been claimed onto t-260817-021, begin work" but "you are the custodian of
+//! been claimed onto robustness-048, begin work" but "you are the custodian of
 //! this project": it sequences, directs, reviews and holds the record for
 //! everything beneath it, rather than finishing one piece of work and standing
 //! down. That sentence is [`crate::cmd_spawn::Handover::Custodian`], and the
@@ -137,7 +137,7 @@
 //! herdr is one server per machine: [`rename_seat`] below renames a real
 //! workspace and a real pane whatever store it was pointed at. Measured the
 //! hard way on 2026-08-17 — `wsp govern robustness -w w1` against a temporary
-//! store renamed the live governor's own window. `wsp sandbox` (t-260816-056)
+//! store renamed the live governor's own window. `wsp sandbox` (robustness-013)
 //! is the tool: its own herdr session, its own socket, its own store.
 //!
 //! # It costs nothing until something is addressed to it
@@ -322,7 +322,7 @@ pub fn seat_for(
 /// it is the custodian of one.
 ///
 /// **One agent, one governorship.** Ed, 2026-08-17, reversing what
-/// t-260817-013 built for. That task argued a night coordinating `robustness`
+/// wsp-063 built for. That task argued a night coordinating `robustness`
 /// while answering for `wsp` above it was one agent and not two, which
 /// described the night accurately and is still the wrong model: it makes two
 /// questions unanswerable in principle rather than merely hard. Which row draws
@@ -1265,7 +1265,7 @@ mod tests {
         }
     }
 
-    /// **One agent, one governorship** — the reversal of what t-260817-013
+    /// **One agent, one governorship** — the reversal of what wsp-063
     /// built, decided by Ed on 2026-08-17 while looking at this seat holding
     /// two.
     ///

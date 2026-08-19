@@ -1,7 +1,7 @@
 //! The arrange-panes port: what wsp asks of the thing it is living *inside*.
 //!
-//! Nothing calls this yet. It is the contract t-260816-084 was opened to write,
-//! and t-260816-061 is the task that moves the call sites onto it. Read it as
+//! Nothing calls this yet. It is the contract robustness-027 was opened to write,
+//! and robustness-018 is the task that moves the call sites onto it. Read it as
 //! the answer to one question: **when wsp wants a screen to look a certain way,
 //! what does it say, and to whom?**
 //!
@@ -18,7 +18,7 @@
 //!
 //! # The sibling contract, and the line this port is on the other side of
 //!
-//! `place.rs` is the other herdr port (decision on t-260816-083). It answers
+//! `place.rs` is the other herdr port (decision on robustness-026). It answers
 //! *start an agent on this task* and its first rule is that **nothing in it
 //! names a pane, a window, a tab or a terminal** — because a supervisor with no
 //! TTY has to be able to implement all of it.
@@ -108,7 +108,7 @@
 //!
 //! This section once ended *"and `place.rs` needs no change"*, which stopped
 //! being true when `spawn` migrated and `place.rs` grew `Order::show`. Settled on
-//! t-260817-008: this port keeps the question and the argument above stands, and
+//! robustness-039: this port keeps the question and the argument above stands, and
 //! `Order::show` is scaffolding held by the *other* port only for as long as this
 //! one has no implementor to declare into. Its removal condition is written where
 //! the field is defined, and it is this port's arrival that fires it. Do not read
@@ -137,7 +137,7 @@
 //! - **[`Body::Rendered`]** — wsp draws it from state. The panel, the detail
 //!   pane, the board. Content is a pure function of a snapshot, so the pane can
 //!   be redrawn at any time, thrown away, or sent somewhere else to be drawn
-//!   (t-260816-082).
+//!   (robustness-025).
 //! - **[`Body::Filled`]** — something else occupies it: an agent, or a command.
 //!   wsp says what should be there and never draws it.
 //!
@@ -255,7 +255,7 @@
 //!   to leave and the pane goes when it does (`detail/editors.rs:196`). Forcing
 //!   is a second, separate decision by a person who has now said it twice.
 //!
-//! **3. Absence of evidence must not create.** This is t-260816-058 inverted and
+//! **3. Absence of evidence must not create.** This is robustness-015 inverted and
 //! it is the frightening one. That bug reaped every binding when herdr answered
 //! with an empty pane list. A reconciler handed the same empty list concludes
 //! that *nothing exists* and opens everything — twenty-two agents, all at once,
@@ -343,7 +343,7 @@
 //!   *died* looks identical from here to one that is busy, because whether an
 //!   agent is alive is a `Place::census` question and this port cannot see it.
 //!   The trigger to add it is therefore named rather than guessed: when the
-//!   observe half (t-260816-059) can tell wsp that a seat has gone
+//!   observe half (robustness-016) can tell wsp that a seat has gone
 //!   `place::State::Gone` while its pane remains, a spec can ask for it to be
 //!   refilled without reopening — and until then it would be a verb with no
 //!   caller, which is the tax this store keeps warning about.
@@ -399,8 +399,8 @@
 //!   When that arrives, geometry enters the spec, this verb comes with it, and
 //!   the convergence rule above is part of the same change.
 //! - **Reading a pane's contents.** `pane.read` is the observe half's
-//!   (t-260816-059), and no arrange call site uses it.
-//! - **Migrating the call sites.** t-260816-061's, exactly as it was for 081.
+//!   (robustness-016), and no arrange call site uses it.
+//! - **Migrating the call sites.** robustness-018's, exactly as it was for 081.
 //!   There is no herdr adapter here either, on purpose: an adapter written
 //!   before its two callers are known is a third opinion about what they need.
 
@@ -462,7 +462,7 @@ impl std::fmt::Display for Surface {
 /// wsp's own name for a pane, plus a generation.
 ///
 /// Rule 1. The name is what the view layer and a person both use — `panel`,
-/// `view`, `board`, `agent:t-260816-084`. The generation is strata's D-55
+/// `view`, `board`, `agent:robustness-027`. The generation is strata's D-55
 /// applied one level down: a slot that is closed and opened again is a
 /// *different* slot, so an op planned against the old one cannot be applied to
 /// the new pane by a reconciler that ran a beat late.
@@ -544,7 +544,7 @@ pub struct Live {
 /// `panel`, `detail`, `board` — and `target` is what it is currently pointed at.
 /// A terminal renderer maps `view` to an argv; a canvas maps it to a component.
 /// That mapping is part 4's, and keeping it out of here is what makes the
-/// renderer replaceable (t-260816-082).
+/// renderer replaceable (robustness-025).
 ///
 /// The split between the two fields is load-bearing rather than tidy: `view`
 /// changes mean a new pane, `target` changes mean [`Op::Repoint`], and today's
@@ -785,7 +785,7 @@ impl Held {
 /// neither is a fact on its own.
 ///
 /// There is no `Default` and the constructors are the whole point. [`World::heard`]
-/// is a reading; [`World::silent`] is not having one. t-260816-058 cost every
+/// is a reading; [`World::silent`] is not having one. robustness-015 cost every
 /// binding in the store to a `unwrap_or_default()` that turned the second into
 /// the first.
 #[derive(Debug, Clone)]
@@ -1319,7 +1319,7 @@ pub trait Arrange {
     /// One read, because the two halves are never wanted apart. An error is not
     /// an empty list — [`World::heard`] versus [`World::silent`] is the whole of
     /// rule 3, and a caller that flattens the two has reintroduced
-    /// t-260816-058.
+    /// robustness-015.
     fn look(&self) -> Result<Vec<Live>>;
 
     /// Make a pane, beside another or in a tab of its own.

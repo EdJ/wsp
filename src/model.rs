@@ -14,7 +14,7 @@ pub const SCHEMA: &str = "1";
 /// given nobody can proceed. `parked` is addressed to nobody: it is a judgement
 /// that the moment is wrong, and what it wants written down is the *trigger*
 /// that should bring it back. Conflating them let the second kind rot —
-/// t-260816-022 sat red on the panel for a day, its three revisit conditions
+/// render-045 sat red on the panel for a day, its three revisit conditions
 /// all come true in the log, looking exactly like work that wanted an answer.
 ///
 /// So they part everywhere the two readings differ: `blocked` is loud, first in
@@ -193,7 +193,7 @@ impl Project {
     /// set to the slug" the same state on disk. They behave identically, and a
     /// project that stored its slug in `code:` would silently stop tracking a
     /// slug that later changed — which is a thing that cannot happen today but
-    /// is exactly what t-260817-025 exists to make possible.
+    /// is exactly what data-015 exists to make possible.
     pub fn code(&self) -> &str {
         if self.code_raw.is_empty() {
             &self.id
@@ -319,7 +319,7 @@ pub fn set_section_in_order(body: &mut String, name: &str, text: &str, order: &[
     // `Log` last, whatever else the body is carrying. Everything that appends
     // to it writes to the end of the body, so a heading sorted after it stops
     // being a heading in a file and starts being a hole: three log lines on
-    // t-260816-012 went under `## Not doing`, where nothing would ever read
+    // wsp-041 went under `## Not doing`, where nothing would ever read
     // them, and nothing failed while it happened. A heading the schema does not
     // know about is still kept — losing prose nobody anticipated would be a
     // worse failure — but it is kept *before* the log.
@@ -1145,7 +1145,7 @@ pub struct Machine {
     /// `place_herdr::mirrored_socket` is herdr's, the mirrored-path assumption
     /// that is right while paths mirror and is exactly what a Linux executor
     /// breaks. It used to be defaulted here, which put a `crate::herdr` call in
-    /// the file that is meant to be nothing but durable entities (t-260816-064).
+    /// the file that is meant to be nothing but durable entities (robustness-019).
     pub backend_at: String,
     /// `darwin` | `linux`, and whatever comes next. Free text: nothing branches
     /// on it yet, and a machine you cannot describe is still a machine.
@@ -1248,7 +1248,7 @@ impl Machine {
             name,
             // No default, and no reading of the old `herdr_sock` key either: a
             // fallback here would be this file naming a backend again, which is
-            // the whole of what t-260816-064 was about. Nothing on disk carries
+            // the whole of what robustness-019 was about. Nothing on disk carries
             // the old key — the field was a day old and no store had a machines
             // directory in it — so the migration is a rename and not a read.
             backend_at: doc.str("backend_at"),

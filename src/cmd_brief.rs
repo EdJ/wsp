@@ -58,7 +58,7 @@ const MAX_DECISIONS: usize = 4;
 /// `SessionStart` hook. Every request in a session re-reads its whole context,
 /// so a token present at request 0 is paid by every request after it — which
 /// sounds like a reason to inject nothing, and is in fact the reason to inject
-/// *this*. Measured on t-260816-096: an agent that arrived with a task title
+/// *this*. Measured on robustness-031: an agent that arrived with a task title
 /// spent 14,450 tokens over requests 4–16 rebuilding context the spawning
 /// session already had, and then carried it for the remaining ~86 requests
 /// anyway. Handing it over at request 0 costs about half that and removes the
@@ -99,7 +99,7 @@ const MAX_HANDBOOK_LINES: usize = 120;
 /// lands, so these are the constraints on the piece in hand.
 const MAX_PARENT_DECISIONS: usize = 6;
 /// Siblings named by id in what is injected above. Title and status only: the
-/// question they answer is "what is t-260816-060", and answering it with the
+/// question they answer is "what is robustness-017", and answering it with the
 /// whole task would be the fetching this replaces, done eagerly.
 const MAX_REFS: usize = 8;
 /// The tail of the task's log. Short on purpose — most of a log is status
@@ -215,10 +215,10 @@ fn stash_here() {
     }
 }
 
-/// Task ids written into a chunk of prose — `t-260816-096`, and nothing else.
+/// Task ids written into a chunk of prose — `robustness-031`, and nothing else.
 ///
 /// Scanned rather than declared. A task names its siblings by writing them into
-/// its overview — "independent of t-260817-002", "read t-260816-096's overview
+/// its overview — "independent of robustness-033", "read robustness-031's overview
 /// first" — and that is the reference an arriving agent goes and looks up. The
 /// `refs` frontmatter field is a different thing holding paths, and reading it
 /// as this would inject the wrong list.
@@ -821,8 +821,8 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
     }
 
     // What the prose above names. Enough to know which of these is worth
-    // opening, and no more — answering "what is t-260816-060" with the whole of
-    // t-260816-060 would be the fetching this replaces, done eagerly and for
+    // opening, and no more — answering "what is robustness-017" with the whole of
+    // robustness-017 would be the fetching this replaces, done eagerly and for
     // every id rather than the one that mattered.
     for (i, t) in r.refs.iter().enumerate() {
         if i == 0 {
@@ -979,7 +979,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         // anything: it is an agent doing its job. The default line below tells
         // it to go and claim something, which is the one instruction that would
         // take the position apart — the seat that borrowed a task to stand on
-        // is exactly what t-260817-021 was filed about.
+        // is exactly what robustness-048 was filed about.
         None if r.custodian.is_some() => row(
             "you",
             p.dim("holding nothing, which is the job — the work below is for the agents you start")
@@ -1351,7 +1351,7 @@ mod tests {
     ///
     /// An agent in a slot holding nothing is doing its job. The default line
     /// for an empty pair of hands tells it to go and claim something, and a
-    /// custodian that claims work is exactly what t-260817-021 was filed about
+    /// custodian that claims work is exactly what robustness-048 was filed about
     /// — the seat on the night this came from borrowed a task to have somewhere
     /// to stand, and every surface then described it as that task's agent.
     #[test]

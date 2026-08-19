@@ -1,8 +1,8 @@
 //! The place-work port: what wsp asks of whatever is running its agents.
 //!
-//! The contract t-260816-081 was opened to write. `wsp spawn` is on it —
+//! The contract robustness-024 was opened to write. `wsp spawn` is on it —
 //! `place_herdr` is the first backend and the fake behind a socket is the
-//! second — and the rest of the call sites are t-260816-061's, still to move.
+//! second — and the rest of the call sites are robustness-018's, still to move.
 //! Read it as the answer to one question: **when wsp puts an agent on a piece
 //! of work, what does it actually need from the thing underneath?**
 //!
@@ -30,11 +30,11 @@
 //!
 //! # What this port is not
 //!
-//! There are **two** herdr ports, not one (decision on t-260816-083). This is
+//! There are **two** herdr ports, not one (decision on robustness-026). This is
 //! the place-work port. The other is the arrange-panes port — `pane.split`,
 //! `pane.close`, `pane.focus`, `pane.layout`, `pane.swap`, `pane.send_text`,
 //! `tab.create`, `tab.close`, `tab.focus`, `workspace.focus` — which belongs to
-//! t-260816-084. Those ten verbs are what a program does when it *lives inside*
+//! robustness-027. Those ten verbs are what a program does when it *lives inside*
 //! a multiplexer as a pane, and every one of their call sites is in `panel/` or
 //! `detail/` bar one, so they are the arrange-panes port's herdr adapter rather
 //! than anything wsp needs from a backend.
@@ -54,7 +54,7 @@
 //!
 //! # The three fates of the seven verbs `place work` means today
 //!
-//! t-260816-078 measured the place-work group at seven herdr methods. They do
+//! robustness-022 measured the place-work group at seven herdr methods. They do
 //! not have one fate, they have three, and telling them apart is most of the
 //! design:
 //!
@@ -68,7 +68,7 @@
 //! | `workspace.report_metadata` | **deleted** |
 //! | `pane.report_metadata` | **deleted** |
 //!
-//! **Deleted** is the easy pair and t-260816-061's correction already had it
+//! **Deleted** is the easy pair and robustness-018's correction already had it
 //! right, understated: the metadata is not merely display-only, it is
 //! *write-only*. `Workspace.tokens` is parsed at `herdr.rs:328` and read
 //! nowhere in the tree, and `Pane` has no `tokens` field at all — so wsp pushes
@@ -77,7 +77,7 @@
 //! partition is the renderer's job (part 4) and not a capability any backend
 //! owes us.
 //!
-//! **Demoted** is the pair t-260816-061 defended, and it was right about the
+//! **Demoted** is the pair robustness-018 defended, and it was right about the
 //! code and wrong about the conclusion. `workspace.rename` and `pane.rename`
 //! are not display projection: a claim stores `workspace_label` and four places
 //! match on it — `reconcile --reap`'s aliveness test (`cmd_agent.rs:1301`),
@@ -114,7 +114,7 @@
 //!
 //! # Where `wsp say` lives
 //!
-//! Not here. `say` is not a port verb, and the answer t-260816-083 gives is
+//! Not here. `say` is not a port verb, and the answer robustness-026 gives is
 //! confirmed: the sentence belongs to the agent module's ephemeral state.
 //!
 //! The reason it looks like a herdr call today is an accident of ownership —
@@ -253,7 +253,7 @@
 //!   and unreachability is a [`Refusal::Unreachable`] from the call that wanted
 //!   it, which arrives at the same moment the guard would have.
 //! - **`focus`.** Still absent, and the argument that removed it still holds
-//!   (decision on t-260817-008): it belongs to the arrange-panes port. What is
+//!   (decision on robustness-039): it belongs to the arrange-panes port. What is
 //!   here is [`Order::show`], which is scaffolding rather than a verb — `spawn`
 //!   has nowhere else to say `--focus` until `arrange` has an implementor.
 //!   The removal condition is on the field and is not restated here.
@@ -267,7 +267,7 @@
 //!   seconds and retype with a `ctrl-u` after six, because herdr types the
 //!   agent's name at a shell prompt that may not be ready. That is a herdr shell
 //!   race and it now sits inside `place_herdr`'s [`Place::start`]. It is also
-//!   the answer to the one loose end in t-260816-078's measurement: the single
+//!   the answer to the one loose end in robustness-022's measurement: the single
 //!   `pane.send_text` outside `panel/` and `detail/` is that retype, and it did
 //!   not become an eighth port verb.
 //!
@@ -287,7 +287,7 @@
 //! it to `ssh -L` because a unix socket on both ends is already herdr's dialect,
 //! and `place_herdr::mirrored_socket` is what an empty one means.
 //!
-//! The `@` suffix belongs to the `Remote` decorator (decision on t-260816-060):
+//! The `@` suffix belongs to the `Remote` decorator (decision on robustness-017):
 //! it holds the connections, strips the machine on the way out and qualifies
 //! ids on the way in, and the backend underneath goes on believing it talks to
 //! one host. That is why this trait is object-safe — `Remote` holds a
@@ -493,7 +493,7 @@ pub struct Order {
     ///
     /// **Scaffolding, with a removal condition. It is not part of this port's
     /// shape and must not be reasoned from.** Focus belongs to the arrange-panes
-    /// port ([`crate::arrange`], "Focus"), and the decision on t-260817-008
+    /// port ([`crate::arrange`], "Focus"), and the decision on robustness-039
     /// settled that it stays there: focus is a state that can be applied
     /// headlessly, and a port every backend must implement without a screen
     /// cannot carry a statement about what a person is looking at.
@@ -806,7 +806,7 @@ impl Census {
     /// nothing is evidence that the work stopped is a policy the caller owns.
     /// `reconcile --reap` says it is not — a herdr restoring a session answers
     /// with an empty list for a second or two, and reaping on that is
-    /// t-260816-015, every binding in the store gone — so the reap's rule is
+    /// render-040, every binding in the store gone — so the reap's rule is
     /// this **and** a seat of its own on the same machine. That is one rule in
     /// one place (`cmd_agent::may_reap`), not a second one here; what this type
     /// changes is that the caller can now tell the three silences apart at all.
@@ -1323,7 +1323,7 @@ mod tests {
     /// separates it from a world where nothing is running.
     ///
     /// `arrange::World` draws this line with two constructors and no `Default`,
-    /// for the reason t-260816-058 paid for: the cost of this bug is a
+    /// for the reason robustness-015 paid for: the cost of this bug is a
     /// `Vec::new()` that looks like an answer. A `Census` cannot be made at all
     /// without saying which of the two it is.
     #[test]

@@ -113,7 +113,7 @@ fn stamp_of(m: &fs::Metadata) -> Option<Stamp> {
 pub struct MachineLive {
     /// Answering *now*, as of `last_seen`. The third state — "unreachable" as
     /// distinct from "answering with nothing" — is this being false, and it is
-    /// the distinction t-260816-038 exists to protect.
+    /// the distinction wsp-048 exists to protect.
     pub reachable: bool,
     /// When it last answered. Kept across a drop, so an offline row can say how
     /// long it has been offline rather than just that it is.
@@ -991,7 +991,7 @@ impl Store {
                 if path.extension().and_then(|x| x.to_str()) != Some("md") {
                     continue;
                 }
-                // `t-260815-001~2` is still that id's record, filed beside an
+                // `strata-prototype-001~2` is still that id's record, filed beside an
                 // earlier one. Reporting the name on disk would hide exactly
                 // the collision this is read to find.
                 if let Some(stem) = path.file_stem().and_then(|x| x.to_str()) {
@@ -1740,7 +1740,7 @@ impl Store {
     // after the task, and the task's title is in the store, whole. The one
     // string with nowhere else to live is a sentence from `wsp say`, and this
     // is where it lives — the agent module's ephemeral state, by the decision
-    // recorded on t-260816-083.
+    // recorded on robustness-026.
     //
     // Keyed on the pane, which is exactly as perishable as the label it is the
     // long form of, and holding both halves: `label` is what was put on the
@@ -1823,7 +1823,7 @@ impl Store {
     // owns and nobody else can write.
     //
     // Nothing here dials anything. The daemon's tunnel supervisor is the only
-    // writer (t-260816-035); everybody else — the panel, the machines view,
+    // writer (wsp-045); everybody else — the panel, the machines view,
     // `herdr::call` picking a socket — reads what it last wrote. A reader that
     // probed for itself would be a second opinion on reachability, and two
     // opinions is exactly the ambiguity that makes an offline machine look
@@ -1842,8 +1842,8 @@ impl Store {
     /// macOS, and `~/.local/state/wsp/sock/<name>.sock` leaves room for a long
     /// home directory and a long machine name without either being the thing
     /// that breaks.
-    // Unused until the tunnel supervisor lands (t-260816-035) and `herdr::call`
-    // learns to route on `@machine` (t-260816-036). Here now because it is the
+    // Unused until the tunnel supervisor lands (wsp-045) and `herdr::call`
+    // learns to route on `@machine` (wsp-046). Here now because it is the
     // agreement between those two, and an agreement written down after the
     // fact is one that was guessed at twice.
     #[allow(dead_code)]
@@ -1863,7 +1863,7 @@ impl Store {
         self.machines_live().remove(name)
     }
 
-    /// The daemon's tunnel supervisor is the only caller (t-260816-035); see
+    /// The daemon's tunnel supervisor is the only caller (wsp-045); see
     /// the section note above for why it is the only one.
     #[allow(dead_code)]
     pub fn set_machine_live(&self, name: &str, live: &MachineLive) {
@@ -2194,7 +2194,7 @@ impl Store {
 /// from taking maximal runs, and all three are load-bearing:
 ///
 /// - `wspt-260815-005` is one token, so an id is never matched inside a longer
-///   word. `[t-260815-004]` is not, because `[` cannot be in a token.
+///   word. `[robustness-002]` is not, because `[` cannot be in a token.
 /// - A token is looked up once and emitted, never re-examined, so one entry in
 ///   the map can never rewrite what another entry just produced.
 /// - An id holds no character that JSON quotes or escapes, so applying this to

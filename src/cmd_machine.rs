@@ -226,7 +226,7 @@ fn standing(f: &Fleet) -> Vec<Standing> {
 ///
 /// A command and not a panel view, for now. The panel is the other surface and
 /// wants the same three states and the same partition; this is the half that
-/// does not need the panel to hold still to be written. See t-260816-053.
+/// does not need the panel to hold still to be written. See wsp-054.
 pub fn list(store: &Store, args: &Args) -> i32 {
     let f = Fleet::live(store);
     match args.json() {

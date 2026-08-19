@@ -180,7 +180,7 @@ pub(super) struct Census {
 /// An agent that has stopped on a `doing` task is a person's problem; a
 /// custodian that has stopped is between the agents it started, which is its
 /// resting state. `wip` and the panel's `needs_you` learned that on
-/// t-260817-013 and the mark did not, so the surface a person actually looks at
+/// wsp-063 and the mark did not, so the surface a person actually looks at
 /// went on drawing the seat as `←` — the loudest row on the screen, meaning
 /// nothing, all night.
 pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>, seat: bool) -> AgentState {
@@ -337,7 +337,7 @@ pub(super) enum Row {
     Detail(Detail),
     /// A project's custodial slot, drawn directly under the project it belongs
     /// to — the third kind of node, by the decision of 2026-08-17 on
-    /// t-260817-021.
+    /// robustness-048.
     ///
     /// It is a row and not an agent for the reason that decision turns on: the
     /// slot is the project's and the agent is passing through. So an empty one
@@ -1121,7 +1121,7 @@ pub(super) fn task_sort_key(t: &Task, has_agent: bool, needs_you: bool) -> (u8, 
 ///
 /// This has always dropped the half of an id that every row repeats and kept
 /// the half that separates them; what changed is which half that is. Under
-/// dated ids (`t-260815-022`) the repeated part was the date — the same on
+/// dated ids (`robustness-010`) the repeated part was the date — the same on
 /// nearly every row in the panel, so dropping it was right everywhere. Under
 /// per-project ids the repeated part is the project, and it is repeated only
 /// among the rows beneath one node: there `010` is the whole of what
@@ -1606,7 +1606,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // The panes that are drawn *as* a seat, and are therefore not drawn again
     // as workers. A custodian that borrowed a task to have somewhere to stand
     // used to appear under that task, three branches from the project it was
-    // answerable for — which is the whole of what t-260817-021 was filed about.
+    // answerable for — which is the whole of what robustness-048 was filed about.
     // The pane rather than its workspace: a second agent working in the
     // custodian's window is an ordinary agent and belongs under its own work.
     let seated_panes: Vec<String> =

@@ -2228,7 +2228,7 @@ mod tests {
     /// The row that was wrong all night, on the surface a person actually looks
     /// at.
     ///
-    /// t-260817-013 taught `wip` and the panel's sort that an idle custodian is
+    /// wsp-063 taught `wip` and the panel's sort that an idle custodian is
     /// not a person being the blocker, and left the *mark* alone — so the tree
     /// and the dock went on drawing `←` on the busiest agent on the machine.
     /// The seat is idle between the agents it starts, by construction, and that

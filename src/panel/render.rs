@@ -1633,7 +1633,7 @@ pub(crate) fn rgb_of(style: Style) -> Option<(u8, u8, u8)> {
 /// What the live panel prints.
 ///
 /// The one-cell case of [`crate::draw::Ansi`], and delegating rather than
-/// repeating it is the point of t-260816-092: a pane wsp is standing in is a
+/// repeating it is the point of robustness-028: a pane wsp is standing in is a
 /// spec of one pane at the origin, so there is one positioning loop and one
 /// inverse rule instead of two that agree until somebody edits one of them.
 pub(crate) fn to_ansi(frame: &[Line], w: usize, h: usize) -> String {

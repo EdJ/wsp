@@ -73,7 +73,7 @@ pub fn host_of(id: &str) -> Option<&str> {
 /// spanning machines cheap: the id is the routing key, so no host parameter has
 /// to be threaded through the 179 `herdr::` references in this crate. The
 /// leftovers — `pane.list`, `workspace.list`, `agent.list`, `events.subscribe`
-/// and `workspace.create` — carry no id at all and are t-260816-037's problem,
+/// and `workspace.create` — carry no id at all and are wsp-047's problem,
 /// not this list's.
 ///
 /// wsp's own `task_id` is deliberately not here. It is not a herdr id, nothing

@@ -293,7 +293,7 @@ fn spawn(store: &Store, m: &Machine, sock: &std::path::Path) -> std::io::Result<
 /// own default when it says nothing.
 ///
 /// The default is the adapter's and not the model's, which is the whole of
-/// t-260816-064 — a durable record has no business computing a herdr path. This
+/// robustness-019 — a durable record has no business computing a herdr path. This
 /// file is entitled to ask for it, because an `ssh -L` between two unix sockets
 /// is already a sentence in herdr's dialect and not the port's.
 ///
@@ -463,7 +463,7 @@ mod tests {
     /// A machine record that does not say where its backend listens still
     /// forwards somewhere.
     ///
-    /// The field stopped being defaulted in the model with t-260816-064, so
+    /// The field stopped being defaulted in the model with robustness-019, so
     /// "empty" is now a shape that reaches this file — a record written by hand
     /// with nothing but an `ssh:` line. The failure it must not become is an
     /// empty far side: ssh answers `-L /s/mb2.sock:` with `Bad local forwarding

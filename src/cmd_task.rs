@@ -781,7 +781,7 @@ where
 ///
 /// The line `mutate` prints is the task's status, which is the whole receipt
 /// for the six verbs that change it and says nothing at all for one whose job
-/// is a different field — `wsp prio 047 low` would answer `· t-260815-047
+/// is a different field — `wsp prio 047 low` would answer `· wsp-019
 /// todo`, which is true and is not what was asked about.
 fn mutate_saying<F>(store: &Store, args: &Args, verb: &str, said: Option<&str>, f: F) -> i32
 where
@@ -904,7 +904,7 @@ pub fn block(store: &Store, args: &Args) -> i32 {
 /// Demands a reason for the same procedural reason `block` does, and wants a
 /// different kind of sentence: not the question somebody owes you, but the
 /// condition that should bring the task back. Writing that down was already
-/// the habit before there was a status for it — t-260816-022 recorded its
+/// the habit before there was a status for it — render-045 recorded its
 /// three revisit conditions unprompted, and then nothing read them, because to
 /// every list on the machine it was one more red row. It is a log line here
 /// too, and the status is what makes the log line findable: `wsp ls -s parked`

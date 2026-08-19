@@ -66,7 +66,7 @@
 //! the machine state, because a claim names a workspace id that exists in
 //! nobody's herdr but the live one. When what you need is this machine's actual
 //! workspaces and agents, no sandbox reproduces it; that residue is
-//! t-260816-057.
+//! robustness-014.
 //!
 //! # It is not empty of *processes*
 //!
@@ -82,7 +82,7 @@
 //! ([`Sandbox::store_env`]), teardown reaps what it started ([`stop_session`]),
 //! and `ls` counts processes so a stray with no session and no directory is
 //! still on the list. The daemon's own refusal is the fourth, in
-//! [`crate::daemon`]. See t-260816-076.
+//! [`crate::daemon`]. See robustness-021.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -147,7 +147,7 @@ impl Sandbox {
     /// daemon` — so a server started without these gives its daemon the socket
     /// of the sandbox and the store of the *live* instance, which is precisely
     /// the pair that makes `sync` reap every binding in the real store. See
-    /// t-260816-076, and t-260816-058 for the reaping half.
+    /// robustness-021, and robustness-015 for the reaping half.
     fn store_env(&self) -> Vec<(String, String)> {
         vec![
             ("WSP_HOME".into(), self.home.display().to_string()),
@@ -227,7 +227,7 @@ fn forget_keys() -> Vec<String> {
 /// handed on to every pane the sandbox would ever open. `cmd_spawn::order`
 /// sheds them again for the seats *wsp* opens; this is what a pane somebody
 /// opens by hand in here gets, and it is where the measurement that opened
-/// t-260817-006 lost its transcript.
+/// robustness-037 lost its transcript.
 fn forget(c: &mut Command) {
     for k in forget_keys() {
         c.env_remove(k);
@@ -696,7 +696,7 @@ fn fake_command(sb: &Sandbox, stage: &Path) -> Command {
 /// there is a herdr session: it is the one handle `stop_session` and
 /// `sandbox ls` have for "which sandbox does this process belong to", and a
 /// second mechanism for the same question is how a stray ends up invisible to
-/// both — which is the defect t-260816-076 was opened for.
+/// both — which is the defect robustness-021 was opened for.
 fn start_fake(sb: &Sandbox, stage: &Path) -> Result<PathBuf, String> {
     let socket = fake_socket(&sb.dir);
     fake_command(sb, stage).spawn().map_err(|e| format!("cannot start the fake: {e}"))?;
@@ -747,7 +747,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     // A fake instead of a herdr: everything above this line is the same
     // instance — the store, the state, the `wsp` shim — and the only thing that
     // changes is what is answering the socket. That is the whole claim of
-    // t-260816-080, and it is why this is a flag rather than a command.
+    // robustness-023, and it is why this is a flag rather than a command.
     let fake = args.has("fake");
     let stage = stage_file(&sb.dir);
     if fake {
@@ -1217,7 +1217,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The defect in t-260816-076, at the line it turned on.
+    /// The defect in robustness-021, at the line it turned on.
     ///
     /// The herdr *server* is what starts plugins, and it starts them with its
     /// own environment. Started without the store, its `wsp daemon` came up on
@@ -1350,7 +1350,7 @@ mod tests {
     ///
     /// Two things have to be true and one of them looks wrong at first glance.
     /// The store and socket must point inside the sandbox — a fake serving the
-    /// sandbox's socket with the live store is the pair from t-260816-076. And
+    /// sandbox's socket with the live store is the pair from robustness-021. And
     /// `HERDR_SESSION` must be *put back* after the caller's `HERDR_` variables
     /// are stripped, because it is the only handle `stop_session` has: without
     /// it the fake outlives the teardown and `sandbox ls` cannot see it either.

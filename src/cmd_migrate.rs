@@ -1,7 +1,7 @@
 //! `wsp migrate` — off dated ids and into each project's own numbering space.
 //!
-//! The change this carries out is t-260815-024, and the reason for it is two
-//! incidents on one day. An agent read `wsp add`'s answer of `t-260817-014`,
+//! The change this carries out is data-004, and the reason for it is two
+//! incidents on one day. An agent read `wsp add`'s answer of `robustness-044`,
 //! typed `013`, and wrote one task's overview onto a task in a *different
 //! project* — a single-digit slip that crossed a project boundary invisibly,
 //! because under the dated scheme nothing in an id says where its task lives.

@@ -2,9 +2,9 @@
 //!
 //! Every panel, every detail pane, every daemon and every agent re-execs into
 //! that one file. Being shared is the whole point of it, so nothing isolates
-//! it: a build tree does not make it yours (t-260816-054 says so outright) and
+//! it: a build tree does not make it yours (robustness-012 says so outright) and
 //! `wsp sandbox` works around it by running the built binary by path
-//! (t-260816-056). What was left over is the copy itself. Nothing serialised
+//! (robustness-013). What was left over is the copy itself. Nothing serialised
 //! it, so two agents installing different HEADs a minute apart is a real race
 //! — and the loser does not find out. What ends up live is whichever `install
 //! -m 755` ran second, and the agent whose work it reverted goes on believing
@@ -278,7 +278,7 @@ fn remember(dst: &Path, rec: &Record) {
 
 /// What can be said about a built binary by looking at the tree it came out of.
 ///
-/// Not the same question as t-260816-050's, which stamps the commit *into* the
+/// Not the same question as render-057's, which stamps the commit *into* the
 /// binary so that any copy of it can be asked. This is the weaker one that can
 /// be answered today, and it is enough for the decision in hand: the source is
 /// still sitting in the tree it was built in, so that tree's HEAD and dirt
@@ -640,7 +640,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     // a verb which writes can be run for real — and what this one writes is the
     // single file no sandbox has a copy of. Without `--to` it would reach
     // straight out of the sandbox and replace the binary every live pane
-    // re-execs into, which is exactly the leak t-260816-076 was flagged for.
+    // re-execs into, which is exactly the leak robustness-021 was flagged for.
     if std::env::var_os("WSP_BIN").is_some() && !args.has("to") {
         eprintln!(
             "wsp: this is a sandbox, and {} is not the sandbox's — name a destination with --to",

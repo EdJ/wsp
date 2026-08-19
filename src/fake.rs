@@ -10,7 +10,7 @@
 //! A sandbox herdr comes up in 0.1s and `wsp verify` is seven seconds warm, so
 //! herdr is not what is slow. What a real herdr cannot do is *be in a state we
 //! choose*, and every expensive bug in this store was a state: an empty pane
-//! list reaping every binding (t-260816-058), one `pane.exited` cascade
+//! list reaping every binding (robustness-015), one `pane.exited` cascade
 //! clearing every binding on the machine, a machine that stops answering
 //! mid-tick, a workspace id handed out again after a restart so a live pane
 //! answers to a dead pane's name, twenty-two workspaces and four agents. None of those can be manufactured on a live herdr, and all of them
@@ -19,7 +19,7 @@
 //! # The division of labour, and the trap it exists to avoid
 //!
 //! A fake encodes our *belief* about herdr, and a fake that is wrong about a
-//! behaviour makes tests green on a lie, silently and for ever. t-260816-056's
+//! behaviour makes tests green on a lie, silently and for ever. robustness-013's
 //! log carries a correction where two probes "verified" that a headless session
 //! loads no plugins and it was false — the redirect that made the probe safe
 //! suppressed the evidence. So the division is explicit:
@@ -58,8 +58,8 @@
 //!
 //! Writing the dialect as the inverse of the port's own reading and asserting
 //! the round trip failed immediately, and the failure was in the port rather
-//! than in the fake. Both were reported on t-260816-081 rather than fixed here,
-//! and both were **repaired on 2026-08-17 by t-260816-061**, which moved the
+//! than in the fake. Both were reported on robustness-024 rather than fixed here,
+//! and both were **repaired on 2026-08-17 by robustness-018**, which moved the
 //! reading into `place_herdr` as it migrated the first call site onto the port.
 //! They are kept here because the fake is what caught them and what holds them
 //! shut:
@@ -85,7 +85,7 @@
 //! when the agent exists" is a promise its herdr adapter has to keep for it, and
 //! does, by waiting.
 //!
-//! And a fourth, which is t-260817-010 and which this fake **missed** until
+//! And a fourth, which is robustness-041 and which this fake **missed** until
 //! 2026-08-17 because it modelled that reply and not the reads after it. For
 //! roughly the next six tenths of a second `agent.get` answers the same way: a
 //! record that exists and names nothing. The adapter was waiting for a record
@@ -101,7 +101,7 @@
 //! `herdr.rs`'s real wire code and works against an unmodified binary: point
 //! `HERDR_SOCKET_PATH` at it and the daemon, the panel and the storyboard all
 //! run against it unchanged. It therefore needs no trait and can land before
-//! t-260816-061 rather than after.
+//! robustness-018 rather than after.
 //!
 //! The cost is worth naming, because it is a limit on what this can ever prove.
 //! `arrange.rs` splits `pane.send_text` into two verbs — [`Arrange::run`] is
@@ -109,7 +109,7 @@
 //! split is invisible at the wire**: both arrive as `pane.send_text`. A fake
 //! behind a socket can record that something was typed and can never say which
 //! verb the caller meant. Only an in-process double can check that, and that is
-//! t-260816-061's to build if it is worth building. Recorded here rather than
+//! robustness-018's to build if it is worth building. Recorded here rather than
 //! guessed at later.
 //!
 //! That question was answered for the *place-work* port while it had six verbs:
@@ -491,7 +491,7 @@ pub struct Stage {
     /// after `agent.start`, before detection catches up.
     ///
     /// The window this fake used to skip, and skipping it is what let
-    /// t-260817-010 live in `place_herdr::start` for as long as it did. Recorded
+    /// robustness-041 live in `place_herdr::start` for as long as it did. Recorded
     /// against herdr 0.7.5 in a sandbox on 2026-08-17, polling `agent.get` every
     /// 150ms from the moment `agent.start` was sent: at 70ms and at 210ms the
     /// reply is a record carrying `launch_pending: true`, `agent_status:
@@ -1963,7 +1963,7 @@ fn split_rect(r: Rect, ratio: f64, down: bool) -> (Rect, Rect) {
 ///
 /// ```json
 /// { "settle": false,
-///   "seats": [ { "state": "working", "agent": "claude", "name": "t-260816-080",
+///   "seats": [ { "state": "working", "agent": "claude", "name": "robustness-023",
 ///                "label": "robustness/080", "cwd": "/Users/e/claude/wsp" } ] }
 /// ```
 pub fn stage_from_json(v: &Value) -> Stage {
@@ -2221,7 +2221,7 @@ mod tests {
     /// the whole discipline: a fake that sent `Some(false)` would make this
     /// test pass, the port look right, and the bug arrive in production.
     ///
-    /// **Repaired 2026-08-17 by t-260816-061**, which is what this assertion
+    /// **Repaired 2026-08-17 by robustness-018**, which is what this assertion
     /// asked for in as many words: the reading moved out of `place.rs` and into
     /// the herdr adapter, where it takes a parsed reply instead of three loose
     /// arguments — so `Starting` now survives the trip, and there is no longer a
@@ -2443,7 +2443,7 @@ mod tests {
         assert_eq!(agents.len(), 2, "a gone agent was listed as a live one");
     }
 
-    /// Silence, in both its forms, is not an empty list. This is t-260816-058's
+    /// Silence, in both its forms, is not an empty list. This is robustness-015's
     /// class of bug, at the seam it came in through — and it is the state the
     /// task exists for, since a live herdr cannot be asked to stop answering.
     #[test]

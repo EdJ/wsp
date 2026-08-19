@@ -162,7 +162,7 @@ fn watch_machines(
 /// Why this daemon must not run: it is pointed at a herdr that is not the
 /// machine's, and at a store nobody named.
 ///
-/// The third defence in t-260816-076, and the one that holds when the other two
+/// The third defence in robustness-021, and the one that holds when the other two
 /// are got right and something starts a daemon anyway. A herdr session server
 /// starts every enabled plugin's `[[startup]]` command — `plugins.json` is
 /// global, not per session — with its own environment. So a sandbox whose
@@ -176,7 +176,7 @@ fn watch_machines(
 /// ordinary one and is never refused, whatever its store. Only a daemon that is
 /// somewhere else has to say which store it is for — and it has to say *both*
 /// halves, because `WSP_HOME` alone leaves state at `~/.local/state/wsp`, which
-/// is where bindings and claims actually live (t-260815-111).
+/// is where bindings and claims actually live (robustness-011).
 ///
 /// # The socket decides, and `HERDR_SESSION` deliberately does not
 ///
@@ -192,7 +192,7 @@ fn watch_machines(
 ///
 /// So it stays in the message, where `herdr session `wsp-w1`` beats a path for
 /// telling you what you are looking at, and out of the predicate. The general
-/// rule, which is the argument of t-260816-060: given two signals for the same
+/// rule, which is the argument of robustness-017: given two signals for the same
 /// question, prefer the one that survives the backend changing. Anything that
 /// is herdr's naming convention rather than an observable fact is something
 /// herdr can change without telling us, and something a different backend would
@@ -238,7 +238,7 @@ fn misdirected(
 //
 // Both then do everything twice against one store and one herdr: push tokens,
 // refresh TTLs, and reap. `sync` reaps bindings against the pane list herdr
-// answers with, and t-260816-015 is the record of what one wrong reap costs.
+// answers with, and render-040 is the record of what one wrong reap costs.
 // The loser of any race is silent, which is why forty-two hours passed.
 //
 // # Refuse, not take over
@@ -845,7 +845,7 @@ mod tests {
         assert!(manned(&line("wsp panel"), &state).is_empty());
     }
 
-    /// The guard that would have stopped t-260816-076 on its own.
+    /// The guard that would have stopped robustness-021 on its own.
     ///
     /// A `wsp daemon` was started by a sandbox's herdr from the global
     /// `plugins.json`, holding that session's socket and — because nobody told
@@ -854,7 +854,7 @@ mod tests {
     ///
     /// Both halves of the store have to be named, not just `WSP_HOME`: state is
     /// where bindings and claims live, and a scratch store with live state is
-    /// the same accident wearing a different hat (t-260815-111).
+    /// the same accident wearing a different hat (robustness-011).
     #[test]
     fn a_daemon_on_somebody_elses_herdr_must_be_told_which_store() {
         // Built from this machine's home rather than a literal: the rule is
@@ -996,7 +996,7 @@ mod tests {
 
     /// A sandbox runs a daemon of its own, deliberately, with `WSP_STATE` set —
     /// so a check that counted it would cry wolf on a machine where sandboxes
-    /// are how a change gets tested (t-260816-076 is why they exist). The store
+    /// are how a change gets tested (robustness-021 is why they exist). The store
     /// is read out of the environment exactly as `Store::open` reads it: told, or
     /// the default.
     #[test]

@@ -1,6 +1,6 @@
 //! The renderer: one spec, drawn to a terminal or to a block of text.
 //!
-//! Part 4 of the partition Ed adopted on 2026-08-17 (decision on t-260816-083).
+//! Part 4 of the partition Ed adopted on 2026-08-17 (decision on robustness-026).
 //! Parts 1–3 are the store, `place.rs` and `arrange.rs`; this is the one that
 //! had no file, because until now it existed only as a command — `wsp panel
 //! storyboard` — that happens to know how to draw.
@@ -89,7 +89,7 @@
 //! # The seam under this port, and why it is not the port's business
 //!
 //! This file names no herdr type, because [`Paint`] is a trait and the view
-//! stays behind it. That was true before t-260817-012 and did not mean much:
+//! stays behind it. That was true before robustness-043 and did not mean much:
 //! all three views carried the runner's structs — `panel::Snapshot` held
 //! `Vec<herdr::Workspace>` and `Vec<herdr::Pane>`, `detail::Ctx` and
 //! `kanban::Ctx` a pane list each — so the cost landed on whoever implemented

@@ -43,7 +43,7 @@
 //! `~/.local/state/wsp/build` held **9.6G in 30 trees**, one per agent that had
 //! ever run this command, every one of them cold on its first build and none of
 //! them ever removed. A cleanup step nobody runs is the lesson of every leak on
-//! t-260815-022, and this was one more.
+//! robustness-010, and this was one more.
 //!
 //! So inside a checkout the scratch goes *under the checkout*, at
 //! `target/wsp-verify`, and takes its target directory with it. It dies with
@@ -327,7 +327,7 @@ pub fn agent_key() -> String {
 /// Where an agent standing in the *trunk* keeps its build tree: under the state
 /// directory rather than the store, because it is machine-local, it is large,
 /// and it is not worth committing. Under `WSP_STATE` rather than a fixed path
-/// so a sandbox (see t-260816-056) gets its own and does not warm — or corrupt
+/// so a sandbox (see robustness-013) gets its own and does not warm — or corrupt
 /// — the real one.
 ///
 /// Named for the repository and keyed on the agent. `repo` has to be the trunk

@@ -11,7 +11,7 @@
 //! that a checkout belongs to whoever is looking at it.
 //!
 //! Everything short of a tree each has been tried and is recorded on
-//! t-260815-022. Naming explicit paths does not help when the file is genuinely
+//! robustness-010. Naming explicit paths does not help when the file is genuinely
 //! being changed by both of you. Hunk-level staging only works if you are the
 //! one committing. Announcing first does not help — a sweep happened twenty
 //! minutes after the announcement, because the other agent committed *to give a
@@ -62,12 +62,12 @@
 //! So the tree outlives the landing, and three things follow. Landing is
 //! exactly what its name says — put my commits on the trunk — which makes it
 //! safe to run repeatedly and safe to run from inside the tree: the first `land`
-//! ever run deleted its own caller's cwd out from under it (t-260817-018), and
+//! ever run deleted its own caller's cwd out from under it (robustness-047), and
 //! that failure is now unreachable rather than handled. Removing is `checkout
 //! --rm`, run when a task is genuinely finished, which is a moment somebody
 //! decides rather than a side effect of a verb they run all day. And because a
 //! command somebody has to remember is a command that gets forgotten — which is
-//! the lesson of every leak recorded on t-260815-022 — there is [`sweep`], the
+//! the lesson of every leak recorded on robustness-010 — there is [`sweep`], the
 //! same shape as `wsp archive` for tasks and `wsp reconcile --reap` for claims,
 //! and it exists for the same reason both of those do.
 //!
@@ -132,7 +132,7 @@
 //!
 //! # Under the root, gitignored
 //!
-//! The third question t-260815-022 carried. [`crate::resolve::Index::project_for_cwd`]
+//! The third question robustness-010 carried. [`crate::resolve::Index::project_for_cwd`]
 //! and `overlap`'s `root_for` are longest-prefix matches against declared
 //! project roots, so a worktree outside the root resolves to no project at all:
 //! `wsp where` goes blank, the panel cannot place the pane, and `overlap` reads
@@ -288,7 +288,7 @@ fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<bool, Strin
 ///
 /// The one seam `spawn` uses, and the reason any of this is worth building. A
 /// rule an agent has to remember is a rule that gets skipped — that is written
-/// down three times over on t-260815-022, about naming paths, about announcing
+/// down three times over on robustness-010, about naming paths, about announcing
 /// first, and about the isolation build that became `wsp verify`. So the tree
 /// is not something an agent asks for; it is where the pane is opened.
 ///
@@ -1708,7 +1708,7 @@ mod tests {
     /// took them from.
     ///
     /// It used to remove it, which deleted its own caller's cwd the first time
-    /// anybody ran it (t-260817-018) and cost a fresh checkout and a cold
+    /// anybody ran it (robustness-047) and cost a fresh checkout and a cold
     /// `target/` every time work resumed on a task. So the tree is still there
     /// afterwards, still on its branch, and landing again from it is an ordinary
     /// thing to do rather than a rebuild.

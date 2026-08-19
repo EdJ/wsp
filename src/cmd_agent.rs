@@ -271,7 +271,7 @@ fn on_the_wire(full: &str) -> String {
 /// It used to be composed — the project the task is in *now*, a slash, the
 /// number off the end of the id — and that composes a name the CLI rejects. An
 /// id keeps the prefix it was numbered under when the task moves project, by
-/// decision on t-260815-004, because an id must never change under a claim, a
+/// decision on robustness-002, because an id must never change under a claim, a
 /// parent link or a log line: `wsp-077` can end up living in `batch`. The
 /// label said `batch/077`, `wsp show batch-077` found nothing, and the thirty
 /// or so tasks moved when `batch` and `fork` were made all displayed a name
@@ -460,7 +460,7 @@ pub(crate) fn full_name(
 /// in one tree all read as `claude`, which is the one thing about them you
 /// already knew. A claim is the moment wsp knows better.
 ///
-/// It renames over a name typed by hand, by decision on t-260815-041, and the
+/// It renames over a name typed by hand, by decision on wsp-016, and the
 /// claim prints what it overwrote so `herdr workspace rename` can put it back.
 /// It used to cost `resolve` its last resort — a workspace whose project was
 /// inferred from a label like `Trance Video` lost that inference the moment the
@@ -472,7 +472,7 @@ pub(crate) fn full_name(
 /// custodial slot is named after the position — see
 /// [`cmd_govern::governor_of`] — and a custodian that claims a task to read it
 /// would otherwise rename its own room after the task and leave the sidebar
-/// saying what t-260817-021 was filed about: `robustness/078`, with nothing
+/// saying what robustness-048 was filed about: `robustness/078`, with nothing
 /// anywhere saying seat. The pane still takes the task's name, because a pane
 /// answers "what is happening in there now" and that is what is happening.
 fn name_after_task(pane: &str, workspace: &str, task: &Task, ws_label: &str) -> Option<String> {
@@ -527,7 +527,7 @@ fn named_after_task(label: &str, task: &Task) -> bool {
 /// The trade: a pane wearing the *old* title after `wsp edit --title` also
 /// carries the right scope, so reconcile no longer refreshes it. It cannot be
 /// told from a sentence — one field holds both, which is the argument for moving
-/// `say` off the label entirely (t-260816-083). It is the cheaper half of the
+/// `say` off the label entirely (robustness-026). It is the cheaper half of the
 /// trade: the workspace below is untouched and still takes the new title, and a
 /// workspace is where "what is this work" is read; the pane answers "what is
 /// happening in there now", and a sentence is a better answer to that than a
@@ -1746,7 +1746,7 @@ pub fn say_looking(store: &Store, panes: &[herdr::Pane], project: Option<&str>, 
 /// Both this and `worked_line` join what they have and skip what they do not,
 /// because every part is optional: a claim made outside herdr has no label, and
 /// one made before the clock was recorded has no duration. Formatting them with
-/// fixed separators left `" · 3s · to t-260815-002"` hanging off nothing.
+/// fixed separators left `" · 3s · to prio1-001"` hanging off nothing.
 pub fn claim_line(c: &serde_json::Value) -> String {
     let get = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or("");
     let mut parts: Vec<String> = Vec::new();
@@ -1763,7 +1763,7 @@ pub fn claim_line(c: &serde_json::Value) -> String {
     parts.join(" · ")
 }
 
-/// `Trance Video · 3h12m · to t-260814-026` — the claim that ended.
+/// `Trance Video · 3h12m · to render-004` — the claim that ended.
 pub fn worked_line(w: &serde_json::Value) -> String {
     let get = |k: &str| w.get(k).and_then(|x| x.as_str()).unwrap_or("");
     let mut parts: Vec<String> = Vec::new();
@@ -2500,11 +2500,11 @@ fn machine_of(id: &str) -> &str {
 ///
 /// Today every workspace is local, so this is one entry keyed `""` and the
 /// behaviour is unchanged. When `workspaces()` fans out across machines
-/// (t-260816-037) the ids come back `@machine`-qualified and this partitions
+/// (wsp-047) the ids come back `@machine`-qualified and this partitions
 /// itself, with no further change here.
 ///
 /// Takes ids rather than workspaces because `sync` needs the same judgement one
-/// layer over, about panes and bindings (t-260816-058). Two rules for "is this
+/// layer over, about panes and bindings (robustness-015). Two rules for "is this
 /// machine answering" is how they drift apart, and the one that drifts is the
 /// one that reaps — so there is one, and each caller brings whatever it has
 /// actually heard.
@@ -2715,7 +2715,7 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
 /// Deliberately not in `sync`: that runs every tick, and a name reasserted
 /// every tick is a name you cannot change by hand. Here it runs when the
 /// daemon starts and when somebody asks — so a name you type survives until
-/// the next reconcile, which is the trade the user picked on t-260815-041.
+/// the next reconcile, which is the trade the user picked on wsp-016.
 fn name_bound(
     store: &Store,
     panes: &[herdr::Pane],
