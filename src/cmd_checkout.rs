@@ -299,10 +299,18 @@ pub(crate) enum Why {
 impl Why {
     /// What to do about it — which is a different command for each, and the
     /// reason a caller reporting these has to know which one it is holding.
-    pub(crate) fn fix(&self, task: &str) -> String {
-        match self {
-            Why::Closed => "`wsp checkout --sweep`".into(),
-            Why::Idle => format!("`wsp checkout {task} --rm`"),
+    ///
+    /// `seated` overrides both, and it is the whole of robustness-076 in one
+    /// line: while an agent is still in a seat on this task, `--rm` and
+    /// `--sweep` take the tree and leave the agent, the claim and the workspace
+    /// standing. Naming them there is how the ending came to be half-done every
+    /// time. [`crate::cmd_spawn::despawn`] is the verb that finishes it, and it
+    /// removes the tree on the way.
+    pub(crate) fn fix(&self, task: &str, seated: bool) -> String {
+        match (self, seated) {
+            (_, true) => format!("`wsp despawn {task}`"),
+            (Why::Closed, false) => "`wsp checkout --sweep`".into(),
+            (Why::Idle, false) => format!("`wsp checkout {task} --rm`"),
         }
     }
 }
@@ -447,6 +455,67 @@ pub(crate) fn sweep(
     out
 }
 
+/// What ending a piece of work did to its tree.
+///
+/// Three answers rather than a boolean, because the reader of a `despawn` has
+/// to be able to tell the tree that was never there from the one that is still
+/// standing — and the second is the only one that needs them to do something.
+/// Reporting them the same way is the fault this whole verb was written
+/// against: a step that says it finished when it did nothing.
+pub(crate) enum Tree {
+    /// No tree for this task in any repository it could be in. The ordinary
+    /// answer for work that never took a checkout.
+    Absent,
+    /// Gone, and whether the branch outlived it.
+    Removed { path: String, branch_kept: bool },
+    /// Left standing, and why — always a reason the caller can act on.
+    Kept { path: String, why: String },
+}
+
+/// Take away the tree for `task`, if there is one and nothing says not to.
+///
+/// The other end of [`tree_for`]: `checkout` puts the tree there when work is
+/// placed on a task, and this takes it away when the work is ended. Both are
+/// called by `spawn` and `despawn` rather than by the agent, for the reason
+/// [`tree_for`] gives — a cleanup step an agent has to remember is one that is
+/// skipped, and the evidence on robustness-076 is eighteen trees left standing
+/// after a single overnight batch.
+///
+/// The refusals are `--rm`'s, and deliberately not the sweep's. Uncommitted
+/// work is the one thing removing a tree destroys for good, so it stops this;
+/// commits the trunk has not got do *not*, because [`remove`] leaves the branch
+/// behind and `wsp checkout` builds the tree again from it. Nothing here is
+/// overridable — a caller who wants a dirty tree gone can say so where saying
+/// it is the whole point of the command, `wsp checkout <id> --rm --force`.
+///
+/// `standing` is the world outside git — the caller's own cwd, a pane in the
+/// tree — and comes in as a closure for the reason [`sweep`]'s `busy` does: the
+/// rule is worth testing and a live herdr is not worth needing in order to test
+/// it.
+pub(crate) fn discard(
+    repos: Vec<PathBuf>,
+    task: &str,
+    standing: &dyn Fn(&Path) -> Option<String>,
+) -> Tree {
+    // No usable repository is no tree, not an error: `pick` only fails when
+    // there was nowhere to look, and nowhere to look is nothing to remove.
+    let Ok(w) = pick(repos, task) else { return Tree::Absent };
+    if !w.dir.join(".git").exists() {
+        return Tree::Absent;
+    }
+    let path = util::contract(&w.dir);
+    if let Some(why) = standing(&w.dir) {
+        return Tree::Kept { path, why };
+    }
+    if dirty(&w.dir) {
+        return Tree::Kept {
+            path,
+            why: format!("uncommitted work in it — `wsp checkout {task} --rm --force` to lose it"),
+        };
+    }
+    Tree::Removed { path, branch_kept: remove(&w.repo, &w.dir, task).branch_kept }
+}
+
 /// Whether a tree has anything uncommitted, tracked or not.
 fn dirty(dir: &Path) -> bool {
     git(dir, &["status", "--porcelain", "--untracked-files=all"])
@@ -555,7 +624,7 @@ impl Where {
 /// Deduplicated through [`util::real`], because the overwhelmingly common case
 /// is the two agreeing and neither the search nor the "where I looked" message
 /// should say the same repository twice.
-fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> {
+pub(crate) fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut add = |repo: Option<PathBuf>| {
         let Some(repo) = repo else { return };
@@ -1240,6 +1309,106 @@ mod tests {
 
         ensure(&dir, &wt, "t-7", "master").unwrap();
         assert!(wt.join("unlanded.txt").exists(), "reopening the task did not get the work back");
+    }
+
+    /// The other end of that seam, and the whole of robustness-076: ending the
+    /// work takes the tree away, and says so in a way that can be told from
+    /// having done nothing.
+    ///
+    /// Three answers rather than a boolean, because the leak was never a
+    /// missing removal — it was three commands where only the first was a verb
+    /// anybody ran, and steps that reported success they had not achieved. A
+    /// `despawn` that prints "removed" over a tree still on disk is worse than
+    /// one that never touched it.
+    #[test]
+    fn ending_the_work_takes_the_tree_and_says_which_of_the_three_it_did() {
+        let (_env, dir) = scratch("discard");
+        repo(&dir);
+        let nobody = |_: &Path| None;
+
+        // Nothing to remove is its own answer, and it is the common one: most
+        // endings are of work that never took a checkout.
+        assert!(matches!(discard(vec![dir.clone()], "t-none", &nobody), Tree::Absent));
+
+        let wt = checkout_dir(&dir, "t-1");
+        ensure(&dir, &wt, "t-1", "master").unwrap();
+        match discard(vec![dir.clone()], "t-1", &nobody) {
+            Tree::Removed { branch_kept, .. } => assert!(!branch_kept, "a branch level with the trunk was kept"),
+            other => panic!("an idle tree survived the ending: {}", named(&other)),
+        }
+        assert!(!wt.exists(), "the directory is still there after a Removed");
+    }
+
+    /// The two refusals, and they are `--rm`'s rather than the sweep's.
+    ///
+    /// Uncommitted work is the one thing removing a tree destroys for good, so
+    /// it stops this and the reason names the command that overrides it.
+    /// Somebody standing in the tree stops it too — two agents in one tree is
+    /// ordinary here, and the second one must not have the floor taken out from
+    /// under it because the first was despawned.
+    #[test]
+    fn a_tree_with_work_in_it_or_somebody_in_it_is_kept_and_the_reason_says_which() {
+        let (_env, dir) = scratch("discard-kept");
+        repo(&dir);
+
+        let wt = checkout_dir(&dir, "t-2");
+        ensure(&dir, &wt, "t-2", "master").unwrap();
+        std::fs::write(wt.join("half-done.txt"), "not committed\n").unwrap();
+        match discard(vec![dir.clone()], "t-2", &|_| None) {
+            Tree::Kept { why, .. } => {
+                assert!(why.contains("uncommitted"), "the reason did not name the work at risk: {why}");
+                assert!(why.contains("--force"), "and gave no way through: {why}");
+            }
+            other => panic!("uncommitted work was thrown away: {}", named(&other)),
+        }
+        assert!(wt.join("half-done.txt").exists(), "the file went anyway");
+
+        // Committed, so nothing is at risk — and it still stays, because
+        // somebody is in it. The closure is asked about the tree that was
+        // found, which is what lets the caller answer for a path it never
+        // computed itself.
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", "done"]);
+        let occupied = |d: &Path| {
+            assert!(d.ends_with("t-2"), "asked about the wrong tree: {d:?}");
+            Some("w9:p1 is standing in it".into())
+        };
+        match discard(vec![dir.clone()], "t-2", &occupied) {
+            Tree::Kept { why, .. } => assert!(why.contains("w9:p1"), "the reason did not name who: {why}"),
+            other => panic!("a tree was removed from under somebody: {}", named(&other)),
+        }
+        assert!(wt.exists());
+    }
+
+    /// A tree removed with commits the trunk has not got is recoverable, and the
+    /// caller is told so — the branch outlives the directory, which is what
+    /// makes ending a piece of work cheap to undo. Same guarantee [`sweep`]
+    /// gives, asserted here because `despawn` reaches it by a different route.
+    #[test]
+    fn ending_the_work_keeps_the_branch_when_it_still_holds_commits() {
+        let (_env, dir) = scratch("discard-branch");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-3");
+        ensure(&dir, &wt, "t-3", "master").unwrap();
+        std::fs::write(wt.join("unlanded.txt"), "mine\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", "never landed"]);
+
+        match discard(vec![dir.clone()], "t-3", &|_| None) {
+            Tree::Removed { branch_kept, .. } => assert!(branch_kept, "the commits were not recoverable"),
+            other => panic!("{}", named(&other)),
+        }
+        ensure(&dir, &wt, "t-3", "master").unwrap();
+        assert!(wt.join("unlanded.txt").exists(), "reopening the task did not get the work back");
+    }
+
+    /// Which of the three came back, for a panic message that names it.
+    fn named(t: &Tree) -> String {
+        match t {
+            Tree::Absent => "Absent — no tree was found at all".into(),
+            Tree::Removed { path, .. } => format!("Removed {path}"),
+            Tree::Kept { path, why } => format!("Kept {path} — {why}"),
+        }
     }
 
     /// The seam `spawn` opens a workspace through. A task gets a tree; a root

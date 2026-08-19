@@ -3769,12 +3769,16 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
             // every declared root and a command that deletes directories should
             // only ever act on the one you are standing in.
             for s in crate::cmd_checkout::stale(&root, &closed) {
+                // A seat still bound to the task changes the advice rather than
+                // the finding: the tree is litter either way, but a `--rm`
+                // there leaves the agent and the workspace behind it.
+                let seated = !store.panes_for_task(&s.task).is_empty();
                 notes.push(format!(
                     "{}: the tree for {} is finished with — {} — {}",
                     util::contract(&root),
                     s.task,
                     s.note,
-                    s.why.fix(&s.task)
+                    s.why.fix(&s.task, seated)
                 ));
             }
             match tree_index_loss(&root) {

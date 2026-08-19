@@ -267,9 +267,46 @@ fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<
             continue;
         }
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
-        // `<repo>-<workspace>`, and the repository name can hold a dash, so the
-        // key is the tail rather than the second field.
-        if live.iter().any(|ws| name.ends_with(&format!("-{}", util::slugify(ws)))) {
+        if live.iter().any(|ws| keyed_on(name, ws)) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            gone.push(util::contract(&path));
+        }
+    }
+    gone.sort();
+    gone
+}
+
+/// Whether a build tree under `build/` belongs to this workspace.
+///
+/// `<repo>-<workspace>`, and the repository name can hold a dash, so the key is
+/// the tail rather than the second field.
+fn keyed_on(name: &str, workspace: &str) -> bool {
+    name.ends_with(&format!("-{}", util::slugify(workspace)))
+}
+
+/// Remove the build trees keyed on one workspace, and say which went.
+///
+/// [`clear_build_dirs`] with the question turned around, and the difference is
+/// the guard rather than the mechanism. That one asks which workspaces are
+/// alive and removes everything else, which is right for a sweep and wrong for
+/// a single ending: it would make `wsp despawn` reach every dead workspace's
+/// residue on a list that is only as good as herdr's last answer. This one is
+/// told the workspace whose last pane has just been closed, so the only tree it
+/// can touch is one that provably has no owner left.
+///
+/// Directories only, for [`clear_build_dirs`]'s reason: the stale `git
+/// worktree` registration is pruned by [`ensure_tree`] or `checkout` the next
+/// time either touches the repository, and pruning it here would mean guessing
+/// which repository the tree came from.
+pub(crate) fn clear_build_key(store: &Store, workspace: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(store.state.join("build")) else { return Vec::new() };
+    let mut gone = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        if !path.is_dir() || !keyed_on(name, workspace) {
             continue;
         }
         if std::fs::remove_dir_all(&path).is_ok() {
@@ -1373,6 +1410,36 @@ mod tests {
         // Nothing to clear is not an error: `--rm --all` is a thing you run
         // without first checking whether there is anything to run it on.
         assert!(clear_build_dirs(&store, Some(&live), Path::new("/nowhere")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The narrow half, aimed at one workspace, and it must stay narrow.
+    ///
+    /// `wsp despawn` calls this the moment a seat's workspace goes, so the
+    /// blast radius is the difference between the two functions: this one is
+    /// *told* which workspace has died, and the sweep above infers it from a
+    /// list of the living. An off-by-one there costs a running agent its build
+    /// tree, which is why the suffix rule is asserted here too rather than
+    /// trusted from one caller away.
+    #[test]
+    fn ending_one_workspace_clears_its_build_trees_and_nobody_elses() {
+        let dir = scratch_dir("one-key");
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let build = store.state.join("build");
+        for t in ["wsp-w2x", "herdr-w2x", "wsp-w2y", "my-wsp-w2x"] {
+            std::fs::create_dir_all(build.join(t).join("tree")).unwrap();
+        }
+
+        let gone = clear_build_key(&store, "w2x");
+        assert_eq!(gone.len(), 3, "the wrong trees went: {gone:?}");
+        assert!(!build.join("wsp-w2x").exists());
+        assert!(!build.join("herdr-w2x").exists(), "a workspace can build more than one repository");
+        assert!(!build.join("my-wsp-w2x").exists(), "the workspace was matched as part of the repo name");
+        assert!(build.join("wsp-w2y").exists(), "another workspace lost the tree it was building in");
+
+        // A workspace with nothing keyed on it is the ordinary case — most
+        // agents build in the warm pool — and it is not an error.
+        assert!(clear_build_key(&store, "w2x").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

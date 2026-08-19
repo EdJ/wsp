@@ -97,7 +97,7 @@ wsp wip                     # every agent, its task, and who needs you
 wsp where                   # what project am I in, and why
 wsp overlap                 # who else is standing in this tree
 wsp spawn 003 --agent       # open a workspace on it and put an agent in it
-wsp despawn 003             # end that agent and release the claim
+wsp despawn 003             # end it: the agent, the claim and the worktree
 ```
 
 ## The panel
@@ -2358,18 +2358,54 @@ give it work that needs it.
 ```sh
 wsp despawn 033                    # end the agent working it, and put the work down
 wsp despawn --pane w26:p1          # …or name the seat, bound or not
+wsp despawn 033 --keep-tree        # …but leave the checkout where it is
 ```
 
-What this replaces is two commands, one of which is not wsp: `wsp release --pane
-w26:p1` and then `herdr workspace close w26`. **Stop first, release last** — the
-reverse of the order it was done by hand, because the two failures are not
-comparable: a seat that will not close keeps its claim and says so, while a claim
-released over a live agent is handed straight to the next one. A seat that was
-*already* gone counts as done, since an agent whose backend died under it is the
-ordinary case for this verb. The argument in full, including why ending a seat
-ends the claim rather than only the binding, is in `src/place.rs`; under herdr the
-verb is `pane.close` on the seat, and `src/place_herdr.rs` records what was
-measured to choose it over `workspace.close`.
+One verb, because the hand procedure was three and only the first of them was a
+verb anybody reached for:
+
+```sh
+wsp despawn <id>                   # ended the agent, released the claim
+wsp checkout <id> --rm             # removed the worktree
+herdr workspace close <ws>         # closed the workspace the pane left behind
+```
+
+The other two were done by whoever noticed, which is why they were not done —
+eighteen worktrees and nineteen workspaces left standing after one overnight
+batch, all found by accident. `wsp checkout --sweep` cannot help, because it only
+removes trees whose task is *finished* and everything here sits at `review` by
+design. Two of the three turn out to be one call: closing the last pane of a
+workspace takes the workspace with it, measured against herdr 0.8.0 and recorded
+in `src/place_herdr.rs`. The third is now part of the verb, and so is a fourth
+nobody had counted — a build tree under the state directory is keyed on the
+workspace, so the workspace going leaves it unreachable.
+
+**Stop first, release last, tree after both** — the reverse of the order it was
+done by hand, because the failures are not comparable: a seat that will not close
+keeps its claim and says so, while a claim released over a live agent is handed
+straight to the next one; and the tree is the only step somebody can still do
+afterwards, so it must never be the step that stops the claim being released. A
+seat that was *already* gone counts as done, since an agent whose backend died
+under it is the ordinary case for this verb.
+
+The tree goes on `--rm`'s terms and not the sweep's: uncommitted work stops it,
+because that is the one thing removing a tree destroys for good, and so does
+somebody standing in it. Commits the trunk has not got do not — the branch
+outlives the directory, and `wsp checkout` builds the tree again from it. Every
+step says what it *did*, including the tree it decided to leave and why, which is
+the point: a cleanup that prints "removed" over a tree still on disk is worse
+than one that never ran.
+
+Nothing here reaps on idleness. A task at `review` is not evidence its agent has
+stopped — `review` is where everything sits, because `done` belongs to the person
+the work is for — and an agent idle for ten minutes may be waiting on you.
+`wsp doctor` is the half that only looks, and it names `wsp despawn` rather than
+`wsp checkout --rm` for a finished tree whose seat is still bound.
+
+The argument in full, including why ending a seat ends the claim rather than only
+the binding, is in `src/place.rs`; under herdr the verb is `pane.close` on the
+seat, and `src/place_herdr.rs` records what was measured to choose it over
+`workspace.close`.
 
 ## Machines
 

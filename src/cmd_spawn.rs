@@ -30,6 +30,7 @@ use serde_json::json;
 
 use crate::agent_commands;
 use crate::cmd_agent;
+use crate::cmd_checkout::{self, Tree};
 use crate::cmd_govern;
 use crate::place::{Agent, Order, Place, Refusal, Seat, State};
 use crate::place_herdr::Herdr;
@@ -988,24 +989,62 @@ pub(crate) fn workspace_of(seat: &Seat) -> Option<String> {
 ///
 /// The other end of [`spawn`], and the reason the port has a `stop` at all: a
 /// loop that starts agents one at a time and cannot end one makes despawning
-/// part of the loop rather than an edge case. What it replaces is two commands,
-/// one of which is not wsp:
+/// part of the loop rather than an edge case.
 ///
-///     wsp release --pane w26:p1     # drop the claim
-///     herdr workspace close w26     # kill the workspace
+/// # One verb, because the hand procedure was never finished
 ///
-/// **Stop first, release last** — the reverse of that, and the argument for it is
-/// where the rule about the claim and the seat already lives, in `place.rs`. This
-/// is the half of it that is code: the claim is released only once the seat is
-/// gone, a seat that was *already* gone counts as gone, and a backend that did
-/// not answer is neither.
+/// Ending an agent took three commands and nothing did all three:
+///
+///     wsp despawn <id>            ended the agent, released the claim
+///     wsp checkout <id> --rm      removed the worktree
+///     herdr workspace close <ws>  closed the workspace the pane left behind
+///
+/// Only the first is a wsp verb anybody reaches for, so the other two were done
+/// by whoever noticed — which is why they were not done. What that cost is on
+/// robustness-076 and is not small: eighteen worktrees and nineteen workspaces
+/// left standing after one overnight batch, every one of them found by
+/// accident. `wsp checkout --sweep` cannot help, because it only removes trees
+/// whose task is *finished* and everything here sits at `review` by design.
+///
+/// So this verb does the whole ending. Two of the three are one call already —
+/// closing the last pane of a workspace takes the workspace with it, measured
+/// against herdr 0.8.0 on 2026-08-19 and argued in `place_herdr`'s module docs —
+/// and the third is [`cmd_checkout::discard`], with `--rm`'s refusals and not
+/// the sweep's. There is a fourth nobody had counted: a build tree under the
+/// state directory is keyed on the workspace, so the workspace going takes its
+/// last owner with it, and 9.6G of that residue had accumulated by 2026-08-17.
+/// [`crate::cmd_verify::clear_build_key`] takes the one that has just been
+/// orphaned.
+///
+/// **Stop first, release last** — the reverse of the list above, and the
+/// argument for it is where the rule about the claim and the seat already
+/// lives, in `place.rs`. This is the half of it that is code: the claim is
+/// released only once the seat is gone, a seat that was *already* gone counts
+/// as gone, and a backend that did not answer is neither. The tree comes after
+/// both, because it is the only step that can be done later by hand.
+///
+/// # What it will not do
+///
+/// It is aimed by hand at a seat, and it stays that way. Nothing here reaps on
+/// idleness: a task at `review` is not evidence its agent has stopped — `review`
+/// is where everything sits, because `done` belongs to the person the work is
+/// for — and an agent idle for ten minutes may be waiting on a person.
+/// Robustness-051 was exactly that, and killing it would have destroyed work to
+/// save a directory.
+///
+/// Every step reports what it *did* rather than what it attempted, including
+/// the tree it decided to leave and why. That is the house fault this verb was
+/// written against, and a cleanup that prints "removed" over a tree still on
+/// disk is worse than one that never ran.
 ///
 /// No guard on an agent that is busy, and that is a decision rather than an
 /// omission. `claim`'s live-holder guard protects you from a *third party* you
 /// may not have known was there; this verb is aimed at a seat by somebody who
-/// knows what is in it. What ending it costs is the session, not the work — the
-/// files in the tree are untouched — and the state it would refuse on is the one
-/// a wedged agent reads as, which is when you most want this.
+/// knows what is in it. What ending it costs is the session, not the work — a
+/// tree holding anything uncommitted is left exactly where it is, which is the
+/// whole of what [`cmd_checkout::discard`] refuses on — and the state it would
+/// refuse on is the one a wedged agent reads as, which is when you most want
+/// this.
 ///
 /// `--headless` names the backend, the same flag the spawn was placed with, and
 /// **wsp does not know which one a seat belongs to** — a claim records a
@@ -1016,7 +1055,87 @@ pub(crate) fn workspace_of(seat: &Seat) -> Option<String> {
 /// Which record should carry it is the state-model half of the translation
 /// layer (the binds note on robustness-061), and is not decided here.
 pub fn despawn(store: &Store, args: &Args) -> i32 {
-    end_work(backend(args).as_ref(), store, args, cmd_agent::my_pane().as_deref())
+    let keep = args.has("keep-tree");
+    let tidy = |seat: &Seat, task: Option<&str>, ws: Option<&str>| swept_up(store, seat, task, ws, keep);
+    end_work(backend(args).as_ref(), store, args, cmd_agent::my_pane().as_deref(), &tidy)
+}
+
+/// What the ending took away after the seat itself.
+struct Leftovers {
+    tree: Tree,
+    /// Build trees that were keyed on the workspace the seat took with it.
+    builds: Vec<String>,
+}
+
+/// The tree and the build trees, once the seat has gone.
+///
+/// Passed into [`end_work`] as a closure rather than called from inside it, for
+/// the reason `me` is passed in below: this is the half of the verb that needs
+/// a git repository and a live herdr under it, and a test of the *ordering* —
+/// stop, release, then tidy — should not need either. It is also the half that
+/// removes directories, and a unit test that reached the real one would be
+/// running `git worktree remove` against whatever tree the test runner happens
+/// to be standing in.
+/// `keep` is `--keep-tree`, and it covers the *checkout* only. A build tree
+/// keyed on a workspace that has gone has no owner left to keep it for, so
+/// there is nothing for a flag to protect and no flag to remember.
+fn swept_up(
+    store: &Store,
+    seat: &Seat,
+    task: Option<&str>,
+    workspace: Option<&str>,
+    keep: bool,
+) -> Leftovers {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let here = util::real(&cwd.display().to_string());
+    // The seat this despawn has just closed is not somebody standing in the
+    // tree. herdr can go on listing a pane for a moment after `pane.close`
+    // returns, and reading that back as an occupant is how a cleanup verb comes
+    // to refuse on the pane it removed itself.
+    let seen: Result<Vec<crate::herdr::Pane>, String> = match crate::herdr::available() {
+        // No herdr on this machine is not a pane in the tree: `place_super`
+        // runs agents with no terminal at all, and a cleanup that refused
+        // without one would remove nothing there, ever.
+        false => Ok(Vec::new()),
+        // A socket that is there and will not answer is a different fact, and
+        // the direction to fail in is the one `sync.rs:41` already argues:
+        // silence is not evidence that nobody is standing in the tree.
+        true => crate::herdr::panes()
+            .map(|ps| ps.into_iter().filter(|p| p.pane_id != seat.as_str()).collect())
+            .map_err(|e| format!("herdr did not say who is standing in it: {e}")),
+    };
+    let standing = |dir: &std::path::Path| -> Option<String> {
+        let dir = util::real(&dir.display().to_string());
+        if here.starts_with(&dir) {
+            return Some("you are standing in it".into());
+        }
+        let panes = match &seen {
+            Ok(panes) => panes,
+            Err(why) => return Some(why.clone()),
+        };
+        panes
+            .iter()
+            .find(|p| util::real(&p.cwd).starts_with(&dir))
+            .map(|p| format!("{} is standing in it", p.pane_id))
+    };
+
+    let tree = match task.filter(|_| !keep) {
+        Some(t) => cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing),
+        // A seat holding nothing names no tree. There is no path from a seat to
+        // a checkout except through the task, and guessing one from the pane's
+        // cwd would remove a tree on the strength of where somebody stood.
+        None => Tree::Absent,
+    };
+
+    // Only once herdr says the workspace has actually gone. A seat with
+    // siblings leaves its workspace standing, and a build tree keyed on a live
+    // workspace belongs to whoever is still in it.
+    let gone = |ws: &str| crate::herdr::workspaces().map(|all| !all.iter().any(|w| w.id == ws));
+    let builds = match workspace {
+        Some(ws) if gone(ws).unwrap_or(false) => crate::cmd_verify::clear_build_key(store, ws),
+        _ => Vec::new(),
+    };
+    Leftovers { tree, builds }
 }
 
 /// Which seat a despawn is about: the one named, or the one holding the task.
@@ -1067,7 +1186,13 @@ fn seat_of(store: &Store, args: &Args, index: &Index) -> Result<(Seat, Option<St
 /// be changing a process-wide variable every other test can see — which is a
 /// flake somebody else's test pays for. It has already happened once in this
 /// tree, to `cmd_install`'s lock test, from the first draft of these tests.
-fn end_work(place: &dyn Place, store: &Store, args: &Args, me: Option<&str>) -> i32 {
+fn end_work(
+    place: &dyn Place,
+    store: &Store,
+    args: &Args,
+    me: Option<&str>,
+    tidy: &dyn Fn(&Seat, Option<&str>, Option<&str>) -> Leftovers,
+) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
     let (seat, task) = match seat_of(store, args, &index) {
@@ -1113,6 +1238,11 @@ fn end_work(place: &dyn Place, store: &Store, args: &Args, me: Option<&str>) -> 
         }
     }
 
+    // Asked before the seat is closed, because after it there is nothing left
+    // to ask: the workspace is the id a build tree is keyed on, and a pane that
+    // has gone cannot say which one it was in.
+    let workspace = workspace_of(&seat);
+
     let closed = match place.stop(&seat) {
         Ok(()) => true,
         // Already gone. The first half of the verb is done, however it happened.
@@ -1131,10 +1261,28 @@ fn end_work(place: &dyn Place, store: &Store, args: &Args, me: Option<&str>) -> 
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);
 
+    // Last, and only now: the tree is the one step a person can still do by
+    // hand afterwards, so it must not be the step that stops the claim being
+    // released. Everything before this line is what `despawn` has always done.
+    let Leftovers { tree, builds } = tidy(&seat, task.as_deref(), workspace.as_deref());
+
     if args.json() {
         println!(
             "{}",
-            json!({ "seat": seat.as_str(), "closed": closed, "task": task, "released": released })
+            json!({
+                "seat": seat.as_str(),
+                "closed": closed,
+                "task": task,
+                "released": released,
+                "tree": match &tree {
+                    Tree::Absent => serde_json::Value::Null,
+                    Tree::Removed { path, branch_kept } =>
+                        json!({ "removed": true, "path": path, "branch_kept": branch_kept }),
+                    Tree::Kept { path, why } =>
+                        json!({ "removed": false, "path": path, "why": why }),
+                },
+                "builds": builds,
+            })
         );
     } else {
         println!("  {}", p.dim(&match closed {
@@ -1145,6 +1293,27 @@ fn end_work(place: &dyn Place, store: &Store, args: &Args, me: Option<&str>) -> 
             (Some(t), true) => println!("  {}", p.dim(&format!("released {t}"))),
             (Some(t), false) => println!("  {}", p.dim(&format!("{t} was not bound to it"))),
             (None, _) => println!("  {}", p.dim("it was holding nothing")),
+        }
+        match &tree {
+            // Nothing at all, rather than "no tree": the common ending has no
+            // checkout in it and a line saying so on every despawn is a line
+            // every reader learns to skip, including on the despawns where the
+            // next two matter.
+            Tree::Absent => {}
+            Tree::Removed { path, branch_kept } => {
+                println!("  {}", p.dim(&format!("removed {path}")));
+                if *branch_kept {
+                    let name = task.as_deref().unwrap_or_default();
+                    println!("  {}", p.yellow(&format!("branch {name} kept — it has commits the trunk has not")));
+                }
+            }
+            // Not dim. This is the one line here that is somebody's to act on,
+            // and the leak this verb exists to stop is exactly a cleanup step
+            // that reported success it had not achieved.
+            Tree::Kept { path, why } => println!("  {}", p.yellow(&format!("kept {path} — {why}"))),
+        }
+        if !builds.is_empty() {
+            println!("  {}", p.dim(&format!("removed {} build tree(s) keyed on the workspace", builds.len())));
         }
     }
     0
@@ -2177,6 +2346,27 @@ mod tests {
         env
     }
 
+    /// The tidying half, stubbed, and what each test asserts instead.
+    ///
+    /// [`swept_up`] is the only part of `despawn` that needs a git repository
+    /// and a live herdr, and the tests below are about the *ordering* — stop,
+    /// release, then tidy — and about what is reported. Reaching the real one
+    /// here would run `git worktree remove` in whatever tree the test runner is
+    /// standing in, which is somebody's actual work. What it did is recorded so
+    /// the one thing worth asserting about it can be: that it ran last, and only
+    /// on an ending that got that far.
+    #[derive(Default)]
+    struct Tidied(std::cell::RefCell<Vec<(String, Option<String>)>>);
+
+    impl Tidied {
+        fn f(&self) -> impl Fn(&Seat, Option<&str>, Option<&str>) -> Leftovers + '_ {
+            |seat: &Seat, task: Option<&str>, _ws: Option<&str>| {
+                self.0.borrow_mut().push((seat.as_str().to_string(), task.map(String::from)));
+                Leftovers { tree: Tree::Absent, builds: Vec::new() }
+            }
+        }
+    }
+
     /// **The decision this task was opened for.** A seat that will not close
     /// keeps its claim.
     ///
@@ -2193,12 +2383,14 @@ mod tests {
         working(&store, "t-260816-095", "w1:p1");
 
         let place = Ends::refusing(Refusal::Backend("pane is not going anywhere".into()));
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None);
+        let tidied = Tidied::default();
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None, &tidied.f());
 
         assert_eq!(code, 1, "a despawn that ended nothing must not report success");
         assert_eq!(place.asked.borrow().len(), 1, "it did try");
         assert!(store.claims().contains_key("t-260816-095"), "the claim went with the agent still there");
         assert!(store.bindings().contains_key("w1:p1"), "and so did the binding");
+        assert!(tidied.0.borrow().is_empty(), "a seat still standing keeps its tree too");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
@@ -2218,7 +2410,8 @@ mod tests {
         working(&store, "t-260816-095", "w1:p1");
 
         let place = Ends::ok();
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None);
+        let tidied = Tidied::default();
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None, &tidied.f());
 
         assert_eq!(code, 0);
         assert_eq!(place.asked.borrow().as_slice(), &[Seat::new("w1:p1")], "the bound seat");
@@ -2228,6 +2421,11 @@ mod tests {
         let t = store.task("t-260816-095").expect("the task");
         assert_eq!(t.status_raw, "doing", "work nobody is on is still work");
         assert!(t.body.contains("released"), "the log should say it was put down:\n{}", t.body);
+        assert_eq!(
+            tidied.0.borrow().as_slice(),
+            &[("w1:p1".to_string(), Some("t-260816-095".to_string()))],
+            "the tree is tidied last, and named by the task the release ended"
+        );
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
@@ -2247,7 +2445,8 @@ mod tests {
         working(&store, "t-260816-095", "w1:p1");
 
         let place = Ends::refusing(Refusal::NoSeat(Seat::new("w1:p1")));
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None);
+        let tidied = Tidied::default();
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None, &tidied.f());
 
         assert_eq!(code, 0);
         assert!(!store.claims().contains_key("t-260816-095"));
@@ -2256,7 +2455,9 @@ mod tests {
         // release: silence is not evidence that the seat is gone.
         working(&store, "t-260816-094", "w1:p2");
         let quiet = Ends::refusing(Refusal::Unreachable("no socket".into()));
-        assert_eq!(end_work(&quiet, &store, &Args::synth("despawn", &["094"], &[]), None), 1);
+        let untidied = Tidied::default();
+        assert_eq!(end_work(&quiet, &store, &Args::synth("despawn", &["094"], &[]), None, &untidied.f()), 1);
+        assert!(untidied.0.borrow().is_empty(), "an ending that released nothing must not remove a tree");
         assert!(store.claims().contains_key("t-260816-094"), "released on a backend's silence");
 
         let _ = std::fs::remove_dir_all(&store.root);
@@ -2319,7 +2520,8 @@ mod tests {
         working(&store, "t-260816-095", "w1:p1");
 
         let place = Ends::ok();
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Some("w1:p1"));
+        let tidied = Tidied::default();
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Some("w1:p1"), &tidied.f());
 
         assert_eq!(code, 2);
         assert!(place.asked.borrow().is_empty(), "it asked the backend to end this pane");

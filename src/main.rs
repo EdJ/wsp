@@ -95,6 +95,8 @@ const BOOL_FLAGS: &[&str] = &[
     "dry-run",
     // Same for `sandbox`, whose positional is a sandbox name.
     "keep", "seed", "fake",
+    // And `despawn`, whose positional is a task id.
+    "keep-tree",
     // And `govern`, whose positional is a project: `wsp spawn -p wsp --govern`
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it.
@@ -625,9 +627,12 @@ fn help() {
                                     it starts on your settings file, as before.
                                     haiku opens in manual mode, so it is refused
                                     unless --focus says you will be at the pane
-  wsp despawn <id> | --pane <seat>  the other end of it: end the agent working
-                                    that task, then release the claim — a seat
-                                    that will not close keeps its claim
+  wsp despawn <id> | --pane <seat>  the other end of it, and the whole ending:
+                                    end the agent, release the claim, remove the
+                                    worktree. A seat that will not close keeps
+                                    its claim; a tree with uncommitted work in it,
+                                    or with somebody in it, is kept and said so.
+                                    --keep-tree leaves the checkout alone
   wsp resume [<id>] [--print]       the agents that were running before herdr
                                     restarted, offered back one row at a time:
                                     ␣ to pick, ↵ to bring those back on the
