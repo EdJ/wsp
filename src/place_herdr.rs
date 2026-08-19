@@ -296,13 +296,59 @@ fn refusal(seat: &Seat, e: &std::io::Error) -> Refusal {
 /// agent carries no `agent` field at all and answers `agent_status: "unknown"`.
 /// herdr cannot distinguish that from an agent which has exited, which is why
 /// [`State::Gone`] is raised from the event stream instead of from a reading.
+///
+/// # All five of herdr's statuses, and the two wsp used to read
+///
+/// `AgentStatus` (herdr `api/schema/common.rs:151`) is `idle | working |
+/// blocked | done | unknown`. This function knew the first two and answered
+/// [`State::Unknown`] to the rest, which cost more than it looks like:
+/// `will_take_a_prompt` says no to `Unknown`, so a perfectly ready agent was
+/// unreachable, and every census counted it as a seat wsp could not see. Read
+/// live off this machine's socket on 2026-08-19, **four of twelve agents were
+/// answering `done`**.
+///
+/// - **`blocked`** is [`State::Blocked`]: a permission prompt has the keyboard.
+///   It was the worst of the three to lose, because it is the one an agent
+///   reaches *by taking a work order*, and the state a person can clear in one
+///   keystroke if anything tells them it is there.
+/// - **`done` is [`State::Idle`] and nothing else**, which is the reading worth
+///   arguing. It is not a fifth agent state: `app/api_helpers.rs:104` derives
+///   it as `(Idle, seen: false)`, and `seen` is "the user has looked at this
+///   pane since it went idle" (`pane/state.rs:8`). So the difference between
+///   `idle` and `done` is a fact about a viewer's window, not about the agent —
+///   and wsp is not that viewer. A wsp census that treated `done` as its own
+///   state would be reporting on which workspace a person happened to have
+///   focused, and would change its answer when they switched tabs.
+///
+///   The temptation is real and should be named, because `done` is *almost* the
+///   signal this file wanted: "the turn ended and nobody has acknowledged it".
+///   It is unreliable for that in both directions — a governor agent is a pane
+///   and not a viewer, so nothing it does marks a pane seen, and a person idly
+///   passing through a workspace clears the flag on an agent nobody looked at.
+///   The durable version of that question is asked in `cmd_agent::quiet_note`,
+///   off facts wsp owns: what herdr says the agent is doing, and when the task
+///   was last written to.
+/// - **`unknown`** stays [`State::Unknown`]. herdr saying it does not know is
+///   the one status that means what wsp's word means.
 fn of_status(agent: &str, status: &str) -> State {
     if agent.trim().is_empty() {
         return State::Empty;
     }
+    of_word(status)
+}
+
+/// The status word on its own, for a caller holding nothing else.
+///
+/// `overlap` is that caller: it carries herdr's word as a string on a row it
+/// has already decided has an agent in it, so the empty-agent arm above would
+/// be answering a question it has asked itself. Split out rather than reached
+/// with a placeholder agent name, which is how a translation table acquires a
+/// second, subtly different copy.
+pub(crate) fn of_word(status: &str) -> State {
     match status.trim() {
         "working" => State::Working,
-        "idle" => State::Idle,
+        "idle" | "done" => State::Idle,
+        "blocked" => State::Blocked,
         _ => State::Unknown,
     }
 }
@@ -344,7 +390,16 @@ pub fn state_of_agent(p: &herdr::Pane) -> State {
 /// one row and many. `Working` off one of these is exact; `Idle` means "idle or
 /// still coming up, and this row cannot say which", so the caller that must not
 /// be lied to asks [`Place::state`] about the one seat.
-fn state_of_pane(p: &herdr::Pane) -> State {
+///
+/// **`doctor`'s census asks this one and not [`state_of_agent`], which looks
+/// backwards and is the point.** Readiness answers "will this take a prompt",
+/// and a census asking whether work is happening does not care: an agent whose
+/// status is `working` is working whether or not it would accept a sentence.
+/// Qualifying by readiness there would read every plugin-reported agent — which
+/// sends no `interactive_ready` at all, so the absence is not evidence — as
+/// [`State::Unknown`], and a census that cannot see an agent is exactly what
+/// robustness-083 was opened about.
+pub(crate) fn state_of_pane(p: &herdr::Pane) -> State {
     of_status(&p.agent, &p.agent_status)
 }
 
@@ -956,6 +1011,48 @@ mod tests {
         let row = |v: Value| state_of_pane(&herdr::parse_pane(&v));
         assert_eq!(row(json!({ "agent": "claude", "agent_status": "idle" })), State::Idle);
         assert_eq!(row(json!({ "agent": "claude", "agent_status": "working" })), State::Working);
+    }
+
+    /// All five words herdr has, against the two this adapter used to know.
+    ///
+    /// The three it dropped all became [`State::Unknown`], which is not a
+    /// harmless default here: `will_take_a_prompt` refuses it, so a ready agent
+    /// was unreachable, and every census counted it as a seat wsp could not
+    /// see. Live on this machine on 2026-08-19, four of twelve agents were
+    /// answering `done`.
+    ///
+    /// The vocabulary was already written down twelve lines from the function
+    /// that did not know it — [`ANY_STATUS`] names all five, because `fork-015`
+    /// needed them to ask herdr's wait for every status at once. So this is
+    /// pinned against that list rather than against a literal, which is what
+    /// makes the two disagreeing a test failure instead of a discovery.
+    #[test]
+    fn every_status_herdr_has_a_word_for_is_a_state_wsp_can_read() {
+        let read = |status: &str| of_status("claude", status);
+
+        assert_eq!(read("working"), State::Working);
+        assert_eq!(read("idle"), State::Idle);
+        assert_eq!(read("blocked"), State::Blocked);
+        // Not a fifth agent state: herdr derives it as idle-and-unseen
+        // (`app/api_helpers.rs:104`), and `seen` is about a person's window.
+        assert_eq!(read("done"), State::Idle, "a viewer's attention is not an agent's state");
+        assert_eq!(read("unknown"), State::Unknown, "herdr's not-knowing is the one that maps across");
+
+        // `unknown` excepted, which is the one where both words mean the same
+        // thing and agreeing is the correct answer.
+        for status in ANY_STATUS.into_iter().filter(|s| *s != "unknown") {
+            assert_ne!(
+                (status, read(status)),
+                (status, State::Unknown),
+                "herdr sends `{status}` and the adapter has no word for it",
+            );
+        }
+
+        // And the reason the first two were ever enough to look right: exactly
+        // one of the five means a turn is running.
+        let turning: Vec<&str> =
+            ANY_STATUS.into_iter().filter(|s| read(s).turn_in_flight()).collect();
+        assert_eq!(turning, vec!["working"]);
     }
 
     /// The shell race. `agent.start` into a pane ten milliseconds old is refused

@@ -124,13 +124,21 @@ impl Standing {
         })
     }
 
-    /// An idle agent on a task that is still `doing`: it has stopped, and a
-    /// person is the blocker. The panel draws this as `←`, `wsp wip` counts it,
-    /// and the brief leads with it — so it is worth having one definition of it
-    /// rather than each of them keeping its own.
+    /// An agent running no turn on a task that is still `doing`: it has
+    /// stopped, and a person is the blocker. The panel draws this as `←`,
+    /// `wsp wip` counts it, and the brief leads with it — so it is worth having
+    /// one definition of it rather than each of them keeping its own.
+    ///
+    /// It said `state == "idle"` until robustness-083, which is one of the
+    /// three words herdr has for a pane with nothing running in it. The two it
+    /// missed are the two nobody is watching for: `done`, which is what an
+    /// agent that finished a turn in an unfocused workspace reports, and
+    /// `blocked`, which is a permission prompt. Both read as busy, and this is
+    /// the definition the brief leads with — so an agent's neighbour could stop
+    /// dead and every session started beside it would be told all was well.
     pub(crate) fn needs_you(&self) -> bool {
         self.agent
-            && self.state == "idle"
+            && crate::place_herdr::of_word(&self.state).stopped()
             && self.task.as_ref().map(|t| t.status() == crate::model::Status::Doing).unwrap_or(false)
     }
 

@@ -310,11 +310,11 @@ pub fn governs(governors: &BTreeMap<String, Value>, workspace: &str) -> Option<S
         .map(|(p, _)| p.clone())
 }
 
-/// Is this idle agent a person's problem?
+/// Is this stopped agent a person's problem?
 ///
-/// The rule `wip` and the panel have both always applied — an idle process on a
-/// `doing` task means whoever is working it has stopped and a person is the
-/// blocker — with the one exception the seat creates. A governor is idle
+/// The rule `wip` and the panel have both always applied — a process running no
+/// turn on a `doing` task means whoever is working it has stopped and a person
+/// is the blocker — with the one exception the seat creates. A governor is idle
 /// *between* the agents it is sequencing, which is most of the time, and
 /// reading that as a stall marked the busiest agent on the machine as stuck.
 ///
@@ -324,8 +324,17 @@ pub fn governs(governors: &BTreeMap<String, Value>, workspace: &str) -> Option<S
 /// seat comes in as a bool because the two callers know it differently — `wip`
 /// has the map in hand, the panel has already joined it onto the row — and
 /// neither should have to hold the other's shape to ask the question.
-pub fn needs_a_person(idle: bool, doing: bool, seat: bool) -> bool {
-    idle && doing && !seat
+///
+/// The first argument is named `stopped` and not `idle`, and robustness-083
+/// renamed it because the two are not the same and the difference was three
+/// silent failures wide. `agent_status == "idle"` is one of the *three* words
+/// herdr has for a pane running no turn — `done` and `blocked` are the others,
+/// and on this machine on 2026-08-19 four of twelve agents were answering
+/// `done`. Every one of them was stopped on live work and reported as busy.
+/// [`crate::place::State::turn_in_flight`] is the reading that answers this
+/// without enumerating herdr's spelling.
+pub fn needs_a_person(stopped: bool, doing: bool, seat: bool) -> bool {
+    stopped && doing && !seat
 }
 
 /// Put a workspace in a project's slot, and say whom it displaced.

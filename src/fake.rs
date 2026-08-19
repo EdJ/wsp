@@ -657,7 +657,17 @@ impl Stage {
 ///   exactly like an idle agent;
 /// - `Gone` has no reading of its own. herdr cannot distinguish an exited
 ///   agent's pane from a shell, so this answers exactly what `Empty` answers,
-///   and the loss is pinned in a test rather than smoothed over.
+///   and the loss is pinned in a test rather than smoothed over;
+/// - `Blocked` is `agent_status: "blocked"`, read off herdr 0.8.0's schema
+///   (`api/schema/common.rs:151`) rather than off a running one, and marked as
+///   such because that is a weaker claim than the lines above it.
+///
+/// **`done` has no `Spot` and deliberately never will.** herdr sends it, and it
+/// is `idle` with a flag saying no human has looked at the pane since
+/// (`app/api_helpers.rs:104`) — a fact about a viewer's window, not about an
+/// agent. The adapter reads it as `Idle` (`place_herdr::of_status`), so a state
+/// here that produced it would be a state wsp cannot round-trip, and this
+/// function's whole value is that it is an exact inverse.
 ///
 /// The `Starting` line is the one that cost something to get right, and it is
 /// why this function returns `Option<bool>` rather than `bool`: absence and
@@ -674,6 +684,7 @@ fn of_state(spot: &Spot) -> (Option<&str>, &'static str, Option<bool>) {
         State::Starting => (name, "idle", None),
         State::Idle => (name, "idle", Some(true)),
         State::Working => (name, "working", Some(true)),
+        State::Blocked => (name, "blocked", Some(true)),
         State::Unknown => (name, "unknown", None),
     }
 }
@@ -1914,6 +1925,7 @@ pub fn stage_from_json(v: &Value) -> Stage {
             "starting" => State::Starting,
             "idle" => State::Idle,
             "working" => State::Working,
+            "blocked" => State::Blocked,
             "gone" => State::Gone,
             "unknown" => State::Unknown,
             // A seat that named an agent and no state is one that is sitting
@@ -2108,7 +2120,9 @@ mod tests {
     fn the_dialect_is_the_inverse_of_the_readings_wsp_makes() {
         let read = |spot: &Spot| crate::place_herdr::state_of_agent(&herdr::parse_pane(&agent_json(spot)));
 
-        for state in [State::Empty, State::Starting, State::Idle, State::Working, State::Unknown] {
+        for state in
+            [State::Empty, State::Starting, State::Idle, State::Working, State::Blocked, State::Unknown]
+        {
             let spot = Spot::agent("s1", "claude", "t-1", state);
             assert_eq!(
                 read(&spot),
@@ -2130,6 +2144,32 @@ mod tests {
         let starting = Spot::agent("s1", "claude", "t-1", State::Starting);
         assert_eq!(of_state(&starting).2, None, "herdr was made to send a readiness it does not send");
         assert!(!read(&starting).will_take_a_prompt(), "the port would tell a caller to prompt a banner");
+    }
+
+    /// `done` is the one status in herdr's vocabulary with no `Spot`, and the
+    /// asymmetry is deliberate rather than missing — so it is asserted here
+    /// instead of being left to be discovered as a hole.
+    ///
+    /// herdr sends it for an agent that went idle while nobody was looking
+    /// (`app/api_helpers.rs:104`), which makes it a fact about a viewer's
+    /// window rather than about an agent. The adapter reads it as `Idle`, so it
+    /// cannot round-trip, and a fake that gave it its own state would be
+    /// offering wsp a distinction wsp has decided not to have.
+    #[test]
+    fn done_is_a_word_herdr_uses_for_idle_and_the_fake_never_sends_it() {
+        let done = herdr::parse_pane(&json!({
+            "pane_id": "s1", "agent": "claude", "agent_status": "done", "interactive_ready": true,
+        }));
+        assert_eq!(crate::place_herdr::state_of_agent(&done), State::Idle);
+        assert!(
+            crate::place_herdr::state_of_agent(&done).will_take_a_prompt(),
+            "read as Unknown this agent was unreachable, and four of twelve on this machine were it"
+        );
+
+        for state in [State::Idle, State::Working, State::Blocked, State::Starting] {
+            let spot = Spot::agent("s1", "claude", "t-1", state);
+            assert_ne!(of_state(&spot).1, "done", "{state:?} was given herdr's viewer flag");
+        }
     }
 
     /// The launch window is something [`Stage::unnamed`] *does*, not something

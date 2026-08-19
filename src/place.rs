@@ -546,9 +546,16 @@ pub struct Agent {
 
 /// What an agent in a seat is doing, as far as the backend can tell.
 ///
-/// herdr reports two states, working or idle, and the README already says why
-/// that is not enough: "`idle` is an answer to a question nobody asked". This
-/// enum is the six answers wsp actually acts on, each with a caller today.
+/// The README says why a backend's own vocabulary is not enough: "`idle` is an
+/// answer to a question nobody asked". This enum is the answers wsp acts on,
+/// each with a caller today.
+///
+/// **The distinction this is for is [`State::turn_in_flight`], and it is the
+/// only one that separates work happening from a slot producing nothing.**
+/// Everything else here is about what wsp may *do* to a seat. That one is about
+/// whether anything is happening in it, and until robustness-083 nothing in wsp
+/// asked it — a census counted processes, and a process that had stopped
+/// mid-task counted the same as one three hours into a turn.
 ///
 /// The two that look like luxuries are the two that have cost the most:
 ///
@@ -574,8 +581,22 @@ pub enum State {
     /// Waiting for input. The only state in which [`Place::tell`] is expected
     /// to succeed.
     Idle,
-    /// Busy. Nothing to do about it and nothing to ask it.
+    /// Busy. Nothing to do about it and nothing to ask it. **The only state in
+    /// which a turn is in flight** — see [`State::turn_in_flight`].
     Working,
+    /// Stopped in front of a question only a person can answer: a permission
+    /// prompt, a trust dialog. Running, and going nowhere until somebody
+    /// answers.
+    ///
+    /// Separate from [`State::Idle`] because the two want opposite handling and
+    /// were indistinguishable until robustness-083: an idle agent is told the
+    /// next thing, a blocked one is *answered*, and a sentence sent to it lands
+    /// in the modal rather than in the composer. It is also the state a Claude
+    /// Code reaches by responding to a work order with a permission request,
+    /// which is why `fork-015` could not have `agent.prompt` wait for
+    /// `working` — a prompt plainly taken passes through here and never
+    /// through there.
+    Blocked,
     /// There was an agent here and it has stopped. The seat may still exist.
     ///
     /// herdr cannot distinguish this from [`State::Empty`] in a listing — an
@@ -597,6 +618,7 @@ impl State {
             State::Starting => "starting",
             State::Idle => "idle",
             State::Working => "working",
+            State::Blocked => "blocked",
             State::Gone => "gone",
             State::Unknown => "unknown",
         }
@@ -613,7 +635,52 @@ impl State {
 
     /// Whether something is running here, whatever it is doing.
     pub fn is_running(&self) -> bool {
-        matches!(self, State::Starting | State::Idle | State::Working)
+        matches!(self, State::Starting | State::Idle | State::Working | State::Blocked)
+    }
+
+    /// Whether a turn is actually running — the reading robustness-083 was
+    /// opened for, and the one nothing in wsp had.
+    ///
+    /// [`State::is_running`] answers "is there a process here", which is what
+    /// every census in wsp asked and is not the question. Seven agents on
+    /// 2026-08-18 answered yes to it with their turns abandoned by an API
+    /// overload: process alive, conversation intact, nothing happening, and
+    /// `doctor` reporting `herdr up, 12 agents`. **An agent that is not turning
+    /// will not start turning on its own**, whatever put it there.
+    ///
+    /// So this is deliberately not `!is_running()` and deliberately does not
+    /// try to say *why* a turn ended. Idle after finishing, idle after an
+    /// overload and blocked on a permission are three different repairs and one
+    /// identical fact: the slot is costing something and producing nothing.
+    /// Telling them apart is a job for whoever reads the census, and wsp does
+    /// not have to understand the cause to raise a hand — see
+    /// `cmd_agent::Bound`.
+    ///
+    /// [`State::Unknown`] answers false, on the rule the rest of this file is
+    /// built on: an absence is not a fact, and least of all a fact about work
+    /// getting done.
+    pub fn turn_in_flight(&self) -> bool {
+        matches!(self, State::Working)
+    }
+
+    /// The same fact from the other side: **there is an agent here and it is
+    /// doing nothing.**
+    ///
+    /// Not merely `!turn_in_flight()`, and the difference is [`State::Unknown`]
+    /// and [`State::Empty`]. An agent nobody can see is not an agent that has
+    /// stopped, and a seat with nothing in it has not stopped either — it is a
+    /// different report with a different verb under it. Only a seat known to
+    /// hold something known not to be turning belongs here.
+    ///
+    /// Written once because four censuses ask it — `wip`'s `needs you`,
+    /// `overlap`'s, the panel's `←`, and `doctor`'s quiet check — and until
+    /// robustness-083 each of them asked it as `agent_status == "idle"`. That
+    /// is one of *three* words herdr has for a pane running no turn, and the
+    /// other two are not corner cases: `done` was four of twelve agents on this
+    /// machine when it was measured, and `blocked` is a permission prompt,
+    /// which is the failure most worth interrupting somebody for.
+    pub fn stopped(&self) -> bool {
+        self.is_running() && !self.turn_in_flight()
     }
 }
 
@@ -918,10 +985,49 @@ mod tests {
     #[test]
     fn only_an_agent_known_to_be_idle_is_told_anything() {
         assert!(State::Idle.will_take_a_prompt());
-        for silent in [State::Starting, State::Unknown, State::Empty, State::Working, State::Gone] {
+        for silent in
+            [State::Starting, State::Unknown, State::Empty, State::Working, State::Blocked, State::Gone]
+        {
             assert!(!silent.will_take_a_prompt(), "{silent:?} was told something");
         }
         assert_eq!(State::default(), State::Unknown, "an absence is not a fact");
+    }
+
+    /// The distinction robustness-083 exists for: **a process is not a turn.**
+    ///
+    /// Every census in wsp asked `is_running` and reported the answer as work in
+    /// progress. On 2026-08-18 an API overload left seven agents alive with
+    /// their turns abandoned, and every one of them answered yes to it — process
+    /// alive, conversation intact, nothing happening, and `doctor` saying
+    /// `herdr up, 12 agents`. These are the two readings side by side, because
+    /// the whole failure was that only one of them existed.
+    #[test]
+    fn a_process_that_exists_is_not_a_turn_that_is_running() {
+        assert!(State::Working.turn_in_flight());
+        for stopped in [State::Idle, State::Blocked, State::Starting] {
+            assert!(stopped.is_running(), "{stopped:?} is an agent that is there");
+            assert!(!stopped.turn_in_flight(), "{stopped:?} is an agent that is doing nothing");
+        }
+        for absent in [State::Empty, State::Gone, State::Unknown] {
+            assert!(!absent.turn_in_flight(), "{absent:?}");
+        }
+        // Not written as `!is_running()`, and this is the assertion that says
+        // why: an agent stopped on a permission prompt is running, is not
+        // turning, and is the one of the three that a person can clear in a
+        // keystroke.
+        assert!(State::Blocked.is_running());
+        assert!(!State::Blocked.will_take_a_prompt(), "a sentence would be typed at the dialog");
+
+        // And `stopped` is not the complement of `turn_in_flight`, which is the
+        // trap in writing it inline at a call site: silence and an empty seat
+        // both answer no to both, and neither is an agent that has stalled.
+        for stopped in [State::Idle, State::Blocked, State::Starting] {
+            assert!(stopped.stopped(), "{stopped:?}");
+        }
+        for neither in [State::Unknown, State::Empty, State::Gone] {
+            assert!(!neither.turn_in_flight(), "{neither:?}");
+            assert!(!neither.stopped(), "{neither:?} is not an agent that stopped");
+        }
     }
 
     /// A seat with nothing in it is not an agent that died, and neither of them
@@ -932,7 +1038,7 @@ mod tests {
         assert!(!State::Empty.is_running());
         assert!(!State::Gone.is_running());
         assert!(!State::Unknown.is_running(), "not knowing is not evidence of work");
-        for running in [State::Starting, State::Idle, State::Working] {
+        for running in [State::Starting, State::Idle, State::Working, State::Blocked] {
             assert!(running.is_running(), "{running:?}");
         }
     }

@@ -70,13 +70,24 @@ pub(super) const MAX_AGENTS_DOCKED: usize = 5;
 
 /// What an agent is waiting for, as far as anything here can tell.
 ///
-/// herdr reports two states, working and idle, and `idle` is an answer to a
-/// question nobody asked: an agent that has stopped is waiting for *something*,
-/// and which something decides whether you have to get up. The store holds the
-/// other half of it. A pane still holding a task that is `doing` has stopped
-/// part-way through and is waiting on you; one holding a task at `blocked` is
-/// waiting on a decision that is at least written down; one holding nothing is
-/// waiting for work. Same two states from herdr, three different answers.
+/// `idle` is an answer to a question nobody asked: an agent that has stopped is
+/// waiting for *something*, and which something decides whether you have to get
+/// up. The store holds the other half of it. A pane still holding a task that
+/// is `doing` has stopped part-way through and is waiting on you; one holding a
+/// task at `blocked` is waiting on a decision that is at least written down; one
+/// holding nothing is waiting for work. One reading from herdr, three different
+/// answers.
+///
+/// **The two `Blocked`s in this file are not the same thing, and the second one
+/// arrived late.** [`AgentState::Blocked`] here means the *task* carries a
+/// written question. herdr also has an `agent_status: "blocked"`, which means a
+/// dialog on that pane has the keyboard right now — a permission request, a
+/// trust prompt — and until robustness-083 it fell through to
+/// [`AgentState::Quiet`] and drew as the dimmest row on the screen. It is the
+/// opposite: the loudest thing here, and the only one a person clears in a
+/// single keystroke. It is drawn as `Asking`, with the task-blocked reading kept
+/// separate, because "a question written on a task" and "a modal waiting for a
+/// keypress" want the same *attention* and completely different actions.
 ///
 /// Declaration order is the order they are drawn in and sorted by: what wants
 /// an answer, then what is free, then what is busy, then what has not said.
@@ -105,8 +116,15 @@ pub(crate) enum AgentState {
     /// row the whole section exists to show.
     Spare,
     Working,
-    /// herdr says neither working nor idle, so nothing here is going to pretend
-    /// to know. Mostly a pane whose agent has not spoken since it started.
+    /// herdr says it does not know, or has not said at all, so nothing here is
+    /// going to pretend to. Mostly a pane whose agent has not spoken since it
+    /// started.
+    ///
+    /// Narrower than it was: `done` and herdr's own `blocked` both used to land
+    /// here, and neither is an absence of information — one is a finished turn
+    /// and the other a dialog waiting for a keypress. Drawing the two states we
+    /// know most about as the one we know nothing about is what this row is for
+    /// *not* doing.
     Quiet,
 }
 
@@ -180,6 +198,11 @@ pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>, seat: bool) 
         // know" — would draw the one moment we know most about as the one we
         // know nothing about. Which the panel is now far likelier to sample,
         // since a status change is what it refetches on.
+        // herdr's own `blocked`: a dialog has the keyboard on that pane. Read
+        // before the seat, because a custodian stopped on a permission prompt is
+        // not resting between agents — it is the one case where a governor's
+        // silence is a fault, and the case a night of sequencing dies in.
+        "blocked" => AgentState::Asking,
         "idle" | "done" if seat => AgentState::Seated,
         "idle" | "done" => match holds {
             Some(Status::Blocked) => AgentState::Blocked,
@@ -1111,7 +1134,10 @@ pub(super) fn task_rows(
     mine.sort_by_key(|t| {
         let a = agent_for_task(&t.id);
         let needs_you = crate::cmd_govern::needs_a_person(
-            a.as_ref().map(|a| a.state == "idle").unwrap_or(false),
+            // See `live::AgentRef::stopped`: `state == "idle"` was one of the
+            // three words herdr has for a pane running no turn, and it is not
+            // the common one.
+            a.as_ref().map(|a| a.stopped()).unwrap_or(false),
             t.status() == Status::Doing,
             a.as_ref().map(|a| a.seat.is_some()).unwrap_or(false),
         );
@@ -1148,7 +1174,10 @@ pub(super) fn task_rows(
         }
         let a = agent_for_task(&t.id);
         let needs_you = crate::cmd_govern::needs_a_person(
-            a.as_ref().map(|a| a.state == "idle").unwrap_or(false),
+            // See `live::AgentRef::stopped`: `state == "idle"` was one of the
+            // three words herdr has for a pane running no turn, and it is not
+            // the common one.
+            a.as_ref().map(|a| a.stopped()).unwrap_or(false),
             t.status() == Status::Doing,
             a.as_ref().map(|a| a.seat.is_some()).unwrap_or(false),
         );
@@ -2733,6 +2762,41 @@ mod tests {
         // The mark is the task's own status, not the agent's: dim, and the
         // same square as blocked at half the weight.
         assert_eq!(status_mark(Status::Parked), (Style::Dim, glyph::PARKED));
+    }
+
+    /// herdr's `blocked` is a dialog holding the keyboard on that pane, and it
+    /// used to fall through to `Quiet` — the dimmest row on the screen, meaning
+    /// "nothing here will pretend to know", for the one state a person clears
+    /// in a single keystroke.
+    ///
+    /// The two things called blocked stay apart. A task with a question written
+    /// on it is a decision somebody owes; a permission prompt is a keypress
+    /// somebody owes *now*, and the second is not a fact about the task at all
+    /// — an agent can be sitting on one while holding nothing.
+    #[test]
+    fn an_agent_stopped_on_a_permission_prompt_is_the_loudest_row_and_not_the_quietest() {
+        assert_eq!(agent_state("blocked", Some(Status::Doing), false), AgentState::Asking);
+        assert_eq!(
+            agent_state("blocked", None, false),
+            AgentState::Asking,
+            "the dialog is on the pane whether or not the pane holds work"
+        );
+        // Including a custodian, which is the one row whose silence is
+        // otherwise its resting state — and the row a night of sequencing dies
+        // in when nothing says it is stopped.
+        assert_eq!(
+            agent_state("blocked", None, true),
+            AgentState::Asking,
+            "a seat on a permission prompt is not resting between agents"
+        );
+        assert_ne!(
+            agent_state("blocked", Some(Status::Doing), false),
+            AgentState::Quiet,
+            "the state this was drawn as, for as long as herdr has been sending it"
+        );
+        // And the task-blocked reading is untouched: same attention, different
+        // action, so they may not be folded into one another.
+        assert_eq!(agent_state("idle", Some(Status::Blocked), false), AgentState::Blocked);
     }
 
     fn task(id: &str, project: Option<&str>, status: &str) -> Task {

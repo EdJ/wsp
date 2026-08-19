@@ -77,9 +77,12 @@ pub(crate) struct AgentRef {
     /// launched from the directory above every checkout stands in no project by
     /// this measure, which is why the panel can end up having to ask.
     pub(crate) cwd: String,
-    /// herdr's word for what the agent is doing — `working`, `idle`, and the
-    /// empty string for a pane that has not said. Read through
-    /// [`crate::panel::agent_state`], which joins it with what the store holds.
+    /// herdr's word for what the agent is doing, kept raw. Five of them —
+    /// `working`, `idle`, `blocked`, `done`, `unknown` — plus the empty string
+    /// for a pane that has not said, and **four of the six mean no turn is
+    /// running**. Read through [`crate::panel::agent_state`], which joins it
+    /// with what the store holds, or through [`AgentRef::stopped`] for the one
+    /// question four censuses ask of it.
     pub(crate) state: String,
     /// Whether an agent is running here, or it is just a shell.
     pub(crate) agent: bool,
@@ -171,6 +174,22 @@ impl Claimed {
 }
 
 impl AgentRef {
+    /// There is an agent in this pane and no turn is running in it.
+    ///
+    /// Read here rather than at the call sites, and the guard in
+    /// [`tests::no_view_names_the_runner`] is why: the answer needs the herdr
+    /// adapter's word table, and a view that reached for it would link wsp's
+    /// socket client into every renderer. This file is already on the other
+    /// side of that seam, so the translation happens once, here, and the views
+    /// get a bool.
+    ///
+    /// The predicate is [`crate::place::State::stopped`] — three of herdr's
+    /// five words, not the one the panel and `wip` used to test for. See it for
+    /// what the other two cost.
+    pub(crate) fn stopped(&self) -> bool {
+        self.agent && crate::place_herdr::of_word(&self.state).stopped()
+    }
+
     /// What to call it — see [`pane_name`], and [`AgentRef::full`] for the
     /// longer answer that outranks it.
     ///
@@ -371,6 +390,35 @@ mod tests {
                  and if it is missing a field, add the field here",
             );
         }
+    }
+
+    /// The reading four censuses share, and the two words that used to be
+    /// missing from all four.
+    ///
+    /// `done` is the expensive one because it is not rare: herdr sends it for
+    /// an agent that finished a turn while nobody was looking at its workspace,
+    /// which on a machine running agents in the background is most of them —
+    /// four of twelve here on 2026-08-19. Every panel, `wip` row and brief read
+    /// those four as busy.
+    #[test]
+    fn a_pane_running_no_turn_says_so_in_more_than_one_word() {
+        let of = |state: &str| AgentRef { agent: true, state: state.into(), ..Default::default() };
+
+        assert!(of("idle").stopped());
+        assert!(of("done").stopped(), "finished while nobody was looking, and read as busy");
+        assert!(of("blocked").stopped(), "a permission prompt is not work in progress");
+        assert!(!of("working").stopped());
+
+        // Silence is not a stall, and neither is a shell. Both would otherwise
+        // be drawn as an agent waiting on a person — the loudest mark on the
+        // panel — for a pane that has nothing to say and a pane that has
+        // nobody in it.
+        assert!(!of("").stopped());
+        assert!(!of("unknown").stopped());
+        assert!(
+            !AgentRef { agent: false, state: "idle".into(), ..Default::default() }.stopped(),
+            "a plain shell is idle for ever"
+        );
     }
 
     /// One pane in the census has the keyboard, and a click means one thing in

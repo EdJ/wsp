@@ -469,12 +469,18 @@ fn wait_ready(
 /// had logged in, which reported three lines of success on 2026-08-17 for an
 /// agent that could never take a turn.
 ///
-/// [`State::Working`] and nothing softer is what counts as taken. `Unknown` is
-/// what herdr's `blocked` and `done` arrive as (`place_herdr::of_status`), and
-/// an absence is not a fact — the rule the rest of this file is built on. The
-/// cost of that strictness is the one false alarm available here: an agent that
-/// takes the order, finishes the whole turn inside [`Patience::taken`] and is
-/// idle again by the first look. A work order whose first act is reading a
+/// [`State::turn_in_flight`] and nothing softer is what counts as taken, and
+/// robustness-083 gave that reading a name without widening it. The one that
+/// asks to be let in is [`State::Blocked`] — an agent that answers a work order
+/// by asking for a permission has plainly taken it — and it must stay out,
+/// because the *other* thing that reads `blocked` is a folder-trust modal
+/// holding the keyboard with the order still unsent behind it. Those two are
+/// the same status and opposite outcomes, and the second Enter below is right
+/// for one of them, so this stays strict and lets the press decide.
+///
+/// The cost of that strictness is the one false alarm available here: an agent
+/// that takes the order, finishes the whole turn inside [`Patience::taken`] and
+/// is idle again by the first look. A work order whose first act is reading a
 /// brief does not, and a spawn wrongly called failed is recoverable in a way
 /// that a spawn wrongly called succeeded is not.
 fn hand_over(
@@ -531,7 +537,7 @@ fn took_it(place: &dyn Place, seat: &Seat, wait: &Patience) -> bool {
     let now = || wait.clock.now();
     let deadline = now() + wait.taken;
     loop {
-        if let Ok(State::Working) = place.state(seat) {
+        if place.state(seat).is_ok_and(|s| s.turn_in_flight()) {
             return true;
         }
         if now() >= deadline {

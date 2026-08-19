@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::cmd_govern;
 use crate::herdr;
 use crate::model::{Status, Task};
-use crate::place::Place;
+use crate::place::{Place, State};
 use crate::place_herdr::Herdr;
 use crate::resolve::{self, Index};
 use crate::store::Store;
@@ -913,6 +913,178 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     }
     println!("{}", p.dim("wsp flag --clear <id> lowers one"));
     0
+}
+
+/// `wsp tell <id> "…"` — say something to an agent without ending it.
+///
+/// **The verb that was missing, and the reason a stalled agent was expensive
+/// rather than merely annoying.** Until this, the only thing that reached an
+/// ordinary agent was a spawn's work order; `wsp govern --tell` reached a
+/// governor and nothing reached anybody else. So the whole repertoire for an
+/// agent that had stopped was `wsp despawn` and `wsp spawn` — which is not a
+/// repair, it is a demolition. On 2026-08-18 that discarded hours of unrecorded
+/// reading across seven agents whose conversations were entirely intact; the
+/// turn had ended, and nothing else had.
+///
+/// So this is the cheap half of the answer to [`quiet_note`]: the census says
+/// which agents are not turning, and this says a sentence to one of them. It is
+/// the same delivery `spawn` uses for a work order and `govern --tell` uses for
+/// direction — [`crate::agent_commands`] over [`crate::place::Place::tell`] —
+/// because how a sentence reaches an agent is a fact about the agent's kind,
+/// and there should not be three answers to it.
+///
+/// **No `/clear` in front of it**, unlike the hand-overs in `panel::verbs`. A
+/// work order is given to an agent that has just finished something else and
+/// wants an empty context; this is a word to one that is in the middle of a
+/// piece of work and whose context is the thing worth saving. Emptying it would
+/// destroy exactly what makes this cheaper than a respawn.
+///
+/// Takes the message on stdin as well as in argv, from the first line rather
+/// than after somebody is bitten. `render-080` recorded what argv-only costs on
+/// this specific payload: a message to an agent is long prose full of file and
+/// verb names, which is precisely the text that wants backticks, and inside the
+/// double quotes a shell needs for it every backtick is command substitution.
+/// Three phrases *executed* instead of being delivered, and the message arrived
+/// fluent with the load-bearing nouns missing — silent at the receiving end,
+/// which is worse than an error.
+pub fn tell(store: &Store, args: &Args) -> i32 {
+    let p = Paint::new();
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp tell <id> \"…\"   (or `-` to read it from stdin)");
+        return 2;
+    };
+    let text = match message(args) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    if !herdr::available() {
+        eprintln!("wsp: no herdr socket — nothing to say it to");
+        return 1;
+    }
+
+    // Not `peek_target`, and the difference is worth a line rather than the
+    // reuse. That resolver's whole value is that it also finds the panel, the
+    // view and the board, which are wsp's own panes and hold no agent — the
+    // right answer for "show me what this looks like" and a hazard for a verb
+    // that types prose into whatever it lands on. This resolves the two things
+    // that can hold an agent and nothing else.
+    let (seat, what) = match target(store, &needle) {
+        Some(v) => v,
+        None => {
+            eprintln!("wsp: nothing holds `{needle}` — `wsp wip` says who holds what");
+            return 1;
+        }
+    };
+
+    let place = Herdr::new();
+    let Some(pane) = herdr::panes().ok().and_then(|ps| ps.into_iter().find(|x| x.pane_id == seat)) else {
+        eprintln!("wsp: herdr does not list {seat}");
+        return 1;
+    };
+    if pane.agent.trim().is_empty() {
+        eprintln!("wsp: no agent in {seat} — the pane is alive and empty. `wsp spawn {needle}` puts one in it");
+        return 1;
+    }
+    // The one state a message must not be sent into, and the reason it is
+    // checked here rather than left to the backend. A blocked agent has a
+    // permission dialog holding the keyboard, so the text does not queue behind
+    // anything — it is typed *at the dialog*, where a sentence about what to do
+    // next can select an answer nobody chose. herdr cannot refuse this for us:
+    // from its side the prompt was delivered and the pane took the keys.
+    if matches!(crate::place_herdr::state_of_pane(&pane), State::Blocked) {
+        eprintln!("wsp: {what} is stopped on a prompt only a person can answer — answer that first");
+        eprintln!("     `wsp peek {needle}` shows what it is asking");
+        return 1;
+    }
+
+    let how = crate::agent_commands::of(&pane.agent);
+    match how.tell(&place, &crate::place::Seat::new(&seat), &text) {
+        Ok(()) => {
+            // Recorded as an event and not on the task's log, deliberately. The
+            // log is injected into every future spawn on that task, so a line
+            // per sentence would be paid for by every session afterwards; this
+            // is forensics — who said what to whom, when — and belongs where
+            // the claims and the releases already are.
+            store.log_event(
+                "agent-told",
+                json!({ "target": what, "pane": seat, "chars": text.len() }),
+            );
+            if args.json() {
+                println!("{}", json!({ "target": what, "pane": seat, "told": true }));
+            } else {
+                println!("{}", p.dim(&format!("→ {what} · {seat}")));
+            }
+            0
+        }
+        // `NotTaken` is delivered-and-unmoved, which for this verb is the
+        // interesting answer rather than an error: the sentence is sitting in
+        // the composer unsent, and it is still there to be rescued. Named as
+        // such, because "failed" would make somebody send it twice.
+        Err(crate::place::Refusal::NotTaken) => {
+            eprintln!("wsp: {what} took the text and started nothing — it is sitting in the composer");
+            eprintln!("     `wsp peek {needle}` shows it; a return in the pane sends it");
+            1
+        }
+        Err(e) => {
+            eprintln!("wsp: {what} was not told: {e}");
+            1
+        }
+    }
+}
+
+/// The pane holding an agent that a needle names: a pane id, or a task.
+///
+/// A workspace is not accepted, and that is a refusal rather than an omission.
+/// A workspace can hold several panes with agents in them, and picking one for
+/// the caller is how a sentence meant for one agent reaches its neighbour —
+/// `govern --tell` may do it because a governorship *is* the workspace's, and a
+/// task is held by a pane.
+fn target(store: &Store, needle: &str) -> Option<(String, String)> {
+    if needle.contains(':') {
+        return Some((needle.to_string(), format!("pane {needle}")));
+    }
+    let t = store.find_task(needle)?;
+    let pane = store.panes_for_task(&t.id).into_iter().next()?;
+    Some((pane, format!("{} — {}", t.id, util::truncate(&t.title, 44))))
+}
+
+/// The message: the rest of the line, or a stream.
+///
+/// Not folded to one line, which is where this parts company with `wsp note`.
+/// That one folds because the `## Log` it writes to is read line-by-line by
+/// everything downstream. This writes to a composer, and the paragraph breaks
+/// in a brief are what make it readable by the thing that has to act on it.
+fn message(args: &Args) -> Result<String, i32> {
+    let rest = args.rest.get(1..).unwrap_or_default();
+    let stream = matches!(rest, [one] if one == "-");
+    if !stream {
+        let text = args.text(1);
+        let text = text.trim();
+        return match text.is_empty() {
+            true => {
+                eprintln!("wsp: nothing to say");
+                Err(2)
+            }
+            false => Ok(text.to_string()),
+        };
+    }
+    if util::stdin_is_tty() {
+        // The same failure `wsp note` names: a command that stops and silently
+        // swallows keys is worse than one that refuses.
+        eprintln!("wsp: nothing is piped in — `-` reads the message from a stream");
+        return Err(2);
+    }
+    match crate::cmd_task::read_source("-") {
+        Ok(raw) if raw.trim().is_empty() => {
+            eprintln!("wsp: nothing on stdin — nothing sent");
+            Err(2)
+        }
+        Ok(raw) => Ok(raw.trim().to_string()),
+        Err(e) => {
+            eprintln!("wsp: cannot read stdin: {e}");
+            Err(1)
+        }
+    }
 }
 
 /// `wsp say "<what you are doing>"` — an agent says where it has got to.
@@ -2495,6 +2667,11 @@ struct WipRow {
     pane: String,
     workspace: String,
     state: String,
+    /// Whether a turn is actually running in it. Beside `state` rather than
+    /// derived from it at the point of drawing, because it is the answer to the
+    /// question the heading asks — and because reading it off the word is the
+    /// thing four censuses each got wrong in their own way.
+    turning: bool,
     needs_you: bool,
     /// The project this pane's workspace is the governor of, if any — which is
     /// no project for every ordinary agent, and that is nearly all of them.
@@ -2530,10 +2707,14 @@ fn wip_rows(w: &Wip) -> Vec<WipRow> {
             Some(&a.cwd),
         );
 
-        let idle = a.agent_status == "idle";
+        // Not `agent_status == "idle"`, which was three words short: see
+        // `cmd_govern::needs_a_person`. Running and not turning is the whole
+        // predicate, and it is asked of the port rather than of herdr's
+        // spelling so the next word herdr adds does not read as work.
+        let stopped = crate::place_herdr::state_of_pane(a).stopped();
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
         let seat = cmd_govern::governs(&w.governors, &a.workspace_id);
-        let needs_you = cmd_govern::needs_a_person(idle, doing, seat.is_some());
+        let needs_you = cmd_govern::needs_a_person(stopped, doing, seat.is_some());
 
         rows.push(WipRow {
             project: r.project.unwrap_or_else(|| "—".into()),
@@ -2544,6 +2725,7 @@ fn wip_rows(w: &Wip) -> Vec<WipRow> {
             pane: a.pane_id.clone(),
             workspace: label.unwrap_or_default(),
             state: a.agent_status.clone(),
+            turning: crate::place_herdr::state_of_pane(a).turn_in_flight(),
             needs_you,
             seat,
         });
@@ -2569,8 +2751,9 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         "agents": rows.iter().map(|r| json!({
             "project": r.project, "task": r.task, "task_id": r.task_id,
             "pane": r.pane, "workspace": r.workspace, "state": r.state,
-            "needs_you": r.needs_you, "seat": r.seat,
+            "turning": r.turning, "needs_you": r.needs_you, "seat": r.seat,
         })).collect::<Vec<_>>(),
+        "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
         "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
@@ -2587,12 +2770,29 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
     if rows.is_empty() {
         out.push(p.dim("no agents running"));
     } else {
-        out.push(format!(
+        // Not `all busy`, which is what this said and was the same sentence
+        // `doctor`'s `herdr up, 12 agents` was saying on the night seven of
+        // them had stopped. `needs you` is a narrower question — stopped *on a
+        // task that is still `doing`* — so a machine full of agents that had
+        // finished and were holding their slots answered it truthfully with
+        // nought, and printed `all busy` over five panes running no turn.
+        // Measured here on 2026-08-19: 12 agents, 7 turning, `all busy`.
+        //
+        // Both counts, because they answer different questions and the second
+        // one does not imply the first. Nothing needing you is genuinely good
+        // news; five agents idle is a slot problem whether or not anybody is
+        // owed an answer.
+        let turning = rows.iter().filter(|r| r.turning).count();
+        let mut head = format!(
             "{}  ·  {} agents  ·  {}",
             p.bold("WIP"),
             rows.len(),
-            if needs > 0 { p.yellow(&format!("{needs} need you")) } else { p.dim("all busy") }
-        ));
+            p.dim(&format!("{turning} running a turn"))
+        );
+        if needs > 0 {
+            head.push_str(&format!("  ·  {}", p.yellow(&format!("{needs} need you"))));
+        }
+        out.push(head);
         out.push(String::new());
         let pw = rows.iter().map(|r| r.project.chars().count()).max().unwrap_or(7).max(7);
         let tw = 46;
@@ -3257,7 +3457,8 @@ impl Probe {
     }
 }
 
-/// Which of four states a bound pane is in, and the middle one is the point.
+/// Which of five states a bound pane is in, and the two in the middle are the
+/// ones a census kept confusing with work.
 ///
 /// `doctor` used to ask a single question — "is this pane in `agent.list`" —
 /// and report every `No` as a dead pane needing `wsp sync`. `sync` reaps
@@ -3265,13 +3466,27 @@ impl Probe {
 /// nothing, and `doctor` printed the same line on the next run, and the run
 /// after that, indefinitely. The fault was the diagnosis rather than the sweep.
 ///
-/// So the fix is a name for the state that had none: the pane is alive and the
-/// agent inside it exited. That is not an absent pane, it is an *emptied* one,
-/// and it is worth showing rather than reaping — it means an agent stopped
-/// mid-task with its claim still held and its worktree still on disk.
+/// So [`Bound::Emptied`] was the first name for a state that had none: the pane
+/// is alive and the agent inside it exited. That is not an absent pane, it is an
+/// *emptied* one, and it is worth showing rather than reaping — it means an
+/// agent stopped mid-task with its claim still held and its worktree still on
+/// disk.
+///
+/// **[`Bound::Quiet`] is the second, and it is the one robustness-083 was
+/// opened for.** Every `Yes` to that single question was called running,
+/// because a row in `agent.list` was taken for work happening. It is not: on
+/// 2026-08-18 an API overload left seven agents with their processes alive,
+/// their conversations intact and their turns abandoned, and `doctor` counted
+/// all seven and said `herdr up, 12 agents`. Nothing had been written to a task
+/// in hours. The reading that separates them was on the socket the whole time
+/// (`place::State::turn_in_flight`), and this asks it.
 enum Bound {
-    /// An agent is running in the pane. Nothing to say.
-    Working,
+    /// A turn is in flight. This, and only this, is work happening.
+    Turning,
+    /// An agent is in the pane and no turn is running. Finished, stopped, or
+    /// waiting on a person — see [`State::turn_in_flight`] for why this does not
+    /// try to say which, and [`quiet_note`] for what makes it worth reporting.
+    Quiet(State),
     /// The pane is listed and no agent is in it. `despawn`, then decide.
     Emptied,
     /// The pane is not listed, and its machine did answer. `sync` reaps it.
@@ -3286,8 +3501,14 @@ fn bound_state(
     panes: &[herdr::Pane],
     answered: &std::collections::BTreeMap<&str, usize>,
 ) -> Bound {
-    if agents.iter().any(|a| a.pane_id == pane) {
-        return Bound::Working;
+    if let Some(a) = agents.iter().find(|a| a.pane_id == pane) {
+        // The status alone. See `place_herdr::state_of_pane` for why a census
+        // must not qualify this by readiness.
+        let state = crate::place_herdr::state_of_pane(a);
+        return match state.turn_in_flight() {
+            true => Bound::Turning,
+            false => Bound::Quiet(state),
+        };
     }
     if panes.iter().any(|p| p.pane_id == pane) {
         return Bound::Emptied;
@@ -3296,6 +3517,74 @@ fn bound_state(
         true => Bound::Gone,
         false => Bound::Unheard,
     }
+}
+
+/// How long a claim may sit with no turn running before it is worth a line.
+///
+/// An hour, and it is the task's own number rather than a tuned one. The point
+/// of the conjunction below is that neither half needs a fine threshold: an
+/// agent between turns is quiet for seconds, and an agent that has written
+/// nothing for an hour is normally deep in a turn. It takes both to be wrong.
+const QUIET: i64 = 60 * 60;
+
+/// What to say, if anything, about a bound pane with no turn in it.
+///
+/// **The conjunction is the whole design, and it is why this needs no screen
+/// and no new state.** Either half alone is ordinary:
+///
+/// - *no turn in flight* is every agent between turns, and every agent that has
+///   finished and is waiting to be told the next thing;
+/// - *nothing written to the task for an hour* is every agent halfway through a
+///   long read, which is exactly when it should be left alone.
+///
+/// Together they are never ordinary. An agent that is running no turn will not
+/// start one on its own — whatever ended the last one, nothing in this system
+/// resumes it — so a claim in that state is a slot spending money and producing
+/// nothing, and it stays that way until a person looks. That is the fact wsp
+/// already had in two files it already reads, and never put side by side.
+///
+/// [`State::Blocked`] skips the hour, because it is the one case where the
+/// repair is a keystroke and the report is the only thing that can summon
+/// somebody to press it. Waiting an hour to mention a permission prompt would
+/// be waiting an hour to say a word.
+///
+/// **What this does not do is guess why the turn ended.** Finished, stalled and
+/// overloaded look identical from here, and a diagnosis wsp cannot support
+/// would be worth less than the fact it can state: the agent is not working,
+/// and nothing has been written since *then*. A person reads that in a second.
+///
+/// The *status* it can read, and that is what picks the verb rather than the
+/// sentence. A task still `doing` is work that stopped in the middle, and the
+/// thing to try first is a word — the conversation is intact, and it was
+/// despawn-and-respawn that threw hours of unrecorded reading away on
+/// 2026-08-18. A task already in `review` is work that finished; the agent is
+/// not stalled, it is *done*, and what is wrong is that it is still holding a
+/// claim and a slot. Measured on this machine the moment this check first ran:
+/// four claims quiet for between five and nine hours, and every one of them the
+/// second kind. A check that had offered `wsp tell` for all four would have
+/// been ignored by the second afternoon.
+fn quiet_note(state: State, status: Status, since: Option<&str>) -> Option<String> {
+    if matches!(state, State::Blocked) {
+        return Some("stopped on a prompt only a person can answer — `wsp peek <id>` shows what it is asking".into());
+    }
+    let quiet = util::since(since?);
+    if quiet < QUIET {
+        return None;
+    }
+    let for_ = util::duration_human(quiet);
+    Some(match status {
+        // Finished, and still in the chair. Nothing is broken and a slot is
+        // gone, so the verb is the one that gives it back.
+        Status::Review | Status::Done => {
+            format!("finished {for_} ago and still holding the claim — `wsp release <id>` frees the slot")
+        }
+        // Waiting on somebody, which is a fact about the work rather than about
+        // the agent. Sitting idle is the correct thing for it to be doing.
+        Status::Blocked | Status::Parked => return None,
+        _ => format!(
+            "no turn running, and nothing written for {for_} — `wsp tell <id> …` reaches it without ending it"
+        ),
+    })
 }
 
 /// A few of the names in a line, with the rest counted.
@@ -3312,9 +3601,14 @@ fn few(named: &[String]) -> String {
 }
 
 /// What `doctor` says about herdr, and about the bindings that outlived it.
+///
+/// `tasks` is here for one reason: an agent's last turn is a fact about herdr
+/// and its last *output* is a fact about the store, and the check this function
+/// gained needs both in the same place. See [`quiet_note`].
 fn herdr_health(
     probe: &Probe,
     bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    tasks: &[Task],
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
@@ -3322,6 +3616,7 @@ fn herdr_health(
         Probe::Up { agents, panes } => {
             let answered = answered_by_machine(panes.iter().map(|p| p.pane_id.as_str()));
             let (mut emptied, mut gone) = (Vec::new(), Vec::new());
+            let (mut quiet, mut turning) = (Vec::new(), 0usize);
             for (pane, b) in bindings {
                 // Named by the work rather than by the pane, because the work
                 // is what the reader has to decide about and what the verb
@@ -3334,7 +3629,25 @@ fn herdr_health(
                 match bound_state(pane, agents, panes, &answered) {
                     Bound::Emptied => emptied.push(named),
                     Bound::Gone => gone.push(named),
-                    Bound::Working | Bound::Unheard => {}
+                    Bound::Turning => turning += 1,
+                    Bound::Quiet(state) => {
+                        // The later of the two, because either one moving is
+                        // the work advancing: `started_at` covers an agent put
+                        // on a task that already had a long history, and
+                        // `updated` covers everything after that.
+                        let started = b.get("started_at").and_then(|x| x.as_str());
+                        let touched = tasks.iter().find(|t| t.id == task).map(|t| t.updated.as_str());
+                        let last = [started, touched].into_iter().flatten().max();
+                        let status = tasks
+                            .iter()
+                            .find(|t| t.id == task)
+                            .map(|t| t.status())
+                            .unwrap_or(Status::Doing);
+                        if let Some(why) = quiet_note(state, status, last) {
+                            quiet.push(format!("{named} — {why}"));
+                        }
+                    }
+                    Bound::Unheard => {}
                 }
             }
             if !emptied.is_empty() {
@@ -3352,7 +3665,20 @@ fn herdr_health(
                     gone.len()
                 ));
             }
-            notes.push(format!("herdr up, {} agents", agents.len()));
+            // A problem rather than a note, which is the whole point of the
+            // task this came from: it was a note-shaped failure — everything
+            // reporting healthy — that cost a night. The conversation in each
+            // of these is intact, so `wsp tell` is the first thing to try and
+            // `wsp despawn` the last.
+            problems.extend(quiet.iter().cloned());
+            // Counted rather than listed, and the count is the correction. The
+            // old line said "12 agents" of a machine on which five were turning
+            // and seven had stopped, and read as health.
+            notes.push(format!(
+                "herdr up, {} agents — {turning} of {} claimed pane(s) running a turn",
+                agents.len(),
+                bindings.len()
+            ));
         }
         Probe::Unreachable(e) => problems.push(format!("herdr socket present but unreachable: {e}")),
         // Not a problem. A machine with no herdr on it is a machine wsp works
@@ -3611,7 +3937,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     section_damage(store, args, &tasks, &index.projects, &mut problems, &mut notes);
 
     let probe = Probe::live();
-    herdr_health(&probe, &bindings, &mut problems, &mut notes);
+    herdr_health(&probe, &bindings, &tasks, &mut problems, &mut notes);
     // Whether the machine has the one daemon it should have. The probe is passed
     // because a machine with no herdr on it wants no daemon either, and a check
     // that said "no daemon running" there is a check that gets ignored along
@@ -3875,6 +4201,125 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row of `agent.list`, and deliberately without `interactive_ready`:
+    /// that is how a plugin-reported agent arrives, and a census that could not
+    /// read one would be blind to a whole class of agent.
+    fn listed(pane: &str, status: &str) -> herdr::Pane {
+        herdr::parse_pane(&json!({ "pane_id": pane, "agent": "claude", "agent_status": status }))
+    }
+
+    /// The failure this file's census was rebuilt for, at the one line that
+    /// decides it.
+    ///
+    /// Seven agents on 2026-08-18 were listed by `agent.list`, alive, and doing
+    /// nothing at all — the turns had been abandoned by an API overload. Being
+    /// listed was the whole of what `doctor` asked, so all seven counted as work
+    /// in progress. A row in that listing is a process, and a process is not a
+    /// turn.
+    #[test]
+    fn an_agent_that_is_listed_is_not_thereby_working() {
+        let answered = answered_by_machine(["w1:p1", "w2:p1", "w3:p1"]);
+        let panes = vec![listed("w1:p1", "working"), listed("w2:p1", "idle"), listed("w3:p1", "blocked")];
+        let bound = |p: &str| bound_state(p, &panes, &panes, &answered);
+
+        assert!(matches!(bound("w1:p1"), Bound::Turning), "a turn in flight is the only working");
+        assert!(matches!(bound("w2:p1"), Bound::Quiet(State::Idle)), "alive, and nothing happening");
+        assert!(
+            matches!(bound("w3:p1"), Bound::Quiet(State::Blocked)),
+            "waiting on a person is not waiting on the model"
+        );
+
+        // And the two states that were already named stay where they were: this
+        // split the `Yes` arm and left the `No` arms alone.
+        let empty = herdr::parse_pane(&json!({ "pane_id": "w4:p1" }));
+        assert!(matches!(bound_state("w4:p1", &[], &[empty], &answered), Bound::Emptied));
+        assert!(matches!(bound_state("w9:p1", &[], &[], &answered), Bound::Gone));
+    }
+
+    /// herdr answers `done` for an agent that went idle while nobody was
+    /// looking at its workspace, which is the *majority* reading on a machine
+    /// running agents in the background — four of twelve on this one, live, on
+    /// 2026-08-19. Read as `Unknown` it was a seat wsp could not see and would
+    /// not speak to.
+    ///
+    /// It is `Idle` and not a state of its own because the difference between
+    /// the two words is `seen` (herdr `pane/state.rs:8`) — whether a person has
+    /// looked at the pane — and a census whose answer changes when somebody
+    /// switches tabs is not a census.
+    #[test]
+    fn an_agent_nobody_has_looked_at_is_idle_and_not_a_mystery() {
+        let answered = answered_by_machine(["w1:p1"]);
+        let panes = vec![listed("w1:p1", "done")];
+        assert!(matches!(
+            bound_state("w1:p1", &panes, &panes, &answered),
+            Bound::Quiet(State::Idle)
+        ));
+    }
+
+    /// Neither half of the test is a fault on its own, which is the whole
+    /// reason it can be run against every claim on the machine without crying
+    /// wolf.
+    #[test]
+    fn a_quiet_agent_is_only_worth_reporting_once_the_work_has_stopped_too() {
+        let recently = util::now_iso();
+        let long_ago = "2020-01-01T00:00:00Z";
+        assert_eq!(quiet_note(State::Idle, Status::Doing, Some(&recently)), None, "between turns");
+
+        let said = quiet_note(State::Idle, Status::Doing, Some(long_ago)).expect("an hour of both");
+        assert!(said.contains("no turn running"), "{said}");
+        assert!(said.contains("wsp tell"), "the repair that keeps the conversation: {said}");
+
+        // Blocked skips the clock: the repair is one keystroke by one person,
+        // and the only thing that can fetch them is being told now.
+        let now = quiet_note(State::Blocked, Status::Doing, Some(&recently)).expect("said at once");
+        assert!(now.contains("only a person can answer"), "{now}");
+
+        // Nothing to measure against is not evidence of a stall. A binding with
+        // no timestamp and no task predates this and says nothing either way.
+        assert_eq!(quiet_note(State::Idle, Status::Doing, None), None);
+    }
+
+    /// The status picks the verb, and getting this wrong is how the check gets
+    /// ignored. All four quiet claims on this machine when it first ran were
+    /// finished work, not stalled work — offering `wsp tell` for those would
+    /// have trained somebody to skip the line.
+    #[test]
+    fn an_agent_that_finished_is_holding_a_slot_and_not_stalled() {
+        let long_ago = Some("2020-01-01T00:00:00Z");
+
+        let done = quiet_note(State::Idle, Status::Review, long_ago).expect("still a claim held");
+        assert!(done.contains("finished"), "{done}");
+        assert!(done.contains("wsp release"), "the slot is the thing to give back: {done}");
+        assert!(!done.contains("wsp tell"), "nothing is stuck here: {done}");
+
+        // And work that is waiting on a person is *supposed* to be sitting
+        // still. An agent idle on a blocked task is doing the right thing, and
+        // a census that nagged about it would be nagging about the answer.
+        for waiting in [Status::Blocked, Status::Parked] {
+            assert_eq!(quiet_note(State::Idle, waiting, long_ago), None, "{waiting:?}");
+        }
+    }
+
+    /// `wsp tell` refuses a workspace on purpose, and takes the two things that
+    /// can hold exactly one agent.
+    #[test]
+    fn a_message_is_addressed_to_a_pane_or_to_the_work_and_never_to_a_room() {
+        let env = crate::util::isolated("tell-target");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let t = Task::new("a task with an agent on it", "x-001");
+        store.save_task(&t).unwrap();
+        store.set_binding("w1:p1", json!({ "task_id": t.id, "pane_id": "w1:p1" }));
+
+        let (pane, what) = target(&store, &t.id).expect("the task's pane");
+        assert_eq!(pane, "w1:p1");
+        assert!(what.starts_with(&t.id), "{what}");
+
+        assert_eq!(target(&store, "w1:p1").map(|(p, _)| p), Some("w1:p1".into()), "a pane id, as given");
+        assert_eq!(target(&store, "w1"), None, "a workspace may hold two agents and names neither");
+        assert_eq!(target(&store, "nothing-like-this"), None);
+    }
 
     /// The correctness hazard the executor design is built around, at the one
     /// line that decides it.
@@ -4374,12 +4819,49 @@ mod tests {
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         assert!(text.contains("1 need you"), "the heading counts it:\n{text}");
         assert!(text.contains("← needs you"), "and the row carries it:\n{text}");
+        // And the heading says how many are working, which is the fact the old
+        // `all busy` asserted without having. Three agents, one of them stopped.
+        assert!(text.contains("2 running a turn"), "{text}");
 
         // A working agent on the same kind of task is not waiting on anybody.
         let mut busy = wip_world();
         busy.agents[1].agent_status = "working".into();
         assert!(wip_rows(&busy).iter().all(|r| !r.needs_you));
-        assert!(wip_lines(&busy, &Paint::new(), false).join("\n").contains("all busy"));
+        let text = wip_lines(&busy, &Paint::new(), false).join("\n");
+        assert!(!text.contains("need you"), "{text}");
+        assert!(
+            !text.contains("all busy"),
+            "the sentence this printed over five stopped agents on 2026-08-19:\n{text}"
+        );
+        assert!(text.contains("3 running a turn"), "{text}");
+    }
+
+    /// The other two words herdr has for a pane with no turn running, and this
+    /// view called both of them busy.
+    ///
+    /// `done` is not rare and this is the measurement that says so: on this
+    /// machine on 2026-08-19, **four of twelve agents were answering it** —
+    /// every agent that had finished a turn while nobody was looking at its
+    /// workspace. `wip` read "not idle" and printed `all busy` over four agents
+    /// that had stopped, which is the report the night of 2026-08-18 was lost
+    /// under.
+    #[test]
+    fn an_agent_that_finished_unwatched_or_stopped_on_a_dialog_is_not_busy() {
+        for word in ["idle", "done", "blocked"] {
+            let mut w = wip_world();
+            w.agents[1].agent_status = word.into();
+            let rows = wip_rows(&w);
+            let flagged: Vec<&str> =
+                rows.iter().filter(|r| r.needs_you).map(|r| r.pane.as_str()).collect();
+            assert_eq!(flagged, ["w2:p1"], "`{word}` is a pane running no turn");
+        }
+
+        // And a word herdr has never sent is still not evidence of work. An
+        // absence stays an absence — the rule the whole port is built on — so
+        // it is not called stopped either.
+        let mut w = wip_world();
+        w.agents[1].agent_status = "something-new".into();
+        assert!(wip_rows(&w).iter().all(|r| !r.needs_you), "not knowing is not knowing it stopped");
     }
 
     /// A pane holding nothing still appears — `wip` is who is running, not who
@@ -4623,7 +5105,7 @@ mod tests {
 
         let say = |probe: Probe| {
             let (mut problems, mut notes) = (Vec::new(), Vec::new());
-            herdr_health(&probe, &bindings, &mut problems, &mut notes);
+            herdr_health(&probe, &bindings, &[], &mut problems, &mut notes);
             (problems, notes)
         };
 
@@ -4647,13 +5129,21 @@ mod tests {
         let (problems, notes) = say(Probe::Up { agents: Vec::new(), panes: Vec::new() });
         assert!(problems.is_empty(), "an empty herdr is a running herdr: {problems:?}");
         assert!(!notes.iter().any(|n| n.contains("binding")), "silence is not evidence: {notes:?}");
-        assert!(notes.iter().any(|n| n == "herdr up, 0 agents"), "{notes:?}");
+        assert!(notes.iter().any(|n| n.starts_with("herdr up, 0 agents")), "{notes:?}");
 
         // And answering with the pane the binding names: nothing stale.
         let busy = wip_agent("w1:p1", "w1", "working", "");
-        let (_, notes) = say(Probe::Up { agents: vec![busy.clone()], panes: vec![busy] });
+        let (problems, notes) = say(Probe::Up { agents: vec![busy.clone()], panes: vec![busy] });
         assert!(!notes.iter().any(|n| n.contains("binding")), "{notes:?}");
         assert!(!notes.iter().any(|n| n.contains("agent gone")), "{notes:?}");
+        assert!(problems.is_empty(), "a turn in flight is the healthy case: {problems:?}");
+        // The correction robustness-083 made to this line. "12 agents" was
+        // read as twelve agents working on the night seven of them had
+        // stopped, and the count that answers that question is the second one.
+        assert!(
+            notes.iter().any(|n| n == "herdr up, 1 agents — 1 of 1 claimed pane(s) running a turn"),
+            "{notes:?}"
+        );
     }
 
     /// The one note that mentions a thing, or the whole list to read when there
@@ -4688,7 +5178,7 @@ mod tests {
         let emptied = labelled("w2:p1", "w2", "");
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         let probe = Probe::Up { agents: vec![busy.clone()], panes: vec![busy, emptied] };
-        herdr_health(&probe, &bindings, &mut problems, &mut notes);
+        herdr_health(&probe, &bindings, &[], &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
 
         let gone = note_about(&notes, "no longer lists");
@@ -4730,9 +5220,9 @@ mod tests {
         }
 
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
-        herdr_health(&Probe::live(), &bindings, &mut problems, &mut notes);
+        herdr_health(&Probe::live(), &bindings, &[], &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
-        assert!(notes.iter().any(|n| n == "herdr up, 1 agents"), "{notes:?}");
+        assert!(notes.iter().any(|n| n.starts_with("herdr up, 1 agents")), "{notes:?}");
 
         let empty = note_about(&notes, "agent gone");
         assert!(empty.contains("t-002 (w2:p1)"), "{empty}");
@@ -4758,7 +5248,7 @@ mod tests {
         let here = wip_agent("w1:p1", "w1", "working", "");
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         let probe = Probe::Up { agents: vec![here.clone()], panes: vec![here] };
-        herdr_health(&probe, &bindings, &mut problems, &mut notes);
+        herdr_health(&probe, &bindings, &[], &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
 
         let gone = note_about(&notes, "no longer lists");

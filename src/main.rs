@@ -483,6 +483,7 @@ fn main() {
         "view" => detail::run(&store, &args),
         "kanban" | "board" => kanban::run(&store, &args),
         "say" => cmd_agent::say(&store, &args),
+        "tell" => cmd_agent::tell(&store, &args),
         "flag" => cmd_agent::flag(&store, &args),
         "reconcile" => {
             let r = cmd_agent::reconcile(&store, args.has("reap"));
@@ -659,6 +660,11 @@ fn help() {
                                     how long to review, and whether it came back
   wsp peek [panel|view|board|<task>]  what is on that pane, or the frame the
                                     sidebar surface last drew
+  wsp tell <id> "…"                 say something to the agent holding that
+                                    task, without ending it — `-` reads the
+                                    message from stdin. The repair for an agent
+                                    whose turn stopped: the conversation is
+                                    intact, and a respawn throws it away
 
 {machines}
   wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is
