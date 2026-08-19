@@ -295,6 +295,18 @@ pub fn has_section(body: &str, name: &str) -> bool {
 /// body is the user's, and losing a heading nobody anticipated would be a
 /// worse failure than any it prevents.
 pub fn set_section_in(body: &mut String, name: &str, text: &str) {
+    set_section_in_order(body, name, text, &SECTIONS);
+}
+
+/// [`set_section_in`] against a record's own set of sections.
+///
+/// The order is a parameter because a worklist's body is not a task's:
+/// `## Groups` is its structure and belongs second, where [`SECTIONS`] would
+/// file it as a heading it has never heard of and sort it after `Decisions`.
+/// Everything else here is the same rule for the same reason, `Log` last
+/// included, so the two do not drift — which is what a second copy of this
+/// function would have bought.
+pub fn set_section_in_order(body: &mut String, name: &str, text: &str, order: &[&str]) {
     let mut secs = split_sections(body);
     let text = demote_headings(text.trim_end());
     match secs.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
@@ -316,13 +328,13 @@ pub fn set_section_in(body: &mut String, name: &str, text: &str) {
             return 0;
         }
         if n.eq_ignore_ascii_case("Log") {
-            return SECTIONS.len() + 1;
+            return order.len() + 1;
         }
-        SECTIONS
+        order
             .iter()
             .position(|s| s.eq_ignore_ascii_case(n))
             .map(|i| i + 1)
-            .unwrap_or(SECTIONS.len())
+            .unwrap_or(order.len())
     };
     secs.sort_by_key(|(n, _)| rank(n));
 
@@ -579,12 +591,20 @@ pub const SECTIONS: [&str; 5] = ["Overview", "Details", "Handbook", "Decisions",
 /// cannot be recovered — the hour was thrown away at the point of writing — so
 /// they stand as they are and every reader here takes both shapes.
 pub fn append_dated(body: &mut String, section: &str, line: &str) {
+    append_dated_in_order(body, section, line, &SECTIONS);
+}
+
+/// [`append_dated`] against a record's own set of sections. See
+/// [`set_section_in_order`] for why the order is a parameter — a worklist that
+/// logged through the task order would have its `## Groups` re-filed under
+/// every note written on it.
+pub fn append_dated_in_order(body: &mut String, section: &str, line: &str, order: &[&str]) {
     let mut text = section_of(body, section).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     text.push_str(&format!("- {} {}\n", util::now_iso(), line));
-    set_section_in(body, section, &text);
+    set_section_in_order(body, section, &text, order);
 }
 
 /// A stored body as it is shown: every stamp written by [`append_dated`]
@@ -1223,6 +1243,332 @@ impl Machine {
     }
 }
 
+// ---- worklists --------------------------------------------------------
+//
+// Every item below carries `#[allow(dead_code)]` and none of them will keep
+// it. The record is built one group ahead of the verbs that read it —
+// `worklist` group 1 against groups 2 to 5 — deliberately, because everything
+// after this types against these shapes and a shape changed later is four
+// rebuilds. The attribute is the marker for "its caller has not landed yet",
+// and it comes off with the `use`, one item at a time, rather than a blanket
+// allow over the whole record that would go on hiding a genuinely dead
+// function years from now.
+
+/// Where a worklist is, and it is the only state the file holds.
+///
+/// Four words, all of them a *decision* somebody took: to start it, to stop
+/// starting things, to be finished with it. Where the run is up to is not here
+/// and is never written — the position is the first group not finished, read
+/// off the tasks and off git, and a status you can compute cannot go stale.
+/// The `batch` handbook is the evidence: its written table disagreed with what
+/// was actually happening inside an hour, while the membership stayed true.
+///
+/// `held` and `done` are not the same stop. `held` is this run halted with
+/// groups still ahead of it; `done` is somebody saying there is nothing left
+/// to want from it. Collapsing them would lose the only distinction a reader
+/// looking at a stalled list actually needs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorklistStatus {
+    Draft,
+    Running,
+    Held,
+    Done,
+}
+
+#[allow(dead_code)]
+impl WorklistStatus {
+    pub fn parse(s: &str) -> Option<WorklistStatus> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "draft" => Some(WorklistStatus::Draft),
+            "running" => Some(WorklistStatus::Running),
+            "held" | "hold" => Some(WorklistStatus::Held),
+            "done" | "closed" => Some(WorklistStatus::Done),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorklistStatus::Draft => "draft",
+            WorklistStatus::Running => "running",
+            WorklistStatus::Held => "held",
+            WorklistStatus::Done => "done",
+        }
+    }
+
+    /// Running is the state everything else keys on: a task may be in at most
+    /// one *running* worklist, routing tries a running worklist's seat first,
+    /// and only a running list has a barrier to wait at. Draft, held and done
+    /// lists are plans, and a task may be in as many of those as somebody
+    /// cares to plan it into.
+    pub fn is_running(&self) -> bool {
+        *self == WorklistStatus::Running
+    }
+}
+
+/// One group in the queue: what may run at the same time, and what has to be
+/// read before the barrier behind it opens.
+///
+/// **The ordinal is not here**, because the ordinal is the position: it is the
+/// index in the queue, rewritten on every write, and a group reference
+/// (`--group 3`) is typed and used inside a minute. Storing a stable id would
+/// buy a handle nothing keeps. What it costs is that a log line saying "group
+/// 3 passed" reads wrong once a group is inserted above it, which is why the
+/// log names the *members*.
+///
+/// Mutual exclusion is not a field either, and that is the concept this shape
+/// removes: two tasks that touch the same file must not be in one group, which
+/// is advice about how to compose a group rather than machinery. It is what
+/// produced zero land-time conflicts across fifteen agents, and it needs no
+/// primitive to keep saying so.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Group {
+    /// Task ids, referenced and not owned: a member stays in whatever project
+    /// it lives in, which is the whole point of a worklist sitting outside
+    /// one. The `batch` moved 26 tasks into a project and back out again for
+    /// want of this.
+    pub members: Vec<String>,
+    /// `xN`: a cap on *the work*, not a budget — "only two of these at once,
+    /// they sit near each other". Absent means as many as the machine allows,
+    /// which is what every group in all three hand-run lists actually wanted.
+    /// The agent budget is a fact about the machine and lives there; the
+    /// effective number is the smaller of the two.
+    pub cap: Option<usize>,
+    /// The prose read at the barrier after this group, empty where there is
+    /// none. Not a predicate: `fork`'s real rule was *"if any of the three
+    /// goes badly, flag and stop rather than push through"*, which no boolean
+    /// expresses. What wsp contributes is the obligation to write a sentence,
+    /// not the judgement in it.
+    ///
+    /// A start condition on the next group is this, read at the same barrier
+    /// by the same reader, which is why there is one field and not two.
+    pub stop: String,
+}
+
+/// The columns a wrapped `stop:` breaks to, and the indent its continuations
+/// carry — chosen so a group and its prose sit inside 80 with the two-space
+/// leader, because this is a file people read and hand-edit ahead of the work.
+#[allow(dead_code)]
+const STOP_INDENT: &str = "        ";
+#[allow(dead_code)]
+const STOP_WIDTH: usize = 70;
+
+/// The `## Groups` section, parsed. Line order is the queue.
+///
+/// The written ordinal is *ignored*: it is a rendering of the position, so a
+/// hand-edit that inserts a group in the middle without renumbering still
+/// means what it looks like it means. [`render_groups`] puts the numbers back.
+///
+/// Forgiving in the two ways a hand-edit is actually wrong. A group line with
+/// no ordinal is a group; indented lines before any `stop:` are more members,
+/// because seven ids do not always fit on one line and somebody will wrap
+/// them. What it is not forgiving about is prose: this section *is* the
+/// structure — that is the whole reason it is safe in the body where the
+/// `batch` handbook's table was not — so anything in it that is not a group
+/// does not survive the next write, and there is nowhere in it for a comment
+/// to live.
+#[allow(dead_code)]
+pub fn parse_groups(text: &str) -> Vec<Group> {
+    let cap_of = |t: &str| -> Option<usize> {
+        // `x` and `×` both, because the design wrote one and the keyboard has
+        // the other, and being told your cap is a task id is a poor way to
+        // learn which.
+        let n = t.strip_prefix('x').or_else(|| t.strip_prefix('X')).or_else(|| t.strip_prefix('×'))?;
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        n.parse().ok()
+    };
+
+    let mut out: Vec<Group> = Vec::new();
+    let mut in_stop = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            let mut g = Group::default();
+            let mut toks = rest.split_whitespace().peekable();
+            // The ordinal, if it is written. Unambiguous: a member is
+            // `<project>-NNN` and never bare digits.
+            if toks.peek().is_some_and(|t| t.bytes().all(|b| b.is_ascii_digit())) {
+                toks.next();
+            }
+            if let Some(n) = toks.peek().and_then(|t| cap_of(t)) {
+                g.cap = Some(n);
+                toks.next();
+            }
+            g.members = toks.map(|t| t.to_string()).collect();
+            out.push(g);
+            in_stop = false;
+            continue;
+        }
+        let Some(last) = out.last_mut() else { continue };
+        if let Some(rest) = trimmed.strip_prefix("stop:") {
+            last.stop = rest.trim().to_string();
+            in_stop = true;
+        } else if in_stop {
+            if !last.stop.is_empty() {
+                last.stop.push(' ');
+            }
+            last.stop.push_str(trimmed);
+        } else {
+            last.members.extend(trimmed.split_whitespace().map(|t| t.to_string()));
+        }
+    }
+    out
+}
+
+/// The `## Groups` section, written. The inverse of [`parse_groups`], and the
+/// pair round-trips: the ordinals are the positions, `xN` is emitted in ASCII
+/// whatever it was read as, and a `stop` that wraps comes back as the one
+/// paragraph it was.
+#[allow(dead_code)]
+pub fn render_groups(groups: &[Group]) -> String {
+    let mut out = String::new();
+    for (i, g) in groups.iter().enumerate() {
+        out.push_str(&format!("- {}", i + 1));
+        if let Some(n) = g.cap {
+            out.push_str(&format!("  x{n}"));
+        }
+        for m in &g.members {
+            out.push_str("  ");
+            out.push_str(m);
+        }
+        out.push('\n');
+        if !g.stop.trim().is_empty() {
+            for (n, line) in util::wrap(g.stop.trim(), STOP_WIDTH).iter().enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                out.push_str(if n == 0 { "  stop: " } else { STOP_INDENT });
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// A worklist's body sections. `Groups` is second because it is what the file
+/// is for; `Overview` above it is where the first group's start condition
+/// lives, there being no group before it to carry one.
+#[allow(dead_code)]
+pub const WORKLIST_SECTIONS: [&str; 4] = ["Overview", "Groups", "Decisions", "Log"];
+
+/// A queue of groups of task references, run in order, with a barrier between
+/// each group and the next.
+///
+/// Durable and committed, one file per list beside `tasks/`, `projects/` and
+/// `machines/`, because a worklist is a **plan** and the history of a plan is
+/// worth having. The seat running it is not: that goes in `governors.json`
+/// with the others, on the same rule — the hierarchy is committed and the
+/// agent standing in it is not.
+///
+/// It sits **outside** the projects its members live in and **references**
+/// them. A project is backlog organisation; a worklist is a set of tasks to be
+/// picked up, in a specific order. The `batch` ran as a project because that
+/// was the only thing that could hold a set, and it cost 26 tasks a move into
+/// it and a move back out.
+///
+/// Frontmatter is four scalars, which is all `fm` takes, and the groups are in
+/// the body: a list of groups is richer than `key: scalar`, so this is forced
+/// rather than chosen. It is safe there for the reason `## Decisions` is safe
+/// and the `batch` handbook was not — that table described a structure held
+/// somewhere else and went stale within the hour, and this section *is* the
+/// structure, so it has nothing to disagree with.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct Worklist {
+    /// The slug, and the file stem. It shares a key space with project ids,
+    /// because `governors.json` is keyed on one and a worklist takes a seat of
+    /// its own — see `Store::scope_taken`, which is where that is enforced.
+    pub id: String,
+    pub title: String,
+    pub status_raw: String,
+    pub created: String,
+    pub body: String,
+}
+
+#[allow(dead_code)]
+impl Worklist {
+    pub fn new(id: &str, title: &str) -> Worklist {
+        Worklist {
+            id: id.to_string(),
+            title: title.to_string(),
+            status_raw: WorklistStatus::Draft.as_str().to_string(),
+            created: util::now_iso(),
+            body: String::new(),
+        }
+    }
+
+    /// Stored raw and parsed on the way out, as a task's status is: a word on
+    /// disk that this build does not know is a word to show somebody, not one
+    /// to launder into `draft` on the next write.
+    pub fn status(&self) -> WorklistStatus {
+        WorklistStatus::parse(&self.status_raw).unwrap_or(WorklistStatus::Draft)
+    }
+
+    pub fn set_status(&mut self, s: WorklistStatus) {
+        self.status_raw = s.as_str().to_string();
+    }
+
+    pub fn from_doc(doc: &Doc, fallback_id: &str) -> Worklist {
+        let id = doc.opt("id").unwrap_or_else(|| fallback_id.to_string());
+        Worklist {
+            title: doc.opt("title").unwrap_or_else(|| id.clone()),
+            id,
+            status_raw: doc.opt("status").unwrap_or_else(|| "draft".into()),
+            created: doc.str("created"),
+            body: doc.body.clone(),
+        }
+    }
+
+    pub fn to_doc(&self) -> Doc {
+        let mut d = Doc::default();
+        d.set_str("id", &self.id);
+        d.set_str("title", &self.title);
+        d.set_str("status", &self.status_raw);
+        d.set_str("created", &self.created);
+        d.set_str("schema", SCHEMA);
+        d.body = self.body.clone();
+        d
+    }
+
+    /// The queue. Read out of the body every time rather than held beside it,
+    /// so there is one copy of the membership and a hand-edit ahead of the
+    /// work is simply read.
+    pub fn groups(&self) -> Vec<Group> {
+        parse_groups(&self.section("Groups").unwrap_or_default())
+    }
+
+    /// Write the queue back, renumbering it. Whether an edit is *allowed* is
+    /// not asked here: the edit window falls out of the derived position — a
+    /// group at or behind it is frozen — and that is the verbs' question, at
+    /// the moment a person can be told which group is running.
+    pub fn set_groups(&mut self, groups: &[Group]) {
+        set_section_in_order(&mut self.body, "Groups", &render_groups(groups), &WORKLIST_SECTIONS);
+    }
+
+    /// The text under `## <name>`, heading excluded.
+    pub fn section(&self, name: &str) -> Option<String> {
+        section_of(&self.body, name)
+    }
+
+    /// Append a timestamped line under `## Log`, in this record's own section
+    /// order — see [`append_dated_in_order`].
+    pub fn log(&mut self, line: &str) {
+        append_dated_in_order(&mut self.body, "Log", line, &WORKLIST_SECTIONS);
+    }
+
+    pub fn render(&self) -> String {
+        fm::emit(&self.to_doc())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1613,5 +1959,135 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         // they overlap — a section list that sorted differently would rewrite
         // every body it touched.
         assert!(PROSE.iter().all(|s| PROJECT_PROSE.contains(s)));
+    }
+
+    // ---- the worklist record ---------------------------------------------
+
+    /// The format, exactly as it is written in a file somebody hand-edits, and
+    /// back out again. The line format is the shape everything downstream types
+    /// against, so this asserts the reading of a written file rather than the
+    /// symmetry of two functions written together.
+    #[test]
+    fn a_group_line_says_what_may_run_at_once_and_what_to_read_before_going_on() {
+        let written = "\
+- 1  robustness-069
+  stop: this changes how spawn behaves for every agent after it. If it does
+        not land clean, stop — the whole night's spawning depends on it.
+- 2  render-071  render-022  data-006
+- 3  x2  render-041  render-068  render-072
+";
+        let gs = parse_groups(written);
+        assert_eq!(gs.len(), 3, "three lines, three groups");
+        assert_eq!(gs[0].members, ["robustness-069"]);
+        assert_eq!(gs[0].cap, None, "no cap is as many as the machine allows");
+        assert!(
+            gs[0].stop.starts_with("this changes how spawn behaves")
+                && gs[0].stop.ends_with("depends on it."),
+            "the wrapped prose is one paragraph again: {:?}",
+            gs[0].stop,
+        );
+        assert_eq!(gs[1].members.len(), 3);
+        assert_eq!(gs[2].cap, Some(2), "`x2` is a cap on the work");
+        assert_eq!(gs[2].members, ["render-041", "render-068", "render-072"]);
+
+        // Round trip. What the file said comes back as what the file said,
+        // which is what makes the body safe to hold the structure in.
+        assert_eq!(render_groups(&gs), written);
+        assert_eq!(parse_groups(&render_groups(&gs)), gs);
+    }
+
+    /// The ordinal is a rendering of the position, not an id. So the queue is
+    /// line order, a hand-edit that inserts a group without renumbering means
+    /// what it looks like it means, and the next write puts the numbers right.
+    #[test]
+    fn the_ordinal_is_the_position_and_is_rewritten_rather_than_trusted() {
+        let gs = parse_groups("- 9  a-001\n- 1  b-002\n- c-003\n");
+        assert_eq!(gs.len(), 3);
+        assert_eq!(gs[0].members, ["a-001"], "line order is the queue");
+        assert_eq!(gs[2].members, ["c-003"], "and a line with no ordinal is still a group");
+        assert_eq!(render_groups(&gs), "- 1  a-001\n- 2  b-002\n- 3  c-003\n");
+    }
+
+    /// `×` is what the design wrote and `x` is what the keyboard has, so both
+    /// read and one is written. Being told your cap is a task id would be a
+    /// poor way to learn which.
+    #[test]
+    fn a_cap_is_read_in_either_of_the_two_ways_it_gets_typed() {
+        for line in ["- 1  ×2  a-001  a-002", "- 1  x2  a-001  a-002", "- 1  X2  a-001  a-002"] {
+            let gs = parse_groups(line);
+            assert_eq!(gs[0].cap, Some(2), "{line}");
+            assert_eq!(gs[0].members, ["a-001", "a-002"], "{line}");
+        }
+        assert_eq!(render_groups(&parse_groups("- 1  ×2  a-001")), "- 1  x2  a-001\n");
+    }
+
+    /// Seven ids do not always fit on a line, and somebody will wrap them.
+    /// Members before a `stop:` continue; everything after it is the prose.
+    #[test]
+    fn a_hand_wrapped_group_is_read_as_the_one_group_it_looks_like() {
+        let gs = parse_groups(
+            "- 2  render-071  render-022  data-006\n     wsp-043  render-057\n  stop: look at the diff\n        before going on\n",
+        );
+        assert_eq!(gs.len(), 1);
+        assert_eq!(gs[0].members.len(), 5, "the continuation is more members");
+        assert_eq!(gs[0].stop, "look at the diff before going on");
+    }
+
+    /// A worklist is a file, and the file is the record: four scalars and the
+    /// groups in the body, because `fm` takes `key: scalar` and a list of
+    /// groups is richer than that.
+    #[test]
+    fn a_worklist_round_trips_through_the_markdown_it_is_stored_as() {
+        let mut w = Worklist::new("batch", "Overnight batch");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[
+            Group { members: vec!["robustness-069".into()], cap: None, stop: "stop rather than push through".into() },
+            Group { members: vec!["render-041".into(), "render-068".into()], cap: Some(2), stop: String::new() },
+        ]);
+        w.log("group robustness-069 passed");
+
+        let got = Worklist::from_doc(&fm::parse(&w.render()), "batch");
+        assert_eq!(got.id, "batch");
+        assert_eq!(got.title, "Overnight batch");
+        assert_eq!(got.status(), WorklistStatus::Running);
+        assert_eq!(got.groups(), w.groups(), "the queue survives the disk");
+        assert_eq!(got.groups()[1].cap, Some(2));
+        assert!(got.section("Log").unwrap().contains("robustness-069 passed"));
+    }
+
+    /// `## Groups` is the file's structure and belongs second, above the
+    /// history that accumulates under it. A worklist logged through the task
+    /// section order would have its groups re-filed after `## Decisions` by
+    /// every note written on it — the same defect that put three log entries
+    /// under a heading nothing would ever read.
+    #[test]
+    fn writing_a_worklists_log_does_not_move_its_groups() {
+        let mut w = Worklist::new("batch", "Overnight batch");
+        set_section_in_order(&mut w.body, "Overview", "what this night is for", &WORKLIST_SECTIONS);
+        w.set_groups(&[Group { members: vec!["a-001".into()], ..Default::default() }]);
+        set_section_in_order(&mut w.body, "Decisions", "- 2026-08-19 a thing", &WORKLIST_SECTIONS);
+        w.log("started");
+        w.log("group a-001 passed");
+
+        assert_eq!(headings(&w.body), ["Overview", "Groups", "Decisions", "Log"]);
+        assert_eq!(w.groups().len(), 1, "and the queue is still readable: {}", w.body);
+        assert_eq!(w.section("Log").unwrap().lines().count(), 2);
+    }
+
+    /// The only state the file holds is the one somebody decides. `running` is
+    /// what everything else keys on, and a word this build does not know is
+    /// shown rather than laundered into `draft` on the next write.
+    #[test]
+    fn a_worklists_status_is_a_decision_and_nothing_about_where_it_is_up_to() {
+        assert!(WorklistStatus::parse("running").unwrap().is_running());
+        assert!(!WorklistStatus::parse("held").unwrap().is_running());
+        assert_eq!(WorklistStatus::parse("draft"), Some(WorklistStatus::Draft));
+        assert_eq!(WorklistStatus::parse("finished"), None);
+
+        let mut w = Worklist::new("batch", "Overnight batch");
+        assert_eq!(w.status(), WorklistStatus::Draft, "a new list has not been started");
+        w.status_raw = "abandoned".into();
+        assert_eq!(w.status(), WorklistStatus::Draft, "an unknown word reads as the default");
+        assert!(w.render().contains("status: abandoned"), "and is still on disk to be seen");
     }
 }

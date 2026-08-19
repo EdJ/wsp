@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::fm;
-use crate::model::{Machine, Project, Task};
+use crate::model::{Machine, Project, Task, Worklist};
 use crate::util;
 
 thread_local! {
@@ -387,6 +387,99 @@ impl Store {
         write_atomic(&path, &m.render())?;
         self.wrote(path);
         Ok(())
+    }
+
+    // ---- worklists --------------------------------------------------------
+    //
+    // The fifth kind, on the `machines/` pattern and for the same reason: a
+    // plan is durable and committed, one file each. No `cached_dir` here,
+    // unlike `tasks/` and `projects/` — that cache exists because the panel
+    // re-reads 285 files four times a second, and a store holds a handful of
+    // worklists read once at a barrier. A cache is worth having where it saves
+    // a reading somebody is waiting on, and is otherwise a second copy of the
+    // truth.
+
+    pub fn worklists_dir(&self) -> PathBuf {
+        self.root.join("worklists")
+    }
+
+    pub fn worklist_path(&self, id: &str) -> PathBuf {
+        self.worklists_dir().join(format!("{id}.md"))
+    }
+
+    /// Every worklist in the store, by slug — `done` ones included, for the
+    /// reason a retired machine is still a row: a worklist is a plan, and the
+    /// history of a plan is the thing worth keeping about it.
+    #[allow(dead_code)] // the verbs that read it are the next group; see `model`
+    pub fn worklists(&self) -> Vec<Worklist> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(self.worklists_dir()) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            if let Ok(text) = fs::read_to_string(&path) {
+                out.push(Worklist::from_doc(&fm::parse(&text), &stem));
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    pub fn worklist(&self, id: &str) -> Option<Worklist> {
+        let text = fs::read_to_string(self.worklist_path(id)).ok()?;
+        Some(Worklist::from_doc(&fm::parse(&text), id))
+    }
+
+    #[allow(dead_code)] // the verbs that read it are the next group; see `model`
+    pub fn save_worklist(&self, w: &Worklist) -> std::io::Result<()> {
+        fs::create_dir_all(self.worklists_dir())?;
+        let path = self.worklist_path(&w.id);
+        write_atomic(&path, &w.render())?;
+        self.wrote(path);
+        Ok(())
+    }
+
+    /// Whether a name is already spoken for as a **scope** — the key space a
+    /// worklist slug and a project id share.
+    ///
+    /// They share one because `governors.json` is keyed on the scope and a
+    /// running worklist takes a seat of its own: routing asks the worklist
+    /// first, then the project. Two things answering to one key would send a
+    /// hand raised at 3am to whichever the map happened to hold.
+    ///
+    /// The project half is checked **by id**, and that is the correction the
+    /// design needed. [`Store::code_taken`] compares against project *codes*,
+    /// and [`Project::code`] falls back to the id only where no code is set —
+    /// so a project with an explicit code would have let a slug collide with
+    /// its id and pass. Both are asked here: the id because that is the
+    /// routing key, and `code_taken` because a slug that is some project's
+    /// code, or a prefix ids have already been handed out under, is a name
+    /// that means something else to everyone reading it.
+    ///
+    /// Occupancy only. That a name is *shaped* like a scope is the caller's —
+    /// `project add` slugifies what it is given, and a worklist has to be
+    /// created the same way, because a key space where one side can name
+    /// something the other cannot is not one key space.
+    ///
+    /// `excluding` is the scope keeping its own name: a rename to what it is
+    /// already called is not a collision.
+    #[allow(dead_code)] // the verbs that read it are the next group; see `model`
+    pub fn scope_taken(&self, scope: &str, excluding: Option<&str>) -> Option<String> {
+        if Some(scope) == excluding {
+            return None;
+        }
+        if self.worklist(scope).is_some() {
+            return Some(format!("worklist `{scope}` uses it"));
+        }
+        if self.projects().iter().any(|p| p.id == scope) {
+            return Some(format!("project `{scope}` uses it"));
+        }
+        self.code_taken(scope, excluding)
     }
 
     // ---- tasks ----------------------------------------------------------
@@ -1937,6 +2030,7 @@ fn replace(path: &Path, contents: &str, durable: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Group, WorklistStatus};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// The daemon marker is state and not work: a daemon starting must not look
@@ -2051,6 +2145,67 @@ mod tests {
 
         assert!(store.clear_machine_live("mb2"));
         assert!(store.machine_live("mb2").is_none(), "back to no opinion, not a negative one");
+    }
+
+    // ---- worklists --------------------------------------------------------
+
+    /// The fifth kind of record, on disk and back. A plan is durable and
+    /// committed for the same reason a project is: what is worth having about
+    /// it later is its history, and a list that lived only in state would lose
+    /// the one thing that makes it worth writing down.
+    #[test]
+    fn a_worklist_is_a_record_of_its_own_and_the_queue_survives_the_store() {
+        let store = scratch("worklists");
+        assert!(store.worklists().is_empty(), "a store with no plans in it");
+
+        let mut w = Worklist::new("batch", "Overnight batch");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[
+            Group { members: vec!["robustness-069".into()], cap: None, stop: "if it does not land clean, stop".into() },
+            Group { members: vec!["render-041".into(), "render-068".into()], cap: Some(2), stop: String::new() },
+        ]);
+        store.save_worklist(&w).unwrap();
+
+        let got = store.worklist("batch").expect("it is where the path says");
+        assert_eq!(got.title, "Overnight batch");
+        assert_eq!(got.status(), WorklistStatus::Running);
+        assert_eq!(got.groups().len(), 2);
+        assert_eq!(got.groups()[0].stop, "if it does not land clean, stop");
+        assert_eq!(got.groups()[1].members, ["render-041", "render-068"]);
+        assert_eq!(store.worklists().len(), 1, "and it is in the list of them");
+        assert!(store.worklist("fork").is_none(), "a name nobody has taken is not a list");
+    }
+
+    /// A worklist slug and a project id are **one key space**, because
+    /// `governors.json` is keyed on the scope and a running worklist takes a
+    /// seat of its own — so two things answering to one name would route a
+    /// raised hand to whichever the map happened to hold.
+    ///
+    /// The case in the middle is the one the design got wrong and this test
+    /// exists for: `code_taken` compares against a project's *code*, which
+    /// falls back to the id only where no code is set. A project with an
+    /// explicit code would therefore have let a slug collide with its id and
+    /// pass, which is exactly the routing this check is here to protect.
+    #[test]
+    fn a_worklist_slug_and_a_project_id_cannot_be_the_same_name() {
+        let store = scratch("worklist-scope");
+        proj(&store, "render", "");
+        proj(&store, "strata-prototype", "sp");
+        store.save_worklist(&Worklist::new("batch", "Overnight batch")).unwrap();
+
+        assert!(store.scope_taken("render", None).is_some(), "a project id is not free");
+        assert!(
+            store.scope_taken("strata-prototype", None).is_some(),
+            "and its own code being something else does not make its id free — \
+             this is what a `code_taken`-only check let through",
+        );
+        assert!(store.scope_taken("sp", None).is_some(), "a project's code names ids and is not free either");
+        assert!(store.scope_taken("batch", None).is_some(), "and the other way: a worklist holds its slug");
+        assert!(store.scope_taken("fork", None).is_none(), "a name nobody has is free");
+        assert!(
+            store.scope_taken("batch", Some("batch")).is_none(),
+            "a scope keeping the name it already has is not colliding with itself",
+        );
     }
 
     // ---- per-project ids --------------------------------------------------

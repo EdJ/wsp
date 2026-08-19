@@ -81,6 +81,16 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: project `{slug}` already exists");
         return 1;
     }
+    // The other half of the scope key space, and it has to be checked here as
+    // well as in `Store::scope_taken` or it only holds in whichever direction
+    // was written second. A worklist slug and a project id are one name
+    // because `governors.json` is keyed on it and a running worklist takes a
+    // seat of its own; two things answering to one key would route a raised
+    // hand to whichever the map happened to hold.
+    if store.worklist(&slug).is_some() {
+        eprintln!("wsp: `{slug}` is not free: worklist `{slug}` uses it");
+        return 1;
+    }
 
     let index = Index::new(store.projects());
     let mut p = Project::new(&slug);

@@ -35,6 +35,7 @@ Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` a
 |---|---|
 | `~/wsp/projects/<slug>.md` | one project per file: parent, tags, roots, brief |
 | `~/wsp/tasks/<id>.md` | one task per file: `<project>-NNN`, or `inbox-NNN` |
+| `~/wsp/worklists/<slug>.md` | one plan per file: a queue of groups of task references, run in order |
 | `~/wsp/archive/tasks/YYYY-MM/` | swept `done` tasks |
 | `~/wsp/archive/projects/` | removed projects, handbook and decisions intact |
 | `~/wsp/ids.json` | retired id → the id it became, so old ones still resolve |
@@ -3257,7 +3258,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/main.rs` | argument parsing, dispatch, help, the version string |
 | `src/store.rs` | atomic writes, `O_EXCL` id allocation, git, state, hooks |
 | `src/fm.rs` | the small YAML-frontmatter subset |
-| `src/model.rs` | `Project`, `Task`, status/priority vocabulary |
+| `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
