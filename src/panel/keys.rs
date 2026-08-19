@@ -183,6 +183,27 @@ pub(crate) struct View {
     /// [`super::render::scroll_to`]. Written by the frame that drew it, so a
     /// click reads the offset the pane in front of you is actually using.
     pub(super) scroll: Option<usize>,
+    /// What the last frame drew that offset against: the row the cursor was
+    /// on, and which line of the tree it was drawn on.
+    ///
+    /// [`scroll`](Self::scroll) is a row *number*, and a row number is not what
+    /// a reader is anchored to — they are looking at a row. The number's
+    /// meaning changes underneath them every time the tree's shape does: the
+    /// pane is a row taller or shorter (the focus dock rewrapping at a new
+    /// width, the map opening, an agent joining or leaving the dock), or the
+    /// rows themselves are rebuilt and everything below the change shifts. A
+    /// stored offset that survives any of those and is merely clamped back
+    /// into range drags the view to whichever end of the clamp it now falls
+    /// outside, while the reader has not asked for anything.
+    ///
+    /// So this is the anchor to re-place it against — see
+    /// [`super::render::geometry`], which uses it whenever the cursor is on
+    /// the row it was on last frame, and ignores it the moment the cursor
+    /// moves, because then the cursor is the thing that is asking.
+    ///
+    /// Not shared and not persisted: it is a fact about the frame in front of
+    /// this reader, and a panel that has not drawn yet has no anchor to keep.
+    pub(super) placed: Option<super::render::Anchor>,
     /// The cursor is what last moved, rather than the view.
     ///
     /// This is which of the two the other one follows. With it set the view

@@ -4195,6 +4195,219 @@ mod tests {
         assert_eq!(ui.selected_index(), chosen + 1, "and it continues from where the cursor was");
     }
 
+    /// More presses of `j` than [`tall_world`] has rows, so a walk that names
+    /// its destination arrives and a walk to the foot gets there. A count
+    /// rather than the row total, because the row total is `Ui`'s and this
+    /// lane does not open `rows.rs`.
+    const PRESSES: usize = 400;
+
+    /// A pane about as tall as the sidebar Ed reads this in.
+    ///
+    /// [`H`] is the storyboard's photograph, and twenty-six rows leaves the
+    /// tree eight of them once the docks have taken theirs — a pane with no
+    /// middle, where every position is within a lookahead of an edge. How far
+    /// the view slips is a function of how many rows the tree has, so on a
+    /// pane that size the fault is a single line and on a real one it is seven.
+    const TALL: usize = 44;
+
+    /// A tree taller than any pane, so the cursor can sit in the middle of a
+    /// list with rows off both ends of it.
+    ///
+    /// [`world`] is a fixture for photographs and is about a screenful; a
+    /// scroll that is only ever at one end of its travel cannot show the case
+    /// these tests are about, which is the middle.
+    ///
+    /// Nine tasks to a project, and that number is the point rather than
+    /// padding: a sidebar draws six of them and a count of the rest, and a pane
+    /// wide enough to be a page draws all nine — see `rows`'
+    /// `MAX_TASKS_PER_PROJECT`. So the same store is a different number of rows
+    /// at the two widths `Z` moves between, which is what makes the row the
+    /// cursor is on row 87 at one width and row 103 at the other. One title is
+    /// long enough to wrap differently at both, because the focus dock's height
+    /// is the other way a width becomes a change in how many tree rows fit.
+    fn tall_world() -> Snapshot {
+        let mut s = world();
+        for n in 0..14 {
+            let id = format!("p{n:02}");
+            s.projects.push(project(&id, Some("meta")));
+            for k in 0..9 {
+                let title = match (n, k) {
+                    (9, 0) => "Work out what the demo shows, in what order, and which of the \
+                               three patches is worth the first thirty seconds of it"
+                        .to_string(),
+                    _ => format!("Task {k} of project {n} of the tall tree"),
+                };
+                s.tasks.push(task(&format!("x-{n:02}-{k}"), &title, Some(&id), "todo"));
+            }
+        }
+        s
+    }
+
+    /// Walk the cursor to a row the way a reader does, and leave the view
+    /// wherever that put it. `j` and not a jump, because the offset under test
+    /// is the one a run of `j` leaves behind.
+    fn walk_to(
+        ui: &mut panel::Ui,
+        view: &mut panel::View,
+        want: &panel::Target,
+        w: usize,
+        h: usize,
+    ) {
+        for _ in 0..PRESSES {
+            if &ui.selected_target() == want {
+                return;
+            }
+            panel::apply_key(Key::Down, ui, view);
+            panel::place(ui, view, w, h);
+        }
+        panic!("the cursor never reached {want:?}");
+    }
+
+    /// What the reader is looking at: the line the cursor was drawn on, and
+    /// which tree row is on each line of the pane.
+    ///
+    /// The cursor's line comes off `frame` itself — the drawn row is the one
+    /// marked `selected` — rather than out of the geometry, because the offset
+    /// is the thing under test and a test that asked the offset where the
+    /// cursor was would be asking the bug whether it was there. The rows per
+    /// line come through `row_at`, which
+    /// [`the_mapping_matches_the_frame_at_every_size`] pins to what `frame`
+    /// paints; it is used here because two frames at two *widths* draw the same
+    /// row as different text, and what has to be equal across a resize is which
+    /// row is on which line, not the number of columns it was cut to.
+    fn on_the_pane(
+        ui: &panel::Ui,
+        view: &mut panel::View,
+        w: usize,
+        h: usize,
+    ) -> (usize, Vec<Option<usize>>) {
+        let drawn = panel::frame(ui, view, w, h);
+        let cursor = drawn.iter().position(|l| l.selected).expect("the cursor is drawn");
+        (cursor, (0..h).map(|y| panel::row_at(ui, view, w, h, y)).collect())
+    }
+
+    /// The tree's own rows, in the order they are drawn: the run of rows from
+    /// the top of the body until the rule that ends it.
+    fn tree_run(rows: &[Option<usize>]) -> Vec<usize> {
+        rows[2..].iter().map_while(|r| *r).collect()
+    }
+
+    /// Ed: "pressing ZZ to enter fullscreen sidebar mode jumps the sidebar
+    /// scroll upwards for an unclear reason." This is the reason.
+    ///
+    /// The view's position is a row *number*, and `Z` changes what a row number
+    /// means. Twice over: the pane is wide enough to be a page, so every
+    /// project stops abbreviating and the rows above the cursor multiply — and
+    /// the focus dock rewraps to a wider pane, so a different number of tree
+    /// rows fit. The stored offset survived both and was merely clamped back
+    /// into range, and the clamp's floor is `sel + LOOKAHEAD + 1 - tree_rows`:
+    /// it puts the row you were reading down at the foot of the pane, which is
+    /// the whole tree sliding up past you.
+    ///
+    /// What it does instead is put the cursor back on the line it was drawn on
+    /// and let the new rows fill in around it.
+    #[test]
+    fn going_full_screen_leaves_the_reader_on_the_row_they_were_reading() {
+        let w = tall_world();
+        let mut view = panel::View::default();
+        // `F` is on, so the dock's height is a function of the width too: both
+        // roads into the fault are open in the one frame, which is what `Z`
+        // actually does.
+        view.set_focus_for_test(true);
+        let mut ui = ui_of(&w, &view);
+        panel::place(&ui, &mut view, W, TALL);
+        walk_to(&mut ui, &mut view, &panel::Target::Task("x-09-0".into()), W, TALL);
+        // And read back up a few rows. A cursor left where `j` stopped is
+        // already standing on the last line the lookahead allows — which is
+        // where the clamp would have put it anyway, so a test that starts there
+        // watches the bug fire and cannot tell. A reader who has walked down
+        // and then come back up is in the middle of the pane, with the view
+        // still where the walk left it, and that is the state `ZZ` finds.
+        for _ in 0..6 {
+            panel::apply_key(Key::Up, &mut ui, &mut view);
+            panel::place(&ui, &mut view, W, TALL);
+        }
+
+        let was = ui.selected_target();
+        let (line, rows) = on_the_pane(&ui, &mut view, W, TALL);
+        let run = tree_run(&rows);
+        assert!(run[0] > 0, "there are rows above the pane, so this is not the top of the tree");
+        assert!(line > 2 && line < 1 + run.len(), "and the cursor is in the middle of the pane");
+
+        // `ZZ`: the host grants the whole screen, the panel takes its shape
+        // from it, and the rows are rebuilt for a pane that no longer
+        // abbreviates.
+        let page = 120;
+        view.fit_to_pane(page);
+        panel::refetch_into(&mut ui, &w, &mut view);
+
+        let (moved, _) = on_the_pane(&ui, &mut view, page, TALL);
+        assert_eq!(ui.selected_target(), was, "the cursor is still on the row it was on");
+        assert_eq!(line, moved, "the cursor changed line, so the tree moved under the reader");
+    }
+
+    /// The same fault with no resize anywhere, which is the half that fires on
+    /// its own several times a night.
+    ///
+    /// A row number stops meaning what it meant whenever the rows change, and
+    /// agents arriving and finishing change them without anybody touching the
+    /// panel: an agent's row leaves the tree, everything below it moves up one,
+    /// and an offset carried across that shows the reader a different place.
+    /// Found by the worklist governor, reading the description of this bug.
+    #[test]
+    fn an_agent_finishing_does_not_scroll_the_tree_under_the_reader() {
+        let mut w = tall_world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        panel::place(&ui, &mut view, W, H);
+        walk_to(&mut ui, &mut view, &panel::Target::Task("x-09-0".into()), W, H);
+
+        let before = panel::frame(&ui, &mut view, W, H);
+        let line = before.iter().position(|l| l.selected).expect("the cursor is drawn");
+
+        // Two panes go: herdr stops reporting them, and their rows go with them.
+        w.panes.retain(|p| p.pane != "w4:p1" && p.pane != "w5:p1");
+        panel::refetch_into(&mut ui, &w, &mut view);
+
+        let after = panel::frame(&ui, &mut view, W, H);
+        assert_eq!(
+            after.iter().position(|l| l.selected),
+            Some(line),
+            "an agent finishing moved the cursor up the pane, which is the tree sliding down"
+        );
+    }
+
+    /// What it does in the case where movement cannot be avoided, so that the
+    /// rule is not mistaken for "the view never moves".
+    ///
+    /// At the end of the tree a pane that grew can only fill from above: there
+    /// are no rows below to bring up. So the rows do slide, the cursor is
+    /// carried down the pane with them, and what stays put is the foot of the
+    /// list — which is the thing the reader is actually looking at down there.
+    #[test]
+    fn a_taller_pane_at_the_end_of_the_tree_fills_from_above() {
+        let w = tall_world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        panel::place(&ui, &mut view, W, H);
+        for _ in 0..PRESSES {
+            panel::apply_key(Key::Down, &mut ui, &mut view);
+            panel::place(&ui, &mut view, W, H);
+        }
+
+        let (line, rows) = on_the_pane(&ui, &mut view, W, H);
+        let last = rows.iter().flatten().max().copied().expect("the tree is drawn");
+
+        // Three more rows of pane, and nothing else changed.
+        let (line2, rows2) = on_the_pane(&ui, &mut view, W, H + 3);
+        assert!(line2 > line, "at the foot of the list the extra rows can only come from above");
+        assert_eq!(
+            rows2.iter().flatten().max().copied(),
+            Some(last),
+            "and the end of the tree is still the end of the tree"
+        );
+    }
+
     /// What the focus dock is drawing, read off the frame the way you would
     /// read it off the pane: the lines between the last two rules.
     fn dock_text(frame: &[panel::Line], w: usize) -> String {

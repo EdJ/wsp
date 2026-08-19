@@ -913,7 +913,37 @@ pub(crate) fn place(ui: &Ui, view: &mut View, w: usize, h: usize) -> Geometry {
     super::keys::pop_pending(ui, view);
     let g = geometry(ui, view, w, h);
     view.scroll = Some(g.scroll);
+    view.placed = Anchor::of(ui, &g);
     g
+}
+
+/// The row this frame was drawn against, and where on the pane it was drawn.
+///
+/// The reason it is the *cursor* rather than the top visible row: the cursor is
+/// the one row the panel already carries across a rebuild by identity — see
+/// [`super::rows::Cursor`] — so it is the only anchor that still means
+/// something after the rows themselves have been rebuilt. The top row can
+/// vanish (an overflow row, an agent that has gone), and an anchor that can
+/// vanish is an anchor with a fallback, which is two rules where one will do.
+#[derive(Clone)]
+pub(crate) struct Anchor {
+    /// The row the cursor was on.
+    on: super::rows::Cursor,
+    /// Lines from the top of the tree to the line it was drawn on.
+    line: usize,
+}
+
+impl Anchor {
+    /// What this frame anchors to, if it anchors to anything.
+    ///
+    /// Nothing when the cursor is not among the rows the tree drew: down in
+    /// the pinned dock, or off the pane entirely because the wheel has carried
+    /// the view away from it. Both are states the panel is allowed to be in,
+    /// and in neither is the cursor what the reader is looking at.
+    fn of(ui: &Ui, g: &Geometry) -> Option<Anchor> {
+        let on_pane = ui.sel < g.tree_len && ui.sel >= g.scroll && ui.sel < g.scroll + g.tree_rows;
+        on_pane.then(|| Anchor { on: ui.cursor(), line: ui.sel - g.scroll })
+    }
 }
 
 pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
@@ -972,7 +1002,11 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
         dock_rows -= 1;
     }
     let tree_rows = body_rows - dock_rows;
-    let scroll = match view.scroll {
+    // The cursor is on the row it was on when the last frame placed this
+    // offset, so nothing that has changed since is the reader travelling:
+    // whatever moved, moved around them. See [`super::keys::View::placed`].
+    let held = view.placed.as_ref().filter(|a| a.on == ui.cursor()).map(|a| a.line);
+    let scroll = match (view.scroll, held) {
         // The cursor pulls the view only when the cursor is what moved. A
         // pointer has just said where it wants to be looking — and where the
         // selection is has nothing to do with it: the wheel is entitled to
@@ -982,11 +1016,51 @@ pub(super) fn geometry(ui: &Ui, view: &View, w: usize, h: usize) -> Geometry {
         // and always drawn, so following the cursor into it would scroll the
         // tree to its end to answer a question about a row that was on screen
         // the whole time.
-        Some(s) if !view.keyed || ui.sel >= tree_len => {
+        //
+        // The anchor below is not consulted here for the same reason: it is the
+        // *cursor's* line, and a view the wheel has just placed is not anchored
+        // to the cursor. So a tree the wheel has moved does still shift when the
+        // rows are rebuilt under it, by however much the rebuild changed above
+        // its top row. Answering that needs the top row's identity rather than
+        // the cursor's, which is `rows`' to give and not this file's to invent.
+        (Some(s), _) if !view.keyed || ui.sel >= tree_len => {
             s.min(tree_len.saturating_sub(tree_rows))
         }
-        Some(s) => scroll_to(s, ui.sel, tree_len, tree_rows, LOOKAHEAD),
-        None => scroll_for(ui.sel.min(tree_len.saturating_sub(1)), tree_len, tree_rows),
+        // Re-anchored rather than clamped: the cursor goes back on the line it
+        // was drawn on, and everything the reader can see stays where it was.
+        //
+        // A row *number* is the wrong thing to carry across any of this. What
+        // it counts changes under it — the rows above the cursor multiply when
+        // a pane wide enough to be a page stops abbreviating them, an agent's
+        // row leaves the tree when the agent does — and how many rows fit
+        // changes too, through every block that takes its height from the pane:
+        // the focus dock rewrapping at a new width, the map or the tag picker
+        // opening, the dock at the foot growing an agent. Clamping the old
+        // number back into the new range is not a small correction. Its floor
+        // is `sel + LOOKAHEAD + 1 - tree_rows`, so a stale offset that is now
+        // too small parks the row you were reading at the *foot* of the pane
+        // and slides the whole tree up past you; its ceiling does the mirror
+        // image. `Z` twice is the trigger a person hits on purpose, and it
+        // moves seven lines on a forty-four row sidebar.
+        //
+        // [`LOOKAHEAD`] is deliberately not asked for here. Rows beyond the
+        // cursor are what *travel* is owed — you are reading in a direction and
+        // want to see where you are going — and this is the case where the
+        // cursor has not moved at all. Demanding it of a pane that has just
+        // changed height is how a change of shape becomes a scroll: the company
+        // a taller pane can now afford is company the view has to move to give.
+        // What is asked instead is only that the cursor is still drawn, so a
+        // pane that got shorter gives up the least it can.
+        //
+        // At the end of the tree it still moves, and has to: a pane that grew
+        // there can only fill from above, and `scroll_to`'s own clamp is what
+        // says so. That is the one case where the rows under the reader are
+        // allowed to slide, because there is no other answer.
+        (Some(_), Some(line)) => {
+            scroll_to(ui.sel.saturating_sub(line), ui.sel, tree_len, tree_rows, 0)
+        }
+        (Some(s), _) => scroll_to(s, ui.sel, tree_len, tree_rows, LOOKAHEAD),
+        (None, _) => scroll_for(ui.sel.min(tree_len.saturating_sub(1)), tree_len, tree_rows),
     };
     Geometry { head: HEAD, map_rows, tags_rows, focus_rows, dock_rows, tree_rows, tree_len, scroll }
 }
