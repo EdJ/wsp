@@ -2958,6 +2958,38 @@ private-index commit leaves `.git/index` holding the tree from before it, so
 check found that thirty seconds after being installed, in its own commit. Doctor
 names the state; the step stops making it.
 
+#### The refusal that names no real change
+
+The same state has a second face, and it is worse than the first because it
+speaks. A trunk whose index is a commit behind will not fast-forward, and git
+says why in the only words it has: *"Your local changes to the following files
+would be overwritten by merge."* **There are none.** `git diff HEAD` in that
+tree is empty, every file matches HEAD exactly, and the whole disagreement is
+the index — which `git reset`, with no paths, clears while touching no file.
+
+git is not wrong about itself; the index and HEAD do disagree. It is the
+*framing*: "local changes" means a **working tree** to whoever is reading it. On
+2026-08-19 that one sentence sent two agents hunting a change that did not
+exist. One concluded, in order, that a rebase had silently dropped a paragraph
+from a module header, that the trunk was in a state needing another seat's eyes,
+and that an agent should hold — and told it so. All three were wrong, and all
+three followed from believing the message; `worklist-013` reached the same wrong
+conclusion independently an hour later. It is the family `worklist-018`,
+`wsp-086` and `worklist-010` are in — a near side reporting confidently about
+state it has not checked — and the only one of them where the report is not even
+false. The fix is therefore a sentence and not a check.
+
+`wsp land` asks before it repeats git's wording, at both places it refuses:
+`cmd_checkout::index_only` is true when every file matches HEAD and only the
+index does not. It **appends** rather than substituting, because the reader is
+owed both what git said and what it meant, and it names `git reset`.
+
+It does not run the reset. The index is shared, so a reset from here discards
+whatever another agent had staged — no file content, since staged work is on
+disk either way, but still somebody's intent, and destroying a record is asked
+for and never automatic (`robustness-090` d1). Diagnosing costs two `git` calls
+on a path that has already failed. Deciding costs somebody their staging.
+
 ### The stash, and telling an agent something at the moment it matters
 
 On 2026-08-19 two agents in separate worktrees exchanged their entire working

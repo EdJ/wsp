@@ -279,6 +279,10 @@ impl Store {
     /// Files that hold no id are deliberately absent rather than harmless
     /// passengers — `daemon.json`, `said.json`, `.lock`. Adding one costs a
     /// read and a token scan of a file that can never match.
+    ///
+    /// A test asserts *through* this list and never against its own copy of
+    /// it: a test that keeps its own copy of a hand-kept list is the same
+    /// mistake with a green tick over it.
     pub fn state_files_with_ids() -> &'static [&'static str] {
         &[
             "bindings.json",
@@ -1512,6 +1516,10 @@ impl Store {
     /// The state files that hold something addressed to somebody *now* — the
     /// list [`Store::attention_stamp`] is written against, and the one place a
     /// new one is added.
+    ///
+    /// A test asserts *through* this list and never against its own copy of
+    /// it: a test that keeps its own copy of a hand-kept list is the same
+    /// mistake with a green tick over it.
     pub fn attention_files() -> &'static [&'static str] {
         &["flags.json", "messages.json"]
     }

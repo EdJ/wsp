@@ -791,6 +791,55 @@ fn dirty(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a tree's whole quarrel with HEAD is in its **index**, with every
+/// file on disk matching HEAD exactly.
+///
+/// This is the state `wsp commit-help` leaves behind by design and says
+/// nothing about at the moment it bites. Step 1 mandates a private
+/// `GIT_INDEX_FILE`, correctly — `git add` otherwise writes to one
+/// `.git/index` for everybody standing in the tree. Commit against it and HEAD
+/// moves while the shared index still holds the tree from *before*, so
+/// `git status` reports `MM` and git reports, truthfully about itself and
+/// misleadingly to a reader, *"Your local changes to the following files would
+/// be overwritten by merge"*.
+///
+/// **There are no local changes.** `git diff HEAD` is empty and the working
+/// tree is byte-for-byte HEAD; "local changes" means a working tree to the
+/// person reading it, and on 2026-08-19 that sentence sent two agents hunting
+/// a change that did not exist — `worklist-020` reached three wrong
+/// conclusions in a row from believing it, and `worklist-013` reached the same
+/// wrong one independently. So [`land`] asks this before it repeats git's
+/// wording, and names `git reset`, which clears the index and touches no file.
+///
+/// # What this deliberately does not do
+///
+/// It does not reset anything. The index is *shared*, so a reset here would
+/// discard whatever another agent had staged — no file content, but somebody's
+/// intent, and this design's rule is that destroying a record is asked for and
+/// never automatic (`robustness-090` d1). Diagnosing costs two `git` calls on
+/// a path that has already failed; deciding costs somebody their staging.
+///
+/// Untracked files are not consulted, because they are not what a fast-forward
+/// refuses over — git names those separately, in a different sentence. The one
+/// caller that *does* need them excluded checks for them itself, where the
+/// difference between "your files" and "your index" is the message.
+fn index_only(dir: &Path) -> bool {
+    // `git` strips `GIT_INDEX_FILE`, which is exactly what is wanted: the index
+    // in question is the shared `.git/index`, never the private one a caller
+    // partway through the commit procedure has exported. See
+    // [`crate::cmd_verify::git`], and [`crate::cmd_agent::doctor`], which asks
+    // a neighbouring question of every declared root for the same reason.
+    git(dir, &["diff", "--quiet", "HEAD"]).is_some()
+        && git(dir, &["diff", "--cached", "--quiet", "HEAD"]).is_none()
+}
+
+/// Whether anything in `dir` is untracked and not ignored.
+fn untracked(dir: &Path) -> bool {
+    git(dir, &["ls-files", "--others", "--exclude-standard"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// The commits on `branch` that the trunk does not have, newest first.
 ///
 /// `pub(crate)` for the worklist barrier, which asks this same question of
@@ -1311,6 +1360,20 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     // it would be this command doing the one thing the whole arrangement exists
     // to stop — moving somebody's work without them.
     if dirty(&w.dir) {
+        // …but say which "it". A tree whose files match HEAD has nothing to
+        // commit, and telling its agent to commit sends it looking for work it
+        // has already done. See [`index_only`]: the disagreement is the shared
+        // index left behind a commit made through a private one, and `git
+        // reset` is the whole of the fix. Untracked files are excluded because
+        // then there genuinely is something here to commit.
+        if index_only(&w.dir) && !untracked(&w.dir) {
+            let d = util::contract(&w.dir);
+            eprintln!("wsp: {d} has nothing uncommitted — its files match HEAD exactly");
+            eprintln!(
+                "wsp: what `git status` shows is the index, a commit behind after a commit made through a private GIT_INDEX_FILE — `git -C {d} reset` clears it and touches no file"
+            );
+            return 2;
+        }
         eprintln!("wsp: {} has uncommitted work — commit it first", util::contract(&w.dir));
         return 2;
     }
@@ -1350,8 +1413,23 @@ pub fn land(store: &Store, args: &Args) -> i32 {
         // `--ff-only` in the trunk rather than a push: the trunk is a checked-out
         // working tree, and this is the one form of update that refuses rather
         // than silently overwriting a file somebody has open there.
-        git_ok(&w.trunk, &["merge", "--ff-only", "--quiet", &on])
-            .map_err(|e| format!("{} would not fast-forward: {e}", util::contract(&w.trunk)))?;
+        git_ok(&w.trunk, &["merge", "--ff-only", "--quiet", &on]).map_err(|e| {
+            let t = util::contract(&w.trunk);
+            let mut msg = format!("{t} would not fast-forward: {e}");
+            // git's refusal names *local changes*, and the commonest reason
+            // there are none is the one the commit procedure creates. Appended
+            // rather than substituted: git is not wrong about itself, and the
+            // reader is owed both what it said and what it meant. [`index_only`]
+            // carries the incident and why this does not simply reset.
+            if index_only(&w.trunk) {
+                msg.push_str(&format!(
+                    "\nwsp: there are no local changes there — the files in {t} match its HEAD exactly, and the whole disagreement is its index, \
+                     left a commit behind by a commit made through a private GIT_INDEX_FILE\n\
+                     wsp: `git -C {t} reset` clears it and touches no file, then `wsp land` again"
+                ));
+            }
+            msg
+        })?;
         Ok(landed)
     });
 
@@ -2058,5 +2136,105 @@ mod tests {
         assert_eq!(trunk(&wt).map(|p| util::real(&p.display().to_string())), Some(util::real(&dir.display().to_string())));
         assert_eq!(trunk_branch(&dir).as_deref(), Some("master"));
         assert_eq!(trunk_branch(&wt).as_deref(), Some("t-4"), "a tree is on its own branch");
+    }
+
+    /// Commit through a private index, the way `wsp commit-help` step 1
+    /// mandates, and leave the shared one behind — the state this whole
+    /// diagnosis exists for.
+    fn commit_behind_the_shared_index(dir: &Path, file: &str, body: &str, msg: &str) {
+        let idx = dir.join("private-index");
+        std::fs::write(dir.join(file), body).unwrap();
+        for args in [
+            vec!["read-tree", "HEAD"],
+            vec!["add", file],
+            vec!["commit", "--quiet", "-m", msg],
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .env("GIT_INDEX_FILE", &idx)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        std::fs::remove_file(&idx).unwrap();
+    }
+
+    /// The sentence that misled two agents in one hour, asserted as a fact
+    /// about git rather than as a claim about wsp: the tree is dirty, and
+    /// there is nothing in it to commit.
+    #[test]
+    fn a_tree_a_commit_left_behind_its_index_reads_as_dirty_with_nothing_to_commit() {
+        let (_env, dir) = scratch("stale-index");
+        repo(&dir);
+        commit_behind_the_shared_index(&dir, "kept.txt", "two\n", "second");
+
+        assert!(dirty(&dir), "`git status` is expected to show this — it shows MM");
+        assert!(index_only(&dir), "the files match HEAD and only the index does not");
+        assert!(!untracked(&dir), "nothing untracked, so nothing here is work to commit");
+
+        // And the fix named in the message, which is the claim that has to
+        // hold: it clears the index and touches no file.
+        let before = std::fs::read_to_string(dir.join("kept.txt")).unwrap();
+        run(&dir, &["reset", "--quiet"]);
+        assert_eq!(std::fs::read_to_string(dir.join("kept.txt")).unwrap(), before);
+        assert!(!dirty(&dir), "a bare reset did not settle it");
+    }
+
+    /// The other half of the same predicate: ordinary uncommitted work must go
+    /// on reading as uncommitted work, or the diagnosis would swallow the
+    /// refusal it was added beside.
+    #[test]
+    fn ordinary_uncommitted_work_is_not_mistaken_for_a_stale_index() {
+        let (_env, dir) = scratch("real-dirt");
+        repo(&dir);
+
+        std::fs::write(dir.join("kept.txt"), "edited\n").unwrap();
+        assert!(dirty(&dir));
+        assert!(!index_only(&dir), "an edited file is a change to the working tree");
+
+        std::fs::write(dir.join("kept.txt"), "one\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        assert!(dirty(&dir));
+        assert!(untracked(&dir), "a new file is work somebody has to commit");
+        assert!(!index_only(&dir), "and the index has nothing to do with it");
+
+        // Both at once is the case the two questions are asked separately for:
+        // the index is a commit behind *and* there is a file to commit, so
+        // `land` owes the ordinary refusal and not the diagnosis.
+        commit_behind_the_shared_index(&dir, "kept.txt", "two\n", "second");
+        assert!(index_only(&dir), "an untracked file is not a change to a tracked one");
+        assert!(untracked(&dir), "…and it is still sitting there");
+    }
+
+    /// The refusal itself, end to end: the trunk's index alone stops the
+    /// fast-forward, and the working tree it names is untouched throughout.
+    #[test]
+    fn a_stale_trunk_index_is_the_whole_of_what_refuses_the_fast_forward() {
+        let (_env, dir) = scratch("ff-index");
+        repo(&dir);
+        commit_behind_the_shared_index(&dir, "kept.txt", "two\n", "second");
+
+        let wt = checkout_dir(&dir, "t-5");
+        ensure(&dir, &wt, "t-5", "master").unwrap();
+        std::fs::write(wt.join("kept.txt"), "three\n").unwrap();
+        run(&wt, &["add", "kept.txt"]);
+        run(&wt, &["commit", "--quiet", "-m", "third"]);
+
+        let refused = git_ok(&dir, &["merge", "--ff-only", "--quiet", "t-5"]).unwrap_err();
+        assert!(
+            refused.contains("local changes"),
+            "git's wording is what the added line answers, and it changed: {refused}"
+        );
+        assert!(index_only(&dir), "…and there are none — this is the index");
+
+        run(&dir, &["reset", "--quiet"]);
+        git_ok(&dir, &["merge", "--ff-only", "--quiet", "t-5"]).expect("a bare reset was not the fix");
+        assert_eq!(std::fs::read_to_string(dir.join("kept.txt")).unwrap(), "three\n");
     }
 }
