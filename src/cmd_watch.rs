@@ -875,8 +875,8 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
             Kind::Unanswered,
             subject,
             &format!(
-                "{who} · this wsp cannot read the record — `wsp ask` lists it, \
-                 and `wsp install` may be what it wants"
+                "{who} · this wsp cannot read the record — wsp ask lists it, \
+                 and wsp install may be what it wants"
             ),
         )
         .loud(),
