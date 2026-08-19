@@ -574,6 +574,109 @@ pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec
     out
 }
 
+/// The word in the footer that opens the menu, and the whole of what a click
+/// has to land on.
+///
+/// herdr's own sidebar keeps its menu behind exactly this: the word `menu`,
+/// right-aligned in the sidebar's footer strip. Copied rather than invented,
+/// and copied as a word rather than as a hamburger — `≡` is already
+/// [`glyph::NOTES`] here and means "something is written", and a panel with one
+/// glyph meaning two things is one you read twice.
+///
+/// It is drawn in the counts line, which is the one line of the panel that is
+/// never a message and never a prompt. A door that comes and goes with a
+/// four-second footer message is a door nobody learns is there.
+pub(super) const MENU_BUTTON: &str = "menu";
+
+/// Where the menu box goes: the row it starts on, the column it starts at, and
+/// how wide it is.
+///
+/// One function because the frame draws it and a click has to find it again,
+/// and a menu you can see two rows above where you can press it is worse than
+/// one with no mouse at all.
+///
+/// Anchored to the bottom right — sitting on the footer, at the edge the `≡` is
+/// at — rather than centred the way a card is. The two are different arrivals:
+/// a card is somebody else's question landing in the middle of what you were
+/// reading, and a menu is a drawer you opened, so it comes out of the thing you
+/// opened it with.
+pub(super) fn menu_box(menu: &super::keys::Menu, w: usize, h: usize) -> (usize, usize, usize) {
+    // The header strip and its rule, and the three the footer keeps. The same
+    // two numbers [`geometry`] holds, and for the same reason: what is left
+    // between them is what a popup is allowed.
+    const HEAD: usize = 2;
+    const FOOTER: usize = 3;
+    // Two columns of border, one of padding either side, and two for the mark
+    // in the margin.
+    let box_w = (menu.width() + 6).min(w.saturating_sub(2)).max(6);
+    let left = w.saturating_sub(box_w + 1);
+    let rows = menu.items.len() + 2;
+    // The footer keeps its three lines: the menu is over the tree, never over
+    // the y/n it is about to raise. Clamped under the header rule for a pane
+    // too short to hold both, where what gives way is the top of the box —
+    // `menu_lines` draws from the top, so a clamp here loses the last rows and
+    // the caller's `get_mut` drops them.
+    let top = h.saturating_sub(FOOTER + rows).max(HEAD);
+    (top, left, box_w)
+}
+
+/// The menu, drawn as a box over the tree.
+///
+/// Bordered for the reason a card is: everything else on the panel is always
+/// there, and this arrived and is going away again.
+pub(super) fn menu_lines(menu: &super::keys::Menu, w: usize) -> Vec<Line> {
+    let text_w = w.saturating_sub(4).max(4);
+    let rule = |left: &str, right: &str| {
+        let mut l = Line::default();
+        l.push(Style::Accent, format!("{left}{}{right}", "─".repeat(w.saturating_sub(2))));
+        l
+    };
+    let mut out = vec![rule("┌", "┐")];
+    for (i, item) in menu.items.iter().enumerate() {
+        let mut l = Line::default();
+        l.push(Style::Accent, "│");
+        l.push(Style::Plain, " ");
+        let mut body = Line::default();
+        // Marked in the margin rather than by inverting the line. `Line`'s
+        // inverse is the whole line, and the whole line here includes the box's
+        // own border — and, once the frame has padded it out to the left edge,
+        // the empty tree beside it. So the mark is a column, and the label is
+        // loud instead.
+        let picked = i == menu.sel;
+        body.push(Style::Accent, if picked { format!("{} ", glyph::CLOSED) } else { "  ".into() });
+        body.push(
+            if picked { Style::Bold } else { Style::Plain },
+            util::truncate(item.label(), text_w.saturating_sub(2)),
+        );
+        body.fit(text_w);
+        l.spans.extend(body.spans);
+        l.push(Style::Plain, " ");
+        l.push(Style::Accent, "│");
+        out.push(l);
+    }
+    out.push(rule("└", "┘"));
+    out
+}
+
+/// Which row of the menu a click at `x`,`y` landed on.
+///
+/// The border is not a row and answers `None`: a click on the frame of a box is
+/// a click that missed, and the row nearest it is `quit herdr`.
+pub(super) fn menu_at(
+    menu: &super::keys::Menu,
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+) -> Option<usize> {
+    let (top, left, box_w) = menu_box(menu, w, h);
+    if x < left || x >= left + box_w {
+        return None;
+    }
+    let i = y.checked_sub(top + 1)?;
+    (i < menu.items.len()).then_some(i)
+}
+
 pub(super) const FOCUS_MIN: usize = 3;
 
 pub(super) const FOCUS_MAX: usize = 6;
@@ -1130,6 +1233,13 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "agents");
     }
+    // And the door, at the right-hand edge, where herdr keeps its own. Fitted
+    // rather than appended: the counts are what give way if a pane is narrow
+    // enough for the two to meet, because a count that is one column short is
+    // still a count and a menu that is one column short is not a door.
+    foot.fit(w.saturating_sub(MENU_BUTTON.chars().count() + 1));
+    foot.push(Style::Plain, " ");
+    foot.push(Style::Dim, MENU_BUTTON);
     lines.push(foot);
 
     // The last line belongs to whatever the panel is waiting for: a value, an
@@ -1173,6 +1283,11 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             }
             l
         }
+        // The keys, and nothing else. A menu is a list you are reading, so the
+        // one thing the line under it is worth is how to take a row and how to
+        // put the list away — and `q` is said because `q` is very likely what
+        // opened it.
+        Mode::Menu(_) => line(Style::Dim, "↵ takes it · q or esc closes"),
         Mode::Confirm { question, .. } => {
             let mut l = Line::default();
             l.push(Style::Warn, util::truncate(question, w.saturating_sub(6)));
@@ -1283,6 +1398,32 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
             _ => line(Style::Dim, "↵ open · E edit · a add · ? keys"),
         },
     });
+
+    // The menu, over everything the panel has drawn except its own footer.
+    //
+    // Last of all, and after the docks rather than with the card, because it is
+    // the only popup that can be up while the key map is: `the key map` is a
+    // row of it, and a menu that slid behind the thing it just opened would be
+    // one you thought had failed. The footer keeps its three lines whatever is
+    // up — see [`menu_box`] — because the next thing this menu draws is a y/n
+    // down there.
+    //
+    // It is allowed over the agents dock, where a card is deliberately not.
+    // The card is clipped to the tree because it is one of a queue of asks and
+    // the dock is where the rest of them are; a menu is a drawer somebody just
+    // opened, it goes away on `↵`, `q` or `esc`, and it comes out of the word
+    // in the footer — which is under the dock, not above it.
+    if let Mode::Menu(menu) = mode {
+        let (top, left, box_w) = menu_box(menu, w, h);
+        for (i, l) in menu_lines(menu, box_w).into_iter().enumerate() {
+            if let Some(slot) = lines.get_mut(top + i) {
+                let mut placed = Line::default();
+                placed.pad(left);
+                placed.spans.extend(l.spans);
+                *slot = placed;
+            }
+        }
+    }
 
     lines.truncate(h);
     lines

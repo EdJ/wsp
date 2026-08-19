@@ -509,6 +509,7 @@ fn effect_label(e: &panel::Effect) -> String {
         panel::Effect::Sidebar => "the sidebar again".into(),
         panel::Effect::Run { argv, .. } => format!("run wsp {}", argv.join(" ")),
         panel::Effect::Tell(_) => "tell an agent".into(),
+        panel::Effect::Herdr(c) => format!("ask herdr to {}", c.said()),
     }
 }
 
@@ -608,6 +609,18 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// Draw this one as the sidebar rather than as the tab.
+    ///
+    /// Every other scene is the tab, because that is the panel with room to
+    /// photograph. The menu is about the sidebar specifically — it exists
+    /// because the fork made this surface *be* herdr's sidebar — and `q` means
+    /// different things in the two, so a scene about the way out of the
+    /// furniture has to be taken in the furniture.
+    fn as_furniture(&mut self) -> &mut Self {
+        self.view.takes_the_tab(false);
+        self
+    }
+
     /// One input, through the door the live loop uses.
     ///
     /// [`panel::apply_input`] and not `apply_key`: a click has to be turned
@@ -681,6 +694,22 @@ impl<'a> Driver<'a> {
         let x = panel::strip_rest_column(&self.ui, self.size.0)
             .unwrap_or_else(|| panic!("the strip is not clipped at {} cells", self.size.0));
         self.click_at(x, 0)
+    }
+
+    /// The word in the footer that opens the menu, asked of the panel rather
+    /// than counted from the edge of the pane — for the reason [`Driver::to_task`]
+    /// exists, and the same one that makes `click_mark` ask `strip_column`.
+    fn click_menu(&mut self) -> &mut Self {
+        let (x, y) = self.view.menu_button(self.size.0, self.size.1);
+        self.click_at(x, y)
+    }
+
+    /// And a row of the menu that is up, by its position in the list.
+    fn click_item(&mut self, i: usize) -> &mut Self {
+        match self.view.menu_row(i, self.size.0, self.size.1) {
+            Some((x, y)) => self.click_at(x, y),
+            None => panic!("no menu is up, so there is no row {i} to point at"),
+        }
     }
 
     /// A raw coordinate. The primitive the three above resolve to, and the one
@@ -1322,6 +1351,49 @@ fn scenes() -> Vec<Scene> {
             .to_pane("w2:p1")
             .key(Key::Char('u'))
             .scene("Before taking work back", "The five keys that generate or re-aim an agent — S C c f u — all ask, the way X does. Nothing here is a record you can retype: u releases the claim *and* empties the window, and an emptied context does not come back. The question names the agent rather than the pane id, and says whether it is still mid-task, which is the fact you want before answering and the one the tree does not show you."),
+    );
+
+    // ---- the way out ----------------------------------------------------
+
+    out.push(
+        Driver::new(&w)
+            .as_furniture()
+            .key(Key::Char('q'))
+            .now_in("the menu")
+            .did("nothing")
+            .says("quit herdr")
+            .scene(
+                "The menu",
+                "q gives back whatever is in front of you — the key map, a search, the detail pane, room a widened sidebar borrowed, the tab Z opened — and when there is nothing left to give back it opens this. The panel itself is never what q closes: it is installed furniture, and losing it to a stray keystroke costs a reinstall. That guard was the whole story while the panel was a pane and herdr's own menu was two clicks away; the fork made this surface *be* herdr's sidebar, so the guard that stopped the stray q also took away the last door out of the terminal. A menu is what the guard was protecting for rather than a hole in it — a list you open and a row you pick is deliberate, two-step and readable, which is exactly what a stray keystroke is not. Close is the first row, because it is the thing whose absence built the menu.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .as_furniture()
+            .key(Key::Char('q'))
+            .key(Key::Enter)
+            .now_in("a confirmation")
+            .did("nothing")
+            .says("quit herdr? 7 agents running")
+            .scene(
+                "Quitting asks, and says what it costs",
+                "The one row here that cannot be un-pressed, so it asks the way X does — and the question carries the consequence, which is not on the screen anywhere else: what quitting costs is the agents. Counted off the census, so it is every agent on the machine and not only the ones the tree happens to be showing. y hands `server.stop` to herdr and herdr goes, taking every pane with it; n leaves it alone.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&w)
+            .click_menu()
+            .now_in("the menu")
+            .click_item(2)
+            .now_in("browse")
+            .did("nothing")
+            .says("close it · then the menu")
+            .scene(
+                "The same door, from the pointer",
+                "herdr keeps its menu behind the word `menu` at the right-hand edge of the sidebar footer, and so does this — copied rather than invented, and copied as a word rather than as a hamburger, because ≡ already means \u{201c}something is written\u{201d} on a task row here. A row is taken on one click where a row of the tree takes two: there is nothing to read on the way, the list is three rows you opened on purpose, and the row that costs anything asks y afterwards. `the key map` is the one row that is also a keystroke — a menu is the only part of the panel anybody finds without knowing a key, so it owes them the keys.",
+            ),
     );
 
     // ---- the mouse, and the pane the keyboard is in ----------------------
@@ -2123,6 +2195,178 @@ mod tests {
             .map(|(s, _)| s)
             .expect("the same pane, ungoverned");
         assert_eq!(ordinary, panel::AgentState::Asking);
+    }
+
+    /// The complaint this whole thing is against, as a test: *"no way to quit
+    /// right now"*, and on the day the fork went live, *"annoying, since we
+    /// lost the herdr menu."*
+    ///
+    /// Both halves are asserted, because either alone is the wrong fix. The
+    /// guard holds — `q` on the sidebar still does not quit the panel, which is
+    /// installed furniture and costs a reinstall — and the key that reached for
+    /// a way out now opens the list of them instead of printing a sentence
+    /// naming the one exit that takes the sidebar with it.
+    #[test]
+    fn q_with_nothing_in_front_of_it_opens_the_menu_rather_than_refusing() {
+        let w = world();
+        // Not the tab: the sidebar, which is what the fork made this surface
+        // and where the way out went missing.
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        assert!(
+            matches!(panel::apply_key(Key::Char('q'), &mut ui, &mut view), panel::Effect::None),
+            "the sidebar is furniture and `q` must never be the thing that takes it down",
+        );
+        assert_eq!(view.mode_name(), "the menu");
+    }
+
+    /// …and it is the *last* thing `q` means, not the first. Every arm before
+    /// it gives back something that is actually in front of you, and a menu
+    /// that jumped the queue would make `q` stop being the key that closes
+    /// things — which is the key it is everywhere else.
+    #[test]
+    fn the_menu_is_what_q_means_only_once_there_is_nothing_left_to_close() {
+        let w = world();
+        let mut view = panel::View::default();
+        view.set_help_for_test(true);
+        let mut ui = ui_of(&w, &view);
+
+        panel::apply_key(Key::Char('q'), &mut ui, &mut view);
+        assert_eq!(view.mode_name(), "browse", "the map was in front of you, so the map goes");
+
+        panel::apply_key(Key::Char('q'), &mut ui, &mut view);
+        assert_eq!(view.mode_name(), "the menu", "and now there is nothing left");
+    }
+
+    /// Ending the terminal is three deliberate steps and never fewer: open the
+    /// menu, take the row, answer the question. The question is the one the
+    /// panel asks in front of anything that cannot be un-pressed, and it counts
+    /// what quitting would cost — which is the agents, and is not on the screen
+    /// anywhere else.
+    #[test]
+    fn quitting_herdr_costs_a_menu_a_row_and_then_a_yes() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        panel::apply_key(Key::Char('q'), &mut ui, &mut view);
+        assert!(
+            matches!(panel::apply_key(Key::Enter, &mut ui, &mut view), panel::Effect::None),
+            "the first row is the way out, and taking it asks rather than does",
+        );
+        assert_eq!(view.mode_name(), "a confirmation");
+
+        // `n` is the answer somebody presses by mistake, and it has to cost
+        // nothing at all.
+        let mut aside = view.clone();
+        let mut same = ui_of(&w, &aside);
+        assert!(matches!(
+            panel::apply_key(Key::Char('n'), &mut same, &mut aside),
+            panel::Effect::None
+        ));
+
+        assert!(
+            matches!(
+                panel::apply_key(Key::Char('y'), &mut ui, &mut view),
+                panel::Effect::Herdr(panel::Chore::Quit)
+            ),
+            "and only a `y` hands `server.stop` to herdr",
+        );
+    }
+
+    /// The word in the footer is a door and not the `q` key pressed for you.
+    ///
+    /// The two are deliberately different implementations of nothing: `q` means
+    /// "give back the nearest thing", so in the tab `Z` opened it closes the
+    /// tab. A word that says `menu` has to open the menu wherever it is drawn,
+    /// and the tab is exactly where that would otherwise go wrong.
+    #[test]
+    fn the_word_in_the_footer_opens_the_menu_where_q_would_close_the_tab() {
+        let w = world();
+        let mut view = panel::View::default();
+        view.takes_the_tab(true);
+        let mut ui = ui_of(&w, &view);
+        let mut here = true;
+
+        let (x, y) = view.menu_button(W, H);
+        panel::apply_input(
+            panel::Input::Key(Key::Click { x, y }),
+            &mut ui,
+            &mut view,
+            W,
+            H,
+            &mut here,
+        );
+        assert_eq!(view.mode_name(), "the menu");
+
+        // And the same panel, same key map, reached by `q` instead: the tab is
+        // what is in front of you, so that is what goes.
+        let mut view = panel::View::default();
+        view.takes_the_tab(true);
+        let mut ui = ui_of(&w, &view);
+        assert!(matches!(
+            panel::apply_key(Key::Char('q'), &mut ui, &mut view),
+            panel::Effect::Quit
+        ));
+    }
+
+    /// A menu row is taken on one click, where a row of the tree takes two.
+    /// There is nothing to read on the way, the list is three rows somebody
+    /// opened on purpose, and the row that costs anything asks afterwards —
+    /// the same argument the marks in the header strip are single-click for.
+    ///
+    /// And the border is a miss rather than the row nearest it, because the row
+    /// nearest it is `quit herdr`.
+    #[test]
+    fn a_menu_row_is_taken_on_the_first_click_and_the_box_edge_is_a_miss() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        let mut here = true;
+        let click = |x: usize, y: usize| panel::Input::Key(Key::Click { x, y });
+
+        panel::apply_key(Key::Char('q'), &mut ui, &mut view);
+        // The last row, which is the key map — the one row whose whole effect
+        // is visible from out here.
+        let (x, y) = view.menu_row(2, W, H).expect("the menu is up");
+        panel::apply_input(click(x, y), &mut ui, &mut view, W, H, &mut here);
+        assert_eq!(view.mode_name(), "browse", "a menu closes behind its own answer");
+        assert!(view.help_for_test(), "and the row it took was the key map");
+
+        // Now the border, on a panel with nothing else open — the key map the
+        // click above put up is what `q` would give back first.
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        panel::apply_key(Key::Char('q'), &mut ui, &mut view);
+        let (x, y) = view.menu_row(0, W, H).expect("the menu is up again");
+        panel::apply_input(click(x, y - 1), &mut ui, &mut view, W, H, &mut here);
+        assert_eq!(
+            view.mode_name(),
+            "the menu",
+            "a click on the frame of a box is a click that missed, not a quit",
+        );
+    }
+
+    /// The shape Ed asked for, held to: *"a sidebar menu, where close can be
+    /// the first option"*.
+    ///
+    /// And the shape the brief asked for beside it — `close` is four different
+    /// promises here, because there is a pane, a tab, a workspace and herdr
+    /// itself. Every row names the thing it acts on, which is what a row of one
+    /// word cannot do.
+    #[test]
+    fn close_is_the_first_row_and_no_row_is_named_by_a_word_on_its_own() {
+        let menu = panel::Menu::global();
+        assert_eq!(menu.items()[0].label(), "quit herdr");
+        for item in menu.items() {
+            assert!(
+                item.label().split_whitespace().count() > 1,
+                "{:?} says `{}`, which does not say what it acts on",
+                item,
+                item.label(),
+            );
+        }
     }
 
     /// The half a record could never be: you can say something to the governor

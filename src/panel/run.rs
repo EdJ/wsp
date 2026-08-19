@@ -22,7 +22,7 @@ use crate::live::{self, AgentRef};
 use crate::store::Store;
 use crate::util::exe_stamp;
 
-use super::keys::{apply_input, say, Effect, Input, Mode, View};
+use super::keys::{apply_input, say, Chore, Effect, Input, Mode, View};
 use super::render::{frame, to_ansi};
 use super::rows::{collect, refetch_into, Cursor, Snapshot, Target, Ui};
 use super::shared;
@@ -1314,6 +1314,27 @@ pub(super) fn event_loop(
                     });
                 }
                 Effect::Tell(t) => tell(t, &mut ui, tx),
+                // The menu's two herdr rows. Straight down the socket, where
+                // every other doing effect runs the CLI: there is no `wsp` for
+                // either of these and there should not be one, because neither
+                // touches the store — see [`Chore`].
+                //
+                // `Quit` is answered before it is reported: herdr goes, and a
+                // surface's next read of stdin ends. The word is said anyway,
+                // for the panel in a pane whose herdr is somebody else's.
+                Effect::Herdr(chore) => {
+                    let (method, done) = match chore {
+                        Chore::Quit => ("server.stop", "quitting"),
+                        Chore::ReloadConfig => ("server.reload_config", "config reloaded"),
+                    };
+                    match herdr::call(method, json!({})) {
+                        Ok(_) => say(&mut ui, done),
+                        // What herdr said, rather than "failed". A socket that
+                        // is not there and a config that will not parse are
+                        // different problems and only one of them is yours.
+                        Err(e) => say(&mut ui, format!("herdr: {e}")),
+                    }
+                }
                 Effect::Run { argv, escalate, then } => {
                     match (run_wsp(&argv), escalate) {
                         (Ok(m), _) => {

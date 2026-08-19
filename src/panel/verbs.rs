@@ -1353,10 +1353,27 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // nothing is lost by quitting it and `Z` opens it again — and a
         // fullscreen with no `q` is one you go looking for the way out of.
         Key::Char('q') | Key::Esc if view.full => Effect::Quit,
-        Key::Char('q') => {
-            say(ui, "nothing to close · ctrl-c quits the panel");
-            Effect::None
-        }
+        // Nothing left to give back, so the key means the last thing it can
+        // mean: the ways out, as a list. It used to say "nothing to close ·
+        // ctrl-c quits the panel", which was true and was also the whole
+        // problem — the panel is the sidebar now, that sentence named the one
+        // exit that takes the sidebar down with it, and herdr's own menu, which
+        // is where the way out of the *terminal* used to live, is what the fork
+        // replaced.
+        //
+        // The guard above is untouched and this is not a hole in it. A menu is
+        // deliberate, two-step and readable, which is exactly what the guard
+        // was protecting against — see [`super::keys::Menu`], where the
+        // argument is written down for the reader who finds a `q` that refuses
+        // to quit sitting beside a menu that offers to.
+        //
+        // Last in the chain and not first, which is what makes it reachable at
+        // all rather than in the way: every arm above is something in front of
+        // you, and this is what is left when nothing is. In the tab `Z` opened
+        // the arm above catches it, so `q` there closes the tab and the next
+        // one opens the menu in the sidebar you land back in — the word in the
+        // footer is the door that works from either.
+        Key::Char('q') => super::keys::open_menu(view),
         Key::Esc => Effect::CloseView,
         Key::Interrupt => Effect::Quit,
 

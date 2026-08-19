@@ -70,6 +70,10 @@ pub(crate) use keys::apply_key;
 // ever draw.
 #[cfg(test)]
 pub(crate) use keys::Mode;
+// And the menu, for the tests that hold it to the shape it was asked for and
+// drive it through the reducer the way a reader would.
+#[cfg(test)]
+pub(crate) use keys::{Chore, Menu};
 #[cfg(test)]
 pub(crate) use rows::Card;
 // The live path reaches these through `super::keys`; only the storyboard's

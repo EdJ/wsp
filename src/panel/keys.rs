@@ -70,6 +70,30 @@ impl View {
         self.focus = on;
     }
 
+    /// And read back, for the one menu row whose whole effect is a field on
+    /// here rather than an [`Effect`] the caller can match on.
+    #[cfg(test)]
+    pub(crate) fn help_for_test(&self) -> bool {
+        self.help
+    }
+
+    /// Where the word that opens the menu is drawn, so a script can point at
+    /// the button rather than at a coordinate — the reason `strip_column`
+    /// exists, and the same failure it avoids: a pair of numbers written down
+    /// here describes the pane the scene was written at and goes on passing
+    /// after the footer changes shape under it.
+    pub(crate) fn menu_button(&self, w: usize, h: usize) -> (usize, usize) {
+        (w.saturating_sub(1), h.saturating_sub(2))
+    }
+
+    /// And where one row of the open menu is. `None` when no menu is up, which
+    /// is a script pointing at something that is not on the screen.
+    pub(crate) fn menu_row(&self, i: usize, w: usize, h: usize) -> Option<(usize, usize)> {
+        let Mode::Menu(menu) = &self.mode else { return None };
+        let (top, left, _) = super::render::menu_box(menu, w, h);
+        (i < menu.items.len()).then(|| (left + 1, top + 1 + i))
+    }
+
     /// What the panel is in the middle of, as one word.
     ///
     /// The mode is the half of the state a frame is worst at reporting: a
@@ -87,6 +111,7 @@ impl View {
             Mode::Find { .. } => "a search",
             Mode::Card(_) => "a card",
             Mode::Confirm { .. } => "a confirmation",
+            Mode::Menu(_) => "the menu",
         }
     }
 }
@@ -309,6 +334,201 @@ pub(crate) enum Mode {
         question: String,
         deed: Box<Effect>,
     },
+    /// A list of things to do that are not about any row.
+    Menu(Menu),
+}
+
+/// The list a menu is holding while it is up.
+///
+/// Every other thing the panel does is a letter pressed at whatever the cursor
+/// is standing on, and for work that is the right shape: `s`, `c`, `X` are all
+/// about a task, a project or an agent. It is the wrong shape for the two or
+/// three things that are about **the terminal itself** — they belong to no row,
+/// so there is no row to press a letter at, and nobody finds them by trying.
+///
+/// It is also the answer to a guard rather than a hole in one, and that is
+/// worth saying here because the next reader will otherwise find a `q` that
+/// refuses to quit sitting beside a menu that offers to, and take one of them
+/// for a mistake. The rule in [`View::full`] is that the sidebar is installed
+/// furniture and must not be lost to a stray keystroke. That was the whole
+/// story while the panel was a pane and herdr's own menu was still there; the
+/// fork made this surface *be* herdr's sidebar, so the guard that stopped the
+/// stray `q` also removed the last door out of the terminal — Ed, on the day:
+/// *"annoying, since we lost the herdr menu."*
+///
+/// A menu is what the guard was protecting *for*: opening a list and picking a
+/// row is deliberate, two-step and readable, which is exactly what a stray
+/// keystroke is not. So the guard stays, `q` with nothing left to close opens
+/// this instead of refusing — the key you press when you want out is the key
+/// that shows you the ways out — and the one row that ends anything asks `y`
+/// after that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Menu {
+    /// What is on offer, in the order they are drawn. Fixed when the menu
+    /// opens: a list that reordered under the cursor is how you press the row
+    /// next to the one you meant, and one of these rows ends the terminal.
+    pub(super) items: Vec<Item>,
+    pub(super) sel: usize,
+}
+
+impl Menu {
+    /// The menu reached from nowhere in particular — herdr's
+    /// `render_global_launcher_menu`, and the half of the pair this task built.
+    /// The other half is a menu about the row under the pointer, and it is a
+    /// different `Vec<Item>` handed to this same struct: same reducer, same
+    /// box, same click. That is the whole reason the payload is a list rather
+    /// than a mode of its own.
+    pub(crate) fn global() -> Menu {
+        Menu { items: vec![Item::QuitHerdr, Item::ReloadConfig, Item::Keys], sel: 0 }
+    }
+
+    /// What is on it, for the test that holds the menu to the shape it was
+    /// asked for: close first, and no row named by a word on its own.
+    #[cfg(test)]
+    pub(crate) fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// The widest label, which is what the box is drawn to.
+    pub(super) fn width(&self) -> usize {
+        self.items.iter().map(|i| i.label().chars().count()).max().unwrap_or(0)
+    }
+}
+
+/// One row of a menu: what it says, and what picking it does.
+///
+/// A closed enum rather than a label beside an [`Effect`], for the reason
+/// [`Request`] is closed — what a row of a menu does is the panel's to decide,
+/// so the payload names something the panel already knows how to do. Picking is
+/// [`choose`], which is the one place a row becomes a deed.
+///
+/// **What is not here, and why.** herdr's own global menu offered five things:
+/// `settings`, `keybinds`, `reload config`, `what's new`, and `detach`. Two of
+/// them draw herdr's own screens — a settings form and a release-notes pane —
+/// and there is no socket call that opens either, so a row for them would be a
+/// row that cannot work; `what's new` needs herdr's update state, which nothing
+/// on this side of the pipe is told. `keybinds` is herdr's key map, and wsp has
+/// its own and a better claim to yours: [`Item::Keys`] is that one. What is
+/// left is the two that are one call each, and they are the two that were
+/// actually lost.
+///
+/// **`close` is not one word.** There is a pane, a tab, a workspace, and herdr
+/// itself, and a menu row that said `close` would be a promise nobody could
+/// read. Every row here names its object. The workspace is deliberately absent:
+/// closing *this* workspace is a question about the row under the cursor, not
+/// about nothing in particular — a surface has no workspace of its own at all
+/// (`Where::nowhere`) — so it belongs to the context menu this is the mechanism
+/// for, not to the global one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Item {
+    /// End herdr: every workspace, every pane, and every agent running in one.
+    ///
+    /// First because Ed asked for it first — *"a sidebar menu, where close can
+    /// be the first option"* — and because it is the thing whose absence built
+    /// the menu. Never without a `y`: it is the one row here that cannot be
+    /// un-pressed, and the question it raises counts what is running.
+    QuitHerdr,
+    /// Have herdr read its config file again.
+    ReloadConfig,
+    /// The key map, docked under the tree — the same thing `?` does.
+    ///
+    /// Here because a menu is the one part of the panel anybody can find
+    /// without knowing a key, so it owes them the list of the keys. It is the
+    /// only row that is also a keystroke, and that is the point of it.
+    Keys,
+}
+
+impl Item {
+    /// What the row says. Each names what it acts on, because `close` on its
+    /// own is four different promises — see the enum's own docs.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Item::QuitHerdr => "quit herdr",
+            Item::ReloadConfig => "reload herdr's config",
+            Item::Keys => "the key map",
+        }
+    }
+}
+
+/// Picking a row. The menu closes either way: a menu that stayed up behind its
+/// own answer would be a list you press twice.
+pub(super) fn choose(item: Item, ui: &Ui, view: &mut View) -> Effect {
+    view.mode = Mode::Browse;
+    match item {
+        Item::QuitHerdr => {
+            // The question carries the consequence, the way `X`'s does, and
+            // the consequence here is not on the screen anywhere: what quitting
+            // costs is the agents, and the count is the one number that makes
+            // `y` a decision rather than a reflex. Read off the census, which
+            // is every agent on the machine whatever the tree is filtered to.
+            // Short enough to survive the narrowest pane a panel is installed
+            // in: the footer gives a question `w - 6` columns, and a question
+            // that is cut before its own count is a question that has thrown
+            // away the reason it was asked.
+            let question = match ui.census.len() {
+                0 => "quit herdr? nothing running".to_string(),
+                1 => "quit herdr? 1 agent running".to_string(),
+                n => format!("quit herdr? {n} agents running"),
+            };
+            view.mode = Mode::Confirm { question, deed: Box::new(Effect::Herdr(Chore::Quit)) };
+            Effect::None
+        }
+        Item::ReloadConfig => Effect::Herdr(Chore::ReloadConfig),
+        // Shown rather than toggled. A row picked out of a list is a request
+        // for the thing named on it, and a `?` that put the map away because it
+        // happened to be up already would be the one row here that did the
+        // opposite of what it says.
+        Item::Keys => {
+            view.help = true;
+            Effect::None
+        }
+    }
+}
+
+/// Put the global menu up. One implementation, because the word in the footer
+/// and the key that falls through to it must not be able to open two different
+/// menus — and because the context menu will arrive as a third caller with a
+/// different list, not as a second mechanism.
+pub(super) fn open_menu(view: &mut View) -> Effect {
+    view.mode = Mode::Menu(Menu::global());
+    Effect::None
+}
+
+/// What the keys mean while a menu is up.
+///
+/// Everything that is not moving, picking or leaving is swallowed, for the
+/// reason the key map swallows it: the menu is open because you were not sure
+/// what to do, which is the worst possible moment for a letter to fire at the
+/// row behind it.
+pub(super) fn menu_key(k: Key, ui: &mut Ui, view: &mut View, mut menu: Menu) -> Effect {
+    let n = menu.items.len();
+    match k {
+        // `q` closes it as well as opening it, so the key that went looking for
+        // a way out is also the way back. `esc` and `ctrl-c` for the same
+        // reason every other mode takes them.
+        Key::Esc | Key::Char('q') | Key::Interrupt => {
+            view.mode = Mode::Browse;
+            Effect::None
+        }
+        Key::Down | Key::Char('j') if n > 0 => {
+            menu.sel = (menu.sel + 1) % n;
+            view.mode = Mode::Menu(menu);
+            Effect::None
+        }
+        Key::Up | Key::Char('k') if n > 0 => {
+            menu.sel = (menu.sel + n - 1) % n;
+            view.mode = Mode::Menu(menu);
+            Effect::None
+        }
+        Key::Enter => match menu.items.get(menu.sel).copied() {
+            Some(item) => choose(item, ui, view),
+            None => {
+                view.mode = Mode::Browse;
+                Effect::None
+            }
+        },
+        _ => Effect::None,
+    }
 }
 
 
@@ -647,7 +867,7 @@ pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(
                 ("R", "only what needs review", Scope::Always),
                 ("w", "the agents, not the work", Scope::Always),
                 ("W", "its task, in the tree", Scope::Agent),
-                ("q", "quit", Scope::Always),
+                ("q", "close it · then the menu", Scope::Always),
             ],
         ),
         (
@@ -756,6 +976,42 @@ pub(crate) enum Effect {
     /// Type into an agent's pane. The only effect that changes nothing at all
     /// in the store — what it changes is what an agent is about to do.
     Tell(Tell),
+    /// Something asked of herdr itself rather than of the work.
+    ///
+    /// Every other effect that *does* something runs `wsp`, because the CLI is
+    /// the one implementation and the panel is a caller of it. These have no
+    /// CLI to run and never will: they are about the terminal the work happens
+    /// in, and wsp keeps no record of a terminal. So they go where
+    /// [`Effect::Focus`] already goes — straight down herdr's socket from the
+    /// loop — and the loop is where the one call lives.
+    Herdr(Chore),
+}
+
+/// What the panel asks of herdr on its own account.
+///
+/// Two, and the shortness is the point: wsp is not a remote control for herdr,
+/// and every arm here is a thing the fork took away rather than a thing worth
+/// adding. See [`Item`] for what was left out and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chore {
+    /// `server.stop`: herdr sets `should_quit` and exits, taking every pane and
+    /// every agent with it. What herdr's own menu called `detach`, named for
+    /// what it does here rather than for what herdr calls it — herdr's row only
+    /// quits when it is configured to, and this call always does.
+    Quit,
+    /// `server.reload_config`: herdr re-reads its config file.
+    ReloadConfig,
+}
+
+impl Chore {
+    /// What was asked, as a phrase — for a storyboard scene, which has to be
+    /// able to say what a keypress *did* where no frame can show it.
+    pub(crate) fn said(self) -> &'static str {
+        match self {
+            Chore::Quit => "quit",
+            Chore::ReloadConfig => "reload its config",
+        }
+    }
 }
 
 pub(super) fn say(ui: &mut Ui, m: impl Into<String>) {
@@ -1453,6 +1709,16 @@ pub(crate) enum Hit {
     /// The click landed on a pane that was not the one being worked in. Taking
     /// the keyboard is the whole of what it did.
     Keyboard,
+    /// The word `menu` in the footer.
+    Opens,
+    /// A row of the menu that is already open.
+    ///
+    /// One click and it is taken, where a row of the tree gets select and then
+    /// activate. The two are different for the reason the strip's marks are:
+    /// there is nothing to read on the way, the list is three rows you opened
+    /// on purpose, and the row that costs anything asks `y` afterwards. A menu
+    /// you have to click twice is one that reads as broken.
+    Menu(usize),
 }
 
 /// Decide what a click does, and move the cursor if that is what it does.
@@ -1494,6 +1760,25 @@ pub(crate) fn click(
     // is a row nobody can see.
     if matches!(view.mode, Mode::Card(_)) {
         return Hit::Nothing;
+    }
+    // The menu is over them too, and is the one popup a pointer is *for*: it
+    // was opened from a word in the footer, and the row under the pointer is a
+    // row somebody is pointing at. Off the box and it is the same miss the card
+    // gives — the tree behind is not what the click meant.
+    if let Mode::Menu(menu) = &view.mode {
+        return match super::render::menu_at(menu, w, h, x, y) {
+            Some(i) => Hit::Menu(i),
+            None => Hit::Nothing,
+        };
+    }
+    // The word in the footer, and only while browsing. A click that opened a
+    // menu over a half-typed title would cost the typing, which is the rule
+    // [`Mode::Card`] is already held to.
+    if matches!(view.mode, Mode::Browse)
+        && y + 2 == h
+        && x + super::render::MENU_BUTTON.chars().count() >= w
+    {
+        return Hit::Opens;
     }
     // The top line is the strip, and a mark on it is an agent.
     if y == 0 {
@@ -1576,6 +1861,10 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Mode::Confirm { question, deed } => {
                 view.mode = Mode::Confirm { question, deed: deed.clone() };
                 confirm_key(k, ui, view, *deed)
+            }
+            Mode::Menu(menu) => {
+                view.mode = Mode::Menu(menu.clone());
+                menu_key(k, ui, view, menu)
             }
         }
     };
@@ -1677,6 +1966,20 @@ pub(crate) fn apply_input(
             // The `⋯`: the agents the strip could not draw. It stands for the
             // same thing `w` does, so it presses it.
             Hit::Rest => apply_key(Key::Char('w'), ui, view),
+            // The word in the footer opens the menu, and only that. It is
+            // deliberately not the `q` key pressed for you, the way the `⋯` is
+            // `w` pressed for you: `q` means "give back the nearest thing" and
+            // only falls through to the menu when there is nothing left to give
+            // back, so in the tab `Z` opened it would close the tab. A word
+            // that says `menu` has to open the menu wherever it is drawn.
+            Hit::Opens => open_menu(view),
+            Hit::Menu(i) => match &view.mode {
+                Mode::Menu(menu) => match menu.items.get(i).copied() {
+                    Some(item) => choose(item, ui, view),
+                    None => Effect::None,
+                },
+                _ => Effect::None,
+            },
             // Selected, or landed on furniture, or landed on a pane nobody was
             // working in — all of which the cursor and `keyboard` above have
             // already recorded, and none of which anybody has to be told about.
