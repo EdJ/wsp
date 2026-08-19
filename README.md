@@ -2922,7 +2922,8 @@ That residue is the whole argument for the other kind of sandbox. A herdr that
 comes up in 0.1s is not slow; what it cannot do is *be in a state you choose*,
 and every expensive bug in this store was a state — an empty pane list reaping
 every binding, a `pane.exited` cascade, a machine that stops answering mid-tick,
-pane ids reissued across a restart, twenty-two workspaces and four agents.
+a workspace id handed out again after a restart so a live pane answers to a dead
+pane's name, twenty-two workspaces and four agents.
 
 `wsp sandbox --fake` replaces the one component that has to be real with one
 that does not. `src/fake.rs` binds the same socket and answers the same
@@ -3237,9 +3238,13 @@ fast builds are a feature here, because a session-start hook runs this binary.
   daemon starting while herdr is still restoring a session would read a
   half-built world as a mass closure. Herdr hands workspace ids out again, so a
   claim naming a closed one is not merely stale: it is waiting to attach itself
-  to whatever takes the id next. The daemon does it
-  before its first sync, which is when herdr has just restored everything under
-  new pane ids. One pane takes one claim there too: two claims naming the same
+  to whatever takes the id next — measured 2026-08-19 against 0.8.0 in a
+  sandbox, and the mechanism is that herdr's workspace counter is process-local,
+  so a restart reserves only one above the highest workspace that survived.
+  Every id above that mark comes round again, and with no session file at all
+  the first workspace is `w1`. The daemon reaps before its first sync, which is
+  the moment herdr has just decided which ids are free.
+  One pane takes one claim there too: two claims naming the same
   workspace used to land on the same pane, and since claims are walked in id
   order the agent came back bound to the *older* task — the one it had left.
 - **cwd is not identity.** Five workspaces share `~/git/Easter` and eleven share

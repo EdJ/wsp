@@ -1170,14 +1170,17 @@ impl Store {
     // ---- claims -----------------------------------------------------------
     //
     // A binding says which *pane* is on a task, and a pane is the most
-    // perishable identifier herdr has — ids are reissued, and one cascade of
-    // `pane.exited` once cleared every binding on this machine at a stroke.
+    // perishable identifier herdr has: it dies with its workspace, and one
+    // cascade of `pane.exited` once cleared every binding on this machine at a
+    // stroke.
     //
     // A claim says which *workspace* the task is being worked in, keyed on
-    // things herdr persists in its own session file: the workspace id, and as
-    // a fallback its label and cwd, which survive even a workspace being
-    // rebuilt under a new id. Claims outlive panes; bindings are derived from
-    // them and are free to be lost.
+    // things herdr persists in its own session file: the workspace id, and as a
+    // fallback its label and cwd. The fallback is load-bearing in both
+    // directions — it finds a workspace rebuilt under a new id, and it is the
+    // only thing that can tell a workspace apart from a later one that was
+    // handed its id (`robustness-084`). Claims outlive panes; bindings are
+    // derived from them and are free to be lost.
 
     /// task id -> claim record
     pub fn claims(&self) -> BTreeMap<String, Value> {

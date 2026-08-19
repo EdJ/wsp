@@ -423,12 +423,18 @@ pub fn shed_env() -> BTreeMap<String, String> {
 /// writes it into a claim and expects to find the same place behind it
 /// tomorrow.
 ///
-/// herdr does not quite supply this. Workspace ids survive a session restore
-/// but not a workspace being rebuilt, and pane ids are reissued on every
-/// restart — which is why claims are keyed on workspaces rather than panes, and
-/// why a claim carries a `workspace_label` to re-find one whose id has changed.
-/// Under this port that shortfall is the herdr adapter's to make good, by
-/// whatever means, and wsp stops carrying the workaround. It is also why
+/// herdr does not quite supply this, and the shortfall is not the one this
+/// comment used to claim. Measured 2026-08-19 (`robustness-084`, and see
+/// [`crate::place_herdr`] for the transcript): a pane number inside a surviving
+/// workspace never comes round again, but a *workspace* id does — herdr's
+/// counter is process-local, and a restart reserves only one above the highest
+/// workspace that survived. So an id above that mark is handed out again, and
+/// with it every pane id qualified by it. A handle can therefore fail in both
+/// directions: name nothing, or name somebody else. That is why claims carry a
+/// `workspace_label` and a cwd — not to re-find an id that changed, but to tell
+/// the workspace we meant from the one that took its name. Under this port the
+/// shortfall is the herdr adapter's to make good, by whatever means, and wsp
+/// stops carrying the workaround. It is also why
 /// nothing here is a `pane` or a `workspace`: today's two ids, of two different
 /// lifetimes, become one handle of one lifetime.
 ///

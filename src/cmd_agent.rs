@@ -1650,11 +1650,14 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
             }),
         );
 
-        // The durable half. A pane id is worthless the moment the pane dies,
-        // so record the workspace instead — by id, and by the label and cwd
-        // herdr keeps in its own session file, which survive the id being
-        // reissued. The label is looked up before the lock: asking herdr is a
-        // socket round-trip, and nothing else should wait on it.
+        // The durable half. A pane id is worthless the moment the pane dies, so
+        // record the workspace instead — by id, and by the label and cwd herdr
+        // keeps in its own session file. Those two are not decoration: a
+        // workspace id above the one that survived a restart is handed out
+        // again (`robustness-084`), so the id alone cannot tell the workspace
+        // this claim meant from the one that took its name, and the label and
+        // cwd are what can. The label is looked up before the lock: asking herdr
+        // is a socket round-trip, and nothing else should wait on it.
         store.set_claim(
             &t.id,
             json!({

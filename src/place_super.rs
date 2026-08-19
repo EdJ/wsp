@@ -157,11 +157,15 @@
 //!
 //! Ids are `sup-1`, `sup-2`, allocated by `O_EXCL` on the directory and never
 //! reused, and the counter that guarantees it survives the seat being ended. The
-//! rule is not tidiness: herdr hands workspace ids out again, and the README's
-//! oldest complaint is that a claim naming a closed one is *waiting to attach
-//! itself to whatever takes the id next*. The counter lives in the same
-//! directory as the claims that could point at it, so an id can only come round
-//! again once the state that could name it is gone too.
+//! rule is not tidiness, and it is the one place in this tree where the old
+//! belief about herdr was right: herdr does hand workspace ids out again, and
+//! the README's oldest complaint is that a claim naming a closed one is *waiting
+//! to attach itself to whatever takes the id next*. Measured 2026-08-19
+//! (`robustness-084`) — herdr's counter is process-local, so a restart reserves
+//! only one above the highest workspace that survived and every id above that
+//! mark is reissued. This counter is on disk instead, in the same directory as
+//! the claims that could point at it, so an id can only come round again once
+//! the state that could name it is gone too.
 //!
 //! # What a reading costs
 //!
@@ -1067,10 +1071,11 @@ mod tests {
 
     /// A name is not handed out twice, however many seats have come and gone.
     ///
-    /// The rule is not tidiness. herdr reissues workspace ids, and the oldest
-    /// complaint in this repository is that a claim naming a closed one is
-    /// waiting to attach itself to whatever takes the id next. A supervisor is
-    /// free of that only if it chooses to be, and this is the choice.
+    /// The rule is not tidiness. herdr reissues workspace ids — measured, not
+    /// assumed (`robustness-084`) — and the oldest complaint in this repository
+    /// is that a claim naming a closed one is waiting to attach itself to
+    /// whatever takes the id next. A supervisor is free of that only if it
+    /// chooses to be, and this is the choice.
     #[test]
     fn a_seat_id_is_never_handed_out_again_after_the_seat_is_ended() {
         let scratch = Scratch::new("ids");

@@ -22,8 +22,9 @@
 //! # One tree per task, not per agent
 //!
 //! [`crate::cmd_verify`] keys its build tree on the workspace, because a build
-//! tree only has to be *somebody's* and pane ids are reissued across herdr
-//! restarts. An edit tree is a different thing keyed on a different fact: what
+//! tree only has to be *somebody's* and an agent is a workspace rather than any
+//! one of its panes. An edit tree is a different thing keyed on a different
+//! fact: what
 //! lands is a task's work, the branch is named for the task, and `spawn` knows
 //! the task before the workspace it is about to open exists. An agent holds one
 //! task at a time, so per-task is per-agent in practice — and when the agent

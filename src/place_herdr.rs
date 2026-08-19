@@ -16,23 +16,48 @@
 //! would have to be resolved back to its root pane on every call, and the claim
 //! would have to be handed something else.
 //!
-//! **Both ids are durable, and that is not the reassurance it sounds like.**
-//! Measured against upstream 0.8.0 on 2026-08-19 (`robustness-062`): across
-//! three server restarts in one day herdr reissued neither. `session.json`
-//! persists a workspace's `id` and its `public_pane_numbers` behind a
-//! `next_public_pane_number` that only advances, and `w1:p6` has been `w1:p6`
-//! since 2026-08-15. What *is* reissued is herdr's internal pane id, which
-//! nothing here ever sees. So the older note in this file — that a pane id is
-//! reissued on every restart — was wrong, and so is anything that inherited it.
+//! **A pane number is durable; a workspace id is not; and a pane id is a
+//! workspace id with a pane number stuck on the end.** That third sentence is
+//! the whole rule, and getting it wrong in either direction has cost this store
+//! something. Measured against upstream 0.8.0 on 2026-08-19 (`robustness-084`),
+//! by driving a sandbox herdr through the restarts rather than by reading it:
 //!
-//! The catch is the reason [`Seat`] still wants corroborating rather than
-//! trusting. The same restart **kills every agent process**: eleven panes for
-//! eleven, respawned as fresh shells, each handed back its transcript by
-//! `claude --resume`. So the handle outlives the thing behind it, and a seat id
-//! that still resolves is not evidence that it names the same agent. The
-//! durability [`Seat`] promises is therefore about corroboration and not about
-//! the handle — `robustness-058`'s design, reached for the opposite reason from
-//! the one written down here before.
+//! - **Inside a workspace that survives, a pane number never comes round
+//!   again.** `session.json` persists `next_public_pane_number` per workspace,
+//!   it only advances, and herdr asserts on load that it is greater than every
+//!   live pane. Split `w1` twice, close both new panes, restart the server,
+//!   split again: the pane is `w1:p4`. `w1:p6` has been `w1:p6` since
+//!   2026-08-15.
+//! - **A workspace id comes round again after a restart.** `NEXT_WORKSPACE_ID`
+//!   is a process-local counter that is *not* persisted; on restore herdr
+//!   reserves only `max(surviving workspace) + 1`. So every id above the
+//!   surviving maximum is handed out again. Create `w1`–`w4`, close `w3` and
+//!   `w4`, restart, create twice: `w3` and `w4`, on new workspaces in a
+//!   different directory. With no session file at all the first workspace is
+//!   `w1` — the governor's id, that half this store's claims name.
+//! - **Therefore a pane id comes round again too.** The reissued `w3`'s root
+//!   pane is `w3:p1`, the same string the old one had. Nothing about the pane
+//!   numbering failed; the qualifier under it changed identity.
+//!
+//! So `robustness-062`'s reading — that herdr reissues nothing — was measured
+//! across three restarts in which nothing above the surviving maximum had been
+//! closed, which is the common case and not the rule. And the older note this
+//! file used to carry — that a pane id is reissued on *every* restart — was
+//! wrong the other way. A pane id is exactly as stable as its workspace.
+//!
+//! What is reissued on every restart regardless is herdr's **internal** pane
+//! id, which nothing here ever sees.
+//!
+//! There is a second reason [`Seat`] wants corroborating rather than trusting,
+//! and it is the one that survives all of the above. The same restart **kills
+//! every agent process**: eleven panes for eleven, respawned as fresh shells,
+//! each handed back its transcript by `claude --resume`. So even for the ids
+//! that do survive, the handle outlives the thing behind it, and a seat id that
+//! still resolves is not evidence that it names the same agent. Between the two
+//! facts there is no reading of a bare id that is worth anything: a resolving id
+//! may be a stranger's workspace, or our own workspace with a stranger's process
+//! in it. `robustness-058`'s corroborate-don't-trust design is right for both
+//! reasons, and was written down under only the weaker one.
 //!
 //! # herdr's name for the seat an occupant is in is `HERDR_PANE_ID`
 //!

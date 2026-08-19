@@ -168,13 +168,27 @@
 //! **1. Identity is wsp's, not the runtime's, and never positional.** A
 //! [`Slot`] is wsp's own name for a pane — `panel`, `view`, `board` — and the
 //! binding from slot to [`Surface`] is wsp's record, which is what
-//! `panels.json` already is (`panel/install.rs:25`). herdr reissues pane ids
-//! across restarts, which is why claims are keyed on workspaces and carry a
-//! label to re-find one. Strata answered the same problem with D-55: an id is
-//! an index *plus a generation*, so storage is recycled and the id never is.
-//! [`Slot`] carries a generation for exactly that reason — a slot closed and
-//! remade is not the slot it replaces, so an op planned against the old one is
-//! refused rather than applied to the new pane. And nothing is identified by
+//! `panels.json` already is (`panel/install.rs:25`). Strata answered the same
+//! problem with D-55: an id is an index *plus a generation*, so storage is
+//! recycled and the id never is. [`Slot`] carries a generation for exactly that
+//! reason — a slot closed and remade is not the slot it replaces, so an op
+//! planned against the old one is refused rather than applied to the new pane.
+//!
+//! The generation used to be justified here by herdr reissuing pane ids, and
+//! that was the wrong argument for a rule that is right anyway. It guards
+//! *wsp's own* close-and-reopen: the reconciler plans against a slot and applies
+//! a beat later, and in between the pane it planned for can have been replaced.
+//! No property of herdr's numbering is involved, which is why the rule survived
+//! the numbering turning out to work differently (`robustness-084`; the
+//! measurement is in [`crate::place_herdr`]).
+//!
+//! What that leaves undefended is worth naming rather than implying. A
+//! generation on the slot says nothing about the [`Surface`] bound to it, and a
+//! surface *can* come round again — a workspace id above the surviving maximum
+//! is reissued after a restart, and `w3:p1` with it. [`plan`] treats a bound
+//! surface that resolves as ours, so a reissued one is a stranger's pane we
+//! relabel and re-point. Nothing here corroborates the binding; `robustness-089`
+//! is open on it. And nothing is identified by
 //! position: `panel/install.rs:80` had to stop taking "first in the list" as
 //! "the pane to split off", which is D-53's positional-identity failure in
 //! miniature.
@@ -358,9 +372,10 @@ pub const DRAW_PENDING_MS: u64 = 2_000;
 /// id does not.
 ///
 /// Unlike a `Seat`, a surface is **not** durable and this port does not ask it
-/// to be. herdr reissues pane ids across restarts; that is precisely why
-/// identity is a [`Slot`] and a surface is only ever the answer to "where is
-/// this slot right now".
+/// to be — which is why identity is a [`Slot`] and a surface is only ever the
+/// answer to "where is this slot right now". It fails in both directions: a
+/// closed pane's id names nothing ever again, and a reissued workspace makes the
+/// same string name a stranger's pane. Neither is a thing to hold identity in.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Surface(String);
 
@@ -390,10 +405,11 @@ impl std::fmt::Display for Surface {
 /// *different* slot, so an op planned against the old one cannot be applied to
 /// the new pane by a reconciler that ran a beat late.
 ///
-/// It matters here more than it looks. herdr reissues pane ids on restart, so
-/// the same string can name somebody else's shell tomorrow; the binding
-/// slot → surface is only trustworthy if a stale slot cannot silently match a
-/// fresh one.
+/// It matters here more than it looks, and not for the reason first written
+/// down. The generation is not about herdr's numbering at all: the reconciler
+/// plans against the world it read and applies against the world as it is, so a
+/// slot closed and remade in between must not swallow an op aimed at the pane it
+/// replaced. That race is wsp's own and needs no help from the backend.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Slot {
     pub name: String,
@@ -928,11 +944,19 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
                     out.note(format!("{slot} never appeared — opening again"));
                 }
 
-                // Rule 5. A pane of ours that the binding lost — a crash between
-                // the split and the save, or a restart that reissued the ids.
-                // The label is what is left to recognise it by, which is the one
-                // place a label is a key and is why the policy is stated rather
-                // than assumed.
+                // Rule 5. A pane of ours that the binding lost — a crash
+                // between the split and the save, a store restored from a
+                // backup, an upgrade that moved the file. The label is what is
+                // left to recognise it by, which is the one place a label is a
+                // key and is why the policy is stated rather than assumed.
+                //
+                // "A restart that reissued the ids" used to head that list and
+                // has been taken out of it: a restart preserves the binding and
+                // the ids under a workspace that survives, and a workspace that
+                // does not survive takes its panes with it — so there is no
+                // orphan to adopt. The reissue that is real goes the other way,
+                // and this branch never runs for it, because the stale surface
+                // still resolves. See the module docs.
                 let orphan = (!want.label.is_empty())
                     .then(|| {
                         world.live.iter().find(|l| {
@@ -1262,9 +1286,10 @@ mod tests {
         assert!(plan(&after, &spec).is_empty(), "reordering the world is not a change to it");
     }
 
-    /// Rule 1's generation, which is strata's D-55 one level down. herdr
-    /// reissues pane ids across restarts, so a slot that has been remade must
-    /// not be matched by an op planned against the one it replaced.
+    /// Rule 1's generation, which is strata's D-55 one level down. A slot that
+    /// has been remade must not be matched by an op planned against the one it
+    /// replaced — the reconciler reads the world, decides, and applies, and the
+    /// pane can go in between.
     #[test]
     fn a_slot_remade_is_not_the_slot_it_replaces() {
         let first = Slot::new("view");
@@ -1375,9 +1400,8 @@ mod tests {
     }
 
     /// Rule 5. A pane of ours the binding lost — a crash between the split and
-    /// the save, or a restart that reissued the ids. Three policies, three
-    /// different plans, and the default is the one the panel already implements
-    /// by hand.
+    /// the save, a store restored from a backup. Three policies, three different
+    /// plans, and the default is the one the panel already implements by hand.
     #[test]
     fn a_pane_of_ours_we_lost_track_of_is_a_decision() {
         let world = World::heard(vec![live("p7", "panel", 30), live("p1", "shell", 100)]);

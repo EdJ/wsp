@@ -12,8 +12,8 @@
 //! choose*, and every expensive bug in this store was a state: an empty pane
 //! list reaping every binding (t-260816-058), one `pane.exited` cascade
 //! clearing every binding on the machine, a machine that stops answering
-//! mid-tick, pane ids reissued across a restart, twenty-two workspaces and four
-//! agents. None of those can be manufactured on a live herdr, and all of them
+//! mid-tick, a workspace id handed out again after a restart so a live pane
+//! answers to a dead pane's name, twenty-two workspaces and four agents. None of those can be manufactured on a live herdr, and all of them
 //! are two lines here.
 //!
 //! # The division of labour, and the trap it exists to avoid
@@ -495,10 +495,23 @@ pub struct Stage {
     /// Keyed on the port verb rather than the method, so a test says "this
     /// backend will not take a prompt" rather than naming `agent.prompt`.
     pub refuse: BTreeMap<Verb, Snub>,
-    /// Where the next invented id comes from. herdr numbers workspaces from one
-    /// and panes within a workspace from one (recorded), and the fake does the
-    /// same so that ids in a sandbox read the way ids read everywhere else.
+    /// Where the next invented workspace id comes from. herdr numbers
+    /// workspaces from one and panes within a workspace from one (recorded), and
+    /// the fake does the same so that ids in a sandbox read the way ids read
+    /// everywhere else.
     next_space: u32,
+    /// The next pane number for each space, which is **not** derivable from the
+    /// spots present and was for a while.
+    ///
+    /// Recorded 2026-08-19 against herdr 0.8.0 in a sandbox (`robustness-084`):
+    /// `next_public_pane_number` is persisted per workspace, only advances, and
+    /// is asserted greater than every live pane on load. Split `w1` twice, close
+    /// both, restart, split — the pane is `w1:p4`. The fake used to count the
+    /// spots in the space and add one, which reissues `p2` the moment `p2`
+    /// closes and, with `p3` still live, hands out an id that is already taken.
+    /// A fake that reissues what herdr will not is a test passing on a state
+    /// that cannot happen, which is the one thing this file must not do.
+    next_pane: BTreeMap<String, u32>,
 }
 
 /// Why the fake will not do something, in wsp's terms.
@@ -532,8 +545,18 @@ impl Default for Stage {
             focused: None,
             refuse: BTreeMap::new(),
             next_space: 1,
+            next_pane: BTreeMap::new(),
         }
     }
+}
+
+/// The pane number in a seat this fake minted, or `None` for a seat it did not.
+///
+/// The one place the fake parses an id it made, and only to keep its own counter
+/// where herdr keeps its own — see [`Stage::next_pane`]. Everything else treats a
+/// seat as opaque, which is the rule `place::Seat` states and this does not bend.
+fn pane_number(space: &str, seat: &str) -> Option<u32> {
+    seat.strip_prefix(space)?.strip_prefix(":p")?.parse().ok()
 }
 
 impl Stage {
@@ -564,9 +587,23 @@ impl Stage {
         if spot.tab.is_empty() {
             spot.tab = format!("{}:t1", spot.space);
         }
-        if spot.seat.is_empty() {
-            let n = self.spots.iter().filter(|s| s.space == spot.space).count() + 1;
-            spot.seat = Seat::new(format!("{}:p{n}", spot.space));
+        match spot.seat.is_empty() {
+            true => {
+                let n = self.next_pane.entry(spot.space.clone()).or_insert(1);
+                spot.seat = Seat::new(format!("{}:p{n}", spot.space));
+                *n += 1;
+            }
+            // A caller that named its own seat moves the counter past it, which
+            // is herdr's own `register_new_pane_with_number` (`workspace.rs:1259`
+            // takes `max(next, number + 1)`). Only its own shape is read: a seat
+            // is opaque and a caller may name one anything, so anything else
+            // leaves the counter alone rather than guessing at it.
+            false => {
+                if let Some(n) = pane_number(&spot.space, spot.seat.as_str()) {
+                    let next = self.next_pane.entry(spot.space.clone()).or_insert(1);
+                    *next = (*next).max(n + 1);
+                }
+            }
         }
         if spot.rect == Rect::default() {
             spot.rect = self.area;
@@ -2028,6 +2065,46 @@ mod tests {
     /// machine. A hang-guard rather than a measurement, and generous on purpose:
     /// it is only ever paid by a test that is already failing.
     const DELIVERY: Duration = Duration::from_secs(10);
+
+    /// Recorded against herdr 0.8.0, 2026-08-19: a pane number is never handed
+    /// out twice inside a workspace, whatever has closed since. The fake counted
+    /// live spots instead, which reissues an id the moment the pane below it
+    /// closes — and with a higher pane still open, hands out one already taken.
+    #[test]
+    fn a_pane_number_is_not_handed_out_again_after_its_pane_closes() {
+        let mut stage = Stage::new();
+        let one = stage.put(Spot::default().on("w1", "w1:t1"));
+        let two = stage.put(Spot::default().on("w1", "w1:t1"));
+        let three = stage.put(Spot::default().on("w1", "w1:t1"));
+        assert_eq!(
+            [one.as_str(), two.as_str(), three.as_str()],
+            ["w1:p1", "w1:p2", "w1:p3"],
+            "the fake stopped numbering panes the way herdr does"
+        );
+
+        stage.spots.retain(|s| s.seat != two);
+        let four = stage.put(Spot::default().on("w1", "w1:t1"));
+        assert_eq!(four.as_str(), "w1:p4", "a closed pane's number came round again");
+        assert!(stage.find(&three).is_some(), "the live pane was overwritten by the new one");
+
+        // Another workspace counts from one: the numbering is per workspace,
+        // which is why a reissued *workspace* id reissues every pane id under it
+        // — the state this file exists to be able to be put in.
+        assert_eq!(stage.put(Spot::default().on("w2", "w2:t1")).as_str(), "w2:p1");
+    }
+
+    /// A stage that names its own seats has to leave the counter somewhere the
+    /// next invented id cannot collide with, which is herdr's rule at restore.
+    #[test]
+    fn a_named_seat_moves_the_counter_past_itself() {
+        let mut stage = Stage::of(vec![Spot::empty("w1:p7").on("w1", "w1:t1")]);
+        assert_eq!(stage.put(Spot::default().on("w1", "w1:t1")).as_str(), "w1:p8");
+
+        // A seat named in some other shape is not this fake's to read, so the
+        // counter stays where it was rather than being guessed at.
+        let mut other = Stage::of(vec![Spot::empty("node-42").on("w1", "w1:t1")]);
+        assert_eq!(other.put(Spot::default().on("w1", "w1:t1")).as_str(), "w1:p1");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-fake-{name}-{}", std::process::id()));

@@ -198,11 +198,18 @@ pub(crate) fn toplevel(dir: &Path) -> Option<PathBuf> {
 
 /// Which agent is asking.
 ///
-/// The workspace, not the pane. Pane ids are reissued across herdr restarts —
-/// which is why claims are keyed on the workspace too — and a build tree that
-/// changed identity on every restart would be a cold build on every restart.
-/// Outside herdr there is no workspace, and `solo` is honest: one shell at a
-/// terminal gets one tree and shares it with the next.
+/// The workspace, not the pane, and the reason first written here was wrong. It
+/// is not that pane ids are reissued — inside a workspace that survives they are
+/// not (`robustness-084`). It is that an agent is a workspace and not a pane: it
+/// splits, it opens a shell beside itself, and `wsp verify` run from any of them
+/// is the same agent asking for the same tree. Keyed on the pane, every split
+/// would be a cold build. Outside herdr there is no workspace, and `solo` is
+/// honest: one shell at a terminal gets one tree and shares it with the next.
+///
+/// A reissued workspace id therefore inherits the previous occupant's warm tree,
+/// and that is fine here and nowhere else: a build tree is a cache of a git
+/// state, so the worst it costs is a rebuild. It is named because the same
+/// inheritance in a claim is `robustness-089`.
 /// `wsp sandbox` keys its instance the same way, deliberately: an agent's build
 /// tree and its sandbox are the same pair of scratch things, and one name for
 /// both means `verify` and `sandbox` cannot disagree about whose they are.
@@ -1259,10 +1266,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The tree is keyed on the workspace rather than the pane because pane ids
-    /// are reissued across herdr restarts — claims are keyed the same way, for
-    /// the same reason. A tree that changed identity on every restart would be
-    /// a cold build on every restart.
+    /// The tree is keyed on the workspace rather than the pane because an agent
+    /// is a workspace and not a pane: it splits, and every pane it opens is the
+    /// same agent wanting the same warm tree.
     #[test]
     fn the_build_tree_is_this_agents_and_not_this_panes() {
         std::env::set_var("WSP_AGENT", "w1");
