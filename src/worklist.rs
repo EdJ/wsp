@@ -65,28 +65,6 @@
 //! It is never removed from the membership: a machine silently editing a plan
 //! is the stale-plan failure with nobody left to notice it.
 //!
-//! # What a passed group licenses, which is the one destructive thing here
-//!
-//! [`sweep`] removes the working trees of the members behind the position, and
-//! it is the only thing in this design that destroys directories on a predicate
-//! without being asked. The evidence for it is exactly the evidence that opened
-//! the barrier, which is why [`Position`] carries the members it passed on its
-//! way through rather than making the sweep go and ask again: two computations
-//! under one act is two answers that can disagree, and the one holding the
-//! `rm -rf` is the wrong one to be second.
-//!
-//! It is [`cmd_checkout::Why::Landed`] and that variant's doc comment is where
-//! the argument lives — the short version is that it is `Why::Idle` plus a
-//! fact, narrower than it rather than broader. What this module contributes is
-//! the fact and the two refusals it does not override: uncommitted work, and a
-//! member still holding its claim, which is named with the `despawn` to run
-//! because an agent still holding its claim is an agent still in the room.
-//!
-//! `Settled` is refused outright as a basis for it. It says a task reached
-//! `review`, which arrives *before* the commit is on the trunk, and removing a
-//! directory on that is the `batch`'s costliest failure with a rm on the end
-//! of it.
-//!
 //! # Why a module and not a method
 //!
 //! Free functions over `&Store` and a `&Worklist`, beside the record rather
@@ -356,6 +334,17 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
 }
 
 /// Take away the trees of the members this worklist has passed.
+///
+/// **This is the one destructive thing in the whole worklist design, and the
+/// only part of this module that is not a question.** A sentence belongs in the
+/// module header saying so; it is here rather than there because two agents
+/// were in this file at once on 2026-08-19 and neither was to edit line 1.
+///
+/// The evidence is exactly the evidence that opened the barrier, which is why
+/// [`Position`] carries the members it passed on its way through rather than
+/// sending the sweep to ask again: two computations under one act is two
+/// answers that can disagree, and the one holding the `rm -rf` is the wrong one
+/// to be second.
 ///
 /// **The one place in this design that destroys directories on a predicate
 /// without being asked**, so read [`cmd_checkout::Why::Landed`] before touching
