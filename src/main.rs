@@ -68,17 +68,43 @@ pub const COMMIT: &str = env!("WSP_COMMIT");
 /// the patch sitting on top of it, and the patch is what goes missing.
 pub const DIRTY: bool = matches!(env!("WSP_DIRTY").as_bytes(), b"1");
 
+/// What this binary was built from, as one word a record can be compared
+/// against: `c52f3c8`, `c52f3c8+dirty`, or empty when the tree was not a
+/// checkout.
+///
+/// The same two halves `version()` prints, without the package number, because
+/// the readers of this are not people: a file written by one build and read by
+/// another asks *were these the same rules*, and `0.1.0` has never moved. The
+/// dirt is in it for the reason [`DIRTY`] exists at all — two builds at one
+/// commit with different patches on top are two different sets of rules, and
+/// the patch is the half that is not written down anywhere else.
+///
+/// Empty compares equal to empty, so two binaries that cannot say where they
+/// came from are treated as one build. That is the honest answer rather than a
+/// safe one: there is nothing to compare, and a comparison that always failed
+/// would put every reader of a stamp permanently in its unknown branch.
+pub fn build_stamp() -> String {
+    match (COMMIT.is_empty(), DIRTY) {
+        (true, _) => String::new(),
+        (false, false) => COMMIT.to_string(),
+        (false, true) => format!("{COMMIT}+dirty"),
+    }
+}
+
 /// `0.1.0`, `0.1.0 (c52f3c8)`, or `0.1.0 (c52f3c8+dirty)`.
 ///
 /// Printed by `--version` and by the help, which is the version string most
 /// people actually see — an agent that runs `wsp help` to find a verb should
 /// not have to run a second command to learn whether the binary answering is
 /// the one somebody just installed.
+///
+/// Built out of [`build_stamp`] rather than beside it, so what `cmd_install`
+/// parses back out of `--version` and what a watch register holds cannot come
+/// to disagree about the same binary.
 pub fn version() -> String {
-    match (COMMIT.is_empty(), DIRTY) {
-        (true, _) => VERSION.to_string(),
-        (false, false) => format!("{VERSION} ({COMMIT})"),
-        (false, true) => format!("{VERSION} ({COMMIT}+dirty)"),
+    match build_stamp().as_str() {
+        "" => VERSION.to_string(),
+        stamp => format!("{VERSION} ({stamp})"),
     }
 }
 

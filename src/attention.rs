@@ -182,9 +182,16 @@ fn event_kind(edge: Edge) -> &'static str {
 /// signal is stored and not just its timing, so a level that has *gone* while
 /// the daemon was down is still there to be compared against and its clearing
 /// is still reported.
-fn load(store: &Store) -> Option<Ledger> {
+///
+/// The second half of the answer is [`cmd_watch::resume`], and it is the same
+/// sentence taken one step further: the file this reads is routinely the
+/// previous binary's, so what it holds may be keyed by rules this build does
+/// not use. The flag it comes back with is *may this be diffed against*, and it
+/// is false for both of the reasons a diff would lie — there is no ledger, or
+/// there is one and another build wrote it.
+fn load(store: &Store) -> Option<(Ledger, bool)> {
     let rec = store.watches().get(KEY).cloned()?;
-    rec.get("ledger").map(Ledger::of_json)
+    rec.get("ledger").is_some().then(|| crate::cmd_watch::resume(&rec))
 }
 
 /// Write the ledger back, with the fact that a reporter ticked.
@@ -213,6 +220,10 @@ fn save(store: &Store, ledger: &Ledger, ticks: u64) {
             "ticks": ticks,
             "standing": ledger.standing(),
             "watching": Kind::every().iter().map(|k| k.word()).collect::<Vec<_>>(),
+            // Whose key rules the ledger below is written by. See
+            // [`cmd_watch::resume`] for what reads it and what it cost not to
+            // have it.
+            "build": crate::build_stamp(),
             "ledger": ledger.json(),
         }),
     );
@@ -269,16 +280,22 @@ pub(crate) fn tick(store: &Store, pass: &mut Pass, source: &mut dyn Source, at: 
     }
     pass.ticks += 1;
     let now = source.sample();
-    let (mut ledger, known) = match load(store) {
-        Some(l) => (l, true),
-        None => (Ledger::default(), false),
-    };
+    let (mut ledger, known) = load(store).unwrap_or_default();
     // Priming on the first pass ever, for `Ledger::prime`'s reason: a
     // subscription is to changes from now, and a daemon started on a machine
     // with six standing stalls must not announce six things that have been true
     // for hours. `prime` lets `blind` through and only `blind`, because a
     // reader that cannot see the agents from its first tick must say so or
     // everything it goes on not to say is meaningless.
+    //
+    // And priming on the first pass after an install, which is the same
+    // statement about a different discontinuity: `daemon::reload` `exec`s
+    // within a tick of a build landing on our path, and what the new image
+    // inherits is a file the old one keyed. See [`cmd_watch::resume`] — a diff
+    // across that boundary reports one clearing that never happened and one
+    // raising for a level that never went down, per standing hand, and the
+    // whole of what makes this affordable is that `prime` keeps what it
+    // recognises.
     let emits = match known {
         true => ledger.advance(&now, at, SETTLE),
         false => ledger.prime(&now, at),
@@ -370,7 +387,11 @@ fn payload(signal: &Signal, edge: Edge, to: &str, at: &str, held: i64) -> Value 
 /// louder — a question somebody wrote beats a stall wsp inferred, because it
 /// has words in it and the person reading has to go and look either way.
 pub(crate) fn standing(store: &Store) -> BTreeMap<String, &'static str> {
-    let Some(ledger) = load(store) else { return BTreeMap::new() };
+    // The stamp is not asked about here. Whether this build would key the set
+    // the same way changes what may be *diffed*; it changes nothing about what
+    // is standing, and a surface that drew nothing across an install would be
+    // the same silence by another route.
+    let Some((ledger, _)) = load(store) else { return BTreeMap::new() };
     let mut out: BTreeMap<String, (crate::message::Kind, &'static str)> = BTreeMap::new();
     for s in ledger.told() {
         let here = (s.loudness(), s.kind.word());
@@ -650,6 +671,48 @@ mod tests {
         // And the far side still knows enough to report it clearing, which is
         // the case a ledger holding only timings would have lost.
         assert_eq!(tick(&store, &mut after, &mut Fake(vec![]), 180).len(), 1);
+    }
+
+    /// Say the ledger on disk was written by some other build, which is what
+    /// every ledger the daemon reads after an install is.
+    fn written_by_another_build(store: &Store) {
+        let mut rec = store.watches().get(KEY).cloned().expect("there is a ledger to restamp");
+        rec.as_object_mut().unwrap().insert("build".into(), json!("another-build"));
+        store.set_watch(KEY, rec);
+    }
+
+    /// **`worklist-034`, driven through the pass that produced it.** An install
+    /// lands, `daemon::reload` `exec`s within the tick, and the ledger the new
+    /// image inherits is keyed by the rules of the build that wrote it —
+    /// `Signal::key` gained a `record` component in `34ae8a3`, so one raised
+    /// hand is `flag:a-1` on one side of the install and `flag:a-1:m-1` on the
+    /// other.
+    ///
+    /// Diffed, that is a clearing that never happened and a raising for a level
+    /// that never went down, for every standing hand on the machine, at
+    /// whatever hour the install lands. What it costs instead is one quiet
+    /// tick.
+    #[test]
+    fn an_install_that_moved_a_key_costs_one_quiet_tick_and_not_two_false_edges() {
+        let (_env, store) = store("rekeyed");
+        task(&store, "a-1", None);
+        let mut pass = Pass::new();
+        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        let hand = Signal::new(Kind::Flag, "a-1", "can I take this?");
+        assert_eq!(tick(&store, &mut pass, &mut Fake(vec![hand]), 60).len(), 1);
+
+        written_by_another_build(&store);
+        let rekeyed = Signal::new(Kind::Flag, "a-1", "can I take this?").of("m-1");
+        let mut after = Pass::new();
+        let out = tick(&store, &mut after, &mut Fake(vec![rekeyed]), 120);
+        assert!(out.is_empty(), "the hand never moved, so nothing is owed anybody: {out:?}");
+        assert_eq!(delivered(&store).len(), 1, "one edge in the whole run, and it is the true one");
+        assert_eq!(standing(&store).get("a-1").copied(), Some("flag"), "and it is still up on the sidebar");
+
+        // The tick after is a diff again: the quiet is one tick, not a mode.
+        let out = tick(&store, &mut after, &mut Fake(vec![]), 180);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].edge, Edge::Down);
     }
 
     /// A signal is derived, so it is **never a record**. `wsp-095`'s answer to

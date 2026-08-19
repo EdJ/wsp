@@ -886,6 +886,13 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "bytes": size,
                 "who": rec.who,
                 "why": why,
+                // The same answer the printed line gives, for the reader that
+                // is a script. Absent from neither: a caller parsing this is
+                // exactly the caller that will not see a yellow line go past.
+                "keeps_the_old_one": stale_watchers(store, &ours)
+                    .iter()
+                    .map(|w| json!({ "key": w.key, "scope": w.scope, "pid": w.pid, "build": w.build }))
+                    .collect::<Vec<_>>(),
             })
         );
         return 0;
@@ -905,7 +912,54 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         "{}",
         p.dim("panels, detail panes and the daemon re-exec into it within a tick — `wsp peek` to look at one")
     );
+    keeps_the_old_one(store, &ours, &p);
     0
+}
+
+/// Name the long-lived processes that will **not** pick this up.
+///
+/// **`worklist-033`.** The line above is true and is the whole of what this
+/// command has ever said, and what it leaves out is the half that cost a day:
+/// `wsp watch` does not re-`exec`, so a governor's watch goes on reporting in
+/// the vocabulary it was born with until somebody restarts it. Four instances
+/// on 2026-08-19 across two seats, and every detection was a person
+/// remembering — one of them a seat that had *just installed the fix to its own
+/// watch* and went on running the fault.
+///
+/// Only what claimed a process and is still alive, and never the daemon: it
+/// `exec`s within a tick, so its register is behind on purpose for a moment and
+/// naming it here would make this line noise on every install. `--once` records
+/// describe no process at all. That leaves exactly the watches, which is
+/// exactly the set that is wrong.
+///
+/// Against what was just installed rather than against the binary running this
+/// command — those are usually the same file and are not always, and the
+/// question a reader has is about the one that is now live.
+fn stale_watchers(store: &Store, ours: &Built) -> Vec<crate::cmd_watch::Registered> {
+    let Some(commit) = &ours.commit else { return Vec::new() };
+    let live = match ours.dirty.is_empty() {
+        true => commit.clone(),
+        false => format!("{commit}+dirty"),
+    };
+    let watches: Vec<_> = crate::cmd_watch::registered(store)
+        .into_iter()
+        .filter(|w| w.watching() && !w.daemon && !w.build.is_empty() && w.build != live)
+        .collect();
+    let alive = crate::place_super::alive(&watches.iter().map(|w| w.pid).collect::<Vec<_>>());
+    watches.into_iter().filter(|w| alive.contains(&w.pid)).collect()
+}
+
+fn keeps_the_old_one(store: &Store, ours: &Built, p: &crate::util::Paint) {
+    for w in stale_watchers(store, ours) {
+        println!(
+            "{} {}",
+            p.yellow("keeps the old one"),
+            p.dim(&format!(
+                "the watch on {} ({}, pid {}) is {} and does not re-exec — ^C and `wsp watch` again, or it reports {}'s logic all night",
+                w.scope, w.key, w.pid, w.build, w.build
+            ))
+        );
+    }
 }
 
 #[cfg(test)]

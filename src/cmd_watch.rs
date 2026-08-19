@@ -442,7 +442,7 @@ impl Signal {
     }
 
     /// The message this is a reading of. See [`Signal::record`].
-    fn of(mut self, record: &str) -> Signal {
+    pub(crate) fn of(mut self, record: &str) -> Signal {
         self.record = Some(record.to_string());
         self
     }
@@ -644,13 +644,46 @@ impl Ledger {
     /// [`Kind::Blind`] is the exception and it is the whole of item 4 in the
     /// module docs: a watch that cannot see the agents from its first tick must
     /// say so, because everything else it does not print is then meaningless.
+    ///
+    /// # The second caller, and why this keeps what it recognises
+    ///
+    /// The first version of this replaced the map outright, which is right for
+    /// a ledger that is empty and wrong for [`resume`]'s other caller: a
+    /// ledger written by a build that spelled [`Signal::key`] differently. That
+    /// one is not empty, and most of what is in it keys the same either side —
+    /// so wiping it would reset `since` on every standing level and mark every
+    /// one still inside its settle window as told. Ed installs several times a
+    /// day; `held` on the eventual clearing would have measured the time since
+    /// the last install rather than how long the hand was up, and a level four
+    /// minutes into a five-minute settle would have been swallowed.
+    ///
+    /// So: what the read still has keeps the time it went up and whether it has
+    /// been said, what the read no longer has is **dropped and not cleared**,
+    /// and what is new is recorded as already told. Nothing is announced and
+    /// nothing is unsaid. On the first tick the map is empty and all three
+    /// clauses collapse to the original behaviour.
     pub(crate) fn prime(&mut self, now: &[Signal], at: i64) -> Vec<Emit> {
+        let seen: BTreeSet<String> = now.iter().map(Signal::key).collect();
+        // Dropped, not cleared. A level whose key this build spells another way
+        // has not gone anywhere, and saying it has is the false edge the whole
+        // of `worklist-034` is about — three hands `wsp flag` was listing
+        // throughout, reported lowered by an install.
+        self.up.retain(|k, _| seen.contains(k));
         let mut out = Vec::new();
         for s in now {
-            let blind = s.kind == Kind::Blind;
-            self.up.insert(s.key(), Held { signal: s.clone(), since: at, told: true });
-            if blind {
-                out.push(Emit { edge: Edge::Up, signal: s.clone(), held: 0 });
+            let key = s.key();
+            let said = self.up.get(&key).is_some_and(|h| h.told);
+            let e = self.up.entry(key).or_insert_with(|| Held {
+                signal: s.clone(),
+                since: at,
+                told: true,
+            });
+            e.signal = s.clone();
+            // Only when it is news. A re-prime over a ledger that already said
+            // this would be saying it twice, which is the shape of defect this
+            // path exists to remove rather than one to add on the way.
+            if s.kind == Kind::Blind && !said {
+                out.push(Emit { edge: Edge::Up, signal: s.clone(), held: at - e.since });
             }
         }
         out
@@ -748,6 +781,57 @@ impl Ledger {
         }
         Ledger { up }
     }
+}
+
+/// A ledger read back out of a watch record, and whether it may be **diffed
+/// against** or only carried forward.
+///
+/// One call, because there are two persisted ledgers and they had the same
+/// fault: the daemon's unattended pass ([`crate::attention::tick`]) and the
+/// pull ledger `wsp watch --once` leaves for the next caller. Both survive the
+/// process on purpose, and surviving the process means routinely being read by
+/// a **different build** — the daemon `exec`s itself the moment an install
+/// lands on its path, and a `--once` caller is a cron whose binary was replaced
+/// between two runs.
+///
+/// # What went wrong, and it is not the vocabulary
+///
+/// [`Ledger::of_json`] validates the signal *word* — `Kind::parse` drops what
+/// it cannot read — and never the *key shape*. `Signal::key` gained a `record`
+/// component in `34ae8a3` for the two predicates that read a message record,
+/// so a ledger written either side of that commit is keyed by rules the other
+/// one does not use. Loaded and advanced against, every old-shaped key is
+/// absent from the new read and reported **gone**, and every new-shaped key is
+/// absent from the old ledger and reported **raised**: one false `cleared` and
+/// one false `raised` per standing hand, per install. Driven on 2026-08-19
+/// across `5a1f71d`↔`796c2d2` — which is exactly the pair `34ae8a3` sits
+/// between — with three hands `wsp flag` listed throughout reported lowered.
+///
+/// `needs-a-person` carries no record and keys the same either side, which is
+/// the only reason Ed's hook filter stayed quiet through it. That is luck, and
+/// the next predicate to gain a key component takes the phone with it.
+///
+/// # Why the build and not the key shape
+///
+/// A key shape cannot be checked by re-deriving it. Both directions of the
+/// change are invisible to that: the pre-`34ae8a3` file has no record in it to
+/// re-derive *from*, so its entries round-trip to themselves and the mismatch
+/// only appears against the new read. Only something written down beside the
+/// ledger can answer *whose rules is this keyed by*, and the build is the one
+/// such thing that cannot be forgotten — a hand-bumped schema number is exactly
+/// the discipline whose absence caused this.
+///
+/// The cost is a [`Ledger::prime`] on every install rather than only on the
+/// installs that moved a key, and that is what makes `prime` keep what it
+/// recognises: a prime that preserved nothing would have been a worse trade
+/// than the bug, several times a day.
+///
+/// A record with no `build` in it was written before this existed, so it is a
+/// ledger we cannot place — primed, once, and stamped on the way out.
+pub(crate) fn resume(rec: &Value) -> (Ledger, bool) {
+    let Some(v) = rec.get("ledger") else { return (Ledger::default(), false) };
+    let keyed_by = rec.get("build").and_then(Value::as_str).unwrap_or_default();
+    (Ledger::of_json(v), keyed_by == crate::build_stamp())
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1259,30 @@ pub(crate) struct Registered {
     /// Advice that does not work is worse than none, and this check exists
     /// precisely to be believed.
     pub(crate) daemon: bool,
+    /// What the process holding this register was built from, and empty for a
+    /// record written before the field existed.
+    ///
+    /// **`worklist-033`.** An install replaces a file; it has no view of the
+    /// processes already holding the old one. `wsp panel`, `wsp view` and the
+    /// daemon all `exec` into the new binary within a tick, and a `wsp watch`
+    /// does not — so a governor's watch goes on reporting in the vocabulary it
+    /// was born with, indefinitely. On 2026-08-19 two seats did exactly that,
+    /// four times between them, and every detection was a person remembering.
+    ///
+    /// It is worse than an ordinary staleness because **the stale process here
+    /// is the thing that reports**. A stale `wsp verify` gives a wrong number
+    /// and somebody re-runs it; a stale watch says *nothing is up* out of logic
+    /// that has been fixed, and there is nothing behind it to disagree. Driven
+    /// side by side, the older watch was not merely wrong, it was blind to a
+    /// whole signal kind — five signals against six, with `unanswered` missing,
+    /// and a question raised in between appearing on one stream and never on
+    /// the other.
+    ///
+    /// So the register carries it, and [`stale_build`] is the comparison. The
+    /// alternative considered was `stat`ing the binary each watcher `exec`'d
+    /// from; this is cheaper, it travels to another machine's records, and it
+    /// is the same field [`resume`] already needed.
+    pub(crate) build: String,
 }
 
 impl Registered {
@@ -1194,6 +1302,29 @@ impl Registered {
     /// with a floor so a very short interval does not make this hair-trigger.
     pub(crate) fn stale(&self) -> bool {
         self.watching() && util::since(&self.tick) > (self.every * STALE_TICKS).max(90)
+    }
+
+    /// Reporting out of a build that is not the one asking.
+    ///
+    /// Only for a watcher that claimed a process, because that is the only kind
+    /// that can go on holding an old image: a `--once` ledger is written by
+    /// whatever binary the caller last ran and describes nothing still running.
+    /// The daemon is excluded for the opposite reason — it `exec`s itself
+    /// within a tick of an install landing on its path, so its register is
+    /// briefly behind on purpose and naming it would be the false alarm that
+    /// teaches people to skip this line.
+    ///
+    /// **Against the build asking, not against what is installed.** Reading
+    /// the installed binary means running it, and the honest question a reader
+    /// has is *is this watcher the same wsp as the one in my hands* — which is
+    /// the right question when the wsp in your hands is the one you just
+    /// installed, and is still a true statement when it is not.
+    ///
+    /// A record with no stamp is not reported. It was written before the field
+    /// existed, which makes it old, and one restart of anything makes it
+    /// answerable — an unanswerable question is not a fault to put in red.
+    pub(crate) fn stale_build(&self) -> bool {
+        self.watching() && !self.daemon && !self.build.is_empty() && self.build != crate::build_stamp()
     }
 }
 
@@ -1219,6 +1350,7 @@ pub(crate) fn registered(store: &Store) -> Vec<Registered> {
             every: v.get("every").and_then(Value::as_i64).unwrap_or(EVERY),
             standing: v.get("standing").and_then(Value::as_u64).unwrap_or(0) as usize,
             daemon: v.get("daemon").and_then(Value::as_bool).unwrap_or(false),
+            build: v.get("build").and_then(Value::as_str).unwrap_or_default().to_string(),
         })
         .collect()
 }
@@ -1239,6 +1371,22 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
     let live = crate::place_super::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     for w in &watches {
         let dead = w.watching() && !live.contains(&w.pid);
+        // Said before the two liveness faults and separately from them, because
+        // it is the one that looks like nothing at all: this watcher is
+        // ticking, on time, answering `--status` green, and reporting out of
+        // code somebody has since fixed. See [`Registered::build`].
+        if !dead && w.stale_build() {
+            problems.push(format!(
+                "the watch on {} ({}) is running {}, and the wsp asking is {} — an install replaces a file and a process already holding the old one keeps it, so what this reports is that build's logic, in that build's vocabulary. Stop it and run `wsp watch` again",
+                w.scope,
+                w.key,
+                w.build,
+                match crate::build_stamp().is_empty() {
+                    true => "a binary that cannot say".to_string(),
+                    false => crate::build_stamp(),
+                }
+            ));
+        }
         if !dead && !w.stale() {
             continue;
         }
@@ -1599,25 +1747,31 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     let at = util::epoch_secs();
     let now = poll.sample();
     let rec = store.watches().get(&key).cloned().unwrap_or(Value::Null);
-    let known = rec.get("ledger").is_some();
-    let mut ledger = match rec.get("ledger") {
-        Some(v) => Ledger::of_json(v),
-        None => Ledger::default(),
-    };
+    // A cron's binary is replaced between two of its runs, which is the same
+    // event the daemon meets as an `exec`. See [`resume`].
+    let (mut ledger, known) = resume(&rec);
     let emits = match known {
         true => ledger.advance(&now, at, spec.settle),
         false => ledger.prime(&now, at),
     };
     say(&emits, at, spec);
     if !known && !spec.json {
-        println!(
-            "{}",
-            aside(
-                at,
-                &format!("primed on {} · {} standing · from here, only what changes", spec.scope.name, ledger.standing()),
-                &Paint::new()
-            )
-        );
+        // Two reasons to have said nothing, and the reader wants to know which:
+        // a first call is a subscription starting, and a re-prime is a tick
+        // this caller has genuinely lost.
+        let said = match rec.get("ledger").is_some() {
+            true => format!(
+                "re-primed on {} · {} standing · the last read was another build's, so this tick is a baseline and not a diff",
+                spec.scope.name,
+                ledger.standing()
+            ),
+            false => format!(
+                "primed on {} · {} standing · from here, only what changes",
+                spec.scope.name,
+                ledger.standing()
+            ),
+        };
+        println!("{}", aside(at, &said, &Paint::new()));
     }
     // pid 0, deliberately: this process is already over. A pull ledger is not a
     // reporter that can die, so it must never read as one — see
@@ -1625,6 +1779,32 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     register_as(store, &key, spec, &ledger, 1, 0);
     0
 }
+
+/// What the stream says when the binary underneath it is replaced.
+///
+/// **`worklist-033`, and it is a line rather than an `exec`.** `wsp panel`,
+/// `wsp view` and the daemon all replace themselves when an install lands on
+/// their path; this loop does not, and going on quietly is the failure — a
+/// stale watch reports *nothing is up* out of logic that has since been fixed,
+/// and there is nothing behind it to disagree. Driven side by side on
+/// 2026-08-19, the older of two watches on one store listed five signals where
+/// the newer listed six, and a question raised between them appeared on one
+/// and never on the other. Not late. Absent, with no way to know the category
+/// existed.
+///
+/// Re-`exec`ing here was weighed and is not done. A watch that replaces itself
+/// mid-stream has to carry its ledger across, and the only ledger it has is in
+/// this variable — so it would have to resume from the register, which changes
+/// what a *freshly started* `wsp watch` means: today that is a subscription
+/// beginning, and it would become one resuming whatever the last watch in this
+/// pane had swallowed. That is a separate decision with its own failure, and it
+/// is not worth taking to remove a line the reader can act on in one keystroke.
+///
+/// Once per install, not once per tick: the reading is adopted when it is
+/// said, so a machine somebody is installing on all evening costs one line per
+/// install and the warning never becomes wallpaper.
+const REPLACED: &str = "wsp was replaced under this watch — it keeps the build it started with, \
+                        so what follows is that build's logic and vocabulary. ^C and `wsp watch` again";
 
 /// The loop.
 fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
@@ -1634,6 +1814,11 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     let mut ledger = Ledger::default();
     let mut ticks: u64 = 0;
     let mut last_beat = started;
+    // What we are executing, so the stream can say when an install lands under
+    // it. The same reading `daemon::run` takes for the same event, and the
+    // difference between the two is the whole of `worklist-033`: the daemon
+    // `exec`s on it, and this cannot. See [`said_replaced`].
+    let mut running = util::exe_stamp();
 
     // The opening line, and it is item 1 of the five: a watcher that says
     // nothing at all from the first second is indistinguishable from one that
@@ -1668,6 +1853,15 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         if !store.exists() {
             break Over::StoreGone;
         }
+        // Before the read, so a reader scrolling back finds the warning above
+        // the first line it should not trust.
+        if let Some(now) = util::exe_stamp().filter(|now| running.is_some_and(|was| was != *now)) {
+            running = Some(now);
+            if !spec.json {
+                println!("{}", aside(at, REPLACED, &p));
+            }
+        }
+
         let emits = ledger.advance(&poll.sample(), at, spec.settle);
         say(&emits, at, spec);
         register(store, &key, spec, &ledger, ticks);
@@ -1769,6 +1963,13 @@ fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u6
             "ticks": ticks,
             "standing": ledger.standing(),
             "watching": spec.want.iter().map(|k| k.word()).collect::<Vec<_>>(),
+            // Two readers, one field. [`resume`] asks it whose key rules the
+            // ledger below was written by; `--status`, `doctor` and
+            // `wsp install` ask it whether the process that wrote this record
+            // is running the binary that is now live — which is the same
+            // question about the same file, and `worklist-033` is the half of
+            // it that has no `exec` behind it.
+            "build": crate::build_stamp(),
             "ledger": ledger.json(),
         }),
     );
@@ -1782,7 +1983,8 @@ fn status(store: &Store, args: &Args) -> i32 {
             "{}",
             serde_json::to_string_pretty(&watches
                 .iter()
-                .map(|w| json!({ "key": w.key, "scope": w.scope, "pid": w.pid, "tick": w.tick, "stale": w.stale(), "watching": w.watching() }))
+                .map(|w| json!({ "key": w.key, "scope": w.scope, "pid": w.pid, "tick": w.tick, "stale": w.stale(), "watching": w.watching(),
+                                 "build": w.build, "stale_build": w.stale_build() }))
                 .collect::<Vec<_>>())
             .unwrap_or_default()
         );
@@ -1799,6 +2001,12 @@ fn status(store: &Store, args: &Args) -> i32 {
         let note = match (dead, w.stale(), w.watching()) {
             (true, _, _) => p.red("the process is gone"),
             (false, true, _) => p.red("has stopped ticking"),
+            // Ahead of the standing count, because a count from an old build is
+            // the thing this line exists to stop being read as a reassurance —
+            // `worklist-033`: five signals where the fixed binary read six.
+            (false, false, true) if w.stale_build() => {
+                p.red(&format!("on {} — restart it to pick up this build", w.build))
+            }
             // Said rather than left blank: a pull ledger looks exactly like a
             // running watch in this list, and the reader is here to find out
             // which of their watches is still going.
@@ -2215,6 +2423,119 @@ mod tests {
         assert_eq!(out[0].signal.kind, Kind::Flag);
     }
 
+    // ---- a ledger the previous build wrote ---------------------------------
+
+    /// One watch record as a build writes it: the ledger, and the stamp saying
+    /// whose key rules it is in.
+    fn record(l: &Ledger, build: &str) -> Value {
+        json!({ "build": build, "ledger": l.json() })
+    }
+
+    /// **`worklist-034`, from the side that produced it.** A hand that was up
+    /// before an install and is up after it, keyed `flag:a-1` by the build that
+    /// wrote the ledger and `flag:a-1:m-1` by the build reading it — the
+    /// `record` component `34ae8a3` added.
+    ///
+    /// Diffed, that is one clearing that never happened and one raising for a
+    /// level that never went down, and `wsp flag` lists the hand throughout
+    /// both. The fix is upstream of the diff: a ledger another build keyed is
+    /// not something to diff against.
+    #[test]
+    fn a_hand_that_never_moved_is_not_lowered_and_raised_by_an_install() {
+        let mut before = Ledger::default();
+        before.prime(&[], 0);
+        assert_eq!(before.advance(&[Signal::new(Kind::Flag, "a-1", "can I take this?")], 60, 0).len(), 1);
+
+        // The same hand, read by a build that puts the record in the key.
+        let after = vec![Signal::new(Kind::Flag, "a-1", "can I take this?").of("m-1")];
+
+        let mut diffed = Ledger::of_json(&before.json());
+        let wrong = diffed.advance(&after, 120, 0);
+        assert_eq!(wrong.len(), 2, "the defect itself, so this test fails if the keying stops moving: {wrong:?}");
+
+        let (mut ledger, known) = resume(&record(&before, "another-build"));
+        assert!(!known, "the stamp is what says this may not be diffed against");
+        assert!(ledger.prime(&after, 120).is_empty(), "nothing moved, so nothing is said");
+        assert_eq!(ledger.standing(), 1, "and the hand is still up, under this build's key");
+    }
+
+    /// The other half of the same guard: an install that did not move a key
+    /// still primes, and a prime that threw the ledger away would reset every
+    /// standing level's clock. Ed installs several times a day, so `held` on
+    /// the eventual clearing would have measured the time since the last
+    /// install rather than how long the hand was up.
+    #[test]
+    fn re_priming_keeps_the_time_a_standing_level_went_up() {
+        let up = vec![Signal::new(Kind::Flag, "a-1", "can I take this?")];
+        let mut before = Ledger::default();
+        before.prime(&[], 0);
+        assert_eq!(before.advance(&up, 60, 0).len(), 1);
+
+        let (mut ledger, _) = resume(&record(&before, "another-build"));
+        assert!(ledger.prime(&up, 600).is_empty());
+        let out = ledger.advance(&[], 660, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].held, 600, "measured from when the hand went up, not from the install");
+    }
+
+    /// A level that genuinely went away while the daemon was replacing itself
+    /// is dropped and **not** reported cleared. That is the cost of the prime
+    /// and it is the whole of it: one tick of edges lost, in exchange for never
+    /// inventing one. The level is still readable in `wsp wip`, `doctor` and
+    /// the panel, which is where a lost push is recovered from.
+    #[test]
+    fn a_level_that_went_away_across_a_re_prime_is_dropped_and_not_cleared() {
+        let mut before = Ledger::default();
+        before.prime(&[], 0);
+        assert_eq!(before.advance(&[Signal::new(Kind::Flag, "a-1", "up")], 60, 0).len(), 1);
+
+        let (mut ledger, _) = resume(&record(&before, "another-build"));
+        assert!(ledger.prime(&[], 120).is_empty());
+        assert_eq!(ledger.standing(), 0);
+    }
+
+    /// The stamp is the *build*, so a ledger this build wrote is diffed exactly
+    /// as it always was — the guard costs a tick only where a tick was already
+    /// going to be wrong.
+    #[test]
+    fn a_ledger_this_build_wrote_is_still_diffed_against() {
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        let up = vec![Signal::new(Kind::Flag, "a-1", "up")];
+        assert_eq!(l.advance(&up, 60, 0).len(), 1);
+
+        let (mut back, known) = resume(&record(&l, &crate::build_stamp()));
+        assert!(known);
+        let out = back.advance(&[], 120, 0);
+        assert_eq!(out.len(), 1, "and the clearing still arrives: {out:?}");
+        assert_eq!(out[0].edge, Edge::Down);
+    }
+
+    /// Two ways to have nothing to diff against, and they are one branch. A
+    /// record from before the stamp existed cannot be placed, so it is treated
+    /// as another build's — which is what it is.
+    #[test]
+    fn a_ledger_with_no_stamp_and_no_ledger_at_all_are_both_a_baseline() {
+        let mut l = Ledger::default();
+        l.prime(&[sig(Kind::Flag, "a-1")], 0);
+        assert!(!resume(&json!({ "ledger": l.json() })).1, "written before there was a stamp to write");
+        assert!(!resume(&Value::Null).1, "nobody has ever watched here");
+        assert_eq!(resume(&Value::Null).0.standing(), 0);
+    }
+
+    /// Item 4 of the five ways silence lies survives the re-prime in both
+    /// directions: a watch that comes up blind says so, and one that was
+    /// already saying so does not say it twice because its binary changed.
+    #[test]
+    fn a_re_prime_says_blind_only_when_the_reader_has_not_been_told() {
+        let blind = vec![sig(Kind::Blind, "herdr")];
+        let mut first = Ledger::default();
+        assert_eq!(first.prime(&blind, 0).len(), 1, "a watch blind from its first tick says so");
+
+        let (mut again, _) = resume(&record(&first, "another-build"));
+        assert!(again.prime(&blind, 60).is_empty(), "and an install is not a second reason to say it");
+    }
+
     /// A pull-mode ledger has no process to lose, so nothing may report it as
     /// a watcher that died — that false alarm is how a `doctor` section comes
     /// to be skipped.
@@ -2229,9 +2550,60 @@ mod tests {
             every: 60,
             standing: 0,
             daemon: false,
+            build: crate::build_stamp(),
         };
         assert!(!pull.watching());
         assert!(!pull.stale(), "a day old and still not a fault: nobody promised to tick");
+    }
+
+    /// One register, as a surface finds it.
+    fn reg(pid: u32, daemon: bool, build: &str) -> Registered {
+        Registered {
+            key: "w1:p1".into(),
+            scope: "wsp".into(),
+            pid,
+            host: String::new(),
+            tick: util::now_iso(),
+            every: 60,
+            standing: 0,
+            daemon,
+            build: build.into(),
+        }
+    }
+
+    /// **`worklist-033`.** A watch does not re-`exec` when an install lands, so
+    /// it goes on reporting in the vocabulary it was born with. Four instances
+    /// in one day across two seats and every detection was a person
+    /// remembering; this is the comparison that makes it a fact.
+    ///
+    /// Ticking, on time, and wrong — which is why it is its own reading and not
+    /// a clause on [`Registered::stale`].
+    #[test]
+    fn a_watch_still_running_an_older_build_is_a_fact_rather_than_something_to_remember() {
+        let old = reg(1, false, "5a1f71d");
+        assert!(!old.stale(), "it is ticking, which is the whole difficulty");
+        assert!(old.stale_build());
+        assert!(!reg(1, false, &crate::build_stamp()).stale_build(), "this build is not a fault");
+    }
+
+    /// The daemon is the one long-lived process that *does* replace itself —
+    /// `daemon::reload` `exec`s within a tick of a build landing on its path.
+    /// Naming it would put a line on every install that is wrong by the time
+    /// anybody reads it, and a check that cries wolf is one people skip along
+    /// with the ones that mean something.
+    #[test]
+    fn the_daemon_is_not_named_for_a_build_it_execs_into_within_the_tick() {
+        assert!(!reg(1, true, "5a1f71d").stale_build());
+    }
+
+    /// Two records that describe no running process, for two different reasons,
+    /// and neither is a stale reporter: a pull ledger has no process at all,
+    /// and a register written before the stamp existed cannot answer the
+    /// question. An unanswerable question is not a fault to print in red.
+    #[test]
+    fn nothing_that_cannot_be_holding_an_old_binary_is_reported_as_holding_one() {
+        assert!(!reg(0, false, "5a1f71d").stale_build(), "a `--once` ledger is not a process");
+        assert!(!reg(1, false, "").stale_build(), "written before there was a stamp to write");
     }
 
     /// The vocabulary is what you subscribe to, so every word in it has to be
@@ -2335,6 +2707,7 @@ mod tests {
                 every: 60,
                 standing: 0,
                 daemon: false,
+                build: crate::build_stamp(),
             };
             r.tick = util::iso_at(util::epoch_secs() - ago);
             r
