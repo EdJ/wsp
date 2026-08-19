@@ -2031,6 +2031,23 @@ fn machine_of(id: &str) -> &str {
 /// machine answering" is how they drift apart, and the one that drifts is the
 /// one that reaps — so there is one, and each caller brings whatever it has
 /// actually heard.
+///
+/// **This is the rule and the wrong source, and its successor is
+/// [`crate::place::Census`]** (robustness-059). Partitioning the ids works only
+/// while wsp knows one backend's shape of id — the `@mb2` the `Remote` decorator
+/// exists to make private — and it reads *answered* off the rows that came back,
+/// so a machine that answered holding nothing is filed under silence, and for as
+/// long as it holds nothing its claims cannot be swept at all. Here that is the
+/// conservative reading rather than a defect — an empty answer is what a herdr
+/// restoring a session gives for a second or two — but it is a reading nobody
+/// chose, because the two facts arrive as one. A census reports who answered as
+/// its own fact, and leaves the choice to the caller that reaps.
+/// The move is not made here because nothing in this reap goes through the port
+/// yet, and it needs the other half with it: a census can only speak about seats
+/// it can see, and a seat being reaped is by definition in no census, so the
+/// record has to carry the machine it was opened on. Both halves land together,
+/// with robustness-058's seat record, and this becomes one comparison of two
+/// names with nothing parsed.
 pub(crate) fn answered_by_machine<'a>(
     ids: impl IntoIterator<Item = &'a str>,
 ) -> std::collections::BTreeMap<&'a str, usize> {

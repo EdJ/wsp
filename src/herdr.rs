@@ -326,6 +326,30 @@ fn fanout() -> Vec<String> {
         .collect()
 }
 
+/// Ask this machine, then every reachable one, and keep the answers apart.
+///
+/// **The one line that knows which machine was silent.** Everything downstream
+/// either has this fact or reconstructs it by parsing the ids that came back —
+/// which is `cmd_agent::machine_of` today, and is the coupling
+/// [`crate::place::Census`] exists to remove: an id is the backend's shape and a
+/// caller that reads one has learned herdr's dialect. Here the machine is a
+/// *name*, the same one [`crate::place::Order::on`] sent the work out under, so
+/// nothing between the two ends has to take an id apart.
+///
+/// `""` is this machine, and it is first. An `Err` is a machine that said
+/// nothing; an `Ok(vec![])` is one that answered and holds nothing. Those are
+/// two different facts and no caller that reaps may confuse them.
+fn each<T>(
+    one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>,
+) -> Vec<(String, std::io::Result<Vec<T>>)> {
+    let mut out = vec![(String::new(), one(None))];
+    out.extend(fanout().into_iter().map(|m| {
+        let said = one(Some(&m));
+        (m, said)
+    }));
+    out
+}
+
 /// Ask this machine, then every reachable one, and put the answers together.
 ///
 /// **This machine's failure is an error and a far machine's is not.** A herdr
@@ -334,11 +358,16 @@ fn fanout() -> Vec<String> {
 /// failed sync. Turning one into the other would empty the panel every time a
 /// laptop closed — and, worse, would hand an empty list to the reap guard,
 /// which is exactly the confusion the guard exists to prevent.
+///
+/// Which is [`each`] with the machines flattened away, and it stays for the
+/// readers that only want the rows. The ones that reap take [`each`].
 fn everywhere<T>(one: impl Fn(Option<&str>) -> std::io::Result<Vec<T>>) -> std::io::Result<Vec<T>> {
-    let mut out = one(None)?;
-    for m in fanout() {
-        if let Ok(mut more) = one(Some(&m)) {
-            out.append(&mut more);
+    let mut out = Vec::new();
+    for (machine, said) in each(one) {
+        match said {
+            Ok(mut more) => out.append(&mut more),
+            Err(e) if machine.is_empty() => return Err(e),
+            Err(_) => {}
         }
     }
     Ok(out)
@@ -519,6 +548,18 @@ pub fn panes() -> std::io::Result<Vec<Pane>> {
 /// Only the panes running an agent — the same fan-out, one method along.
 pub fn agents() -> std::io::Result<Vec<Pane>> {
     everywhere(|m| panes_on(m, "agent.list", "agents"))
+}
+
+/// The same two lists, machine by machine. See [`each`].
+///
+/// For [`crate::place_herdr`]'s census, which is the reading a reap is decided
+/// on and so is the one that may not lose a silence.
+pub fn panes_each() -> Vec<(String, std::io::Result<Vec<Pane>>)> {
+    each(|m| panes_on(m, "pane.list", "panes"))
+}
+
+pub fn agents_each() -> Vec<(String, std::io::Result<Vec<Pane>>)> {
+    each(|m| panes_on(m, "agent.list", "agents"))
 }
 
 fn sget(v: &Value, key: &str) -> String {
@@ -861,6 +902,62 @@ mod tests {
         // This machine failing *is* an error: there is nothing to work with.
         std::env::set_var("HERDR_SOCKET_PATH", state.join("nothing-here.sock"));
         assert!(panes().is_err());
+    }
+
+    /// The three silences, told apart at the only place that can tell them
+    /// apart — and the flat list that cannot, side by side with it.
+    ///
+    /// `panes()` answers with one pane in every case below. A reader holding
+    /// that list and a record naming a pane on mb2 has to decide whether mb2
+    /// closed the pane or never spoke, and the list says the same thing either
+    /// way: nothing from mb2. That is why the reap reached for the `@mb2`
+    /// suffix, and [`each`] is what it should have been able to reach for
+    /// instead.
+    #[test]
+    fn the_fan_out_knows_a_machine_that_held_nothing_from_one_that_said_nothing() {
+        let env = util::isolated("herdr-each");
+        let state = env.state();
+        std::fs::create_dir_all(env.home().join("machines")).unwrap();
+        std::fs::write(
+            env.home().join("machines/mb2.md"),
+            "---\nname: mb2\nssh: mb2\nstatus: active\n---\n",
+        )
+        .unwrap();
+        std::fs::write(state.join("machines.json"), r#"{"mb2":{"reachable":true,"tunnel":"up"}}"#)
+            .unwrap();
+
+        let here = state.join("here.sock");
+        let there = state.join("sock").join("mb2.sock");
+        std::env::set_var("HERDR_SOCKET_PATH", &here);
+        let one = json!({ "panes": [{ "pane_id": "w0:p1", "workspace_id": "w0" }] });
+        let none = json!({ "panes": [] });
+        let listing = || each(|m| panes_on(m, "pane.list", "panes"));
+
+        // mb2 answers, and holds nothing.
+        let local = stand_in(&here, 1, one.clone());
+        let far = stand_in(&there, 1, none);
+        let said = listing();
+        far.join().unwrap();
+        local.join().unwrap();
+        assert_eq!(said.len(), 2, "this machine and the one the store names");
+        assert_eq!(said[0].0, "", "this machine is first and is spelled the same as Order::on");
+        assert_eq!(said[1].0, "mb2");
+        assert!(said[1].1.as_ref().is_ok_and(|p| p.is_empty()), "heard, and holding nothing");
+
+        // mb2 says nothing at all: no socket at the end of the tunnel.
+        std::fs::remove_file(&there).unwrap();
+        let local = stand_in(&here, 1, one);
+        let said = listing();
+        local.join().unwrap();
+        assert!(said[0].1.is_ok(), "this machine still answered");
+        assert!(said[1].1.is_err(), "silence is an answer of its own, not an empty list");
+
+        // And the flat reading of the same two worlds cannot tell them apart —
+        // which is the defect, stated as a test rather than as a comment.
+        let local = stand_in(&here, 1, json!({ "panes": [{ "pane_id": "w0:p1" }] }));
+        let flat = panes().expect("this machine answered");
+        local.join().unwrap();
+        assert_eq!(flat.len(), 1, "one pane, whether mb2 was empty or gone");
     }
 
     /// The end of the wire, with a real socket at the end of it.

@@ -914,7 +914,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         if let Ok(rows) = place.census() {
             cmd_agent::learn_sessions(
                 store,
-                rows.iter()
+                rows.seats()
                     .filter(|r| r.seat == seat)
                     .map(|r| (r.seat.as_str(), r.session.as_str())),
             );
@@ -1687,7 +1687,7 @@ mod tests {
         fn stop(&self, _: &Seat) -> crate::place::Result<()> {
             panic!("waiting does not end seats")
         }
-        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
             panic!("waiting is about one seat")
         }
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
@@ -1928,7 +1928,7 @@ mod tests {
         fn stop(&self, _: &Seat) -> crate::place::Result<()> {
             panic!("a handover that fails leaves the agent standing")
         }
-        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
             panic!("a handover is about one seat")
         }
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
@@ -2136,7 +2136,7 @@ mod tests {
         fn state(&self, _: &Seat) -> crate::place::Result<State> {
             panic!("spawn does not ask how the work is going")
         }
-        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
             panic!("spawn is about one seat")
         }
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
@@ -2306,7 +2306,7 @@ mod tests {
         fn state(&self, _: &Seat) -> crate::place::Result<State> {
             panic!("despawn does not ask how the work is going")
         }
-        fn census(&self) -> crate::place::Result<Vec<crate::place::Seated>> {
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
             panic!("despawn is about one seat")
         }
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {

@@ -729,7 +729,7 @@ impl Kind for Claude {
     /// at all is no longer fatal to the sentence for the same reason — the
     /// handle does not come from there any more.
     fn address(&self, place: &dyn Place, spawn: &Spawn) -> Option<Address> {
-        let row = place.census().ok().and_then(|c| c.into_iter().find(|s| &s.seat == spawn.seat));
+        let row = place.census().ok().and_then(|c| c.seats().find(|s| &s.seat == spawn.seat).cloned());
         // A listing wsp could not take is treated as an empty one, which is the
         // opposite of what [`Kind::running`] does with the same failure and right
         // for the opposite reason: there the difference decides whether to
@@ -1721,8 +1721,8 @@ mod tests {
             self.said.borrow_mut().push((seat.clone(), text.to_string()));
             Ok(())
         }
-        fn census(&self) -> Result<Vec<Seated>> {
-            Ok(self.seats.clone())
+        fn census(&self) -> Result<crate::place::Census> {
+            Ok(crate::place::Census::heard("", self.seats.clone()))
         }
         fn open(&self, _: &Order) -> Result<Seat> {
             panic!("telling an agent does not open seats")

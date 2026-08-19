@@ -191,7 +191,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::place::{self, Agent, Event, Order, Place, Refusal, Result, Seat, Seated, State};
+use crate::place::{self, Agent, Census, Event, Order, Place, Refusal, Result, Seat, Seated, State};
 use crate::store::{write_atomic, Store};
 use crate::util::{self, Clock};
 
@@ -923,8 +923,11 @@ impl Place for Supervisor<'_> {
     /// An error is not an empty list — this returns rows or the error that
     /// stopped it, and a `ps` that would not run leaves every agent believed
     /// alive rather than reaped.
-    fn census(&self) -> Result<Vec<Seated>> {
-        Ok(self.survey())
+    fn census(&self) -> Result<Census> {
+        // One machine, and it is this one. A supervisor forks locally; there is
+        // no fan-out to be partly silent about, so the census is one answer and
+        // an empty one is a fact rather than a silence.
+        Ok(Census::heard("", self.survey()))
     }
 
     /// Poll, and say what changed.
@@ -1085,7 +1088,7 @@ mod tests {
         assert_ne!(first, second);
         place.stop(&first).expect("the seat was there");
         place.stop(&second).expect("the seat was there");
-        assert!(place.census().unwrap().is_empty(), "the seats outlived their stop");
+        assert!(place.census().unwrap().seats().next().is_none(), "the seats outlived their stop");
 
         let third = place.open(&Order::default()).unwrap();
         assert_ne!(third, first, "an id came round again with the claims still naming it");
@@ -1181,7 +1184,7 @@ mod tests {
         assert!(!State::Gone.is_running());
         // The seat is still there. Ending the agent and ending the seat are one
         // verb, and nothing has called it.
-        assert!(place.census().unwrap().iter().any(|s| s.seat == seat));
+        assert!(place.census().unwrap().seats().any(|s| s.seat == seat));
     }
 
     /// What a seat's occupant must not inherit is *removed* here, not emptied —
@@ -1290,7 +1293,7 @@ mod tests {
         );
 
         let seats = place.census().unwrap();
-        let of = |s: &Seat| seats.iter().find(|r| &r.seat == s).cloned().unwrap();
+        let of = |s: &Seat| seats.seats().find(|r| &r.seat == s).cloned().unwrap();
         assert_eq!(of(&empty).state, State::Empty, "a seat somebody could sit in is still a seat");
         assert_eq!(of(&empty).label, "a seat");
         assert_eq!(of(&busy).state, State::Working);
@@ -1371,7 +1374,7 @@ mod tests {
         place.stop(&seat).expect("the seat was there");
 
         place.heard(&seat, "SessionEnd", State::Gone, &json!({ "session_id": "abc" }));
-        assert!(place.census().unwrap().is_empty(), "a hook recreated the seat");
+        assert!(place.census().unwrap().seats().next().is_none(), "a hook recreated the seat");
         assert_eq!(place.state(&seat), Err(Refusal::NoSeat(seat.clone())));
         assert_eq!(place.stop(&seat), Err(Refusal::NoSeat(seat)), "already gone");
     }
@@ -1428,7 +1431,7 @@ mod tests {
         let place = scratch.place();
         let refused = place.open(&Order { on: Some("mb2".into()), ..Order::default() });
         assert!(matches!(refused, Err(Refusal::Unsupported(_))), "{refused:?}");
-        assert!(place.census().unwrap().is_empty(), "a refused order left a seat behind");
+        assert!(place.census().unwrap().seats().next().is_none(), "a refused order left a seat behind");
     }
 
     /// Ending a seat ends what was running in it, and ending it twice is not a

@@ -705,6 +705,126 @@ pub struct Seated {
     pub session: String,
 }
 
+/// What every backend said when it was asked what it holds.
+///
+/// **Not a `Vec<Seated>`, and that difference is the whole of this type.** A
+/// flat list can say what is running; it cannot say *who was asked*. So a
+/// caller that reaps on the strength of one is a network blip away from handing
+/// back every task an executor holds: unreachable, answering-with-nothing and
+/// never-asked all arrive as the same empty list, and the only party that can
+/// tell them apart is the one that made the calls and got the errors.
+///
+/// wsp has that judgement today and gets it by **parsing the id** —
+/// `cmd_agent::machine_of` reads herdr's `@mb2` suffix and partitions the live
+/// list on it. That works only while wsp knows one backend's shape of id, which
+/// is exactly what a [`Seat`] is not allowed to have and what the `Remote`
+/// decorator makes private. This type is where the fact comes from instead: the
+/// fan-out *already knows* which machine answered — `herdr::each` is the line
+/// that knows — and until now it threw the answer away and let a caller
+/// reconstruct it from the ids that came back.
+///
+/// [`Census::heard`] and [`Census::silent`] are different constructors and there
+/// is no `Default`. The same shape [`crate::arrange::World`] takes, for the same
+/// reason: **the cost of this bug is a `Vec::new()` that looks like an answer.**
+///
+/// **A partial answer is good news.** A census across four machines with one
+/// down is three machines' worth of fact, and reading it as a failed call would
+/// empty the panel every time a laptop closed — the rule `herdr::everywhere`
+/// already states as *this machine's failure is an error and a far machine's is
+/// not*. [`Refusal::Unreachable`] is kept for the case it names, nobody answered
+/// at all, and [`Place::census`] says when that is returned.
+///
+/// # What this settles, and what has to go with it
+///
+/// It settles half of the question, and the half it does not settle is the one
+/// that would otherwise be discovered late. A census can only speak about seats
+/// it can *see*, and a seat a reap is deciding about is by definition in no
+/// census — that is what makes it a candidate. So the machine names here have to
+/// meet a machine name on wsp's own record of the seat, and an opaque handle
+/// cannot be asked which one it is.
+///
+/// That record can carry it, and not by parsing anything, because wsp names the
+/// machine at every door a seat comes in by: [`Order::on`] when wsp opens one,
+/// `WSP_MACHINE` — which the executor shim already reads, and today only spends
+/// on qualifying ids — when an agent out there claims one, and this type when a
+/// seat is adopted from a backend that was asked. The decision is on
+/// robustness-059 and the record is robustness-058's.
+#[derive(Debug, Clone)]
+pub struct Census {
+    said: Vec<(String, Result<Vec<Seated>>)>,
+}
+
+impl Census {
+    /// A backend answered. An empty answer is a fact: it holds nothing.
+    ///
+    /// `machine` is [`Order::on`]'s name for it and `""` is this one — the same
+    /// spelling on both sides of the port, so that what went out as `--on mb2`
+    /// comes back as `mb2` without anything in between reading an id.
+    pub fn heard(machine: &str, seats: Vec<Seated>) -> Census {
+        Census { said: vec![(machine.to_string(), Ok(seats))] }
+    }
+
+    /// A backend said nothing, and why.
+    ///
+    /// The row that has no representation in a `Vec<Seated>` and the reason this
+    /// type exists. Keeping the [`Refusal`] rather than a flag is what lets a
+    /// reader tell a partition from a machine that is misconfigured, without
+    /// either of them being confused with an idle one.
+    pub fn silent(machine: &str, why: Refusal) -> Census {
+        Census { said: vec![(machine.to_string(), Err(why))] }
+    }
+
+    /// Two censuses as one — what a fan-out folds its answers with.
+    pub fn and(mut self, other: Census) -> Census {
+        self.said.extend(other.said);
+        self
+    }
+
+    /// Every seat every backend that answered is holding.
+    ///
+    /// What a caller who only wants the rows reads, and it is safe for exactly
+    /// those callers: a seat that is *here* is here whoever else was silent.
+    /// Anything concluding from an **absence** must ask [`Census::answered`]
+    /// first, and absence is the only question this method cannot answer.
+    pub fn seats(&self) -> impl Iterator<Item = &Seated> {
+        self.said.iter().filter_map(|(_, s)| s.as_ref().ok()).flatten()
+    }
+
+    /// The seats one backend is holding, and none if it said nothing.
+    pub fn on<'a>(&'a self, machine: &'a str) -> impl Iterator<Item = &'a Seated> {
+        self.said
+            .iter()
+            .filter(move |(m, _)| m == machine)
+            .filter_map(|(_, s)| s.as_ref().ok())
+            .flatten()
+    }
+
+    /// Whether this machine replied at all.
+    ///
+    /// **The judgement everything that reaps turns on**, and it is deliberately
+    /// only half of one: this says *heard from*, and whether an answer of
+    /// nothing is evidence that the work stopped is a policy the caller owns.
+    /// `reconcile --reap` says it is not — a herdr restoring a session answers
+    /// with an empty list for a second or two, and reaping on that is
+    /// t-260816-015, every binding in the store gone — so the reap's rule is
+    /// this **and** a seat of its own on the same machine. That is one rule in
+    /// one place (`cmd_agent::may_reap`), not a second one here; what this type
+    /// changes is that the caller can now tell the three silences apart at all.
+    pub fn answered(&self, machine: &str) -> bool {
+        self.said.iter().any(|(m, s)| m == machine && s.is_ok())
+    }
+
+    /// Whether anybody answered.
+    pub fn was_heard(&self) -> bool {
+        self.said.iter().any(|(_, s)| s.is_ok())
+    }
+
+    /// Who said nothing, and why. For a reader that draws it or logs it.
+    pub fn unheard(&self) -> impl Iterator<Item = (&str, &Refusal)> {
+        self.said.iter().filter_map(|(m, s)| s.as_ref().err().map(|e| (m.as_str(), e)))
+    }
+}
+
 /// Something the backend noticed, without being asked.
 ///
 /// "Tell me when it stops" is the clause of Ed's sentence that has no polling
@@ -916,7 +1036,15 @@ pub trait Place {
     /// not an empty list, and callers reaping anything on the strength of this
     /// must treat the two differently — that rule is older than this port
     /// (`sync.rs:41`) and survives it.
-    fn census(&self) -> Result<Vec<Seated>>;
+    ///
+    /// [`Census`] is that rule made unsayable-wrong rather than remembered: the
+    /// answer is per backend, so a machine that was silent is a row of its own
+    /// instead of an absence of rows. **A partial answer is an answer** — one
+    /// machine down out of four is three machines' worth of fact — so
+    /// [`Refusal::Unreachable`] is returned only when *nothing* answered, which
+    /// is the sentence it already carries and the moment `herdr::available()`
+    /// used to be asked in advance.
+    fn census(&self) -> Result<Census>;
 
     /// Block, calling `f` for each event, until `f` returns false.
     ///
@@ -1097,5 +1225,74 @@ mod tests {
         }
         assert!(Seat::default().is_empty());
         assert_ne!(Seat::new("w0:p3"), Seat::new("w0:p3@mb2"));
+    }
+
+    fn row(id: &str) -> Seated {
+        Seated { seat: Seat::new(id), ..Seated::default() }
+    }
+
+    /// The distinction the whole type exists for, and the one a `Vec<Seated>`
+    /// cannot hold: a machine that answered and holds nothing, and a machine
+    /// that said nothing, are both no rows and are not the same fact.
+    ///
+    /// Reaping on the second is a network blip handing back every task an
+    /// executor holds. Refusing to reap on the first is a claim over a closed
+    /// workspace that nothing ever sweeps. One list gets one of them wrong.
+    #[test]
+    fn a_machine_that_holds_nothing_is_not_a_machine_that_said_nothing() {
+        let empty = Census::heard("mb2", Vec::new());
+        let quiet = Census::silent("mb2", Refusal::Unreachable("no route to host".into()));
+
+        assert_eq!(empty.seats().count(), 0, "no rows");
+        assert_eq!(quiet.seats().count(), 0, "the same no rows");
+        assert!(empty.answered("mb2"), "and it was heard from");
+        assert!(!quiet.answered("mb2"), "and it was not");
+
+        assert_eq!(quiet.unheard().count(), 1, "who was silent, and why, survives the census");
+        assert_eq!(empty.unheard().count(), 0);
+        let (machine, why) = quiet.unheard().next().unwrap();
+        assert_eq!(machine, "mb2");
+        assert!(matches!(why, Refusal::Unreachable(_)), "a partition, not a misconfiguration");
+    }
+
+    /// One machine down out of two is one machine's worth of fact.
+    ///
+    /// The reading `Refusal::Unreachable` from a fan-out would have forced —
+    /// the whole call failed — is wrong twice over: it throws away seats that
+    /// were reported, and it says nothing about *which* machine went quiet,
+    /// which is the only part a reap needs.
+    #[test]
+    fn a_census_missing_one_machine_still_answers_for_the_others() {
+        let c = Census::heard("", vec![row("w0:p1")])
+            .and(Census::silent("mb2", Refusal::Unreachable("gone".into())))
+            .and(Census::heard("mb3", vec![row("w0:p1@mb3")]));
+
+        assert!(c.was_heard(), "somebody answered");
+        assert_eq!(c.seats().count(), 2, "every seat every answering machine holds");
+        assert_eq!(c.on("").count(), 1);
+        assert_eq!(c.on("mb3").next().unwrap().seat, Seat::new("w0:p1@mb3"));
+        assert_eq!(c.on("mb2").count(), 0, "a silent machine holds nothing readable");
+        assert!(c.answered("") && c.answered("mb3") && !c.answered("mb2"));
+        assert!(!c.answered("mb4"), "a machine nobody asked is as unheard as one that was");
+    }
+
+    /// Nobody answered is a census too, and `was_heard` is the only thing that
+    /// separates it from a world where nothing is running.
+    ///
+    /// `arrange::World` draws this line with two constructors and no `Default`,
+    /// for the reason t-260816-058 paid for: the cost of this bug is a
+    /// `Vec::new()` that looks like an answer. A `Census` cannot be made at all
+    /// without saying which of the two it is.
+    #[test]
+    fn a_census_nobody_answered_cannot_be_read_as_an_empty_world() {
+        let none = Census::silent("", Refusal::Unreachable("no socket".into()))
+            .and(Census::silent("mb2", Refusal::Unreachable("no route".into())));
+        assert!(!none.was_heard());
+        assert_eq!(none.seats().count(), 0);
+        assert_eq!(none.unheard().count(), 2, "both, and each with its own reason");
+
+        let world = Census::heard("", Vec::new());
+        assert!(world.was_heard(), "an answer of nothing is an answer");
+        assert_eq!(world.seats().count(), 0);
     }
 }

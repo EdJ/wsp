@@ -186,7 +186,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::herdr;
-use crate::place::{Agent, Event, Order, Place, Refusal, Result, Seat, Seated, State};
+use crate::place::{Agent, Census, Event, Order, Place, Refusal, Result, Seat, Seated, State};
 use crate::util::{self, Clock};
 
 /// herdr as a place to put work.
@@ -734,25 +734,63 @@ impl Place for Herdr<'_> {
         }
     }
 
-    /// Seats from `pane.list`, states from `agent.list`.
+    /// Seats from `pane.list`, states from `agent.list`, machine by machine.
     ///
     /// Two calls because neither answers the question alone: `pane.list` is the
     /// only one that knows about a seat with nobody in it, and `agent.list` is
-    /// the only one that can tell a starting agent from an idle one. Both fan
-    /// out across machines already, so this is a census of everywhere.
+    /// the only one that can tell a starting agent from an idle one.
     ///
-    /// An error is not an empty list, and this returns the error — the rule is
-    /// older than the port (`sync.rs:41`) and outlives it.
-    fn census(&self) -> Result<Vec<Seated>> {
-        let panes = herdr::panes().map_err(|e| refusal(&Seat::default(), &e))?;
-        let agents = herdr::agents().map_err(|e| refusal(&Seat::default(), &e))?;
-        Ok(panes
-            .iter()
-            .map(|p| match agents.iter().find(|a| a.pane_id == p.pane_id) {
-                Some(a) => seated(a, state_of_agent(a)),
-                None => seated(p, state_of_pane(p)),
-            })
-            .collect())
+    /// **Asked per machine rather than as one flat list**, which is the whole of
+    /// [`Census`]: a machine that is unreachable and a machine that holds
+    /// nothing both contribute no rows, and only the fan-out is in a position to
+    /// say which happened. `herdr::each` has always known; until now it threw
+    /// the answer away and the reap dug it back out of the `@mb2` suffix on the
+    /// ids, which is a backend's private shape read by wsp.
+    ///
+    /// Silence is per call, so a machine can be heard about its panes and not
+    /// its agents. Its seats are then read the way a `pane.list` row is read
+    /// anywhere else — [`state_of_pane`], which cannot tell a starting agent
+    /// from an idle one and never claims to. That is a worse *state*, not a
+    /// wrong census, and it is the right trade here: refusing the machine
+    /// outright would turn a partial answer into a silence, and a silence is the
+    /// one answer nothing may act on.
+    ///
+    /// An error is not an empty list, and it is returned only when **no** machine
+    /// answered — see [`Place::census`].
+    fn census(&self) -> Result<Census> {
+        let agents = herdr::agents_each();
+        let mut said = herdr::panes_each().into_iter().map(|(machine, panes)| {
+            let panes = match panes {
+                Err(e) => return Census::silent(&machine, refusal(&Seat::default(), &e)),
+                Ok(panes) => panes,
+            };
+            let running = agents
+                .iter()
+                .find(|(m, _)| *m == machine)
+                .and_then(|(_, a)| a.as_ref().ok())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let seats = panes
+                .iter()
+                .map(|p| match running.iter().find(|a| a.pane_id == p.pane_id) {
+                    Some(a) => seated(a, state_of_agent(a)),
+                    None => seated(p, state_of_pane(p)),
+                })
+                .collect();
+            Census::heard(&machine, seats)
+        });
+        // `each` asks this machine first and always, so there is always a first
+        // answer; the `None` arm is unreachable and is written as a refusal
+        // rather than an `expect` because a census is not a place to panic.
+        match said.next().map(|first| said.fold(first, Census::and)) {
+            Some(c) if c.was_heard() => Ok(c),
+            // Nobody answered. The local machine's own words, because they are
+            // the ones worth reading: a far machine being gone never gets here.
+            Some(c) => Err(c.unheard().next().map(|(_, e)| e.clone()).unwrap_or_else(|| {
+                Refusal::Unreachable("nothing was asked".into())
+            })),
+            None => Err(Refusal::Unreachable("nothing was asked".into())),
+        }
     }
 
     /// This machine's stream. A `Remote` decorator is what will hold one per
@@ -1155,6 +1193,68 @@ mod tests {
 
     }
 
+    /// The reap's evidence, end to end: a census over two machines where one of
+    /// them is not there.
+    ///
+    /// Three things have to hold at once, and before [`Census`] no return type
+    /// could hold all three. The seats this machine reported survive — a
+    /// partition is not a failed sync. mb2 is named as unheard rather than
+    /// implied by an absence of rows. And nothing anywhere read the `@mb2` on an
+    /// id to work either of them out: the machine is the name the store gave it
+    /// and the name `--on` would have sent work out under.
+    ///
+    /// One test, because `util::isolated` sets `WSP_STATE` for the process.
+    #[test]
+    fn a_census_names_the_machine_that_said_nothing_rather_than_leaving_a_gap() {
+        let env = util::isolated("adapter-census-fanout");
+        std::fs::create_dir_all(env.home().join("machines")).unwrap();
+        std::fs::write(
+            env.home().join("machines/mb2.md"),
+            "---\nname: mb2\nssh: mb2\nstatus: active\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            env.state().join("machines.json"),
+            r#"{"mb2":{"reachable":true,"tunnel":"up"}}"#,
+        )
+        .unwrap();
+
+        let here = Fake::bind(
+            env.path("herdr.sock"),
+            Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]),
+        )
+        .unwrap();
+        let (k, v) = here.socket_env();
+        std::env::set_var(k, v);
+        let far_socket = env.state().join("sock").join("mb2.sock");
+
+        // Both machines up: two seats, and nobody unheard.
+        let there = Fake::bind(
+            &far_socket,
+            Stage::of(vec![Spot::agent("w1:p1", "claude", "t-2", State::Idle)]),
+        )
+        .unwrap();
+        let c = Herdr::new().census().expect("both answered");
+        assert_eq!(c.seats().count(), 2, "one from each machine");
+        assert!(c.on("mb2").any(|s| s.seat == Seat::new("w1:p1@mb2")), "qualified at the door");
+        assert_eq!(c.unheard().count(), 0);
+        drop(there);
+        let _ = std::fs::remove_file(&far_socket);
+
+        // mb2 gone. The call still succeeds, this machine's seat is still
+        // reported, and the silence is a row rather than a missing one.
+        let c = Herdr::new().census().expect("mb2 being gone is not this machine's problem");
+        assert_eq!(c.seats().count(), 1, "what is here is here whoever else went quiet");
+        assert!(c.answered(""), "this machine spoke");
+        assert!(!c.answered("mb2"), "and mb2 did not — which no list of rows could have said");
+        assert_eq!(c.unheard().map(|(m, _)| m).collect::<Vec<_>>(), ["mb2"]);
+
+        // And with this machine gone too there is nothing to work with, which is
+        // the one case that is still a refusal.
+        here.goes(Quiet::HangsUp);
+        assert!(matches!(Herdr::new().census(), Err(Refusal::Unreachable(_))));
+    }
+
     /// `available()` was a question asked in advance about a socket. This is what
     /// it became: the answer to the call that wanted it, from the caller's own
     /// verb, in both of the ways a backend goes quiet.
@@ -1201,7 +1301,7 @@ mod tests {
             ]),
         );
         let seats = Herdr::new().census().expect("the fake answered");
-        let of = |id: &str| seats.iter().find(|s| s.seat == Seat::new(id)).cloned();
+        let of = |id: &str| seats.seats().find(|s| s.seat == Seat::new(id)).cloned();
 
         assert_eq!(of("w1:p1").unwrap().state, State::Starting, "a pane row would have said idle");
         assert_eq!(of("w1:p1").unwrap().agent.name, "t-1", "what it was started as");

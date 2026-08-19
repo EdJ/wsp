@@ -685,7 +685,7 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
     // next time. Cheapest here — the backend has just been asked whether the
     // agent is ready, so it plainly has an opinion.
     if let Ok(rows) = place.census() {
-        let ours: Vec<&crate::place::Seated> = rows.iter().filter(|r| r.seat == seat).collect();
+        let ours: Vec<&crate::place::Seated> = rows.seats().filter(|r| r.seat == seat).collect();
         crate::cmd_agent::learn_sessions(
             store,
             ours.iter().map(|r| (r.seat.as_str(), r.session.as_str())),
