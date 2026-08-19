@@ -149,6 +149,7 @@
 //! in the reassuring direction gets ignored, and one that is wrong in the
 //! alarming direction gets ignored too.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -991,8 +992,9 @@ pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String
 /// [`Landings::files`] for the lookup that follows from that.
 ///
 /// The reflog is read **once for the repository** and one `git diff
-/// --name-only` is spent per member, which is what makes this affordable to do
-/// for a whole group.
+/// --name-only` is spent per land — usually one per member, and the live trunk
+/// has no member above five — which is what makes this affordable to do for a
+/// whole group.
 ///
 /// # What it cannot answer, and why that is said out loud
 ///
@@ -1063,7 +1065,7 @@ impl Landings {
     /// the one confusion this type is here to keep out.
     pub(crate) fn files(&self, repo: &Path, branch: &str) -> Option<Vec<String>> {
         let named = format!("merge {branch}:");
-        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut out: BTreeSet<String> = BTreeSet::new();
         let mut landed = false;
         for (at, (tip, _)) in
             self.values.iter().enumerate().filter(|(_, (_, why))| why.starts_with(&named))

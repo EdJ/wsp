@@ -888,8 +888,9 @@ pub struct Overlap {
 /// was silently blind to until `worklist-024`.
 ///
 /// One `git reflog` per repository — a group's members are routinely in two or
-/// three — and one `git diff --name-only` per member, which is the cost the
-/// design priced.
+/// three — and one `git diff --name-only` per *land*, which is one per member
+/// for all but the member that landed twice. That is the cost the design
+/// priced, and it did not move much when the arity did.
 pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
     let mut repos = Repos::new(store);
     let mut logs: HashMap<PathBuf, cmd_checkout::Landings> = HashMap::new();
