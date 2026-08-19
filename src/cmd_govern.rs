@@ -696,9 +696,26 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         // begins with a dash — the flag parser reads that as the next flag —
         // so the words after the project are taken as the sentence too, and a
         // person who types the obvious thing is not answered with a parse.
-        let text = match args.get("tell") {
-            Some(t) if t != "true" => t,
-            _ => args.rest[1..].join(" "),
+        let typed = told(args);
+        // The verb this task was raised on. A governor brief is the longest
+        // prose anything in wsp sends, and it is prose *about the code* — file
+        // names, verb names, identifiers — so it is written with backticks,
+        // and inside the double quotes a shell needs for a paragraph every one
+        // of them runs a command. What arrived on 2026-08-18 was fluent with
+        // the load-bearing nouns missing, and nothing at the receiving end
+        // looked truncated. `-` is what `edit --overview`, `note`, `flag
+        // --body` and `tell` already spell; until this it was delivered to the
+        // governor as the literal word `-`, which is the same defect `wsp note`
+        // was fixed for, one file along.
+        let text = match typed.trim() == "-" {
+            true => match crate::cmd_agent::piped_message() {
+                Ok(t) => t,
+                Err(code) => return code,
+            },
+            false => match crate::cmd_agent::typed_message(&typed) {
+                Ok(t) => t,
+                Err(code) => return code,
+            },
         };
         return tell(&governors, &proj.id, &text, args);
     }
@@ -744,6 +761,22 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     }
     println!("  {}", p.dim("raised hands here reach this workspace · wsp govern --clear to stand down"));
     0
+}
+
+/// The sentence as it was typed, out of the three shapes the flag parser can
+/// hand it over in.
+///
+/// `--tell` normally carries the sentence as its value. It does not when the
+/// sentence begins with a dash, because the parser reads that as the next flag
+/// — so the words after the project are taken as the sentence too, and a person
+/// who types the obvious thing is not answered with a parse. That fallback is
+/// also what makes `--tell -` work without a case of its own: a lone dash is
+/// not a value either, so it lands in `rest` and comes back out here.
+fn told(args: &Args) -> String {
+    match args.get("tell") {
+        Some(t) if t != "true" => t,
+        _ => args.rest[1..].join(" "),
+    }
 }
 
 /// `wsp govern <project> --tell "…"` — a sentence for whoever is in the slot.
@@ -921,6 +954,32 @@ mod tests {
         let mut data = Project::new("data");
         data.parent = Some("robustness".into());
         Index::new(vec![Project::new("tooling"), wsp, rob, data])
+    }
+
+    /// The message the shell rewrote, and the spelling that stops it.
+    ///
+    /// Every shape has to arrive as the same string, because the one that does
+    /// not is the one that gets sent: `--tell -` used to reach the governor as
+    /// the literal word `-`, delivered, receipted and empty of everything the
+    /// sender wrote.
+    #[test]
+    fn the_dash_reaches_govern_as_the_stream_in_every_spelling() {
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+
+        for line in [
+            vec!["govern", "render", "--tell", "-"],
+            vec!["govern", "render", "--tell=-"],
+        ] {
+            assert_eq!(told(&parse(&line)).trim(), "-", "{line:?}");
+        }
+
+        // …and a sentence is still a sentence, in both the shapes that carry
+        // one: as the flag's value, and as the words after the project when it
+        // begins with a dash the parser would have eaten.
+        let a = parse(&["govern", "render", "--tell", "come and look at this"]);
+        assert_eq!(told(&a), "come and look at this");
+        let b = parse(&["govern", "render", "--tell", "--overview is the one to read"]);
+        assert_eq!(told(&b), "--overview is the one to read");
     }
 
     fn seated(pairs: &[(&str, &str)]) -> BTreeMap<String, Value> {

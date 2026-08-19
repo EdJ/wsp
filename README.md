@@ -1280,6 +1280,51 @@ Two rules came out of that, and both are about refusing to guess:
   stored alone. Collapsing the two is how a save wipes a section nobody touched,
   which is reachable from `--from` and stdin, which is to say from an agent.
 
+## Prose the shell never sees
+
+```sh
+wsp note   <id> -            wsp block <id> -       wsp edit <id> --overview -
+wsp decide <id> -            wsp park  <id> -       wsp flag <id> --body -
+wsp tell   <id> -            wsp govern <proj> --tell -
+```
+
+Every verb whose payload is routinely a paragraph reads it from stdin, spelled
+`-` the way `cat -` spells it, and every one of them still takes the sentence
+on the line for the one-liner that is the common case.
+
+The reason is not convenience. Prose written here is prose *about this CLI* —
+file names, verb names, code identifiers — which is exactly the text that wants
+backticks, and inside the double quotes a shell needs for a multi-paragraph
+message every backtick is command substitution. It fired twice. On 2026-08-18 a
+governor brief sent with `wsp govern <proj> --tell "…"` arrived fluent with its
+load-bearing nouns missing, three of its phrases having executed instead: the
+receiving end saw nothing that looked truncated, which is worse than an error.
+On 2026-08-19 a decision written with `wsp decide <id> "…"` ran `wsp verify
+--alone` and substituted a 745-test progress bar into the record, and the
+decision itself is gone. That is the most durable and most quoted thing the
+store holds, replaced by a command's output, with a success receipt printed.
+
+Which is why length is not the test. `block` and `park` are one line each and
+they take `-` too, because a blocking question names the two shapes it is
+choosing between and naming a shape here means naming a verb. What separates
+the verbs that have `-` from the ones that do not is whether single quotes are
+a real defence: they stop a shell dead, and they are usable right up until the
+text contains an apostrophe, which a paragraph always does and a title never
+does. So `wsp add`, `wsp rename`, `wsp say`, `wsp flag <id> "why"` and
+`wsp project set … brief=…` stay argv-only and are quoted `'like this'`.
+
+Nothing detected either failure, and that is the other half. A store cannot see
+that a shell rewrote its argument — the command it receives is well-formed and
+the words in it are gone. What it *can* be certain about is control bytes:
+prose has newlines and tabs in it and nothing else below space, so a carriage
+return or an escape sequence arriving as a task's prose came from a terminal
+and not from anybody's keyboard. Every intake refuses them, argv and stream
+alike, and every one of them is a line the panel, the brief and a pane title
+would otherwise have drawn. It is a floor rather than a solution — a
+substitution can return text with no control byte in it, and that still gets
+through. What stops that one is `-` existing on the verb, so the shell never
+sees the prose at all.
+
 ## Adopting what is already open
 
 ```sh

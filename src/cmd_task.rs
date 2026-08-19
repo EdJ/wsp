@@ -16,6 +16,15 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp add \"title\" [-p project] [-t tag]… [--prio high]");
         return 2;
     }
+    // A title has no `-` form and does not need one — one line, and single
+    // quotes stop a shell dead. What it does need is the same refusal every
+    // other intake makes, because a title is the most-quoted string in the
+    // store: it is in `ls`, in the brief, in the pane's own name, and in every
+    // spawn on the task afterwards.
+    if let Some(why) = util::terminal_output(&title) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
 
     let index = Index::new(store.projects());
 
@@ -675,15 +684,23 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     })
 }
 
+/// Reads its prose the same way `note` does — see [`payload_source`].
+///
+/// The reason a block wants a stream is not length, it is that the sentence is
+/// nearly always *a question about the code*: which of two shapes, whether a
+/// flag means what it looks like, what `wsp verify --alone` is supposed to do
+/// when the tree is dirty. That is backtick-shaped text going through a shell,
+/// which is the fault this whole survey is about.
 pub fn block(store: &Store, args: &Args) -> i32 {
-    let reason = args.text(1);
-    if reason.trim().is_empty() {
-        eprintln!("usage: wsp block <id> \"reason\"");
-        return 2;
-    }
-    mutate(store, args, "blocked", |t| {
+    const USAGE: &str = "wsp block <id> \"the question\"   (or `-` to read it from stdin)";
+    let (reason, from) = match prose_payload(args, USAGE) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let said = from.map(|src| format!("{} characters from {src}", reason.len()));
+    mutate_saying(store, args, "blocked", said.as_deref(), |t| {
         t.set_status(Status::Blocked);
-        t.log(&format!("blocked: {}", reason.trim()));
+        t.log(&format!("blocked: {reason}"));
     })
 }
 
@@ -698,14 +715,15 @@ pub fn block(store: &Store, args: &Args) -> i32 {
 /// too, and the status is what makes the log line findable: `wsp ls -s parked`
 /// is now a question you can ask.
 pub fn park(store: &Store, args: &Args) -> i32 {
-    let reason = args.text(1);
-    if reason.trim().is_empty() {
-        eprintln!("usage: wsp park <id> \"what would bring it back\"");
-        return 2;
-    }
-    mutate(store, args, "parked", |t| {
+    const USAGE: &str = "wsp park <id> \"what would bring it back\"   (or `-` to read it from stdin)";
+    let (reason, from) = match prose_payload(args, USAGE) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let said = from.map(|src| format!("{} characters from {src}", reason.len()));
+    mutate_saying(store, args, "parked", said.as_deref(), |t| {
         t.set_status(Status::Parked);
-        t.log(&format!("parked: {}", reason.trim()));
+        t.log(&format!("parked: {reason}"));
     })
 }
 
@@ -759,7 +777,18 @@ fn fold(text: &str) -> String {
 /// it names. `Err` is the exit code, with the reason already on stderr.
 fn prose_payload(args: &Args, usage: &str) -> Result<(String, Option<String>), i32> {
     let Some(src) = payload_source(args.rest.get(1..).unwrap_or_default()) else {
-        let text = fold(&args.text(1));
+        let typed = args.text(1);
+        // Before the fold, because folding collapses runs of whitespace and a
+        // carriage return is whitespace: the evidence that this came off a
+        // terminal is the first thing `fold` would destroy.
+        if let Some(why) = util::terminal_output(&typed) {
+            eprintln!("wsp: {why}");
+            // Names the cause, because the shape of the mistake is not
+            // visible in what arrived: the caller sees fluent prose.
+            eprintln!("     a backtick inside double quotes runs a command. `-` reads the text from a stream, where a shell never sees it");
+            return Err(2);
+        }
+        let text = fold(&typed);
         if text.is_empty() {
             eprintln!("usage: {usage}");
             return Err(2);
@@ -1433,6 +1462,12 @@ pub fn rename(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp rename <id> \"new title\"");
         return 2;
     }
+    // Same reading as `add`: one line, no stream form, and the one check that
+    // costs nothing.
+    if let Some(why) = util::terminal_output(&title) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
     mutate(store, args, "rename", |t| {
         t.log(&format!("renamed from \"{}\"", t.title));
         t.title = title.trim().to_string();
@@ -1551,13 +1586,24 @@ fn prose_source(args: &Args) -> Option<String> {
 }
 
 pub(crate) fn read_source(src: &str) -> std::io::Result<String> {
-    if src == "-" {
+    let raw = if src == "-" {
         use std::io::Read;
         let mut s = String::new();
         std::io::stdin().read_to_string(&mut s)?;
-        return Ok(s);
+        s
+    } else {
+        std::fs::read_to_string(util::expand(src))?
+    };
+    // A stream is the safe path and still not a trusted one: `wsp note <id> -`
+    // with a build's log on the other end of the pipe is the same damage as
+    // the substitution in [`crate::util::terminal_output`], arrived by hand.
+    // Checked here rather than at each caller because this is the one door
+    // every stream comes through, and every caller already prints what it
+    // could not read.
+    if let Some(why) = util::terminal_output(&raw) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, why));
     }
-    std::fs::read_to_string(util::expand(src))
+    Ok(raw)
 }
 
 /// Edit prose without ever showing anyone the frontmatter.
@@ -2265,6 +2311,67 @@ mod tests {
         assert_eq!(log.lines().filter(|l| !l.trim().is_empty()).count(), 1, "one note, one entry: {log}");
         assert!(log.contains("Eighteen tests") && log.contains("renamed this machine's w1"), "{log}");
         assert!(!log.trim_end().ends_with(" -"), "the dash is what this task is about: {log}");
+    }
+
+    /// The verbs whose prose is a *question about the code*, and therefore the
+    /// verbs whose prose is full of backticks.
+    ///
+    /// `block` and `park` were argv-only until this. Neither is long by nature,
+    /// which is why they were left out the first time — but length was never
+    /// what made the shell dangerous. A blocking question names the two shapes
+    /// it is choosing between, and naming a shape in this store means naming a
+    /// verb, and a verb between double quotes inside backticks is a command
+    /// substitution. See [`crate::util::terminal_output`].
+    #[test]
+    fn a_block_and_a_park_take_their_reason_from_a_stream_too() {
+        let store = scratch("block-stream");
+        task_with(&store, "t-260815-047", "normal");
+        task_with(&store, "t-260815-048", "normal");
+
+        let q = scratch_file("question", "Does `wsp verify --alone` mean the tree, or HEAD?\n");
+        assert_eq!(block(&store, &parse(&["block", "047", "--from", &q])), 0);
+        let log = log_of(&store, "047");
+        assert!(log.contains("blocked: Does `wsp verify --alone`"), "{log}");
+        assert_eq!(store.find_task("047").unwrap().status(), Status::Blocked);
+
+        let when = scratch_file("when", "When `place_super` stops being the only backend.\n");
+        assert_eq!(park(&store, &parse(&["park", "048", "--from", &when])), 0);
+        let log = log_of(&store, "048");
+        assert!(log.contains("parked: When `place_super`"), "{log}");
+        assert_eq!(store.find_task("048").unwrap().status(), Status::Parked);
+
+        // And the dash that used to be recorded as the whole reason.
+        assert_eq!(payload_source(&["-".to_string()]), Some("-".into()));
+    }
+
+    /// The second occurrence, and the one that made this a data-integrity fault
+    /// rather than a nuisance: a decision replaced in the store by the progress
+    /// bar of the test run its own prose caused to execute.
+    ///
+    /// Asserted through `decide` and through a file rather than through a shell,
+    /// because what a shell would hand over is exactly this — a terminal's bytes
+    /// where a paragraph was meant. Both doors are checked: the one the
+    /// substitution comes through (argv) and the one an agent pipes a log into
+    /// by mistake (a stream).
+    #[test]
+    fn a_captured_terminal_is_refused_at_both_doors() {
+        let store = scratch("decide-capture");
+        task_with(&store, "t-260815-047", "normal");
+
+        let captured = "verifying HEAD itself \u{1b}[2mrunning 745 tests\u{1b}[0m\ralone 87/745  ";
+        assert_eq!(decide(&store, &parse(&["decide", "047", captured])), 2, "argv");
+        // 1 rather than 2 on this one, and deliberately: the stream door is
+        // the single place every source comes through, so this arrives as a
+        // source that could not be read, which is already an exit 1.
+        let path = scratch_file("captured", captured);
+        assert_eq!(decide(&store, &parse(&["decide", "047", "--from", &path])), 1, "a stream");
+
+        let body = store.find_task("047").unwrap().body;
+        assert!(!body.contains("745"), "nothing of it may reach the store: {body}");
+
+        // And the prose it is protecting is not itself refused. Newlines and
+        // tabs are what a paragraph is made of.
+        assert_eq!(decide(&store, &parse(&["decide", "047", "One shape.\n\tThen the other."])), 0);
     }
 
     /// Nothing to record is refused, out loud.

@@ -560,7 +560,12 @@ fn help() {
   wsp decide <task|proj> "…"      record what was settled, and why
   wsp decide <t|p> "…" --supersedes d1   …and which earlier one it replaces
   wsp note <id> "text"              append to the log
-  wsp note <id> - | --from FILE     …or from stdin, or a file; one entry is one
+  wsp block|park|decide|note <id> - | --from FILE
+                                    …or from stdin, or a file. A paragraph
+                                    typed between double quotes is rewritten by
+                                    the shell — every backtick in it runs a
+                                    command — and `-` is the path that never
+                                    meets one. For the log, one entry is one
                                     line, so what arrives on several is folded
   wsp edit <id> [--overview|--details|--decisions]  prose, in $EDITOR
   wsp edit <id> --overview --from F|-    …or from a file, or stdin
@@ -650,8 +655,12 @@ fn help() {
                                     as an agent that has stalled; --clear stands
                                     down and leaves the seat open, --remove takes
                                     the seat off the project altogether
-  wsp govern <proj> --tell "…"      say something to whoever is in that seat —
-                                    the panel's T, from a shell
+  wsp govern <proj> --tell "…" | -  say something to whoever is in that seat —
+                                    the panel's T, from a shell. Direction is
+                                    long prose full of identifiers, so reach for
+                                    `--tell -` and pipe it: between double quotes
+                                    a shell runs every backtick in it, and the
+                                    message arrives fluent with the nouns gone
   wsp spawn -p <proj> --govern      …or start one: a workspace on the project, an
                                     agent in it, the seat taken, and a custodial
                                     work order rather than a claim
@@ -669,7 +678,7 @@ fn help() {
                                     how long to review, and whether it came back
   wsp peek [panel|view|board|<task>]  what is on that pane, or the frame the
                                     sidebar surface last drew
-  wsp tell <id> "…"                 say something to the agent holding that
+  wsp tell <id> "…" | -             say something to the agent holding that
                                     task, without ending it — `-` reads the
                                     message from stdin. The repair for an agent
                                     whose turn stopped: the conversation is

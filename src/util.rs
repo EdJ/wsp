@@ -804,11 +804,67 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Whether text a person is supposed to have written is in fact a terminal's
+/// output. `Some` is the thing found, phrased to go after "cannot read X: ".
+///
+/// The fault this exists for is command substitution, and it is worth naming
+/// precisely because the answer looks like an over-reaction otherwise. Every
+/// verb here takes prose *about this CLI* — file names, verb names, code
+/// identifiers — which is exactly the text that wants backticks, and inside
+/// the double quotes a shell needs for a paragraph every backtick runs a
+/// command. On 2026-08-19 `wsp decide <id> "…"` carrying `` `wsp verify
+/// --alone` `` ran a 745-test suite and substituted its progress bar into the
+/// decision. The decision is gone; the progress bar is in the store.
+///
+/// Control bytes are the one part of that which a program can be certain
+/// about. Prose has newlines and tabs in it and nothing else below space —
+/// a carriage return or an escape sequence in a task file did not come from
+/// anybody's keyboard, it came from a terminal, and it would go on to be drawn
+/// into a brief, a panel row and a pane title that all assume otherwise.
+///
+/// It is a floor and not a solution, and the honest limit is worth stating
+/// where the next reader is: substitution can produce text with no control
+/// byte in it at all, and this will pass it. What stops *that* is the `-`
+/// form existing on every verb that takes a paragraph, so the shell never sees
+/// the prose. This catches the case where it has already happened.
+pub fn terminal_output(text: &str) -> Option<String> {
+    let bad = text.chars().find(|c| c.is_control() && *c != '\n' && *c != '\t')?;
+    let named = match bad {
+        '\x1b' => "an escape sequence".to_string(),
+        '\r' => "a carriage return".to_string(),
+        '\x07' => "a bell".to_string(),
+        c => format!("a control byte (U+{:04X})", c as u32),
+    };
+    Some(format!("it is terminal output rather than prose — {named} in it"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    /// What a paragraph is made of, against what a terminal emits.
+    ///
+    /// The line this has to hold is exact: newline and tab are prose, and
+    /// everything else below space is not. Drawn too tight it refuses the
+    /// paragraph breaks a brief is written in; drawn too loose it is the check
+    /// that let a 745-test progress bar into a decision.
+    #[test]
+    fn a_paragraph_passes_and_a_captured_terminal_does_not() {
+        let prose = "Two shapes.\n\n\t`wsp verify --alone`, or the tree.\n\nThe second — for now.";
+        assert_eq!(terminal_output(prose), None, "newlines and tabs are what prose is");
+
+        for (bytes, named) in [
+            ("\x1b[2malone\x1b[0m", "an escape sequence"),
+            ("alone 87/745  \ralone 88/745", "a carriage return"),
+            ("done\x07", "a bell"),
+            ("running\x00745", "a control byte (U+0000)"),
+        ] {
+            let why = terminal_output(bytes).unwrap_or_default();
+            assert!(why.contains(named), "{bytes:?} should name {named}, said {why:?}");
+        }
+    }
 
     /// The premise this was first written on was false: `HERDR_SOCKET_PATH` is
     /// not "unset outside a sandbox", it is set in *every* live herdr pane. So

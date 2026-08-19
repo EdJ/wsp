@@ -704,6 +704,14 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         .collect::<Vec<_>>()
         .join(" ");
     let said = said.trim();
+    // The sentence is a row on somebody's panel and stays one line, so it has
+    // no `-` form — `--body -` below is where a paragraph goes. It gets the
+    // check anyway: see [`crate::util::terminal_output`].
+    if let Some(why) = util::terminal_output(said) {
+        eprintln!("wsp: {why}");
+        eprintln!("     `wsp flag {} --body -` reads a paragraph from a stream", task.id);
+        return 2;
+    }
     let env = herdr::Env::read();
     let pane = args.get("pane").or(env.pane_id).unwrap_or_default();
     let workspace = env.workspace_id.unwrap_or_default();
@@ -1056,18 +1064,34 @@ fn target(store: &Store, needle: &str) -> Option<(String, String)> {
 /// in a brief are what make it readable by the thing that has to act on it.
 fn message(args: &Args) -> Result<String, i32> {
     let rest = args.rest.get(1..).unwrap_or_default();
-    let stream = matches!(rest, [one] if one == "-");
-    if !stream {
-        let text = args.text(1);
-        let text = text.trim();
-        return match text.is_empty() {
-            true => {
-                eprintln!("wsp: nothing to say");
-                Err(2)
-            }
-            false => Ok(text.to_string()),
-        };
+    if !matches!(rest, [one] if one == "-") {
+        return typed_message(&args.text(1));
     }
+    piped_message()
+}
+
+/// A message given on the command line, checked for the one thing that says it
+/// is not one. See [`crate::util::terminal_output`] — the payload here is prose
+/// about the CLI going through a shell, which is the exact shape that comes
+/// back carrying a command's output instead of the command's name.
+pub(crate) fn typed_message(raw: &str) -> Result<String, i32> {
+    let text = raw.trim();
+    if text.is_empty() {
+        eprintln!("wsp: nothing to say");
+        return Err(2);
+    }
+    if let Some(why) = util::terminal_output(text) {
+        eprintln!("wsp: {why}");
+        eprintln!("     a backtick inside double quotes runs a command. `-` reads the message from a stream, where a shell never sees it");
+        return Err(2);
+    }
+    Ok(text.to_string())
+}
+
+/// The message on stdin. Shared with `govern --tell -`, because the two verbs
+/// are one act — a sentence typed into an agent's composer — and a stream form
+/// that behaved differently on one of them is a stream form nobody trusts.
+pub(crate) fn piped_message() -> Result<String, i32> {
     if util::stdin_is_tty() {
         // The same failure `wsp note` names: a command that stops and silently
         // swallows keys is worse than one that refuses.
@@ -1111,6 +1135,14 @@ pub fn say(store: &Store, args: &Args) -> i32 {
 
     let said = args.text(0);
     let said = said.trim();
+    // Short by nature and so no `-` form: this is a status line in a sidebar,
+    // and one that needed a stream would be one nobody ran. It gets the check
+    // anyway, and here it is a rendering question rather than a record one —
+    // an escape sequence reaching a pane label is drawn, not stored.
+    if let Some(why) = util::terminal_output(said) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
 
     // Home is the task this pane holds. Without one there is nothing to fall
     // back to, so the label is cleared outright and herdr goes back to naming

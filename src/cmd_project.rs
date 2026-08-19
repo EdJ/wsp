@@ -88,6 +88,14 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     p.tags = args.all("tag");
     p.roots = args.all("root").iter().map(|r| util::contract(&util::expand(r))).collect();
     p.brief = args.get("brief").unwrap_or_default();
+    // One frontmatter line, so no `-` form — `wsp project edit <slug>` is where
+    // a project's prose is written. The check is here because this one is
+    // frontmatter: a control byte on a `brief:` line is not a bad-looking
+    // brief, it is a project file the parser reads differently.
+    if let Some(why) = util::terminal_output(&p.brief) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
     if let Some(status) = args.get("status") {
         p.status = status;
     }
@@ -636,6 +644,12 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: `{pair}` is not key=value");
             return 2;
         };
+        // Every value here is one frontmatter line. See the same check in
+        // `add`: this is the file the whole tree is read out of.
+        if let Some(why) = util::terminal_output(v) {
+            eprintln!("wsp: {k}: {why}");
+            return 2;
+        }
         match k {
             "name" => proj.name = v.to_string(),
             "brief" => proj.brief = v.to_string(),
