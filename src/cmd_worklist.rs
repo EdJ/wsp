@@ -1357,6 +1357,13 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    // A list somebody has finished with is not a run, and `next` is a running
+    // verb. It answers rather than reporting a barrier that is nobody's to
+    // pass: the four states are about a run, and this one is over.
+    if w.status() == WorklistStatus::Done {
+        println!("{} {}", w.id, Paint::new().dim("is done — nothing left to want from it"));
+        return 0;
+    }
     let pos = worklist::position(store, &w, Reading::Landed);
     let st = state(store, &w, &pos);
     let gone = worklist::dangling(store, &w);
@@ -1598,6 +1605,11 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String]) -> serde
 /// spawn` per member: the moment the queue spawns it needs a spawn policy —
 /// kind, tier, machine, mandate — and every one of those was a judgement in all
 /// three real runs.
+///
+/// Two flags. `--keep` leaves the trees standing for one barrier — and says so,
+/// because it defers rather than opts out. `-n` is a dry run of the whole verb:
+/// what it would record, what it would sweep, and what the group that landed
+/// touched, with nothing written and nothing removed.
 pub fn go(store: &Store, args: &Args) -> i32 {
     let (mut w, said, seat) = match list_and_words(store, args) {
         Ok(v) => v,
@@ -1613,7 +1625,7 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     // Checked at every `go` and not only at the first, because a group ahead of
     // the work can be edited by hand between two barriers, and this is the last
     // moment before those members are named as startable.
-    if let Some(code) = only_one_running(store, &w) {
+    if let Some(code) = only_one_running(store, &w, &pos) {
         return code;
     }
 
@@ -1677,12 +1689,17 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         None => worklist::Overlap::default(),
     };
 
+    // `-n` is a dry run of the **whole verb**, not of the sweep alone. Half a
+    // dry run — the verdict written for real, the trees only imagined — is a
+    // state nobody typing `-n` is asking for, and it is one that leaves the
+    // barrier passed with the cleanup still to do.
+    let dry = args.has("dry-run");
     let swept = match (crossed, args.has("keep")) {
         // The very position the barrier was read off, handed on rather than
         // recomputed: two walks under one `rm -rf` is two answers that can
         // disagree, and the one holding the removal is the wrong one to be
         // second. That is `worklist::sweep`'s own seam and its argument.
-        (Some(_), false) => match worklist::sweep(store, &pos, args.has("dry-run")) {
+        (Some(_), false) => match worklist::sweep(store, &pos, dry) {
             Ok(s) => Some(s),
             Err(why) => {
                 eprintln!("wsp: the sweep was refused: {why}");
@@ -1695,7 +1712,6 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     // The record. A verdict goes on the group the barrier is behind, so it
     // travels with the group rather than with an ordinal that is rewritten on
     // every write.
-    let verdict = verdict_of(&said);
     match starting {
         // Groups already finished when the list started were passed by nobody,
         // and marking them says so rather than leaving a run that has to be
@@ -1709,7 +1725,7 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         }
         false => {
             if let Some(n) = crossed {
-                groups[n - 1].verdict = verdict.clone();
+                groups[n - 1].verdict = verdict_of(&said);
             }
         }
     }
@@ -1736,20 +1752,23 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     }
 
     let msg = format!("go {}", w.id);
-    let saved = save(store, &mut w, &groups, "go", &msg);
-    if saved != 0 {
-        return saved;
+    if !dry {
+        let saved = save(store, &mut w, &groups, "go", &msg);
+        if saved != 0 {
+            return saved;
+        }
+        store.log_event(
+            "worklist-go",
+            json!({ "id": w.id, "passed": crossed, "started": starting, "verdict": said }),
+        );
     }
-    store.log_event(
-        "worklist-go",
-        json!({ "id": w.id, "passed": crossed, "started": starting, "verdict": said }),
-    );
 
     if args.json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "worklist": w.id,
+                "dry_run": dry,
                 "started": starting,
                 "passed": crossed,
                 "verdict": said,
@@ -1769,11 +1788,17 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     }
 
     let p = Paint::new();
+    let would = if dry { "would be " } else { "" };
     match (starting, resuming, crossed) {
-        (true, _, _) => println!("{} {}", p.bold(&w.id), p.dim("started")),
-        (_, true, _) => println!("{} {}", p.bold(&w.id), p.dim("started again")),
-        (_, _, Some(n)) => println!("{} {}", p.bold(&w.id), p.dim(&format!("group {n} passed"))),
+        (true, _, _) => println!("{} {}", p.bold(&w.id), p.dim(&format!("{would}started"))),
+        (_, true, _) => println!("{} {}", p.bold(&w.id), p.dim(&format!("{would}started again"))),
+        (_, _, Some(n)) => {
+            println!("{} {}", p.bold(&w.id), p.dim(&format!("group {n} {would}passed")))
+        }
         _ => println!("{}", p.bold(&w.id)),
+    }
+    if dry {
+        println!("{}", p.dim("-n — nothing was written and no tree was removed"));
     }
     if !gone.is_empty() {
         println!("{}  {}", p.bold("gone"), gone.join("  "));
@@ -1784,7 +1809,7 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     if crossed.is_some() {
         say_overlap(&p, &overlap);
     }
-    say_swept(&p, swept.as_ref(), crossed.is_some() && args.has("keep"), args.has("dry-run"));
+    say_swept(&p, swept.as_ref(), crossed.is_some() && args.has("keep"), dry);
     println!("{}", p.dim(&format!("{}  what may start now", how("next", &w, seat))));
     0
 }
@@ -1798,12 +1823,19 @@ pub fn go(store: &Store, args: &Args) -> i32 {
 /// of `cmd_govern::seat_for`, which has to have one answer: a hand raised at 3am
 /// must reach whoever is running the list this task is in tonight, and two
 /// running lists holding it is a question with no answer.
-fn only_one_running(store: &Store, w: &Worklist) -> Option<i32> {
+///
+/// **Only members this list has not already passed.** A finished member sitting
+/// in a second list is a fact about a plan and not about tonight, and refusing
+/// a barrier over it would stop the sweep and the report as well as the naming
+/// — a heavy answer to something nothing is going to act on.
+fn only_one_running(store: &Store, w: &Worklist, pos: &Position) -> Option<i32> {
     let running = worklist::Running::read(store);
+    let done: Vec<&str> = pos.passed.iter().map(|b| b.member.id.as_str()).collect();
     let clash: Vec<String> = w
         .groups()
         .iter()
         .flat_map(|g| g.members.clone())
+        .filter(|m| !done.contains(&m.as_str()))
         .filter_map(|m| {
             running.list_of(&m).filter(|l| *l != w.id).map(|l| format!("{m} is in `{l}`"))
         })
@@ -1910,6 +1942,10 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {} \"why\" — a hold with no reason on it is a run nobody can restart", how("hold", &w, seat));
         eprintln!("     `-` reads the sentence from a stream, where a shell never sees it");
         return 2;
+    }
+    if w.status() == WorklistStatus::Done {
+        eprintln!("wsp: `{}` is done — there is nothing left in it to stop", w.id);
+        return 1;
     }
     if w.status() == WorklistStatus::Held {
         println!("{} {}", w.id, Paint::new().dim("is already held"));
@@ -2452,6 +2488,30 @@ mod tests {
             "the sentence is on the group the barrier is behind, dated"
         );
         assert_eq!(gate_of(&store, "batch"), "ready wl-002", "and now the next group is named");
+    }
+
+    /// `-n` is a dry run of the whole verb. Half a dry run — the verdict
+    /// written for real and the trees only imagined — is a state nobody typing
+    /// it is asking for, and it is one that leaves the barrier passed with the
+    /// cleanup still to do.
+    #[test]
+    fn a_dry_run_passes_nothing_and_writes_nothing() {
+        let (_env, store) = running("dry");
+        task(&store, "wl-001", "todo");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+
+        assert_eq!(flagged(&store, &["go", "batch"], &[("dry-run", "true")]), 0);
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Draft, "not started");
+
+        run(&store, &["go", "batch"]);
+        task(&store, "wl-001", "review");
+        assert_eq!(gate_of(&store, "batch"), "after 1 ", "group 1 landed and the barrier is shut");
+        assert_eq!(flagged(&store, &["go", "batch"], &[("dry-run", "true")]), 0);
+        assert_eq!(verdicts(&store, "batch")[0], "", "and it is still shut");
+        assert_eq!(gate_of(&store, "batch"), "after 1 ");
     }
 
     /// A group with no stop condition asks for no judgement — and it is still a
