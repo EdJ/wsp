@@ -1558,7 +1558,11 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
         worked,
         bindings: w.bindings.clone(),
         panes: w.panes.clone(),
-        messages: Vec::new(),
+        // The same hands the panel is drawing. A page that showed none while
+        // the tree beside it showed three would be a storyboard of a panel
+        // nobody has: `o` on a card lands here, and what it lands on is the
+        // rest of the message.
+        messages: w.flags.clone(),
         // A still frame has no edit tab, so no section menu.
         columns: Vec::new(),
     };
@@ -6422,6 +6426,69 @@ mod tests {
         assert_eq!(count(&mut ui), f.flags.len(), "all of them, once asked");
     }
 
+    /// `worklist-018`. **The card's heading is the subject, never the sender's
+    /// words**, and the message is said once.
+    ///
+    /// A card lies over somebody else's tree, and the one thing a reader needs
+    /// from it that the words cannot give them is *which task this is about*.
+    /// The heading used to be the flag's own `--title` when it carried one — a
+    /// sender overwriting the subject — and the task's title otherwise, which
+    /// meant a hand with a headline and one line of detail drew that line as
+    /// the heading and again as the paragraph. Both are `Message::about` and
+    /// `Message::text` collapsed into one slot.
+    #[test]
+    fn a_card_names_the_task_it_is_about_and_says_the_message_once() {
+        let mut f = flagged_world();
+        hand_on(&mut f, "t-105").text =
+            message::compose("the reducer is free now", "", "so I can start this afternoon.");
+        let inside = card_body(&f, 153, 50);
+        assert!(
+            card_head(&f, 153, 50).contains("Panel work item number 5"),
+            "the heading is the task, so a card over a tree says what it is about: {}",
+            card_head(&f, 153, 50),
+        );
+        assert_eq!(
+            inside.iter().filter(|t| t.contains("the reducer is free now")).count(),
+            1,
+            "the headline is in the paragraph and not also the heading: {inside:?}",
+        );
+        assert!(
+            inside.iter().any(|t| t.contains("so I can start this afternoon")),
+            "and the rest of it is under the headline: {inside:?}",
+        );
+    }
+
+    /// A row cannot hold a paragraph, so it says there is one.
+    ///
+    /// `worklist-018`'s first owed thing, at the surface with the least room:
+    /// *the listing must show the body when there is one, or say there is one.*
+    /// A hand carrying five lines and a hand carrying none drew identically,
+    /// and the mark is the one the tree already uses for **there is prose
+    /// behind this**, so it is learned once and read everywhere.
+    #[test]
+    fn a_row_says_when_there_is_more_of_the_message_than_a_row() {
+        let f = read_world();
+        let (mut ui, _view) = showing(&f, &[]);
+        let at = on_row_kind(&mut ui, panel::RowKind::Flag);
+        assert!(
+            panel::render_row_for_test(&ui, at, W).text().contains(panel::glyph::NOTES),
+            "a hand with a paragraph behind it says so: {}",
+            panel::render_row_for_test(&ui, at, W).text(),
+        );
+
+        // And one that is all on the row does not — a mark that is always there
+        // is a mark that says nothing.
+        let mut one = read_world();
+        hand_on(&mut one, "t-105").text = "can I take this one?".into();
+        let (mut ui, _view) = showing(&one, &[]);
+        let at = on_row_kind(&mut ui, panel::RowKind::Flag);
+        assert!(
+            !panel::render_row_for_test(&ui, at, W).text().contains(panel::glyph::NOTES),
+            "a one-line hand claimed to be hiding something: {}",
+            panel::render_row_for_test(&ui, at, W).text(),
+        );
+    }
+
     /// A card comes up because somebody else raised a hand, and it holds the
     /// keyboard while it is up.
     ///
@@ -6535,6 +6602,24 @@ mod tests {
         s
     }
 
+    /// The card's heading row, off the same frame.
+    ///
+    /// Its own helper because the heading and the paragraph answer different
+    /// questions and `worklist-018` is about the two being told apart: the
+    /// heading is the **subject** and the paragraph is the **message**, and a
+    /// test that read them out of one list could not say which had gone wrong.
+    fn card_head(snap: &Snapshot, w: usize, h: usize) -> String {
+        let (ui, mut view) = showing(snap, &[]);
+        panel::frame(&ui, &mut view, w, h)
+            .iter()
+            .map(|l| l.text())
+            .find_map(|t| {
+                let (a, b) = (t.find('\u{2502}')?, t.rfind('\u{2502}')?);
+                (a < b).then(|| t[a + '\u{2502}'.len_utf8()..b].trim().to_string())
+            })
+            .expect("no card at all")
+    }
+
     /// The rows of the paragraph a card is actually showing, off a real frame.
     ///
     /// The card is a run of bordered rows: a heading, a blank, the paragraph, a
@@ -6562,7 +6647,13 @@ mod tests {
         // tail.
         let start = inside.iter().position(|t| t.is_empty()).expect("a blank under the heading") + 1;
         let rest = &inside[start..];
-        let end = rest.iter().position(|t| t.is_empty()).unwrap_or(rest.len());
+        // To the LAST blank, not the first. A card's paragraph is the whole
+        // message — headline, blank line, detail — since `worklist-018` made the
+        // card draw one text instead of picking between two fields, so a blank
+        // line inside the paragraph is the ordinary shape rather than the end
+        // of it. Stopping at the first one read the headline and called it the
+        // card.
+        let end = rest.iter().rposition(|t| t.is_empty()).unwrap_or(rest.len());
         rest[..end].to_vec()
     }
 
@@ -6625,7 +6716,7 @@ mod tests {
         // The count is the rest of the paragraph at the width it would be read
         // at — the same wrap the card itself did, over the whole body.
         let mut f = f;
-        let whole = crate::util::wrap(hand_on(&mut f, "t-105").body(), W - 6);
+        let whole = crate::util::wrap(hand_on(&mut f, "t-105").text.trim(), W - 6);
         assert_eq!(body.len() - 1 + n, whole.len(), "{n} more lines is not what is left");
 
         // A flag that fits gets no such row: the card only spends it on a

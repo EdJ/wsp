@@ -396,18 +396,38 @@ pub(crate) struct Card {
     /// [`crate::message::new_id`].
     pub(super) id: String,
     pub(super) task: String,
-    /// The card's heading: the agent's own, else the task's title. An agent
-    /// gets to name it because the task's title is often the wrong sentence for
-    /// the moment — "the store will not parse" on a task called something else
-    /// is the case, and re-titling the task to say so would be a lie about the
-    /// work.
-    pub(super) title: String,
-    /// The one line the row draws.
-    pub(super) said: String,
-    /// The paragraph the card draws, when there is one. Falls back to `said`,
-    /// and then to the task's own overview — a card with a heading and nothing
-    /// under it is a knock on the door with nobody there.
-    pub(super) body: String,
+    /// **The subject**, which is the task's own title — never the sender's
+    /// words.
+    ///
+    /// `worklist-018`. A card is drawn over somebody else's tree, and the one
+    /// thing a reader needs from it that the words cannot give them is *which
+    /// task this is about*; a sender may not overwrite that. It used to be the
+    /// flag's `--title` when it had one, which is `Message::about` and
+    /// `Message::text` collapsed into one slot — so a hand that named its own
+    /// heading replaced the subject, and a hand that did not carry a heading
+    /// drew nothing at all.
+    ///
+    /// The id when the task is gone: a hand raised about something since
+    /// retired is still a hand raised, and the row has to stay selectable —
+    /// `x` on it is the only thing that will ever take it down.
+    pub(super) subject: String,
+    /// **The message**, entire, exactly as it was raised.
+    ///
+    /// One field, because two is the fault this card is named in: the first
+    /// line is the headline the row draws ([`crate::message::Message::title`])
+    /// and the whole of it is what the card draws. There is nothing here to
+    /// prefer wrongly, and no way to write a hand whose words are in the field
+    /// nobody looked at.
+    pub(super) text: String,
+    /// What the card draws when the message has no words in it — the task's own
+    /// overview.
+    ///
+    /// **Not the message and never drawn as one**: it is the panel repeating
+    /// what it already holds, so `wsp flag <id>` on its own — *look at this
+    /// task, it exists* — is a knock on the door with something behind it
+    /// rather than an empty box. It is kept apart from `text` precisely so the
+    /// row cannot draw the task's own prose as a headline somebody wrote.
+    pub(super) instead: String,
     /// The pane that raised it.
     pub(super) who: String,
     /// The one thing a keypress can answer, if it asked for anything.
@@ -485,43 +505,49 @@ impl Card {
     }
 
     /// The one line the row draws, for a test about a card whose words changed
-    /// under it.
+    /// under it. The first line of the message and nothing else — see
+    /// [`Card::text`].
     #[cfg(test)]
     pub(crate) fn said(&self) -> &str {
-        &self.said
+        self.head()
+    }
+
+    /// The headline: the message's first line, and the task's title when the
+    /// hand carried no words at all.
+    ///
+    /// Derived rather than stored, so it cannot come apart from the text it is
+    /// the first line of. That is the whole of `worklist-018` in one method: a
+    /// record with a headline field and a body field has a state where the
+    /// important one is empty, and a first line does not.
+    pub(super) fn head(&self) -> &str {
+        match self.text.lines().next().unwrap_or("").trim() {
+            "" => &self.subject,
+            head => head,
+        }
+    }
+
+    /// The paragraph, which is the message entire — headline included, because
+    /// this is the surface with room and a one-line hand drawn as *everything
+    /// after the first line* is an empty card.
+    pub(super) fn paragraph(&self) -> &str {
+        match self.text.trim() {
+            "" => &self.instead,
+            text => text,
+        }
     }
 
     /// Everything the card needs, out of one raised hand and the task it names.
     fn of(m: &crate::message::Message, tasks: &[Task]) -> Card {
         let task = m.about.task().unwrap_or_default();
         let found = tasks.iter().find(|t| t.id == task);
-        let said = m.title().to_string();
-        let title = match said.is_empty() {
-            false => said.clone(),
-            // The task's own when the hand carried no words, and the id when
-            // the task is gone as well. A hand raised about something that has
-            // since been retired is still a hand raised, and the row has to
-            // stay selectable — `x` on it is the only thing that will ever take
-            // it down.
-            true => found.map(|t| t.title.clone()).unwrap_or_else(|| task.to_string()),
-        };
-        let body = match (m.body(), said.as_str()) {
-            (b, _) if !b.is_empty() => b.to_string(),
-            (_, s) if !s.is_empty() => s.to_string(),
-            // Neither, which is `wsp flag <id>` on its own — "look at this, it
-            // exists". The task's own overview is the honest thing to put under
-            // that heading: it is what the person is being asked to look at,
-            // and the panel is holding it already.
-            _ => found
-                .and_then(|t| crate::model::section_of(&t.body, "Overview"))
-                .unwrap_or_default(),
-        };
         Card {
             id: m.id.clone(),
             task: task.to_string(),
-            title,
-            said,
-            body: util::truncate(body.trim(), BODY_MAX),
+            subject: found.map(|t| t.title.clone()).unwrap_or_else(|| task.to_string()),
+            text: util::truncate(m.text.trim(), BODY_MAX),
+            instead: found
+                .and_then(|t| crate::model::section_of(&t.body, "Overview"))
+                .unwrap_or_default(),
             who: m.from.byline(),
             ask: Request::parse(m.ask().unwrap_or(crate::message::Ask::Nothing).as_str()),
             seen: m.seen,
@@ -2673,25 +2699,34 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             l.pad(at);
             l.push(Style::Dim, path_fit(path, w.saturating_sub(at).max(4)));
         }
-        // The sentence first, because the sentence is the news. The task's own
+        // The headline first, because the headline is the news. The task's own
         // title is one row up in the tree with a `▲` on it, and the pane that
         // raised it is on the right where the agents section keeps its right-
         // hand column — so what is left to say here is the thing only this row
-        // says. A flag with nothing written on it falls back to the title,
+        // says. A hand with nothing written on it falls back to the title,
         // which is the whole of "look at this task, it exists".
+        //
+        // `≡` when there is more of the message than fits a row — the same mark
+        // the tree already uses for *there is prose behind this*, so the reader
+        // learns it once. `worklist-018` is a row that had no way to say it: a
+        // hand carrying five lines and a hand carrying none drew identically,
+        // and the seat read the paragraph out of `flags.json` four hours later.
         Row::Flag { card } => {
-            let (title, said, who) = (&card.title, &card.said, &card.who);
+            let who = &card.who;
             l.push(Style::Plain, " ");
             l.push(Style::Warn, glyph::FLAG);
             l.push(Style::Plain, " ");
             let mut right = Line::default();
+            if card.text.trim().lines().count() > 1 {
+                right.push(Style::Muted, glyph::NOTES);
+                right.push(Style::Plain, " ");
+            }
             if !who.is_empty() {
                 right.push(Style::Dim, util::truncate(who, 8));
             }
             let count_w = if right.spans.is_empty() { 0 } else { right.width() + 1 };
             let avail = w.saturating_sub(4 + count_w).max(4);
-            let body = if said.is_empty() { title } else { said };
-            l.push(Style::Warn, util::truncate(body, avail));
+            l.push(Style::Warn, util::truncate(card.head(), avail));
             if !right.spans.is_empty() {
                 l.pad(w.saturating_sub(l.width() + right.width()).max(1));
                 l.spans.extend(right.spans);
@@ -2718,19 +2753,21 @@ pub(super) fn full_text(row: &Row) -> String {
         Row::Group { project, .. } => {
             project.clone().unwrap_or_else(|| NOPROJECT_LABEL.to_string())
         }
-        // Both halves, and the title as well: the row draws the sentence and
-        // cuts it at a pane's width, and `F` is where the whole of a raised
-        // hand is read — which task, what was said, and who said it.
+        // The headline, the subject and who: `F` is where the whole of a raised
+        // hand is read, and the row above it has had to cut all three. The
+        // headline leads because the subject is one row up in the tree; when
+        // the hand carried no words `head` is the subject already, and the
+        // dock says it once rather than twice.
         Row::Flag { card } => {
-            let (title, said, who) = (&card.title, &card.said, &card.who);
-            let mut out = title.clone();
-            if !said.is_empty() {
-                out = format!("{said} — {out}");
+            let (head, subject, who) = (card.head(), &card.subject, &card.who);
+            let mut out = match head == subject {
+                true => subject.clone(),
+                false => format!("{head} — {subject}"),
+            };
+            if !who.is_empty() {
+                out = format!("{out} · {who}");
             }
-            match who.is_empty() {
-                true => out,
-                false => format!("{out} · {who}"),
-            }
+            out
         }
         // Both halves, because the whole point of the row is that they are
         // separable: which position this is, and who is in it today. The pane

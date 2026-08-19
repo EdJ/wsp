@@ -874,9 +874,14 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
             json!({ "id": task.id, "flagged": true, "said": said, "pane": pane })
         );
     } else {
+        // The rows the seat will see, and not a paraphrase of the arguments.
+        // The receipt used to print the positional sentence, so an agent that
+        // put its message in `--body` was shown an empty confirmation of a
+        // message it had sent — the near side reporting success on its own
+        // records. See [`hand_rows`].
         println!("{} {}  {}", p.red(glyph_flag()), p.bold(&task.id), task.title);
-        if !said.is_empty() {
-            println!("  {}", p.dim(said));
+        for l in hand_rows(&raised, &p) {
+            println!("{l}");
         }
         if ask == "claim" {
             println!("  {}", p.dim("asking to take it · y there hands it over"));
@@ -993,6 +998,82 @@ fn dispose(store: &Store, args: &Args, needle: &str, clearing: bool) -> i32 {
     0
 }
 
+/// The most of one hand's detail a listing prints before it says how much is
+/// left.
+///
+/// A guard against a pasted build log, not a decision about how much to show —
+/// and the two are different. The card's budget is a *decision*: a knock on the
+/// door is read over somebody else's tree and the rest is a keypress away. A
+/// shell listing has nowhere else to send you, so it prints the message, and
+/// this is only the wall a paste hits. Wide enough that no hand anybody writes
+/// reaches it.
+const HAND_LINES: usize = 40;
+
+/// One raised hand, drawn the way it will be read.
+///
+/// **The receipt and the listing share this on purpose.** `worklist-018`: an
+/// agent raised a hand carrying a paragraph that said *landed and NOT
+/// INSTALLED, the retry hazard is live*; `wsp flag` printed a success receipt
+/// with none of it in it, and the seat's listing drew the task's own title, a
+/// pane and an age. Both ends reported a message that neither of them had
+/// shown to anybody, and it was read four hours later out of `flags.json` by
+/// hand. An agent handed back the rows its own message produced cannot put a
+/// paragraph into an empty row and be told it worked — which is the same
+/// repair `cmd_install::health` and `delivered` are, arriving at the one verb
+/// whose entire effect is on somebody else's screen.
+///
+/// One text and no second field to prefer wrongly: the first line is the
+/// headline and the rest is drawn under it. [`message::compose`] is what makes
+/// the first line non-empty whenever anything at all was given.
+fn hand_rows(m: &Message, p: &Paint) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if !m.title().is_empty() {
+        out.push(format!("  {}", m.title()));
+    }
+    let rest: Vec<&str> = m.body().lines().collect();
+    for l in rest.iter().take(HAND_LINES) {
+        out.push(format!("    {}", p.dim(l)));
+    }
+    if rest.len() > HAND_LINES {
+        let n = rest.len() - HAND_LINES;
+        out.push(format!("    {}", p.dim(&format!("… {n} more line(s) · wsp flag --json has them"))));
+    }
+    out
+}
+
+/// The line under a hand: who raised it, how long ago, what a keypress would
+/// answer, and whose it is.
+///
+/// **The ask is on it because it was nowhere in this listing.** The card said
+/// *asks to take it* and `wsp watch` said *asking to claim*, and a seat reading
+/// its own inbox — which is the surface a governor actually uses — could not
+/// tell a question from a notice. That is `worklist-018`'s second owed check
+/// and it failed: `--ask claim` raised with no sentence drew a task title, a
+/// pane and an age, and nothing that said a keypress would answer it.
+fn hand_aside(m: &Message, seat: Option<&cmd_govern::Seat>, held_here: bool) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let who = m.from.byline();
+    if !who.is_empty() {
+        out.push(who);
+    }
+    let held = util::since(&m.at);
+    if held > 0 {
+        out.push(util::duration_human(held));
+    }
+    if m.ask() == Some(Ask::Claim) {
+        out.push("asks to take it".into());
+    }
+    // Nothing when there is no seat above it, which is the ordinary case and
+    // already reads as "this is yours" to the person looking at it.
+    if let Some(s) = seat {
+        out.push(match held_here {
+            true => format!("{} yours · {}", glyph_seat(), s.scope),
+            false => format!("{} {} · {}", glyph_seat(), cmd_govern::governor_of(&s.scope), s.workspace),
+        });
+    }
+    out.join(" · ")
+}
+
 /// Who a raised hand is addressed to, in one line of receipt.
 ///
 /// Addressing, not delivery. Nothing is pushed at the seat: the flag is written
@@ -1080,6 +1161,8 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     let mut shown = 0;
+    // Whether any of them is a question, which decides the last line.
+    let mut asked = false;
 
     // Read once for the whole list rather than per row: the answer is the same
     // handful of files however many hands are up.
@@ -1095,36 +1178,27 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
             continue;
         }
         shown += 1;
-        // A flag on a task that has since been retired is a hand raised about
-        // nothing. Say so rather than printing a bare id: the fix is to lower
-        // it, and nothing else here will.
+        asked |= m.shape() == Some(Shape::Question);
+        // The subject. A hand about a task that has since been retired is
+        // still a hand raised, and it says the subject is gone rather than
+        // drawing `(no such task)` where a title goes — those two words in the
+        // title slot made a retired subject and an empty message render
+        // identically, which is how three hands on Ed's panel on 2026-08-19
+        // read as blank rows carrying nothing.
         let title = match &task {
             Some(t) => t.title.clone(),
-            None => p.dim("(no such task)").to_string(),
+            None => p.dim("— the task is gone; the hand is still up").to_string(),
         };
         println!("{} {}  {}", p.red(glyph_flag()), p.bold(id), title);
-        let mut second: Vec<String> = Vec::new();
-        if !m.title().is_empty() {
-            second.push(m.title().to_string());
+        // What was said, in full. The seat has nowhere else to read it: the
+        // panel has a card and this has nothing behind it, which is what made
+        // `flags.json` the surface of last resort.
+        for l in hand_rows(m, &p) {
+            println!("{l}");
         }
-        let who = m.from.byline();
-        if !who.is_empty() {
-            second.push(who);
-        }
-        let held = util::since(&m.at);
-        if held > 0 {
-            second.push(util::duration_human(held));
-        }
-        // Nothing when there is no seat above it, which is the ordinary case
-        // and already reads as "this is yours" to the person looking at it.
-        if let Some(s) = &seat {
-            second.push(match held_here {
-                true => format!("{} yours · {}", glyph_seat(), s.scope),
-                false => format!("{} {} · {}", glyph_seat(), cmd_govern::governor_of(&s.scope), s.workspace),
-            });
-        }
-        if !second.is_empty() {
-            println!("  {}", p.dim(&second.join(" · ")));
+        let aside = hand_aside(m, seat.as_ref(), held_here);
+        if !aside.is_empty() {
+            println!("  {}", p.dim(&aside));
         }
     }
     if shown == 0 {
@@ -1132,6 +1206,14 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     println!("{}", p.dim("wsp flag --clear <id> lowers one"));
+    // And the other verb, only when there is something it applies to. A
+    // question may not be cleared — `Shape::may` refuses it, because clearing
+    // is what looked like answering in `worklist-004` — so a listing that
+    // offered only the refused verb would send a reader at the one door that
+    // is shut.
+    if asked {
+        println!("{}", p.dim("wsp answer <id> \"…\" closes one and reaches whoever asked"));
+    }
     0
 }
 
@@ -4762,6 +4844,86 @@ mod tests {
         assert_eq!(up[0].title(), "the index is behind HEAD", "and the one lost was the older");
         assert_eq!(up[1].title(), "and the tree is shared");
         assert_ne!(up[0].id, up[1].id, "two hands sharing an identity is the same fault again");
+    }
+
+    /// **The fault `worklist-018` exists for**, driven through the verb and
+    /// asserted where the words are actually read.
+    ///
+    /// An agent raised a hand carrying *landed and NOT INSTALLED — the retry
+    /// hazard is live* in `--body`, with no positional sentence. `wsp flag`
+    /// stored it, returned success, and printed a receipt with none of it in;
+    /// the seat's listing drew the task's own title, a pane and an age. Both
+    /// ends reported a message neither of them had shown to anybody, and it was
+    /// read four hours later out of `flags.json` by hand.
+    ///
+    /// Two halves, and both are needed. The writer joins the three inputs into
+    /// one text so there is no empty headline to draw ([`message::compose`]);
+    /// this is the other half — every surface reads that one text, first line
+    /// as the headline and the rest under it, so there is no second field to
+    /// prefer wrongly.
+    #[test]
+    fn a_hand_raised_with_only_a_body_is_drawn_where_it_is_read() {
+        let (_env, store) = scratch("flag-body-only");
+        a_task(&store, "wsp-001");
+        let body = "landed and NOT INSTALLED — the retry hazard is live\n\nuntil somebody runs `wsp install`, every seat is on the old binary";
+        assert_eq!(raise_one(&store, &["wsp-001"], &[("body", body)]), 0);
+
+        let up = crate::message::raised(&store);
+        let rows = hand_rows(&up[0], &Paint::new());
+        assert!(
+            rows[0].contains("landed and NOT INSTALLED"),
+            "the first line of the message is the headline, wherever it was typed: {rows:?}",
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("every seat is on the old binary")),
+            "and the rest of it is drawn under that: {rows:?}",
+        );
+    }
+
+    /// `wsp flag <id>` on its own draws no words, because there are none.
+    ///
+    /// The cheap version has to stay cheap — *look at this task, it exists* is a
+    /// complete thing for an agent to say — and the row above these carries the
+    /// task's own title, so the reader is not left with a blank. What must not
+    /// happen is the surface inventing a sentence to fill the space.
+    #[test]
+    fn a_hand_with_nothing_written_on_it_draws_nothing_rather_than_something_invented() {
+        let (_env, store) = scratch("flag-bare");
+        a_task(&store, "wsp-001");
+        assert_eq!(raise_one(&store, &["wsp-001"], &[]), 0);
+
+        let up = crate::message::raised(&store);
+        assert!(hand_rows(&up[0], &Paint::new()).is_empty(), "words appeared from nowhere");
+    }
+
+    /// A hand that a keypress would answer says so in the listing.
+    ///
+    /// `worklist-018`'s second owed check, and it failed when it was made: the
+    /// card said *asks to take it*, `wsp watch` said *asking to claim*, and
+    /// `wsp flag --seat` — a governor's actual inbox — said neither. So a
+    /// question raised with no sentence was a row carrying a task title, a pane
+    /// and an age, indistinguishable from a notice.
+    #[test]
+    fn the_listing_says_when_a_hand_is_a_question_a_keypress_would_answer() {
+        let (_env, store) = scratch("flag-ask-shown");
+        a_task(&store, "wsp-001");
+        assert_eq!(
+            raise_one(&store, &["wsp-001"], &[("ask", "claim"), ("pane", "w4:p2")]),
+            0,
+        );
+
+        let up = crate::message::raised(&store);
+        assert!(
+            hand_aside(&up[0], None, false).contains("asks to take it"),
+            "a question read as a notice: {}",
+            hand_aside(&up[0], None, false),
+        );
+
+        // And a hand that asks for nothing does not pretend to: the phrase is
+        // only worth its width when it is true.
+        raise_one(&store, &["wsp-001", "just look at this"], &[]);
+        let up = crate::message::raised(&store);
+        assert!(!hand_aside(&up[1], None, false).contains("asks to"), "a notice claimed to be a question");
     }
 
     /// And the ambiguity that follows is said out loud rather than guessed at.

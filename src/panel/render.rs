@@ -315,6 +315,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Dim, g::SEAT), (Style::Plain, " "), (Style::Muted, "governor · verb"), (Style::Plain, "  "), (Style::Muted, "empty")], "a vacancy", "the position outlives whoever was in it — wsp spawn -p <project> --govern fills it again. Drawn only where no slot above it is filled: a vacancy is an invitation, and one per level would bury the governors that exist"),
                 mark(&[(Style::Dim, g::NOTES)], "written on", "something is in this row's Overview or Details — E opens it"),
                 mark(&[(Style::Warn, g::FLAG)], "raised", "an agent has flagged this task and said why — x lowers it"),
+                mark(&[(Style::Warn, g::FLAG), (Style::Plain, " "), (Style::Warn, "the reducer is free"), (Style::Plain, "  "), (Style::Muted, g::NOTES)], "and more of it", "on a raised hand, the same mark again: the row is the headline and there is a paragraph behind it — ↵ brings the card up, o opens the task"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "inbox")], "a group", "not a project, but still a scope — folds and takes the cursor like one"),
                 mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "agents"), (Style::Plain, " "), (Style::Dim, "7")], "the section", "pinned at the foot: the five agents the strip puts first, under the project each is in, with the count of all of them"),
                 mark(&[(Style::Dim, "1")], "hotkey", "1-9 jump straight to that agent's terminal"),
@@ -582,23 +583,51 @@ pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec
     let mut inner: Vec<Line> = Vec::new();
     let mut head = Line::default();
     head.push(Style::Warn, format!("{} ", glyph::FLAG));
-    head.push(Style::Bold, util::truncate(&card.title, text_w.saturating_sub(2)));
+    // The subject, and never the sender's words. What a reader needs from a
+    // box lying over somebody else's tree, and cannot get from the message
+    // itself, is which task it is about — see [`super::rows::Card::subject`].
+    head.push(Style::Bold, util::truncate(&card.subject, text_w.saturating_sub(2)));
     inner.push(head);
     inner.push(Line::default());
+
+    // The message entire, headline included: this is the surface with the
+    // room, and a one-line hand drawn as everything-after-the-first-line is an
+    // empty card.
+    let wrapped = util::wrap(card.paragraph(), text_w);
 
     // Two rules, the heading, and the blank line either side of the body, plus
     // however many lines the tail needs — and then, of what is left, no more
     // paragraph than the budget buys at this width.
-    let budget = CARD_CHARS.div_ceil(text_w).max(3);
-    let avail = room.saturating_sub(5 + tail.len()).max(1).min(budget);
-    let wrapped = util::wrap(&card.body, text_w);
+    //
+    // Spent row by row against the characters each row actually holds, rather
+    // than divided out in advance. A blank line is a row and is not reading,
+    // and charging it a full row of a budget held in characters is the same
+    // mistake the row-count budget made in a sidebar — smaller, and the same
+    // shape. It stopped being theoretical with `worklist-018`: a card's
+    // paragraph is now one message rather than one field, so it has a headline,
+    // a blank line and a detail in it, and the divided budget spent two rows on
+    // twenty-eight characters.
+    let room_rows = room.saturating_sub(5 + tail.len()).max(1);
+    let mut avail = 0;
+    let mut spent = 0;
+    while avail < wrapped.len() && avail < room_rows {
+        // Three rows before the budget may stop it, for the reason the old
+        // `.max(3)` was there: a card cut to one line is a card that says
+        // nothing, whatever the width.
+        if avail >= 3 && spent >= CARD_CHARS {
+            break;
+        }
+        spent += wrapped[avail].chars().count();
+        avail += 1;
+    }
+    let avail = avail.max(1);
     let cut = wrapped.len() > avail;
     // One row of the paragraph goes to saying how much of it is not here. That
     // is the row it is worth: ` …` told you it had been cut and left you no way
     // to know whether the rest was a sentence or a page, which is the decision
     // the card is here to support — a thousand words behind an `o` is worth a
     // pane and forty are not.
-    let shown = if cut { avail - 1 } else { avail };
+    let shown = if cut { avail.saturating_sub(1) } else { avail };
     for t in wrapped.iter().take(shown) {
         inner.push(line(Style::Plain, t.clone()));
     }
