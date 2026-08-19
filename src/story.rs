@@ -1034,7 +1034,7 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('R'))
             .scene(
                 "Only what needs review",
-                "`R` narrows the tree to work an agent has finished with and handed back — `review` is where an agent stops, and only a person says `done`. The project rows stay so each one is placed, and every key goes on meaning what it means: `d` closes it, `o` sends it back, `↵` opens it in the detail pane. Nothing else changes, which is why this is a filter and not a second pane. The footer says the filter is on, because one left up silently reads as an empty backlog.",
+                "`R` narrows the tree to work an agent has finished with and handed back — `review` is where an agent stops, and only a person says `done`. The project rows stay so each one is placed, and every key goes on meaning what it means: `d` closes it, `o` sends it back, `↵` opens it. Nothing else changes, which is why this is a filter and not a second pane. The footer says the filter is on, because one left up silently reads as an empty backlog.",
             ),
     );
 
@@ -1163,7 +1163,7 @@ fn scenes() -> Vec<Scene> {
         Driver::new(&w)
             .to_task("t-002")
             .key(Key::Char('F'))
-            .scene("The title in full", "F docks the selected row's title under the tree, wrapped, where the row itself has room for a quarter of it. Reading the rest used to mean ↵, which opens a second pane and takes the cursor out of the tree — a lot of ceremony for one sentence. Three lines whatever is selected, so the tree does not step up and down as the cursor passes between a short title and a long one; six when the title needs them, because a focus panel that cut the title would fail on exactly the rows it exists for."),
+            .scene("The title in full", "F docks the selected row's title under the tree, wrapped, where the row itself has room for a quarter of it. Reading the rest means ↵, which puts the tree away and draws the whole task in its place — a lot of ceremony for one sentence. Three lines whatever is selected, so the tree does not step up and down as the cursor passes between a short title and a long one; six when the title needs them, because a focus panel that cut the title would fail on exactly the rows it exists for."),
     );
 
     out.push(
@@ -1452,7 +1452,7 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
         // A still frame of a pane nothing was driven through: there was no
         // transition, so there is nothing to claim about one.
         claims: Vec::new(),
-        html: panel::to_html(&detail::frame(&ctx, &focus, W, H), W),
+        html: panel::to_html(&detail::frame(&ctx, &focus, W, H, detail::Placed::Pane), W),
     };
     vec![
         shot("Detail: a task", "↵ on a task opens it here rather than folding something. Overview says what it is, Details carries the working material, and the log reads newest first — after the fact, the last line is the one that matters.", Focus::Task("t-003".into())),

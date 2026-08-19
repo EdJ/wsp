@@ -167,7 +167,12 @@ pub(crate) struct View {
     pub(super) keyed: bool,
     /// What the next keypress means.
     pub(crate) mode: Mode,
-    /// What the detail pane is currently showing, so `↵` can close it.
+    /// What is open, so `↵` on the same row means close it.
+    ///
+    /// One field for both ways of showing it — the page the panel draws in its
+    /// own room, and the pane it splits when there is no host to ask. `↵` means
+    /// the same thing either way, so the state it reads is the same state; what
+    /// differs is only who is holding the cells, and that is the loop's to know.
     pub(super) showing: Option<crate::detail::Focus>,
     /// A row to select on the next rebuild — set when something is created, so
     /// the cursor follows what you just made.
@@ -180,9 +185,13 @@ pub(crate) struct View {
     pub(super) help: bool,
     /// The selected row's title in full, docked above the footer. A row is one
     /// line wide and a title is not, so the tree names most work by its first
-    /// twenty-five characters; reading the rest meant `↵`, which opens another
-    /// pane and takes the cursor out of the tree. This reads it where you are
+    /// twenty-five characters; reading the rest meant `↵`, which puts the tree
+    /// away and draws the whole task in its place. This reads it where you are
     /// and follows the cursor, so it is scrolling rather than looking things up.
+    ///
+    /// Both are still worth having, and the reason survived `↵` becoming a page
+    /// rather than a second pane: what `F` costs is three rows, and what `↵`
+    /// costs is the tree.
     pub(super) focus: bool,
     /// The width this panel has asked its host for, if it is asking.
     ///

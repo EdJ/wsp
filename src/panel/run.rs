@@ -647,6 +647,56 @@ fn point_at(ui: &mut Ui, want: &Cursor) -> bool {
     }
 }
 
+/// What the panel is drawing in the room it asked for.
+///
+/// The axis `fork-011` said the next page would pay for again, and this is it
+/// paying: `expand` generalised for free — a third caller is the same call with
+/// a third number — and *what is drawn in the room* did not, because that never
+/// crosses the wire and is this process's alone. Two variants is the whole of
+/// the cost, and it is the right cost: herdr is told a number of columns and
+/// learns nothing about which of these is in them.
+///
+/// One at a time, deliberately. There is one pane, and a page replaces the tree
+/// rather than stacking on it — so `↵` from a board is this enum changing
+/// variant, not a second page opening over the first.
+enum Page {
+    /// The project by state, at whatever width the host will give — `K`.
+    Board(BoardPage),
+    /// A task or a project written up, at a page's width — `↵`.
+    Task(TaskPage),
+}
+
+/// A task or a project in full, drawn where the tree was.
+///
+/// **The last pane the panel rented for itself.** `wsp-080` gave back every
+/// other one; `↵` kept splitting a pane to put the detail in, and from a
+/// surface that pane is not even the panel's own — `view_target` falls through
+/// to "the widest pane that is not ours", which is the pane somebody is working
+/// in. So `↵` has been taking 45% of the reader's terminal to show them
+/// something the panel could draw itself. Now it draws it.
+///
+/// `E` is untouched and stays a tab. The rule underneath both is `pop_out`'s
+/// own: the panel stops renting screen for *itself*, and goes on opening the
+/// full-size things a person asked for. A task read is the panel showing you
+/// something; `$EDITOR` on it is a process in a pty, which no width makes
+/// drawable here.
+struct TaskPage {
+    /// What is open. Mirrored on [`View::showing`], which is what `↵` on the
+    /// same row reads to know it means close — the same field, and the same
+    /// meaning, as when the detail was a pane.
+    focus: crate::detail::Focus,
+    /// Everything the frame reads, rebuilt on the refetch the tree uses. Held
+    /// rather than gathered per frame because a frame is drawn on every key and
+    /// this is six reads of the store.
+    ctx: crate::detail::Ctx,
+}
+
+impl TaskPage {
+    fn open(store: &Store, focus: crate::detail::Focus, panes: Vec<AgentRef>) -> TaskPage {
+        TaskPage { focus, ctx: crate::detail::Ctx::page(store, panes) }
+    }
+}
+
 /// The board, drawn in the room the host gave, in place of the tree.
 ///
 /// The third caller of [`expand`] and the one that shows what the seam is for.
@@ -681,8 +731,13 @@ struct BoardPage {
 }
 
 impl BoardPage {
-    fn open(store: &Store, scope: kanban::Scope, show_done: bool) -> BoardPage {
-        let board = kanban::collect(&kanban::Ctx::live(store), &scope, show_done);
+    fn open(
+        store: &Store,
+        scope: kanban::Scope,
+        show_done: bool,
+        panes: Vec<AgentRef>,
+    ) -> BoardPage {
+        let board = kanban::collect(&kanban::Ctx::of(store, panes), &scope, show_done);
         BoardPage { scope, show_done, cur: kanban::Cursor::default(), board }
     }
 
@@ -692,27 +747,96 @@ impl BoardPage {
     /// was still in hand: after the rebuild the slot it sat in belongs to
     /// whatever moved up into it, so the cursor would otherwise be left
     /// pointing at a neighbour.
-    fn rebuild(&mut self, store: &Store, follow: Option<String>) {
+    fn rebuild(&mut self, store: &Store, follow: Option<String>, panes: Vec<AgentRef>) {
         let keep = follow.or_else(|| self.board.card_at(&self.cur).map(|c| c.id.clone()));
-        self.board = kanban::collect(&kanban::Ctx::live(store), &self.scope, self.show_done);
+        self.board =
+            kanban::collect(&kanban::Ctx::of(store, panes), &self.scope, self.show_done);
         self.cur =
             keep.and_then(|id| self.board.find(&id)).unwrap_or_else(|| self.cur.clamped(&self.board));
     }
 }
 
-/// What a key pressed on the board leaves for the loop to do.
+impl Page {
+    /// The frame this page draws, at the size the host actually gave.
+    ///
+    /// `note` is the panel's own footer message, on whichever footer this page
+    /// has: one message and one clock across all of them, so a sentence written
+    /// by a key on the tree does not vanish the moment a page takes the pane.
+    ///
+    /// The board takes it as an argument because it has always had a footer of
+    /// its own. The task page does not, so the note is written over its last
+    /// line here — which is the same trade the tree and the board both make,
+    /// spending the key hint on the sentence for four seconds. Without it `E`
+    /// on a page would be the one key in the panel that can fail in silence:
+    /// [`pop_out`] answers in words, and there would be nowhere to put them.
+    fn frame(&self, note: &str, w: usize, h: usize) -> Vec<super::render::Line> {
+        match self {
+            Page::Board(p) => kanban::frame(&p.board, &p.cur, w, h, note),
+            Page::Task(p) => {
+                let mut out =
+                    crate::detail::frame(&p.ctx, &p.focus, w, h, crate::detail::Placed::Page);
+                if !note.is_empty() {
+                    if let Some(last) = out.last_mut() {
+                        *last = super::render::line(
+                            super::render::Style::Accent,
+                            crate::util::truncate(note, w),
+                        );
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Read the store again, because something changed. See the refetch below.
+    ///
+    /// `panes` is the census the loop has already fetched for the tree. Handed
+    /// down rather than fetched again: a page repaints on the same cadence the
+    /// panel does, and a socket call per repaint is the clock `fork-001`
+    /// removed. The store read is not saved and is the honest remaining cost —
+    /// a second pass over files the snapshot beside it has just read, for as
+    /// long as a page is open.
+    fn rebuild(&mut self, store: &Store, follow: Option<String>, panes: Vec<AgentRef>) {
+        match self {
+            Page::Board(p) => p.rebuild(store, follow, panes),
+            Page::Task(p) => p.ctx = crate::detail::Ctx::page(store, panes),
+        }
+    }
+
+    /// The width to ask the host for. Different per page and never explained to
+    /// the host — see [`super::verbs::expand`].
+    ///
+    /// A board absorbs every column it is given, so it asks past the end. A
+    /// task written up does not: it is prose, laid out to a measure, and the
+    /// fields and sub-task rows around it are short. [`super::render::PAGE_MIN`]
+    /// is the same number `Z` asks for and the same reasoning — the width at
+    /// which this stops being a thing you glance at.
+    fn width(&self) -> usize {
+        match self {
+            Page::Board(_) => super::render::WHOLE_SCREEN,
+            Page::Task(_) => super::render::PAGE_MIN,
+        }
+    }
+}
+
+/// What a key pressed on a page leaves for the loop to do.
 ///
 /// The board's own [`kanban::Action`] speaks of cards and columns; this speaks
 /// of the pane. Two enums rather than one because the board is drawn in two
-/// places now — its own tab and this page — and only one of them has a room to
+/// places — its own tab and this page — and only one of them has a room to
 /// give back.
-enum FromBoard {
+enum FromPage {
     /// Nothing the loop has to do; the cursor moved, or the footer was written.
     Nothing,
     /// Rebuild from the store, putting the cursor on this card if it is named.
+    /// The card is the board's; a task page has nothing to land on.
     Refetch(Option<String>),
     /// The page is finished with. Give the room back and draw the tree.
     Close,
+    /// Finished with, and this is what to draw instead — `↵` on a card. The
+    /// room is not given back and taken again: it is one ask at the new page's
+    /// width, so the sidebar never blinks through its own width in between.
+    Show(crate::detail::Focus),
 }
 
 /// A key, while the board has the pane.
@@ -726,22 +850,19 @@ fn board_key(
     k: Key,
     p: &mut BoardPage,
     ui: &mut Ui,
-    view: &mut View,
-    store: &Store,
     self_ws: Option<&str>,
-    me: Option<&str>,
-) -> FromBoard {
+) -> FromPage {
     match kanban::apply_key(k, &p.board, &mut p.cur) {
-        kanban::Action::None => FromBoard::Nothing,
+        kanban::Action::None => FromPage::Nothing,
         kanban::Action::Say(m) => {
             say(ui, m);
-            FromBoard::Nothing
+            FromPage::Nothing
         }
-        kanban::Action::Refetch => FromBoard::Refetch(None),
+        kanban::Action::Refetch => FromPage::Refetch(None),
         kanban::Action::ShowDone => {
             p.show_done = !p.show_done;
             say(ui, if p.show_done { "showing done" } else { "hiding done" });
-            FromBoard::Refetch(None)
+            FromPage::Refetch(None)
         }
         // The CLI, exactly as the tree's keys run it: the event log, the hooks
         // and the commit all happen because it is the same path a person at a
@@ -752,7 +873,7 @@ fn board_key(
                 Ok(m) => say(ui, m.label),
                 Err(e) => say(ui, e),
             }
-            FromBoard::Refetch(Some(task))
+            FromPage::Refetch(Some(task))
         }
         // An editor is a tab here too, and for the reason it is one everywhere
         // else: `wsp edit` runs `$EDITOR`, which is a process in a pty, and the
@@ -760,24 +881,51 @@ fn board_key(
         // [`pop_out`].
         kanban::Action::Edit { id } => {
             say(ui, pop_out(&["edit".to_string(), id.clone()], &id, self_ws));
-            FromBoard::Nothing
+            FromPage::Nothing
         }
-        // `↵` opens the task where the panel already shows things, and the
-        // board stands down on the way out — so you come back to the tree with
-        // it open rather than to a board you now have to leave. Only if it
-        // landed: with nowhere to put the detail, closing would take the task
-        // off the screen instead of putting it on one.
-        kanban::Action::Open { id } => {
-            let focus = crate::detail::Focus::Task(id);
-            let m = inspect(store, self_ws, &focus, me);
-            if !m.is_empty() {
-                say(ui, m);
-                return FromBoard::Nothing;
-            }
-            view.showing = Some(focus);
-            FromBoard::Close
+        // `↵` means what it means on the tree: the task written up, in place.
+        // The board stands down on the way, because it holds nothing of its own
+        // and leaving it behind the thing you opened from it would be a view
+        // you have finished with, waiting to be closed.
+        //
+        // It used to hand the task to the sidebar's detail *pane*. There is no
+        // pane to hand it to any more, and that is the point of this task —
+        // whichever key opens the detail, it is the panel that draws it.
+        kanban::Action::Open { id } => FromPage::Show(crate::detail::Focus::Task(id)),
+        kanban::Action::Quit => FromPage::Close,
+    }
+}
+
+/// A key, while a task written up has the pane.
+///
+/// Two things to do with something you are reading — stop, and edit it — and
+/// four keys for the first, because `q`, `esc` and `ctrl-c` all mean "out" to
+/// some hand or other. `↵` is among them for the reason `Z` and `K` close with
+/// the key that opened them: the way out of a page is the way in.
+///
+/// Everything else is deliberately nothing. The tree's keys are aimed at a row
+/// under a cursor, and there is no cursor on this page; letting them through
+/// would act on whatever the tree happened to be pointing at behind it.
+fn task_key(k: Key, p: &TaskPage, ui: &mut Ui, self_ws: Option<&str>) -> FromPage {
+    match k {
+        Key::Enter | Key::Char('q') | Key::Esc | Key::Interrupt => FromPage::Close,
+        // The one thing this page is not, reached from it in one key. `E` means
+        // what it means everywhere: `$EDITOR` on the prose, full size, in the
+        // reader's own terminal. See [`pop_out`].
+        Key::Char('E') => {
+            let (argv, label) = match &p.focus {
+                crate::detail::Focus::Task(id) => {
+                    (vec!["edit".to_string(), id.clone()], id.clone())
+                }
+                crate::detail::Focus::Project(id) => {
+                    (vec!["project".to_string(), "edit".to_string(), id.clone()], id.clone())
+                }
+                crate::detail::Focus::Nothing => return FromPage::Nothing,
+            };
+            say(ui, pop_out(&argv, &label, self_ws));
+            FromPage::Nothing
         }
-        kanban::Action::Quit => FromBoard::Close,
+        _ => FromPage::Nothing,
     }
 }
 
@@ -862,10 +1010,10 @@ pub(super) fn event_loop(
     // to be handled in the order they arrived rather than thrown away.
     let mut carry: std::collections::VecDeque<Msg> = Default::default();
 
-    // The board, when one is up, and `None` for the tree. The whole of "what is
-    // drawn in the room" — see [`BoardPage`] — and it is one variable because
-    // there is one pane: a page replaces the tree rather than sitting over it.
-    let mut page: Option<BoardPage> = None;
+    // The page, when one is up, and `None` for the tree. The whole of "what is
+    // drawn in the room" — see [`Page`] — and it is one variable because there
+    // is one pane: a page replaces the tree rather than sitting over it.
+    let mut page: Option<Page> = None;
 
     // `&mut` on the view because the frame is where the tree's scroll offset
     // is decided, and the view keeps it: the click handler two branches below
@@ -879,22 +1027,22 @@ pub(super) fn event_loop(
         screen: &mut dyn Screen,
         ui: &Ui,
         view: &mut View,
-        page: Option<&BoardPage>,
+        page: Option<&Page>,
     ) -> (usize, usize) {
         let (w, h) = screen.size();
         match page {
             Some(p) => {
-                // The footer the panel would have drawn, on the board's own
-                // footer line. One message and one clock across both, so a
+                // The panel's own footer message, handed to whichever page is
+                // up. One message and one clock across all of them, so a
                 // sentence written by a key on the tree does not vanish the
-                // moment the board takes the pane. See [`super::render::NOTE`].
+                // moment a page takes the pane. See [`super::render::NOTE`].
                 let note = ui
                     .message
                     .as_ref()
                     .filter(|(_, at)| at.elapsed() < super::render::NOTE)
                     .map(|(m, _)| m.as_str())
                     .unwrap_or_default();
-                screen.paint(&kanban::frame(&p.board, &p.cur, w, h, note), w, h)
+                screen.paint(&p.frame(note, w, h), w, h)
             }
             None => screen.paint(&frame(ui, view, w, h), w, h),
         }
@@ -946,29 +1094,48 @@ pub(super) fn event_loop(
         match msg {
             // A page has the pane and the keyboard with it. The tree's reducer
             // is not consulted at all — not to fall through to and not to
-            // suppress: what is in front of the reader is a board, and a key
-            // that quietly moved a cursor they cannot see would be the seam
-            // showing. `q`, `esc` and `K` give the room back; see [`board_key`].
+            // suppress: what is in front of the reader is a board or a task
+            // written up, and a key that quietly moved a cursor they cannot see
+            // would be the seam showing. See [`board_key`] and [`task_key`].
             Msg::Key(k) if page.is_some() => {
-                let acted = page
-                    .as_mut()
-                    .map(|p| board_key(k, p, &mut ui, &mut view, store, self_ws, me));
+                let acted = page.as_mut().map(|p| match p {
+                    Page::Board(b) => board_key(k, b, &mut ui, self_ws),
+                    Page::Task(t) => task_key(k, t, &mut ui, self_ws),
+                });
                 match acted {
-                    None | Some(FromBoard::Nothing) => {}
-                    Some(FromBoard::Refetch(card)) => {
+                    None | Some(FromPage::Nothing) => {}
+                    Some(FromPage::Refetch(card)) => {
                         follow = card;
                         refetch = true;
                     }
-                    Some(FromBoard::Close) => {
+                    // One ask at the new page's width rather than a give-back
+                    // and a fresh take: the sidebar never blinks through its
+                    // own width on the way from a board to a task.
+                    Some(FromPage::Show(focus)) => {
+                        let panes = screen.live().panes;
+                        let next = Page::Task(TaskPage::open(store, focus.clone(), panes));
+                        expand(screen, &mut view, Some(next.width()));
+                        view.showing = Some(focus);
+                        page = Some(next);
+                        // Deliberately no refetch. The page was built from the
+                        // store a line ago and nothing about this keystroke
+                        // changed it; the tree behind is not on screen and is
+                        // rebuilt when the room goes back. A refetch here would
+                        // be a second read of the store, an `adopt` and a focus
+                        // round-trip, on every `↵` from a board.
+                    }
+                    Some(FromPage::Close) => {
                         // The room goes back through the same seam it was asked
                         // for. The page is dropped whatever the host says: a
                         // host that has stopped answering must not be able to
-                        // leave a board nobody can close.
+                        // leave a page nobody can close.
                         expand(screen, &mut view, None);
                         page = None;
-                        // The tree behind has not been rebuilt while the board
-                        // was up unless something asked it to, and a command
-                        // run on the board is exactly that kind of something.
+                        // `↵` on the same row has to mean open again, and the
+                        // tree behind has not been rebuilt while the page was
+                        // up unless something asked it to — which a command run
+                        // on a board is exactly.
+                        view.showing = None;
                         refetch = true;
                     }
                 }
@@ -993,14 +1160,39 @@ pub(super) fn event_loop(
                     ui.message = Some(("synced".into(), Instant::now()));
                     refetch = true;
                 }
+                // `↵`, the second caller of the seam and the last pane the
+                // panel rented for itself. See [`TaskPage`]: from a surface,
+                // the pane this used to split is not the panel's own but the
+                // one somebody is working in.
+                //
+                // A host that cannot be asked still splits it, because a `↵`
+                // that did nothing at all would be worse than one that costs a
+                // pane — that is the fallback, and it is the whole of what a
+                // tty panel and an older herdr still do.
                 Effect::Inspect(focus) => {
-                    let msg = inspect(store, self_ws, &focus, me);
-                    if msg.is_empty() {
+                    // Built before it is asked for, so that the number asked
+                    // for is the page's own and is named in one place. On a
+                    // host that refuses, the reads are thrown away — six of the
+                    // store, and a census that a surface already has in hand —
+                    // which is nothing beside the pane split that follows.
+                    let next =
+                        Page::Task(TaskPage::open(store, focus.clone(), screen.live().panes));
+                    if expand(screen, &mut view, Some(next.width())) {
+                        page = Some(next);
                         view.showing = Some(focus);
                     } else {
-                        say(&mut ui, msg);
+                        let msg = inspect(store, self_ws, &focus, me);
+                        if msg.is_empty() {
+                            view.showing = Some(focus);
+                        } else {
+                            say(&mut ui, msg);
+                        }
                     }
                 }
+                // Reached only on the fallback: a page takes the keyboard, so
+                // `↵` and `q` on one go to [`task_key`] and never through the
+                // tree's reducer. What is left here is the pane, and closing it
+                // is what it always was.
                 Effect::CloseView => {
                     if close_view(store, self_ws, me) {
                         say(&mut ui, "closed");
@@ -1017,11 +1209,17 @@ pub(super) fn event_loop(
                 // room, which herdr is never told. A host that cannot be asked
                 // opens the tab it always opened.
                 Effect::Board { scope, label } => {
-                    if expand(screen, &mut view, Some(super::render::WHOLE_SCREEN)) {
-                        // Built now rather than on the next refetch: this is a
-                        // board of the store as it is, and the frame at the
-                        // foot of this loop has to have something to draw.
-                        page = Some(BoardPage::open(store, scope, view.show_done));
+                    // Built now rather than on the next refetch: this is a
+                    // board of the store as it is, and the frame at the foot of
+                    // this loop has to have something to draw.
+                    let next = Page::Board(BoardPage::open(
+                        store,
+                        scope.clone(),
+                        view.show_done,
+                        screen.live().panes,
+                    ));
+                    if expand(screen, &mut view, Some(next.width())) {
+                        page = Some(next);
                         // Nothing said, where `Z` says "the whole tree". A
                         // widened tree still looks like the tree and is worth a
                         // word; a board looks like nothing else on this pane.
@@ -1328,7 +1526,7 @@ pub(super) fn event_loop(
             // the tree as it is now rather than as it was before the board
             // started changing it.
             if let Some(p) = page.as_mut() {
-                p.rebuild(store, follow.take());
+                p.rebuild(store, follow.take(), snap.panes.clone());
             }
         }
 
@@ -1388,6 +1586,70 @@ mod tests {
             "the flag check sits behind the cadence gate — an unfocused panel \
              would take up to thirty seconds to raise a card, and as long again \
              to put away one somebody else has answered",
+        );
+    }
+
+    /// The page's keys, and the ones it deliberately swallows.
+    ///
+    /// `↵` is the way out as well as the way in, for the reason `Z` and `K`
+    /// close what they opened. Everything else must be *nothing*: the tree's
+    /// keys are aimed at a row under a cursor and there is no cursor on this
+    /// page, so a `d` that fell through would move a card the reader cannot
+    /// see, on whatever row the tree happened to be pointing at behind it.
+    #[test]
+    fn a_page_of_prose_is_left_only_by_the_keys_that_say_so() {
+        let page = TaskPage {
+            focus: crate::detail::Focus::Task("wsp-013".into()),
+            ctx: crate::detail::Ctx {
+                tasks: Vec::new(),
+                index: crate::resolve::Index::new(Vec::new()),
+                claims: Default::default(),
+                worked: Default::default(),
+                bindings: Default::default(),
+                panes: Vec::new(),
+                columns: Vec::new(),
+            },
+        };
+        let mut ui = collect(&Snapshot::default(), &View::default());
+
+        for k in [Key::Enter, Key::Char('q'), Key::Esc, Key::Interrupt] {
+            assert!(
+                matches!(task_key(k, &page, &mut ui, None), FromPage::Close),
+                "{k:?} should give the room back",
+            );
+        }
+        // A sample of the tree's own vocabulary, none of which has a target here.
+        for k in [Key::Char('j'), Key::Char('d'), Key::Char('X'), Key::Char('Z'), Key::Char('K')] {
+            assert!(
+                matches!(task_key(k, &page, &mut ui, None), FromPage::Nothing),
+                "{k:?} reached past the page to the tree behind it",
+            );
+        }
+    }
+
+    /// `↵` must never become a key that does nothing.
+    ///
+    /// The page is what a host that answers gives you; a tty panel and any
+    /// herdr from before widths existed cannot be asked, and there the detail
+    /// still has to appear somewhere — which is the pane this task exists to
+    /// stop renting. Keeping both is what makes the wsp half shippable against
+    /// a herdr nobody has rebuilt, and losing the second one is a change that
+    /// works perfectly for whoever makes it.
+    ///
+    /// Read out of the source because no fixture drives this loop; the honest
+    /// half — that a host with nothing to give says so — is tested where it can
+    /// be, on `expand`.
+    #[test]
+    fn the_key_that_opens_a_page_still_opens_a_pane_where_there_is_nobody_to_ask() {
+        let arm = SRC
+            .split("Effect::Inspect(focus) => {")
+            .nth(1)
+            .expect("the inspect arm moved");
+        let arm = &arm[..arm.find("Effect::CloseView").expect("the arm below it moved")];
+        assert!(arm.contains("if expand("), "`↵` no longer asks for the room at all");
+        assert!(
+            arm.contains("inspect(store"),
+            "the fallback went: on a tty panel and on an older herdr `↵` now does nothing",
         );
     }
 

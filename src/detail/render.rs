@@ -11,9 +11,27 @@ use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util;
 
-use super::Focus;
+use super::{Focus, Placed};
 
 const LABEL_W: usize = 9;
+
+/// The widest prose is laid out, however much room the frame is given.
+///
+/// A field is a label and a short value and reads at any width; a paragraph
+/// does not. Wrapped to the whole of a ninety-six column page the eye loses the
+/// start of the next line, which is why books, newspapers and this repository's
+/// own source all stop well short of the page they are printed on.
+///
+/// It exists because of [`Placed::Page`]. In a pane this rarely binds — a
+/// detail pane is a split of something else and is usually narrower than this —
+/// but the page is as wide as the panel could get, and "fill the rect" is the
+/// one thing prose must not do with the room.
+const MEASURE: usize = 80;
+
+/// How wide to lay prose out in a frame of `w` columns. See [`MEASURE`].
+fn measure(w: usize) -> usize {
+    w.min(MEASURE)
+}
 
 /// `label   value` — the shape every field in this view takes.
 fn field(label: &str, value: &str, style: Style) -> Line {
@@ -62,15 +80,37 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
+    /// What a pane reads, including which editors are beside it.
     pub(super) fn live(store: &Store) -> Ctx {
+        Ctx { columns: super::editors::editor_columns(), ..Ctx::read(store, live::panes()) }
+    }
+
+    /// What a page reads: the same thing, with the panes handed in and no
+    /// editors beside it.
+    ///
+    /// Empty columns is a fact rather than an economy — a page is the panel
+    /// drawing this in its own room, and there is nothing next to it to place a
+    /// section in.
+    ///
+    /// The panes are taken as an argument for a sharper reason. A pane asks
+    /// herdr for them over a socket; a *surface* is told what herdr is running
+    /// and has the answer already, which is the clock `fork-001` removed and
+    /// measured — 6.9% of a core down to 2.3%. A page repainting four times a
+    /// second must not put it back, so it is given the census the loop already
+    /// holds rather than asking for its own.
+    pub(crate) fn page(store: &Store, panes: Vec<AgentRef>) -> Ctx {
+        Ctx::read(store, panes)
+    }
+
+    fn read(store: &Store, panes: Vec<AgentRef>) -> Ctx {
         Ctx {
             tasks: store.tasks(),
             index: Index::new(store.projects()),
             claims: store.claims(),
             worked: store.worked(),
             bindings: store.bindings(),
-            panes: live::panes(),
-            columns: super::editors::editor_columns(),
+            panes,
+            columns: Vec::new(),
         }
     }
 
@@ -83,7 +123,7 @@ impl Ctx {
     }
 }
 
-pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
+pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize, placed: Placed) -> Vec<Line> {
     let mut out: Vec<Line> = Vec::new();
     match focus {
         Focus::Nothing => {
@@ -105,7 +145,12 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
     // place its keys do anything. Offering three keys in a view with nothing
     // beside it would be advertising a menu whose every entry answers "no
     // editors open".
-    let cols = &ctx.columns;
+    let cols = match placed {
+        // A page has no editors beside it whatever the context says, and the
+        // menu is the half of this footer that is only about them.
+        Placed::Page => &[][..],
+        Placed::Pane => &ctx.columns[..],
+    };
     let footer = if cols.is_empty() { 2 } else { 3 };
     out.truncate(h.saturating_sub(footer));
     while out.len() < h.saturating_sub(footer) {
@@ -117,10 +162,16 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize) -> Vec<Line> {
     }
     out.push(line(
         Style::Dim,
-        if cols.is_empty() {
-            "h/l left or right · W save and close · q close, discarding"
-        } else {
-            "o/d/D then 1-3 places a section · 1/2/3 alone sets the columns · W save · q discard"
+        match (placed, cols.is_empty()) {
+            // The panel's own keys, because on a page the panel is what is
+            // holding them. Nothing here acts on another pane, so nothing here
+            // needs naming for being surprising — what needs naming is the way
+            // out, and that `E` still puts you in your own editor.
+            (Placed::Page, _) => "↵ or q closes it · E edits it",
+            (Placed::Pane, true) => "h/l left or right · W save and close · q close, discarding",
+            (Placed::Pane, false) => {
+                "o/d/D then 1-3 places a section · 1/2/3 alone sets the columns · W save · q discard"
+            }
         }
         .to_string(),
     ));
@@ -273,7 +324,7 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         if let Some(text) = t.section(name) {
             out.push(Line::default());
             out.push(heading(&name.to_lowercase()));
-            for l in util::wrap(&text, w) {
+            for l in util::wrap(&text, measure(w)) {
                 if l.trim().is_empty() {
                     out.push(Line::default());
                 } else {
@@ -296,7 +347,7 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         for entry in log.iter().rev() {
             let text = entry.trim_start().trim_start_matches("- ");
             let mut first = true;
-            for l in util::wrap(text, w.saturating_sub(2)) {
+            for l in util::wrap(text, measure(w).saturating_sub(2)) {
                 let mut ln = Line::default();
                 ln.push(Style::Dim, if first { "· " } else { "  " });
                 ln.push(Style::Muted, l);
@@ -337,7 +388,7 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     }
     if !p.brief.is_empty() {
         out.push(Line::default());
-        for l in util::wrap(&p.brief, w) {
+        for l in util::wrap(&p.brief, measure(w)) {
             out.push(line(Style::Muted, l));
         }
     }
@@ -353,7 +404,7 @@ fn project_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
         if let Some(text) = p.section(name) {
             out.push(Line::default());
             out.push(heading(&name.to_lowercase()));
-            for l in util::wrap(&text, w) {
+            for l in util::wrap(&text, measure(w)) {
                 if l.trim().is_empty() {
                     out.push(Line::default());
                 } else {
@@ -460,6 +511,96 @@ mod tests {
             .filter(|s| crate::model::PROSE.iter().any(|p| p.eq_ignore_ascii_case(s.text.trim())))
             .map(|s| (s.text.trim().to_string(), matches!(s.style, Style::Accent)))
             .collect()
+    }
+
+    fn task_ctx(t: crate::model::Task) -> Ctx {
+        Ctx {
+            tasks: vec![t],
+            index: Index::new(vec![crate::model::Project::new("wsp")]),
+            claims: Default::default(),
+            worked: Default::default(),
+            bindings: Default::default(),
+            panes: Vec::new(),
+            columns: Vec::new(),
+        }
+    }
+
+    fn text_of(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    /// The one thing prose must not do with the room a page was given.
+    ///
+    /// `↵` widens the panel to ninety-six columns, and everything else in this
+    /// frame is happy there — a field is a label and a short value, a sub-task
+    /// row is a status and a title. A paragraph is not: at ninety-six the eye
+    /// loses the start of the next line, which is why [`MEASURE`] exists and
+    /// why this checks the drawn frame rather than the constant.
+    ///
+    /// It would have been very easy not to notice. Nothing looks broken — the
+    /// text is all there, correctly wrapped, to the wrong width.
+    #[test]
+    fn prose_is_laid_out_to_a_measure_rather_than_to_the_width_it_was_given() {
+        let mut t = crate::model::Task::new("a title", "wsp-013");
+        t.project = Some("wsp".into());
+        t.body = format!("## Overview\n{}\n", "one two three four five six ".repeat(40));
+        let ctx = task_ctx(t);
+
+        // The prose lines and nothing else: a rule is drawn to the rect on
+        // purpose, and it is the paragraph this is about.
+        let prose = |w: usize| -> usize {
+            frame(&ctx, &Focus::Task("wsp-013".into()), w, 90, Placed::Page)
+                .iter()
+                .filter(|l| l.text().contains("one two three"))
+                .map(|l| l.width())
+                .max()
+                .unwrap_or(0)
+        };
+
+        let widest = prose(200);
+        assert!(widest > 0, "the overview was not drawn at all");
+        assert!(
+            widest <= MEASURE,
+            "prose ran to {widest} columns; a page is wide and the prose in it is not",
+        );
+
+        // …and a frame narrower than the measure still fills what it has, or
+        // this would be a paragraph in a column down the left of every pane.
+        assert!(prose(40) > 30, "a narrow frame should still use its width");
+    }
+
+    /// A page offers the panel's keys, because on a page the panel is what is
+    /// holding them.
+    ///
+    /// The pane's footer names `W save and close` and a section menu, and both
+    /// act on **editor panes beside this one**. A page has none and cannot open
+    /// one, so advertising them would be offering keys that answer nothing —
+    /// and the menu is drawn from a context the page shares with the pane, so
+    /// this is checked with columns present rather than absent.
+    #[test]
+    fn a_page_offers_the_way_out_and_never_the_editors_it_does_not_have() {
+        let mut t = crate::model::Task::new("a title", "wsp-013");
+        t.project = Some("wsp".into());
+        let ctx = Ctx {
+            columns: vec!["overview".to_string(), "details".to_string()],
+            ..task_ctx(t)
+        };
+        let focus = Focus::Task("wsp-013".into());
+
+        let page = text_of(&frame(&ctx, &focus, 96, 40, Placed::Page));
+        assert!(page.contains("↵ or q closes it"), "the way out is named:\n{page}");
+        assert!(page.contains("E edits it"), "and so is the editor:\n{page}");
+        assert!(!page.contains("W save"), "there is nothing to save:\n{page}");
+        assert!(!page.contains("1 overview"), "and no columns to place:\n{page}");
+
+        // The same context in a pane still gets the menu, so the line above is
+        // about where it is drawn and not about the columns having gone.
+        let pane = text_of(&frame(&ctx, &focus, 96, 40, Placed::Pane));
+        assert!(pane.contains("1 overview"), "a pane keeps its menu:\n{pane}");
+        assert!(pane.contains("W save"), "and its keys:\n{pane}");
     }
 
     #[test]

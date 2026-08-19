@@ -985,6 +985,11 @@ impl Ui {
 /// to see a frame was to have both running. Taking the inputs as data instead
 /// lets a fixture stand one up and render it offline — the whole point of the
 /// snapshot backend.
+///
+/// `Default` is a store with nothing in it, which is a real state — a fresh
+/// `wsp init` — and the cheapest way for a test to hold a [`Ui`] that is not
+/// about any particular tree.
+#[derive(Default)]
 pub struct Snapshot {
     pub projects: Vec<crate::model::Project>,
     pub tasks: Vec<Task>,

@@ -17,7 +17,7 @@ use super::editors::{
     Columns, MAX_COLUMNS,
 };
 use super::render::{frame, Ctx};
-use super::{get_focus, Focus};
+use super::{get_focus, Focus, Placed};
 
 pub fn run(store: &Store, args: &crate::Args) -> i32 {
     let ws = args
@@ -74,7 +74,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
             seen = Some((focus.clone(), fp));
             let (w, h) = panel::term_size();
             let ctx = Ctx::live(store);
-            let painted = panel::to_ansi(&frame(&ctx, &focus, w, h), w, h);
+            let painted = panel::to_ansi(&frame(&ctx, &focus, w, h, Placed::Pane), w, h);
             if painted != last {
                 print!("{painted}");
                 let _ = std::io::stdout().flush();

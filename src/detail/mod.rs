@@ -1,13 +1,28 @@
-//! `wsp view` — the detail pane.
+//! `wsp view` — a task or a project, in full.
 //!
-//! The panel answers "what is there"; this answers "what is this". It runs in a
-//! pane of its own beside the panel, and follows whatever the panel last opened
-//! — so pressing `↵` costs one pane for the whole session rather than one per
-//! thing you look at, and the pane you are reading never moves.
+//! The panel answers "what is there"; this answers "what is this".
+//!
+//! # Two places it is drawn, and which one is the design
+//!
+//! **A page**, which is the panel itself: `↵` asks its host for a page's width
+//! and draws this where the tree was — see `panel::run`'s `TaskPage` and the
+//! seam under it, `panel::verbs::expand`. Nothing is rented and nothing is
+//! spawned; the frame below is simply given more columns and a different thing
+//! to put in them.
+//!
+//! **A pane of its own**, which is the fallback and what this file's [`run`]
+//! is: a `wsp view` process beside the panel, following whatever the panel last
+//! opened through a file. It is what a tty panel gets, and any host too old to
+//! say it takes widths. It is also the context pane in the tab `E` opens, where
+//! it is not a fallback at all but the right shape — the editors are beside it.
+//!
+//! Which it is changes one thing in the frame, and [`Placed`] is how it is told:
+//! the keys at the foot. Everything above them is the same drawing, because it
+//! is the same question being answered.
 //!
 //! It shares the panel's `Line`/`Style` model, which means the same frame can be
-//! painted to a terminal or dropped into the storyboard, and the two views
-//! cannot drift apart on colour.
+//! painted to a terminal, handed to the panel as a page, or dropped into the
+//! storyboard, and none of the three can drift apart on colour.
 //!
 //! Three parts, split where the work splits: [`render`] draws a task or a
 //! project, [`editors`] gets the pair of editors a pop-out opened to go, and
@@ -25,6 +40,23 @@ pub use run::run;
 use serde_json::json;
 
 use crate::store::Store;
+
+/// Where a frame is being drawn, which is the one thing about it the data
+/// cannot say.
+///
+/// The same task in the same columns offers different keys depending on who is
+/// holding the pane, and the foot of the frame has to say which — a page that
+/// advertised `W save and close` would be offering to save editors that are not
+/// there, in a view that cannot open one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placed {
+    /// A pane of its own: `wsp view`, split off the panel or off the work, and
+    /// in an edit tab the context above the editors. It closes by ending.
+    Pane,
+    /// A page: the panel itself, widened, drawing this instead of the tree. It
+    /// closes by giving the room back — see `panel::verbs::expand`.
+    Page,
+}
 
 /// What a detail pane is pointed at.
 #[derive(Debug, Clone, PartialEq, Eq)]

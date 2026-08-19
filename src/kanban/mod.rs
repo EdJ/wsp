@@ -274,14 +274,25 @@ pub(crate) struct Ctx {
 
 impl Ctx {
     pub(crate) fn live(store: &Store) -> Ctx {
+        // A herdr that is not answering costs the agent marks and nothing
+        // else. The durable half is the board.
+        Ctx::of(store, live::panes())
+    }
+
+    /// The same, with the census handed in.
+    ///
+    /// For the board drawn as a page inside the panel, where the loop is
+    /// already holding what herdr is running — pushed to it, in a surface,
+    /// rather than asked for. A page repainting four times a second must not
+    /// reopen the socket `fork-001` closed; see [`crate::detail::Ctx::page`],
+    /// which takes it for the same reason.
+    pub(crate) fn of(store: &Store, panes: Vec<AgentRef>) -> Ctx {
         Ctx {
             tasks: store.tasks(),
             index: Index::new(store.projects()),
             bindings: store.bindings(),
             claims: store.claims(),
-            // A herdr that is not answering costs the agent marks and nothing
-            // else. The durable half is the board.
-            panes: seated(live::panes(), &store.governors()),
+            panes: seated(panes, &store.governors()),
         }
     }
 }
