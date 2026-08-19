@@ -4005,8 +4005,18 @@ mod tests {
         // that only reads `collect` would go on passing if a later width branch
         // moved into `render`.
         let drawn = |view: &mut panel::View, w: usize| -> Vec<panel::Target> {
-            let ui = ui_of(&world, view);
+            let mut ui = ui_of(&world, view);
             panel::place(&ui, view, w, TALL);
+            // Walked to the foot of the tree first. A pane anchored at the top
+            // is blind to a project that overflows near the end of it — the
+            // extra rows fall off the bottom, and the window is identical
+            // whether or not they are there. The `wsp` branch is the last thing
+            // in this fixture, which is exactly the place a top-anchored frame
+            // cannot see.
+            for _ in 0..ui.rows_for_test() {
+                panel::apply_key(Key::Down, &mut ui, view);
+                panel::place(&ui, view, w, TALL);
+            }
             let mut probe = ui.clone();
             (0..TALL)
                 .filter_map(|y| panel::row_at(&ui, view, w, TALL, y))
