@@ -4138,7 +4138,7 @@ mod tests {
         let mut ui = ui_of(&w, &view);
         panel::place(&ui, &mut view, W, H);
         let top = |ui: &panel::Ui, view: &panel::View| panel::row_at(ui, view, W, H, 2);
-        let mut down = |ui: &mut panel::Ui, view: &mut panel::View| {
+        let down = |ui: &mut panel::Ui, view: &mut panel::View| {
             panel::apply_key(Key::Down, ui, view);
             panel::place(ui, view, W, H);
         };
