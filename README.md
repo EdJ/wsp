@@ -2733,8 +2733,9 @@ part, because the defences were individually correct and collectively assumed
 something that was not true: that a checkout belongs to whoever is looking at
 it.
 
-A shared checkout has four pieces of shared mutable state, and we found them in
-this order, each by being bitten:
+A shared checkout has six pieces of shared mutable state, and we found them in
+this order, each by being bitten. The last one is not in the checkout at all,
+which is why a tree each did not fix it:
 
 | Shared | How it bites |
 |---|---|
@@ -2743,6 +2744,7 @@ this order, each by being bitten:
 | `target/` | concurrent builds serialise on one lock, and neither build is attributable |
 | `~/.local/bin/wsp` | whoever installs last decides what every running pane *and the daemon* is executing |
 | `~/wsp` (the store) | the same defect as the index, inside the tool: every command committed the whole store, so one agent's `wsp done` carried another's hand-written rule under a message about a task. Fixed in `git_commit` — commands commit the paths they wrote |
+| `refs/stash` | one stack per **repository**, whatever the worktree — so two agents stashing seconds apart exchange their entire working trees, and `git stash list` is empty by the time either notices |
 
 ### What each check catches, and what it does not
 
@@ -2757,6 +2759,7 @@ spot of the check we were relying on at the time.
 | `wsp verify` | the above, without anyone remembering how — and it names what changed that you did *not* put under test | the same blind spot: it proves the patch stands alone, not that the patch is yours |
 | A private `GIT_INDEX_FILE` | the other agent's staged work entering your commit | the working tree; two people still editing one file; **the shared index, which nobody is now reading** |
 | `wsp doctor` | a shared index holding something older than HEAD, in any declared project root | a shared index holding something *newer* — staged work is indistinguishable from staged work |
+| the stash guard | `git stash` itself, refused inside the command that would have taken it, in every worktree of the repository | a stash already on the stack when it was installed — `wsp doctor` names those, and `pop` is still the wrong way to take one back |
 | `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one |
 | `wsp install` | a second install while one is in flight, and a build older than what is already live | what the live binary *contains*, if somebody installed it by hand — the record beside it describes wsp's own installs and admits when it no longer matches |
 | `wsp --version`, and `wsp doctor` against it | which commit is live, however it got there, and whether it carries work no commit holds | what that work *was* — `+dirty` names no files, and the tree it came out of may be gone |
@@ -2790,6 +2793,94 @@ private-index commit leaves `.git/index` holding the tree from before it, so
 *every* commit made the right way leaves the shared index a commit behind. The
 check found that thirty seconds after being installed, in its own commit. Doctor
 names the state; the step stops making it.
+
+### The stash, and telling an agent something at the moment it matters
+
+On 2026-08-19 two agents in separate worktrees exchanged their entire working
+trees, and neither did anything the tooling told them not to. `ui-002` and
+`worklist-004` both ran `git stash`, thirty-six seconds apart, and both ran `git
+stash pop`. Each tree came back holding the other's work — 603 lines and an
+untracked file in the wrong checkout — and `git stash list` was empty, because
+both stashes had already been popped into the wrong places. Two things made it
+recoverable and both were luck: the trees were at the same commit, so a diff
+from one applied against the other, and `wsp despawn` refuses to remove a tree
+with uncommitted work, so stopping the running agent did not take the tree it
+was holding.
+
+The mechanism is one sentence. `refs/stash` lives in the **common** `.git`, not
+in the worktree, so every worktree of a repository shares one stack. A tree each
+fixes the working tree, the index and `target/`; it does not touch this, and
+nothing in the file-overlap rule that composes agents into groups says a word
+about it, because that rule composes by what agents will *touch* and this is
+something they *share*.
+
+**The interesting half is why the rule did not work, because there was one.**
+`wsp commit-help` had forbidden stashing in a shared tree all along, in the same
+paragraph as the recovery procedure — *recover by path, never pop* — and both
+agents did neither. That is not a badly written rule. It is a rule that is read
+at the wrong time by construction: **the hazard fires while you are
+investigating**, hours before anything is staged, at a moment when there is no
+reason at all to open a document about committing. Writing it a third time, more
+loudly, would have produced a third unread copy. So would the agent-written
+memory that was assumed to cover it and did not — memory is scoped per
+directory, every agent gets its own worktree, and no worktree has a memory scope
+at all.
+
+So the question is not how to say it better. It is **what is in the path at the
+moment `git stash` is typed**, and the answer is: git, and nothing else. wsp is
+not invoked, no wsp output is on screen, and no brief written hours earlier is
+being reread.
+
+`src/guard.rs` installs a `reference-transaction` hook, which git runs inside
+the stash command itself, with `refs/stash` named in the transaction it is about
+to make. The hook refuses it. The agent sees a sentence saying the stack is
+shared and to commit to its own branch instead, and the working tree is exactly
+where it was — git aborts the whole transaction and touches nothing.
+
+Three things make it the right shape rather than merely the only one. It is
+**shared exactly the way the stash is shared**: hooks live in the common git
+directory, so one file covers every worktree, every worktree made later, and the
+trunk, where a person at a shell can do the same damage. It **refuses rather
+than warns**, and a refusal here is free — nothing is half-done to recover from.
+And it is **not a lock**: no shared mutable state, nothing to wait on, nothing
+left held. Two agents doing ordinary things is not contention; it is two agents
+who needed to be told one fact.
+
+It refuses the *creation* of a stash and allows the *removal* of one, and that
+asymmetry is measured rather than tasteful. `git stash pop` applies to the
+working tree **first** and drops the ref **after**, so a refusal there arrives
+once the damage is done — and leaves `refs/stash` standing with an emptied
+reflog, a state `git stash list` reports as no stashes at all. A guard that
+creates that is worse than no guard. So the hook allows a transaction setting
+`refs/stash` to zeroes (the last entry going) or to a value already in its own
+reflog (a `pop` uncovering the one beneath), and refuses anything else, which is
+a commit that did not exist a moment ago. `git stash apply` and `git stash list`
+touch no ref and are never seen. `git rebase --autostash` keeps its commit in
+`.git/rebase-merge/autostash` and never goes near `refs/stash`, which is what
+`wsp land` needs and what a test asserts.
+
+It is installed from `cmd_checkout::ensure`, which both `wsp spawn` and `wsp
+checkout` reach, for the reason the per-task tree is: a step an agent has to
+remember is a step that gets skipped, so the guard is not something anybody asks
+for. It is never written over a `reference-transaction` hook wsp did not write,
+and never written through a `core.hooksPath` pointing outside the repository —
+that path may be a template shared by every repository on the machine. `wsp
+doctor` reports either of those, a root with no guard, a git older than 2.28
+which runs no such hook at all, and any stash already sitting on the stack,
+which is the one hazard the guard cannot close.
+
+The cost is ~13ms on a `git commit` and nothing on `status`, `diff` or `log`:
+the hook runs on every ref transaction, and its first line exits for two of the
+three phases. No tokens, and nothing at session start.
+
+Getting past it on purpose is `git -c core.hooksPath=/dev/null stash`, or
+deleting the file. That is written here and deliberately **not** in the refusal
+message, because an escape hatch offered at the moment of refusal is an escape
+hatch that gets taken.
+
+What this does not fix is the general shape the incident exposed: composition
+here is by what agents will touch, and nothing composes by what agents share.
+`refs/stash` is closed. `ids.json`, `governors.json` and the trunk are not.
 
 ### Do not search a release binary for a string
 
@@ -3319,6 +3410,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, and the sweep a passed group licenses |
+| `src/guard.rs` | the stash guard: one stack per repository however many worktrees, and the git hook that refuses it inside the command that would have taken it |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
 | `src/place_herdr.rs` | that port over herdr: the shell race, the launch window, the retype |
