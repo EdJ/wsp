@@ -42,23 +42,52 @@
 //! disagreement is legible; a caller drawing at 250ms asks for `Settled` and
 //! never starts a process.
 //!
-//! # The third answer git has, which the predicate as designed did not
+//! # The two answers git has that the predicate as designed did not
 //!
 //! `cmd_checkout::ahead()` answers "what does this branch hold that the trunk
-//! has not", and on a branch that does not exist it answers "nothing" — which
-//! reads as landed. That is the barrier opening on a group **nothing was ever
-//! spawned for**, which is the one failure it exists to prevent. So the branch
-//! is asked about before it is compared, and [`Landing::NoBranch`] is its own
-//! answer rather than a silent zero.
+//! has not", and it answers **nothing** in three different situations: the
+//! branch landed, there is no such branch, and the branch is there holding
+//! nothing. The first is the only one that is finished, and the other two both
+//! open a barrier on work that has not happened — the one failure a barrier
+//! exists to prevent (`wsp-088` d4). So neither is left as a silent zero:
+//! the branch is asked about before it is compared ([`Landing::NoBranch`]),
+//! and an empty comparison is [`Landing::Nothing`], which is a reading and not
+//! a verdict.
 //!
-//! It is genuinely ambiguous and the store settles it: a branch is deleted with
-//! `git branch -d`, which refuses unless the work is merged, so a *missing*
-//! branch is either work that landed and was swept or work that never began.
-//! A member with no branch is therefore finished only if it is also settled —
-//! nobody has finished a task whose branch never existed and whose status is
-//! still `todo`. The cost is one extra process per member, and only where the
-//! branch is missing, since the comparison is skipped when there is nothing to
-//! compare.
+//! The empty branch is not an edge case, it is **every branch between `wsp
+//! spawn` and the first commit**: `wsp checkout` cuts the branch at the trunk
+//! tip, so a whole group reads as landed from the moment its agents are given
+//! their trees. Driven against a store and a repository of their own on
+//! 2026-08-19, five spawned agents with nothing committed anywhere produced
+//! `group 1 of 3 finished`, and four spawned agents produced a group of one
+//! with the other four silently gone from it. Fixtures never saw it because a
+//! fixture builds branches that already have commits on them.
+//!
+//! Both answers are genuinely ambiguous, and **the store settles both the same
+//! way**. A branch is deleted with `git branch -d`, which refuses unless the
+//! work is merged, so a *missing* branch is either work that landed and was
+//! swept or work that never began; a branch holding nothing is either that
+//! same landed work before the sweep took it, or a tree somebody is standing in
+//! this minute. A landed branch and a branch cut from the trunk tip are the
+//! same object, and no question put to git separates them. So a member is
+//! finished only if it is also settled — nobody has finished a task whose
+//! branch holds nothing and whose status is still `doing`.
+//!
+//! That is **one reading either side of the sweep** rather than two, which is
+//! worth more than the defect it closes: a member that landed without reaching
+//! `review` used to read finished while its branch stood and never-started the
+//! moment the sweep deleted it. See [`Position::slipped`], which exists to
+//! survive that flip.
+//!
+//! What it costs is that a member whose work is on the trunk holds the barrier
+//! until somebody says `wsp review`. That is the narrow half of "a fact, not a
+//! status anybody must remember to set": the fact still decides wherever git
+//! has one, and this is exactly the state where git has none. The alternative
+//! — a branch with no commits is not landed — is worse and was rejected:
+//! `worklist-008` produces prose in the store and not one line of code, so its
+//! branch will never hold a commit, and a predicate demanding one stalls every
+//! design-only member for ever. [`Landing::NoRepo`] exists because design-only
+//! work is legitimate, and this must not take that back.
 //!
 //! # Members that are not there
 //!
@@ -148,9 +177,12 @@ impl Settlement {
 /// What git says about a member's branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
-    /// The trunk has everything the branch holds. The only answer a barrier
-    /// opens on by itself.
-    Landed,
+    /// The branch is there and holds nothing the trunk has not got. **Landed
+    /// work and a branch `wsp checkout` cut at the trunk tip are the same
+    /// object**, so this is a reading and not a verdict: [`Standing`] settles
+    /// it against the store exactly as it does [`NoBranch`], and for the same
+    /// reason. See the module docs.
+    Nothing,
     /// Commits the trunk has not got, and the name of the trunk branch they
     /// are not on — read from the repository rather than assumed to be
     /// `master`, because that is a fact about the repository and not about wsp.
@@ -181,16 +213,19 @@ pub struct Standing {
 impl Standing {
     /// Whether this member is finished, under the reading it was read with.
     ///
-    /// The two branch-shaped answers fall back on the store, and that is the
-    /// judgement the module docs argue for: a missing branch is landed work
-    /// that was swept when the task is settled, and work that never began when
-    /// it is not.
+    /// **Only one answer decides on git alone**, and it is the negative one:
+    /// commits the trunk has not got are a fact, and nothing in the store
+    /// overrides them. Every other answer falls back on the store, which is
+    /// the judgement the module docs argue for — a branch that is missing, or
+    /// is there holding nothing, is landed work when the task is settled and
+    /// work that never began when it is not.
     pub fn finished(&self) -> bool {
         match &self.landing {
             None => self.settlement.settled(),
-            Some(Landing::Landed) => true,
             Some(Landing::Ahead { .. }) => false,
-            Some(Landing::NoBranch | Landing::NoRepo) => self.settlement.settled(),
+            Some(Landing::Nothing | Landing::NoBranch | Landing::NoRepo) => {
+                self.settlement.settled()
+            }
         }
     }
 
@@ -204,6 +239,16 @@ impl Standing {
             Some(Landing::Ahead { commits, trunk }) => {
                 let n = if *commits == 1 { "1 commit".to_string() } else { format!("{commits} commits") };
                 format!("{n} not on {trunk}")
+            }
+            // Both halves of the ambiguity, in that order, because the reader
+            // at a barrier is nearly always looking at the first one: a tree
+            // handed out minutes ago with nothing committed in it yet. The
+            // second half is why the sentence does not simply say "not
+            // started" — it may be work that is on the trunk and never reached
+            // `review`, and telling somebody to go and spawn that is the
+            // failure this predicate exists to prevent.
+            Some(Landing::Nothing) if !self.settlement.settled() => {
+                "nothing committed on its branch — or landed and never marked".into()
             }
             Some(Landing::NoBranch) if !self.settlement.settled() => "no branch — nothing has run for it".into(),
             Some(Landing::NoRepo) if !self.settlement.settled() => "no repository to look in".into(),
@@ -272,12 +317,21 @@ pub struct Position {
     ///
     /// That fallback is right and it has one hole. A member whose branch landed
     /// but whose task never reached `review` — an agent that landed and then
-    /// died, a status somebody forgot — reads as finished while its branch is
-    /// there and as *never started* the moment the sweep takes it. Without the
-    /// floor the position slips back onto a group already passed, and `wsp
-    /// worklist next` offers to start members whose work is on the trunk: a
-    /// second agent spawned onto landed work, which is the exact failure the
-    /// barrier exists to prevent, caused by the barrier's own cleanup.
+    /// died, a status somebody forgot — reads as unfinished, and goes on
+    /// reading that way after the sweep has taken the branch that was the only
+    /// argument against it. Without the floor the position slips back onto a
+    /// group already passed, and `wsp worklist next` offers to start members
+    /// whose work is on the trunk: a second agent spawned onto landed work,
+    /// which is the exact failure the barrier exists to prevent, caused by the
+    /// barrier's own cleanup.
+    ///
+    /// It used to be worse and it is worth recording which half was fixed
+    /// where. That member read *finished* while its branch stood and flipped to
+    /// never-started when the sweep deleted it, so the barrier opened on the
+    /// strength of a reading the sweep then destroyed. Settling `Nothing`
+    /// against the store made the two sides of the sweep agree — the barrier no
+    /// longer opens there at all — which leaves this floor holding one case
+    /// rather than two: a group whose verdict is already written.
     ///
     /// So the walk does not stop below the floor — and it says who made it
     /// stop trying to. A member here is the disagreement this module exists to
@@ -677,8 +731,13 @@ fn landing(repos: &mut Repos, t: &Task) -> Landing {
         return Landing::NoBranch;
     };
 
+    // And this is the state `ahead()` alone does not have either: an empty
+    // answer on a branch that exists is landed work and is equally a branch cut
+    // at the trunk tip and never committed to, which is every member of a group
+    // between `wsp spawn` and its first commit. Neither this nor `NoBranch` is
+    // a verdict; `Standing::finished` settles both against the store.
     match cmd_checkout::ahead(&trunk.dir, &trunk.branch, &branch).len() {
-        0 => Landing::Landed,
+        0 => Landing::Nothing,
         commits => Landing::Ahead { commits, trunk: trunk.branch },
     }
 }
@@ -926,6 +985,22 @@ mod tests {
         dir
     }
 
+    /// A tree on a branch of the task's name with **nothing committed on it**,
+    /// which is what `wsp checkout` leaves and what every member of a group
+    /// looks like between its spawn and its first commit.
+    ///
+    /// The one state a fixture does not build by accident, and the reason this
+    /// helper exists next to `committed`: `worklist-007` drove all four
+    /// landings twice against fixtures whose branches all had commits on them,
+    /// and the defect that opened every barrier early was invisible in both
+    /// passes.
+    fn spawned(repo: &Path, id: &str) -> PathBuf {
+        let dir = repo.join(cmd_checkout::WORKTREES).join(id);
+        let from = cmd_checkout::trunk_branch(repo).expect("the repository is on a branch");
+        git_run(repo, &["worktree", "add", "--quiet", "-b", id, &dir.display().to_string(), &from]);
+        dir
+    }
+
     fn land(repo: &Path, id: &str) {
         git_run(repo, &["merge", "--ff-only", "--quiet", id]);
     }
@@ -984,6 +1059,33 @@ mod tests {
             "the file two of them shared, and only that file"
         );
         assert_eq!(o.unread, ["wsp-4"], "and the one nobody could place is named, not dropped");
+    }
+
+    /// The same root, in the report rather than in the predicate. A branch that
+    /// landed nothing is sitting on the trunk value it was cut from, so a
+    /// search on the tip alone finds it in the reflog and hands it the diff of
+    /// whatever really landed there — the trunk's own commit, reported as the
+    /// work of members who had committed nothing at all.
+    ///
+    /// It is the same evidence and the same mistake as the barrier's, so it is
+    /// fixed with it rather than separately: the entry has to *name* the branch.
+    #[test]
+    fn a_member_that_landed_nothing_is_not_handed_the_trunks_own_commit() {
+        let (_env, store, repo) = scratch("empty-overlap");
+        // Two entries in the trunk's reflog, so there is something below the
+        // tip for the diff to reach for.
+        std::fs::write(repo.join("theirs.txt"), "not ours\n").unwrap();
+        git_run(&repo, &["add", "theirs.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "theirs"]);
+
+        for id in ["wsp-1", "wsp-2"] {
+            task(&store, id, "review");
+            spawned(&repo, id);
+        }
+
+        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        assert!(o.shared.is_empty(), "neither of them touched a file, let alone the same one");
+        assert_eq!(o.unread, ["wsp-1", "wsp-2"], "and not knowing is said, not smoothed over");
     }
 
     /// The whole of what "derived" means, asserted as arithmetic: the position
@@ -1069,6 +1171,89 @@ mod tests {
 
         let p = position(&store, &w, Reading::Landed);
         assert!(p.finished(), "a swept tree on a settled task is finished, not started");
+    }
+
+    /// The same state at the other end, and the one that was actually costing
+    /// us barriers: the branch is *there* and holds nothing, because
+    /// `wsp checkout` cuts it at the trunk tip. Every member of every group
+    /// looks like this from the moment it is spawned until its first commit.
+    #[test]
+    fn a_branch_with_nothing_on_it_does_not_read_as_landed() {
+        let (_env, store, repo) = scratch("empty-branch");
+        task(&store, "wsp-1", "doing");
+        spawned(&repo, "wsp-1");
+        let w = list("- 1  wsp-1\n- 2  wsp-2\n");
+
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.at, Some(1), "a tree handed out this minute has not finished the group");
+        assert_eq!(p.members[0].landing, Some(Landing::Nothing), "git has nothing to say either way");
+        assert_eq!(p.members[0].note(), "nothing committed on its branch — or landed and never marked");
+
+        // And the constraint the fix had to satisfy. `worklist-008` produces
+        // prose in the store and not one line of code, so its branch will never
+        // hold a commit: a predicate that demanded one would stall every
+        // design-only member for ever, which is the failure the naive repair
+        // makes and this one must not.
+        task(&store, "wsp-1", "review");
+        assert!(
+            position(&store, &w, Reading::Landed).finished(),
+            "design-only work is finished when the store says so, branch or no branch"
+        );
+    }
+
+    /// The reproduction, at the size it was found at: a whole group spawned,
+    /// nothing committed anywhere, and a barrier that used to say `finished`.
+    ///
+    /// `wsp-088` d4's named failure is a barrier opening early — it does not
+    /// error, it starts the next group on a trunk missing this one's work — so
+    /// this asserts the members are *named* as well as counted. An earlier
+    /// reading dropped four of five spawned agents out of the group silently,
+    /// and nothing in the one line a governor reads said they had ever been
+    /// there.
+    #[test]
+    fn a_group_that_has_only_been_spawned_holds_the_barrier_and_names_who() {
+        let (_env, store, repo) = scratch("spawned-group");
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            task(&store, id, "doing");
+            spawned(&repo, id);
+        }
+        let w = list("- 1  wsp-1  wsp-2  wsp-3\n- 2  wsp-4\n");
+
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.at, Some(1), "the barrier does not open on three trees and no commits");
+        assert_eq!(
+            p.holding().iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["wsp-1", "wsp-2", "wsp-3"],
+            "and every one of them is on the line that says what is holding it"
+        );
+        assert!(p.passed.is_empty(), "nothing behind it, so nothing to sweep");
+    }
+
+    /// One reading either side of the sweep, which is what settling `Nothing`
+    /// against the store buys beyond the defect it closes.
+    ///
+    /// A member that landed and never reached `review` used to read *finished*
+    /// while its branch stood and *never started* the moment the sweep deleted
+    /// that branch — the barrier opening on evidence its own cleanup then
+    /// destroyed. Both sides now say the same thing, and [`Position::slipped`]
+    /// is left holding one case instead of two.
+    #[test]
+    fn a_landed_branch_reads_the_same_before_and_after_its_tree_is_swept() {
+        let (_env, store, repo) = scratch("either-side");
+        task(&store, "wsp-1", "doing");
+        committed(&repo, "wsp-1");
+        land(&repo, "wsp-1");
+        let w = list("- 1  wsp-1\n");
+
+        assert_eq!(position(&store, &w, Reading::Landed).at, Some(1), "landed, and the status never came");
+
+        git_run(&repo, &["worktree", "remove", "--force", &repo.join(cmd_checkout::WORKTREES).join("wsp-1").display().to_string()]);
+        git_run(&repo, &["branch", "-d", "wsp-1"]);
+        assert_eq!(
+            position(&store, &w, Reading::Landed).at,
+            Some(1),
+            "and the sweep taking the branch changes nothing about the answer"
+        );
     }
 
     /// Absence is somebody's decision and it must not stall a night. The id is

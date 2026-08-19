@@ -1397,11 +1397,23 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing]) -> Front {
     for s in members.iter().filter(|s| !s.finished()) {
         if let Some(c) = claims.get(&s.id) {
             waiting.push((s.clone(), crate::cmd_agent::claim_where(c)));
-        } else if matches!(s.landing, None | Some(Landing::NoBranch) | Some(Landing::NoRepo)) {
+        } else if matches!(
+            s.landing,
+            None | Some(Landing::Nothing | Landing::NoBranch | Landing::NoRepo)
+        ) {
             // No branch and nobody holding it: nothing has run for this member.
             // A member with no repository to look in — design-only work — is
             // the same answer for a different reason, and it is the reason
             // `Landing::NoRepo` is not an error.
+            //
+            // `Nothing` is here because an empty branch is evidentially a
+            // missing one — see `worklist::Landing::Nothing` — and it is the
+            // ordinary state of a member whose tree was made and whose agent
+            // then died before committing: the branch is a leftover of `wsp
+            // checkout` and there is nobody in it. It is the claim above that
+            // keeps this honest while somebody *is* in it, and this is the
+            // line that makes the comment on this function true: a member the
+            // predicate called finished never reached it at all.
             ready.push(s.id.clone());
         } else {
             waiting.push((s.clone(), s.note()));

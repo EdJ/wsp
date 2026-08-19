@@ -794,12 +794,19 @@ pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String
 /// landed branch says where it began.
 ///
 /// The trunk's reflog does, exactly and cheaply. Every land is one
-/// fast-forward, so the entry whose value **is** this branch's tip has the
-/// trunk's previous value in the entry below it, and the diff between the two
-/// is precisely what this branch added — whoever else landed in between, and
+/// fast-forward, so the entry that **names this branch** has the trunk's
+/// previous value in the entry below it, and the diff between the two is
+/// precisely what this branch added — whoever else landed in between, and
 /// however many times it was rebased on the way. Measured against a repository
 /// with an unrelated commit landing between two members and all three rebased:
 /// each member came back with its own files and no one else's.
+///
+/// **Named, and not merely matched by value.** A branch that has landed
+/// nothing is sitting on the trunk value it was cut from, so a search on the
+/// tip alone finds it in the log and hands it the diff of whatever really
+/// landed there. That is not a near miss: it reported five agents who had
+/// committed nothing at all as having touched one file between them, which is
+/// this report inventing the very evidence it was written to supply.
 ///
 /// The reflog is read **once for the repository** and one `git diff
 /// --name-only` is spent per member, which is what makes this affordable to do
@@ -816,14 +823,20 @@ pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String
 /// changed. Reporting the second as the first is a clean bill of health nothing
 /// checked, which is the `batch`'s absence-as-evidence all over again.
 pub(crate) struct Landings {
-    /// The trunk's values, newest first.
-    values: Vec<String>,
+    /// The trunk's values, newest first, each with the reflog's own account of
+    /// how the trunk came to hold it.
+    values: Vec<(String, String)>,
 }
 
 impl Landings {
     pub(crate) fn read(repo: &Path, trunk_branch: &str) -> Landings {
-        let values = git(repo, &["reflog", "show", "--format=%H", trunk_branch])
-            .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        let values = git(repo, &["reflog", "show", "--format=%H %gs", trunk_branch])
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| l.trim().split_once(' '))
+                    .map(|(h, why)| (h.to_string(), why.trim().to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         Landings { values }
     }
@@ -833,8 +846,25 @@ impl Landings {
     pub(crate) fn files(&self, repo: &Path, branch: &str) -> Option<Vec<String>> {
         let tip = git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])?;
         let tip = tip.trim();
-        let at = self.values.iter().position(|v| v == tip)?;
-        let base = self.values.get(at + 1)?;
+        // **The tip matching is not enough, and the reason is the same one
+        // `worklist::Landing::Nothing` exists for**: a branch `wsp checkout`
+        // cut at the trunk tip sits on a trunk value it did not put there, and
+        // matching on the hash alone hands it the diff of whatever landed at
+        // that point — somebody else's commit, or the trunk's own. Driven on
+        // 2026-08-19 against five spawned agents with nothing committed, all
+        // five were reported as having touched a file none of them had opened.
+        //
+        // So the entry has to *name this branch*, which the reflog says
+        // outright: [`land`] fast-forwards the trunk onto the branch, and
+        // `merge <branch>:` is what git writes for that. A branch that got
+        // there some other way answers `None` — "nobody knows what it changed"
+        // — which is the answer this type already promises for a trunk that was
+        // reset or a land done by hand, and it is the one that cannot be read
+        // as a clean bill of health.
+        let at = self.values.iter().position(|(v, why)| {
+            v == tip && why.strip_prefix("merge ").is_some_and(|r| r.starts_with(&format!("{branch}:")))
+        })?;
+        let (base, _) = self.values.get(at + 1)?;
         let out = git(repo, &["diff", "--name-only", base, tip])?;
         Some(out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
     }
