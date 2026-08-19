@@ -782,26 +782,68 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
     // else — a body for the paragraph a row cannot hold, and an ask for the one
     // thing a keypress can answer.
     let title = args.get("title").unwrap_or_default();
-    let body = match args.get("body") {
-        // `--body -` reaches the parser as `true`, the same way `--from` does:
-        // a lone dash is not a value, it is the conventional name for stdin.
-        Some(v) if v == "true" || v == "-" => match crate::cmd_task::read_source("-") {
-            Ok(text) => text,
-            Err(e) => {
-                eprintln!("wsp: cannot read stdin: {e}");
-                return 1;
-            }
-        },
-        Some(v) => v,
-        None if from_stdin => match crate::cmd_task::read_source("-") {
-            Ok(text) => text,
-            Err(e) => {
-                eprintln!("wsp: cannot read stdin: {e}");
-                return 1;
-            }
-        },
-        None => String::new(),
+    // Where the paragraph comes from, and there are three spellings of it
+    // because `worklist-036` is what having only two cost.
+    //
+    // `--from <path>` is what `note`, `block`, `park` and `decide` all take,
+    // and **the house rule printed in every brief is to pass prose through a
+    // file** — a shell evaluates backticks inside double quotes, so the one
+    // habit the fleet is told to form was the habit that lost the message on
+    // this verb. `flag` had `--body -` and no `--from`; the parser bound the
+    // path to an option nothing read, and the hand went up with `"text": ""`
+    // and a success receipt under it. `robustness-088`'s named failure — *a
+    // panel full of flags nobody reads* — arriving through the verb built to
+    // prevent it, and arriving silently, which is the half that matters
+    // unattended: nobody reads the receipt at three in the morning.
+    //
+    // Two sources for one paragraph is refused rather than resolved. Picking
+    // one and dropping the other is the same fault in a smaller hat, and there
+    // is no reading of `--body X --from Y` where the caller knew what they were
+    // asking for.
+    if args.has("body") && args.has("from") {
+        eprintln!("wsp: --body and --from are two sources for one paragraph — give one");
+        return 2;
+    }
+    // A lone `--from`, or `--from -`, is stdin: a dash is not a value, it is
+    // the conventional name for the stream, and `--body -` reaches the parser
+    // as `true` the same way. `prose_source` reads it identically.
+    let source = match (args.get("from"), args.get("body")) {
+        (Some(path), _) => Some(match path.as_str() {
+            "true" => "-".to_string(),
+            other => other.to_string(),
+        }),
+        (None, Some(v)) if v == "true" || v == "-" => Some("-".to_string()),
+        (None, None) if from_stdin => Some("-".to_string()),
+        _ => None,
     };
+    let body = match &source {
+        Some(src) => match crate::cmd_task::read_source(src) {
+            Ok(text) => text,
+            Err(e) => {
+                match src.as_str() {
+                    "-" => eprintln!("wsp: cannot read stdin: {e}"),
+                    path => eprintln!("wsp: cannot read {path}: {e}"),
+                }
+                return 1;
+            }
+        },
+        None => args.get("body").unwrap_or_default(),
+    };
+    // A source that was given and came back empty is the same silence again by
+    // another road: the file was the wrong path's worth of nothing, or the pipe
+    // was, and the caller believes a paragraph went up. `wsp flag <id>` on its
+    // own stays legal — *look at this task* is a complete thing to say — but a
+    // caller that pointed at words and got none is told so instead of raising
+    // an empty hand and exiting 0.
+    if let Some(src) = &source {
+        if body.trim().is_empty() && said.is_empty() && title.trim().is_empty() {
+            match src.as_str() {
+                "-" => eprintln!("wsp: nothing came in on stdin — the hand would go up empty"),
+                path => eprintln!("wsp: {path} is empty — the hand would go up empty"),
+            }
+            return 2;
+        }
+    }
     let ask = args.get("ask").unwrap_or_default();
     // A closed vocabulary, because the answer is a key on somebody's panel and
     // that key runs a command. An agent naming its own argv would be an agent
@@ -4878,6 +4920,88 @@ mod tests {
             rows.iter().any(|r| r.contains("every seat is on the old binary")),
             "and the rest of it is drawn under that: {rows:?}",
         );
+    }
+
+    /// **The fault `worklist-036` exists for**, driven through the verb.
+    ///
+    /// `wsp flag <id> --from FILE` wrote a record with `"text": ""`, printed a
+    /// success receipt and raised a hand with the words gone. `flag` took a
+    /// positional sentence, `-`, `--title` and `--body` and had no `--from`, so
+    /// the parser bound the path to an option nothing read — and `--from` is
+    /// the spelling `note`, `block`, `park` and `decide` all take and the one
+    /// every brief tells an agent to use, because a shell evaluates backticks
+    /// inside double quotes. The habit the fleet is told to form was the habit
+    /// that lost the message, on the one verb whose entire job is to not lose
+    /// one.
+    ///
+    /// Asserted on the words rather than on the exit code, because the exit
+    /// code was already 0 when this was broken.
+    #[test]
+    fn a_hand_raised_from_a_file_carries_the_words_the_file_held() {
+        let (env, store) = scratch("flag-from-file");
+        a_task(&store, "wsp-001");
+        let path = env.path("finding.txt");
+        std::fs::write(&path, "the index is behind HEAD\n\nand the tree is shared\n").unwrap();
+
+        assert_eq!(raise_one(&store, &["wsp-001"], &[("from", path.to_str().unwrap())]), 0);
+
+        let up = crate::message::raised(&store);
+        assert_eq!(up.len(), 1);
+        let rows = hand_rows(&up[0], &Paint::new());
+        assert!(
+            rows[0].contains("the index is behind HEAD"),
+            "the file's first line is the headline: {rows:?}",
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("and the tree is shared")),
+            "and the rest of the file is under it: {rows:?}",
+        );
+    }
+
+    /// A source that was given and came back empty is told about, not raised.
+    ///
+    /// The other road to the same silence: the path was wrong in a way the
+    /// filesystem does not mind — an empty file, a pipe with nothing in it —
+    /// and the caller believes a paragraph went up. `wsp flag <id>` on its own
+    /// stays legal, because *look at this task* is a complete thing to say;
+    /// what is refused is pointing at words and raising a hand without them.
+    #[test]
+    fn a_source_that_came_back_empty_is_refused_rather_than_raised_with_nothing_on_it() {
+        let (env, store) = scratch("flag-from-empty");
+        a_task(&store, "wsp-001");
+        let path = env.path("nothing.txt");
+        std::fs::write(&path, "\n").unwrap();
+
+        assert_eq!(
+            raise_one(&store, &["wsp-001"], &[("from", path.to_str().unwrap())]),
+            2,
+            "an empty source reported success",
+        );
+        assert!(
+            crate::message::raised(&store).is_empty(),
+            "and a hand went up with nothing behind it",
+        );
+    }
+
+    /// Two sources for one paragraph is a caller who does not know what they
+    /// asked for, and choosing one of them is this task's own fault in a
+    /// smaller hat — the message that lost is lost silently.
+    #[test]
+    fn a_paragraph_given_twice_is_refused_rather_than_one_of_them_dropped() {
+        let (env, store) = scratch("flag-from-and-body");
+        a_task(&store, "wsp-001");
+        let path = env.path("finding.txt");
+        std::fs::write(&path, "out of the file\n").unwrap();
+
+        assert_eq!(
+            raise_one(
+                &store,
+                &["wsp-001"],
+                &[("body", "on the command line"), ("from", path.to_str().unwrap())],
+            ),
+            2,
+        );
+        assert!(crate::message::raised(&store).is_empty(), "one of the two went up anyway");
     }
 
     /// `wsp flag <id>` on its own draws no words, because there are none.

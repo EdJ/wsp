@@ -810,6 +810,8 @@ fn help() {
   wsp flag <id> ["why"]             raise a hand on a task — at the seat that
                                     governs it, or on every panel if there is none
   wsp flag <id> --title T --body -  …with a card: a heading and a paragraph
+  wsp flag <id> --from FILE         …with that paragraph out of a file, the
+                                    spelling every other prose verb takes
   wsp flag <id> --ask claim         …and a question a keypress answers
   wsp flag [--clear <id>] [--seat]  what is raised, and whose it is; --seat
                                     narrows it to this seat's own; --clear lowers
