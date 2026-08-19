@@ -249,6 +249,26 @@ pub(crate) fn stashed(repo: &Path) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout).lines().map(|l| l.to_string()).collect()
 }
 
+/// What there is to say about entries on the stack, or nothing.
+///
+/// One place rather than two because `doctor` and `wsp commit-help` say the
+/// same thing to different readers at different moments, and prose that exists
+/// twice diverges — which is the failure this whole module is about, one level
+/// up. The first line stands alone; the rest are indented detail.
+pub(crate) fn stash_lines(held: &[String]) -> Vec<String> {
+    let Some(first) = held.first() else {
+        return Vec::new();
+    };
+    vec![
+        format!(
+            "{} stash entr(y/ies) on this repository's shared stack — every worktree of it sees them, and a `pop` in any of them takes them",
+            held.len()
+        ),
+        format!("  {first}"),
+        "  `git stash show -p stash@{0}` and apply it by path where it belongs — a `pop` puts it wherever you happen to be standing".into(),
+    ]
+}
+
 /// What `doctor` says about the guard, over every declared root.
 ///
 /// `look` and `list` are passed in so the tests can state a repository's answer
@@ -267,16 +287,13 @@ pub(crate) fn health(
 
         // A stash on the stack first, because it is the live hazard and the
         // guard's state is only ever about the next one.
-        let held = list(root);
-        if !held.is_empty() {
-            problems.push(format!(
-                "{shown}: {} stash entr(y/ies) on the shared stack — every worktree of this repository sees them, and a `pop` in any of them takes them",
-                held.len()
-            ));
-            problems.push(format!("  {}", held.first().cloned().unwrap_or_default()));
-            problems.push(
-                "  `git stash show -p stash@{0}` and apply it by path where it belongs — a `pop` puts it wherever you happen to be standing".into(),
-            );
+        for (n, line) in stash_lines(&list(root)).into_iter().enumerate() {
+            // Only the first is a sentence about this root; the rest are its
+            // detail and already carry their own indent.
+            problems.push(match n {
+                0 => format!("{shown}: {line}"),
+                _ => line,
+            });
         }
 
         match look(root) {
@@ -429,6 +446,11 @@ mod tests {
         assert!(said.contains("shared stack"), "{said}");
         assert!(said.contains("stash@{0}"), "the entry itself, not just a count: {said}");
         assert!(said.contains("by path"), "recovery is by path and never by pop: {said}");
+    }
+
+    #[test]
+    fn an_empty_stack_is_silence_and_that_is_what_makes_the_check_affordable() {
+        assert!(stash_lines(&[]).is_empty(), "a true sentence printed always reads as background");
     }
 
     #[test]

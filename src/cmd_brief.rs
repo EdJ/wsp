@@ -169,6 +169,7 @@ pub fn commit_help(store: &Store, args: &Args) -> i32 {
     match text {
         Some(t) => {
             println!("{t}");
+            stash_here();
             0
         }
         // Unlike the brief, this one is allowed to fail: it was asked for, and
@@ -183,6 +184,34 @@ pub fn commit_help(store: &Store, args: &Args) -> i32 {
             );
             1
         }
+    }
+}
+
+/// The one line `committing.md` cannot know is true: there is a stash on the
+/// stack of the repository you are standing in, right now.
+///
+/// The file already carries the recovery — *`git stash show --stat` first and
+/// recover by path, never `pop`* — and it carries it whether or not there is
+/// anything to recover, which is how a true sentence reads as background. The
+/// stash is refused at creation now (`crate::guard`), so an entry here is
+/// stranded work from before the guard or a person's own, and either way it is
+/// visible to every worktree and one `pop` away from landing in the wrong one.
+///
+/// Printed only when there is one, which is the whole reason it is affordable:
+/// the normal answer is silence and costs one `git` call on a command nobody
+/// runs in a loop.
+fn stash_here() {
+    let dir = std::env::current_dir().unwrap_or_default();
+    let held = crate::guard::stashed(&dir);
+    if held.is_empty() {
+        return;
+    }
+    let p = Paint::new();
+    let mut lines = crate::guard::stash_lines(&held).into_iter();
+    eprintln!();
+    eprintln!("{} {}", p.yellow("▲"), lines.next().unwrap_or_default());
+    for rest in lines {
+        eprintln!("{}", p.dim(&rest));
     }
 }
 

@@ -2867,7 +2867,11 @@ and never written through a `core.hooksPath` pointing outside the repository —
 that path may be a template shared by every repository on the machine. `wsp
 doctor` reports either of those, a root with no guard, a git older than 2.28
 which runs no such hook at all, and any stash already sitting on the stack,
-which is the one hazard the guard cannot close.
+which is the one hazard the guard cannot close. `wsp commit-help` says that last
+one too, when the repository you are standing in has one and not otherwise —
+`committing.md` has carried the by-path recovery all along, and a true sentence
+printed whether or not there is anything to recover is how it comes to read as
+background.
 
 The cost is ~13ms on a `git commit` and nothing on `status`, `diff` or `log`:
 the hook runs on every ref transaction, and its first line exits for two of the
