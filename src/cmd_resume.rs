@@ -65,12 +65,23 @@
 //! # Nothing is resumed without being asked for
 //!
 //! Ed, same day: *"it is not automatic: on load, ask the user."* The daemon
-//! does not bring anything back. What it does at startup is put the question in
-//! front of whoever is there — [`ask_on_startup`] — and the question is a list
-//! with a box on each row, because "resume everything" and "resume nothing" are
-//! both wrong answers most mornings: a governor is usually worth having back
-//! and a task agent that was halfway through something you have since decided
-//! against is not.
+//! does not bring anything back. What it does at startup is put the question
+//! where whoever is there will find it — [`ask_on_startup`] — and the question
+//! is a list with a box on each row, because "resume everything" and "resume
+//! nothing" are both wrong answers most mornings: a governor is usually worth
+//! having back and a task agent that was halfway through something you have
+//! since decided against is not.
+//!
+//! **Found, not forced.** The question opens unfocused and raises a hand on
+//! each row instead of taking the screen; [`ask_on_startup`] carries what the
+//! old behaviour cost, and it is not a small story.
+//!
+//! And it is asked about a smaller set than it used to be. Herdr 0.8.0 resumes
+//! agents itself where its own integration recorded a session, so the case this
+//! path was written for has shrunk to exactly the agents herdr could *not*
+//! bring back. [`resumable`] is where that line is drawn, and drawing it wrong
+//! is worse than the original fault: an offer to resume an agent already back
+//! on screen is a stolen screen for a question with no content.
 //!
 //! # How far back a resume reaches, for one id a person names
 //!
@@ -239,15 +250,15 @@ fn of_row(row: &Value) -> Option<Thread> {
     })
 }
 
-/// Whether a row of the last census is one the restart actually interrupted.
+/// Whether a row of the last census is one herdr is already answering for.
 ///
-/// A session that is running *now* needs nothing: the agent survived, or has
-/// already been brought back, and offering it again would start a second copy
-/// of a live conversation. Compared on the session id rather than the pane,
-/// because a pane id does not survive a herdr restart and the session is
-/// precisely the thing that does.
-fn still_running(live: &[String], t: &Thread) -> bool {
-    live.iter().any(|s| *s == t.session)
+/// A session herdr holds needs nothing from wsp: the agent survived, or has
+/// been brought back, or is *about to be* — and offering any of the three would
+/// start a second copy of a live conversation. Compared on the session id
+/// rather than the pane, because a pane id does not survive a herdr restart and
+/// the session is precisely the thing that does.
+fn herdr_holds(held: &[String], t: &Thread) -> bool {
+    held.iter().any(|s| *s == t.session)
 }
 
 /// The census that is on offer: the one a restart interrupted if the daemon
@@ -266,21 +277,40 @@ fn offered(store: &Store) -> Vec<Value> {
     }
 }
 
-/// What that census holds that is not running now — the offer, in the order it
-/// was drawn.
+/// What that census holds that herdr is not answering for — the offer, in the
+/// order it was drawn.
 ///
-/// An unreachable herdr answers nothing rather than everything: with no live
-/// list there is no evidence any of these agents is gone, and offering to
-/// resume a machine's worth of live sessions is the one failure this list must
-/// not have.
+/// **`pane.list` rather than `agent.list`, and that is the whole of the fix in
+/// this file.** Herdr resumes agents itself now, and a restart is precisely the
+/// moment when what herdr *will* run is not yet running: `persist::restore`
+/// hangs the snapshot's `agent_session` on the restored pane and arms a resume
+/// plan that fires seconds later, when the pane first gets a rect. Asked at
+/// daemon start — which is where [`ask_on_startup`] asks — `agent.list` reads
+/// every one of those as gone, and the offer becomes a stolen screen for a
+/// question with no content, which is worse than the fault the offer was
+/// written for.
+///
+/// `pane.list` reports the same `agent_session`, from the same terminal record,
+/// and it is set on restore *before the process exists*. So it answers "what
+/// herdr holds" rather than "what is running", and the two differ by exactly
+/// the panes herdr is in the middle of bringing back. What survives the filter
+/// is what herdr could not resume — the agents whose session herdr's own
+/// integration never reported — which is the set this question is now about.
+///
+/// The named door is unaffected: `wsp resume <id>` never comes through here, so
+/// a person who wants a second copy can still say so.
+///
+/// An unreachable herdr answers nothing rather than everything: with no listing
+/// there is no evidence any of these agents is gone, and offering to resume a
+/// machine's worth of live sessions is the one failure this list must not have.
 pub fn resumable(store: &Store) -> Vec<Thread> {
-    let Ok(live) = herdr::agents() else { return Vec::new() };
-    let live: Vec<String> =
-        live.into_iter().map(|p| p.session_id).filter(|s| !s.is_empty()).collect();
+    let Ok(panes) = herdr::panes() else { return Vec::new() };
+    let held: Vec<String> =
+        panes.into_iter().map(|p| p.session_id).filter(|s| !s.is_empty()).collect();
     offered(store)
         .iter()
         .filter_map(of_row)
-        .filter(|t| !still_running(&live, t))
+        .filter(|t| !herdr_holds(&held, t))
         .filter(Thread::here)
         .collect()
 }
@@ -873,11 +903,11 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
                 // reachable by name — `wsp resume <id>` — through the record
                 // and then the log.
                 Some(Step::Take) => {
-                    store.clear_held();
+                    answered(store);
                     picker.chosen().into_iter().cloned().collect()
                 }
                 Some(_) => {
-                    store.clear_held();
+                    answered(store);
                     println!("{}", p.dim("nothing resumed"));
                     return 0;
                 }
@@ -956,6 +986,13 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
                 // better answer than waiting for it to turn up in a census
                 // under the same id.
                 store.forget_held(&t.session);
+                // And the hand with it, on the one path that does not go
+                // through `answered`: `wsp resume <id>` and `--yes` never see
+                // the picker, and a flag left up over an agent that is back on
+                // screen is the noise this whole change is about.
+                if let Some(task) = &t.task {
+                    lower_hand(store, task);
+                }
                 resumed += 1;
                 println!("{} resumed in {seat}", p.bold(&t.row()));
             }
@@ -995,7 +1032,87 @@ fn as_json(r: &Row) -> Value {
     })
 }
 
-/// Put the question in front of whoever is there when herdr comes up.
+/// The sentence a raised hand carries, and the way one is recognised again.
+///
+/// Compared, not just written: [`answered`] lowers only the hands still saying
+/// this, so a flag an agent has since raised on the same task by hand is left
+/// exactly where it is. A one-line constant is the whole of that guarantee.
+const HAND: &str = "its agent did not come back after the restart";
+
+/// Raise a hand on every offered row that names a task.
+///
+/// The question is in a workspace nobody is looking at, on purpose (see
+/// [`ask_on_startup`]), so something has to point at it — and the panel is
+/// already drawn in every workspace and already pins flags at its foot. A row
+/// per agent rather than one notice, because that is what a person acts on: the
+/// task whose agent is missing, with the door on it.
+///
+/// **Never over a hand somebody else raised.** A flag is one record per task and
+/// `set_flag` replaces it; clobbering an agent's own question with a restart
+/// notice would lose the more important of the two. The row is still in the
+/// picker either way.
+///
+/// A seat gets no hand, because a custodian holds no task and there is no row
+/// to raise one on. The workspace label and the daemon's own line are what that
+/// case has, and it is named in the note on `fork-016`.
+fn raise_hands(store: &Store, waiting: &[Thread]) {
+    let already = store.flags();
+    for t in waiting {
+        let Some(task) = &t.task else { continue };
+        if already.contains_key(task) {
+            continue;
+        }
+        store.set_flag(
+            task,
+            serde_json::json!({
+                "said": HAND,
+                "title": "",
+                "body": format!("`wsp resume {task}` brings it back on the thread it was on."),
+                "ask": "",
+                "pane": "",
+                "workspace": "",
+                "at": util::now_iso(),
+            }),
+        );
+        // The same event `wsp flag` writes, because the seam is the same one:
+        // `~/wsp/hooks/on-task-flagged` is how a restart that lost four agents
+        // becomes a desktop notification rather than a line in a log.
+        store.log_event(
+            "task-flagged",
+            serde_json::json!({ "id": task, "said": HAND, "pane": "" }),
+        );
+    }
+}
+
+/// The offer has been answered: drop the census and lower the hands it raised.
+///
+/// Both together, because they are one fact. A hand still up over a list that
+/// has been read is a hand that teaches a person to ignore hands.
+///
+/// Answered covers `esc` as well as `↵`: a person who looked and said no has
+/// looked. A row that then refused to resume printed its reason and its door on
+/// the way past, which is where that news belongs — not on a flag nobody asked
+/// to keep.
+fn answered(store: &Store) {
+    for r in store.held() {
+        let task = text(&r, "task");
+        if !task.is_empty() {
+            lower_hand(store, &task);
+        }
+    }
+    store.clear_held();
+}
+
+/// Take one hand down, if it is still the one this file put up.
+fn lower_hand(store: &Store, task: &str) {
+    if store.flags().get(task).map(|f| text(f, "said")) != Some(HAND.to_string()) {
+        return;
+    }
+    store.clear_flag(task);
+    store.log_event("task-unflagged", serde_json::json!({ "id": task, "said": HAND }));
+}
+
+/// Put the question where whoever is there will find it when herdr comes up.
 ///
 /// Called once from the daemon's start, beside the `reconcile` that rebuilds
 /// bindings from claims and for the same reason: herdr has just restored its
@@ -1007,8 +1124,34 @@ fn as_json(r: &Row) -> Value {
 /// list of what they had, and the failure mode of this whole feature is a
 /// window nobody wanted rather than a machine full of agents nobody asked for.
 ///
+/// # It does not take the screen, and this is the reason
+///
+/// It used to, deliberately, and the doc line said why: *"a question behind
+/// another window is not one."* That argument was written when wsp had nowhere
+/// else to ask. What it cost, on 2026-08-18 and traced on `fork-003`: the new
+/// workspace took the screen **and the keyboard**, the two characters Ed had
+/// already typed (`nc`) landed in its shell, and the `pane.send_text` below
+/// appended `wsp resume\n` to the same line. The pane held `ncwsp resume` and
+/// `zsh: command not found: ncwsp`, and it cost this project a false accusation
+/// against a governor before the call site was found.
+///
+/// So: **`show: false`, and `exec` rather than typing at a prompt.** Unfocused
+/// is what stops another window's keystrokes arriving here at all; `exec` is
+/// what stops a prompt that already has characters in it from fusing with this
+/// one, and it makes the command *be* the pane — answering the question closes
+/// it, with no shell left behind to close twice. `panel/verbs.rs` opens its
+/// full-tree tab exactly this way.
+///
+/// And the question is still a question, because two things point at it: the
+/// workspace is labelled with the count, which herdr draws in its own chrome,
+/// and [`raise_hands`] puts a flag on each task, which the panel pins at its
+/// foot in every workspace. A hand raised on the row is a better question than
+/// a window in front of the face, and it does not land two keystrokes in a
+/// shell.
+///
 /// Silent when the last census is empty, which is every daemon start that is
-/// not following a restart.
+/// not following a restart — and, since `resumable` started reading `pane.list`,
+/// silent on every restart herdr resumed everything from.
 pub fn ask_on_startup(store: &Store) -> usize {
     let waiting = resumable(store);
     if waiting.is_empty() {
@@ -1022,24 +1165,31 @@ pub fn ask_on_startup(store: &Store) -> usize {
     if store.held().is_empty() {
         store.set_held(store.roster());
     }
+    // Before the terminal, and unconditionally: the hand is the half of this
+    // that works when no window can be opened at all.
+    raise_hands(store, &waiting);
     let order = Order {
-        label: "resume?".to_string(),
+        label: format!("resume {}?", waiting.len()),
         cwd: None,
         env: cmd_spawn::seat_env(None, None),
         on: None,
-        // The one place a seat is opened in front of the person on purpose:
-        // it is a question, and a question behind another window is not one.
-        show: true,
+        show: false,
     };
     let place = Herdr::new();
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "wsp".into());
     match place.open(&order) {
         Ok(seat) => match herdr::call(
             "pane.send_text",
-            serde_json::json!({ "pane_id": seat.as_str(), "text": "wsp resume\n" }),
+            serde_json::json!({
+                "pane_id": seat.as_str(),
+                "text": format!("exec {} resume\n", util::shell_quote(&exe)),
+            }),
         ) {
             Ok(_) => {
                 eprintln!(
-                    "wsp daemon: {} agent(s) were running before the restart — asking in {seat}",
+                    "wsp daemon: {} agent(s) did not come back — waiting in {seat}, and flagged",
                     waiting.len()
                 );
                 waiting.len()
@@ -1265,16 +1415,71 @@ mod tests {
         assert_eq!((t.session.as_str(), t.from), ("abc", Source::Record));
     }
 
-    /// The boundary Ed drew: the offer is the last census, and an agent that is
-    /// still running is not part of it.
+    /// The boundary Ed drew: the offer is the last census, and an agent herdr
+    /// is answering for is not part of it.
+    ///
+    /// The middle row is the one this was widened for. `restored` is a session
+    /// hanging on a pane herdr has brought back but not yet started — it is in
+    /// `pane.list` and not in `agent.list`, and offering it would put a second
+    /// copy of a live conversation on the screen a few seconds before the first
+    /// one arrived.
     #[test]
-    fn what_is_offered_is_the_last_census_minus_what_is_still_running() {
-        let live = vec!["alive".to_string()];
-        let rows: Vec<Thread> =
-            [row("render-061", "gone"), row("render-019", "alive")].iter().filter_map(of_row).collect();
-        let offered: Vec<&Thread> = rows.iter().filter(|t| !still_running(&live, t)).collect();
+    fn what_is_offered_is_the_last_census_minus_what_herdr_holds() {
+        let held = vec!["alive".to_string(), "restored".to_string()];
+        let rows: Vec<Thread> = [
+            row("render-061", "gone"),
+            row("render-019", "alive"),
+            row("render-020", "restored"),
+        ]
+        .iter()
+        .filter_map(of_row)
+        .collect();
+        let offered: Vec<&Thread> = rows.iter().filter(|t| !herdr_holds(&held, t)).collect();
         assert_eq!(offered.len(), 1, "{offered:?}");
         assert_eq!(offered[0].what, "render-061");
+    }
+
+    /// The hand, and the one thing it must never do.
+    #[test]
+    fn a_hand_is_raised_per_task_and_never_over_one_somebody_else_raised() {
+        let (_env, store) = store("resume-hands");
+        store.set_flag("render-019", json!({ "said": "blocked on you", "ask": "claim" }));
+
+        let waiting: Vec<Thread> =
+            [row("render-061", "s1"), row("render-019", "s2")].iter().filter_map(of_row).collect();
+        raise_hands(&store, &waiting);
+
+        let flags = store.flags();
+        assert_eq!(
+            flags.get("render-061").map(|f| text(f, "said")),
+            Some(HAND.to_string()),
+            "the row with nothing on it gets the hand"
+        );
+        assert_eq!(
+            flags.get("render-019").map(|f| text(f, "said")),
+            Some("blocked on you".to_string()),
+            "and an agent's own question is left exactly where it was"
+        );
+    }
+
+    /// Answering the question puts the hands down — and only the ones it put
+    /// up. The offer is dropped in the same act, because they are one fact.
+    #[test]
+    fn answering_lowers_the_hands_it_raised_and_leaves_the_others() {
+        let (_env, store) = store("resume-answered");
+        store.set_held(vec![row("render-061", "s1"), row("render-019", "s2")]);
+        store.set_flag("render-019", json!({ "said": "blocked on you" }));
+        let waiting: Vec<Thread> = store.held().iter().filter_map(of_row).collect();
+        raise_hands(&store, &waiting);
+
+        answered(&store);
+        assert!(store.held().is_empty(), "the census goes with the answer");
+        assert!(store.flags().get("render-061").is_none(), "our hand comes down");
+        assert_eq!(
+            store.flags().get("render-019").map(|f| text(f, "said")),
+            Some("blocked on you".to_string()),
+            "and somebody else's does not"
+        );
     }
 
     /// The copy that outlives the tick, and the two ways a row leaves it. The

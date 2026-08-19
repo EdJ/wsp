@@ -903,4 +903,25 @@ mod tests {
         let err = call("agent.get", json!({ "target": "w0:p3@gpu" })).expect_err("no tunnel to gpu");
         assert!(err.to_string().contains("gpu: no tunnel"), "{err}");
     }
+
+    /// A pane herdr has restored but not yet re-launched still carries the
+    /// session it is going to resume, and `pane.list` is where that is visible.
+    ///
+    /// Recorded against herdr 0.8.0: `persist::restore` hangs the snapshot's
+    /// `agent_session` on the restored terminal and arms the resume plan, which
+    /// fires when the pane first gets a rect — so for those seconds the row has
+    /// a session and no `agent`, and `agent.list` may not carry it at all.
+    /// [`crate::cmd_resume::resumable`] reads exactly this to tell "herdr is
+    /// bringing this one back" apart from "this one is gone", so it is pinned
+    /// here rather than left to be rediscovered at the next restart.
+    #[test]
+    fn a_restored_pane_carries_the_session_herdr_is_about_to_resume() {
+        let p = parse_pane(&json!({
+            "pane_id": "w1:p6",
+            "cwd": "/Users/edjames/claude",
+            "agent_session": { "source": "herdr:claude", "agent": "claude", "kind": "id", "value": "c109006f" },
+        }));
+        assert_eq!(p.session_id, "c109006f");
+        assert!(p.agent.is_empty(), "and nothing is running in it yet");
+    }
 }
