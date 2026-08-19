@@ -291,6 +291,18 @@ impl Store {
     /// passengers — `daemon.json`, `said.json`, `.lock`. Adding one costs a
     /// read and a token scan of a file that can never match.
     ///
+    /// `resumable.json` is the one file that carries a `task` and is still
+    /// absent on purpose: the daemon overwrites it whole from live bindings on
+    /// every tick, so a stale id in it has a life of twenty seconds. Its frozen
+    /// copy `resume-held.json` is here for the opposite reason — it is written
+    /// once, when a restart is found to have killed everything, and nothing
+    /// keeps it current until a person has answered. Measured 2026-08-20: a
+    /// member renumbered between the freeze and the answer read as
+    /// `Stale::Forgotten`, came up unticked and labelled "no longer in the
+    /// store", and the hand this file had raised on it could not be lowered
+    /// afterwards, because `messages.json` *had* been rewritten and the held
+    /// row naming the old id no longer matched it.
+    ///
     /// A test asserts *through* this list and never against its own copy of
     /// it: a test that keeps its own copy of a hand-kept list is the same
     /// mistake with a green tick over it.
@@ -307,6 +319,7 @@ impl Store {
             "detail.json",
             "panel-view.json",
             "panels.json",
+            "resume-held.json",
             "events.jsonl",
         ]
     }
@@ -601,6 +614,42 @@ impl Store {
 
     pub fn task_path(&self, id: &str) -> PathBuf {
         self.tasks_dir().join(format!("{id}.md"))
+    }
+
+    /// The task an id **written down earlier** names, following a renumbering.
+    ///
+    /// The middle rung between [`Store::task`] and [`Store::resolve_task`], and
+    /// it exists because the two ends are both wrong for an id a machine
+    /// recorded. `task` is the raw path read and a renumbered task is not at
+    /// the path its old id names, so it answers `None` for work that is plainly
+    /// there. `resolve_task` answers, but it also falls through to bare
+    /// suffixes and to title substrings — guessing, which is right for an id a
+    /// person typed and wrong for one wsp wrote itself, where the only
+    /// ambiguity possible is the one a renumbering introduced. Guessing there
+    /// resumes, or waits on, work nobody named.
+    ///
+    /// One hop is the whole lookup: [`Store::rename_tasks`] collapses chains as
+    /// it writes them, so no entry in the map points at an id that was itself
+    /// renamed, and a lookup can never land on a name that has moved on again.
+    ///
+    /// The map is a parameter rather than read here because the callers that
+    /// matter are loops — every member of a group, every row of a census — and
+    /// `renamed_ids` is a file read. A caller with one id to check passes
+    /// `&self.renamed_ids()` and pays it once.
+    ///
+    /// # Why this is a method and not a line at each call site
+    ///
+    /// It is the same enumeration `record_dirs` and `state_files_with_ids`
+    /// exist for, one storey lower still: **a raw path read standing in for the
+    /// resolving one**, found three times in two days and never by the person
+    /// it happened to, because each site fails by *discarding* rather than by
+    /// complaining. `worklist::member` read a renumbered member as
+    /// `Settlement::Gone` — which is settled — and opened a barrier on work
+    /// still on its branch; `Repos::branches` got it right and is the model;
+    /// `cmd_resume::stale` read one as `Stale::Forgotten` and took it off the
+    /// list a restart offers back. A shorter list is not an error message.
+    pub fn task_now(&self, renamed: &BTreeMap<String, String>, id: &str) -> Option<Task> {
+        self.task(id).or_else(|| renamed.get(id).and_then(|now| self.task(now)))
     }
 
     /// Resolve a user-typed id: exact, then a retired id, then bare suffix

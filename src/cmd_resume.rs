@@ -381,7 +381,21 @@ impl Stale {
 /// the second makes it unrunnable.
 pub fn stale(store: &Store, t: &Thread) -> Option<Stale> {
     if let Some(id) = &t.task {
-        match store.task(id) {
+        // [`Store::task_now`] and not [`Store::task`]: the id in a census row
+        // was written down when the row was, and a task renumbered since is
+        // not at the path it names. The raw read called that `Forgotten` — a
+        // row unticked, and labelled "no longer in the store" about work that
+        // is plainly still there — so `↵` on the offer quietly resumed one
+        // agent fewer, with the only explanation being a sentence that was
+        // false. `resume-held.json` is rewritten by a renumbering now, which
+        // shuts the frozen census's window; this shuts the roster's, which
+        // stays open because `resumable.json` is deliberately left out of that
+        // rewrite and is what `offered` falls back to for the twenty seconds
+        // before the daemon's next tick replaces it.
+        //
+        // One lookup either way: the file read is the same one, and `ids.json`
+        // is only reached when the exact path missed.
+        match store.task_now(&store.renamed_ids(), id) {
             None => return Some(Stale::Forgotten),
             Some(task) => match task.status() {
                 s @ (Status::Review | Status::Done) => return Some(Stale::Moved(s)),
@@ -1234,6 +1248,7 @@ pub fn ask_on_startup(store: &Store) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn store(tag: &str) -> (crate::util::Isolated, Store) {
         let env = crate::util::isolated(tag);
@@ -1616,6 +1631,67 @@ mod tests {
         let r = Row::new(&store, thread("render-999", &tree));
         assert_eq!(r.stale, Some(Stale::Forgotten));
         assert!(!r.on);
+    }
+
+    /// The renumbering, from the offer's side: a member renamed between the
+    /// census being frozen and a person answering it.
+    ///
+    /// Both halves are asserted, because either one alone leaves a hole. The
+    /// rewrite repairs a held census written from now on and nothing already
+    /// on disk; the resolving read repairs both, and is also the only thing
+    /// covering the roster — which `offered` falls back to and which is
+    /// deliberately *not* rewritten, because the daemon overwrites it whole
+    /// every twenty seconds.
+    ///
+    /// What the raw read cost is the shape worth keeping in the test name:
+    /// not an error, a shorter list. The row came up unticked under the words
+    /// "no longer in the store", about work that was plainly still there.
+    #[test]
+    fn a_row_whose_task_was_renumbered_since_the_census_is_still_on_the_offer() {
+        let (env, store) = store("resume-renumbered");
+        let tree = env.path("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        task_at(&store, "t-260815-014", Status::Doing);
+        store.set_held(vec![json!({
+            "pane": "w1:p1", "workspace": "w1", "session": "s1",
+            "cwd": tree.display().to_string(), "kind": "claude",
+            "label": "t-260815-014", "task": "t-260815-014",
+        })]);
+
+        let map = BTreeMap::from([("t-260815-014".to_string(), "worklist-002".to_string())]);
+        store.rename_tasks(&map).unwrap();
+
+        assert_eq!(
+            text(&store.held()[0], "task"),
+            "worklist-002",
+            "the frozen census is state that holds a task id, and a renumbering rewrites it",
+        );
+
+        // And the read stands on its own, for the census that was frozen
+        // before this existed and for the roster, which is never rewritten.
+        let mut old = thread("t-260815-014", &tree);
+        old.task = Some("t-260815-014".to_string());
+        assert_eq!(
+            stale(&store, &old),
+            None,
+            "the work is there under its new name, and a shorter list is not an error message",
+        );
+        assert!(Row::new(&store, old).on, "so it is still ticked, as it was before the rename");
+    }
+
+    /// The half that has to be asserted through the list rather than beside
+    /// it: a test keeping its own copy of a hand-kept list is the same mistake
+    /// with a green tick over it.
+    #[test]
+    fn the_frozen_census_is_named_as_state_a_renumbering_has_to_rewrite() {
+        assert!(
+            Store::state_files_with_ids().contains(&"resume-held.json"),
+            "a renumbering would walk past the census a restart is offering back",
+        );
+        assert!(
+            !Store::state_files_with_ids().contains(&"resumable.json"),
+            "the live roster is overwritten whole every tick and pays a read for nothing",
+        );
     }
 
     /// Another machine's path is not ours to stat. Without this every row from
