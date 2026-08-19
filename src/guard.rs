@@ -282,6 +282,7 @@ pub(crate) fn health(
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
+    let mut unguarded: Vec<String> = Vec::new();
     for root in roots {
         let shown = crate::util::contract(root);
 
@@ -297,19 +298,35 @@ pub(crate) fn health(
         }
 
         match look(root) {
-            State::Ours => {}
-            State::Missing | State::Stale => notes.push(format!(
-                "{shown}: no stash guard — `wsp spawn` or `wsp checkout` in it installs one"
-            )),
+            State::Ours | State::Unknown => {}
+            // Folded rather than one line each, because at rollout that is
+            // *every* declared root and eleven identical lines is how a reader
+            // learns to skip doctor's output. It is not a fault either: a
+            // repository wsp has never put an agent in does not need a guard,
+            // and the next `spawn` there installs one.
+            State::Missing | State::Stale => unguarded.push(shown),
+            // These two stay per-root. Both are specific, both are rare, and
+            // both need the path to act on.
             State::Foreign => notes.push(format!(
-                "{shown}: a reference-transaction hook that is not wsp's is installed, so the stash guard is not — leave it be and read {shown}/.git/hooks/reference-transaction"
+                "{shown}: a reference-transaction hook that is not wsp's is installed, so the stash guard is not — leave it be, and read {shown}/.git/hooks/reference-transaction"
             )),
             State::Elsewhere(path) => notes.push(format!(
                 "{shown}: core.hooksPath sends git to {}, which may be shared by every repository on this machine — the stash guard is not installed there",
                 crate::util::contract(&path)
             )),
-            State::Unknown => {}
         }
+    }
+
+    if !unguarded.is_empty() {
+        let named: Vec<&str> = unguarded.iter().take(3).map(|s| s.as_str()).collect();
+        let rest = match unguarded.len() > named.len() {
+            true => format!(" and {} more", unguarded.len() - named.len()),
+            false => String::new(),
+        };
+        notes.push(format!(
+            "no stash guard in {}{rest} — a `wsp spawn` or `wsp checkout` in one installs it there",
+            named.join(", ")
+        ));
     }
 
     // Once for the run, not once per root, and only when there is a guard for
@@ -465,7 +482,16 @@ mod tests {
             &mut notes,
         );
         assert!(problems.is_empty(), "{problems:?}");
-        assert!(notes.join("\n").contains("no stash guard"), "{notes:?}");
+        assert!(notes.join("\n").contains("no stash guard in /r"), "{notes:?}");
+    }
+
+    #[test]
+    fn every_root_being_unguarded_is_one_line_and_not_one_line_each() {
+        let roots: Vec<PathBuf> = (0..11).map(|n| PathBuf::from(format!("/r{n}"))).collect();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        health(&roots, |_| State::Missing, |_| Vec::new(), "git version 2.35.1", &mut problems, &mut notes);
+        assert_eq!(notes.len(), 1, "eleven identical lines is how a reader learns to skip doctor: {notes:?}");
+        assert!(notes[0].contains("and 8 more"), "{notes:?}");
     }
 
     #[test]
