@@ -1947,7 +1947,12 @@ mod tests {
     use super::*;
 
     fn pane(id: &str, label: &str) -> PaneInfo {
-        PaneInfo { id: id.into(), label: label.into(), tab: "t1".into() }
+        PaneInfo {
+            id: id.into(),
+            label: label.into(),
+            tab: "t1".into(),
+            terminal: String::new(),
+        }
     }
 
     /// A screen with nobody to ask: what a tty panel is, and what a herdr from

@@ -1966,6 +1966,10 @@ pub struct Reconciled {
     /// take, and a swept seat means raised hands stop being addressed to a
     /// workspace nobody is in.
     pub stood_down: usize,
+    /// Panel records forgotten for the same reason, and separate again: this
+    /// one costs nobody any work, it only stops `panels.json` pointing at panes
+    /// that belong to whoever took the workspace id next.
+    pub forgotten: usize,
 }
 
 /// Returns what it put right.
@@ -2051,7 +2055,9 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
     let mut out = Reconciled::default();
     let claims = store.claims();
     let governors = store.governors();
-    if claims.is_empty() && governors.is_empty() {
+    // A store with nothing claimed and no seat in it still has panel records to
+    // sweep, so the fast path out is only for the pass that is not reaping.
+    if claims.is_empty() && governors.is_empty() && !reap {
         return out;
     }
     let Ok(panes) = herdr::panes() else { return out };
@@ -2060,6 +2066,17 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
 
     if reap {
         let answered = answered_by_machine(workspaces.iter().map(|w| w.id.as_str()));
+
+        // `panels.json` is keyed on the workspace too, and until
+        // `robustness-090` nothing swept it at all: 147 entries and not one of
+        // them a workspace herdr still listed. Same guard, same evidence, one
+        // file over — and `crate::panel::reap_panels` is where the argument for
+        // sweeping it *here* rather than in `sync` is written down.
+        out.forgotten = crate::panel::reap_panels(
+            store,
+            &workspaces.iter().map(|w| w.id.clone()).collect::<Vec<_>>(),
+            &answered,
+        );
 
         // A seat whose workspace has gone is worse than no seat: every raised
         // hand under it goes on being addressed to a workspace nobody is

@@ -158,6 +158,10 @@ pub(crate) use run::{stty, term_size};
 // same closed stdin, same one implementation of what a verb means.
 pub(crate) use verbs::{inspect, pop_out, run_wsp};
 pub use install::{install, install_if_adopted, uninstall};
+// The record of which pane holds the panel is keyed on a workspace, so it is
+// swept where the other workspace-keyed records are — see `install::reap_panels`
+// for why that is `reconcile --reap` and not `sync`.
+pub(crate) use install::reap_panels;
 pub use run::run;
 // The same panel, drawn by a host that owns the cells — herdr's forked sidebar
 // today. See `surface.rs` for why the frame is built here and not there.

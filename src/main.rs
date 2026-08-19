@@ -494,6 +494,7 @@ fn main() {
             if args.has("reap") {
                 println!("ended {} claim(s) whose workspace is gone", r.reaped);
                 println!("emptied {} seat(s) whose workspace is gone", r.stood_down);
+                println!("forgot {} panel record(s) whose workspace is gone", r.forgotten);
             }
             0
         }

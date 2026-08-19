@@ -3324,6 +3324,22 @@ fast builds are a feature here, because a session-start hook runs this binary.
   One pane takes one claim there too: two claims naming the same
   workspace used to land on the same pane, and since claims are walked in id
   order the agent came back bound to the *older* task — the one it had left.
+- **A record of a pane carries what was behind it.** `panels.json` is which pane
+  holds the panel in each workspace, and nothing swept it: 147 entries on this
+  machine against six live workspaces, not one of them a workspace herdr still
+  listed. Rot on its own — but ids come round, so a stale `"w10": "w10:p2"`
+  matched a reissued `w10`'s second pane, and `panel install` reported a panel
+  in a workspace that had none while the record went on naming a stranger's
+  pane. So the value records herdr's `terminal_id` beside the pane id and the
+  test became *is this still the pane I recorded* rather than *does something
+  answer to that id* — rule 1 of `src/arrange.rs`, which is where the argument
+  is. A witness missing on either side is believed, since every record written
+  before the field has none. The sweep goes with the claims and the seats in
+  `wsp reconcile --reap`: the key is a workspace id, and a record destroyed on a
+  daemon tick is a record destroyed while herdr is still restoring a session.
+  What it never touches is that the panel was adopted on this machine at all —
+  that is a field of its own now, because it used to be spelled "the map is not
+  empty" and the first sweep would have turned the plugin's auto-install off.
 - **cwd is not identity.** Five workspaces share `~/git/Easter` and eleven share
   `~/claude/vst`. Resolution order is pin → binding → claim → cwd → workspace
   label, so `wsp pin <project>` is the override when a directory is ambiguous.
