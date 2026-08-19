@@ -915,13 +915,27 @@ pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
         // The branch is asked for under every name the task has had, for the
         // reason `Repos::branches` gives: a tree made before a renumbering is
         // on a branch of the old id, and that is the ref the reflog holds.
-        match repos.branches(&task.id).iter().find_map(|b| log.files(&trunk.dir, b)) {
-            None => out.unread.push(id.clone()),
-            Some(files) => {
-                for f in files {
-                    touched.entry(f).or_default().push(id.clone());
-                }
+        //
+        // **Every name, not the first one that answers.** A task renumbered
+        // between two lands has one land under each name, and stopping at the
+        // first reads the newer and drops the older — the same "one is all
+        // there is" mistake `Landings::files` had within a single name, one
+        // level up. A name that never landed answers `None` here legitimately,
+        // because it is a name and not a claim, so it is *no* name answering
+        // that means nobody could place the member.
+        let mut files: BTreeSet<String> = BTreeSet::new();
+        let mut placed = false;
+        for b in repos.branches(&task.id) {
+            if let Some(f) = log.files(&trunk.dir, &b) {
+                placed = true;
+                files.extend(f);
             }
+        }
+        if !placed {
+            out.unread.push(id.clone());
+        }
+        for f in files {
+            touched.entry(f).or_default().push(id.clone());
         }
     }
 
@@ -1174,6 +1188,44 @@ mod tests {
             o.shared,
             vec![("early.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
             "the file they shared is on wsp-1's first land, not its last"
+        );
+    }
+
+    /// The same arity fault one level up, where the branch is asked for under
+    /// every name the task has had. A member that lands, gets renumbered, and
+    /// lands again from a fresh tree has one entry under each name, and taking
+    /// the first name that answers drops the other land entirely.
+    #[test]
+    fn a_member_renumbered_between_two_lands_is_read_under_both_of_its_names() {
+        let (_env, store, repo) = scratch("renamed");
+        task(&store, "wsp-1", "review");
+        task(&store, "wsp-2", "review");
+
+        // The first land, under the id the tree was cut with.
+        let old = committed(&repo, "wsp-9"); // wsp-9.txt
+        std::fs::write(old.join("early.txt"), "mine\n").unwrap();
+        git_run(&old, &["add", "."]);
+        git_run(&old, &["commit", "--quiet", "-m", "early"]);
+        land(&repo, "wsp-9");
+        store.rename_tasks(&BTreeMap::from([("wsp-9".to_string(), "wsp-1".to_string())])).unwrap();
+
+        // And a second, from a tree cut under the new one — which is what
+        // `ensure` does for a task whose first tree is gone.
+        let new = committed(&repo, "wsp-1"); // wsp-1.txt, off the trunk
+        land(&repo, "wsp-1");
+
+        let second = committed(&repo, "wsp-2");
+        git_run(&second, &["rebase", "--quiet", "master"]);
+        std::fs::write(second.join("early.txt"), "theirs\n").unwrap();
+        git_run(&second, &["commit", "--quiet", "--all", "--message", "early too"]);
+        land(&repo, "wsp-2");
+        assert!(new.is_dir(), "both trees stood the whole time");
+
+        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        assert_eq!(
+            o.shared,
+            vec![("early.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
+            "the shared file is on the land the member made under its old id"
         );
     }
 
