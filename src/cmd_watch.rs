@@ -940,6 +940,9 @@ impl Source for Poll<'_> {
         let task_of = |id: &str| wip.tasks.iter().find(|t| t.id == id);
 
         let mut out: Vec<Signal> = Vec::new();
+        // The panes that have said why they stopped. Filled by (b2), read by
+        // (c), and the reason the two are in this order.
+        let mut spoken_for: BTreeSet<String> = BTreeSet::new();
 
         // (a) The store half: two statuses, both levels, both about work rather
         // than about an agent. Neither needs herdr, so both keep answering
@@ -1014,7 +1017,12 @@ impl Source for Poll<'_> {
                 None if self.scope.all => m.id.clone(),
                 None => continue,
             };
-            out.extend(asking(&m, &subject, &rows));
+            if let Some(sig) = asking(&m, &subject, &rows) {
+                if let Some(w) = &m.waiting {
+                    spoken_for.insert(w.pane.clone());
+                }
+                out.push(sig);
+            }
         }
 
         for r in rows.iter() {
@@ -1038,6 +1046,19 @@ impl Source for Poll<'_> {
                     &format!("{} · stopped on a prompt only a person can answer — wsp peek <id>", r.pane),
                 )
                 .loud(),
+                // An agent that has said why it stopped is not also *stopped
+                // for a reason wsp cannot see*, which is all this reading ever
+                // was. Two lines about one agent is how a governor learns to
+                // skim — the judgement (d) already makes about `Quiet` — and
+                // here the weaker line is worse than redundant: its repair is
+                // `wsp tell`, and telling an agent that is waiting on
+                // `wsp answer` is `worklist-013` exactly, the answer going down
+                // the channel with no memory while the question stays open.
+                //
+                // Only this arm. A modal holding the keyboard is a different
+                // repair — one keypress, not a sentence — and an agent can be
+                // in one while a question of its own is standing.
+                _ if spoken_for.contains(&r.pane) => continue,
                 _ => Signal::new(
                     Kind::NeedsAPerson,
                     &t.id,
