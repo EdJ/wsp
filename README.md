@@ -3270,9 +3270,15 @@ tree made thirty seconds ago for an agent who has not typed yet looks like. A
 worklist supplies the one missing fact — a member of a group it has declared
 finished had an agent put on it and its work is on master — so `Why::Landed` is
 that same idle tree **plus evidence**, narrower than idle rather than broader.
-`wsp worklist go` sweeps the group behind the barrier it just passed, `--keep`
-opts out, and `--sweep` and `wsp doctor` read the same licence off any running
-worklist. Uncommitted work still stops it, and a member still holding its claim
+`wsp worklist go` sweeps every group behind the barrier it just passed, and
+`--sweep` and `wsp doctor` read the same licence off any running worklist.
+**`--keep` defers rather than opts out** and that is chosen rather than
+overlooked: a group kept at one barrier is one more group behind at the next,
+where the licence for it is word for word the same, so sweeping only the group
+just crossed would strand exactly the trees somebody was careful about. What
+that costs is paid by saying it — `go` names the trees it is taking from groups
+passed earlier, because a `--keep` that quietly stops mattering one barrier
+later is the surprise the flag exists to prevent. Uncommitted work still stops it, and a member still holding its claim
 is named with the `wsp despawn` to run rather than swept: an agent still holding
 its claim is an agent still in the room.
 

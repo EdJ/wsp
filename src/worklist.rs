@@ -208,6 +208,18 @@ impl Standing {
     }
 }
 
+/// A member of a group behind the position, and which group that was.
+///
+/// The ordinal is a *position* and not an id — it is rewritten whenever a group
+/// is inserted above it, which is why a log line names members rather than
+/// numbers — so it is carried on an answer computed now and never written down.
+/// It is here for one reason: see [`sweep`] and what it costs `--keep`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Behind {
+    pub group: usize,
+    pub member: Standing,
+}
+
 /// Where a worklist is up to.
 ///
 /// The ordinal is 1-based because it is the number written in the file and
@@ -238,7 +250,11 @@ pub struct Position {
     /// was used once, or one that began before any of this existed, would
     /// otherwise leave trees that nothing ever comes back for. It costs nothing
     /// — these members were read on the way past.
-    pub passed: Vec<Standing>,
+    ///
+    /// Each one says which group it was in, and that ordinal exists for exactly
+    /// one reason: it is what lets [`sweep`] tell a caller that it is about to
+    /// take trees an earlier `--keep` spared. See that function.
+    pub passed: Vec<Behind>,
     /// Which of the two questions was asked.
     ///
     /// Carried so that [`sweep`] can refuse the free answer. `Settled` is a
@@ -277,13 +293,13 @@ impl Position {
 pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
     let groups = w.groups();
     let mut repos = Repos::new(store);
-    let mut passed: Vec<Standing> = Vec::new();
+    let mut passed: Vec<Behind> = Vec::new();
     for (i, g) in groups.iter().enumerate() {
         let members = group(store, &mut repos, g, reading);
         if !members.iter().all(Standing::finished) {
             return Position { at: Some(i + 1), of: groups.len(), members, passed, reading };
         }
-        passed.extend(members);
+        passed.extend(members.into_iter().map(|member| Behind { group: i + 1, member }));
     }
     Position { at: None, of: groups.len(), members: Vec::new(), passed, reading }
 }
@@ -362,6 +378,42 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
 /// here rather than quietly re-read, because re-reading it would put a second
 /// computation under the destructive half that can disagree with the first.
 ///
+/// # `--keep` defers, it does not opt out, and the caller must say so
+///
+/// The caller's `--keep` is simply not calling this. That reads as an opt-out
+/// and it is not one, because this sweeps **every** group behind the position
+/// rather than only the one just crossed. So a barrier passed with `--keep`
+/// spares its trees, and the *next* `go` takes them, because by then that group
+/// is one more group behind and the licence for it is word for word the same:
+///
+/// ```text
+/// barrier 1, --keep   nothing swept
+/// barrier 2, normal   group 1 and group 2 both go
+/// ```
+///
+/// That is a real cost and it is chosen rather than overlooked. Sweeping only
+/// the group just crossed would leave a `--keep`ed group's trees with nothing
+/// that ever comes back for them — the 18-worktree finding, reintroduced by the
+/// flag meant to be careful. Making `--keep` *sticky* would need a written mark
+/// on a group saying "kept", which is a field that can go stale on a record
+/// whose whole design is that its position is derived and never written, and it
+/// would still leak the trees at the end.
+///
+/// What is not acceptable is doing it quietly: somebody who kept a tree in
+/// order to go and look at it loses it one barrier later without being told,
+/// which is the failure `--keep` exists to prevent, delayed by one group. So
+/// [`Sweep::earlier`] names exactly those trees and **the caller is obliged to
+/// print them** — "sweeping 6 trees, 2 of them from groups passed earlier" is
+/// the whole of the fix, and it arrives where the decision is being made. The
+/// argument for sweeping automatically is that a manual procedure gets
+/// abandoned; the answer to that is not to make the automatic one quieter.
+///
+/// What `--keep` still buys is real, and it is worth being clear that no work is
+/// at stake either way: a removed tree comes back with `wsp checkout <id>`,
+/// because `remove` deletes the branch with `-d` and git refuses that unless
+/// the work is merged, and uncommitted work stops the removal outright. `--keep`
+/// buys the convenience of looking, for one barrier.
+///
 /// Why this is automatic at all, since it is the question somebody will ask:
 /// it was manual for two nights and happened zero times in them, leaving 18
 /// worktrees and 19 orphaned workspaces in one of them. A procedure run by hand
@@ -378,24 +430,49 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
 /// still named by [`dangling`], which is a different question and a different
 /// moment.
 #[allow(dead_code)]
-pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<cmd_checkout::Swept, String> {
+pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
     if p.reading != Reading::Landed {
         return Err("a tree is removed on the landed reading and never on the settled one".into());
     }
     let mut repos = Repos::new(store);
     let mut members = Vec::new();
-    for s in &p.passed {
-        let Some(project) = store.task(&s.id).and_then(|t| t.project) else { continue };
+    for b in &p.passed {
+        let Some(project) = store.task(&b.member.id).and_then(|t| t.project) else { continue };
         let Some(trunk) = repos.of(&project) else { continue };
         members.push(cmd_checkout::Passed {
-            task: s.id.clone(),
+            task: b.member.id.clone(),
             trunk: trunk.dir,
             trunk_branch: trunk.branch,
         });
     }
     let closed = cmd_checkout::finished(store);
     let occupied = cmd_checkout::Occupied::now(store);
-    Ok(cmd_checkout::sweep_passed(&members, &closed, &|t, d| occupied.of(t, d), dry))
+    let swept = cmd_checkout::sweep_passed(&members, &closed, &|t, d| occupied.of(t, d), dry);
+
+    // The group this barrier is the far side of. `at` is the first group not
+    // finished, so the one just crossed is the one before it — and when nothing
+    // is left, it is the last group there is.
+    let crossed = p.at.map(|a| a - 1).unwrap_or(p.of);
+    let earlier = swept
+        .removed
+        .iter()
+        .filter(|t| p.passed.iter().any(|b| &&b.member.id == t && b.group < crossed))
+        .cloned()
+        .collect();
+    Ok(Sweep { swept, earlier })
+}
+
+/// What one barrier's sweep did, and the part of it the caller has to say out
+/// loud.
+#[allow(dead_code)]
+pub struct Sweep {
+    /// What was removed, what branch outlived its tree, and what was left
+    /// standing and why — [`cmd_checkout::sweep_passed`]'s own answer.
+    pub swept: cmd_checkout::Swept,
+    /// The removed trees that belonged to a group passed *before* the barrier
+    /// just crossed. Named separately because these are the ones an earlier
+    /// `--keep` spared, and the caller owes the reader a sentence about them.
+    pub earlier: Vec<String>,
 }
 
 /// Every task a *running* worklist has passed, and the ids those tasks used to
@@ -419,8 +496,9 @@ pub fn passed_by_running(store: &Store) -> BTreeSet<String> {
     let renamed = store.renamed_ids();
     for w in &running {
         for s in position(store, w, Reading::Landed).passed {
-            out.extend(renamed.iter().filter(|(_, to)| *to == s.id.as_str()).map(|(from, _)| from.clone()));
-            out.insert(s.id);
+            let id = s.member.id;
+            out.extend(renamed.iter().filter(|(_, to)| *to == id.as_str()).map(|(from, _)| from.clone()));
+            out.insert(id);
         }
     }
     out
@@ -905,15 +983,64 @@ mod tests {
 
         let p = position(&store, &w, Reading::Landed);
         assert_eq!(p.at, Some(2), "the barrier is where it should be");
-        assert_eq!(p.passed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["wsp-1"]);
+        assert_eq!(p.passed.iter().map(|b| b.member.id.as_str()).collect::<Vec<_>>(), ["wsp-1"]);
+        assert_eq!(p.passed[0].group, 1, "and it remembers which group it was in");
 
         let out = sweep(&store, &p, false).expect("the landed reading licenses it");
-        assert_eq!(out.removed, ["wsp-1"]);
+        assert_eq!(out.swept.removed, ["wsp-1"]);
+        assert!(out.earlier.is_empty(), "the group just crossed is not an earlier one");
         assert!(!repo.join(cmd_checkout::WORKTREES).join("wsp-1").exists(), "the passed tree is still here");
         assert!(
             repo.join(cmd_checkout::WORKTREES).join("wsp-2").join(".git").exists(),
             "a member of the group being waited on was swept"
         );
+    }
+
+    /// What `--keep` actually buys, asserted rather than assumed, because it is
+    /// the half of the sweep that is easy to believe wrongly. Keeping a group's
+    /// trees at one barrier does not keep them: the next barrier takes them,
+    /// since by then that group is one further behind and the licence is word
+    /// for word the same. So the flag **defers**, and the only thing that makes
+    /// that honest is `earlier` naming the trees a caller has to mention —
+    /// somebody who kept a tree to go and look at it must not lose it in
+    /// silence one group later.
+    #[test]
+    fn keeping_a_groups_trees_at_one_barrier_defers_them_to_the_next() {
+        let (_env, store, repo) = scratch("keep");
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            task(&store, id, "review");
+        }
+        let w = list("- 1  wsp-1\n- 2  wsp-2\n- 3  wsp-3\n");
+        let worktrees = repo.join(cmd_checkout::WORKTREES);
+        // All three trees up front, because a member with no branch at all is a
+        // member nothing has run for — worklist-002's own distinction — and the
+        // barrier would settle on the store rather than on git.
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            committed(&repo, id);
+        }
+
+        // Barrier 1. `--keep` is the caller not calling us at all, so nothing
+        // happens — which is exactly what the flag promises, at this barrier.
+        land(&repo, "wsp-1");
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.at, Some(2), "group 1 has landed and group 2 has not");
+        assert!(worktrees.join("wsp-1").join(".git").exists(), "nobody swept anything");
+
+        // Barrier 2, passed without it. Group 1's tree goes too, because by now
+        // it is one more group behind and the licence for it is the same — and
+        // it is named apart from group 2's, which is the sentence the caller
+        // owes whoever kept it in order to go and look at it.
+        //
+        // `wsp land` rebases before it fast-forwards, and so does this: the
+        // trunk moved when group 1 landed.
+        git_run(&worktrees.join("wsp-2"), &["rebase", "--quiet", "master"]);
+        land(&repo, "wsp-2");
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.at, Some(3), "the barrier moved on");
+        let out = sweep(&store, &p, false).expect("the landed reading licenses it");
+        assert_eq!(out.swept.removed, ["wsp-1", "wsp-2"], "the deferred tree did not go with this one");
+        assert_eq!(out.earlier, ["wsp-1"], "and the caller cannot say which one it kept last time");
+        assert!(worktrees.join("wsp-3").join(".git").exists(), "the group being waited on was swept");
     }
 
     /// The one refusal that is about the *reading* rather than the tree, and it
