@@ -10,6 +10,14 @@
 //! happening inside the hour while the membership stayed true. A status you can
 //! compute cannot go stale, and this module is the computation.
 //!
+//! It also holds the one act in this design that *destroys* anything —
+//! [`sweep`], which removes the working trees of the members a passed group
+//! leaves behind. That lives here rather than beside the sweep it extends
+//! because the licence and the barrier are one fact: the evidence that opens a
+//! barrier is the evidence that clears the trees behind it, and two
+//! computations under one `rm -rf` can disagree. The argument for it is on
+//! [`sweep`], not repeated here.
+//!
 //! # Two readings, and they are deliberately allowed to disagree
 //!
 //! | | reads | costs | asked by |
