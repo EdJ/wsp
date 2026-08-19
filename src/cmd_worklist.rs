@@ -93,7 +93,13 @@ fn worklist_or_why(store: &Store, needle: &str) -> Result<Worklist, String> {
     if names.is_empty() {
         return Err(format!("wsp: no worklist `{needle}` — there are none yet, and `wsp worklist new {needle} \"title\"` makes one"));
     }
-    Err(format!("wsp: no worklist matching `{needle}` — there is {}", names.join(", ")))
+    // Named rather than counted, and truncated rather than wrapped: with three
+    // lists the names *are* the answer, and with thirty the first few plus
+    // `worklist ls` is.
+    Err(format!(
+        "wsp: no worklist matching `{needle}` — there is {}",
+        util::truncate(&names.join(", "), 60)
+    ))
 }
 
 // ---- the window -------------------------------------------------------
@@ -478,6 +484,11 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
     let win = window(store, &w);
     let mut gone: Vec<String> = Vec::new();
     let mut emptied = 0;
+    // The window is read once and the ordinals shift underneath it, which is
+    // safe rather than lucky: a group is only ever dropped after it has passed
+    // the check, so every drop is ahead of the position, and dropping a group
+    // ahead of the position renumbers only the groups after it — which are
+    // ahead of it too. Nothing frozen can be pulled into reach.
     for needle in &typed {
         // Against the membership rather than against the store, and the store
         // second. A member the store has never heard of is exactly the one this

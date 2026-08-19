@@ -3348,6 +3348,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
 | `src/cmd_machine.rs` | the machines agents can be run on |
+| `src/cmd_worklist.rs` | composing a queue of groups, and the window a hand may still edit it in |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |
