@@ -1494,8 +1494,8 @@ fn end_work(
                 "released": released,
                 "tree": match &tree {
                     Tree::Absent => serde_json::Value::Null,
-                    Tree::Removed { path, branch_kept } =>
-                        json!({ "removed": true, "path": path, "branch_kept": branch_kept }),
+                    Tree::Removed { path, kept } =>
+                        json!({ "removed": true, "path": path, "branch_kept": kept.is_some(), "branch": kept }),
                     Tree::Kept { path, why } =>
                         json!({ "removed": false, "path": path, "why": why }),
                 },
@@ -1518,11 +1518,13 @@ fn end_work(
             // every reader learns to skip, including on the despawns where the
             // next two matter.
             Tree::Absent => {}
-            Tree::Removed { path, branch_kept } => {
+            Tree::Removed { path, kept } => {
                 println!("  {}", p.dim(&format!("removed {path}")));
-                if *branch_kept {
-                    let name = task.as_deref().unwrap_or_default();
-                    println!("  {}", p.yellow(&format!("branch {name} kept — it has commits the trunk has not")));
+                // The branch as the tree named it, not as the task is named
+                // now: a renumbered task's work is on a branch of the old id,
+                // and this line is the only thing that says where it went.
+                if let Some(branch) = kept {
+                    println!("  {}", p.yellow(&format!("branch {branch} kept — it has commits the trunk has not")));
                 }
             }
             // Not dim. This is the one line here that is somebody's to act on,

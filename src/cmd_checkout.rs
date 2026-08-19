@@ -488,18 +488,45 @@ fn judge(repo: &Path, onto: &str, task: &str, dir: &Path, closed: bool, passed: 
 /// commits the trunk has not got, and that is work rather than litter. Left
 /// behind, `checkout` finds it again and rebuilds the tree from it, which is
 /// what makes removing a tree recoverable and reopening a task cheap.
-fn remove(repo: &Path, dir: &Path, task: &str) -> Removed {
+///
+/// **The branch is read off the tree, before the tree goes, rather than taken
+/// from the task's name** — [`judge`]'s rule, arriving here late, and read in
+/// this one function rather than asked of each of its four callers. A tree made
+/// before its task was renumbered is on a branch of the id it had then, so
+/// `branch -d <task>` named a branch that does not exist: it deleted nothing
+/// and reported *kept* — "it has commits the trunk has not" — over a branch
+/// that had landed everything it held, on every removal of a renumbered task's
+/// tree.
+///
+/// What that leaves behind is worse than the false line, and it is the one part
+/// reading the name here does not repair. [`checkout_dir`] finds an old id only
+/// while its *directory* stands, so once the tree is gone `wsp checkout` under
+/// the new id cuts a fresh branch at the trunk tip and unlanded commits are
+/// unreachable through wsp — which is exactly the recovery [`discard`] declines
+/// to refuse on the strength of. So the name is carried out to the caller: it
+/// cannot mend the lookup, and it does make the line that says where the work
+/// went name a branch somebody can check out.
+fn remove(repo: &Path, dir: &Path) -> Removed {
     let existed = dir.exists();
+    // Before the removal: a tree that has gone cannot be asked what it was on.
+    // `None` is a detached HEAD, where there is no branch to keep and nothing
+    // to delete — [`judge`] refuses such a tree, so only `--rm` reaches here
+    // with one.
+    let branch = trunk_branch(dir);
     let _ = git(repo, &["worktree", "remove", "--force", &dir.display().to_string()]);
     let _ = std::fs::remove_dir_all(dir);
     let _ = git(repo, &["worktree", "prune"]);
-    let branch_kept = git(repo, &["branch", "-d", task]).is_none();
-    Removed { existed, branch_kept }
+    let kept = branch.filter(|b| git(repo, &["branch", "-d", b]).is_none());
+    Removed { existed, kept }
 }
 
 struct Removed {
     existed: bool,
-    branch_kept: bool,
+    /// The branch that outlived the tree, named rather than flagged: it is what
+    /// a reader has to type to get the work back, and it is not always the
+    /// task's id. `None` is a branch that went with the tree, having nothing
+    /// the trunk had not got.
+    kept: Option<String>,
 }
 
 /// What one sweep did, and what it declined to do.
@@ -507,8 +534,10 @@ struct Removed {
 pub(crate) struct Swept {
     /// Tasks whose trees went.
     pub removed: Vec<String>,
-    /// Tasks whose branch outlived the tree because it still holds commits the
-    /// trunk has not got.
+    /// The branches that outlived their tree because they still hold commits
+    /// the trunk has not got. Branch names and not task ids: a renumbered task
+    /// works on a branch of the id it had then, and this is the name somebody
+    /// getting the work back has to type.
     pub branches: Vec<String>,
     /// Tasks left alone, and why. Reported rather than silent: a sweep that
     /// quietly skips things is one nobody can tell from a sweep that found
@@ -560,8 +589,8 @@ pub(crate) fn sweep(
             continue;
         }
         if !dry {
-            if remove(root, &dir, &s.task).branch_kept {
-                out.branches.push(s.task.clone());
+            if let Some(branch) = remove(root, &dir).kept {
+                out.branches.push(branch);
             }
         }
         out.removed.push(s.task);
@@ -635,8 +664,8 @@ pub(crate) fn sweep_passed(
         match judge(&m.trunk, &m.trunk_branch, &m.task, &dir, closed(&m.task), true) {
             Err(why) => out.kept.push((m.task.clone(), why)),
             Ok(_) => {
-                if !dry && remove(&m.trunk, &dir, &m.task).branch_kept {
-                    out.branches.push(m.task.clone());
+                if let Some(branch) = (!dry).then(|| remove(&m.trunk, &dir).kept).flatten() {
+                    out.branches.push(branch);
                 }
                 out.removed.push(m.task.clone());
             }
@@ -703,8 +732,10 @@ pub(crate) enum Tree {
     /// No tree for this task in any repository it could be in. The ordinary
     /// answer for work that never took a checkout.
     Absent,
-    /// Gone, and whether the branch outlived it.
-    Removed { path: String, branch_kept: bool },
+    /// Gone, and the branch that outlived it, if one did — named, because it
+    /// is what somebody has to type to get the work back and it is not always
+    /// the task's id.
+    Removed { path: String, kept: Option<String> },
     /// Left standing, and why — always a reason the caller can act on.
     Kept { path: String, why: String },
 }
@@ -750,7 +781,7 @@ pub(crate) fn discard(
             why: format!("uncommitted work in it — `wsp checkout {task} --rm --force` to lose it"),
         };
     }
-    Tree::Removed { path, branch_kept: remove(&w.repo, &w.dir, task).branch_kept }
+    Tree::Removed { path, kept: remove(&w.repo, &w.dir).kept }
 }
 
 /// Whether a tree has anything uncommitted, tracked or not.
@@ -952,6 +983,27 @@ impl Where {
     fn searched(&self) -> String {
         self.looked.iter().map(|t| util::contract(t)).collect::<Vec<_>>().join(" or ")
     }
+
+    /// The branch the work is on: **read off the tree, never assumed to be the
+    /// task's name**, and `None` for a tree that is detached or not there yet.
+    ///
+    /// [`checkout_dir`] resolves the *directory* through a renumbering — a tree
+    /// made before the id changed keeps the old name — and the branch in it is
+    /// of that old name too. Both verbs here were asking [`ahead`] about
+    /// `task`, and `ahead` on a branch that does not exist answers the same
+    /// empty list as one that has landed: `land` printed `nothing to land`,
+    /// exited 0 and left the work on the branch, and `checkout` dropped the
+    /// `ahead N commit(s) to land` line that is how an agent knows to type it.
+    /// [`judge`] has read the branch this way since `worklist-002`, calling the
+    /// conflation the one thing that predicate is written to avoid; these are
+    /// the callers nobody told.
+    ///
+    /// Asked of git each time rather than resolved in [`pick`], because the
+    /// answer changes underneath a `Where`: `checkout` calls [`ensure`], which
+    /// is what creates the branch this then reads.
+    fn on(&self) -> Option<String> {
+        trunk_branch(&self.dir)
+    }
 }
 
 /// The repositories a tree for `task` could be in, in the order to try them.
@@ -1077,13 +1129,14 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
             );
             return 2;
         }
-        let r = remove(&w.repo, &w.dir, &w.task);
+        let r = remove(&w.repo, &w.dir);
         if args.json() {
             println!(
                 "{}",
                 json!({
                     "removed": r.existed,
-                    "branch_kept": r.branch_kept,
+                    "branch_kept": r.kept.is_some(),
+                    "branch": r.kept,
                     "path": util::contract(&w.dir),
                     "looked": w.looked.iter().map(|t| util::contract(t)).collect::<Vec<_>>(),
                 })
@@ -1101,8 +1154,8 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
             );
         } else {
             println!("removed {}", util::contract(&w.dir));
-            if r.branch_kept {
-                println!("{}", p.yellow(&format!("branch {} kept — it has commits the trunk has not", w.task)));
+            if let Some(branch) = &r.kept {
+                println!("{}", p.yellow(&format!("branch {branch} kept — it has commits the trunk has not")));
             }
         }
         return 0;
@@ -1116,7 +1169,9 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    let commits = ahead(&w.repo, &w.branch, &w.task);
+    // After [`ensure`], so a tree it has just made names its own new branch.
+    let on = w.on();
+    let commits = on.as_deref().map(|b| ahead(&w.repo, &w.branch, b)).unwrap_or_default();
 
     if args.json() {
         println!(
@@ -1124,7 +1179,7 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
             json!({
                 "task": w.task,
                 "path": util::contract(&w.dir),
-                "branch": w.task,
+                "branch": on,
                 "from": w.branch,
                 "new": fresh,
                 "ahead": commits.len(),
@@ -1259,8 +1314,22 @@ pub fn land(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {} has uncommitted work — commit it first", util::contract(&w.dir));
         return 2;
     }
-    if ahead(&w.repo, &w.branch, &w.task).is_empty() {
-        println!("{} {}", p.dim("nothing to land —"), p.dim(&format!("{} is already in {}", w.task, w.branch)));
+    // The branch is read off the tree, which is the whole of `worklist-025`:
+    // `w.task` is the *current* id and the tree may be on a branch of the id it
+    // had before a `wsp mv` renumbered it. See [`Where::on`] — asking `ahead`
+    // for a branch that does not exist got the answer for one that had landed,
+    // and this printed success over work still sitting on a branch. A detached
+    // tree is refused rather than guessed at, [`judge`]'s rule for the same
+    // reason: there is no branch here to compare with the trunk.
+    let Some(on) = w.on() else {
+        eprintln!(
+            "wsp: {} is on a detached HEAD — nothing here names a branch to land",
+            util::contract(&w.dir)
+        );
+        return 2;
+    };
+    if ahead(&w.repo, &w.branch, &on).is_empty() {
+        println!("{} {}", p.dim("nothing to land —"), p.dim(&format!("{on} is already in {}", w.branch)));
         return 0;
     }
 
@@ -1277,11 +1346,11 @@ pub fn land(store: &Store, args: &Args) -> i32 {
                 util::contract(&w.dir)
             ));
         }
-        let landed = ahead(&w.repo, &w.branch, &w.task);
+        let landed = ahead(&w.repo, &w.branch, &on);
         // `--ff-only` in the trunk rather than a push: the trunk is a checked-out
         // working tree, and this is the one form of update that refuses rather
         // than silently overwriting a file somebody has open there.
-        git_ok(&w.trunk, &["merge", "--ff-only", "--quiet", &w.task])
+        git_ok(&w.trunk, &["merge", "--ff-only", "--quiet", &on])
             .map_err(|e| format!("{} would not fast-forward: {e}", util::contract(&w.trunk)))?;
         Ok(landed)
     });
@@ -1682,6 +1751,93 @@ mod tests {
         assert!(wt.join("mine.txt").exists(), "the work is gone");
     }
 
+    /// The same conflation, with `land` on the end of it rather than a sweep —
+    /// `worklist-025`, found by driving it: an inbox task takes a tree, commits,
+    /// is filed with `wsp mv` and renumbered, and `wsp land` printed `nothing to
+    /// land`, exited 0 and left the work on the branch.
+    ///
+    /// Asserted as the two answers themselves, because the difference between
+    /// them is the whole defect: the id says landed and the tree says one
+    /// commit outstanding, about the same work at the same moment.
+    #[test]
+    fn landing_a_renumbered_task_reads_the_branch_off_the_tree_and_not_off_the_id() {
+        let (_env, dir) = scratch("land-renumbered");
+        repo(&dir);
+        // The tree an agent took and committed in under the id it had then.
+        let wt = checkout_dir(&dir, "inbox-001");
+        ensure(&dir, &wt, "inbox-001", "master").unwrap();
+        std::fs::write(wt.join("work.txt"), "mine\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", "the work"]);
+        std::fs::write(Store::open().ids_path(), r#"{"inbox-001":"proj-001"}"#).unwrap();
+
+        // `land` resolves the tree by the new id and finds the old one, which is
+        // the half that already worked.
+        let w = pick(vec![dir.clone()], "proj-001").expect("the renumbered tree");
+        assert!(w.dir.ends_with("inbox-001"), "the tree was not resolved through the renaming: {:?}", w.dir);
+
+        assert!(
+            ahead(&w.repo, &w.branch, &w.task).is_empty(),
+            "the id names a branch that exists, so this test proves nothing"
+        );
+        let on = w.on().expect("the tree names its own branch");
+        assert_eq!(on, "inbox-001");
+        assert_eq!(ahead(&w.repo, &w.branch, &on).len(), 1, "the work the id reported as landed");
+
+        // And the rest of what `land` does, driven with that name: the trunk
+        // fast-forwards onto the branch the tree is really on.
+        git_ok(&wt, &["rebase", &w.branch]).unwrap();
+        git_ok(&w.trunk, &["merge", "--ff-only", "--quiet", &on]).unwrap();
+        assert!(dir.join("work.txt").exists(), "the work still did not reach the trunk");
+    }
+
+    /// The other end of the same fault, and the more expensive one: `remove`
+    /// deleted `git branch -d <task>`, which for a renumbered task is a name no
+    /// branch has. So a tree went, the branch it was on stayed under the old
+    /// name with nothing pointing at it — [`checkout_dir`] only finds an old id
+    /// while its *directory* stands — and the next `wsp checkout` cut a fresh
+    /// branch at the trunk tip. The commits were still in the repository and
+    /// unreachable through wsp, which is exactly what [`discard`] declines to
+    /// refuse on the strength of the branch bringing them back.
+    #[test]
+    fn ending_a_renumbered_tasks_work_names_the_branch_the_tree_was_really_on() {
+        let (_env, dir) = scratch("discard-renumbered");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "inbox-002");
+        ensure(&dir, &wt, "inbox-002", "master").unwrap();
+        std::fs::write(wt.join("unlanded.txt"), "mine\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", "never landed"]);
+        std::fs::write(Store::open().ids_path(), r#"{"inbox-002":"proj-002"}"#).unwrap();
+
+        match discard(vec![dir.clone()], "proj-002", &|_| None) {
+            Tree::Removed { kept, .. } => assert_eq!(
+                kept.as_deref(),
+                Some("inbox-002"),
+                "the branch holding the work was not named, so nobody can get it back"
+            ),
+            other => panic!("{}", named(&other)),
+        }
+        assert!(
+            git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/inbox-002"]).is_some(),
+            "the branch went and took the only copy of the work with it"
+        );
+
+        // And the same tree once its work is on the trunk: the branch goes with
+        // the directory, rather than being reported as kept forever under a
+        // name that never existed.
+        ensure(&dir, &wt, "inbox-002", "master").unwrap();
+        git_ok(&dir, &["merge", "--ff-only", "--quiet", "inbox-002"]).unwrap();
+        match discard(vec![dir.clone()], "proj-002", &|_| None) {
+            Tree::Removed { kept, .. } => assert_eq!(kept, None, "a landed branch was kept: {kept:?}"),
+            other => panic!("{}", named(&other)),
+        }
+        assert!(
+            git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/inbox-002"]).is_none(),
+            "the branch outlived work that is on the trunk"
+        );
+    }
+
     /// The two refusals a barrier may not talk its way past, and the reason
     /// each is there. Uncommitted work is the one thing here that does not come
     /// back, so it stops the removal however good the evidence is. An agent
@@ -1769,7 +1925,7 @@ mod tests {
         let wt = checkout_dir(&dir, "t-1");
         ensure(&dir, &wt, "t-1", "master").unwrap();
         match discard(vec![dir.clone()], "t-1", &nobody) {
-            Tree::Removed { branch_kept, .. } => assert!(!branch_kept, "a branch level with the trunk was kept"),
+            Tree::Removed { kept, .. } => assert!(kept.is_none(), "a branch level with the trunk was kept: {kept:?}"),
             other => panic!("an idle tree survived the ending: {}", named(&other)),
         }
         assert!(!wt.exists(), "the directory is still there after a Removed");
@@ -1831,7 +1987,7 @@ mod tests {
         run(&wt, &["commit", "--quiet", "-m", "never landed"]);
 
         match discard(vec![dir.clone()], "t-3", &|_| None) {
-            Tree::Removed { branch_kept, .. } => assert!(branch_kept, "the commits were not recoverable"),
+            Tree::Removed { kept, .. } => assert_eq!(kept.as_deref(), Some("t-3"), "the commits were not recoverable"),
             other => panic!("{}", named(&other)),
         }
         ensure(&dir, &wt, "t-3", "master").unwrap();
