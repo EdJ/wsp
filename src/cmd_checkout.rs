@@ -253,19 +253,85 @@ fn former_ids(task: &str) -> Vec<String> {
         .collect()
 }
 
-/// Make this task's tree if it has none. Returns whether it was new.
+/// A branch left behind by a renumbering, still holding work.
+///
+/// Named and never taken. [`ensure`] cuts the tree it was asked for regardless;
+/// this is the sentence that goes with it.
+struct Orphan {
+    /// A former id of the task, which is the branch its work is on.
+    branch: String,
+    /// How many commits it has that the trunk has not. Never zero — a branch
+    /// with nothing outstanding is not worth a reader's attention, and saying
+    /// so about every renumbered task would train them past the line that
+    /// matters.
+    commits: usize,
+}
+
+/// What making a tree found.
+///
+/// Two answers rather than one because the second is a *finding* and not a
+/// result: the tree was made either way, and [`Orphan`] is what nobody was
+/// looking at.
+struct Made {
+    /// Whether the tree was new.
+    fresh: bool,
+    orphan: Option<Orphan>,
+}
+
+/// The commits a former id's branch holds that the trunk has not, if there is
+/// one and it holds any.
+///
+/// The looking half of `worklist-027`, and the whole of it: **adopting work is
+/// asked for, never automatic** — the symmetric rule to `robustness-090` d1's
+/// *destroying a record is asked for, never automatic*, and settled on this
+/// task by two seats independently. A former id's branch may be work somebody
+/// deliberately abandoned, and a task refiled because its first attempt was
+/// wrong is a *common* reason to renumber, so reviving it under the new id
+/// would put commits nobody chose to carry forward into a diff nobody expects.
+/// A lost branch is discovered; a silently adopted one is discovered later.
+///
+/// So the answer is a sentence and never an action. [`checkout_dir`] resolves
+/// a renumbered task's *directory* through the store and can be silent about
+/// it because it cannot be wrong — there is one tree, it is where the work is,
+/// and reusing it loses nothing. A branch is ambiguous in exactly the way a
+/// directory is not, and nothing in the store records which kind it is.
+///
+/// Only paid for when a tree is being made, and only past the first line for a
+/// task that has actually been renumbered: [`former_ids`] is empty for every
+/// task in a store that has never renamed anything, and that store has no file
+/// at all.
+fn orphan(repo: &Path, onto: &str, task: &str) -> Option<Orphan> {
+    former_ids(task).into_iter().find_map(|branch| {
+        // Asked before it is compared, because `ahead()` on a branch that does
+        // not exist answers the same empty list as one that has landed — the
+        // conflation `worklist-002` named and `worklist-025` chased through
+        // four call sites. Here it would silently drop the report.
+        git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])?;
+        let commits = ahead(repo, onto, &branch).len();
+        (commits > 0).then_some(Orphan { branch, commits })
+    })
+}
+
+/// Make this task's tree if it has none.
 ///
 /// The branch is created at the trunk's tip on first use and reused after, so
 /// an agent that comes back to a task after a `wsp release` finds its own
 /// commits rather than a fresh start.
-fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<bool, String> {
+///
+/// A renumbered task whose tree was swept is the one case where that promise
+/// fails, because the commits are on a branch of the id it had then and this
+/// cuts a fresh one at the trunk tip. It still does — see [`orphan`] for why
+/// adopting the old branch is the worse answer — but it no longer does it
+/// silently, and the finding rides out on [`Made`] rather than being printed
+/// from here, because two callers want it in two shapes.
+fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<Made, String> {
     // Before the early return, because the guard is a property of the
     // repository rather than of this tree: a second agent arriving at a tree
     // that already exists is exactly who it is for. See `crate::guard` for why
     // it is installed here and not asked for by a verb.
     crate::guard::ensure(repo);
     if dir.join(".git").exists() {
-        return Ok(false);
+        return Ok(Made { fresh: false, orphan: None });
     }
     // A directory left by a removed worktree, or a registration whose directory
     // is gone: both make `add` refuse, and both are what a cleanup step nobody
@@ -281,7 +347,10 @@ fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<bool, Strin
     } else {
         git_ok(repo, &["worktree", "add", "--quiet", "-b", task, &path, from])?;
     }
-    Ok(true)
+    // Looked for on both arms, and not only where a fresh branch is cut. A
+    // task renumbered after some of its work had already landed under the new
+    // id has both branches, and the old one is no less invisible for that.
+    Ok(Made { fresh: true, orphan: orphan(repo, from, task) })
 }
 
 /// The directory a workspace being opened on `task` should stand in.
@@ -297,6 +366,22 @@ fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<bool, Strin
 /// `None` is the honest answer to "nothing to isolate here": a root that is not
 /// a git repository, or a repository on a detached HEAD with no trunk to branch
 /// from. The caller opens the root itself and says so.
+///
+/// The two lines this prints are [`ensure`]'s finding rather than this
+/// function's business, and they are printed **here** rather than returned
+/// because this is the seam every tree that is not a `wsp checkout` is made
+/// through, and a finding each caller has to remember to report is a finding
+/// that goes unreported — robustness-010's lesson about rules an agent has to
+/// remember, applied to a caller. See [`orphan`] for what is being said and
+/// why nothing is done about it.
+///
+/// Where it lands, stated rather than assumed: `spawn` runs this in front of
+/// its own output, so whoever asked for the agent reads it. `wsp resume` calls
+/// it while building its picker and then clears the screen to draw, so the
+/// line is written and not seen — that path reaches this only as a *fallback*
+/// for a claim with no recorded cwd, and the same sentence is waiting on the
+/// next `wsp checkout` of the task, which is where somebody is actually
+/// deciding what to do with the work.
 pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
     let root = util::expand(root);
     let repo = toplevel(&root)?;
@@ -307,8 +392,27 @@ pub(crate) fn tree_for(root: &str, task: &str) -> Option<String> {
     // is git declining to put two agents on one task — the same thing the claim
     // guard declines a moment later, and a good reason to fall back to the root
     // rather than to fail the spawn.
-    ensure(&repo, &dir, task, &branch).ok()?;
+    let made = ensure(&repo, &dir, task, &branch).ok()?;
+    if let Some(o) = &made.orphan {
+        eprintln!(
+            "wsp: {task} was renumbered — branch {} still holds {} that {branch} has not, and this tree is not on it",
+            o.branch,
+            n_commits(o.commits)
+        );
+        eprintln!("wsp: nothing was taken from it — `git -C {} merge {}` if that work carries forward", util::contract(&dir), o.branch);
+    }
     Some(util::contract(&dir))
+}
+
+/// `n commits`, singular at one.
+///
+/// One reader-facing phrase in one place: every line that reports outstanding
+/// work counts the same thing and should count it the same way.
+fn n_commits(n: usize) -> String {
+    match n {
+        1 => "1 commit".to_string(),
+        n => format!("{n} commits"),
+    }
 }
 
 /// Why a tree is finished with.
@@ -465,8 +569,7 @@ fn judge(repo: &Path, onto: &str, task: &str, dir: &Path, closed: bool, passed: 
     };
     let commits = ahead(repo, onto, &branch);
     if !commits.is_empty() {
-        let n = if commits.len() == 1 { "1 commit".to_string() } else { format!("{} commits", commits.len()) };
-        return Err(format!("{n} on {branch} that {onto} has not got"));
+        return Err(format!("{} on {branch} that {onto} has not got", n_commits(commits.len())));
     }
     let why = if passed { Why::Landed } else { Why::Idle };
     let note = match why {
@@ -1211,13 +1314,14 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
     }
 
     let head = git(&w.trunk, &["rev-parse", "--short", &w.branch]).map(|s| s.trim().to_string()).unwrap_or_default();
-    let fresh = match ensure(&w.repo, &w.dir, &w.task, &w.branch) {
-        Ok(f) => f,
+    let made = match ensure(&w.repo, &w.dir, &w.task, &w.branch) {
+        Ok(m) => m,
         Err(e) => {
             eprintln!("wsp: {e}");
             return 1;
         }
     };
+    let fresh = made.fresh;
     // After [`ensure`], so a tree it has just made names its own new branch.
     let on = w.on();
     let commits = on.as_deref().map(|b| ahead(&w.repo, &w.branch, b)).unwrap_or_default();
@@ -1232,6 +1336,7 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
                 "from": w.branch,
                 "new": fresh,
                 "ahead": commits.len(),
+                "former": made.orphan.as_ref().map(|o| json!({ "branch": o.branch, "commits": o.commits })),
             })
         );
         return 0;
@@ -1245,6 +1350,24 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
     );
     if !commits.is_empty() {
         println!("{} {}", p.dim("ahead"), p.bold(&format!("{} commit(s) to land", commits.len())));
+    }
+    // Named and not taken — see [`orphan`]. Two lines because they are two
+    // different things: the first is a fact the reader did not have, the second
+    // is the one command that acts on it, and printing the command in the same
+    // breath as the fact is what makes this a visible choice rather than a
+    // warning. `--rm` already names the branch it keeps when a tree goes; this
+    // is the other end of that gap, at the moment the task is picked up again,
+    // which is the only moment somebody is guaranteed to be looking.
+    if let Some(o) = &made.orphan {
+        println!(
+            "{} {}",
+            p.dim("former"),
+            p.yellow(&format!("{} holds {} that {} has not — this tree is not on it", o.branch, n_commits(o.commits), w.branch))
+        );
+        println!(
+            "       {}",
+            p.dim(&format!("the id this task had before it was renumbered — `git merge {}` in the tree above takes it", o.branch))
+        );
     }
     println!("{} {}", p.dim("cd"), util::contract(&w.dir));
     0
@@ -1525,7 +1648,7 @@ mod tests {
         repo(&dir);
 
         let wt = checkout_dir(&dir, "t-1");
-        assert!(ensure(&dir, &wt, "t-1", "master").unwrap(), "the tree was not new");
+        assert!(ensure(&dir, &wt, "t-1", "master").unwrap().fresh, "the tree was not new");
         std::fs::write(wt.join("mine.txt"), "mine\n").unwrap();
         run(&wt, &["add", "mine.txt"]);
         run(&wt, &["commit", "--quiet", "-m", "mine"]);
@@ -1573,7 +1696,7 @@ mod tests {
         run(&wt, &["commit", "--quiet", "-m", "wip"]);
 
         git_ok(&dir, &["worktree", "remove", &wt.display().to_string()]).unwrap();
-        assert!(ensure(&dir, &wt, "t-3", "master").unwrap(), "the tree was not remade");
+        assert!(ensure(&dir, &wt, "t-3", "master").unwrap().fresh, "the tree was not remade");
         assert!(wt.join("wip.txt").exists(), "the work left on the branch did not come back");
     }
 
@@ -1914,6 +2037,52 @@ mod tests {
             git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/inbox-002"]).is_none(),
             "the branch outlived work that is on the trunk"
         );
+    }
+
+    /// `worklist-027`, the third and last of the renumbering conflations, and
+    /// the only one that is not a bug being fixed. A task takes a tree under
+    /// one id, commits, is renumbered, and the tree is swept: the commits are
+    /// on a branch of the old id, [`checkout_dir`] finds an old id only while
+    /// its *directory* stands, and reopening the task cuts a fresh branch at
+    /// the trunk tip. Both halves are asserted here because both are chosen —
+    /// **the branch is not adopted**, and it is **not left unmentioned**. See
+    /// [`orphan`] for why, and for the two seats that decided it independently.
+    #[test]
+    fn reopening_a_renumbered_task_whose_tree_went_names_the_branch_holding_its_work() {
+        let (_env, dir) = scratch("orphan-branch");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "inbox-003");
+        ensure(&dir, &wt, "inbox-003", "master").unwrap();
+        std::fs::write(wt.join("unlanded.txt"), "mine\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", "never landed"]);
+        std::fs::write(Store::open().ids_path(), r#"{"inbox-003":"proj-003"}"#).unwrap();
+
+        // The tree goes and the branch stays, which is `worklist-025`'s half.
+        assert_eq!(remove(&dir, &wt).kept.as_deref(), Some("inbox-003"), "the branch went with the tree");
+
+        // Reopening under the new id. A fresh branch at the trunk tip, and the
+        // work not in it: this is the loss, and it is deliberate — a task
+        // refiled because its first attempt was wrong is a common reason to
+        // renumber, so the old branch is quite likely work somebody abandoned.
+        let fresh = checkout_dir(&dir, "proj-003");
+        let made = ensure(&dir, &fresh, "proj-003", "master").unwrap();
+        assert!(made.fresh, "the tree was not new");
+        assert!(!fresh.join("unlanded.txt").exists(), "the abandoned branch was adopted");
+        assert_eq!(trunk_branch(&fresh).as_deref(), Some("proj-003"), "the tree is not on the new id's branch");
+
+        // And the finding that turns an invisible loss into a visible choice.
+        let o = made.orphan.expect("the branch holding the only copy of the work was not named");
+        assert_eq!(o.branch, "inbox-003");
+        assert_eq!(o.commits, 1);
+
+        // Nothing to say once that work is on the trunk. A line printed for
+        // every renumbered task is a line a reader learns to skip, including
+        // on the checkouts where it is the whole point.
+        let _ = remove(&dir, &fresh);
+        git_ok(&dir, &["merge", "--ff-only", "--quiet", "inbox-003"]).unwrap();
+        let made = ensure(&dir, &checkout_dir(&dir, "proj-003"), "proj-003", "master").unwrap();
+        assert!(made.orphan.is_none(), "a landed branch was reported as work nobody is looking at");
     }
 
     /// The two refusals a barrier may not talk its way past, and the reason
