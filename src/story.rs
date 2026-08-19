@@ -2357,6 +2357,57 @@ mod tests {
         );
     }
 
+    /// A popover goes away when you click off it, and the word that opened it
+    /// is off it.
+    ///
+    /// Three clicks, because the three are different rules that a single
+    /// "click closes it" would blur: the tree behind is a dismissal, the word
+    /// in the footer is a dismissal *and* is what makes `menu` read as a
+    /// toggle, and the box's own frame is neither — an edge you can fall
+    /// through is an edge nobody trusts.
+    #[test]
+    fn a_click_off_the_menu_puts_it_away_and_the_frame_is_not_off_it() {
+        let w = world();
+        let click = |x: usize, y: usize| panel::Input::Key(Key::Click { x, y });
+        let mut here = true;
+
+        let up = |view: &mut panel::View, ui: &mut panel::Ui| {
+            panel::apply_key(Key::Char('q'), ui, view);
+            assert_eq!(view.mode_name(), "the menu", "the menu is up");
+        };
+
+        // The tree, well away from the box.
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        up(&mut view, &mut ui);
+        panel::apply_input(click(1, 3), &mut ui, &mut view, W, H, &mut here);
+        assert_eq!(view.mode_name(), "browse", "a click on the tree puts the menu away");
+
+        // The word in the footer, which is what opened it.
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        up(&mut view, &mut ui);
+        let (x, y) = view.menu_button(W, H);
+        panel::apply_input(click(x, y), &mut ui, &mut view, W, H, &mut here);
+        assert_eq!(
+            view.mode_name(),
+            "browse",
+            "clicking `menu` a second time shuts what it opened",
+        );
+
+        // And the frame, which is on the box.
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+        up(&mut view, &mut ui);
+        let (x, y) = view.menu_row(0, W, H).expect("the menu is up");
+        panel::apply_input(click(x, y - 1), &mut ui, &mut view, W, H, &mut here);
+        assert_eq!(
+            view.mode_name(),
+            "the menu",
+            "the edge of a box is not a way out of it",
+        );
+    }
+
     /// What a popover owes the panel behind it: every row it lies on keeps the
     /// columns the box does not cover.
     ///

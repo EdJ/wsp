@@ -727,6 +727,25 @@ pub(super) fn menu_at(
     (i < menu.items.len()).then_some(i)
 }
 
+/// Is the pointer on the menu at all — its frame included?
+///
+/// [`menu_at`] answers "which row", and says `None` both for the border and for
+/// the tree a mile away. Those are the same answer to that question and
+/// different answers to this one: a click on the frame is a click that missed a
+/// row, and a click outside is a click that means *put it away*. Dismissing on
+/// the border would make the box's own edge a trapdoor.
+pub(super) fn menu_holds(
+    menu: &super::keys::Menu,
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+) -> bool {
+    let (top, left, box_w) = menu_box(menu, w, h);
+    let rows = menu.items.len() + 2;
+    x >= left && x < left + box_w && y >= top && y < top + rows
+}
+
 pub(super) const FOCUS_MIN: usize = 3;
 
 pub(super) const FOCUS_MAX: usize = 6;

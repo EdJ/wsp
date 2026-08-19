@@ -1719,6 +1719,21 @@ pub(crate) enum Hit {
     /// on purpose, and the row that costs anything asks `y` afterwards. A menu
     /// you have to click twice is one that reads as broken.
     Menu(usize),
+    /// A click anywhere else while the menu is up: put it away.
+    ///
+    /// A popover closes when you click off it — that is what makes it a
+    /// popover rather than a mode you are stuck in, and it is the behaviour a
+    /// pointer has everywhere else it meets one. It covers the word in the
+    /// footer too, so clicking `menu` a second time shuts what it opened; the
+    /// word is outside the box, so it arrives here rather than as
+    /// [`Hit::Opens`], which only fires while browsing. A click on the box's own
+    /// frame is a miss and not a dismissal — see [`super::render::menu_holds`].
+    ///
+    /// Deliberately not the click passing through to whatever is underneath.
+    /// The tree behind a popup is not what the click meant — the same rule
+    /// [`Mode::Card`] is held to — so the first click dismisses and a second
+    /// one selects.
+    Shuts,
 }
 
 /// Decide what a click does, and move the cursor if that is what it does.
@@ -1768,7 +1783,10 @@ pub(crate) fn click(
     if let Mode::Menu(menu) = &view.mode {
         return match super::render::menu_at(menu, w, h, x, y) {
             Some(i) => Hit::Menu(i),
-            None => Hit::Nothing,
+            // On the box but not on a row: the frame. A miss, and the menu
+            // stays — the edge of a box is not a way out of it.
+            None if super::render::menu_holds(menu, w, h, x, y) => Hit::Nothing,
+            None => Hit::Shuts,
         };
     }
     // The word in the footer, and only while browsing. A click that opened a
@@ -1980,6 +1998,13 @@ pub(crate) fn apply_input(
                 },
                 _ => Effect::None,
             },
+            // Off the box, so the menu goes away — including the word that
+            // opened it, which is why `menu` toggles rather than doing
+            // nothing on the second click.
+            Hit::Shuts => {
+                view.mode = Mode::Browse;
+                Effect::None
+            }
             // Selected, or landed on furniture, or landed on a pane nobody was
             // working in — all of which the cursor and `keyboard` above have
             // already recorded, and none of which anybody has to be told about.
