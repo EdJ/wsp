@@ -363,9 +363,44 @@ pub fn group(store: &Store, repos: &mut Repos, g: &Group, reading: Reading) -> V
     g.members.iter().map(|m| member(store, repos, m, reading)).collect()
 }
 
+/// The task an id names, following a renumbering.
+///
+/// [`Store::task`] is the raw path read, and a renumbered task is not at the
+/// path its old id names. Consulting `ids.json` here is the same correction
+/// [`Repos::branches`] already makes for the branch — and it is wanted for a
+/// sharper reason. Git's version of this failure *stalls* a barrier: a
+/// renumbered member reads as having no branch, and a group waits for work
+/// already on the trunk. The store's version **opens** one: `Settlement::Gone`
+/// is settled, so a member the store could not find stopped holding its group,
+/// the run walked on past work still on its branch, and `go` wrote "no task
+/// answers to <old id>" into the log where it reads later as evidence somebody
+/// archived it. Reproduced 2026-08-19 on `worklist-015`.
+///
+/// One hop is the whole lookup. [`Store::rename_tasks`] collapses chains as it
+/// writes them, so no entry in the map points at an id that was itself
+/// renamed — a lookup can never land on a name that has moved on again.
+///
+/// Deliberately not [`Store::resolve_task`], which answers a different
+/// question: it falls through to bare suffixes and to title substrings,
+/// reading every task in the store to do it. A member is an exact id somebody
+/// wrote down, and the only ambiguity it can have is the one a renumbering
+/// introduced. Guessing at a member from a substring would put a task into a
+/// barrier that nobody put in the list.
+fn task_now(store: &Store, renamed: &BTreeMap<String, String>, id: &str) -> Option<Task> {
+    store.task(id).or_else(|| renamed.get(id).and_then(|now| store.task(now)))
+}
+
 /// How one member stands.
+///
+/// `Standing::id` is the id the task answers to **now**, which is not always
+/// the id the worklist names it by — see [`task_now`]. It is the current one
+/// because that is the identity everything downstream is keyed on: a tree is
+/// named after the id it was cut under, and [`passed_by_running`] expands the
+/// current id *backwards* through `ids.json` to reach the older names a
+/// directory walk sees. Handing it the older name gives it nothing to expand
+/// and loses the newer one.
 pub fn member(store: &Store, repos: &mut Repos, id: &str, reading: Reading) -> Standing {
-    let task = store.task(id);
+    let task = task_now(store, &repos.renamed, id);
     let settlement = match &task {
         None => Settlement::Gone,
         Some(t) => match t.status() {
@@ -379,7 +414,8 @@ pub fn member(store: &Store, repos: &mut Repos, id: &str, reading: Reading) -> S
         (Reading::Landed, None) => None,
         (Reading::Landed, Some(t)) => Some(landing(repos, t)),
     };
-    Standing { id: id.to_string(), settlement, landing }
+    let id = task.map_or_else(|| id.to_string(), |t| t.id);
+    Standing { id, settlement, landing }
 }
 
 /// The members no task answers to, across the whole list rather than only the
@@ -392,9 +428,13 @@ pub fn member(store: &Store, repos: &mut Repos, id: &str, reading: Reading) -> S
 /// the one thing nothing here is allowed to do.
 pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
     let mut out = Vec::new();
+    // Read once for the whole list rather than per member, as
+    // `passed_by_running` reads it: a list is a handful of groups of a handful
+    // of ids, and this is asked on a surface that redraws.
+    let renamed = store.renamed_ids();
     for g in w.groups() {
         for m in g.members {
-            if store.task(&m).is_none() && !out.contains(&m) {
+            if task_now(store, &renamed, &m).is_none() && !out.contains(&m) {
                 out.push(m);
             }
         }
@@ -489,7 +529,13 @@ pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
     let mut repos = Repos::new(store);
     let mut members = Vec::new();
     for b in &p.passed {
-        let Some(project) = store.task(&b.member.id).and_then(|t| t.project) else { continue };
+        // `b.member.id` is already the id the task answers to now — `member`
+        // resolved it — but the read goes through `task_now` anyway so that
+        // nothing here depends on that having been done upstream.
+        let Some(project) = task_now(store, &repos.renamed, &b.member.id).and_then(|t| t.project)
+        else {
+            continue;
+        };
         let Some(trunk) = repos.of(&project) else { continue };
         members.push(cmd_checkout::Passed {
             task: b.member.id.clone(),
@@ -783,19 +829,25 @@ pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
     let mut out = Overlap::default();
 
     for id in members {
+        // Through `task_now`, because these are the raw member ids out of the
+        // worklist's own text and a renumbered one is not at the path it
+        // names. It is also what makes the `branches` call below work: that
+        // expands the *current* id backwards into the names a tree may have
+        // been cut under, so asking it with the worklist's older name gives it
+        // nothing to expand and misses the branch under the newer one.
+        //
         // No project, no root, or no repository is not a member that could not
         // be read: it is design-only work with nothing to look in, and it is
         // passed over exactly as the sweep passes over it.
-        let Some(trunk) = store.task(id).and_then(|t| t.project).and_then(|p| repos.of(&p)) else {
-            continue;
-        };
+        let Some(task) = task_now(store, &repos.renamed, id) else { continue };
+        let Some(trunk) = task.project.as_deref().and_then(|p| repos.of(p)) else { continue };
         let log = logs
             .entry(trunk.dir.clone())
             .or_insert_with(|| cmd_checkout::Landings::read(&trunk.dir, &trunk.branch));
         // The branch is asked for under every name the task has had, for the
         // reason `Repos::branches` gives: a tree made before a renumbering is
         // on a branch of the old id, and that is the ref the reflog holds.
-        match repos.branches(id).iter().find_map(|b| log.files(&trunk.dir, b)) {
+        match repos.branches(&task.id).iter().find_map(|b| log.files(&trunk.dir, b)) {
             None => out.unread.push(id.clone()),
             Some(files) => {
                 for f in files {

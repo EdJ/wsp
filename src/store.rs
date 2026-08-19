@@ -207,6 +207,50 @@ impl Store {
         self.root.join("archive/projects")
     }
 
+    /// Every directory in the store that holds records, archive months
+    /// expanded — the list a walk over *the whole store* is to be written
+    /// against.
+    ///
+    /// # Why this exists rather than a list at each call site
+    ///
+    /// The store has gained record kinds — `machines/`, then `worklists/` —
+    /// and each walk over it was written against the directories its author
+    /// knew about at the time. Nobody went back to the walks. Measured
+    /// 2026-08-19: [`Store::rename_tasks`] rewrote every reference to a
+    /// renumbered task except the ones inside a worklist, so a running list
+    /// went on naming a member by an id nothing answered to, read it as
+    /// `Settlement::Gone` — which is *settled* — and opened its barrier on
+    /// work still sitting on its branch. [`Store::fingerprint`] is blind to
+    /// `worklists/` and to `machines/` for the same reason, which is
+    /// `worklist-009`.
+    ///
+    /// So the next record kind is one line here instead of a hunt for the
+    /// walks that need telling. A caller wanting a subset **excludes** from
+    /// this, visibly, rather than listing what it happens to remember: an
+    /// omission is invisible in review and an exclusion is not.
+    ///
+    /// The archive is in it because an archived record holds ids in the same
+    /// space as a live one and is cited by live prose. The state directory is
+    /// not: it is ephemeral, uncommitted JSON rather than records, and
+    /// `rename_tasks` names its files one by one for that reason. Neither are
+    /// the `.md` files at the store root — `agents.md`, `committing.md`,
+    /// `README.md` are standing instructions to agents, not records of work.
+    pub fn record_dirs(&self) -> Vec<PathBuf> {
+        let mut out = vec![
+            self.projects_dir(),
+            self.tasks_dir(),
+            self.machines_dir(),
+            self.worklists_dir(),
+            self.archive_projects_dir(),
+        ];
+        // One directory per month, and a record whose `updated` is wrong lands
+        // in any of them — the same reason `highest_seq` reads them all.
+        if let Ok(months) = fs::read_dir(self.archive_dir()) {
+            out.extend(months.flatten().map(|m| m.path()).filter(|p| p.is_dir()));
+        }
+        out
+    }
+
     pub fn exists(&self) -> bool {
         self.projects_dir().is_dir() || self.tasks_dir().is_dir()
     }
@@ -686,12 +730,13 @@ impl Store {
                 }
             }
         };
-        collect(self.tasks_dir(), &mut targets);
-        collect(self.projects_dir(), &mut targets);
-        if let Ok(months) = fs::read_dir(self.archive_dir()) {
-            for m in months.flatten() {
-                collect(m.path(), &mut targets);
-            }
+        // Every record directory, from the one place that knows them all —
+        // see [`Store::record_dirs`]. Written against a hand-kept list, this
+        // rewrote tasks, projects and the archive and left `worklists/` alone,
+        // which is how a running list came to name a member by an id nothing
+        // answered to and open its barrier on it.
+        for dir in self.record_dirs() {
+            collect(dir, &mut targets);
         }
         for path in targets {
             let Ok(text) = fs::read_to_string(&path) else { continue };
