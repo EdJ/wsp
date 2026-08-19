@@ -263,7 +263,39 @@ impl Kind {
         matches!(self, Kind::NeedsAPerson | Kind::Flag | Kind::AgentGone | Kind::Blind)
     }
 
-    /// `wsp-095` Part 4's loudness enum, for the envelope.
+    /// Whether evaluating this predicate needs herdr to answer.
+    ///
+    /// **Read by [`Ledger::advance`], and it is the difference between a level
+    /// that went away and one nobody could look at.** [`Poll::sample`] derives
+    /// the agent half from a census, so when herdr is unreachable that half of
+    /// every tick is simply absent — no rows, no bindings, nothing. A diff
+    /// taken against that reads every stall on the machine as having resolved,
+    /// and the next tick after herdr comes back reads them all as new.
+    ///
+    /// One herdr restart is therefore two edges per standing signal, neither of
+    /// which happened. On a stream a person discounts it, having just seen
+    /// `blind` go up; through a hook it is a phone buzzing twice for every
+    /// stalled agent on the box, at whatever hour herdr was restarted. That is
+    /// `robustness-088`'s named failure — *noise is worse than the silence it
+    /// replaces* — arriving by the one route that has nobody reading it.
+    ///
+    /// So: silence is not evidence, which is the judgement `sync` already makes
+    /// before it reaps. A level of a kind that could not be read this tick is
+    /// **held**, not cleared, and it goes down on the first tick that can
+    /// actually see it.
+    fn needs_herdr(&self) -> bool {
+        match self {
+            Kind::NeedsAPerson | Kind::AgentGone => true,
+            // The store answers these whether or not anything else does, which
+            // is what makes saying `blind` worth anything at all.
+            Kind::Review | Kind::Blocked | Kind::Flag => false,
+            // Its own evidence.
+            Kind::Blind => false,
+        }
+    }
+
+    /// How much of the receiver's time this may take, as
+    /// [`crate::message::Kind`].
     ///
     /// *"A derived signal → `note`, except herdr's `blocked` — a modal holding
     /// the keyboard, fixed by one keypress — which `quiet_note` already
@@ -271,8 +303,13 @@ impl Kind {
     /// `direction`."* That promotion is carried on the signal rather than on
     /// the kind, because it is a fact about the reading and not about the
     /// predicate; see [`Signal::loud`].
-    fn kind_word(&self) -> &'static str {
-        "note"
+    ///
+    /// The enum is `message.rs`'s and not a word written out here. It was a
+    /// literal `"note"` until the record landed, which is two vocabularies
+    /// agreeing by hand — and the one thing the fleet has paid for repeatedly
+    /// is a word spelled out in a second place drifting from the first.
+    fn loudness(&self) -> crate::message::Kind {
+        crate::message::Kind::Note
     }
 }
 
@@ -303,7 +340,7 @@ pub(crate) struct Signal {
 }
 
 impl Signal {
-    fn new(kind: Kind, subject: &str, detail: &str) -> Signal {
+    pub(crate) fn new(kind: Kind, subject: &str, detail: &str) -> Signal {
         Signal {
             kind,
             subject: subject.to_string(),
@@ -318,7 +355,7 @@ impl Signal {
         self
     }
 
-    fn loud(mut self) -> Signal {
+    pub(crate) fn loud(mut self) -> Signal {
         self.loud = true;
         self
     }
@@ -345,9 +382,13 @@ impl Signal {
     /// rather than a schema change.
     pub(crate) fn envelope(&self, edge: Edge, to: &str, at: &str) -> Value {
         json!({
-            "shape": "signal",
+            "shape": crate::message::Shape::Signal.as_str(),
             "signal": self.kind.word(),
-            "kind": match self.loud { true => "direction", false => self.kind.kind_word() },
+            "kind": match self.loud {
+                true => crate::message::Kind::Direction,
+                false => self.kind.loudness(),
+            }
+            .as_str(),
             "edge": edge.word(),
             "from": "wsp",
             "to": to,
@@ -367,7 +408,7 @@ pub(crate) enum Edge {
 }
 
 impl Edge {
-    fn word(&self) -> &'static str {
+    pub(crate) fn word(&self) -> &'static str {
         match self {
             Edge::Up => "up",
             Edge::Down => "down",
@@ -437,6 +478,10 @@ impl Ledger {
     pub(crate) fn advance(&mut self, now: &[Signal], at: i64, settle: i64) -> Vec<Emit> {
         let mut out = Vec::new();
         let seen: BTreeSet<String> = now.iter().map(Signal::key).collect();
+        // Half the predicates could not be evaluated at all this tick, so their
+        // absence from `now` says nothing. See [`Kind::needs_herdr`] for what
+        // treating it as news costs.
+        let blind = now.iter().any(|s| s.kind == Kind::Blind);
 
         for s in now {
             let e = self.up.entry(s.key()).or_insert_with(|| Held {
@@ -450,7 +495,12 @@ impl Ledger {
             e.signal = s.clone();
         }
 
-        let gone: Vec<String> = self.up.keys().filter(|k| !seen.contains(*k)).cloned().collect();
+        let gone: Vec<String> = self
+            .up
+            .iter()
+            .filter(|(k, h)| !seen.contains(*k) && !(blind && h.signal.kind.needs_herdr()))
+            .map(|(k, _)| k.clone())
+            .collect();
         for k in gone {
             if let Some(h) = self.up.remove(&k) {
                 if h.told && h.signal.kind.clears() {
@@ -501,7 +551,7 @@ impl Ledger {
         self.up.len()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         Value::Object(
             self.up
                 .iter()
@@ -535,7 +585,7 @@ impl Ledger {
     /// and then lowered between two `--once` calls printed the raise and
     /// nothing else, and *a hand in my scope lowered by somebody else* is one
     /// of the five things a governor asked to be told.
-    fn of_json(v: &Value) -> Ledger {
+    pub(crate) fn of_json(v: &Value) -> Ledger {
         let mut up = BTreeMap::new();
         for (key, rec) in v.as_object().into_iter().flatten() {
             let word = rec.get("signal").and_then(Value::as_str).unwrap_or_default();
@@ -591,6 +641,12 @@ pub(crate) trait Source {
 /// project and its sub-tree, or a worklist's members. Two rules because there
 /// are two questions, and using the routing rule for an unseated `-p` would
 /// silently drop every task some other seat happens to answer for.
+///
+/// There is a third way, and it has no name to type: [`Scope::machine`]. Every
+/// task on the box, which is not a thing a *governor* ever wants — a seat that
+/// answered for everything would answer for nothing — and is exactly what the
+/// unattended pass in [`crate::attention`] is for. Nobody asked it to look, so
+/// there is nobody whose scope it could take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Scope {
     pub(crate) name: String,
@@ -599,6 +655,23 @@ pub(crate) struct Scope {
     /// this workspace is no longer in the slot — an exit condition that costs
     /// nothing and is the natural end of a seat's subscription.
     pub(crate) workspace: String,
+    /// Every task, with no membership test at all. See [`Scope::machine`].
+    pub(crate) all: bool,
+}
+
+impl Scope {
+    /// The whole machine, for a reader that is nobody's seat.
+    ///
+    /// Deliberately not reachable from argv. `wsp watch` is a *subscription*
+    /// and a subscription is to a scope somebody answers for; the daemon is not
+    /// a subscriber, it is the process that runs anyway, and what it derives is
+    /// addressed per signal by [`cmd_govern::seat_for`] rather than by having
+    /// been asked for. Putting a `--all` on the verb would give a governor a
+    /// way to subscribe to work it cannot act on, which is the noise
+    /// `wsp-095` Part 9 asks to be kept out.
+    pub(crate) fn machine() -> Scope {
+        Scope { name: "this machine".into(), seated: false, workspace: String::new(), all: true }
+    }
 }
 
 /// Whether a task is this scope's to report on.
@@ -609,6 +682,9 @@ pub(crate) fn in_scope(
     lists: &worklist::Running,
     task: &Task,
 ) -> bool {
+    if scope.all {
+        return true;
+    }
     if scope.seated {
         return cmd_govern::seat_for(governors, index, lists.list_of(&task.id), task.project.as_deref())
             .is_some_and(|s| s.scope == scope.name);
@@ -797,6 +873,15 @@ pub(crate) struct Registered {
     pub(crate) tick: String,
     pub(crate) every: i64,
     pub(crate) standing: usize,
+    /// The daemon's unattended pass rather than somebody's subscription.
+    ///
+    /// It is here for one reason and it is the repair line. Everything else
+    /// about the two is identical — a process that claimed to keep reporting, a
+    /// ledger, a last tick — and the advice is not: a watch that has stopped is
+    /// forgotten and started again, and a daemon that has stopped is neither.
+    /// Advice that does not work is worse than none, and this check exists
+    /// precisely to be believed.
+    pub(crate) daemon: bool,
 }
 
 impl Registered {
@@ -840,6 +925,7 @@ pub(crate) fn registered(store: &Store) -> Vec<Registered> {
             tick: v.get("tick").and_then(Value::as_str).unwrap_or_default().to_string(),
             every: v.get("every").and_then(Value::as_i64).unwrap_or(EVERY),
             standing: v.get("standing").and_then(Value::as_u64).unwrap_or(0) as usize,
+            daemon: v.get("daemon").and_then(Value::as_bool).unwrap_or(false),
         })
         .collect()
 }
@@ -868,10 +954,22 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
             true => "the process is gone",
             false => "the process is alive and has stopped ticking",
         };
+        // Two subjects, one fault, two repairs. The daemon's pass is not a
+        // subscription somebody started and it is not one they can restart with
+        // `wsp watch`; `daemon::health` says whether the process is there at
+        // all, and this says whether the half of it that watches is running —
+        // which is a distinct failure, because `Store::run_hook` waits for its
+        // child and a hook that blocks wedges the loop without killing it.
+        let repair = match w.daemon {
+            true => "`wsp doctor` names the daemon below; `kill` it and herdr restarts it, or run `wsp daemon` yourself".to_string(),
+            false => format!("`wsp watch --forget {}` clears the record; `wsp watch` starts one again", w.key),
+        };
+        let what = match w.daemon {
+            true => "the daemon's unattended pass".to_string(),
+            false => format!("the watch on {} ({})", w.scope, w.key),
+        };
         problems.push(format!(
-            "the watch on {} ({}) last ticked {ago} ago — {why}, so silence from it means nothing. \
-             `wsp watch --forget {}` clears the record; `wsp watch` starts one again",
-            w.scope, w.key, w.key
+            "{what} last ticked {ago} ago — {why}, so silence from it means nothing. {repair}"
         ));
     }
 }
@@ -1025,13 +1123,13 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
             .unwrap_or_default()
             .to_string();
         let here = herdr::Env::read().workspace_id.unwrap_or_default();
-        return Ok(Scope { seated: !workspace.is_empty() && workspace == here, name, workspace });
+        return Ok(Scope { seated: !workspace.is_empty() && workspace == here, name, workspace, all: false });
     }
     let Some(ws) = herdr::Env::read().workspace_id else {
         return Err("wsp: no scope. Run this in the seat's workspace, or say `wsp watch -p <project>`".into());
     };
     match cmd_govern::governs(&governors, &ws) {
-        Some(name) => Ok(Scope { name, seated: true, workspace: ws }),
+        Some(name) => Ok(Scope { name, seated: true, workspace: ws, all: false }),
         None => Err("wsp: this workspace is nobody's seat, so there is no scope to watch.\n\
                      \x20    `wsp watch <project>` watches one, `wsp govern <project>` takes the seat"
             .into()),
@@ -1084,7 +1182,7 @@ fn is_out(store: &Store, scope: &Scope, needle: &str) -> bool {
     let index = Index::new(store.projects());
     let lists = worklist::Running::read(store);
     let name = index.find(needle).map(|p| p.id.clone()).unwrap_or_else(|| needle.to_string());
-    let asked = Scope { name, seated: false, workspace: scope.workspace.clone() };
+    let asked = Scope { name, seated: false, workspace: scope.workspace.clone(), all: false };
     let members: Vec<&Task> = tasks
         .iter()
         .filter(|t| in_scope(&asked, &index, &store.governors(), &lists, t))
@@ -1486,6 +1584,53 @@ mod tests {
         assert!(l.advance(&later, 3000, 0).is_empty());
     }
 
+    /// **Silence is not evidence.** A tick that could not reach herdr has no
+    /// agent half at all, so the levels derived from it are absent — and a diff
+    /// that read absence as resolution would report every stall on the machine
+    /// as cleared, then report them all as new when herdr came back.
+    ///
+    /// One herdr restart, two edges per standing signal, none of which
+    /// happened. Through `wsp watch` a person discounts it, having just seen
+    /// `blind` go up on the line above; through `attention`'s hook it is a
+    /// phone buzzing twice per stalled agent at whatever hour herdr restarted.
+    #[test]
+    fn going_blind_holds_the_levels_it_can_no_longer_read_rather_than_clearing_them() {
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        let seeing = vec![sig(Kind::NeedsAPerson, "a-1"), sig(Kind::Review, "a-2")];
+        assert_eq!(l.advance(&seeing, 60, 0).len(), 2);
+
+        // herdr goes away. The store half still answers, so `review` is a real
+        // reading and stays; the agent half is unreadable, so it is held.
+        let blind = vec![sig(Kind::Review, "a-2"), sig(Kind::Blind, "herdr")];
+        let out = l.advance(&blind, 120, 0);
+        assert_eq!(out.len(), 1, "only `blind` itself is news");
+        assert_eq!(out[0].signal.kind, Kind::Blind);
+        assert_eq!(l.standing(), 3, "the stall is still up, it is just not being looked at");
+
+        // And back. Nothing is re-announced, because nothing changed.
+        let out = l.advance(&seeing, 180, 0);
+        assert_eq!(out.len(), 1, "the stall arrived again");
+        assert_eq!(out[0].signal.kind, Kind::Blind, "and it is `blind` clearing");
+        assert_eq!(out[0].edge, Edge::Down);
+    }
+
+    /// The other half of the same rule: a stall that genuinely resolved while
+    /// wsp was blind is reported on the first tick that can see it, one tick
+    /// late. Holding is a deferral, never a floor.
+    #[test]
+    fn a_level_that_went_away_while_blind_is_reported_once_the_view_comes_back() {
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        l.advance(&[sig(Kind::NeedsAPerson, "a-1")], 60, 0);
+        l.advance(&[sig(Kind::Blind, "herdr")], 120, 0);
+
+        let out = l.advance(&[], 180, 0);
+        let cleared: Vec<Kind> = out.iter().map(|e| e.signal.kind).collect();
+        assert!(cleared.contains(&Kind::NeedsAPerson), "the stall's clearing was owed and paid");
+        assert_eq!(l.standing(), 0);
+    }
+
     /// An agent is "stopped" for a few seconds between every pair of turns, so
     /// the join alone would fire on nearly every agent on nearly every tick.
     /// The settle is the watcher's one advantage over a snapshot: it can
@@ -1600,6 +1745,7 @@ mod tests {
             tick: util::iso_at(util::epoch_secs() - 86_400),
             every: 60,
             standing: 0,
+            daemon: false,
         };
         assert!(!pull.watching());
         assert!(!pull.stale(), "a day old and still not a fault: nobody promised to tick");
@@ -1705,6 +1851,7 @@ mod tests {
                 tick: String::new(),
                 every: 60,
                 standing: 0,
+                daemon: false,
             };
             r.tick = util::iso_at(util::epoch_secs() - ago);
             r

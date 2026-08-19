@@ -1848,6 +1848,30 @@ notification with an empty body looks like a broken tool rather than a wrong
 path. Failures are ignored on purpose: a broken hook must not be able to stop a
 task being finished.
 
+## Being told when nobody is looking
+
+Every surface above states a fact to whoever ran the command. The daemon is the
+one process that runs anyway, so it is the one thing that can look when nobody
+asked: once a minute it derives the same level set `wsp watch` subscribes to,
+for the whole machine, and writes the *changes* to `events.jsonl`.
+
+```sh
+cp hooks/on-attention-raised.sample ~/wsp/hooks/on-attention-raised
+chmod +x ~/wsp/hooks/on-attention-raised
+```
+
+`attention-raised` when a level goes up, `attention-cleared` when it goes down,
+and never anything in between — it is a level, so it is said once and does not
+repeat on a timer. `.data` carries `kind`, which is the field to filter on:
+`direction` is the reading a keypress repairs (an agent stopped on a permission
+prompt), everything else is `note`. `to` is the seat that answers for it, or
+`everyone`.
+
+Nothing is shipped enabled, and `wsp doctor` says so while `hooks/` is empty —
+what may interrupt you at 3am is not a tool's decision, but a delivery path with
+nothing at the end of it should not read as working. The argument for all of it
+is in `src/attention.rs`.
+
 ## Sub-tasks
 
 ```sh
@@ -3621,7 +3645,8 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/draw.rs` | the renderer: one spec and a view, drawn to a terminal or to a block of text |
 | `src/fake.rs` | a backend that answers that socket out of a state we choose — `wsp sandbox --fake` |
 | `src/sync.rs` | tasks + panes → metadata tokens |
-| `src/daemon.rs` | event subscription, debounce, TTL refresh |
+| `src/daemon.rs` | event subscription, debounce, TTL refresh, and the pass that looks when nobody asked |
+| `src/attention.rs` | that pass: the level set derived on a timer, the ledger that survives the process, and the one edge that leaves it — `hooks/on-attention-raised` |
 | `src/input.rs` | terminal bytes → keys: the escape-sequence parser |
 | `src/panel/rows.rs` | what is in the tree, and how each row draws |
 | `src/panel/render.rs` | `Line`/`Style`, the frame, and the ansi + html backends |

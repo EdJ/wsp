@@ -1,0 +1,63 @@
+#!/bin/sh
+# ~/wsp/hooks/on-attention-raised — what wsp does when it notices, unattended.
+#
+# The daemon derives the level set once a minute (`src/attention.rs`) and writes
+# an edge here whenever one goes up. This file is the whole of the escape to
+# anything louder: a desktop notification is already an executable file, and wsp
+# deliberately ships none, because what is allowed to interrupt you at 3am is
+# not a tool's decision.
+#
+#   cp hooks/on-attention-raised.sample ~/wsp/hooks/on-attention-raised
+#   chmod +x ~/wsp/hooks/on-attention-raised
+#
+# The event arrives as one JSON object on stdin:
+#
+#   {"ts":…,"kind":"attention-raised","data":{
+#      "shape":"signal",          a level. Nothing to answer, nothing to close.
+#      "signal":"needs-a-person", which predicate — see `wsp watch --help`
+#      "kind":"direction",        how loud. `direction` is the one that earns a
+#                                 noise: a modal has the keyboard and one
+#                                 keypress fixes it. Everything else is `note`.
+#      "edge":"up",               `attention-cleared` carries "down"
+#      "to":"wsp",                the seat that answers for it, or "everyone"
+#      "about":"robustness-088",  the task
+#      "text":"w4P:p1 · stopped on a prompt only a person can answer — wsp peek <id>",
+#      "held":312,"held_human":"5m"}}
+#
+# Filtering is yours and belongs here rather than in wsp: the pass emits every
+# fact it can stand behind, and this file decides which of them is worth your
+# attention. The default below is the narrowest useful one — make a noise only
+# for the reading a keypress repairs, and log the rest.
+
+set -eu
+event=$(cat)
+
+# Two greps rather than a JSON parser, because this must run with nothing
+# installed. Both fields are wsp's own closed vocabularies, so neither is
+# free text that could match by accident.
+case $event in
+  *'"kind":"direction"'*) loud=yes ;;
+  *)                      loud=no  ;;
+esac
+
+# Everything, always, so there is a record to read in the morning. Beside the
+# machine state and not in $WSP_HOME: the store is a git repository wsp commits
+# what it writes to, and a log growing inside it shows up in `wsp doctor` as
+# uncommitted work for ever.
+printf '%s\n' "$event" >> "${WSP_STATE:-$HOME/.local/state/wsp}/attention.log"
+
+[ "$loud" = yes ] || exit 0
+
+# The text, for a human. `sed` because `jq` is not a dependency of anything else
+# here; a machine that has it should use it.
+text=$(printf '%s' "$event" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
+about=$(printf '%s' "$event" | sed -n 's/.*"about":"\([^"]*\)".*/\1/p')
+
+case $(uname) in
+  Darwin)
+    osascript -e "display notification \"${text}\" with title \"wsp: ${about}\"" >/dev/null 2>&1 ||:
+    ;;
+  *)
+    command -v notify-send >/dev/null 2>&1 && notify-send "wsp: ${about}" "${text}" ||:
+    ;;
+esac

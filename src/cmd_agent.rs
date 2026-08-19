@@ -4289,6 +4289,10 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // only place in wsp that can tell a fleet with nothing to say from a
     // watcher that stopped saying it.
     crate::cmd_watch::health(store, &mut problems);
+    // And whether the one thing that reports with nobody looking has anywhere
+    // to report *to*. The pass is the fix for "nothing notices unattended" and
+    // an empty `hooks/` would make it a fix that notices and tells no one.
+    crate::attention::health(store, &mut notes);
 
     if args.json() {
         println!("{}", json!({ "problems": problems, "notes": notes }));

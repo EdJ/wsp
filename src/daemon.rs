@@ -7,11 +7,22 @@
 //! Deliberately dependency-free. One thread blocks on the event stream and
 //! feeds a channel; the main loop coalesces bursts (herdr emits
 //! `workspace_focused` on every sidebar hover) and refreshes TTLs on a timer.
+//!
+//! It carries one passenger, and being the only long-lived process is the whole
+//! qualification for it: [`crate::attention`] derives what is wrong on this
+//! machine once a minute and puts the changes where a hook can see them. That
+//! is the one thing in wsp that happens at nobody's request — every other
+//! surface states the same facts to whoever is looking. It rides above the
+//! fingerprint gate below rather than beside the sync, because a stopped agent
+//! changes nothing in the store and raises no event this daemon can subscribe
+//! to, so a pass that ran only when something woke us would never run on the
+//! one condition it is for.
 
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use crate::attention;
 use crate::herdr;
 use crate::store::Store;
 use crate::sync::{self, Cache};
@@ -595,6 +606,10 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     let mut tunnels = Supervisor::new();
     let mut last_refresh = Instant::now();
     let mut last_fingerprint = store.fingerprint();
+    // The half of this process that looks rather than syncs. Its ledger lives
+    // in the store and not in this variable, so the `exec` below costs it
+    // nothing; see `attention::load`.
+    let mut pass = attention::Pass::new();
     // What we are executing, so we can notice an `install` landing underneath
     // us. See `reload` at the top of the loop for why the daemon needs this at
     // all when herdr restarts it.
@@ -669,6 +684,14 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
                 // down: an `ssh -L` we leave behind holds the socket the daemon
                 // that replaced us needs to bind.
                 tunnels.shutdown();
+                // And the claim to be watching, for the same reason as the
+                // tunnels: a register left saying a reporter is running would
+                // have `doctor` report the ticks stopping as a fault rather
+                // than as this daemon having handed over on purpose. The ledger
+                // itself stays, and must — the daemon taking the store over
+                // reads it, and a successor that primed instead would swallow
+                // every level standing at the moment of the hand-over.
+                attention::stand_down(store);
                 // Always said, not only when verbose. A process that ends on
                 // purpose owes the log the reason, or the next person to look
                 // finds a daemon that simply stopped.
@@ -713,6 +736,32 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
                         if l.error.is_empty() { "no answer yet" } else { &l.error }
                     ),
                     None => eprintln!("wsp daemon: {name} gone"),
+                }
+            }
+        }
+
+        // Above the gate below, and that placement is the whole point of this
+        // task. A stopped agent changes nothing in the store and raises no
+        // event this daemon subscribes to — `pane.agent_status_changed` is
+        // per-pane and cannot be asked for globally, see `EVENTS` — so a pass
+        // that ran only when something woke us would be a pass that never ran
+        // on the one condition it exists to notice. It has its own interval and
+        // it is a passenger on this loop, never a reason to sync.
+        // One reading of the clock for both, so a tick can never be recorded
+        // at a time the due check did not make it due for.
+        let now = crate::util::epoch_secs();
+        if pass.due(now) {
+            let mut source = attention::machine_source(store);
+            let emits = attention::tick(store, &mut pass, &mut source, now);
+            if verbose {
+                for e in &emits {
+                    eprintln!(
+                        "wsp daemon: attention {} {} {} — {}",
+                        e.edge.word(),
+                        e.signal.kind.word(),
+                        e.signal.subject,
+                        e.signal.detail
+                    );
                 }
             }
         }
