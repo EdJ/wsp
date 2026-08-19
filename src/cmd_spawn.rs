@@ -503,7 +503,11 @@ fn hand_over(
     // one failure this function exists to recover from, and `?` here was the
     // whole of that mistake.
     let mut look = match how.tell(place, seat, text) {
-        Ok(()) => true,
+        // Both deliveries look the same from here, and deliberately.
+        // `Delivery::Started` is a status change of *some* kind and this
+        // function is strict about which — see the paragraph above on
+        // `Blocked` — so the confirmation stays wsp's own.
+        Ok(_) => true,
         Err(Refusal::NotTaken) => false,
         Err(e) => return Err(e.to_string()),
     };
@@ -1377,6 +1381,7 @@ pub(crate) fn cmd_agent_claim(store: &Store, task: &str, flags: &[(&str, &str)])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::place::Delivery;
 
     fn seat(tag: &str) -> Store {
         let root = std::env::temp_dir().join(format!("wsp-place-{tag}-{}", std::process::id()));
@@ -1775,7 +1780,7 @@ mod tests {
         fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
             panic!("waiting does not start agents")
         }
-        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<()> {
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
             panic!("waiting does not talk to agents")
         }
         fn stop(&self, _: &Seat) -> crate::place::Result<()> {
@@ -1818,7 +1823,7 @@ mod tests {
         ) -> Option<agent_commands::Address> {
             None
         }
-        fn tell(&self, _: &dyn Place, _: &Seat, _: &str) -> crate::place::Result<()> {
+        fn tell(&self, _: &dyn Place, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
             panic!("readiness does not deliver work orders")
         }
         fn ran(&self, _: &str, _: &str) -> Option<agent_commands::Ran> {
@@ -1990,11 +1995,11 @@ mod tests {
     }
 
     impl Place for Composer {
-        fn tell(&self, _: &Seat, text: &str) -> crate::place::Result<()> {
+        fn tell(&self, _: &Seat, text: &str) -> crate::place::Result<Delivery> {
             self.heard.borrow_mut().push(text.to_string());
             match self.watches && self.starts_after != Some(0) {
                 true => Err(Refusal::NotTaken),
-                false => Ok(()),
+                false => Ok(Delivery::Started),
             }
         }
         fn nudge(&self, _: &Seat) -> crate::place::Result<()> {
@@ -2039,7 +2044,7 @@ mod tests {
     struct Speaks;
 
     impl agent_commands::Kind for Speaks {
-        fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> crate::place::Result<()> {
+        fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> crate::place::Result<Delivery> {
             place.tell(seat, text)
         }
         fn args(&self, _: &agent_commands::Spawn) -> Vec<String> {
@@ -2224,7 +2229,7 @@ mod tests {
         fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
             panic!("no agent was asked for")
         }
-        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<()> {
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
             panic!("no agent was asked for")
         }
         fn state(&self, _: &Seat) -> crate::place::Result<State> {
@@ -2394,7 +2399,7 @@ mod tests {
         fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
             panic!("despawn does not start agents")
         }
-        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<()> {
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
             panic!("despawn does not talk to agents")
         }
         fn state(&self, _: &Seat) -> crate::place::Result<State> {

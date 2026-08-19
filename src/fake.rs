@@ -360,6 +360,24 @@ pub struct Spot {
     /// in `pane.list` (recorded), and because a test asserting wsp has *stopped*
     /// pushing tokens needs somewhere for them to fail to arrive.
     pub tokens: BTreeMap<String, String>,
+    /// Whether a person started this agent by typing at the pane, rather than
+    /// herdr starting it.
+    ///
+    /// **The distinction the fake did not have, and worklist-010 lived in the
+    /// gap.** `interactive_ready` is herdr's `managed_agent_interactive_ready`
+    /// (`app/agents.rs:390`) — true only for an agent herdr launched itself, and
+    /// `skip_serializing_if = "is_false"` for everything else, so an agent
+    /// somebody started by hand carries no readiness at any status. Every
+    /// recording behind [`of_state`] was made against an agent `wsp spawn` had
+    /// started, which is why the dialect claimed `interactive_ready: true`
+    /// unconditionally and why no test could reproduce a verb that only failed
+    /// against seats.
+    ///
+    /// And a seat is exactly the pane this is true of. A governor is a person's
+    /// window that a person typed `claude` into; `wsp govern` records the pane
+    /// it is already in and never starts anything. So the one address wsp has
+    /// for a seat was the one reading its fake could not produce.
+    pub hand_started: bool,
 }
 
 /// Written out rather than derived, for the reason `arrange::Filler` gives:
@@ -381,6 +399,7 @@ impl PartialEq for Spot {
             && self.tab == other.tab
             && self.rect == other.rect
             && self.tokens == other.tokens
+            && self.hand_started == other.hand_started
     }
 }
 
@@ -419,6 +438,12 @@ impl Spot {
     }
     pub fn session(mut self, id: impl Into<String>) -> Spot {
         self.session = id.into();
+        self
+    }
+    /// This agent was started by a person, not by herdr — see
+    /// [`Spot::hand_started`].
+    pub fn by_hand(mut self) -> Spot {
+        self.hand_started = true;
         self
     }
 
@@ -716,12 +741,20 @@ fn of_state(spot: &Spot) -> (Option<&str>, &'static str, Option<bool>) {
         "" => None,
         kind => Some(kind),
     };
+    // An agent herdr did not start carries no readiness at all, whatever it is
+    // doing — [`Spot::hand_started`] has the recording and the bug. The status
+    // word is unaffected: herdr scrapes that off the screen and reports it for
+    // every agent it can see.
+    let ready = |r: Option<bool>| match spot.hand_started {
+        true => None,
+        false => r,
+    };
     match spot.state {
         State::Empty | State::Gone => (None, "unknown", None),
         State::Starting => (name, "idle", None),
-        State::Idle => (name, "idle", Some(true)),
-        State::Working => (name, "working", Some(true)),
-        State::Blocked => (name, "blocked", Some(true)),
+        State::Idle => (name, "idle", ready(Some(true))),
+        State::Working => (name, "working", ready(Some(true))),
+        State::Blocked => (name, "blocked", ready(Some(true))),
         State::Unknown => (name, "unknown", None),
     }
 }
@@ -2221,6 +2254,43 @@ mod tests {
         let starting = Spot::agent("s1", "claude", "t-1", State::Starting);
         assert_eq!(of_state(&starting).2, None, "herdr was made to send a readiness it does not send");
         assert!(!read(&starting).will_take_a_prompt(), "the port would tell a caller to prompt a banner");
+    }
+
+    /// The reading this fake could not produce until worklist-010, and the one
+    /// every seat in the store answers with.
+    ///
+    /// `interactive_ready` is `managed_agent_interactive_ready`
+    /// (`app/agents.rs:390`): true only for an agent herdr launched itself, and
+    /// `skip_serializing_if = "is_false"`, so for an agent a person started it
+    /// is absent at every status rather than `false`. Recorded 2026-08-19 from
+    /// one `agent.list` on this machine: `w1:p6`, the `wsp` seat, `agent_status:
+    /// "working"` with no `interactive_ready` and no `name`; `w3R:p1`, spawned
+    /// by wsp, working, with both.
+    ///
+    /// The dialect claimed the second reading for every agent because every
+    /// recording behind it was taken from one wsp had spawned — so a fake full
+    /// of managed agents was the whole population under test, and the verb that
+    /// only misbehaves against seats had a green suite over it.
+    #[test]
+    fn an_agent_a_person_started_carries_no_readiness_at_any_status() {
+        for state in [State::Idle, State::Working, State::Blocked] {
+            let by_hand = Spot::agent("w1:p6", "claude", "", state).by_hand();
+            let seen = agent_json(&by_hand);
+            assert_eq!(seen.get("interactive_ready"), None, "{state:?} was given a readiness flag");
+            assert_eq!(seen.get("launch_pending"), None, "{state:?} is not a launch window either");
+            assert_eq!(
+                of_state(&by_hand).1,
+                of_state(&Spot::agent("w1:p6", "claude", "", state)).1,
+                "the status word is scraped off the screen and does not depend on who started it",
+            );
+
+            // Which wsp reads two ways, and the difference is worklist-010:
+            // readiness-qualified it is not knowable, and as a plain status word
+            // it is exactly what herdr said.
+            let pane = herdr::parse_pane(&seen);
+            assert_eq!(crate::place_herdr::state_of_agent(&pane), State::Unknown);
+            assert_eq!(crate::place_herdr::state_of_pane(&pane), state);
+        }
     }
 
     /// `done` is the one status in herdr's vocabulary with no `Spot`, and the

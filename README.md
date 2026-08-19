@@ -2142,6 +2142,25 @@ through the workspace rather than through the pane the agent started in, and it
 arrives with no `/clear` in front of it, because emptying a governor's context
 to speak to it would destroy the thread the position exists to hold.
 
+**And it is queued, not immediate — say what you know.** A governor is mid-turn
+most of the time, because sequencing is what the position does. A sentence given
+to an agent in the middle of a turn is delivered and queued behind it, so nothing
+about that agent changes and there is nothing for a watch to see: `--tell` prints
+`delivered, no turn seen` and means exactly that. For a day it printed `the wsp
+seat was not told` instead — a herdr status probe's timeout standing in for the
+verdict on a message that had already arrived — and the retries that report
+provoked sent one paragraph to that seat three times (worklist-010). Hence also
+the other half: the same sentence to the same pane inside two minutes is read as
+a retry and refused, and `--again` is how you mean it.
+
+**A flag is the other channel and it fails differently.** `wsp flag <id> "why"`
+touches no agent at all: it writes state the panel draws and `wsp watch` reports,
+so it cannot time out, cannot be queued and does not care what the addressee is
+doing — and it does not arrive on its own either, because somebody has to read.
+`--tell` puts words in a context; a flag raises a hand on a row. When a hand is
+raised at 3am on a task in a running worklist, it is a flag that reaches the seat
+running the batch, and `--tell` is for direction that has to land in the thread.
+
 **It outlives its occupant.** `--clear` and a reaped workspace both *vacate* the
 slot and leave it standing; `--remove` is the separate decision that a project
 has no governor. An empty slot is a row you can stand on and fill, which is the

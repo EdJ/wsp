@@ -202,7 +202,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::place::{Place, Refusal, Result, Seat, Seated};
+use crate::place::{Delivery, Place, Refusal, Result, Seat, Seated};
 use crate::util;
 use crate::util::Clock;
 
@@ -315,7 +315,7 @@ pub trait Kind {
     /// Not `Place::tell` renamed. The port's verb is what the *backend* can do
     /// about it; this one chooses between that and whatever the agent itself
     /// offers, and typing at a terminal is only the fallback.
-    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<()>;
+    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery>;
 
     /// Whether the agent wsp started here is running, as its **own** runtime
     /// sees it — `None` where the kind has no runtime to ask.
@@ -480,7 +480,7 @@ impl Kind for Plain {
         None
     }
 
-    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<()> {
+    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
         place.tell(seat, text)
     }
 
@@ -745,7 +745,7 @@ impl Kind for Claude {
     /// Guessing at the protocol of an authenticated private socket is not a
     /// thing to do inside a spawn verb, so this delegates, and the failure path
     /// in `cmd_spawn` reports the address instead.
-    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<()> {
+    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
         place.tell(seat, text)
     }
 
@@ -1717,9 +1717,9 @@ mod tests {
     }
 
     impl Place for Typed {
-        fn tell(&self, seat: &Seat, text: &str) -> Result<()> {
+        fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery> {
             self.said.borrow_mut().push((seat.clone(), text.to_string()));
-            Ok(())
+            Ok(Delivery::Started)
         }
         fn census(&self) -> Result<crate::place::Census> {
             Ok(crate::place::Census::heard("", self.seats.clone()))

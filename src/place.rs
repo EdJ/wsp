@@ -881,6 +881,42 @@ pub enum Refusal {
     Backend(String),
 }
 
+/// What became of a sentence [`Place::tell`] delivered.
+///
+/// `Ok` has always meant *delivered* and never *taken* — the paragraph on
+/// [`Place::tell`] is older than this enum and is unchanged by it. What this
+/// adds is the answer to the second question where a backend has one, because
+/// worklist-010 was a verb that could not tell **delivered and watched** from
+/// **delivered and unwatchable** and so said neither, and then said something
+/// false instead.
+///
+/// Two variants and not three. A backend with no way to watch, and a backend
+/// that watched and could not tell, are the same fact to every caller: nothing
+/// here confirms a turn, nothing here is owed, and a retry is the wrong move.
+/// Telling *those* two apart would be a fact about the backend rather than
+/// about the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Delivered, and the agent moved in answer to it — watched by something in
+    /// a position to see it.
+    ///
+    /// Moved, rather than *is working*: an agent that answers a work order by
+    /// asking for a permission has plainly taken it and is `blocked`. That is
+    /// why `cmd_spawn::hand_over` still takes its own reading afterwards — a
+    /// folder-trust modal is the same status and the opposite outcome, and this
+    /// says the sentence landed on something awake, not what it decided.
+    Started,
+    /// Delivered, with no turn observed and none claimed.
+    ///
+    /// Either the backend does not watch, or it watched an agent that was
+    /// already mid-turn: a sentence queued behind a turn in progress changes no
+    /// status, so there is nothing for a watch to see and the agent has not read
+    /// it yet. **This is not a failure and must never be reported as one** —
+    /// that report is worklist-010, where a governor retried a message that had
+    /// arrived and sent the same paragraph three times.
+    Unconfirmed,
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -969,7 +1005,14 @@ pub trait Place {
     /// treats it as one has thrown away the recovery. What it is not entitled to
     /// do is make `Ok` mean less than it did — a backend that watched and one
     /// that could not both say `Ok` when there is nothing to rescue.
-    fn tell(&self, seat: &Seat, text: &str) -> Result<()>;
+    ///
+    /// Which is why the `Ok` says [`Delivery`]. There are three outcomes and not
+    /// two: watched and started, watched and stalled ([`Refusal::NotTaken`]),
+    /// and delivered with nothing to watch — the last being the agent that was
+    /// already mid-turn, which is the ordinary case for anything said to a
+    /// governor. A backend that cannot watch answers [`Delivery::Unconfirmed`]
+    /// to all of it, which is the truth about what it knows.
+    fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery>;
 
     /// Submit whatever is sitting unsent in the agent's input.
     ///

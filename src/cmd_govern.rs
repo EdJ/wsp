@@ -789,7 +789,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
                 Err(code) => return code,
             },
         };
-        return tell(&governors, &scope, &text, args);
+        return tell(store, &governors, &scope, &text, args);
     }
 
     let Some(ws) = workspace else {
@@ -870,7 +870,7 @@ fn told(args: &Args) -> String {
 /// word to one that is in the middle of a night's sequencing. Emptying the
 /// governor's context to speak to it would destroy the one thing the position
 /// exists to hold.
-fn tell(governors: &BTreeMap<String, Value>, scope: &str, text: &str, args: &Args) -> i32 {
+fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &str, args: &Args) -> i32 {
     use crate::place::Seat as Pane;
 
     let text = text.trim();
@@ -889,20 +889,20 @@ fn tell(governors: &BTreeMap<String, Value>, scope: &str, text: &str, args: &Arg
 
     let place = crate::place_herdr::Herdr::new();
     let how = crate::agent_commands::of(&pane.agent);
-    match how.tell(&place, &Pane::new(&pane.pane_id), text) {
-        Ok(()) => {
-            if args.json() {
-                println!("{}", json!({ "project": scope, "pane": pane.pane_id, "told": true }));
-            } else {
-                println!("{}", Paint::new().dim(&format!("→ {} · {}", scope, pane.pane_id)));
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("wsp: the {scope} seat was not told: {e}");
-            1
+    let sent = crate::cmd_agent::Sent::new(
+        scope,
+        &format!("the {scope} seat"),
+        &pane.pane_id,
+        &pane.pane_id,
+        text,
+        args,
+    );
+    if let Some(ago) = sent.already_sent(store) {
+        if !args.has("again") {
+            return crate::cmd_agent::twice(&sent, ago, &Paint::new());
         }
     }
+    crate::cmd_agent::delivered(store, how.tell(&place, &Pane::new(&pane.pane_id), text), &sent)
 }
 
 /// `wsp govern --clear [<project>]` — this workspace stops being the seat.

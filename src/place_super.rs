@@ -191,7 +191,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::place::{self, Agent, Census, Event, Order, Place, Refusal, Result, Seat, Seated, State};
+use crate::place::{self, Agent, Census, Delivery, Event, Order, Place, Refusal, Result, Seat, Seated, State};
 use crate::store::{write_atomic, Store};
 use crate::util::{self, Clock};
 
@@ -852,7 +852,7 @@ impl Place for Supervisor<'_> {
     /// not a formality here: an append to a file nothing is reading succeeds
     /// perfectly and silently, so [`Place::state`] is the only thing standing
     /// between a work order and a seat that has been dead for an hour.
-    fn tell(&self, seat: &Seat, text: &str) -> Result<()> {
+    fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery> {
         let state = self.state(seat)?;
         if !state.will_take_a_prompt() {
             return Err(Refusal::NotReady(state));
@@ -869,7 +869,11 @@ impl Place for Supervisor<'_> {
         // second `tell` arriving at the same moment: `O_APPEND` is atomic for a
         // write this size, so two sentences interleave as two lines rather than
         // as one unparseable one.
-        writeln!(f, "{line}").map_err(|e| Refusal::Backend(e.to_string()))
+        writeln!(f, "{line}").map_err(|e| Refusal::Backend(e.to_string()))?;
+        // [`Delivery::Unconfirmed`] and never anything stronger, on the same
+        // grounds as the refusal above: an append to a file is not evidence
+        // that anything read it. A backend that cannot watch says so.
+        Ok(Delivery::Unconfirmed)
     }
 
     /// End the agent, and let the seat go.

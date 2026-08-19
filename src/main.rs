@@ -715,7 +715,10 @@ fn help() {
                                     task, without ending it — `-` reads the
                                     message from stdin. The repair for an agent
                                     whose turn stopped: the conversation is
-                                    intact, and a respawn throws it away
+                                    intact, and a respawn throws it away.
+                                    The same sentence twice inside two minutes
+                                    is read as a retry and refused; `--again`
+                                    means it
 
 {machines}
   wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is

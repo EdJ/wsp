@@ -186,7 +186,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::herdr;
-use crate::place::{Agent, Census, Event, Order, Place, Refusal, Result, Seat, Seated, State};
+use crate::place::{Agent, Census, Delivery, Event, Order, Place, Refusal, Result, Seat, Seated, State};
 use crate::util::{self, Clock};
 
 /// herdr as a place to put work.
@@ -272,6 +272,15 @@ const NO_AGENT: &str = "agent_not_found";
 const NO_PANE: &str = "pane_not_found";
 const PANE_BUSY: &str = "agent_pane_busy";
 const NOT_TAKEN: &str = "agent_prompt_stalled";
+
+/// The sixth, and the only one that is not a refusal: herdr's `wait` giving up.
+///
+/// Matched on the code rather than on the sentence, because the sentence is
+/// herdr's to reword and `"code":"timeout"` is the wire contract
+/// (`api/wait.rs:618`). Not in [`refusal`] with the others and the reason is
+/// [`Herdr::tell`]'s: what a timeout means depends on what was underneath the
+/// wait, and only the call that put a delivery there knows one happened.
+const WATCH_TIMED_OUT: &str = "\"code\":\"timeout\"";
 
 /// Every status herdr has a word for, which is how [`Herdr::tell`] asks its wait
 /// for the one thing it wants and nothing more.
@@ -432,6 +441,24 @@ pub fn state_of_agent(p: &herdr::Pane) -> State {
 /// robustness-083 was opened about.
 pub(crate) fn state_of_pane(p: &herdr::Pane) -> State {
     of_status(&p.agent, &p.agent_status)
+}
+
+/// Whether a turn is in flight in this seat, off the status word alone.
+///
+/// Not [`Place::state`] with a `turn_in_flight()` on the end, and the
+/// difference is worklist-010, which [`Herdr::tell`] carries: that one
+/// qualifies the word by a readiness
+/// flag herdr sends only for agents it launched, and answers
+/// [`State::Unknown`] for a working seat somebody started by hand. Nothing
+/// that asks *is work happening here* wants that qualification —
+/// [`state_of_pane`] is the reading, and this is the only caller that needs
+/// it off `agent.get` rather than off a census row.
+///
+/// A seat that cannot be read is not turning **as far as this is
+/// concerned**, which is the safe way round: the wait is attached, and a
+/// wait that answers nothing now costs a word rather than a false failure.
+fn turning(seat: &Seat) -> bool {
+    look(seat).ok().flatten().is_some_and(|a| state_of_pane(&a).turn_in_flight())
 }
 
 /// A `herdr::Pane` as a census row.
@@ -685,12 +712,53 @@ impl Place for Herdr<'_> {
     /// against a call that is about to wait seconds, and there is no way to ask
     /// for the first wait without it: what to send depends on the state, and only
     /// herdr knows the state.
-    fn tell(&self, seat: &Seat, text: &str) -> Result<()> {
+    ///
+    /// **The gate asks for the status word and not for [`Place::state`], which
+    /// is worklist-010 and was a lie in production for a day.** `state` is
+    /// [`state_of_agent`]: a status *qualified by readiness*, and
+    /// `interactive_ready` is true only for an agent herdr launched itself
+    /// (`app/agents.rs:390` reads `managed_agent_interactive_ready`, and the
+    /// field is `skip_serializing_if = "is_false"`, so for everything else it is
+    /// absent). A seat is the one pane that is usually **not** launched by
+    /// herdr — a person types `claude` in a window and governs from it — so
+    /// `agent.get` on the `wsp` seat answers `agent_status: "working"` with no
+    /// readiness at all, [`state_of_agent`] correctly calls that
+    /// [`State::Unknown`], and a gate that demanded [`State::Working`] attached
+    /// the wait to exactly the agents the paragraph above says it must not.
+    /// Recorded on `w1:p6`, 2026-08-19, against `w3R:p1` which herdr did start
+    /// and which carries the field.
+    ///
+    /// Readiness is the wrong question here and [`state_of_pane`]'s own docs
+    /// already say so: "an agent whose status is `working` is working whether or
+    /// not it would accept a sentence". The gate is not asking whether the agent
+    /// will take a prompt — the prompt is going either way — it is asking
+    /// whether a turn is in flight, which is [`State::turn_in_flight`] over the
+    /// word herdr sent. A reading that cannot be had answers `false` and gets
+    /// the wait, which is the same choice as before and now costs nothing:
+    ///
+    /// **A wait that times out is not a failed send, and this is the whole of
+    /// the harm.** herdr dispatches the prompt and only then begins to wait
+    /// (`api/wait.rs:206`), so `{"code":"timeout"}` out of `agent.prompt` is a
+    /// statement about the watch and never about the delivery — every other way
+    /// for the prompt itself to fail comes back as its own code. Reporting it as
+    /// `Err` is what made a governor retry a message that had arrived, three
+    /// times in one day. So it is [`Delivery::Unconfirmed`]: delivered, and no
+    /// turn seen. Read in `tell` rather than in [`refusal`] because it is only
+    /// true here — this is the one call that knows a delivery came first.
+    fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery> {
         let mut params = json!({ "target": seat.as_str(), "text": text });
-        if !matches!(self.state(seat), Ok(State::Working)) {
+        let watched = !turning(seat);
+        if watched {
             params["wait"] = json!({ "until": ANY_STATUS, "timeout_ms": TAKEN });
         }
-        herdr::call_for("agent.prompt", params, SLOW).map(|_| ()).map_err(|e| refusal(seat, &e))
+        match herdr::call_for("agent.prompt", params, SLOW) {
+            Ok(_) if watched => Ok(Delivery::Started),
+            Ok(_) => Ok(Delivery::Unconfirmed),
+            Err(e) if herdr::answered(&e) && e.to_string().contains(WATCH_TIMED_OUT) => {
+                Ok(Delivery::Unconfirmed)
+            }
+            Err(e) => Err(refusal(seat, &e)),
+        }
     }
 
     /// `agent.send_keys enter`, which is the recovery that was run by hand every
@@ -942,6 +1010,85 @@ mod tests {
         place.tell(&seat, "stand down at eight").expect("a queued sentence is delivered");
         let told = fake.asked().into_iter().find(|a| a.verb == Verb::Tell);
         assert_eq!(told.map(|a| a.said), Some("stand down at eight".into()), "it reached the seat");
+    }
+
+    /// **worklist-010: the same sentence, to the same kind of agent, at the one
+    /// pane wsp is obliged to use — and for a day it was reported undelivered.**
+    ///
+    /// The test above passes because the fake's working agent carries
+    /// `interactive_ready: true`, which every recording behind the dialect was
+    /// taken from an agent `wsp spawn` had started. A *seat* is the other kind.
+    /// Nobody spawns a governor: a person types `claude` into their own window
+    /// and runs `wsp govern`, so herdr never managed that agent and answers
+    /// `agent_status: "working"` with no readiness at all. The gate asked
+    /// [`Place::state`], which qualifies the word by that flag and correctly
+    /// says [`State::Unknown`] — and a gate testing for [`State::Working`] then
+    /// attached the wait to the exact agents the test above exists to keep it
+    /// away from.
+    ///
+    /// Recorded on `w1:p6` on 2026-08-19, the `wsp` seat, while `w3R:p1` — a
+    /// spawned agent, same herdr, same second — carried the field. Three
+    /// deliveries to that seat were reported as `the wsp seat was not told`, one
+    /// of which is known to have arrived because the seat quoted it back.
+    #[test]
+    fn a_seat_a_person_started_is_mid_turn_like_any_other_and_is_not_waited_on() {
+        let stage = Stage::of(vec![Spot::agent("w1:p6", "claude", "wsp", State::Working).by_hand()]);
+        let (fake, _env) = bound("seat", stage);
+        let dial = Dial::new();
+        let place = brisk(&dial);
+        let seat = Seat::new("w1:p6");
+
+        // Not a bug in the reading and not something to repair here: readiness
+        // is genuinely unknown for an agent herdr did not launch, and
+        // `will_take_a_prompt` is right to refuse it. The bug was asking that
+        // question at all.
+        assert_eq!(place.state(&seat).unwrap(), State::Unknown, "a seat has no readiness flag");
+
+        assert_eq!(
+            place.tell(&seat, "worklist-005 touches panel/rows.rs"),
+            Ok(Delivery::Unconfirmed),
+            "the wait went out against a turn in flight, which is eight seconds ending in a lie",
+        );
+        let told = fake.asked().into_iter().find(|a| a.verb == Verb::Tell);
+        assert_eq!(told.map(|a| a.seat), Some(Some(seat)), "and the sentence did arrive");
+    }
+
+    /// **The other half of worklist-010, and the constraint rather than the
+    /// preference: never report failure for a send that happened.**
+    ///
+    /// The gate above closes the case wsp can see coming. This is the one it
+    /// cannot — the seat that was idle when it was read and turning by the time
+    /// the prompt landed, which is a race no amount of asking first can remove.
+    /// It is provoked here by taking the reading away entirely, which is the
+    /// same position the caller is in: the wait goes out, and herdr answers the
+    /// timeout it answers for a turn already in flight.
+    ///
+    /// herdr dispatches the prompt and only then begins to wait
+    /// (`api/wait.rs:206`), so that timeout is a statement about the watch and
+    /// never about the delivery. Reporting it as a failure is what made a
+    /// governor retry a message that had arrived, and one paragraph reached the
+    /// `wsp` seat three times in a day on the strength of it. The delivery is
+    /// the fact; the watch is the thing that came back empty.
+    #[test]
+    fn a_watch_that_times_out_is_a_delivery_and_never_a_failure() {
+        let stage = Stage::of(vec![Spot::agent("w1:p6", "claude", "wsp", State::Working)]);
+        let (fake, _env) = bound("unwatchable", stage);
+        let dial = Dial::new();
+        let place = brisk(&dial);
+        let seat = Seat::new("w1:p6");
+
+        // No reading, so no gate: this is the race, and it is also every
+        // caller's position the moment `agent.get` is slow.
+        fake.refuses(Verb::Ask, Snub::Backend("agent.get is not answering".into()));
+
+        assert_eq!(
+            place.tell(&seat, "stand down at eight"),
+            Ok(Delivery::Unconfirmed),
+            "`was not told` about a sentence that was told is the sentence that costs three sends",
+        );
+        assert_eq!(dial.elapsed(), Duration::ZERO, "nothing here waits on wsp's own clock");
+        let told = fake.asked().into_iter().find(|a| a.verb == Verb::Tell);
+        assert_eq!(told.map(|a| a.said), Some("stand down at eight".into()));
     }
 
     /// The other half: a prompt into an idle agent *is* waited on, and a wait
