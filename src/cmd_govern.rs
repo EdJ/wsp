@@ -992,8 +992,16 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     if let Some(was) = displaced {
         println!("  {}", p.dim(&format!("taken from {}", was.workspace)));
     }
+    // Not in the same grey as the hint below it. One agent holds one
+    // governorship, so this line is the whole of an eviction: the seat it names
+    // goes open, and `wsp govern <that scope> --tell` stops reaching this
+    // workspace the moment it prints — which is how a peer finds out, on
+    // 2026-08-19, that the seat it was addressing had moved. The seat that lost
+    // it had read this line and not weighed it, so the second half is the
+    // consequence spelled out rather than left to be inferred from "open".
     if let Some(was) = &handed_back {
-        println!("  {}", p.dim(&format!("stood down from {was}, and its seat is open")));
+        println!("  {} {}", p.yellow("stood down from"), p.bold(was));
+        println!("  {}", p.dim("that seat is open — --tell no longer reaches you there"));
     }
     println!("  {}", p.dim("raised hands here reach this workspace · wsp govern --clear to stand down"));
     0
@@ -1067,9 +1075,23 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
 /// `wsp govern --clear [<project>]` — this workspace stops being the seat.
 ///
 /// Bare, it stands down from everything this workspace holds, because a session
-/// ending does not end one seat at a time. Named, it gives up one and keeps the
-/// rest, which is how a seat that governs `wsp` and `robustness` hands the
-/// second one on.
+/// ending does not end one seat at a time. Named, it stands down the scope you
+/// name and leaves anything else standing.
+///
+/// **That plural is legacy being healed, not an arrangement to compose.** One
+/// agent holds one governorship — the decision, and the two questions it makes
+/// unanswerable, are in [`governs`] — and [`take`] stands a workspace down from
+/// whatever it held before. So two scopes on one workspace is a store written
+/// before that rule or edited around it — this one held two for a night — and
+/// it heals the next time anybody takes a seat. `--clear <scope>` is here to
+/// survive that state, not to build it: a seat wanting `wsp` covered while it
+/// runs `robustness` is asking for the chain [`seat_for`] walks, which answers
+/// with a different agent. Said here, 800 lines from the decision, because this
+/// paragraph read as a description of how governorship works cost a night on
+/// 2026-08-19 — a seat took a second scope not expecting the eviction that
+/// [`governs`] and [`take`] both document, lost the first, and with it the
+/// address `wsp govern <scope> --tell` reaches it by, so a peer could not reach
+/// it at all.
 ///
 /// `--clear` vacates and `--remove` takes the slot off the project, and the
 /// difference is which of the two facts changed. An agent standing down is a
