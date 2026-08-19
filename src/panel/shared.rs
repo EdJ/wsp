@@ -41,9 +41,9 @@
 //! [`super::run::share`] is where both now go.
 //!
 //! It lives in the state directory rather than the store proper, which is what
-//! keeps it out of `Store::fingerprint` — that walks `projects/` and `tasks/`
-//! only. A file inside the fingerprint would give every panel on the machine a
-//! full rebuild on every fold and every press of `j`.
+//! keeps it out of `Store::fingerprint` — that walks the store's committed
+//! records only. A file inside the fingerprint would give every panel on the
+//! machine a full rebuild on every fold and every press of `j`.
 
 use std::collections::HashSet;
 

@@ -95,8 +95,8 @@
 //! mistaken for a task id**: see [`new_id`].
 //!
 //! **Refresh (`worklist-009`).** `Store::fingerprint` is likewise not the
-//! place: it walks `projects/` and `tasks/`, and flags were deliberately kept
-//! out of it with a stamp of their own, because a panel refetch gated on the
+//! place: it walks the store's committed records, and flags were deliberately
+//! kept out of it with a stamp of their own, because a panel refetch gated on the
 //! store's fingerprint would sit on a raised hand until something unrelated
 //! moved. A message is the same fact, so it goes in the same stamp —
 //! `Store::flags_stamp` is now `Store::attention_stamp` and reads both files in

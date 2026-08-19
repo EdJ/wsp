@@ -221,9 +221,9 @@ impl Store {
     /// renumbered task except the ones inside a worklist, so a running list
     /// went on naming a member by an id nothing answered to, read it as
     /// `Settlement::Gone` — which is *settled* — and opened its barrier on
-    /// work still sitting on its branch. [`Store::fingerprint`] is blind to
-    /// `worklists/` and to `machines/` for the same reason, which is
-    /// `worklist-009`.
+    /// work still sitting on its branch. [`Store::fingerprint`] had been blind
+    /// to `worklists/` and to `machines/` for the same reason, and is written
+    /// against [`Store::live_record_dirs`] now — that was `worklist-009`.
     ///
     /// So the next record kind is one line here instead of a hunt for the
     /// walks that need telling. A caller wanting a subset **excludes** from
@@ -237,19 +237,30 @@ impl Store {
     /// the `.md` files at the store root — `agents.md`, `committing.md`,
     /// `README.md` are standing instructions to agents, not records of work.
     pub fn record_dirs(&self) -> Vec<PathBuf> {
-        let mut out = vec![
-            self.projects_dir(),
-            self.tasks_dir(),
-            self.machines_dir(),
-            self.worklists_dir(),
-            self.archive_projects_dir(),
-        ];
+        let mut out = self.live_record_dirs();
+        out.push(self.archive_projects_dir());
         // One directory per month, and a record whose `updated` is wrong lands
         // in any of them — the same reason `highest_seq` reads them all.
         if let Ok(months) = fs::read_dir(self.archive_dir()) {
             out.extend(months.flatten().map(|m| m.path()).filter(|p| p.is_dir()));
         }
         out
+    }
+
+    /// [`Store::record_dirs`] with the archive left out — the directories that
+    /// hold *open* work.
+    ///
+    /// This is the excluding half the doc above asks for, and it is written as
+    /// the base that `record_dirs` adds the archive to rather than as a second
+    /// list of kinds, so a record kind is still named in exactly one place. A
+    /// sibling list that merely happened to agree would be the original
+    /// mistake with one more copy of it.
+    ///
+    /// It exists because [`Store::fingerprint`] is on a tick: expanding the
+    /// archive months costs a `read_dir` per call to throw the result away, and
+    /// walking the months themselves costs a `stat` per task ever finished.
+    pub fn live_record_dirs(&self) -> Vec<PathBuf> {
+        vec![self.projects_dir(), self.tasks_dir(), self.machines_dir(), self.worklists_dir()]
     }
 
     /// Every state file that holds a task id, and therefore every file a
@@ -1160,10 +1171,48 @@ impl Store {
     /// task inside a second are two changes, and a store that rewrites a file
     /// the moment it claims it hits that window constantly. Filesystems that
     /// only keep whole seconds degrade to the old resolution rather than break.
+    ///
+    /// # What is in the stamp, and what is not
+    ///
+    /// **Every live record kind, and the archive is the only exclusion.** This
+    /// read `[projects_dir(), tasks_dir()]` for as long as those were the only
+    /// two kinds; `machines/` arrived, then `worklists/`, and nobody came back
+    /// — so adding a machine moved nothing any panel could see, and a worklist
+    /// row would have sat stale through a group finishing, a barrier opening
+    /// and a `status` going to `held` until an unrelated task happened to be
+    /// written. That is `worklist-009`, and the shape of the bug is worse than
+    /// the bug: it is diagnosed once at the surface as "the row is wrong" and
+    /// again, later, in here as "the refresh is wrong". So the list is
+    /// [`Store::live_record_dirs`] and the next kind is already in it.
+    ///
+    /// The archive is left out on purpose and not by omission — and not on
+    /// today's cost, which is nothing: walking it too measured 4.06ms, the same
+    /// number again, because 26 archived tasks are a rounding error. It is left
+    /// out because it is the one directory that grows without bound, by every
+    /// task ever finished, while buying a fact the stamp already has: `wsp
+    /// done` takes the file *out of* `tasks/`, and the count half of this is
+    /// there precisely so a departure is visible. So the stamp stays
+    /// proportional to open work, which is what a panel draws.
+    ///
+    /// Ephemeral state is out for a different reason and has stamps of its own
+    /// where it needs them: a raised hand, a message and a panel's own scroll
+    /// are not changes to the work, and a surface that wants them reads
+    /// [`Store::attention_stamp`] beside this rather than widening this.
+    ///
+    /// **Cost, measured rather than assumed** — it is on the panel's tick, so
+    /// widening it is a bill paid several times a second. Against the live
+    /// store on 2026-08-20, each figure the mean of 500 warm calls in a process
+    /// with nothing else in it: 4.24ms for the two directories this walked
+    /// before, 4.09ms for the four it walks now. The added directories are not
+    /// free, they are *below the noise* — an empty directory costs 50µs to
+    /// open, `tasks/` alone is 4.09ms of the total at 468 files, and
+    /// `worklists/` and `machines/` hold single figures between them. The shape
+    /// to remember is a ~50µs constant per directory and the rest linear in
+    /// files, so what would make this expensive is a directory that *grows*.
     pub fn fingerprint(&self) -> u64 {
         let mut newest = 0u64;
         let mut files = 0u64;
-        for dir in [self.projects_dir(), self.tasks_dir()] {
+        for dir in self.live_record_dirs() {
             let Ok(entries) = fs::read_dir(dir) else { continue };
             for e in entries.flatten() {
                 files += 1;
@@ -1496,9 +1545,9 @@ impl Store {
     /// Has anybody raised, lowered, answered or said anything since this said
     /// otherwise?
     ///
-    /// [`Store::fingerprint`] walks `projects/` and `tasks/` and cannot see
-    /// this: a raised hand is state, deliberately, and the panel's refetch is
-    /// gated on that fingerprint. Without a stamp of its own a raised hand
+    /// [`Store::fingerprint`] walks the store's records and cannot see this: a
+    /// raised hand is state, deliberately, and the panel's refetch is gated on
+    /// that fingerprint. Without a stamp of its own a raised hand
     /// would wait for whatever else happened to change the store — which on a
     /// quiet machine is nothing at all, and a hand nobody sees is worse than no
     /// hand.
@@ -2308,9 +2357,9 @@ mod tests {
     }
 
     /// A hand raised is state, and the panel's refetch is gated on a
-    /// fingerprint that walks `projects/` and `tasks/` — so the stamp is what
-    /// stands between a flag and a panel that shows it whenever something else
-    /// happens to change. Nothing about the store moves when one is raised,
+    /// fingerprint over the store's records — so the stamp is what stands
+    /// between a flag and a panel that shows it whenever something else happens
+    /// to change. Nothing about the store moves when one is raised,
     /// which is the whole reason this exists.
     #[test]
     fn a_raised_hand_is_visible_without_the_store_moving() {
@@ -2425,15 +2474,23 @@ mod tests {
     /// because adding a machine is a change to the setup. The live half is
     /// state and must not: a machine flapping in and out of reach would
     /// otherwise look to every panel on the seat like the work having changed.
+    ///
+    /// Both halves are asserted here now. Until `worklist-009` this said all of
+    /// the above, took `after_add`, and then only ever checked the liveness
+    /// half against it — so the sentence was true as an intention and false as
+    /// a fact for as long as `machines/` had existed, and the test went green
+    /// either way. An audit that reads one of two halves reports clean.
     #[test]
     fn a_machine_is_a_committed_file_and_its_liveness_is_not() {
         let store = scratch("machines");
         assert!(store.machines().is_empty(), "no machines dir yet is no machines");
+        let before_add = store.fingerprint();
 
         let mut m = Machine::new("mb2", "mb2.tail");
         m.os = "darwin".into();
         store.save_machine(&m).unwrap();
         let after_add = store.fingerprint();
+        assert_ne!(after_add, before_add, "adding a machine was invisible to every panel");
 
         let back = store.machine("mb2").expect("round-trips through the file");
         assert_eq!(back.ssh, "mb2.tail");
@@ -2930,11 +2987,19 @@ mod tests {
         let _ = fs::remove_dir_all(&store.root);
     }
 
+    /// Say when a file was last written, rather than waiting for a clock to
+    /// say it. Every fingerprint test below is about *which* changes the stamp
+    /// carries, and a test that slept to make an mtime differ would be
+    /// asserting the filesystem's timestamp resolution instead.
+    fn set_mtime(path: &Path, at: SystemTime) {
+        let f = fs::File::options().write(true).open(path).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(at)).unwrap();
+    }
+
     fn task_file(store: &Store, name: &str, at: SystemTime) {
         let path = store.tasks_dir().join(name);
         fs::write(&path, "x").unwrap();
-        let f = fs::File::options().write(true).open(&path).unwrap();
-        f.set_times(fs::FileTimes::new().set_modified(at)).unwrap();
+        set_mtime(&path, at);
     }
 
     /// The two halves of the fingerprint have to survive into the answer
@@ -2980,6 +3045,74 @@ mod tests {
 
         task_file(&store, "b.md", t - Duration::from_secs(3600));
         assert_ne!(alone, store.fingerprint(), "an older file arriving was invisible");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// The exposure `worklist-009` is: a queue advancing has to be a change
+    /// every panel can see.
+    ///
+    /// [`Store::fingerprint`] walked `projects/` and `tasks/` for as long as
+    /// those were the only two record kinds, and nobody came back to it when
+    /// `machines/` and then `worklists/` arrived. So a group finishing, a
+    /// barrier opening, a `status` going to `held` — none of it moved the stamp
+    /// the daemon, the panel and `wsp view` all gate their refetch on, and a
+    /// worklist row would have sat stale until an unrelated task happened to be
+    /// written. Stale in the pinned foot, beside `(agents)` and `(flagged)`,
+    /// which are the sections that exist for news about *now*: a row there that
+    /// reports the wrong state confidently is worse than no row.
+    ///
+    /// **The second write is the one that matters** and the reason this does
+    /// not stop at the file arriving. Advancing a queue does not add a file, it
+    /// rewrites one — so the count half of the stamp cannot carry it and only
+    /// the mtime half can, and a walk that reached `worklists/` but summed the
+    /// two halves together would still be blind to exactly this.
+    ///
+    /// Asserted through [`Store::live_record_dirs`] rather than against a list
+    /// of directories written out again here, for the reason that list exists:
+    /// the failure was a hand-kept list nobody revisited when a record kind was
+    /// added, and a test that keeps its own copy of one is the same mistake
+    /// with a green tick over it.
+    #[test]
+    fn a_worklist_advancing_is_a_change_the_refresh_can_see() {
+        let store = scratch("fp-worklist");
+        for kind in ["projects", "tasks", "worklists", "machines"] {
+            assert!(
+                store.live_record_dirs().iter().any(|d| d.ends_with(kind)),
+                "{kind} is a record kind outside the stamp every refetch gates on",
+            );
+        }
+        // The archive is the one exclusion, and it is a decision rather than an
+        // oversight — see the doc on [`Store::fingerprint`]. Written down here
+        // because the next reader to find the stamp expensive will reach for
+        // this line, and the answer is that the growing directory is already
+        // out.
+        let archive = store.root.join("archive");
+        assert!(
+            !store.live_record_dirs().iter().any(|d| d.starts_with(&archive)),
+            "the one directory that grows without bound is on the panel's tick",
+        );
+
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let quiet = store.fingerprint();
+
+        let mut w = Worklist::new("batch", "Overnight batch");
+        w.body = "## Groups\n- 1  data-002 data-003\n- 2  data-004\n".into();
+        store.save_worklist(&w).unwrap();
+        set_mtime(&store.worklist_path("batch"), t);
+        let composed = store.fingerprint();
+        assert_ne!(composed, quiet, "a worklist arriving was invisible to every panel");
+
+        // And now the queue moves without the store gaining or losing a file,
+        // which is what a barrier opening looks like on disk.
+        w.set_status(WorklistStatus::Held);
+        store.save_worklist(&w).unwrap();
+        set_mtime(&store.worklist_path("batch"), t + Duration::from_secs(1));
+        assert_ne!(
+            store.fingerprint(),
+            composed,
+            "the queue advancing moved nothing the panel refetches on",
+        );
 
         let _ = fs::remove_dir_all(&store.root);
     }

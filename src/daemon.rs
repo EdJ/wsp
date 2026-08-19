@@ -756,8 +756,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             let emits = attention::tick(store, &mut pass, &mut source, now);
             // An edge is exactly the moment the sidebar's `needs` token
             // changes, and nothing else below would notice: `store.fingerprint`
-            // walks `projects/` and `tasks/`, and a level going up moves
-            // neither. Without this the token is correct and up to `REFRESH`
+            // walks the store's committed records, and a level going up moves
+            // none of them. Without this the token is correct and up to `REFRESH`
             // late, which on the one signal that is *somebody is waiting on
             // you* is the fault being fixed with a smaller number on it.
             attention_moved = !emits.is_empty();

@@ -1103,8 +1103,8 @@ pub(super) fn event_loop(
     let mut took_focus = Instant::now() - Duration::from_secs(60);
     let mut last_fingerprint = store.fingerprint();
     // The other half of "has anything changed": a hand raised or lowered, or a
-    // message raised or answered. Those are state files rather than tasks, so
-    // the fingerprint above — which walks `projects/` and `tasks/` — cannot see
+    // message raised or answered. Those are state files rather than records, so
+    // the fingerprint above — which walks the store's records — cannot see
     // them, and a panel that watched only the store would show a flag whenever
     // the store next happened to change and never on a quiet machine.
     // `attention_stamp` reads every such file, so nothing here has to remember
