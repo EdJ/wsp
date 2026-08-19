@@ -1894,12 +1894,23 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         );
     }
 
+    // Read here rather than at the top, because `go` is what puts the list
+    // into `running` and a list is only asked ahead of a project chain once it
+    // is running: this is the state the members about to be named will raise
+    // their hands into.
+    let list_seat = seat_on(store, &w);
+
     if args.json() {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "worklist": w.id,
                 "dry_run": dry,
+                // The routing answer and not the occupancy: `false` is a hand
+                // raised on a member reaching whatever seat sits above its own
+                // project. A caller driving this verb sees no output at all,
+                // and that is the case this whole line exists for.
+                "seated": matches!(list_seat, SeatOn::Held),
                 "started": starting,
                 "passed": crossed,
                 "verdict": said,
@@ -1941,6 +1952,38 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         say_overlap(&p, &overlap);
     }
     say_swept(&p, swept.as_ref(), crossed.is_some() && args.has("keep"), dry);
+    // Beside the line naming what may start, because it is about those same
+    // members: a hand raised on one of them reaches this list's seat, and with
+    // nobody in it, the project chain each member happens to sit in. Referencing
+    // a task across a project boundary rather than moving it — `wsp-088` d1 —
+    // only has its benefit once the list has a seat; without one it has the cost
+    // of moving and none of the gain, and it looks like it works.
+    //
+    // Said at every barrier and not only at the start, because a barrier is
+    // where the next group's members are named as startable and that is what
+    // makes new hands possible. It stops the moment somebody takes the seat.
+    //
+    // **Not a refusal, and `go` does not take the seat.** A list may legitimately
+    // be run by somebody who has not taken it, and taking one stands the
+    // workspace down from whatever it held before — a consequence nobody typing
+    // `go` asked for.
+    match &list_seat {
+        SeatOn::Held => {}
+        rest => {
+            println!(
+                "{}  {}",
+                p.bold("no seat"),
+                p.dim(&format!("hands raised on its members reach their projects' seats · wsp govern {}", w.id))
+            );
+            if let SeatOn::Elsewhere(host) = rest {
+                println!(
+                    "{}  {}",
+                    util::pad("", 7),
+                    p.dim(&format!("held from {host} — not a machine a hand raised here reaches"))
+                );
+            }
+        }
+    }
     println!("{}", p.dim(&format!("{}  what may start now", how("next", &w, seat))));
     0
 }
@@ -1983,6 +2026,35 @@ fn only_one_running(store: &Store, w: &Worklist, pos: &Position) -> Option<i32> 
     }
     eprintln!("     take them out of one of the two, or hold the other — wsp worklist hold <slug> \"why\"");
     Some(1)
+}
+
+/// Whether anybody answers for this list, read from this machine.
+enum SeatOn {
+    /// Somebody is in it, here.
+    Held,
+    /// No record at all, or a post standing empty.
+    Nobody,
+    /// Filled from another machine, carried so the line can say which rather
+    /// than claim the list has never had a seat.
+    Elsewhere(String),
+}
+
+/// The first step of [`crate::cmd_govern::seat_for`]'s walk, asked of the list
+/// rather than of a task: a member's raised hand tries its list's seat and
+/// falls through to the member's own project chain when nobody is in it.
+///
+/// Read through [`crate::cmd_govern::slots`] so this answer and routing's are
+/// one answer. A record filled from another host is a seat nothing raised here
+/// can reach, and `seat_of` already reads it as absent rather than as
+/// somewhere — this must agree with it or the line would promise a seat that
+/// no hand arrives at.
+fn seat_on(store: &Store, w: &Worklist) -> SeatOn {
+    let slot = crate::cmd_govern::slots(&store.governors()).into_iter().find(|s| s.scope == w.id);
+    match slot {
+        Some(s) if s.filled() => SeatOn::Held,
+        Some(s) if s.elsewhere() => SeatOn::Elsewhere(s.host),
+        _ => SeatOn::Nobody,
+    }
 }
 
 /// What the group that just landed touched, where two of them touched one file.
@@ -2711,6 +2783,49 @@ mod tests {
         assert_eq!(run(&store, &["go", "batch", "the", "table", "is", "agreed"]), 0);
         assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
         assert_eq!(gate_of(&store, "batch"), "ready wl-001");
+    }
+
+    /// A list with no seat routes its members' raised hands to their own
+    /// projects' seats, and `go` is where somebody is present to hear it said.
+    ///
+    /// `robustness-088` is the first member ever referenced across a project
+    /// boundary rather than moved, and its routing check arrived at the `wsp`
+    /// seat four minutes after it was spawned. Every step of that walk was
+    /// correct — its list had no seat, so `seat_for` fell through to the
+    /// project chain. What is wrong is the silence: referencing rather than
+    /// moving only has its benefit once the list has a seat, and without one it
+    /// has the cost of moving with none of the gain while looking like it
+    /// works.
+    ///
+    /// Said, never refused. A list may legitimately be run by somebody who has
+    /// not taken the seat, and `go` does not take one either — taking a seat
+    /// stands a workspace down from whatever it held before.
+    #[test]
+    fn a_list_with_no_seat_says_where_its_hands_go_and_still_passes_the_barrier() {
+        let (_env, store) = running("seatless");
+        task(&store, "wl-001", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+
+        let w = store.worklist("batch").unwrap();
+        assert!(matches!(seat_on(&store, &w), SeatOn::Nobody), "no record is nobody");
+        assert_eq!(run(&store, &["go", "batch"]), 0, "and it is said rather than refused");
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
+
+        // A post standing empty answers the same, because what routing asks is
+        // who is in it *now* — `cmd_govern::vacate` keeps the slot and drops
+        // the occupancy.
+        store.set_governor("batch", json!({ "since": util::now_iso() }));
+        assert!(matches!(seat_on(&store, &w), SeatOn::Nobody), "an empty post is nobody");
+
+        // And a seat held from another machine is not one a hand raised here
+        // reaches: `seat_of` reads it as absent, so this must too, and it says
+        // which machine rather than claiming the list never had a seat.
+        store.set_governor("batch", json!({ "workspace": "w1", "host": "another-box" }));
+        assert!(matches!(seat_on(&store, &w), SeatOn::Elsewhere(h) if h == "another-box"));
+
+        store.set_governor("batch", json!({ "workspace": "w1", "host": util::hostname() }));
+        assert!(matches!(seat_on(&store, &w), SeatOn::Held), "and this is the quiet case");
     }
 
     /// The constraint the routing step rests on: a hand raised at 3am reaches
