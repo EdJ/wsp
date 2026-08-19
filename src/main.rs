@@ -37,6 +37,7 @@ mod herdr;
 mod input;
 mod kanban;
 mod live;
+mod message;
 mod model;
 mod overlap;
 mod panel;

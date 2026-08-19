@@ -1102,12 +1102,14 @@ pub(super) fn event_loop(
     // on the first of a burst and not on the ninety after it.
     let mut took_focus = Instant::now() - Duration::from_secs(60);
     let mut last_fingerprint = store.fingerprint();
-    // The other half of "has anything changed": a hand raised or lowered. It
-    // is a state file rather than a task, so the fingerprint above — which
-    // walks `projects/` and `tasks/` — cannot see it, and a panel that watched
-    // only the store would show a flag whenever the store next happened to
-    // change and never on a quiet machine.
-    let mut last_flags = store.flags_stamp();
+    // The other half of "has anything changed": a hand raised or lowered, or a
+    // message raised or answered. Those are state files rather than tasks, so
+    // the fingerprint above — which walks `projects/` and `tasks/` — cannot see
+    // them, and a panel that watched only the store would show a flag whenever
+    // the store next happened to change and never on a quiet machine.
+    // `attention_stamp` reads every such file, so nothing here has to remember
+    // which ones there are.
+    let mut last_flags = store.attention_stamp();
     // The status the frame in front of the reader was drawn with, and when we
     // last asked herdr whether it still holds. See [`STATUS_POLL`].
     let mut drawn_status: HashMap<String, String> = HashMap::new();
@@ -1557,14 +1559,14 @@ pub(super) fn event_loop(
                 // workspaces inside it landed on a settled question holding the
                 // keyboard.
                 //
-                // It can be checked this often because of what it costs: one
-                // `stat` of one file, against the `readdir` of two directories
-                // and the two socket round-trips a refetch makes. At five ticks
-                // a second across twenty-two panels that is a hundred stats a
-                // second and no allocation — cheaper than the status poll
-                // below, which is a socket call and already runs on every
-                // unfocused panel.
-                let flags_now = store.flags_stamp();
+                // It can be checked this often because of what it costs: a
+                // `stat` per file in `Store::attention_files` — two of them —
+                // against the `readdir` of two directories and the two socket
+                // round-trips a refetch makes. At five ticks a second across
+                // twenty-two panels that is a couple of hundred stats a second
+                // and no allocation — cheaper than the status poll below, which
+                // is a socket call and already runs on every unfocused panel.
+                let flags_now = store.attention_stamp();
                 if flags_now != last_flags {
                     refetch = true;
                     dirty = false;
@@ -1615,7 +1617,7 @@ pub(super) fn event_loop(
         if refetch {
             last_fetch = Instant::now();
             last_fingerprint = store.fingerprint();
-            last_flags = store.flags_stamp();
+            last_flags = store.attention_stamp();
             // Adopt before rebuilding, because the folds and the filters decide
             // which rows there are to rebuild. A panel that has just been
             // switched to refetches on the `workspace.focused` that named it,
@@ -1713,7 +1715,9 @@ mod tests {
             .split("Msg::Tick => {\n")
             .nth(1)
             .expect("the tick arm moved");
-        let stamp = tick.find("flags_stamp()").expect("the tick no longer reads the flags at all");
+        let stamp = tick
+            .find("attention_stamp()")
+            .expect("the tick no longer reads what is addressed to somebody");
         let gate = tick
             .find("if last_fetch.elapsed() >= interval")
             .expect("the cadence gate moved");

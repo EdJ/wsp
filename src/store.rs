@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::fm;
+use crate::message::{self, Message, Refused};
 use crate::model::{Machine, Project, Task, Worklist};
 use crate::util;
 
@@ -249,6 +250,50 @@ impl Store {
             out.extend(months.flatten().map(|m| m.path()).filter(|p| p.is_dir()));
         }
         out
+    }
+
+    /// Every state file that holds a task id, and therefore every file a
+    /// renumbering has to rewrite — the state half of [`Store::record_dirs`].
+    ///
+    /// # Why this exists rather than a list inside `rename_tasks`
+    ///
+    /// It is the same lesson one storey down, and the store half proved it
+    /// costs a barrier: `worklist-015` was a hand-kept list of *record
+    /// directories* that nobody revisited when `worklists/` was added, so a
+    /// renumbered member read as gone — which is *settled* — and a barrier
+    /// opened on work still sitting on a branch. The live trigger was `wsp mv`,
+    /// an ordinary verb, not `wsp migrate`.
+    ///
+    /// State is exposed to exactly the same thing and had exactly the same
+    /// shape of list. `messages.json` is the case that would have repeated it:
+    /// a message names the task it is about and the task somebody is waiting
+    /// on, and both are dead references the moment a task is renumbered — a
+    /// question whose `waiting.task` no longer resolves cannot have its answer
+    /// written to a task log, which is the one write in the whole design that
+    /// is not best-effort.
+    ///
+    /// A caller wanting a subset **excludes** from this, visibly, rather than
+    /// listing what it happens to remember: an omission is invisible in review
+    /// and an exclusion is not.
+    ///
+    /// Files that hold no id are deliberately absent rather than harmless
+    /// passengers — `daemon.json`, `said.json`, `.lock`. Adding one costs a
+    /// read and a token scan of a file that can never match.
+    pub fn state_files_with_ids() -> &'static [&'static str] {
+        &[
+            "bindings.json",
+            "claims.json",
+            "worked.json",
+            "flags.json",
+            "messages.json",
+            "governors.json",
+            "mandates.json",
+            "pins.json",
+            "detail.json",
+            "panel-view.json",
+            "panels.json",
+            "events.jsonl",
+        ]
     }
 
     pub fn exists(&self) -> bool {
@@ -750,17 +795,20 @@ impl Store {
         }
 
         // Ephemeral state keys tasks by id too — a claim, a binding, a raised
-        // hand, the event log. It is not committed, so it is rewritten under
-        // the same lock everything else takes rather than with the store.
-        // Rewriting the raw text is sound here precisely because an id can hold
-        // no JSON metacharacter: there is nothing to escape and nothing to
-        // reparse.
+        // hand, a message, the event log. It is not committed, so it is
+        // rewritten under the same lock everything else takes rather than with
+        // the store. Rewriting the raw text is sound here precisely because an
+        // id can hold no JSON metacharacter: there is nothing to escape and
+        // nothing to reparse. It is also why every id that is *not* a task id
+        // must be unable to look like one — see `crate::message::new_id`.
+        //
+        // The list is [`Store::state_files_with_ids`] and not written out here,
+        // for the reason [`Store::record_dirs`] exists: this is the same
+        // hand-kept list one storey down, and the failure it produces is the
+        // same one — a record kind added, the walk not told, and an id nothing
+        // answers to left sitting in a file somebody reads.
         self.locked(|| {
-            for name in
-                ["bindings.json", "claims.json", "worked.json", "flags.json", "governors.json",
-                 "mandates.json", "pins.json", "detail.json", "panel-view.json", "panels.json",
-                 "events.jsonl"]
-            {
+            for name in Store::state_files_with_ids() {
                 let path = self.state_file(name);
                 let Ok(text) = fs::read_to_string(&path) else { continue };
                 let (out, n) = substitute_tokens(&text, map);
@@ -1422,25 +1470,128 @@ impl Store {
         removed
     }
 
-    /// Has anybody raised or lowered a flag since this said otherwise?
+    /// Has anybody raised, lowered, answered or said anything since this said
+    /// otherwise?
     ///
     /// [`Store::fingerprint`] walks `projects/` and `tasks/` and cannot see
-    /// this: flags are state, deliberately, and the panel's refetch is gated on
-    /// that fingerprint. Without a stamp of its own a raised hand would wait
-    /// for whatever else happened to change the store — which on a quiet
-    /// machine is nothing at all, and a hand nobody sees is worse than no hand.
+    /// this: a raised hand is state, deliberately, and the panel's refetch is
+    /// gated on that fingerprint. Without a stamp of its own a raised hand
+    /// would wait for whatever else happened to change the store — which on a
+    /// quiet machine is nothing at all, and a hand nobody sees is worse than no
+    /// hand.
     ///
-    /// One `stat`, which is why it can sit in the same tick gate. Nanoseconds
-    /// for the same reason the fingerprint uses them: raising and lowering
-    /// inside one second is two pieces of news. A missing file is zero — the
-    /// resting state, and equal to itself.
-    pub fn flags_stamp(&self) -> u64 {
-        fs::metadata(self.state_file("flags.json"))
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as u64)
+    /// **It reads every file attention lives in, so a surface never has to
+    /// remember a second one.** `worklist-009` is the store half of this
+    /// mistake — `fingerprint` was written against the directories its author
+    /// knew about and nobody went back to it when a record kind was added — and
+    /// a message record is exactly the record kind that would have repeated it
+    /// here: a message is drawn on the same panel, in the same section, on the
+    /// same tick. So the next one is a line in [`Store::attention_files`]
+    /// rather than a hunt for the gates that need telling.
+    ///
+    /// One `stat` per file, which is why it can sit in the same tick gate.
+    /// Nanoseconds for the same reason the fingerprint uses them: raising and
+    /// lowering inside one second is two pieces of news. A missing file is zero
+    /// — the resting state, and equal to itself. They are `max`ed rather than
+    /// summed because a sum of two mtimes can collide with a different pair,
+    /// and a collision here is a panel that keeps drawing an answered question.
+    pub fn attention_stamp(&self) -> u64 {
+        Store::attention_files()
+            .iter()
+            .filter_map(|name| {
+                fs::metadata(self.state_file(name))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+            })
+            .max()
             .unwrap_or(0)
+    }
+
+    /// The state files that hold something addressed to somebody *now* — the
+    /// list [`Store::attention_stamp`] is written against, and the one place a
+    /// new one is added.
+    pub fn attention_files() -> &'static [&'static str] {
+        &["flags.json", "messages.json"]
+    }
+
+    // ---- messages ---------------------------------------------------------
+    //
+    // The record `wsp-095` found missing: every message in wsp is a keystroke
+    // stream into a composer, and a message that is not a record cannot be
+    // re-read, replied to, deduplicated or attributed. The envelope, the three
+    // shapes and the question lifecycle are in [`crate::message`], which is
+    // also where the reasoning lives; this is only where it is kept.
+    //
+    // State and not store, for the reason a flag is: a message is addressed to
+    // somebody *now*, and putting an interruption into git would leave it in
+    // the history of the work for ever. `wsp note` is still the verb for the
+    // half of it worth keeping — and an *answered question* is the one thing
+    // here that does land on a task, because a decision about the work is what
+    // `## Log` is for.
+    //
+    // Keyed by message id and not by task id, which is the whole of
+    // `worklist-017`: `flags.json` is keyed by task, so a second flag on one
+    // task silently replaces the first.
+
+    /// message id -> the record.
+    #[allow(dead_code)]
+    pub fn messages(&self) -> BTreeMap<String, Message> {
+        match self.read_json("messages.json") {
+            Value::Object(m) => {
+                m.into_iter().map(|(id, v)| (id.clone(), Message::from_json(&id, &v))).collect()
+            }
+            _ => BTreeMap::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn message(&self, id: &str) -> Option<Message> {
+        match self.read_json("messages.json").get(id) {
+            Some(v) => Some(Message::from_json(id, v)),
+            None => None,
+        }
+    }
+
+    /// Write one.
+    ///
+    /// **Refuses a level.** A [`crate::message::Shape::Signal`] is derived on
+    /// the pass that needs it and re-derived on the next one; storing it is
+    /// storing a fact that may have stopped being true, and a panel drawing
+    /// those is `robustness-088`'s named failure — *worse than the silence it
+    /// replaces*. The guard is at the door rather than only in the lifecycle
+    /// functions so that a consumer reaching for the store directly meets it
+    /// too.
+    #[allow(dead_code)]
+    pub fn save_message(&self, m: &Message) -> Result<(), Refused> {
+        if m.shape() == Some(message::Shape::Signal) {
+            return Err(Refused::IsALevel);
+        }
+        self.update_json("messages.json", |f| {
+            f.insert(m.id.clone(), m.to_json());
+        });
+        Ok(())
+    }
+
+    /// Remove one, for a caller pruning what is closed.
+    ///
+    /// **Refuses an open question**, and that refusal is the point rather than
+    /// a courtesy: forgetting a question somebody is sitting still on is
+    /// exactly the `worklist-004` failure — the hand goes down, every surface
+    /// reads the matter as closed, and the asker learns nothing. A question
+    /// ends by being answered or abandoned, both of which take a sentence and
+    /// both of which reach the asker.
+    #[allow(dead_code)]
+    pub fn forget_message(&self, id: &str) -> Result<bool, Refused> {
+        if let Some(m) = self.message(id) {
+            if m.shape() == Some(message::Shape::Question) && m.is_open() {
+                return Err(Refused::StillOpen);
+            }
+        }
+        let mut removed = false;
+        self.update_json("messages.json", |f| removed = f.remove(id).is_some());
+        Ok(removed)
     }
 
     // ---- watches ----------------------------------------------------------
@@ -2137,12 +2288,12 @@ mod tests {
     #[test]
     fn a_raised_hand_is_visible_without_the_store_moving() {
         let store = scratch("flags");
-        assert_eq!(store.flags_stamp(), 0, "nothing written yet is the resting state");
+        assert_eq!(store.attention_stamp(), 0, "nothing written yet is the resting state");
         let before = store.fingerprint();
 
         store.set_flag("t-1", json!({ "said": "can I take this?", "pane": "w1:p6" }));
         assert_eq!(store.fingerprint(), before, "a flag is not a change to the work");
-        let raised = store.flags_stamp();
+        let raised = store.attention_stamp();
         assert_ne!(raised, 0, "…and it is a change the panel can see");
         assert_eq!(
             store.flags().get("t-1").and_then(|f| f.get("said")).and_then(|s| s.as_str()),
@@ -2154,8 +2305,91 @@ mod tests {
         // until something else changed.
         assert!(store.clear_flag("t-1"));
         assert!(store.flags().is_empty());
-        assert!(store.flags_stamp() >= raised, "lowering it is a change too");
+        assert!(store.attention_stamp() >= raised, "lowering it is a change too");
         assert!(!store.clear_flag("t-1"), "and there is nothing left to lower");
+    }
+
+    /// The refresh exposure, from the second record type's side.
+    ///
+    /// `worklist-009` is the store half of this: [`Store::fingerprint`] was
+    /// written against the directories its author knew about and nobody went
+    /// back to it, so a panel drawing a worklist never refreshes. A message is
+    /// the same hazard one storey down — it is drawn on the same panel, in the
+    /// same section, on the same tick, and it moves nothing the fingerprint can
+    /// see. Asserted through [`Store::attention_files`] rather than by naming
+    /// the two files again here: a test that keeps its own copy of a hand-kept
+    /// list is the same mistake with a green tick over it.
+    #[test]
+    fn a_message_is_visible_to_the_gate_a_raised_hand_already_moves() {
+        let store = scratch("msg-stamp");
+        assert!(
+            Store::attention_files().contains(&"messages.json"),
+            "the message record is outside the stamp the panel gates on",
+        );
+        let before = store.fingerprint();
+        let quiet = store.attention_stamp();
+
+        let m = crate::message::Message::new(
+            crate::message::Party::pane("w4J:p1", "ws"),
+            crate::message::Kind::Note,
+            "both in worklist.rs",
+        );
+        store.save_message(&m).unwrap();
+
+        assert_eq!(store.fingerprint(), before, "a message is not a change to the work");
+        assert!(store.attention_stamp() > quiet, "…and it is a change the panel can see");
+    }
+
+    /// The renumbering exposure, from the second record type's side.
+    ///
+    /// `worklist-015` was a hand-kept list of record *directories* that nobody
+    /// revisited when a record kind was added, so a renumbered member read as
+    /// gone — which is *settled* — and a barrier opened on work still on a
+    /// branch. The live trigger was `wsp mv`, an ordinary verb.
+    ///
+    /// A message names two tasks: the one it is about and the one somebody is
+    /// waiting on. The second is the one that costs, because it is where an
+    /// answer gets written, and that write is the only one in the whole design
+    /// that is not best-effort. Asserted against
+    /// [`Store::state_files_with_ids`] for the same reason the record-directory
+    /// test is asserted against [`Store::record_dirs`].
+    #[test]
+    fn a_renumbering_reaches_the_tasks_a_message_names() {
+        use crate::message::{About, Kind, Message, Party, Waiting};
+        let store = scratch("msg-rename");
+        proj(&store, "worklist", "");
+
+        assert!(
+            Store::state_files_with_ids().contains(&"messages.json"),
+            "a renumbering would walk past the message record",
+        );
+
+        let mut t = Task::new("the member", "t-260815-014");
+        t.project = Some("worklist".into());
+        store.save_task(&t).unwrap();
+
+        let m = Message::question(
+            Party::pane("w4J:p1", "ws"),
+            Kind::Note,
+            "is t-260815-014 the one to move?",
+            Waiting::new("w4J:p1", "t-260815-014"),
+        )
+        .about(About::Task("t-260815-014".into()));
+        store.save_message(&m).unwrap();
+
+        let mut map = BTreeMap::new();
+        map.insert("t-260815-014".to_string(), "worklist-002".to_string());
+        store.rename_tasks(&map).unwrap();
+
+        let back = store.message(&m.id).expect("the message is still there under its own id");
+        assert_eq!(
+            back.waiting.as_ref().map(|w| w.task.as_str()),
+            Some("worklist-002"),
+            "the answer would have been written to a task that no longer answers to that id",
+        );
+        assert_eq!(back.about, About::Task("worklist-002".into()));
+        assert!(back.text.contains("worklist-002"), "prose naming the task is rewritten too");
+        assert_eq!(back.id, m.id, "a message id is not in the task id space and must not move");
     }
 
     /// The two halves of a machine, and the line between them.
