@@ -1277,9 +1277,21 @@ fn target(store: &Store, needle: &str) -> Option<(String, String)> {
 /// everything downstream. This writes to a composer, and the paragraph breaks
 /// in a brief are what make it readable by the thing that has to act on it.
 fn message(args: &Args) -> Result<String, i32> {
-    let rest = args.rest.get(1..).unwrap_or_default();
+    prose(args, 1)
+}
+
+/// The same sentence, for the verbs that are not `tell`.
+///
+/// `wsp ask` and `wsp answer` take prose after an id exactly as this does, and
+/// they must take it *identically*: the `-` form, the empty check and the
+/// backtick refusal are one behaviour, and a second copy of them is a second
+/// set of edge cases. `render-080` is why the refusal exists at all — three
+/// phrases were executed by the shell instead of delivered, and the message
+/// arrived fluent with the load-bearing nouns missing.
+pub(crate) fn prose(args: &Args, skip: usize) -> Result<String, i32> {
+    let rest = args.rest.get(skip..).unwrap_or_default();
     if !matches!(rest, [one] if one == "-") {
-        return typed_message(&args.text(1));
+        return typed_message(&args.text(skip));
     }
     piped_message()
 }

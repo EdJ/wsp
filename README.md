@@ -3609,6 +3609,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
+| `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back |
 | `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, and what a landed group touched |
 | `src/guard.rs` | the stash guard: one stack per repository however many worktrees, and the git hook that refuses it inside the command that would have taken it |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
@@ -3637,6 +3638,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, and the three reasons one is finished with |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
+| `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker |
 | `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, and the five ways silence lies |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |

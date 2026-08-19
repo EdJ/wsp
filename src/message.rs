@@ -775,6 +775,45 @@ impl Message {
         self.is_open() && self.shape().is_some_and(|s| s != Shape::Signal)
     }
 
+    /// Should a person look at this?
+    ///
+    /// # Why this is not [`Message::is_open`] widened
+    ///
+    /// [`Message::is_open`] fails closed on a word it cannot parse, which is
+    /// right for **action** and silent for **attention**, and they are
+    /// different questions. An older binary — and the installed binary is
+    /// routinely not the tree — meeting a state a newer one wrote does not
+    /// merely refuse to act on it: with only `is_open` it reports that nothing
+    /// is standing. A question that cannot be parsed becomes a question that
+    /// raises nothing, which is `robustness-051` arriving through the module
+    /// built to remove it.
+    ///
+    /// The repair is the one this project has already made twice, in
+    /// `cmd_checkout`: give the unknown case **its own answer** rather than
+    /// folding it into one that already means something. `Landing::NoBranch`
+    /// and then `Landing::Nothing` are readings rather than verdicts, and
+    /// widening `is_open` would undo both — a consumer asking *is this
+    /// question open* would get `true` for a record whose state is unreadable,
+    /// which is not an answer, it is a different wrong answer.
+    ///
+    /// So the two stay separate and both stay honest. `is_open` answers false,
+    /// meaning *I do not know that this is open*. This answers true for open
+    /// **and** for unreadable, meaning *somebody should look at this*, and it
+    /// is what a surface draws from. **"I do not understand this" is a
+    /// first-class reason to fetch a human, not a reason to say nothing.**
+    ///
+    /// [`Shape::may`] is unchanged and still permits nothing it cannot parse:
+    /// fail closed for action, loud for attention.
+    ///
+    /// It catches an unreadable *shape* too, and by the same route rather than
+    /// by a second clause: a record whose shape is a word this build does not
+    /// know still has a state, and while that state says `open` this says so —
+    /// where [`Message::owes_a_disposition`] cannot, because it has to name a
+    /// shape to know whose disposition it is.
+    pub fn needs_attention(&self) -> bool {
+        self.is_open() || self.state().is_none()
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "id": self.id,
@@ -1095,6 +1134,47 @@ pub enum Landed {
     RecordOnly(String),
 }
 
+/// The task an answer to this question will durably land on, if any.
+///
+/// **The asker's own task first**, which is `wsp-095` Part 7 unchanged: an
+/// agent is respawned onto the task it holds and reads its log in the brief,
+/// so that is where an answer is waiting for it whether it is alive, stopped
+/// or gone.
+///
+/// # The fallback exists because a seat holds no task
+///
+/// And a seat is the party this whole task is about. `worklist-014`: for the
+/// whole of 2026-08-19 the two governor seats exchanged perhaps thirty
+/// messages and **a person carried most of them**, because a reply from a seat
+/// has nowhere to live — [`Waiting`] names a pane, the pane's scrollback is not
+/// a record, and the pane closes. Landing the answer on `waiting.task` serves
+/// every agent and none of the seats.
+///
+/// So when the asker holds no task, the answer lands on the task the question
+/// was **about**. That is not a second address; it is the same rule — *put the
+/// answer where the next reader will look for it* — applied to a party whose
+/// next reader is not itself. The evidence is what survived the day: the `w30`
+/// decode, the `needs_you` correction, the join shape and the stash repair are
+/// all readable now because somebody put them on a task, and the prose that
+/// carried them between two panes is gone.
+///
+/// It is a fallback and never an override, so nothing about an agent's answer
+/// changes: an agent asking about somebody *else's* task is still answered on
+/// its own, because its own is the one it will be handed again.
+///
+/// `None` is a real answer and not a failure — see [`Landed::RecordOnly`],
+/// which names it rather than swallowing it. The verb refuses to raise a
+/// question that would reach it (`cmd_message::ask`); this is what the record
+/// says when one arrives by some other road.
+pub fn homes_to(store: &Store, q: &Message) -> Option<String> {
+    let mine = q.waiting.as_ref().map(|w| w.task.as_str()).unwrap_or_default();
+    if !mine.is_empty() && store.task(mine).is_some() {
+        return Some(mine.to_string());
+    }
+    let about = q.about.task()?;
+    store.task(about).map(|_| about.to_string())
+}
+
 /// A question closed, and the two things a caller then has in hand.
 #[derive(Debug, Clone)]
 pub struct Closed {
@@ -1178,7 +1258,7 @@ fn close_locked(
 
     // The task log FIRST. Everything after this point is best-effort delivery;
     // this is the part that is not.
-    let landed = match store.task(&waiting.task) {
+    let landed = match homes_to(store, &q).and_then(|id| store.task(&id)) {
         Some(mut t) => {
             t.log(&format!("{} by {}: {text}", act.as_str(), by.byline()));
             t.touch();
@@ -1187,7 +1267,16 @@ fn close_locked(
                 Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", t.id)),
             }
         }
-        None => Landed::RecordOnly(format!("no task {} to write it on", waiting.task)),
+        // Both roads are named, because "it went nowhere" is a sentence a
+        // receipt has to be able to say specifically. The asker's task is gone
+        // *and* the subject is not a task either — so the words are on the
+        // message record and nowhere else, which is a reading and not a drop.
+        None => Landed::RecordOnly(match (waiting.task.as_str(), q.about.task()) {
+            ("", None) => "the asker holds no task and the question names none".into(),
+            ("", Some(a)) => format!("the asker holds no task and there is no task {a}"),
+            (w, None) => format!("no task {w} to write it on"),
+            (w, Some(a)) => format!("neither {w} nor {a} is a task to write it on"),
+        }),
     };
 
     let question = hop(store, id, by, act, text)?;
@@ -1760,5 +1849,157 @@ mod tests {
         assert_eq!(back.ask(), Some(Ask::Claim));
         assert_eq!(back.source(), Source::Agent, "a pane's message is an agent's");
         assert_eq!(back.kind(), Some(Kind::Stop));
+    }
+
+    /// The `wsp` seat's objection to `is_open()`, and the decision the worklist
+    /// custodian took on it, 2026-08-19: **an unreadable record needs a person,
+    /// and it gets its own answer rather than being folded into a state that
+    /// means something else.**
+    ///
+    /// `is_open()` is fail-closed for *action* and fail-silent for *attention*,
+    /// and attention is what this phase exists for. An older binary meeting a
+    /// state a newer one wrote does not merely refuse to act: with only
+    /// `is_open()` it reports that nothing is standing, so a question that
+    /// cannot be parsed raises nothing — `robustness-051` arriving through the
+    /// module built to remove it. The premise is not hypothetical: the
+    /// installed binary was not the tree for the whole of that day.
+    ///
+    /// Both readings are asserted together on one record, because the value of
+    /// the split is that the two answers **differ**, and a test that checked
+    /// only the new one would pass just as well if `is_open()` had been widened
+    /// instead — which is the repair that was refused.
+    #[test]
+    fn a_state_this_build_cannot_read_fetches_a_person_and_still_refuses_to_act() {
+        let mut newer = Message::new(seat(), Kind::Note, "the group is stalled");
+        newer.state_raw = "deferred".into();
+        assert_eq!(newer.state(), None, "the premise: a word this build does not know");
+        assert!(!newer.is_open(), "the lifecycle answer stays honest: I do not know that this is open");
+        assert!(!newer.owes_a_disposition(), "and nothing acts on a state it has not understood");
+        assert!(
+            newer.needs_attention(),
+            "\"I do not understand this\" is a reason to fetch somebody, not a reason to say nothing",
+        );
+
+        // An unreadable *shape* is the same fault one field over, and it is
+        // caught by the same predicate rather than by a second clause.
+        let mut odd = Message::new(seat(), Kind::Note, "a shape from a later build");
+        odd.shape_raw = "proposal".into();
+        assert!(!odd.owes_a_disposition(), "nothing can say whose disposition an unknown shape owes");
+        assert!(odd.needs_attention(), "…and it is still standing, so somebody must look");
+
+        // And the ordinary two are unchanged, which is what makes the new
+        // predicate an addition rather than a widening.
+        assert!(Message::new(seat(), Kind::Note, "open").needs_attention());
+        let mut done = Message::new(seat(), Kind::Note, "dealt with");
+        done.state_raw = State::Acknowledged.as_str().into();
+        assert!(!done.needs_attention(), "a record somebody disposed of is not standing");
+    }
+
+    /// **The failure `worklist-014` exists for**: for the whole of 2026-08-19 a
+    /// person carried messages between two governor seats, because a reply from
+    /// a seat has nowhere to live. A seat holds no task, so an answer routed
+    /// only by `waiting.task` lands nowhere and the words stay in a pane that
+    /// closes.
+    ///
+    /// So the subject is the fallback home, and the rule is the same one stated
+    /// twice: *put the answer where the next reader will look for it.*
+    #[test]
+    fn a_seat_holding_no_task_is_answered_onto_the_task_it_asked_about() {
+        let store = scratch("seat-home");
+        asker(&store, "wsp-095");
+        let q = Message::question(
+            Party::seat("worklist"),
+            Kind::Note,
+            "does the barrier reading hold at a branch cut from the trunk tip?",
+            Waiting::new("w3R:p1", ""),
+        )
+        .about(About::Task("wsp-095".into()));
+        raise(&store, &q).expect("a seat's question names the pane that is waiting");
+
+        assert_eq!(
+            homes_to(&store, &q).as_deref(),
+            Some("wsp-095"),
+            "a seat's answer lives on the task the question was about, or nowhere",
+        );
+        let closed = answer(
+            &store,
+            &q.id,
+            &Party::seat("wsp"),
+            "it holds — cmd_checkout::ahead() reads the branch off the tree",
+        )
+        .expect("a question with a home can be answered");
+        assert_eq!(closed.landed, Landed::Task("wsp-095".into()));
+        let back = store.task("wsp-095").expect("the subject is still there");
+        assert!(
+            back.body.contains("answered by wsp seat"),
+            "the answer is on the record with a byline, which is the half Ed was carrying by hand",
+        );
+    }
+
+    /// The fallback is a fallback and never an override, so nothing about an
+    /// agent's answer changes. An agent asking about somebody else's task is
+    /// still answered on **its own**, because its own is the one it will be
+    /// handed again on the next spawn — which is the whole reason the task log
+    /// is the delivery mechanism rather than merely the archive.
+    #[test]
+    fn an_agent_is_answered_on_its_own_task_even_when_it_asked_about_another() {
+        let store = scratch("home-order");
+        asker(&store, "worklist-014");
+        asker(&store, "worklist-020");
+        let q = Message::question(
+            Party::pane("w4N:p1", "wsp-worklist-014"),
+            Kind::Note,
+            "may I take worklist-020 as well?",
+            Waiting::new("w4N:p1", "worklist-014"),
+        )
+        .about(About::Task("worklist-020".into()));
+        raise(&store, &q).expect("an agent's question names its own task");
+
+        assert_eq!(
+            homes_to(&store, &q).as_deref(),
+            Some("worklist-014"),
+            "the asker's own task wins, because it is the one the asker will read",
+        );
+        answer(&store, &q.id, &seat(), "yes — nobody else is in it").unwrap();
+        assert!(
+            store.task("worklist-014").unwrap().body.contains("answered by worklist seat"),
+            "on the asker's task",
+        );
+        assert!(
+            !store.task("worklist-020").unwrap().body.contains("answered by"),
+            "and not on the subject's, which nobody is waiting on",
+        );
+    }
+
+    /// Nowhere to land is a **reading and not a drop**, and the receipt names
+    /// both roads it did not take. The same repair `cmd_checkout` made twice:
+    /// give the unknown case its own answer rather than a silence that looks
+    /// like success.
+    #[test]
+    fn an_answer_with_nowhere_to_land_says_where_it_did_not_go() {
+        let store = scratch("no-home");
+        let q = Message::question(
+            Party::seat("worklist"),
+            Kind::Note,
+            "are we agreed on the panel/rows.rs protocol?",
+            Waiting::new("w3R:p1", ""),
+        )
+        .about(About::Scope("wsp".into()));
+        raise(&store, &q).unwrap();
+        assert_eq!(homes_to(&store, &q), None, "a scope is not a place a log line can live");
+
+        let closed = answer(&store, &q.id, &Party::seat("wsp"), "agreed").unwrap();
+        match &closed.landed {
+            Landed::RecordOnly(why) => assert!(
+                why.contains("holds no task") && why.contains("names none"),
+                "a receipt that cannot say where the words went is the fault it is reporting: {why}",
+            ),
+            other => panic!("expected the record-only reading, got {other:?}"),
+        }
+        assert_eq!(
+            closed.reply.reply_to.as_deref(),
+            Some(q.id.as_str()),
+            "the answer still knows which question it closes, which is how it finds the asker",
+        );
     }
 }

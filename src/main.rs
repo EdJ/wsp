@@ -16,8 +16,9 @@ mod cmd_checkout;
 mod cmd_govern;
 mod cmd_install;
 mod cmd_machine;
-mod cmd_migrate;
 mod cmd_mandate;
+mod cmd_message;
+mod cmd_migrate;
 mod cmd_project;
 mod cmd_resume;
 mod cmd_sandbox;
@@ -112,6 +113,11 @@ const BOOL_FLAGS: &[&str] = &[
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
     // and the parent, and `worklist show <slug> --log`.
     "sub", "log",
+    // And the return path. `wsp answer <id> --abandon "the reason"` is the word
+    // order somebody types, and without this the reason is eaten as the flag's
+    // value and the verb refuses for want of a sentence it was given. `--again`
+    // is the escape from the repeat guard and is shared with both `tell` verbs.
+    "abandon", "again",
 ];
 
 /// Flags that keep their meaning inside a command's payload.
@@ -502,6 +508,12 @@ fn main() {
         "say" => cmd_agent::say(&store, &args),
         "tell" => cmd_agent::tell(&store, &args),
         "flag" => cmd_agent::flag(&store, &args),
+        // The return path. `flag` and `tell` are one-directional and stay that
+        // way; these three are the case where something is owed back, and the
+        // answer is a record before it is a sentence in somebody's pane.
+        "ask" => cmd_message::ask(&store, &args),
+        "answer" => cmd_message::answer(&store, &args),
+        "ack" => cmd_message::ack(&store, &args),
         "reconcile" => {
             let r = cmd_agent::reconcile(&store, args.has("reap"));
             println!("reconciled {} binding(s) from claims", r.bound);
@@ -796,6 +808,13 @@ fn help() {
   wsp flag <id> --ask claim         …and a question a keypress answers
   wsp flag [--clear <id>] [--seat]  what is raised, and whose it is; --seat
                                     narrows it to this seat's own; --clear lowers
+  wsp ask <id> ["the question"|-]   a question about a task, with a return path:
+                                    the answer comes back to you and lands on a
+                                    task's log. `wsp tell` is still for prose
+  wsp ask                           what is open, who is waiting, and how long
+  wsp answer <mid> "…" | -          close one: the log first, then whoever asked
+  wsp answer <mid> --abandon "…"    the other ending, and it also goes home
+  wsp ack <mid>                     an answer read, or a notification taken on
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
   wsp adopt [--yes]                 turn live workspaces into tasks
