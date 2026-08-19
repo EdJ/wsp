@@ -34,7 +34,7 @@ mod render;
 mod run;
 
 pub(crate) use editors::{edit_command, slot_path, start_editor, Columns};
-pub(crate) use render::{frame, Ctx};
+pub(crate) use render::{frame, Ctx, WHEEL_STEP};
 pub use run::run;
 
 use serde_json::json;

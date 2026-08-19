@@ -44,7 +44,18 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     // and stat-ing the store is cheap, re-reading every task file is not.
     let started_as = crate::util::exe_stamp();
     let mut last = String::new();
-    let mut seen: Option<(Focus, u64)> = None;
+    // What the frame in front of the reader was drawn from. The offset is in
+    // here with the target and the fingerprint because it is the third thing
+    // that changes what is drawn — without it a scroll would move the number
+    // and repaint nothing until the store next moved.
+    let mut seen: Option<(Focus, u64, usize)> = None;
+    // How far down the write-up this pane is, in drawn lines.
+    //
+    // A local, and there is nowhere else it could be: a `wsp view` pane is one
+    // process reading one thing, and when it ends there is nothing to remember.
+    // Never clamped here — `frame` is the only thing that knows how long the
+    // write-up is, so it clamps and hands it back. See its doc.
+    let mut off: usize = 0;
     let mut quit = false;
     let mut reload = false;
     // Panes a previous W could not get rid of. A second W closes them outright.
@@ -70,11 +81,14 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
         }
         let focus = pinned.clone().unwrap_or_else(|| get_focus(store, &ws));
         let fp = store.fingerprint();
-        if seen.as_ref() != Some(&(focus.clone(), fp)) {
-            seen = Some((focus.clone(), fp));
+        if seen.as_ref() != Some(&(focus.clone(), fp, off)) {
             let (w, h) = panel::term_size();
             let ctx = Ctx::live(store);
-            let painted = panel::to_ansi(&frame(&ctx, &focus, w, h, Placed::Pane), w, h);
+            let painted = panel::to_ansi(&frame(&ctx, &focus, w, h, Placed::Pane, &mut off), w, h);
+            // After the frame, because the frame is what clamps `off`: storing
+            // what was asked for rather than what was drawn would leave a pane
+            // at the foot repainting on every `j`.
+            seen = Some((focus.clone(), fp, off));
             if painted != last {
                 print!("{painted}");
                 let _ = std::io::stdout().flush();
@@ -203,6 +217,28 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
                     let left = matches!(k, Key::Char('h') | Key::Left);
                     footer(&focus_by_position(left), Style::Warn);
                 }
+                // Reading keys, in the panel's own vocabulary — see
+                // `panel::run`'s `task_key`, which binds the same set on a
+                // page. The same frame truncates in both places, so the same
+                // gap was in both; the offset being a parameter of `frame`
+                // rather than a field of the panel is what let this cost ten
+                // lines rather than a second implementation.
+                //
+                // No wheel: this pane never turns mouse reporting on, so a
+                // notch here is the terminal's own scrollback and not ours.
+                // And only the vertical arrows, because `h`/`l` and `←`/`→`
+                // are the arm above — they focus the pane beside this one, and
+                // that meaning was here first.
+                // Saturating downward too: `G` leaves `usize::MAX` for the
+                // frame to clamp, and a burst of keys is drained here before
+                // the next frame is drawn.
+                Key::Char('j') | Key::Down => off = off.saturating_add(1),
+                Key::Char('k') | Key::Up => off = off.saturating_sub(1),
+                Key::Char(' ') => {
+                    off = off.saturating_add(panel::term_size().1.saturating_sub(3).max(1))
+                }
+                Key::Char('g') | Key::Home => off = 0,
+                Key::Char('G') | Key::End => off = usize::MAX,
                 Key::Char('W') => {
                     let outcome = close_editors(&stuck);
                     let msg = match outcome {

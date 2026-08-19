@@ -1515,10 +1515,15 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
         // A still frame has no edit tab, so no section menu.
         columns: Vec::new(),
     };
-    let shot = |title: &str, caption: &str, focus: Focus| Scene {
+    // `off` is how far down the write-up the frame is, which is a thing a still
+    // picture can show and a person holding a key down cannot: the storyboard
+    // is where a scroll offset is actually checked. `usize::MAX` is what `G`
+    // sends — the frame is the only thing that knows where the end is, so a
+    // scene asks for past it and is drawn wherever that lands.
+    let shot = |title: &str, caption: &str, gesture: &str, focus: Focus, mut off: usize| Scene {
         title: title.to_string(),
         caption: caption.to_string(),
-        gesture: "↵".into(),
+        gesture: gesture.to_string(),
         target: match &focus {
             Focus::Task(id) => format!("task {id}"),
             Focus::Project(p) => format!("project {p}"),
@@ -1527,14 +1532,18 @@ fn detail_scenes(w: &Snapshot) -> Vec<Scene> {
         // A still frame of a pane nothing was driven through: there was no
         // transition, so there is nothing to claim about one.
         claims: Vec::new(),
-        html: panel::to_html(&detail::frame(&ctx, &focus, W, H, detail::Placed::Pane), W),
+        html: panel::to_html(
+            &detail::frame(&ctx, &focus, W, H, detail::Placed::Pane, &mut off),
+            W,
+        ),
     };
     vec![
-        shot("Detail: a task", "↵ on a task opens it here rather than folding something. Overview says what it is, Details carries the working material, and the log reads newest first — after the fact, the last line is the one that matters.", Focus::Task("t-003".into())),
-        shot("Detail: after a handoff", "The task the Trance agent moved off. It is still doing — work underway with nobody on it is a true state, and usually means you are the blocker — but the claim has gone to the task the agent took up, and what is left is the trace: where it was worked, for how long, and what it was handed to.", Focus::Task("t-002".into())),
-        shot("Detail: a parent", "A task with work decomposed under it — what an agent given direction on this one would make for itself. The panel shows the shape as indentation and a count; there is room here to say which children and what state each is in, which is the question you open a parent to ask.", Focus::Task("t-005".into())),
-        shot("Detail: a project", "↵ on a project: rolled-up work, what sits under it, and its own tasks in the panel's order.", Focus::Project("trance".into())),
-        shot("Detail: nothing yet", "The pane before anything is opened. It is a reader — it waits rather than guessing.", Focus::Nothing),
+        shot("Detail: a task", "↵ on a task opens it here rather than folding something. Overview says what it is, Details carries the working material, and the log reads newest first — after the fact, the last line is the one that matters. It does not fit, and the rule above the keys says so: 24 of 31 lines, which is the one thing a truncated frame never used to admit.", "↵", Focus::Task("t-003".into()), 0),
+        shot("Detail: read to the end", "The same task, scrolled to its foot. What ran off the bottom is the log — drawn last and newest-first, so what a reader lost was the most recent thing anybody wrote about the task. j/k and the arrows move a line, space a screenful less the line you were on, g and G the ends. The count goes on saying 31/31 rather than going out, so being at the bottom of a long write-up still reads differently from a short one that never scrolled.", "G", Focus::Task("t-003".into()), usize::MAX),
+        shot("Detail: after a handoff", "The task the Trance agent moved off. It is still doing — work underway with nobody on it is a true state, and usually means you are the blocker — but the claim has gone to the task the agent took up, and what is left is the trace: where it was worked, for how long, and what it was handed to.", "↵", Focus::Task("t-002".into()), 0),
+        shot("Detail: a parent", "A task with work decomposed under it — what an agent given direction on this one would make for itself. The panel shows the shape as indentation and a count; there is room here to say which children and what state each is in, which is the question you open a parent to ask.", "↵", Focus::Task("t-005".into()), 0),
+        shot("Detail: a project", "↵ on a project: rolled-up work, what sits under it, and its own tasks in the panel's order.", "↵", Focus::Project("trance".into()), 0),
+        shot("Detail: nothing yet", "The pane before anything is opened. It is a reader — it waits rather than guessing.", "↵", Focus::Nothing, 0),
     ]
 }
 

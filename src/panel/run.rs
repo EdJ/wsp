@@ -712,11 +712,34 @@ struct TaskPage {
     /// rather than gathered per frame because a frame is drawn on every key and
     /// this is six reads of the store.
     ctx: crate::detail::Ctx,
+    /// How far down the write-up this page is, in drawn lines.
+    ///
+    /// **Here rather than on [`View`], and that is the decision.** `View` is
+    /// the durable half: it is written to disk and *adopted* by the next panel
+    /// through `super::shared`, `scroll` included. Where you had got to in one
+    /// task's log is the last thing that should travel — a second panel would
+    /// come up part-way down a read it never took, in a page it does not even
+    /// have open. It is a fact about this pane and this moment, and its life is
+    /// exactly this struct's: `↵` opens at the top, closing forgets.
+    ///
+    /// The units differ too. `View::scroll` counts *tree rows* and is clamped
+    /// against a cursor by `render::scroll_to`; this counts *drawn lines* and
+    /// there is no cursor on a page to clamp it against. Two quantities, and
+    /// one field holding both would be the sort of sharing that reads as reuse
+    /// until the day one of them changes meaning.
+    ///
+    /// [`BoardPage::cur`] sits here for the same reason and says so: two panels
+    /// are looking at the same folds, they are not looking at the same board.
+    ///
+    /// Never clamped here. `detail::frame` is the only thing that knows how
+    /// long the write-up is, so it clamps and writes back — see its doc, and
+    /// [`task_key`], which adds to this freely and lets the frame correct it.
+    scroll: usize,
 }
 
 impl TaskPage {
     fn open(store: &Store, focus: crate::detail::Focus, panes: Vec<AgentRef>) -> TaskPage {
-        TaskPage { focus, ctx: crate::detail::Ctx::page(store, panes) }
+        TaskPage { focus, ctx: crate::detail::Ctx::page(store, panes), scroll: 0 }
     }
 }
 
@@ -792,12 +815,23 @@ impl Page {
     /// spending the key hint on the sentence for four seconds. Without it `E`
     /// on a page would be the one key in the panel that can fail in silence:
     /// [`pop_out`] answers in words, and there would be nowhere to put them.
-    fn frame(&self, note: &str, w: usize, h: usize) -> Vec<super::render::Line> {
+    ///
+    /// `&mut` because of the task page: `detail::frame` is where a scroll
+    /// offset is clamped against a write-up whose length only it knows, and
+    /// [`TaskPage::scroll`] keeps what it decides. The same reason
+    /// `super::render::frame` takes a `&mut View`.
+    fn frame(&mut self, note: &str, w: usize, h: usize) -> Vec<super::render::Line> {
         match self {
             Page::Board(p) => kanban::frame(&p.board, &p.cur, w, h, note),
             Page::Task(p) => {
-                let mut out =
-                    crate::detail::frame(&p.ctx, &p.focus, w, h, crate::detail::Placed::Page);
+                let mut out = crate::detail::frame(
+                    &p.ctx,
+                    &p.focus,
+                    w,
+                    h,
+                    crate::detail::Placed::Page,
+                    &mut p.scroll,
+                );
                 if !note.is_empty() {
                     if let Some(last) = out.last_mut() {
                         *last = super::render::line(
@@ -921,16 +955,71 @@ fn board_key(
 
 /// A key, while a task written up has the pane.
 ///
-/// Two things to do with something you are reading — stop, and edit it — and
-/// four keys for the first, because `q`, `esc` and `ctrl-c` all mean "out" to
-/// some hand or other. `↵` is among them for the reason `Z` and `K` close with
-/// the key that opened them: the way out of a page is the way in.
+/// Three things to do with something you are reading — move through it, stop,
+/// and edit it — and four keys for stopping, because `q`, `esc` and `ctrl-c`
+/// all mean "out" to some hand or other. `↵` is among them for the reason `Z`
+/// and `K` close with the key that opened them: the way out of a page is the
+/// way in.
 ///
-/// Everything else is deliberately nothing. The tree's keys are aimed at a row
-/// under a cursor, and there is no cursor on this page; letting them through
-/// would act on whatever the tree happened to be pointing at behind it.
-fn task_key(k: Key, p: &TaskPage, ui: &mut Ui, self_ws: Option<&str>) -> FromPage {
+/// # Moving through it
+///
+/// The vocabulary is the tree's, so a hand that reads the panel reads a page:
+/// `j`/`k` and the arrows by a line, the wheel by
+/// [`crate::detail::WHEEL_STEP`], `g`/`G` and `Home`/`End` to the ends. `space`
+/// is the one key this has that the tree does not, because this is the one view
+/// that is prose — a screenful at a time is how a long log is actually read,
+/// and `h` rows of `j` is not.
+///
+/// A screenful keeps a line: `h - 3` is the two footer rows and one line of
+/// overlap, and the overlap is the point — the line you were reading when you
+/// pressed the key is what tells you where the new screen joins the old.
+///
+/// **Nothing clamps here.** `usize::MAX` is `G`, and `+ STEP` at the foot is
+/// allowed to overshoot, because `detail::frame` is the only thing that knows
+/// how long the write-up is and it clamps and writes back. See
+/// [`TaskPage::scroll`]. Doing it here would need the length, which would need
+/// building the frame, which is the thing about to happen anyway.
+///
+/// Everything else is deliberately nothing. The tree's *verbs* are aimed at a
+/// row under a cursor, and there is no cursor on this page; letting them
+/// through would act on whatever the tree happened to be pointing at behind it.
+fn task_key(k: Key, p: &mut TaskPage, ui: &mut Ui, self_ws: Option<&str>, h: usize) -> FromPage {
+    // A screenful, less the footer and a line of overlap. Never zero: a page
+    // in three rows still has to move when the key is pressed.
+    let screenful = h.saturating_sub(3).max(1);
+    // Saturating in both directions, and the top end is not decoration: `G`
+    // leaves `usize::MAX` here for the frame to clamp, and two keys can arrive
+    // between two frames.
+    let down = |at: usize, by: usize| at.saturating_add(by);
     match k {
+        Key::Down | Key::Char('j') => {
+            p.scroll = down(p.scroll, 1);
+            FromPage::Nothing
+        }
+        Key::Up | Key::Char('k') => {
+            p.scroll = p.scroll.saturating_sub(1);
+            FromPage::Nothing
+        }
+        Key::Wheel { up } => {
+            p.scroll = if up {
+                p.scroll.saturating_sub(crate::detail::WHEEL_STEP)
+            } else {
+                down(p.scroll, crate::detail::WHEEL_STEP)
+            };
+            FromPage::Nothing
+        }
+        Key::Char(' ') => {
+            p.scroll = down(p.scroll, screenful);
+            FromPage::Nothing
+        }
+        Key::Char('g') | Key::Home => {
+            p.scroll = 0;
+            FromPage::Nothing
+        }
+        Key::Char('G') | Key::End => {
+            p.scroll = usize::MAX;
+            FromPage::Nothing
+        }
         Key::Enter | Key::Char('q') | Key::Esc | Key::Interrupt => FromPage::Close,
         // The one thing this page is not, reached from it in one key. `E` means
         // what it means everywhere: `$EDITOR` on the prose, full size, in the
@@ -1050,7 +1139,7 @@ pub(super) fn event_loop(
         screen: &mut dyn Screen,
         ui: &Ui,
         view: &mut View,
-        page: Option<&Page>,
+        page: Option<&mut Page>,
     ) -> (usize, usize) {
         let (w, h) = screen.size();
         match page {
@@ -1070,7 +1159,7 @@ pub(super) fn event_loop(
             None => screen.paint(&frame(ui, view, w, h), w, h),
         }
     }
-    drawn_size = draw(screen, &ui, &mut view, page.as_ref());
+    drawn_size = draw(screen, &ui, &mut view, page.as_mut());
 
     loop {
         let msg = match carry.pop_front() {
@@ -1123,7 +1212,7 @@ pub(super) fn event_loop(
             Msg::Key(k) if page.is_some() => {
                 let acted = page.as_mut().map(|p| match p {
                     Page::Board(b) => board_key(k, b, &mut ui, self_ws),
-                    Page::Task(t) => task_key(k, t, &mut ui, self_ws),
+                    Page::Task(t) => task_key(k, t, &mut ui, self_ws, h),
                 });
                 match acted {
                     None | Some(FromPage::Nothing) => {}
@@ -1594,7 +1683,7 @@ pub(super) fn event_loop(
         if is_key {
             shared::share(store, &view, ui.cursor(), &mut agreed);
         }
-        drawn_size = draw(screen, &ui, &mut view, page.as_ref());
+        drawn_size = draw(screen, &ui, &mut view, page.as_mut());
     }
 }
 
@@ -1655,7 +1744,29 @@ mod tests {
     /// see, on whatever row the tree happened to be pointing at behind it.
     #[test]
     fn a_page_of_prose_is_left_only_by_the_keys_that_say_so() {
-        let page = TaskPage {
+        let mut page = blank_page();
+        let mut ui = collect(&Snapshot::default(), &View::default());
+
+        for k in [Key::Enter, Key::Char('q'), Key::Esc, Key::Interrupt] {
+            assert!(
+                matches!(task_key(k, &mut page, &mut ui, None, 26), FromPage::Close),
+                "{k:?} should give the room back",
+            );
+        }
+        // A sample of the tree's own verbs, none of which has a target here.
+        for k in [Key::Char('d'), Key::Char('X'), Key::Char('Z'), Key::Char('K')] {
+            assert!(
+                matches!(task_key(k, &mut page, &mut ui, None, 26), FromPage::Nothing),
+                "{k:?} reached past the page to the tree behind it",
+            );
+        }
+    }
+
+    /// A page under test, with nothing in it. Every claim below is about what
+    /// the keys do to the offset, which the frame is what clamps — so the
+    /// write-up being empty costs the tests nothing.
+    fn blank_page() -> TaskPage {
+        TaskPage {
             focus: crate::detail::Focus::Task("wsp-013".into()),
             ctx: crate::detail::Ctx {
                 tasks: Vec::new(),
@@ -1666,21 +1777,63 @@ mod tests {
                 panes: Vec::new(),
                 columns: Vec::new(),
             },
-        };
-        let mut ui = collect(&Snapshot::default(), &View::default());
-
-        for k in [Key::Enter, Key::Char('q'), Key::Esc, Key::Interrupt] {
-            assert!(
-                matches!(task_key(k, &page, &mut ui, None), FromPage::Close),
-                "{k:?} should give the room back",
-            );
+            scroll: 0,
         }
-        // A sample of the tree's own vocabulary, none of which has a target here.
-        for k in [Key::Char('j'), Key::Char('d'), Key::Char('X'), Key::Char('Z'), Key::Char('K')] {
+    }
+
+    /// The keys that move a page move it, and in the tree's own vocabulary.
+    ///
+    /// `j` used to be in the list above, as one of the tree's keys that must
+    /// not reach past a page. It still must not *move a row*; what it does now
+    /// is move the page, which is the thing this task existed to add.
+    #[test]
+    fn the_reading_keys_move_the_page_and_never_the_tree() {
+        let mut ui = collect(&Snapshot::default(), &View::default());
+        let mut act = |p: &mut TaskPage, k: Key| {
             assert!(
-                matches!(task_key(k, &page, &mut ui, None), FromPage::Nothing),
-                "{k:?} reached past the page to the tree behind it",
+                matches!(task_key(k, p, &mut ui, None, 26), FromPage::Nothing),
+                "{k:?} must stay on the page",
             );
+        };
+
+        let mut p = blank_page();
+        for k in [Key::Char('j'), Key::Down] {
+            let was = p.scroll;
+            act(&mut p, k);
+            assert_eq!(p.scroll, was + 1, "{k:?} is a line");
+        }
+        for k in [Key::Char('k'), Key::Up] {
+            let was = p.scroll;
+            act(&mut p, k);
+            assert_eq!(p.scroll, was - 1, "{k:?} is a line back");
+        }
+
+        // The top is a floor rather than an underflow, and it is the only
+        // clamping this function does — because it is the only end it knows.
+        p.scroll = 0;
+        act(&mut p, Key::Up);
+        assert_eq!(p.scroll, 0, "the top holds");
+
+        let mut p = blank_page();
+        act(&mut p, Key::Wheel { up: false });
+        assert_eq!(p.scroll, crate::detail::WHEEL_STEP, "a notch is the tree's notch");
+        act(&mut p, Key::Wheel { up: true });
+        assert_eq!(p.scroll, 0, "and back");
+
+        // A screenful keeps a line of overlap, so it is short of the height by
+        // the footer and by that line.
+        let mut p = blank_page();
+        act(&mut p, Key::Char(' '));
+        assert_eq!(p.scroll, 26 - 3, "space is a screenful, less the join");
+
+        // `G` does not know where the end is and does not pretend to: it asks
+        // for past it, and `detail::frame` clamps. See [`TaskPage::scroll`].
+        for k in [Key::Char('G'), Key::End] {
+            let mut p = blank_page();
+            act(&mut p, k);
+            assert_eq!(p.scroll, usize::MAX, "{k:?} means the end, wherever it is");
+            act(&mut p, if k == Key::End { Key::Home } else { Key::Char('g') });
+            assert_eq!(p.scroll, 0, "and back to the top");
         }
     }
 

@@ -123,7 +123,38 @@ impl Ctx {
     }
 }
 
-pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize, placed: Placed) -> Vec<Line> {
+/// How far down a frame one press of the wheel or `space` moves it.
+///
+/// Three for the wheel is the tree's own [`crate::panel::keys::wheel`] step,
+/// so a notch means the same amount of travel whichever of the two the panel
+/// is drawing. A screenful keeps a line of overlap, because the line you were
+/// reading when you pressed the key is the one that tells you where you are.
+pub(crate) const WHEEL_STEP: usize = 3;
+
+/// A task or a project, drawn into `h` rows starting `off` lines down.
+///
+/// # The offset is a parameter, and it is clamped here
+///
+/// This frame builds the whole write-up and then cuts it to the room it was
+/// given, so by the time it returns the overflow is gone — which is why the
+/// offset cannot live anywhere but in this call. It is `&mut` for the reason
+/// [`crate::panel::render::frame`] takes a `&mut View`: the length of the
+/// write-up is not known until it has been built, so the *frame* is the only
+/// place that can say how far down it is possible to be, and the caller keeps
+/// what it decides.
+///
+/// That write-back is not bookkeeping. A key handler here adds three and lets
+/// this clamp, so a reader who holds `j` at the foot has no overshoot to walk
+/// off before `k` moves — the bug the panel's own wheel documents having had.
+/// `usize::MAX` is how `G` says "the end" without knowing where the end is.
+pub(crate) fn frame(
+    ctx: &Ctx,
+    focus: &Focus,
+    w: usize,
+    h: usize,
+    placed: Placed,
+    off: &mut usize,
+) -> Vec<Line> {
     let mut out: Vec<Line> = Vec::new();
     match focus {
         Focus::Nothing => {
@@ -152,30 +183,90 @@ pub(crate) fn frame(ctx: &Ctx, focus: &Focus, w: usize, h: usize, placed: Placed
         Placed::Pane => &ctx.columns[..],
     };
     let footer = if cols.is_empty() { 2 } else { 3 };
-    out.truncate(h.saturating_sub(footer));
-    while out.len() < h.saturating_sub(footer) {
+    let body = h.saturating_sub(footer);
+    let total = out.len();
+    // Clamp against what was actually built and hand it back. Everything below
+    // reads the clamped value, so the rule and the hint describe the frame in
+    // front of the reader rather than what a key asked for.
+    *off = (*off).min(total.saturating_sub(body));
+    out.drain(..*off);
+    out.truncate(body);
+    while out.len() < body {
         out.push(Line::default());
     }
-    out.push(line(Style::Dim, "─".repeat(w)));
+    let scrolls = total > body;
+    let shown = (*off + body).min(total);
+    out.push(rule(w, scrolls.then_some((shown, total))));
     if !cols.is_empty() {
         out.push(menu_line(cols, w));
     }
     out.push(line(
         Style::Dim,
-        match (placed, cols.is_empty()) {
-            // The panel's own keys, because on a page the panel is what is
-            // holding them. Nothing here acts on another pane, so nothing here
-            // needs naming for being surprising — what needs naming is the way
-            // out, and that `E` still puts you in your own editor.
-            (Placed::Page, _) => "↵ or q closes it · E edits it",
-            (Placed::Pane, true) => "h/l left or right · W save and close · q close, discarding",
-            (Placed::Pane, false) => {
-                "o/d/D then 1-3 places a section · 1/2/3 alone sets the columns · W save · q discard"
-            }
-        }
-        .to_string(),
+        util::truncate(
+            match (placed, cols.is_empty()) {
+                // The panel's own keys, because on a page the panel is what is
+                // holding them. Nothing here acts on another pane, so nothing
+                // here needs naming for being surprising — what needs naming is
+                // the way out, and that `E` still puts you in your own editor.
+                //
+                // The scroll keys are named only when there is something to
+                // scroll, and only on a page. A page has the room and is the
+                // view whose whole purpose is reading; the pane's two hints are
+                // already at the width of a split, and pushing `q discard` off
+                // the end to advertise `space` would cost more than it bought.
+                // The rule above says there is more in both.
+                (Placed::Page, _) if scrolls => {
+                    "space or j/k scrolls · ↵ or q closes it · E edits it"
+                }
+                (Placed::Page, _) => "↵ or q closes it · E edits it",
+                (Placed::Pane, true) => {
+                    "h/l left or right · W save and close · q close, discarding"
+                }
+                (Placed::Pane, false) => {
+                    "o/d/D then 1-3 places a section · 1/2/3 alone sets the columns · W save · q discard"
+                }
+            },
+            w,
+        ),
     ));
     out
+}
+
+/// The rule above the footer, carrying how far down the write-up you are.
+///
+/// A frame that silently drops its tail is the whole of what this task was
+/// about, so scrolling on its own is half a fix: a reader who cannot see that
+/// there is more has no reason to press the key. The count goes on the rule
+/// rather than in the hint because the rule is the one line in this frame with
+/// nothing on it, and in a pane the hint has no room to spare.
+///
+/// `at` is the line drawn on the bottom row and the length of the write-up, and
+/// it is `None` when the whole thing fits. A marker that is always there says
+/// nothing — the question it answers only exists when the answer can be yes —
+/// and every frame in the storyboard that fits stays byte-identical.
+///
+/// It keeps saying `62/62` once you reach the foot, which is not redundant: it
+/// is how a reader at the end can still tell a long write-up they have read to
+/// the bottom of from a short one that never scrolled at all. What it reports
+/// is that this scrolls, and where in it you are.
+fn rule(w: usize, at: Option<(usize, usize)>) -> Line {
+    let mut l = Line::default();
+    // Two dashes of tail so it reads as set into the rule rather than as the
+    // rule having run out. Below that width there is no room to set anything
+    // into, and the plain rule is the honest drawing.
+    let tail = 2;
+    let mark = match at {
+        Some((shown, total)) => format!(" {shown}/{total} "),
+        None => String::new(),
+    };
+    if mark.is_empty() || w < mark.chars().count() + tail + tail {
+        l.push(Style::Dim, "─".repeat(w));
+        return l;
+    }
+    l.push(Style::Dim, "─".repeat(w - mark.chars().count() - tail));
+    l.push(Style::Muted, mark);
+    l.push(Style::Dim, "─".repeat(tail));
+    l
 }
 
 /// The menu: what is in each column, and what a key would bring in.
@@ -552,7 +643,7 @@ mod tests {
         // The prose lines and nothing else: a rule is drawn to the rect on
         // purpose, and it is the paragraph this is about.
         let prose = |w: usize| -> usize {
-            frame(&ctx, &Focus::Task("wsp-013".into()), w, 90, Placed::Page)
+            frame(&ctx, &Focus::Task("wsp-013".into()), w, 90, Placed::Page, &mut 0)
                 .iter()
                 .filter(|l| l.text().contains("one two three"))
                 .map(|l| l.width())
@@ -590,7 +681,7 @@ mod tests {
         };
         let focus = Focus::Task("wsp-013".into());
 
-        let page = text_of(&frame(&ctx, &focus, 96, 40, Placed::Page));
+        let page = text_of(&frame(&ctx, &focus, 96, 40, Placed::Page, &mut 0));
         assert!(page.contains("↵ or q closes it"), "the way out is named:\n{page}");
         assert!(page.contains("E edits it"), "and so is the editor:\n{page}");
         assert!(!page.contains("W save"), "there is nothing to save:\n{page}");
@@ -598,7 +689,7 @@ mod tests {
 
         // The same context in a pane still gets the menu, so the line above is
         // about where it is drawn and not about the columns having gone.
-        let pane = text_of(&frame(&ctx, &focus, 96, 40, Placed::Pane));
+        let pane = text_of(&frame(&ctx, &focus, 96, 40, Placed::Pane, &mut 0));
         assert!(pane.contains("1 overview"), "a pane keeps its menu:\n{pane}");
         assert!(pane.contains("W save"), "and its keys:\n{pane}");
     }
@@ -714,6 +805,159 @@ mod tests {
         let day = util::local_ymd("2026-08-16T23:15:00Z");
         assert!(text.contains(&format!("{day} libc gives us the offset")), "decision:\n{text}");
         assert!(text.contains(&format!("{day} blocked:")), "log:\n{text}");
+    }
+
+    /// A task with `n` log lines, each one findable on its own.
+    ///
+    /// The log because that is what actually overflowed: it is drawn last and
+    /// newest-first, so the half a truncated frame loses is the most recent
+    /// thing anybody wrote about the task. A fixture that overflowed on the
+    /// overview would be testing the arithmetic and not the complaint.
+    fn long_log(n: usize) -> Ctx {
+        let mut t = crate::model::Task::new("a long-running task", "wsp-013");
+        t.project = Some("wsp".into());
+        let log: String =
+            (0..n).map(|i| format!("- 2026-08-19 line {i}\n")).collect();
+        t.body = format!("## Log\n{log}");
+        task_ctx(t)
+    }
+
+    /// The whole of what this task was about: the last line of a long write-up
+    /// is reachable, where before it was simply not there.
+    ///
+    /// Asserted on the *first* log line, which is the one drawn last — the log
+    /// reads newest-first, so the end of the frame is the oldest entry, and a
+    /// frame that can show it has shown everything between.
+    #[test]
+    fn a_write_up_taller_than_the_room_can_be_read_to_its_last_line() {
+        let ctx = long_log(60);
+        let focus = Focus::Task("wsp-013".into());
+        let (w, h) = (96, 20);
+
+        let mut off = 0;
+        let top = text_of(&frame(&ctx, &focus, w, h, Placed::Page, &mut off));
+        assert!(top.contains("line 59"), "the newest entry is at the top:\n{top}");
+        assert!(!top.contains("line 0\n"), "and the oldest is off the bottom");
+
+        // `G`, as the page sends it: past the end, and the frame is what knows
+        // where the end is.
+        off = usize::MAX;
+        let foot = text_of(&frame(&ctx, &focus, w, h, Placed::Page, &mut off));
+        assert!(foot.contains("line 0\n"), "the last line is reachable:\n{foot}");
+        assert!(off < usize::MAX, "and the offset came back clamped");
+    }
+
+    /// The clamp is handed back, and that write-back is the point of the `&mut`.
+    ///
+    /// Without it a reader who held `j` at the foot would build an offset of
+    /// four hundred against a write-up of sixty, and `k` would move nothing at
+    /// all until the overshoot had been walked off one line at a time — which
+    /// is the bug `panel::keys::wheel` documents having had, arriving here by
+    /// the same route.
+    #[test]
+    fn an_offset_past_the_end_comes_back_at_the_end_rather_than_where_it_was_asked() {
+        let ctx = long_log(60);
+        let focus = Focus::Task("wsp-013".into());
+
+        let mut off = usize::MAX;
+        let at_end = text_of(&frame(&ctx, &focus, 96, 20, Placed::Page, &mut off));
+        let settled = off;
+
+        // One line back from the far end moves, immediately.
+        off = settled - 1;
+        let one_up = text_of(&frame(&ctx, &focus, 96, 20, Placed::Page, &mut off));
+        assert_ne!(one_up, at_end, "a line back from the foot is a different frame");
+
+        // And asking for the end again lands in the same place, not further on.
+        off = usize::MAX;
+        let _ = frame(&ctx, &focus, 96, 20, Placed::Page, &mut off);
+        assert_eq!(off, settled, "the end is one place");
+    }
+
+    /// A frame is exactly the size it was given, however far down it is.
+    ///
+    /// The offset moves where the cut is taken; it must not change that there
+    /// is one. A frame short of its rows leaves whatever the pane drew last
+    /// showing underneath it, and one over its rows pushes its own footer off.
+    #[test]
+    fn a_frame_is_its_full_height_at_every_offset() {
+        let ctx = long_log(60);
+        let focus = Focus::Task("wsp-013".into());
+        for h in [6usize, 20, 200] {
+            for want in [0usize, 7, usize::MAX] {
+                let mut off = want;
+                let n = frame(&ctx, &focus, 96, h, Placed::Page, &mut off).len();
+                assert_eq!(n, h, "h={h} off={want}");
+            }
+        }
+    }
+
+    /// Scrolling silently is half a fix: a reader with no sign that there is
+    /// more has no reason to press the key.
+    ///
+    /// Which is also why the sign is absent when everything fits — the rule
+    /// answers "is there more", and that question does not exist when the
+    /// answer cannot be yes.
+    #[test]
+    fn the_rule_says_how_far_down_it_is_only_when_there_is_further_to_go() {
+        let focus = Focus::Task("wsp-013".into());
+        // The rule is the frame's second-from-last line on a page, above the
+        // one-line hint.
+        let rule_of = |ctx: &Ctx, h: usize, mut off: usize| -> String {
+            let f = frame(ctx, &focus, 96, h, Placed::Page, &mut off);
+            f[f.len() - 2].text()
+        };
+
+        let short = long_log(2);
+        assert_eq!(
+            rule_of(&short, 40, 0).trim_matches('─'),
+            "",
+            "a write-up that fits gets the plain rule it always had",
+        );
+
+        let long = long_log(60);
+        let top = rule_of(&long, 20, 0);
+        assert!(top.contains('/'), "somewhere to go, and the rule says so: {top}");
+        // And it goes on saying so at the foot, where the two halves agree —
+        // which is how "read to the bottom of a long one" is told apart from
+        // "a short one that never scrolled".
+        let foot = rule_of(&long, 20, usize::MAX);
+        let mark = foot.trim_matches('─').trim().to_string();
+        let (shown, total) = mark.split_once('/').unwrap_or_default();
+        assert_eq!(shown, total, "at the foot the two halves agree: {foot}");
+        assert!(!total.is_empty(), "and there is a marker at all: {foot}");
+
+        // Whatever it says, it is still a rule of exactly the width it was
+        // given — the marker is set into it, not appended to it.
+        for (h, off) in [(20usize, 0usize), (20, usize::MAX), (40, 0)] {
+            let mut o = off;
+            let f = frame(&long, &focus, 96, h, Placed::Page, &mut o);
+            assert_eq!(f[f.len() - 2].width(), 96, "h={h} off={off}");
+        }
+    }
+
+    /// The keys are named where there is room to name them and where they are
+    /// worth naming: on a page, and only when there is something to scroll.
+    ///
+    /// The pane's hints are already at the width of a split. Pushing
+    /// `q discard` off the end to advertise `space` would cost a key that
+    /// throws work away to advertise one that moves the view — see [`frame`],
+    /// where the rule carries the signal that both placements get.
+    #[test]
+    fn a_page_that_scrolls_names_the_keys_and_a_pane_keeps_its_own() {
+        let focus = Focus::Task("wsp-013".into());
+        let hint = |ctx: &Ctx, placed: Placed| -> String {
+            let mut off = 0;
+            frame(ctx, &focus, 96, 20, placed, &mut off).last().expect("a footer").text()
+        };
+
+        let long = long_log(60);
+        let page = hint(&long, Placed::Page);
+        assert!(page.contains("space or j/k"), "{page}");
+        assert!(page.contains("q closes it"), "and the way out is still there: {page}");
+
+        assert!(!hint(&long_log(2), Placed::Page).contains("j/k"), "nothing to scroll");
+        assert!(hint(&long, Placed::Pane).contains("q close, discarding"), "the pane's own");
     }
 
     /// A narrow pane must not wrap the menu into the frame above it: `fit`
