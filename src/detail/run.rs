@@ -48,7 +48,19 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     // here with the target and the fingerprint because it is the third thing
     // that changes what is drawn — without it a scroll would move the number
     // and repaint nothing until the store next moved.
-    let mut seen: Option<(Focus, u64, usize)> = None;
+    //
+    // The attention stamp is the fourth, and it was missing: this pane draws
+    // raised hands and messages — see [`super::render`], which filters on
+    // `Message::needs_attention` — and `Store::fingerprint` deliberately cannot
+    // see either, because both are machine-local state rather than a change to
+    // the work. So a hand raised on the task in front of the reader sat
+    // undrawn until something unrelated touched the store, which on a quiet
+    // machine is nothing at all. Found while fixing the same fault one storey
+    // up in `worklist-009`: a gate blind to something its own surface draws.
+    // Kept as a separate `u64` rather than mixed into the fingerprint, because
+    // two stamps folded into one number can agree by collision and the whole
+    // point of this tuple is that it is compared for equality.
+    let mut seen: Option<(Focus, u64, u64, usize)> = None;
     // How far down the write-up this pane is, in drawn lines.
     //
     // A local, and there is nowhere else it could be: a `wsp view` pane is one
@@ -81,14 +93,15 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
         }
         let focus = pinned.clone().unwrap_or_else(|| get_focus(store, &ws));
         let fp = store.fingerprint();
-        if seen.as_ref() != Some(&(focus.clone(), fp, off)) {
+        let attention = store.attention_stamp();
+        if seen.as_ref() != Some(&(focus.clone(), fp, attention, off)) {
             let (w, h) = panel::term_size();
             let ctx = Ctx::live(store);
             let painted = panel::to_ansi(&frame(&ctx, &focus, w, h, Placed::Pane, &mut off), w, h);
             // After the frame, because the frame is what clamps `off`: storing
             // what was asked for rather than what was drawn would leave a pane
             // at the foot repainting on every `j`.
-            seen = Some((focus.clone(), fp, off));
+            seen = Some((focus.clone(), fp, attention, off));
             if painted != last {
                 print!("{painted}");
                 let _ = std::io::stdout().flush();
@@ -481,5 +494,44 @@ fn focus_by_position(leftmost: bool) -> String {
             String::new()
         }
         None => "nothing to focus".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    const SRC: &str = include_str!("run.rs");
+
+    /// A `wsp view` pane draws raised hands and messages, so it has to refetch
+    /// on them.
+    ///
+    /// It gated on [`crate::store::Store::fingerprint`] alone, and that stamp
+    /// deliberately cannot see either: both are machine-local state, not a
+    /// change to the work — the argument is on `fingerprint` itself. So a hand
+    /// raised on the task in front of the reader stayed undrawn until something
+    /// unrelated touched the store, which on a quiet machine is never. The
+    /// panel had already learned this and reads `attention_stamp` beside its
+    /// fingerprint; this pane, which renders the same records through
+    /// [`super::render`], had not.
+    ///
+    /// Asserted against the source for the reason the panel's own tick test is:
+    /// what is wrong here is *where a call is*, and a loop that owns the
+    /// terminal cannot be driven from a test to find that out. Both stamps must
+    /// reach the comparison, so both are checked ahead of it.
+    #[test]
+    fn a_view_pane_repaints_on_a_raised_hand_and_not_only_on_the_work() {
+        let loop_body = SRC.split("while !quit && !reload {").nth(1).expect("the loop moved");
+        let fp = loop_body.find("store.fingerprint()").expect("the work stamp is gone");
+        let attention =
+            loop_body.find("store.attention_stamp()").expect("the pane cannot see a raised hand");
+        let gate = loop_body.find("if seen.as_ref() !=").expect("the repaint gate moved");
+        assert!(
+            fp < gate && attention < gate,
+            "a stamp is read after the gate that decides whether to repaint, so \
+             it cannot be part of that decision",
+        );
+        assert!(
+            loop_body[..gate].contains("attention"),
+            "the attention stamp is not among the things the frame was drawn from",
+        );
     }
 }
