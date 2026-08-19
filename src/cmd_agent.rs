@@ -596,7 +596,10 @@ pub(crate) fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
     let Some(p) = panes.iter().find(|p| p.pane_id == pane) else { return };
 
     if named_after_task(&p.label, &task) {
-        let governs = cmd_govern::governs(&store.governors(), &p.workspace_id);
+        // This pane's, not the room's: a worker finishing a task in a
+        // custodian's workspace was renamed `governor · <project>` — it took
+        // the seat's name off a seat it does not hold. worklist-035.
+        let governs = cmd_govern::governs(&store.governors(), &p.workspace_id, Some(pane));
         let _ = match &governs {
             Some(project) => herdr::rename_pane(pane, &cmd_govern::governor_of(project)),
             None => herdr::rename_pane(pane, UNASSIGNED_LABEL),
@@ -1191,9 +1194,11 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     // row instead. `--seat` is for the agent that only wants its own.
     let index = Index::new(store.projects());
     let governors = store.governors();
-    let mine = herdr::Env::read()
+    let env = herdr::Env::read();
+    let mine = env
         .workspace_id
-        .and_then(|ws| cmd_govern::governs(&governors, &ws));
+        .as_deref()
+        .and_then(|ws| cmd_govern::governs(&governors, ws, env.pane_id.as_deref()));
     let only_mine = args.has("seat");
     // Asked for an inbox from a pane that has no seat. Said plainly, because
     // "nothing raised for you" and "you are not the seat" look identical from
@@ -2524,10 +2529,11 @@ pub struct Reconciled {
     pub named: usize,
     /// Claims dropped because the workspace holding them is gone.
     pub reaped: usize,
-    /// Seats dropped for the same reason. Separate from `reaped` because they
-    /// are not the same loss: a reaped claim frees work for somebody else to
-    /// take, and a swept seat means raised hands stop being addressed to a
-    /// workspace nobody is in.
+    /// Seats emptied because the agent in them is gone — its workspace closed,
+    /// or its pane went while the workspace stood. Separate from `reaped`
+    /// because they are not the same loss: a reaped claim frees work for
+    /// somebody else to take, and a swept seat means raised hands stop being
+    /// addressed to nobody.
     pub stood_down: usize,
     /// Panel records forgotten for the same reason, and separate again: this
     /// one costs nobody any work, it only stops `panels.json` pointing at panes
@@ -2631,6 +2637,51 @@ pub(crate) fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, id: &
     answered.contains_key(machine_of(id))
 }
 
+/// What herdr answered with, and the one question a seat record asks of it.
+///
+/// Four lists rather than two because [`may_reap`] is asked twice and of
+/// different evidence — see [`Census::nobody_in`].
+pub(crate) struct Census<'a> {
+    pub(crate) workspaces: &'a [&'a str],
+    pub(crate) panes: &'a [&'a str],
+    pub(crate) heard_workspaces: &'a std::collections::BTreeMap<&'a str, usize>,
+    pub(crate) heard_panes: &'a std::collections::BTreeMap<&'a str, usize>,
+}
+
+impl Census<'_> {
+    /// Is the agent that took this seat gone?
+    ///
+    /// **Two tests, because a seat empties two ways and only one of them was
+    /// ever checked.** The workspace closing is the tidy one — a night ending,
+    /// a set of rooms retired — and it is what this loop was written for. The
+    /// commoner one is the pane going while the room stands: a crash, a machine
+    /// restart, a session ending, `wsp despawn --pane … --force`. worklist-035
+    /// drove it on `796c2d2` — the `acc` seat's pane ended at 20:15:38, and
+    /// nine minutes later `wsp flag acc-006` still answered *raised to the acc
+    /// governor · w1 · x there lowers it*, with nobody at w1:p2 and nobody
+    /// there for nine minutes. `governors.json` had carried the pane the whole
+    /// time; nothing had ever compared it against the census.
+    ///
+    /// **Each half is guarded by its own evidence.** `may_reap`'s rule is that
+    /// only a machine that *spoke* gets its records examined, and the two
+    /// listings are two separate speakings: a herdr that answered
+    /// `workspace.list` and failed `pane.list` would, on one shared guard,
+    /// empty every seat on the machine out of an empty answer. That is the
+    /// exact failure `may_reap` exists to prevent, so it is asked twice.
+    ///
+    /// A record naming no pane is left to the workspace test alone.
+    /// `wsp govern -w` writes one, naming a room the process was not standing
+    /// in, and a seat with no address is not evidence of an empty one.
+    pub(crate) fn nobody_in(&self, workspace: &str, pane: &str) -> bool {
+        let room_gone = may_reap(self.heard_workspaces, workspace)
+            && !self.workspaces.contains(&workspace);
+        let pane_gone = !pane.is_empty()
+            && may_reap(self.heard_panes, pane)
+            && !self.panes.contains(&pane);
+        room_gone || pane_gone
+    }
+}
+
 pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
     let mut out = Reconciled::default();
     let claims = store.claims();
@@ -2672,15 +2723,25 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
         // distinction existed, a night ending took the governor off `wsp`
         // entirely, and the morning had no way to tell "nobody is in the seat"
         // from "this project never had one".
+        //
+        // **And the pane, which is the case worklist-035 was filed on** — the
+        // workspace outlives the agent in it, so the test above missed the
+        // commonest way a seat empties. `Census::nobody_in` carries that
+        // argument, and the second `answered_by_machine` below is why it needs
+        // its own evidence rather than the workspaces'.
+        let seen_panes = answered_by_machine(panes.iter().map(|p| p.pane_id.as_str()));
+        let census = Census {
+            workspaces: &workspaces.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            panes: &panes.iter().map(|p| p.pane_id.as_str()).collect::<Vec<_>>(),
+            heard_workspaces: &answered,
+            heard_panes: &seen_panes,
+        };
         for (project, g) in &governors {
             let get = |k: &str| g.get(k).and_then(|v| v.as_str()).unwrap_or("");
             if !get("host").is_empty() && get("host") != host {
                 continue;
             }
-            if !may_reap(&answered, get("workspace")) {
-                continue;
-            }
-            if workspaces.iter().any(|w| w.id == get("workspace")) {
+            if !census.nobody_in(get("workspace"), get("pane")) {
                 continue;
             }
             if cmd_govern::vacate(store, project) {
@@ -3352,7 +3413,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // spelling so the next word herdr adds does not read as work.
         let stopped = crate::place_herdr::state_of_pane(a).stopped();
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
-        let seat = cmd_govern::governs(&w.governors, &a.workspace_id);
+        let seat = cmd_govern::governs(&w.governors, &a.workspace_id, Some(&a.pane_id));
         let needs_you = cmd_govern::needs_a_person(stopped, doing, seat.is_some());
 
         rows.push(WipRow {
@@ -4601,6 +4662,11 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
 
     let probe = Probe::live();
     herdr_health(&probe, &bindings, &tasks, &mut problems, &mut notes);
+    // And whether anybody is in the seats. Off the same probe, because a check
+    // that read herdr again could disagree with the one above it about what
+    // answered — see [`cmd_govern::health`], which is the only thing in wsp
+    // that can tell a seat from an empty one.
+    cmd_govern::health(&probe, store, &mut problems);
     // Detection rules herdr is taking from this machine instead of from
     // upstream. Silent on a machine with none, which is every machine until
     // somebody has a fault worth shadowing upstream's fixes to fix.
@@ -5454,6 +5520,83 @@ mod tests {
         let panes = answered_by_machine(["w0:p1", "w0:p2"]);
         assert!(may_reap(&panes, "w3:p9"));
         assert!(!may_reap(&panes, "w0:p1@mb2"));
+    }
+
+    /// The fault worklist-035 was filed on, at the line that decides it: a
+    /// seat empties when its *pane* goes, and the room it was in usually
+    /// outlives it.
+    ///
+    /// Driven on `796c2d2` — the `acc` seat's pane was ended at 20:15:38 and
+    /// nine minutes later `wsp flag acc-006` still answered *raised to the acc
+    /// governor · w1*. `w1` was open the whole time, which is why the old test
+    /// — is the workspace still listed — never fired.
+    #[test]
+    fn a_seat_whose_pane_is_gone_is_empty_even_where_its_workspace_stands() {
+        let heard_ws = answered_by_machine(["w1"]);
+        let heard_panes = answered_by_machine(["w1:p1"]);
+        let census = Census {
+            workspaces: &["w1"],
+            panes: &["w1:p1"],
+            heard_workspaces: &heard_ws,
+            heard_panes: &heard_panes,
+        };
+
+        assert!(census.nobody_in("w1", "w1:p2"), "the pane is gone and w1 is still open");
+        assert!(!census.nobody_in("w1", "w1:p1"), "the agent that took it is still sitting there");
+        assert!(census.nobody_in("w9", "w9:p1"), "and the whole room going is still the whole room going");
+        assert!(
+            !census.nobody_in("w1", ""),
+            "a record with no pane on it — `wsp govern -w` — has nothing to compare",
+        );
+    }
+
+    /// Each half on its own evidence, which is what stops this emptying the
+    /// store out of a half-answer.
+    ///
+    /// A herdr that listed its workspaces and failed to list its panes is the
+    /// shape that would have done it: one shared guard would read "no panes" as
+    /// "every pane is gone" and stand down every seat on the machine. That is
+    /// the failure `may_reap` was written for, so it is asked twice — see
+    /// [`Census::nobody_in`].
+    #[test]
+    fn a_pane_listing_that_answered_with_nothing_empties_no_seat() {
+        let heard_ws = answered_by_machine(["w1"]);
+        let heard_panes = answered_by_machine(std::iter::empty());
+        let census = Census {
+            workspaces: &["w1"],
+            panes: &[],
+            heard_workspaces: &heard_ws,
+            heard_panes: &heard_panes,
+        };
+        assert!(!census.nobody_in("w1", "w1:p2"), "nothing was heard about panes, so nothing is known");
+
+        // And the other way round: panes answered, workspaces did not.
+        let heard_ws = answered_by_machine(std::iter::empty());
+        let heard_panes = answered_by_machine(["w1:p1"]);
+        let census = Census {
+            workspaces: &[],
+            panes: &["w1:p1"],
+            heard_workspaces: &heard_ws,
+            heard_panes: &heard_panes,
+        };
+        assert!(!census.nobody_in("w9", "w1:p1"), "the room is unheard-of and the pane is right there");
+        assert!(census.nobody_in("w9", "w9:p1"), "the pane listing is enough on its own");
+    }
+
+    /// The far machine, over both halves. An executor whose tunnel is down
+    /// answers with nothing, and nothing is not an empty machine.
+    #[test]
+    fn silence_from_an_executor_empties_none_of_its_seats() {
+        let heard_ws = answered_by_machine(["w0"]);
+        let heard_panes = answered_by_machine(["w0:p1"]);
+        let census = Census {
+            workspaces: &["w0"],
+            panes: &["w0:p1"],
+            heard_workspaces: &heard_ws,
+            heard_panes: &heard_panes,
+        };
+        assert!(!census.nobody_in("w4@mb2", "w4:p1@mb2"), "mb2 said nothing about either");
+        assert!(census.nobody_in("w4", "w4:p1"), "and this machine's own is examined as ever");
     }
 
     /// The generalisation, not a second rule beside the old one: `reap` used to

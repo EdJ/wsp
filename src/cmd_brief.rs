@@ -311,7 +311,7 @@ impl Briefing {
         let seat_at = env
             .workspace_id
             .as_deref()
-            .and_then(|ws| cmd_govern::governs(&governors, ws))
+            .and_then(|ws| cmd_govern::governs(&governors, ws, env.pane_id.as_deref()))
             .and_then(|scope| crate::worklist::running_position(store, &scope));
         Briefing {
             project: current_project(store, args, &world.index).unwrap_or(None),
@@ -636,15 +636,26 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
             b.project.as_deref(),
         )
         .map(|s| {
-            let mine = b.workspace.as_deref() == Some(s.workspace.as_str());
+            // The pane's and not the room's: a worker beside a custodian was
+            // told the seat above its work was itself. `Seat::sat_in` is that
+            // rule, written once — worklist-035.
+            let mine = b
+                .workspace
+                .as_deref()
+                .is_some_and(|ws| s.sat_in(ws, b.pane.as_deref()));
             (s, mine)
         }),
         list: mine.and_then(|t| b.lists.of(&t.id)).cloned(),
         seat_at: b.seat_at.clone(),
+        // The pane's and not the room's, which is the whole of worklist-035
+        // read from the brief: two agents spawned into a custodian's workspace
+        // were each told `seat  governor of acc  yours to sequence, direct,
+        // review` — a work order neither had asked for, on a night nobody was
+        // reading.
         custodian: b
             .workspace
             .as_deref()
-            .and_then(|ws| cmd_govern::governs(&b.governors, ws)),
+            .and_then(|ws| cmd_govern::governs(&b.governors, ws, b.pane.as_deref())),
         // A path rule rather than a question for git, so this stays free in the
         // one command a session-start hook runs.
         own_tree: b

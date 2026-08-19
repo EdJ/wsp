@@ -1544,7 +1544,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             // wearing no label of ours is still named after its workspace, and
             // that name was cut by the same rule.
             full: crate::cmd_agent::full_name(&snap.said, &a.pane, &a.where_(), held),
-            seat: crate::cmd_govern::governs(&snap.governors, &a.workspace),
+            seat: crate::cmd_govern::governs(&snap.governors, &a.workspace, Some(&a.pane)),
             ..a.clone()
         }
     };
@@ -1567,11 +1567,20 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         crate::cmd_govern::slots(&snap.governors)
             .into_iter()
             .map(|slot| {
+                // The recorded pane, and the room only where the room holds
+                // one agent — [`crate::cmd_govern::occupant`] carries the
+                // argument, and this is the drawn half of the same rule. A
+                // workspace with a custodian and a worker in it was drawing
+                // whichever the iterator reached first as the custodian.
                 let occupant = slot.occupant.as_ref().and_then(|s| {
+                    let mut room = panes.iter().filter(|a| a.workspace == s.workspace && a.agent);
                     panes
                         .iter()
                         .find(|a| a.pane == s.pane && a.agent)
-                        .or_else(|| panes.iter().find(|a| a.workspace == s.workspace && a.agent))
+                        .or(match (room.next(), room.next()) {
+                            (Some(only), None) => Some(only),
+                            _ => None,
+                        })
                         .map(|a| as_ref(a, Some(slot.scope.clone())))
                 });
                 (slot.scope.clone(), (occupant, slot.elsewhere()))
@@ -3153,6 +3162,43 @@ mod tests {
             ),
             other => panic!("no heading above the agent: {other:?}"),
         }
+    }
+
+    /// Two agents in the custodian's room, and only one of them draws as the
+    /// custodian.
+    ///
+    /// worklist-035. The seat's `seat` mark and the exemption that comes with
+    /// it — a seated row is idle *between* the agents it is waiting on, so it
+    /// never reads as needing you — were being handed to whichever pane the
+    /// scan reached first. Here the worker is first in the list, which is how
+    /// this went unnoticed for a night: it drew as the governor and the real
+    /// seat drew as an ordinary agent.
+    #[test]
+    fn a_worker_sharing_the_custodians_workspace_is_not_drawn_as_the_custodian() {
+        let mut snap = tree();
+        snap.projects.push(project("acc", Some("wsp"), ""));
+        snap.governors
+            .insert("acc".to_string(), serde_json::json!({"workspace": "w1", "pane": "w1:p2"}));
+        for pane in ["w1:p1", "w1:p2"] {
+            snap.panes.push(AgentRef {
+                pane: pane.to_string(),
+                workspace: "w1".to_string(),
+                state: "idle".to_string(),
+                agent: true,
+                ..Default::default()
+            });
+        }
+
+        let ui = collect(&snap, &View { agents: true, ..Default::default() });
+        let seated: Vec<&str> = ui
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Agent { agent, .. } if agent.seat.is_some() => Some(agent.pane.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seated, ["w1:p2"], "the pane that took the seat, and only that one");
     }
 
     /// What `Z` is for. The label herdr holds is 44 characters because a

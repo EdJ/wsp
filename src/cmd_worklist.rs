@@ -1313,8 +1313,16 @@ fn words(args: &Args, from: usize) -> Result<String, i32> {
 /// how a workspace comes to hold a worklist seat, and one key space means the
 /// scope it holds is either a project or a list with no ambiguity to settle.
 fn seated(store: &Store, args: &Args) -> Option<Worklist> {
-    let ws = args.get("workspace").or_else(|| crate::herdr::Env::read().workspace_id)?;
-    let scope = crate::cmd_govern::governs(&store.governors(), &ws)?;
+    let env = crate::herdr::Env::read();
+    let ws = args.get("workspace").or_else(|| env.workspace_id.clone())?;
+    // `-w` names a room this process is not standing in, so its own pane says
+    // nothing about who is sitting there — the same rule `wsp govern` applies
+    // to the pane it stamps on the record.
+    let pane = match args.get("workspace") {
+        Some(_) => None,
+        None => env.pane_id.as_deref(),
+    };
+    let scope = crate::cmd_govern::governs(&store.governors(), &ws, pane)?;
     store.worklist(&scope)
 }
 

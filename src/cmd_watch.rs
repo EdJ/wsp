@@ -796,6 +796,12 @@ pub(crate) struct Scope {
     /// this workspace is no longer in the slot — an exit condition that costs
     /// nothing and is the natural end of a seat's subscription.
     pub(crate) workspace: String,
+    /// And the pane in it, so that end condition is read exactly. A workspace
+    /// holds more than one agent, and a subscription that survived because a
+    /// *neighbour* was still in the room would be a seat's watch going on after
+    /// the seat did — see [`cmd_govern::governs`]. Empty for a scope that was
+    /// named rather than sat in, where there is no pane to speak of.
+    pub(crate) pane: String,
     /// Every task, with no membership test at all. See [`Scope::machine`].
     pub(crate) all: bool,
 }
@@ -811,7 +817,7 @@ impl Scope {
     /// way to subscribe to work it cannot act on, which is the noise
     /// `wsp-095` Part 9 asks to be kept out.
     pub(crate) fn machine() -> Scope {
-        Scope { name: "this machine".into(), seated: false, workspace: String::new(), all: true }
+        Scope { name: "this machine".into(), seated: false, workspace: String::new(), pane: String::new(), all: true }
     }
 }
 
@@ -1409,14 +1415,21 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let here = herdr::Env::read().workspace_id.unwrap_or_default();
-        return Ok(Scope { seated: !workspace.is_empty() && workspace == here, name, workspace, all: false });
+        let env = herdr::Env::read();
+        let here = env.workspace_id.unwrap_or_default();
+        let pane = env.pane_id.unwrap_or_default();
+        let seated = !workspace.is_empty()
+            && workspace == here
+            && cmd_govern::governs(&governors, &here, Some(&pane)).as_deref() == Some(name.as_str());
+        return Ok(Scope { seated, name, workspace, pane, all: false });
     }
-    let Some(ws) = herdr::Env::read().workspace_id else {
+    let env = herdr::Env::read();
+    let Some(ws) = env.workspace_id else {
         return Err("wsp: no scope. Run this in the seat's workspace, or say `wsp watch -p <project>`".into());
     };
-    match cmd_govern::governs(&governors, &ws) {
-        Some(name) => Ok(Scope { name, seated: true, workspace: ws, all: false }),
+    let pane = env.pane_id.unwrap_or_default();
+    match cmd_govern::governs(&governors, &ws, Some(&pane)) {
+        Some(name) => Ok(Scope { name, seated: true, workspace: ws, pane, all: false }),
         None => Err("wsp: this workspace is nobody's seat, so there is no scope to watch.\n\
                      \x20    `wsp watch <project>` watches one, `wsp govern <project>` takes the seat"
             .into()),
@@ -1469,7 +1482,8 @@ fn is_out(store: &Store, scope: &Scope, needle: &str) -> bool {
     let index = Index::new(store.projects());
     let lists = worklist::Running::read(store);
     let name = index.find(needle).map(|p| p.id.clone()).unwrap_or_else(|| needle.to_string());
-    let asked = Scope { name, seated: false, workspace: scope.workspace.clone(), all: false };
+    let asked =
+        Scope { name, seated: false, workspace: scope.workspace.clone(), pane: scope.pane.clone(), all: false };
     let members: Vec<&Task> = tasks
         .iter()
         .filter(|t| in_scope(&asked, &index, &store.governors(), &lists, t))
@@ -1688,7 +1702,8 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         }
         // A seat's subscription ends when the seat does. Free, and it is the
         // natural end the flag asks callers to supply.
-        if spec.scope.seated && cmd_govern::governs(&store.governors(), &spec.scope.workspace).as_deref()
+        if spec.scope.seated
+            && cmd_govern::governs(&store.governors(), &spec.scope.workspace, Some(&spec.scope.pane)).as_deref()
             != Some(spec.scope.name.as_str())
         {
             break Over::SeatVacated;

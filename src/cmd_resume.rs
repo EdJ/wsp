@@ -693,7 +693,7 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
         if let (true, Some(ws)) = (t.seat_of.is_some(), cmd_spawn::workspace_of(&seat)) {
             cmd_govern::learn_seats(
                 store,
-                ours.iter().map(|r| (ws.as_str(), r.session.as_str(), r.cwd.as_str())),
+                ours.iter().map(|r| (ws.as_str(), r.seat.as_str(), r.session.as_str(), r.cwd.as_str())),
             );
         }
     }
@@ -1269,7 +1269,7 @@ mod tests {
             "a seat nothing has been learned about has no thread to resume"
         );
 
-        cmd_govern::learn_seats(&store, [("w1", "c109006f", "/Users/edjames/claude")].into_iter());
+        cmd_govern::learn_seats(&store, [("w1", "w1:p6", "c109006f", "/Users/edjames/claude")].into_iter());
         let t = thread_for_seat(&store, "wsp").expect("the seat now has a session");
         assert_eq!((t.session.as_str(), t.cwd.as_str()), ("c109006f", "/Users/edjames/claude"));
         assert_eq!(t.from, Source::Record);
@@ -1286,7 +1286,7 @@ mod tests {
             "wsp",
             json!({ "workspace": "w1", "pane": "w1:p6", "host": util::hostname(), "since": util::now_iso() }),
         );
-        cmd_govern::learn_seats(&store, [("w1", "c109006f", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(&store, [("w1", "w1:p6", "c109006f", "/tmp/tree")].into_iter());
         cmd_govern::vacate(&store, "wsp");
 
         assert!(
@@ -1304,7 +1304,7 @@ mod tests {
     fn standing_an_empty_seat_down_again_keeps_the_same_thread() {
         let (_env, store) = store("resume-twice");
         store.set_governor("wsp", json!({ "workspace": "w1", "host": util::hostname() }));
-        cmd_govern::learn_seats(&store, [("w1", "sess", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "sess", "/tmp/tree")].into_iter());
         cmd_govern::vacate(&store, "wsp");
         store.set_governor(
             "wsp",
@@ -1351,11 +1351,11 @@ mod tests {
     fn silence_from_the_backend_leaves_a_seats_session_alone() {
         let (_env, store) = store("resume-silence");
         store.set_governor("wsp", json!({ "workspace": "w1", "host": util::hostname() }));
-        cmd_govern::learn_seats(&store, [("w1", "sess", "/tmp/tree")].into_iter());
-        cmd_govern::learn_seats(&store, [("w1", "", "")].into_iter());
+        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "sess", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "", "")].into_iter());
         assert_eq!(thread_for_seat(&store, "wsp").map(|t| t.session), Some("sess".to_string()));
 
-        cmd_govern::learn_seats(&store, [("w1", "another", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "another", "/tmp/tree")].into_iter());
         assert_eq!(
             thread_for_seat(&store, "wsp").map(|t| t.session),
             Some("another".to_string()),
@@ -1370,7 +1370,7 @@ mod tests {
     fn re_taking_the_same_seat_does_not_erase_its_session() {
         let (_env, store) = store("resume-retake");
         store.set_governor("wsp", json!({ "workspace": "w1", "host": util::hostname() }));
-        cmd_govern::learn_seats(&store, [("w1", "sess", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "sess", "/tmp/tree")].into_iter());
         cmd_govern::take(&store, "wsp", "w1", "w1:p9");
         assert_eq!(thread_for_seat(&store, "wsp").map(|t| t.session), Some("sess".to_string()));
 

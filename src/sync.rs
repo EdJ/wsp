@@ -118,7 +118,7 @@ fn roster(
                     .get(&p.pane_id)
                     .and_then(|b| b.get("task_id"))
                     .and_then(Value::as_str),
-                "seat": crate::cmd_govern::governs(governors, &p.workspace_id),
+                "seat": crate::cmd_govern::governs(governors, &p.workspace_id, Some(&p.pane_id)),
             })
         })
         .collect()
@@ -193,7 +193,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
                             .unwrap_or_default(),
                         false => p.cwd.as_str(),
                     };
-                    (p.workspace_id.as_str(), p.session_id.as_str(), cwd)
+                    (p.workspace_id.as_str(), p.pane_id.as_str(), p.session_id.as_str(), cwd)
                 }),
             );
             // And the census itself, kept so a restart can offer back what a
@@ -262,7 +262,12 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         // other token here describes work — measured on the live seat, the
         // sidebar said `scope=robustness/078` and nothing at all about the two
         // governorships that window was actually holding.
-        let seat = crate::cmd_govern::governs(&governors, &ws.id);
+        //
+        // The one seat question in this file that is genuinely the *room's*:
+        // this token is drawn on the workspace, and a workspace containing a
+        // seat is a workspace containing a seat however many panes are in it.
+        // Every other reader here is a pane and passes one.
+        let seat = crate::cmd_govern::governs(&governors, &ws.id, None);
 
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("proj", proj.clone()),
@@ -302,7 +307,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         // what it reports, and `scope` falls back to it for the same reason: the
         // ten columns a narrow sidebar keeps for "which piece of work is this"
         // are better spent on `wsp` than on nothing.
-        let seat = crate::cmd_govern::governs(&governors, &a.workspace_id);
+        let seat = crate::cmd_govern::governs(&governors, &a.workspace_id, Some(&a.pane_id));
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("task", t.map(|t| util::truncate(&t.title, 44))),
             ("taskid", t.map(|t| t.id.clone())),

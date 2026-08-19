@@ -594,7 +594,7 @@ fn whoami(store: &Store) -> (Party, Option<String>) {
     let scope = env
         .workspace_id
         .as_deref()
-        .and_then(|ws| crate::cmd_govern::governs(&store.governors(), ws));
+        .and_then(|ws| crate::cmd_govern::governs(&store.governors(), ws, pane.as_deref()));
     match (scope, &pane) {
         (Some(scope), _) => (Party::seat(&scope), pane.clone()),
         (None, Some(p)) => (
