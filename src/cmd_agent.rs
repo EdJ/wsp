@@ -3914,6 +3914,20 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // The fifth piece of shared mutable state, and the last one nothing was
+    // watching: `refs/stash`, one stack per repository however many worktrees
+    // stand in it. The guard that refuses a new one lives in git rather than
+    // here — `crate::guard` says why — so what is left for doctor is whether
+    // each root has it, and whether anything is sitting on the stack now.
+    crate::guard::health(
+        &seen,
+        crate::guard::state,
+        crate::guard::stashed,
+        &crate::guard::git_version(),
+        &mut problems,
+        &mut notes,
+    );
+
     // And the binary those trees were built into, which is the one file none
     // of the checks above can see: the stamp travels in the bytes, so it is
     // asked of the installed wsp rather than worked out from a tree.

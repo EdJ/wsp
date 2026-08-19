@@ -31,6 +31,7 @@ mod detect_override;
 mod draw;
 mod fake;
 mod fm;
+mod guard;
 mod herdr;
 mod input;
 mod kanban;

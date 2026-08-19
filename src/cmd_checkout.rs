@@ -259,6 +259,11 @@ fn former_ids(task: &str) -> Vec<String> {
 /// an agent that comes back to a task after a `wsp release` finds its own
 /// commits rather than a fresh start.
 fn ensure(repo: &Path, dir: &Path, task: &str, from: &str) -> Result<bool, String> {
+    // Before the early return, because the guard is a property of the
+    // repository rather than of this tree: a second agent arriving at a tree
+    // that already exists is exactly who it is for. See `crate::guard` for why
+    // it is installed here and not asked for by a verb.
+    crate::guard::ensure(repo);
     if dir.join(".git").exists() {
         return Ok(false);
     }
