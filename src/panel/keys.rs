@@ -30,16 +30,6 @@ use super::verbs::{browse_key, pick_tell, Ask, Pick, Tell};
 ///
 /// [`Snapshot`]: super::rows::Snapshot
 impl View {
-    /// Take the shape of the pane this panel is drawn in.
-    ///
-    /// Which rows exist depends on it — see [`View::wide`] — so it is taken
-    /// before the rows are built rather than at the moment they are drawn, and
-    /// it is one function so that the live loop and the storyboard cannot come
-    /// to different views of what counts as a page.
-    pub(crate) fn fit_to_pane(&mut self, w: usize) {
-        self.wide = super::render::is_page(w);
-    }
-
     /// This panel is the tab `Z` opened rather than the sidebar. Set from the
     /// command line at startup and never changed, because it is what this
     /// process *is*; see [`View::full`].
@@ -54,6 +44,15 @@ impl View {
     #[cfg(test)]
     pub(crate) fn asked_for_width(&mut self, cols: Option<usize>) {
         self.asked_width = cols;
+    }
+
+    /// Open a project's fold without walking the cursor onto its row and
+    /// pressing the key. Test-only, and it exists for the one assertion the key
+    /// route cannot make cleanly: the cap gives way to the reader's fold and to
+    /// nothing else, so a test about the cap has to set a fold and not a width.
+    #[cfg(test)]
+    pub(crate) fn expand_for_test(&mut self, key: &str) {
+        self.expanded.insert(key.to_string());
     }
 
     /// The key map changes how many rows the tree gets, which changes where a
@@ -130,16 +129,6 @@ pub(crate) struct View {
     /// nothing. This one is a tab somebody opened a moment ago and will close
     /// again, so `q`, `esc` and `Z` all close it, and the footer says so.
     pub(super) full: bool,
-    /// The pane is a page rather than a sidebar — wide enough to be read rather
-    /// than glanced at, which is what `Z` makes it.
-    ///
-    /// A fact about this pane and not about the work, so it is never shared: two
-    /// panels open on the same tree, one zoomed and one not, are looking at the
-    /// same folds through different windows. The loop sets it from the terminal
-    /// before the rows are built, because it is the rows that change — a page
-    /// shows a project's tasks all of them, where a sidebar shows six and a
-    /// count of the rest.
-    pub(super) wide: bool,
     /// Include `done` tasks, and the projects that hold only those.
     pub(super) show_done: bool,
     /// Narrow the tree to work at `review` — what an agent has finished with
@@ -258,8 +247,9 @@ pub(crate) struct View {
     /// [`super::run::Screen::ask_width`] for the seam.
     ///
     /// A fact about this pane and not about the work, so it is not carried
-    /// between panels — the same reason [`View::wide`] is not. A second panel
-    /// on the same tree has its own rect and its own host.
+    /// between panels: a second panel on the same tree has its own rect and its
+    /// own host, and the two of them are looking at the same folds through
+    /// different windows.
     pub(super) asked_width: Option<usize>,
     /// The ask this panel last put up, so it puts it up once.
     ///

@@ -842,15 +842,23 @@ pub(super) fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
 ///
 /// A title in this store averages sixty-four characters, and a row spends about
 /// thirty more on depth, marks, an id and the counts down the right — so
-/// ninety-six is roughly the width at which the tree stops abbreviating and
+/// ninety-six is roughly the width at which a row stops being truncated and
 /// starts saying what the work is. Below it the panel is a sidebar however it
 /// got there; at or above it, it is being read rather than glanced at.
+///
+/// It is a width somebody asks the host *for* — see [`super::verbs::cycle`] and
+/// `super::run::Page::width` — and never a width anything is tested against.
+/// Nothing about the frame branches on it, because a panel that drew different
+/// content either side of a threshold rewrites itself under the reader when a
+/// split moves, and that was a real bug: crossing this number un-collapsed
+/// folded projects and jumped the scroll. Wider is the same panel with more
+/// room.
 pub(super) const PAGE_MIN: usize = 96;
 
 /// What a page asks for when there is no width that would be enough.
 ///
-/// [`PAGE_MIN`] is a threshold — the tree stops abbreviating there, and more
-/// room after that only spends columns on whitespace. A board has no such
+/// [`PAGE_MIN`] is a measure — the tree stops abbreviating around there, and
+/// more room after that only spends columns on whitespace. A board has no such
 /// number: it is four columns side by side, every one of them a title that was
 /// written to be read, and every column it is given goes straight into them.
 /// So it asks for more than a terminal has and lets the host decide.
@@ -865,16 +873,6 @@ pub(super) const PAGE_MIN: usize = 96;
 /// The value is the largest the wire can carry: `cols` crosses as a `u16`, and
 /// a number that would not fit is a request the host cannot read at all.
 pub(super) const WHOLE_SCREEN: usize = u16::MAX as usize;
-
-/// Is this pane a page rather than a sidebar?
-///
-/// Asked of the width alone, and it decides one thing: whether a project shows
-/// all its tasks or six and a count of the rest. How many rows there are cannot
-/// come into it, because the cap is what decides how many rows there are, and a
-/// rule that read them back would chase itself.
-pub(crate) fn is_page(w: usize) -> bool {
-    w >= PAGE_MIN
-}
 
 /// The whole panel as styled lines. No escapes, no terminal — a backend turns
 /// Where the frame's parts land in a pane of this size.

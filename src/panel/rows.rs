@@ -1169,14 +1169,22 @@ pub(super) fn task_rows(
     let tops = nested.iter().filter(|(_, d)| *d == 0).count();
     let key = project.unwrap_or(INBOX_KEY);
     // The cap is a sidebar's economy: six tasks is what one project may spend of
-    // a column that has to hold thirty projects. A pane wide enough to draw the
-    // tree in columns has no such shortage — it was made big to be read whole —
-    // so there the branch is all of itself, and `⋯` never comes up.
+    // a column that has to hold thirty projects, and `⋯` is how the tail stays
+    // reachable.
     //
-    // A search has no such shortage either: what it draws is already the few
-    // rows somebody asked for, and a seventh hit rolled into `⋯` is the finding
-    // aid hiding the thing it was asked to find.
-    let cap = match view.expanded.contains(key) || view.wide || !view.filter.is_empty() {
+    // Two things lift it, and both of them are somebody asking. A fold is the
+    // reader's own: they opened this branch and the whole of it is what they
+    // opened. A search is the same ask arriving by another route — what it
+    // draws is already the few rows somebody named, and a seventh hit rolled
+    // into `⋯` is the finding aid hiding the thing it was asked to find.
+    //
+    // Width used to lift it too, and that was a bug rather than a third case.
+    // A project collapsed in the sidebar came back expanded at page width, with
+    // no keypress about folding anywhere — so `ZZ` rewrote the tree under the
+    // reader, and the scroll offset they were anchored by stopped meaning what
+    // it meant. `Z` changes how much room the rows get and never which rows
+    // there are; see `super::verbs::expand`.
+    let cap = match view.expanded.contains(key) || !view.filter.is_empty() {
         true => tops,
         false => tops.min(MAX_TASKS_PER_PROJECT),
     };

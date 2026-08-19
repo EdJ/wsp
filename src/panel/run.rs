@@ -1089,12 +1089,6 @@ pub(super) fn event_loop(
     // `crate::live`, and `crate::draw`'s "focus is not an input".
     let (mut keyboard, mut self_focused) = screen.focus(&live, me, self_ws);
     let snap = Snapshot::live(store, live.panes);
-    // What shape of thing this pane is, before the rows are built from it: a
-    // page shows a project's tasks all of them and a sidebar shows six. See
-    // [`View::wide`], and the tick below, which is where a pane that changes
-    // shape under a running panel is noticed.
-    let mut drawn_size = screen.size();
-    view.fit_to_pane(drawn_size.0);
     let mut ui = collect(&snap, &view);
     if point_at(&mut ui, &want) {
         want = Cursor::default();
@@ -1140,7 +1134,7 @@ pub(super) fn event_loop(
         ui: &Ui,
         view: &mut View,
         page: Option<&mut Page>,
-    ) -> (usize, usize) {
+    ) {
         let (w, h) = screen.size();
         match page {
             Some(p) => {
@@ -1154,12 +1148,14 @@ pub(super) fn event_loop(
                     .filter(|(_, at)| at.elapsed() < super::render::NOTE)
                     .map(|(m, _)| m.as_str())
                     .unwrap_or_default();
-                screen.paint(&p.frame(note, w, h), w, h)
+                screen.paint(&p.frame(note, w, h), w, h);
             }
-            None => screen.paint(&frame(ui, view, w, h), w, h),
+            None => {
+                screen.paint(&frame(ui, view, w, h), w, h);
+            }
         }
     }
-    drawn_size = draw(screen, &ui, &mut view, page.as_mut());
+    draw(screen, &ui, &mut view, page.as_mut());
 
     loop {
         let msg = match carry.pop_front() {
@@ -1351,11 +1347,12 @@ pub(super) fn event_loop(
                 Effect::Full => {
                     let want = cycle(view.asked_width, screen.widest());
                     if expand(screen, &mut view, want) {
-                        // Nothing is refetched and nothing is redrawn here. The
-                        // host answers by resizing us, the tick notices the new
-                        // shape, and the rows are rebuilt then — see
-                        // [`View::fit_to_pane`]. Doing it now would build them
-                        // for a width we have only asked for.
+                        // Nothing is refetched and nothing is redrawn here,
+                        // and nothing needs to be: the rows do not depend on
+                        // the width. The host answers by resizing us and the
+                        // next frame is drawn into whatever columns came back —
+                        // the same rows, with more room. That is the whole of
+                        // what this key does.
                         //
                         // Said, rather than left to be read off the frame: two
                         // of the three states can be granted the same columns on
@@ -1538,21 +1535,14 @@ pub(super) fn event_loop(
                 refetch = true;
             }
             Msg::Tick => {
-                // The pane has changed shape since the rows were built — `Z`,
-                // a split dragged wider, a window resized. Almost all of that
-                // the frame answers by itself, because it is drawn to whatever
-                // it measures; this is the part it cannot, because a page and a
-                // sidebar do not have the same rows in them. See [`View::wide`].
+                // Nothing here about the shape of the pane. `Z`, a split
+                // dragged wider, a window resized — the frame answers all of it
+                // by itself, because it is built for whatever the screen says
+                // it measures. There used to be a refetch on this line, because
+                // a page and a sidebar did not have the same rows in them; that
+                // was the `ZZ` scroll jump, and `super::rows` no longer reads
+                // the width when it decides which rows exist.
                 //
-                // Read off the last frame rather than measured here, so the
-                // shape and the frame in front of the reader agree — see the
-                // `draw` closure.
-                let was = view.wide;
-                view.fit_to_pane(drawn_size.0);
-                if view.wide != was {
-                    refetch = true;
-                    dirty = false;
-                }
                 // A hand raised outranks the cadence.
                 //
                 // Everything else the background gate defers is *news about
@@ -1683,7 +1673,7 @@ pub(super) fn event_loop(
         if is_key {
             shared::share(store, &view, ui.cursor(), &mut agreed);
         }
-        drawn_size = draw(screen, &ui, &mut view, page.as_mut());
+        draw(screen, &ui, &mut view, page.as_mut());
     }
 }
 

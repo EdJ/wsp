@@ -823,9 +823,9 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 /// The whole of a panel changing its own size, and it is three lines because
 /// there is nothing to negotiate: this says the width, the host gives it as far
 /// as the terminal goes, and the next frame is built for whatever columns
-/// exist. Nothing here waits for an answer and nothing reads one — [`View::wide`]
-/// is derived from the width the frame is drawn at, so a panel that commanded a
-/// page on a sixty-column screen draws sixty columns of sidebar, is correct,
+/// exist. Nothing here waits for an answer and nothing reads one, and nothing
+/// needs to: every frame is built for the columns it measures, so a panel that
+/// commanded a page on a sixty-column screen draws sixty columns, is correct,
 /// and has still moved — see [`cycle`], where the position is the ask.
 ///
 /// `cols` of `None` gives the room back.
@@ -844,10 +844,16 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 /// # What this is called, and what it is not
 ///
 /// It is a **page**: the panel given a wider rect, drawing something written to
-/// be read rather than glanced at. The word is not new here — [`is_page`] has
-/// decided what a row shows since long before the host could be asked for
-/// anything, and [`PAGE_MIN`] is where the tree stops abbreviating. What is new
-/// is that the panel can now ask to be one.
+/// be read rather than glanced at. The word is not new here — [`PAGE_MIN`] has
+/// named the width a row stops being truncated at since long before the host
+/// could be asked for anything. What is new is that the panel can now ask to
+/// be one.
+///
+/// It is a *width*, and only a width. The rows are the same rows either side of
+/// any number: a project shows what its fold and the filter say it shows, and
+/// the pane getting bigger is not somebody asking to see more work. There used
+/// to be a predicate here that said otherwise, and it un-collapsed folded
+/// projects on `ZZ` and jumped the scroll — see `super::rows::task_rows`.
 ///
 /// It was very nearly called an *overlay*, and that would have been wrong in a
 /// way worth writing down, because `Z`, `K` and everything after are named by
@@ -865,8 +871,6 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 /// herdr release. The wire carries a number and never a reason, and "page" is
 /// the word on this side for what the number is *for*.
 ///
-/// [`View::wide`]: super::keys::View::wide
-/// [`is_page`]: super::render::is_page
 /// [`PAGE_MIN`]: super::render::PAGE_MIN
 pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usize>) -> bool {
     // Zero is how the wire spells giving it back; see herdr's `wsp_sidebar`.
@@ -885,13 +889,12 @@ pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usiz
 /// # The third state is the kanban's, not a second one that looks like it
 ///
 /// "The whole page" asks for [`WHOLE_SCREEN`], the same constant `K`'s board
-/// asks for (see `super::run::Page::width`), and what it gets drawn as is
-/// decided by [`is_page`] on the width that came back, exactly as every other
-/// wide frame is. There is no `Z`-shaped fullscreen anywhere: one constant, one
-/// predicate. That matters more now than it did — the host used to be the
-/// shared reference both definitions were measured against, and a surface that
-/// commands its own width has removed it as one, so two definitions of "full"
-/// would have nothing left to pull them back together.
+/// asks for (see `super::run::Page::width`), and what comes back is drawn into
+/// exactly as every other wide frame is. There is no `Z`-shaped fullscreen
+/// anywhere: one constant, and no second notion of "full" for it to drift from.
+/// That matters more now than it did — the host used to be the shared reference
+/// both definitions were measured against, and a surface that commands its own
+/// width has removed it as one.
 ///
 /// # The position is what was asked for, never what was given
 ///
@@ -917,7 +920,6 @@ pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usiz
 /// always opened — so the cycle simply has one fewer state to be in.
 ///
 /// [`View::asked_width`]: super::keys::View::asked_width
-/// [`is_page`]: super::render::is_page
 /// [`Screen::ask_width`]: super::run::Screen::ask_width
 pub(super) fn cycle(now: Option<usize>, widest: Option<usize>) -> Option<usize> {
     match now {

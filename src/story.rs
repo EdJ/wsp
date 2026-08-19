@@ -587,10 +587,10 @@ impl<'a> Driver<'a> {
     /// The panel `Z` opens: a tab of its own, at the width of the workspace.
     fn at(snap: &'a Snapshot, w: usize, h: usize) -> Driver<'a> {
         let mut view = panel::View::default();
-        // Exactly what the live loop does before it builds its rows: which rows
-        // there are depends on whether this is a page or a sidebar, and what
-        // `q` means depends on whether this panel is the tab or the furniture.
-        view.fit_to_pane(w);
+        // The one thing the live loop sets before it builds its rows and the
+        // width does not say: what `q` means depends on whether this panel is
+        // the tab or the furniture. The rows themselves do not depend on `w` at
+        // all — see `panel::verbs::expand`.
         view.takes_the_tab(true);
         let ui = panel::collect(snap, &view);
         panel::place(&ui, &mut view, w, h);
@@ -3980,50 +3980,88 @@ mod tests {
         assert!(matches!(from(None, Key::Char('q')), panel::Effect::None));
     }
 
-    /// A page shows the branch whole; a sidebar shows six of it and says so.
+    /// Ed: `Z` "should change the geometry and nothing else — we want the view
+    /// to be *the same, just wider*". A collapsed project stays collapsed.
     ///
     /// The cap is an economy: six tasks is what one project may spend of a
     /// column that has to hold thirty projects, and the `⋯` is how the tail
-    /// stays reachable. A pane wide enough to be read rather than glanced at has
-    /// no such shortage, so the whole branch is there — which is what `Z` is
-    /// pressed for, and it follows the width rather than the key, so dragging a
-    /// split wider gets the same tree.
+    /// stays reachable. Page width used to lift it, on the argument that a pane
+    /// made big to be read whole has no such shortage — and that was the cause
+    /// of the `ZZ` scroll jump. It expanded folds nobody had touched, so the
+    /// tree was rewritten under the reader and the offset they were anchored by
+    /// stopped meaning what it meant. Anchoring (see the tests below) fixed the
+    /// symptom; this is the half that stops the content moving in the first
+    /// place.
+    ///
+    /// The fold is still the reader's to open at either width, and it survives
+    /// the round trip — which is the part that read as broken: press `ZZ` and
+    /// your folds stopped meaning anything, with no keypress about folding.
     #[test]
-    fn a_page_shows_the_branch_whole_and_a_sidebar_shows_six() {
+    fn a_width_change_does_not_unfold_a_project() {
         let world = world();
-        let tasks_of = |w: usize| -> (Vec<String>, usize) {
-            let mut view = panel::View::default();
-            view.fit_to_pane(w);
-            let mut ui = ui_of(&world, &view);
-            let mut ids = Vec::new();
+        // What is actually on the pane, at a width, as targets. Asked of the
+        // frame and not of the row list, because the row list is the thing that
+        // used to be right while the drawing was wrong — and because a test
+        // that only reads `collect` would go on passing if a later width branch
+        // moved into `render`.
+        let drawn = |view: &mut panel::View, w: usize| -> Vec<panel::Target> {
+            let ui = ui_of(&world, view);
+            panel::place(&ui, view, w, TALL);
+            let mut probe = ui.clone();
+            (0..TALL)
+                .filter_map(|y| panel::row_at(&ui, view, w, TALL, y))
+                .map(|i| {
+                    probe.select_for_test(i);
+                    probe.selected_target()
+                })
+                .collect()
+        };
+        // How much of the branch the *tree* holds, past the foot of any pane:
+        // the `wsp` fixture's eight tasks live at the end of the tree, so a
+        // page that is not forty-four rows tall shows the fold working without
+        // showing all of it. The claim about width is made on `drawn` above;
+        // this is the claim about the cap.
+        let branch = |view: &panel::View| -> (usize, usize) {
+            let mut ui = ui_of(&world, view);
+            let mut tasks = 0;
             for i in 0..ui.rows_for_test() {
                 ui.select_for_test(i);
-                if let panel::Target::Task(id) = ui.selected_target() {
-                    ids.push(id);
+                if matches!(ui.selected_target(), panel::Target::Task(id) if id.starts_with("t-1"))
+                {
+                    tasks += 1;
                 }
             }
-            let more =
-                kinds(&mut ui).into_iter().filter(|k| *k == panel::RowKind::More).count();
-            (ids, more)
+            let more = kinds(&mut ui).into_iter().filter(|k| *k == panel::RowKind::More).count();
+            (tasks, more)
         };
 
-        // The fixture's `wsp` project holds eight, which is what the overflow
-        // row exists for.
-        let (sidebar, sidebar_more) = tasks_of(W);
-        let (page, page_more) = tasks_of(120);
-        let panel_work = |ids: &[String]| ids.iter().filter(|id| id.starts_with("t-1")).count();
-
-        assert_eq!(panel_work(&sidebar), 6, "a sidebar spends six rows on one project");
-        assert_eq!(panel_work(&page), 8, "a page shows the branch whole");
-        assert!(page.len() > sidebar.len(), "and the tree is longer for it");
-
-        // One `⋯` fewer, not none: the other belongs to the agents dock, which
-        // keeps five rows however wide the pane is — it is a pinned list of who
-        // has stopped, and a page is not a reason to grow it.
+        // Collapsed, at a sidebar and at a page. `PAGE_MIN` is ninety-six, so
+        // these are either side of the width that used to decide it.
+        let mut view = panel::View::default();
+        let sidebar = drawn(&mut view, W);
+        let page = drawn(&mut view, 120);
         assert_eq!(
-            sidebar_more,
-            page_more + 1,
-            "the ⋯ the page loses is the project's tail, and the one it keeps is the dock's",
+            sidebar, page,
+            "the page is the sidebar's rows in more columns, not a different tree",
+        );
+
+        // Six of the branch, and the tail still reachable — which is what makes
+        // the cap an economy rather than a truncation. Two `⋯`: the project's,
+        // and the agents dock's own, a pinned list of who has stopped that
+        // keeps five rows at any width because room is not a reason to grow it.
+        assert_eq!(branch(&view), (6, 2), "six of the branch, and a ⋯ holding the rest");
+
+        // Opened by the reader, which is the one ask the cap gives way to — and
+        // it gives way at *both* widths. Before this, the fold was overridden
+        // while wide: collapse a project, press `ZZ`, and it was expanded again
+        // with no keypress about folding anywhere.
+        let mut view = panel::View::default();
+        view.expand_for_test("wsp");
+        assert_eq!(branch(&view), (8, 1), "the whole branch, and the ⋯ left is the dock's");
+        assert_eq!(
+            drawn(&mut view, W),
+            drawn(&mut view, 120),
+            "and the fold is the reader's at either width",
         );
     }
 
@@ -4295,17 +4333,23 @@ mod tests {
     /// Ed: "pressing ZZ to enter fullscreen sidebar mode jumps the sidebar
     /// scroll upwards for an unclear reason." This is the reason.
     ///
-    /// The view's position is a row *number*, and `Z` changes what a row number
-    /// means. Twice over: the pane is wide enough to be a page, so every
-    /// project stops abbreviating and the rows above the cursor multiply — and
-    /// the focus dock rewraps to a wider pane, so a different number of tree
-    /// rows fit. The stored offset survived both and was merely clamped back
-    /// into range, and the clamp's floor is `sel + LOOKAHEAD + 1 - tree_rows`:
-    /// it puts the row you were reading down at the foot of the pane, which is
-    /// the whole tree sliding up past you.
+    /// The view's position is a row *number*, and `Z` changed what a row number
+    /// means. Twice over: the pane became wide enough to be a page, so every
+    /// project stopped abbreviating and the rows above the cursor multiplied —
+    /// and the focus dock rewraps to a wider pane, so a different number of
+    /// tree rows fit. The stored offset survived both and was merely clamped
+    /// back into range, and the clamp's floor is `sel + LOOKAHEAD + 1 -
+    /// tree_rows`: it puts the row you were reading down at the foot of the
+    /// pane, which is the whole tree sliding up past you.
     ///
-    /// What it does instead is put the cursor back on the line it was drawn on
-    /// and let the new rows fill in around it.
+    /// Both roads are closed, at different depths. The first one is shut at
+    /// source — width no longer decides which rows exist, so the tree cannot
+    /// multiply under a resize at all, and the run of rows asserted below is
+    /// the same run either side. The second cannot be: a dock that wraps to the
+    /// pane it is drawn in is the dock working, so the number of tree rows will
+    /// go on changing with the width. That is what the anchoring is for — the
+    /// cursor goes back on the line it was drawn on and the rows fill in around
+    /// it, rather than an integer being carried across and clamped.
     #[test]
     fn going_full_screen_leaves_the_reader_on_the_row_they_were_reading() {
         let w = tall_world();
@@ -4334,16 +4378,26 @@ mod tests {
         assert!(run[0] > 0, "there are rows above the pane, so this is not the top of the tree");
         assert!(line > 2 && line < 1 + run.len(), "and the cursor is in the middle of the pane");
 
-        // `ZZ`: the host grants the whole screen, the panel takes its shape
-        // from it, and the rows are rebuilt for a pane that no longer
-        // abbreviates.
+        // `ZZ`: the host grants the whole screen and the next frame is drawn
+        // into it. The refetch is here because one lands on this pane every few
+        // seconds anyway — an agent arriving, a task finishing — and a resize
+        // must survive the frame after it as well as the frame it caused.
         let page = 120;
-        view.fit_to_pane(page);
         panel::refetch_into(&mut ui, &w, &mut view);
 
-        let (moved, _) = on_the_pane(&ui, &mut view, page, TALL);
+        let (moved, after) = on_the_pane(&ui, &mut view, page, TALL);
         assert_eq!(ui.selected_target(), was, "the cursor is still on the row it was on");
         assert_eq!(line, moved, "the cursor changed line, so the tree moved under the reader");
+        // And the reason it did not have to move: the same rows are on the
+        // pane, in the same order, starting at the same place in the tree. A
+        // wider pane is more columns and not more work.
+        let widened = tree_run(&after);
+        assert_eq!(run[0], widened[0], "the tree is anchored at the same row it was");
+        assert_eq!(
+            run[..],
+            widened[..run.len().min(widened.len())],
+            "and the rows below it are the rows that were below it",
+        );
     }
 
     /// The same fault with no resize anywhere, which is the half that fires on
