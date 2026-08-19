@@ -63,6 +63,8 @@
 //! caller is about to run `wsp spawn <id>`, which prints the title itself — and
 //! `--json` carries the rest for whatever would rather parse it.
 
+use std::collections::BTreeSet;
+
 use serde_json::json;
 
 use crate::model::{Group, Worklist, WorklistStatus};
@@ -872,6 +874,81 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     0
 }
 
+// ---- what a passed group left behind ----------------------------------
+//
+// `Position::slipped` is the verdict floor's receipt: a member of a group the
+// run has already passed that does not read as finished. Its own doc comment
+// ends *"a caller that prints nothing about it is the floor quietly covering
+// the thing it was put in to survive"* — and for a while `report` was the only
+// caller that printed anything, so `show`, `next` on a finished list, `done`
+// and every `--json` object between them covered it. That is why the words and
+// the mark live here instead of at one call site: a block one caller in four
+// prints is how this happened, and a block nothing can assert on is why it went
+// unnoticed.
+
+/// What being behind means, in the words a reader can act on.
+const BEHIND: &str = "in a group already passed, and not finished — the run does not go back for them";
+
+/// The `behind` block, in the caller's own label column.
+///
+/// `head` is the label already painted and `indent` the column the sentence
+/// under it hangs from — the running verbs put a bold word at the margin and
+/// `show` has an eight-wide dim column — and both of them put two spaces after
+/// the head, which is the only thing this needs to know about either.
+///
+/// Empty in every ordinary run, which is what makes it affordable on a verb a
+/// governor types at every barrier.
+fn behind_lines(p: &Paint, slipped: &[Standing], head: &str, indent: usize) -> Vec<String> {
+    if slipped.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<&str> = slipped.iter().map(|s| s.id.as_str()).collect();
+    let mut out = vec![format!("{head}  {}", ids.join("  "))];
+    out.extend(
+        util::wrap(BEHIND, 78usize.saturating_sub(indent))
+            .iter()
+            .map(|line| format!("{}{}", " ".repeat(indent), p.dim(line))),
+    );
+    out
+}
+
+/// The same members, for a `--json` object: the id and the word the store holds
+/// for it, which together are the disagreement.
+fn behind_json(slipped: &[Standing]) -> serde_json::Value {
+    json!(slipped
+        .iter()
+        .map(|s| json!({ "id": s.id, "status": s.settlement.word() }))
+        .collect::<Vec<_>>())
+}
+
+/// The mark in front of a group in the plan: where the run is, and the one
+/// case where "passed" is not the whole truth.
+///
+/// A group behind the position drew `✓` whatever its members now say, which is
+/// exactly the same glyph as one that genuinely landed — so the plan, which is
+/// where somebody is looking, was the surface that said least about it. `!` is
+/// the mark a panel row already uses for something that wants a person.
+fn group_mark(p: &Paint, at: Option<usize>, ordinal: usize, slipped_in: &BTreeSet<usize>) -> String {
+    match at {
+        Some(a) if a == ordinal => p.cyan("→"),
+        _ if slipped_in.contains(&ordinal) => p.yellow("!"),
+        Some(a) if a > ordinal => p.dim("✓"),
+        None => p.dim("✓"),
+        _ => " ".to_string(),
+    }
+}
+
+/// Which groups a member slipped in, for the mark above.
+///
+/// The ordinal is carried on `passed` and not on `slipped`, and the two are the
+/// same walk: `position` puts every member of a group it walks past on `passed`
+/// and the unfinished ones on `slipped`. Read from `passed` here so the mark
+/// needs no second reading — and the block still prints off `slipped`, so a
+/// member the two ever disagree about is named without a mark rather than lost.
+fn slipped_in(pos: &Position) -> BTreeSet<usize> {
+    pos.passed.iter().filter(|b| !b.member.finished()).map(|b| b.group).collect()
+}
+
 // ---- show -------------------------------------------------------------
 
 pub fn show(store: &Store, args: &Args) -> i32 {
@@ -912,6 +989,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                     "id": s.id,
                     "status": s.settlement.word(),
                 })).collect::<Vec<_>>(),
+                // Carried in the settled reading's object because the settled
+                // reading is where it was invisible: this object said `at`,
+                // `dangling`, `groups`, `waiting_on` and `worklist`, and a
+                // member the floor stepped over is in none of those.
+                "behind": behind_json(&pos.slipped),
                 "dangling": dangling,
             }))
             .unwrap_or_default()
@@ -957,6 +1039,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
     if !groups.is_empty() {
         println!();
+        let behind_at = slipped_in(&pos);
         let w_ord = groups.len().to_string().chars().count();
         // Where the ids begin: the mark, the ordinal and the cap column, each
         // with its two spaces. Everything written under a group hangs off this,
@@ -965,12 +1048,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         let members_at = w_ord + 9;
         for (i, g) in groups.iter().enumerate() {
             let ordinal = i + 1;
-            let mark = match pos.at {
-                Some(at) if at == ordinal => p.cyan("→"),
-                Some(at) if at > ordinal => p.dim("✓"),
-                None => p.dim("✓"),
-                _ => " ".to_string(),
-            };
+            let mark = group_mark(&p, pos.at, ordinal, &behind_at);
             let cap = match g.cap {
                 Some(n) => format!("x{n}"),
                 None => String::new(),
@@ -1026,6 +1104,17 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         println!();
         println!("{}  {}", p.dim(&util::pad("gone", 8)), dangling.join("  "));
         println!("{}  {}", util::pad("", 8), p.dim("no task answers to these — nothing here removes them"));
+    }
+
+    // Beside `gone`, in the same column and for the same reason: both are about
+    // a member the run will never mention again, and neither is anything the
+    // position line above says. The `!` marks in the plan say which groups;
+    // this says which members, because a mark with no legend is not evidence.
+    if !pos.slipped.is_empty() {
+        println!();
+        for line in behind_lines(&p, &pos.slipped, &p.dim(&util::pad("behind", 8)), 10) {
+            println!("{line}");
+        }
     }
 
     // The prose, minus the two sections that are not prose: `Groups` is drawn
@@ -1357,14 +1446,41 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    let pos = worklist::position(store, &w, Reading::Landed);
     // A list somebody has finished with is not a run, and `next` is a running
     // verb. It answers rather than reporting a barrier that is nobody's to
     // pass: the four states are about a run, and this one is over.
+    //
+    // **It still says what is behind it**, and that is why the reading is paid
+    // for above this and not below it. Marking a list `done` used to make a
+    // member the floor stepped over invisible on every surface at once, since
+    // this was the verb that named it — a status somebody sets is not a reason
+    // to stop saying that a group was passed without one of its members. The
+    // walk is the same one `next` pays for anywhere else and nothing polls a
+    // finished list: `done` is where a governor's loop ends.
     if w.status() == WorklistStatus::Done {
-        println!("{} {}", w.id, Paint::new().dim("is done — nothing left to want from it"));
+        let p = Paint::new();
+        if args.json() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "worklist": w.id,
+                    "status": "done",
+                    "state": "done",
+                    "at": pos.at,
+                    "of": pos.of,
+                    "behind": behind_json(&pos.slipped),
+                }))
+                .unwrap_or_default()
+            );
+            return 0;
+        }
+        for line in behind_lines(&p, &pos.slipped, &p.bold("behind"), 8) {
+            println!("{line}");
+        }
+        println!("{} {}", w.id, p.dim("is done — nothing left to want from it"));
         return 0;
     }
-    let pos = worklist::position(store, &w, Reading::Landed);
     let st = state(store, &w, &pos);
     let gone = worklist::dangling(store, &w);
 
@@ -1425,20 +1541,10 @@ fn report(w: &Worklist, pos: &Position, st: &State, gone: &[String], seat: bool)
         println!("{}  {}", p.bold("gone"), gone.join("  "));
         println!("      {}", p.dim("no task answers to these — nothing here removes them"));
     }
-    // The other line that cannot be missed, and it is rarer and stranger: a
-    // member of a group this run has already passed that does not read as
-    // finished. See `worklist::reached` — the run does not go back for it, and somebody
-    // has to be told it is there rather than have the floor quietly cover it.
-    if !pos.slipped.is_empty() {
-        println!(
-            "{}  {}",
-            p.bold("behind"),
-            pos.slipped.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join("  ")
-        );
-        println!(
-            "        {}",
-            p.dim("in a group already passed, and not finished — the run does not go back for them")
-        );
+    // The other line that cannot be missed, and it is rarer and stranger. The
+    // argument is above `behind_lines`; this is the caller that always had it.
+    for line in behind_lines(&p, &pos.slipped, &p.bold("behind"), 8) {
+        println!("{line}");
     }
 
     match st {
@@ -1546,6 +1652,10 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String]) -> serde
         "status": w.status().as_str(),
         "at": pos.at,
         "of": pos.of,
+        // What `report` prints and this object did not, which made the machine
+        // half of the same verb the quieter one — and a governor polling
+        // `--json` is the reader least likely to go and look.
+        "behind": behind_json(&pos.slipped),
         "dangling": gone,
     });
     match st {
@@ -2030,11 +2140,21 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     }
     let pos = worklist::position(store, &w, Reading::Settled);
     let left: Vec<String> = pos.holding().iter().map(|s| s.id.clone()).collect();
+    // The other half of what is being closed over, and the half that is easy to
+    // close over without noticing: a member of a group this run already passed
+    // that does not read as finished. It is not "still open" — nothing here is
+    // waiting on it and no barrier will ever mention it again — which is
+    // exactly why the decision is the last moment it can be written down.
+    let behind: Vec<String> = pos.slipped.iter().map(|s| s.id.clone()).collect();
+    let tail = match behind.is_empty() {
+        true => String::new(),
+        false => format!(" · behind {}", behind.join(" ")),
+    };
 
     w.set_status(WorklistStatus::Done);
     w.log(&match pos.at {
-        None => "done — every group finished".to_string(),
-        Some(at) => format!("done at group {at} of {} — {}", pos.of, left.join(" ")),
+        None => format!("done — every group finished{tail}"),
+        Some(at) => format!("done at group {at} of {} — {}{tail}", pos.of, left.join(" ")),
     });
     let groups = w.groups();
     let msg = format!("done {}", w.id);
@@ -2042,10 +2162,16 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     if code != 0 {
         return code;
     }
-    store.log_event("worklist-done", json!({ "id": w.id, "at": pos.at, "open": left }));
+    store.log_event(
+        "worklist-done",
+        json!({ "id": w.id, "at": pos.at, "open": left, "behind": behind }),
+    );
 
     if args.json() {
-        println!("{}", json!({ "worklist": w.id, "status": "done", "at": pos.at, "open": left }));
+        println!(
+            "{}",
+            json!({ "worklist": w.id, "status": "done", "at": pos.at, "open": left, "behind": behind })
+        );
         return 0;
     }
     let p = Paint::new();
@@ -2063,6 +2189,9 @@ pub fn done(store: &Store, args: &Args) -> i32 {
                 }
             ))
         );
+    }
+    for line in behind_lines(&p, &pos.slipped, &p.bold("behind"), 8) {
+        println!("{line}");
     }
     0
 }
@@ -2639,6 +2768,72 @@ mod tests {
             p.slipped.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             ["wl-001"],
             "and the member that would have dragged it back is named"
+        );
+    }
+
+    /// The receipt for the floor, and who is told about it.
+    ///
+    /// `report` was the only one of four callers that printed anything: `show`
+    /// drew a passed group holding a member left behind with the same `✓` as
+    /// one that genuinely landed, and neither `--json` object mentioned it. The
+    /// mark and the words are one thing now, so a caller that prints neither is
+    /// a caller that did not ask.
+    #[test]
+    fn a_member_the_floor_stepped_over_is_named_and_the_group_it_slipped_in_is_marked() {
+        let (_env, store) = running("behind");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["go", "batch"]);
+        run(&store, &["go", "batch"]);
+        task(&store, "wl-001", "doing");
+
+        let (_, p) = at(&store, "batch");
+        let paint = Paint::plain();
+        let marks: Vec<String> =
+            (1..=p.of).map(|n| group_mark(&paint, p.at, n, &slipped_in(&p))).collect();
+        assert_eq!(marks, ["!", "→"], "the group it slipped in is not a group that landed");
+
+        let block = behind_lines(&paint, &p.slipped, "behind", 8).join("\n");
+        assert!(block.starts_with("behind  wl-001"), "the member is named: {block}");
+        assert!(block.contains("already passed"), "and what that means is said: {block}");
+        assert!(
+            block.lines().all(|l| l.chars().count() <= 80),
+            "inside eighty however deep the column is: {block}"
+        );
+
+        assert_eq!(
+            behind_json(&p.slipped),
+            serde_json::json!([{ "id": "wl-001", "status": "doing" }]),
+            "and the machine half carries the disagreement, not only the id"
+        );
+        assert!(behind_lines(&paint, &[], "behind", 8).is_empty(), "silent in an ordinary run");
+    }
+
+    /// `done` is a decision and it says what it is closing over. A member of a
+    /// group already passed is the half of that nobody is waiting on — no
+    /// barrier will mention it again, and marking the list finished used to be
+    /// the moment it stopped being said anywhere — so the decision is the last
+    /// place it can be written down.
+    #[test]
+    fn done_names_what_slipped_behind_it_and_not_only_what_was_still_open() {
+        let (_env, store) = running("donebehind");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["go", "batch"]);
+        run(&store, &["go", "batch"]);
+        task(&store, "wl-001", "doing");
+
+        assert_eq!(run(&store, &["done", "batch"]), 0);
+        let log = store.worklist("batch").unwrap().section("Log").unwrap_or_default();
+        assert!(
+            log.contains("done at group 2 of 2 — wl-002 · behind wl-001"),
+            "what was open and what was left behind are different facts: {log}"
         );
     }
 
