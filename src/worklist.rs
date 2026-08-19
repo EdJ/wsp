@@ -1369,7 +1369,14 @@ mod tests {
              expands backwards from"
         );
 
+        // `review` as well as the land, and that is not this test being made
+        // to pass: a branch holding nothing is a branch that landed and one
+        // `wsp checkout` cut at the trunk tip, and the store is what separates
+        // them (`Landing::Nothing`). So the sequence here is the one an agent
+        // actually performs, and the assertion still turns on the renumbering
+        // — the id the list names is not the id either half is read under.
         land(&repo, "wsp-9");
+        task(&store, "wsp-9", "review");
         assert!(
             position(&store, &w, Reading::Landed).finished(),
             "and it opens on the landing, through the renumbering"
