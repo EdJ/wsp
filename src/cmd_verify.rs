@@ -913,16 +913,29 @@ fn rerun_alone(tree: &Path, target: &Path, name: &str, share: &Share) -> Option<
 /// A deadlock is exactly the class of bug this pass hunts — `robustness-072`
 /// was a wait on a file that never appeared, and the fix was to wait on the
 /// child instead — so a test that hangs is a result and not an accident. With
-/// no limit the first one to hang costs the whole ten minutes and prints
-/// nothing at the end of it, which is the one failure mode an instrument
-/// nobody is watching cannot have.
+/// no limit the first one to hang costs the whole pass and prints nothing at
+/// the end of it, which is the one failure mode an instrument nobody is
+/// watching cannot have. That is the whole job: bound a hang. It is not a
+/// statement about how long a test ought to take.
 ///
-/// Sixty seconds against tests that average 117ms alone (728 in 85s, measured
-/// 2026-08-19). It is deliberately nowhere near tight: this laptop runs six
-/// agents at load 200–350 often enough, and a timeout that fires under load
-/// would report the machine rather than the test — which is the exact mistake
-/// this instrument exists to stop people making.
-const ALONE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Which is why the number is enormous. Measured 2026-08-19 over all 776
+/// tests, one process each: median 10ms, p99 550ms, and the slowest in the
+/// suite 2.31s. With six competing processes on eight cores — roughly what
+/// this laptop looks like with other agents on it — that slowest test took
+/// 6.77s, an inflation of 2.9x. Five minutes clears it by about 44x.
+///
+/// The margin is that wide because the tail grows faster than the median does,
+/// and because being wrong in the two directions costs wildly different
+/// things. This constant's smaller sibling proved both. `run_alone`'s own test
+/// held a *do-nothing* child — `#!/bin/sh` and `exit 0`, observed done in 6ms
+/// on a quiet machine — to five seconds, and on a loaded one it missed that
+/// budget in 11 of 150 runs. A budget only a small multiple above the observed worst
+/// case is a budget that reports the machine. And when it does, the instrument
+/// says *this test does not survive alone* about a test that does, which is
+/// how an instrument stops being believed — whereas a budget that is too
+/// generous costs one genuinely hung test five minutes, once, in a pass that
+/// prints each failure as it happens rather than at the end.
+const ALONE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The compiled test binaries, out of cargo's own JSON.
 ///
@@ -995,15 +1008,18 @@ fn listed(out: &str) -> Vec<String> {
 
 /// Run one test in a process of its own and say what happened to it.
 ///
-/// The output goes to a file rather than a pipe because the process is waited
-/// on with a timeout: a pipe nobody is draining fills and stops the writer, so
-/// a test that printed enough would hang here and be reported as the hang this
-/// is looking for. One file, reused, in the agent's own scratch directory.
+/// The output goes to a file rather than a pipe because the process may be
+/// waited on with a timeout: a pipe nobody is draining fills and stops the
+/// writer, so a test that printed enough would hang here and be reported as
+/// the hang this is looking for. One file, reused, in the agent's own scratch
+/// directory.
 ///
-/// Waiting is `try_wait` in a loop, which asks the kernel about the child
-/// rather than about anything standing in for it. Five milliseconds is under a
-/// percent of the time one test takes and two seconds across the whole pass.
-fn run_alone(exe: &Path, name: &str, log: &Path, timeout: Duration) -> Option<Failure> {
+/// `timeout` is `None` for a caller that only wants the child's answer, and
+/// then no clock is consulted at all — the wait blocks until the child is
+/// done, however long the machine takes to get round to it. A budget is for
+/// the one caller that cannot afford a hang, and it is a backstop rather than
+/// an expectation: see `ALONE_TIMEOUT`.
+fn run_alone(exe: &Path, name: &str, log: &Path, timeout: Option<Duration>) -> Option<Failure> {
     let Ok(file) = std::fs::File::create(log) else {
         return Some(Failure { name: name.into(), at: None, message: Some("no log file".into()) });
     };
@@ -1022,30 +1038,42 @@ fn run_alone(exe: &Path, name: &str, log: &Path, timeout: Duration) -> Option<Fa
             return Some(Failure { name: name.into(), at: None, message: Some(format!("{e}")) })
         }
     };
-    let started = Instant::now();
-    let mut ok = None;
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) => {
-                ok = Some(st.success());
-                break;
+    // Both arms wait on the child's own state and nothing standing in for it.
+    // With no budget that is one blocking wait, which is the only wait that
+    // cannot be wrong about a slow machine. With one it is `try_wait` in a
+    // loop; the median test alone is 10ms, so a 5ms poll overshoots by 2.5ms
+    // on average and costs about two seconds across the whole 776. The one
+    // caller that polls is spending that to bound a hang. The child is asked
+    // about before the clock is, so a parent descheduled past its own deadline
+    // still reports the child that finished while it was away — the deadline
+    // can only be reached by a child that is genuinely still running.
+    let waited: Result<bool, String> = match timeout {
+        None => child.wait().map(|st| st.success()).map_err(|e| format!("the wait failed: {e}")),
+        Some(limit) => {
+            let started = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => break Ok(st.success()),
+                    // Not a timeout, and it must not be reported as one: this
+                    // is the wait itself failing, and "no answer" would send
+                    // the next reader after a hang that never happened.
+                    Err(e) => break Err(format!("the wait failed: {e}")),
+                    Ok(None) => {}
+                }
+                if started.elapsed() > limit {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("no answer in {limit:?} — killed"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => break,
-            Ok(None) => {}
         }
-        if started.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
+    };
+    let ok = match waited {
+        Ok(ok) => ok,
+        Err(message) => {
+            return Some(Failure { name: name.into(), at: None, message: Some(message) })
         }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let Some(ok) = ok else {
-        return Some(Failure {
-            name: name.into(),
-            at: None,
-            message: Some(format!("no answer in {timeout:?} — killed")),
-        });
     };
     if ok {
         return None;
@@ -1097,7 +1125,7 @@ fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> 
             print!("\r{} {}/{}  ", p.dim("alone"), i + 1, names.len());
             let _ = std::io::stdout().flush();
         }
-        if let Some(f) = run_alone(exe, name, &log, ALONE_TIMEOUT) {
+        if let Some(f) = run_alone(exe, name, &log, Some(ALONE_TIMEOUT)) {
             if tick {
                 print!("\r\x1b[K");
             }
@@ -1560,18 +1588,28 @@ mod tests {
     /// difference between an instrument and somebody watching a terminal — and
     /// a deadlock is precisely the class of bug it hunts (`robustness-072` was
     /// a wait on a file that never appeared). Without the timeout the first
-    /// test to hang costs the whole ten minutes and prints nothing at the end
-    /// of it, which is the one way this can fail silently.
+    /// test to hang costs the whole pass and prints nothing at the end of it,
+    /// which is the one way this can fail silently.
+    ///
+    /// Nothing here is timed. The failure *is* the proof the budget fired:
+    /// waiting the child out would have produced a pass, because the child
+    /// exits zero. And the child sleeps five minutes rather than a few seconds
+    /// so that the pass and the failure are not separated by a number a
+    /// descheduled parent could cross — `exec` so the kill lands on the sleep
+    /// itself and no orphan is left behind by the one that never happens.
     #[test]
     fn a_test_that_never_answers_is_a_failure_rather_than_a_hung_pass() {
         let dir = scratch_dir("alone-hang");
         let exe = dir.join("hangs");
-        std::fs::write(&exe, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::write(&exe, "#!/bin/sh\nexec sleep 300\n").unwrap();
         chmod_x(&exe);
 
-        let started = Instant::now();
-        let out = run_alone(&exe, "whatever::hangs", &dir.join("log"), Duration::from_millis(150));
-        let took = started.elapsed();
+        let out = run_alone(
+            &exe,
+            "whatever::hangs",
+            &dir.join("log"),
+            Some(Duration::from_millis(150)),
+        );
 
         let f = out.expect("a test that never returned was reported as passing");
         assert_eq!(f.name, "whatever::hangs");
@@ -1580,8 +1618,42 @@ mod tests {
             "the failure does not say it was killed: {:?}",
             f.message
         );
-        // The child slept for thirty seconds; the pass moved on in under two.
-        assert!(took < Duration::from_secs(5), "the timeout did not kill it: {took:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A budget cannot tell a slow test from a hung one, so only the caller
+    /// that has to survive a hang carries one.
+    ///
+    /// This is the whole argument for `timeout` being an `Option`. A wall-clock
+    /// budget answers "has this taken too long", and on a machine with six
+    /// agents building, "too long" is a fact about the machine. Held against a
+    /// test that was going to answer, it prints the accusation this instrument
+    /// exists to make — *this test does not survive alone* — about a test that
+    /// does. The child below is the same shape as the `exit 0` script that was
+    /// reported as never answering, only slowed to a fifth of a second so it
+    /// can say so without a loaded machine.
+    #[test]
+    fn a_slow_test_is_not_a_hung_one_unless_a_budget_was_asked_for() {
+        let dir = scratch_dir("alone-slow");
+        let exe = dir.join("slow");
+        std::fs::write(&exe, "#!/bin/sh\nsleep 0.2\nexit 0\n").unwrap();
+        chmod_x(&exe);
+        let log = dir.join("log");
+
+        // A budget it cannot meet accuses a test that passes.
+        let accused = run_alone(&exe, "a::b", &log, Some(Duration::from_millis(20)))
+            .expect("the budget did not fire on a child that outlives it");
+        assert!(
+            accused.message.as_deref().unwrap_or_default().contains("no answer"),
+            "a child killed by the budget was reported as something else: {:?}",
+            accused.message
+        );
+
+        // The same child, no budget, and there is no clock left to be wrong.
+        assert!(
+            run_alone(&exe, "a::b", &log, None).is_none(),
+            "a test that passed was reported as a failure"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1600,7 +1672,12 @@ mod tests {
         .unwrap();
         chmod_x(&exe);
 
-        let f = run_alone(&exe, "a::b", &dir.join("log"), Duration::from_secs(5))
+        // No budget: this is about what the parser makes of a red test, and a
+        // clock here has nothing to measure and one thing to get wrong. With
+        // five seconds it did — 11 of 150 runs on a loaded machine reported a
+        // script that is `exit 0` as a test that never answered, which is the
+        // instrument accusing the suite of the fault it was built to find.
+        let f = run_alone(&exe, "a::b", &dir.join("log"), None)
             .expect("a failing test was reported as passing");
         assert_eq!(f.at.as_deref(), Some("src/a.rs:12:9"), "the panic site was lost");
         assert_eq!(f.message.as_deref(), Some("the seat was empty"), "the assertion was lost");
@@ -1609,7 +1686,7 @@ mod tests {
         std::fs::write(&ok, "#!/bin/sh\nexit 0\n").unwrap();
         chmod_x(&ok);
         assert!(
-            run_alone(&ok, "a::b", &dir.join("log"), Duration::from_secs(5)).is_none(),
+            run_alone(&ok, "a::b", &dir.join("log"), None).is_none(),
             "a passing test was reported as a failure"
         );
         let _ = std::fs::remove_dir_all(&dir);
