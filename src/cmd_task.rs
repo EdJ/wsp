@@ -4,6 +4,7 @@ use serde_json::json;
 
 use crate::cmd_agent::{claim_line, current_project, worked_line};
 use crate::herdr;
+use crate::message::{self, Ask, Message, Shape};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
 use crate::store::Store;
@@ -504,6 +505,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         if let Some(l) = crate::worklist::Running::read(store).of(&t.id) {
             v["list"] = json!({ "list": l.list, "group": l.group, "of": l.of });
         }
+        // The same rule as `claim` above: an agent reading this back is often
+        // asking exactly this, and the alternative is the one it actually
+        // reached for — reading a state file by hand.
+        v["raised"] = json!(raised_about(store, &t.id).iter().map(|m| m.to_json()).collect::<Vec<_>>());
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }
@@ -576,6 +581,27 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         // migration leaves, so a task never loses every sign it was worked.
         println!("{} {}", p.dim(&util::pad("worked", 9)), worked_line(w));
     }
+    // What is up about this task, above the prose. `worklist-018`: a hand
+    // raised with a paragraph and no sentence drew as a blank row at the seat,
+    // and the seat's next move — `wsp show <id>` — said nothing about it
+    // either, so the only surface that held the words was `flags.json`. It
+    // costs nothing on a task with nothing raised, which is nearly all of them,
+    // and it is the whole page on the few where it is not.
+    let raised = raised_about(store, &t.id);
+    if !raised.is_empty() {
+        println!("\n{}", p.dim("RAISED"));
+        for m in &raised {
+            println!("  {} {}", p.red(crate::panel::glyph::FLAG), p.bold(&headline(m)));
+            let rest = m.body().trim();
+            if !rest.is_empty() {
+                for l in rest.lines() {
+                    println!("    {l}");
+                }
+            }
+            println!("    {}", p.dim(&asking(m)));
+        }
+    }
+
     // Decisions first and in their own block: on a task they are what was
     // settled about this work, and burying them mid-body between Details and
     // the log is how a reader misses the one line that would have stopped them.
@@ -609,6 +635,57 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         println!("\n{}", rest.trim());
     }
     0
+}
+
+/// The hands up about one task: open, or in words this build cannot read.
+///
+/// [`Message::needs_attention`] rather than `is_open`, because *"I cannot read
+/// this"* is a reason to put something in front of a person and not a reason to
+/// go quiet — the installed binary is routinely older than the tree. Answers
+/// are left out: they are written to this task's log before they are delivered,
+/// so they are already further down this page.
+fn raised_about(store: &Store, task: &str) -> Vec<Message> {
+    message::about_task(store, task)
+        .into_iter()
+        .filter(|m| m.reply_to.is_none() && m.needs_attention())
+        .collect()
+}
+
+/// The one line a raised hand is read by.
+///
+/// [`Message::title`] and nothing else — one text, first line. `worklist-018`
+/// is what a second field costs: `wsp flag` took a sentence, a `--title` and a
+/// `--body`, every surface preferred a different one of the three, and a hand
+/// carrying only the third drew as a task title and an age. The empty case is
+/// `wsp flag <id>` on its own, which is a complete thing to say, so it is said
+/// rather than drawn blank.
+fn headline(m: &Message) -> String {
+    match m.title() {
+        "" => "raised this, with nothing written on it".to_string(),
+        t => t.to_string(),
+    }
+}
+
+/// Who is asking, how long they have been, and the verb that ends it.
+///
+/// The verb is named beside the words for `worklist-013`'s reason: that hand
+/// was answered within minutes down another channel and stayed up for 2h14m,
+/// because answering and recording were two acts and only one of them was on
+/// the path of getting the work moving.
+fn asking(m: &Message) -> String {
+    let mut parts = vec![m.from.byline()];
+    if m.ask() == Some(Ask::Claim) {
+        parts.push("asks to take it".into());
+    }
+    let held = util::since(&m.at);
+    if held > 0 {
+        parts.push(util::duration_human(held));
+    }
+    parts.push(match m.shape() {
+        Some(Shape::Question) => format!("wsp answer {} \"…\"", m.id),
+        _ => format!("wsp ack {}", m.id),
+    });
+    parts.join(" · ")
 }
 
 fn mutate<F>(store: &Store, args: &Args, verb: &str, f: F) -> i32
@@ -1994,6 +2071,57 @@ mod tests {
         let store = Store::at(root.clone(), root.join("state"));
         store.ensure_dirs().unwrap();
         store
+    }
+
+    /// `worklist-018`. A hand carrying a paragraph and no sentence drew as a
+    /// blank row at the seat, and `wsp show <id>` — the seat's next move — said
+    /// nothing about it either, so the only place the words existed was
+    /// `flags.json`. That is how this task's own fault was found, and it is why
+    /// the headline is the first line of the text and never a second field.
+    #[test]
+    fn a_task_says_what_is_raised_about_it_and_the_headline_is_the_first_line() {
+        let store = scratch("show-raised");
+        let t = task_with(&store, "worklist-010", "high");
+        let m = message::Message::question(
+            message::Party::pane("w46:p1", "w46"),
+            message::Kind::Note,
+            "landed and NOT INSTALLED — the retry hazard is live\n\nuntil somebody runs `wsp install`",
+            message::Waiting::new("w46:p1", &t.id),
+        )
+        .about(message::About::Task(t.id.clone()));
+        message::raise(&store, &m).unwrap();
+
+        let up = raised_about(&store, &t.id);
+        assert_eq!(up.len(), 1, "one hand is up");
+        assert_eq!(
+            headline(&up[0]),
+            "landed and NOT INSTALLED — the retry hazard is live",
+            "the first line is the headline, and there is no other field to prefer over it",
+        );
+        assert_eq!(
+            up[0].body(),
+            "until somebody runs `wsp install`",
+            "and the rest is still there to draw",
+        );
+        assert!(asking(&up[0]).contains("wsp answer "), "with the verb that ends it: {}", asking(&up[0]));
+    }
+
+    /// `wsp flag <id>` on its own is a complete thing to say — *look at this
+    /// task, it exists*. It is the one input that leaves no words in the
+    /// record, and it is said out loud rather than drawn as an empty line,
+    /// because a blank row is indistinguishable from a hand about a task that
+    /// has been retired.
+    #[test]
+    fn a_hand_with_nothing_written_on_it_is_said_rather_than_left_blank() {
+        let store = scratch("show-raised-empty");
+        let t = task_with(&store, "worklist-011", "normal");
+        let m = message::Message::new(message::Party::Human, message::Kind::Note, "")
+            .about(message::About::Task(t.id.clone()));
+        message::raise(&store, &m).unwrap();
+
+        let up = raised_about(&store, &t.id);
+        assert_eq!(headline(&up[0]), "raised this, with nothing written on it");
+        assert!(asking(&up[0]).contains("wsp ack "), "a notification is acknowledged, not answered");
     }
 
     fn task_with(store: &Store, id: &str, level: &str) -> Task {
