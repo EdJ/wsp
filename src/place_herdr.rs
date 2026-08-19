@@ -117,6 +117,12 @@
 //!   place an agent runs, and a backend asked to end one must not take down the
 //!   pane somebody else is reading beside it.
 //!
+//! Re-measured against 0.8.0 on 2026-08-19 (`robustness-076`), because
+//! `despawn` now leans on it as the whole of what `herdr workspace close` did:
+//! a workspace created and its root pane closed, and `workspace.list` no longer
+//! held it. The middle bullet still stands, which is why that verb needs no
+//! `workspace.close` of its own.
+//!
 //! `workspace_not_found` is therefore a code this file never has to read, and
 //! [`refusal`] does not know it: the id in hand is always a pane's.
 //!
