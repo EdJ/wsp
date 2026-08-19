@@ -1804,6 +1804,13 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
                 return 1;
             }
         },
+        "worklist" => match store.worklist(&item.id) {
+            Some(w) => w.body,
+            None => {
+                eprintln!("wsp: {} disappeared while you were editing", item.id);
+                return 1;
+            }
+        },
         _ => match store.task(&item.id) {
             Some(t) => t.body,
             None => {
@@ -1876,6 +1883,15 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         "project" => store.project(&item.id).map(|mut p| {
             p.body = body;
             store.save_project(&p)
+        }),
+        // A worklist's `## Groups` is never in `sections`, so nothing that
+        // arrives here can rewrite the queue: this reaches the prose around it
+        // and the verbs keep the structure. `## Overview` is the one that
+        // matters — it is the start condition for group 1, there being no
+        // barrier in front of it to carry one.
+        "worklist" => store.worklist(&item.id).map(|mut w| {
+            w.body = body;
+            store.save_worklist(&w)
         }),
         _ => store.task(&item.id).map(|mut t| {
             t.body = body;

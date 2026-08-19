@@ -1306,9 +1306,10 @@ impl Machine {
 // item at a time rather than as a blanket allow over the record that would go
 // on hiding a genuinely dead function years from now.
 //
-// Two are still here, each on the one item it covers and each naming the caller
-// it is waiting for. That is the whole discipline: a marker with no named
-// caller is a dead item nobody has admitted to yet.
+// None is left. The last two named `wsp worklist next` and `go|hold|done` as
+// the callers they were waiting for, and both have landed — which is the whole
+// discipline working: a marker with no named caller is a dead item nobody has
+// admitted to yet, and a marker whose caller arrives comes off with it.
 
 /// Where a worklist is, and it is the only state the file holds.
 ///
@@ -1404,6 +1405,30 @@ pub struct Group {
     /// A start condition on the next group is this, read at the same barrier
     /// by the same reader, which is why there is one field and not two.
     pub stop: String,
+    /// The sentence somebody wrote to pass the barrier after this group, empty
+    /// until they have. Written by `wsp worklist go` and by nothing else.
+    ///
+    /// **This is written state on a record whose whole design is that its
+    /// position is derived, and it belongs here for the same reason `status`
+    /// does: it is a decision, not a computation.** The position is arithmetic
+    /// over the tasks and over git and can never go stale; a verdict is a
+    /// judgement about prose — *"if any of the three goes badly, flag and stop
+    /// rather than push through"* — which nothing can recompute and nothing
+    /// else records. `wsp worklist next` has to know whether it was given
+    /// before it will name the next group, so it has to be readable back.
+    ///
+    /// Beside [`Self::stop`] rather than in the log, because the two are one
+    /// exchange: the stop condition is the question and this is the answer to
+    /// it, and an answer filed away from its question is one a reader has to
+    /// reassemble. It also survives renumbering, which a log line naming an
+    /// ordinal would not — it travels with the group, and the ordinal is only
+    /// ever a position.
+    ///
+    /// Barrier *zero* has no group to carry one, and needs none: the start
+    /// condition for group 1 is the worklist's own `## Overview`, and the
+    /// decision to pass it is the list's `status` moving off `draft`. One
+    /// written fact per barrier, and no barrier with two.
+    pub verdict: String,
 }
 
 impl Group {
@@ -1435,7 +1460,6 @@ impl Group {
     /// effective parallelism until something is deciding how many of a group to
     /// start, and `wsp worklist next` is where that happens. The editing verbs
     /// only ever write the number down.
-    #[allow(dead_code)] // `wsp worklist next`, `worklist` group 4
     pub fn parallelism(&self, machine_cap: Option<usize>) -> Option<usize> {
         match (self.cap, machine_cap) {
             (Some(group), Some(machine)) => Some(group.min(machine)),
@@ -1444,11 +1468,10 @@ impl Group {
     }
 }
 
-/// The columns a wrapped `stop:` breaks to, and the indent its continuations
-/// carry — chosen so a group and its prose sit inside 80 with the two-space
-/// leader, because this is a file people read and hand-edit ahead of the work.
-const STOP_INDENT: &str = "        ";
-const STOP_WIDTH: usize = 70;
+/// The column a group's prose wraps at, leader included — chosen so a group
+/// and its prose sit inside 80 whichever label carries them, because this is a
+/// file people read and hand-edit ahead of the work.
+const PROSE_WIDTH: usize = 78;
 
 /// The `## Groups` section, parsed. Line order is the queue.
 ///
@@ -1476,8 +1499,18 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         n.parse().ok()
     };
 
+    // What an indented line under a group continues. Two prose blocks now
+    // hang off a group, so "am I inside the stop condition" is no longer a
+    // bool: a wrapped `verdict:` would otherwise land in the middle of the
+    // `stop:` it answers.
+    enum Cont {
+        Members,
+        Stop,
+        Verdict,
+    }
+
     let mut out: Vec<Group> = Vec::new();
-    let mut in_stop = false;
+    let mut cont = Cont::Members;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1497,23 +1530,35 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             }
             g.members = toks.map(|t| t.to_string()).collect();
             out.push(g);
-            in_stop = false;
+            cont = Cont::Members;
             continue;
         }
         let Some(last) = out.last_mut() else { continue };
         if let Some(rest) = trimmed.strip_prefix("stop:") {
             last.stop = rest.trim().to_string();
-            in_stop = true;
-        } else if in_stop {
-            if !last.stop.is_empty() {
-                last.stop.push(' ');
-            }
-            last.stop.push_str(trimmed);
+            cont = Cont::Stop;
+        } else if let Some(rest) = trimmed.strip_prefix("verdict:") {
+            last.verdict = rest.trim().to_string();
+            cont = Cont::Verdict;
         } else {
-            last.members.extend(trimmed.split_whitespace().map(|t| t.to_string()));
+            match cont {
+                Cont::Stop => join(&mut last.stop, trimmed),
+                Cont::Verdict => join(&mut last.verdict, trimmed),
+                Cont::Members => {
+                    last.members.extend(trimmed.split_whitespace().map(|t| t.to_string()))
+                }
+            }
         }
     }
     out
+}
+
+/// A wrapped line, put back onto the paragraph it was broken out of.
+fn join(text: &mut String, line: &str) {
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text.push_str(line);
 }
 
 /// The `## Groups` section, written. The inverse of [`parse_groups`], and the
@@ -1532,24 +1577,50 @@ pub fn render_groups(groups: &[Group]) -> String {
             out.push_str(m);
         }
         out.push('\n');
-        if !g.stop.trim().is_empty() {
-            for (n, line) in util::wrap(g.stop.trim(), STOP_WIDTH).iter().enumerate() {
-                if line.is_empty() {
-                    continue;
-                }
-                out.push_str(if n == 0 { "  stop: " } else { STOP_INDENT });
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
+        block(&mut out, "stop", &g.stop);
+        block(&mut out, "verdict", &g.verdict);
     }
     out
+}
+
+/// One of a group's prose blocks, wrapped to the column its continuations
+/// carry. Empty writes nothing, which is what makes an unanswered barrier and
+/// a group with no stop condition look the same in the file: absent.
+fn block(out: &mut String, label: &str, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let leader = format!("  {label}: ");
+    let indent = " ".repeat(leader.chars().count());
+    for (n, line) in util::wrap(text.trim(), PROSE_WIDTH - leader.chars().count()).iter().enumerate()
+    {
+        if line.is_empty() {
+            continue;
+        }
+        out.push_str(if n == 0 { &leader } else { &indent });
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 /// A worklist's body sections. `Groups` is second because it is what the file
 /// is for; `Overview` above it is where the first group's start condition
 /// lives, there being no group before it to carry one.
 pub const WORKLIST_SECTIONS: [&str; 4] = ["Overview", "Groups", "Decisions", "Log"];
+
+/// The sections of a worklist a person writes by hand, which is every one of
+/// them except the two nothing may type into.
+///
+/// `Groups` is out because the queue has verbs of its own and a window they may
+/// edit it in — an editor that could rewrite the section would be a way around
+/// both. `Log` is out for the reason it is out of [`PROSE`]: it is dated and
+/// append-only, and editing history in place is how history stops being
+/// evidence.
+///
+/// What is left is where the first group's start condition lives. There is no
+/// barrier in front of group 1 to carry stop prose, so `## Overview` carries
+/// it, which is what `wsp worklist edit` exists for.
+pub const WORKLIST_PROSE: [&str; 2] = ["Overview", "Decisions"];
 
 /// A queue of groups of task references, run in order, with a barrier between
 /// each group and the next.
@@ -1607,7 +1678,6 @@ impl Worklist {
     /// never moves it: `new` writes `draft` and every editing verb leaves it
     /// alone, which is the point of the status holding only what somebody
     /// decided.
-    #[allow(dead_code)] // `wsp worklist go|hold|done`, `worklist` group 4
     pub fn set_status(&mut self, s: WorklistStatus) {
         self.status_raw = s.as_str().to_string();
     }
@@ -2178,8 +2248,8 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         let mut w = Worklist::new("batch", "Overnight batch");
         w.set_status(WorklistStatus::Running);
         w.set_groups(&[
-            Group { members: vec!["robustness-069".into()], cap: None, stop: "stop rather than push through".into() },
-            Group { members: vec!["render-041".into(), "render-068".into()], cap: Some(2), stop: String::new() },
+            Group { members: vec!["robustness-069".into()], cap: None, stop: "stop rather than push through".into(), ..Group::default() },
+            Group { members: vec!["render-041".into(), "render-068".into()], cap: Some(2), ..Group::default() },
         ]);
         w.log("group robustness-069 passed");
 
@@ -2190,6 +2260,36 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!(got.groups(), w.groups(), "the queue survives the disk");
         assert_eq!(got.groups()[1].cap, Some(2));
         assert!(got.section("Log").unwrap().contains("robustness-069 passed"));
+    }
+
+    /// A group carries two blocks of prose and they are one exchange: `stop:`
+    /// is the question read at the barrier behind the group, `verdict:` is the
+    /// answer somebody wrote to pass it. Both wrap on the way out and both come
+    /// back as the one paragraph they were, and — this is the part that could
+    /// go wrong — a wrapped `verdict:` does not land inside the `stop:` above
+    /// it, which is what `## Groups` being parsed line by line costs.
+    #[test]
+    fn a_verdict_and_the_stop_condition_it_answers_round_trip_side_by_side() {
+        let stop = "if any of the three goes badly, flag and stop rather than push \
+                    through — the whole night's spawning depends on it landing clean";
+        let verdict = "2026-08-19T21:04:00Z all three landed and the trunk built; \
+                       nothing else in the tree moved while they were out";
+        let mut w = Worklist::new("batch", "Overnight batch");
+        w.set_groups(&[
+            Group {
+                members: vec!["robustness-069".into()],
+                cap: None,
+                stop: stop.into(),
+                verdict: verdict.into(),
+            },
+            Group { members: vec!["render-041".into()], ..Group::default() },
+        ]);
+
+        let got = Worklist::from_doc(&fm::parse(&w.render()), "batch").groups();
+        assert_eq!(got[0].stop, stop, "wrapped on the way out and joined on the way back");
+        assert_eq!(got[0].verdict, verdict, "and the answer did not land inside the question");
+        assert_eq!(got[0].members, ["robustness-069"], "nor either of them among the members");
+        assert_eq!(got[1].verdict, "", "a barrier nobody has passed writes nothing at all");
     }
 
     /// `## Groups` is the file's structure and belongs second, above the

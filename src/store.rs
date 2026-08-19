@@ -2148,8 +2148,8 @@ mod tests {
         let mut w = Worklist::new("batch", "Overnight batch");
         w.set_status(WorklistStatus::Running);
         w.set_groups(&[
-            Group { members: vec!["robustness-069".into()], cap: None, stop: "if it does not land clean, stop".into() },
-            Group { members: vec!["render-041".into(), "render-068".into()], cap: Some(2), stop: String::new() },
+            Group { members: vec!["robustness-069".into()], cap: None, stop: "if it does not land clean, stop".into(), ..Group::default() },
+            Group { members: vec!["render-041".into(), "render-068".into()], cap: Some(2), ..Group::default() },
         ]);
         store.save_worklist(&w).unwrap();
 

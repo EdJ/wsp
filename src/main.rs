@@ -719,10 +719,28 @@ fn help() {
                                     a cap on the work, and the prose read at
                                     the barrier after that group — `-` reads it
                                     from a stream, where a shell never sees it
+  wsp worklist edit <slug> --overview -    what has to be true before group 1
+                                    starts — there is no barrier in front of it
+                                    to carry a stop condition, so the list does
   wsp worklist ls|show <slug>       every list, or one: the groups, where it is
                                     up to, and which of them may still be edited
   Editing is write-ahead-only: a group at or behind where the list is up to has
   either run or is running, and is refused with what may be edited instead.
+
+  wsp worklist next [<slug>]        what may start now, what is holding it, the
+                                    prose to read at a barrier, or nothing left.
+                                    No slug when the workspace holds the seat
+  wsp worklist go [<slug>] ["…"]    start the list, or pass a barrier: records
+                                    the verdict, sweeps the trees of the groups
+                                    behind it, and says which members of the
+                                    group that just landed touched one file
+  wsp worklist hold [<slug>] "why"  start nothing more. What is already running
+                                    is left to finish — work in flight cannot
+                                    be unwound
+  wsp worklist done <slug>          nothing left to want from it
+  A barrier with prose at it will not pass until `go` is given a sentence, and
+  the sentence is dated onto the group. Nothing spawns: `next` names the members
+  and the governor runs `wsp spawn` per member.
 
 {plumbing}
   wsp panel [--full]                the sidebar replacement (runs in a pane);

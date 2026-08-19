@@ -580,7 +580,6 @@ pub(crate) fn sweep(
 /// Marked dead until `wsp worklist go` lands, which is the convention
 /// [`crate::worklist`] states: the attribute is the marker for "its caller has
 /// not landed yet", not for something nobody wants.
-#[allow(dead_code)]
 pub(crate) struct Passed {
     pub task: String,
     pub trunk: PathBuf,
@@ -617,7 +616,6 @@ pub(crate) struct Passed {
 ///
 /// A member with no tree is not a finding. Most of them will have none: a tree
 /// swept at an earlier barrier, or work that never took a checkout at all.
-#[allow(dead_code)]
 pub(crate) fn sweep_passed(
     members: &[Passed],
     closed: &dyn Fn(&str) -> bool,
@@ -775,6 +773,71 @@ pub(crate) fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String
     git(repo, &["log", "--format=%h %s", &format!("{trunk_branch}..{branch}")])
         .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default()
+}
+
+/// What each landed branch put on the trunk, read back off the trunk's reflog.
+///
+/// The worklist barrier's one piece of feedback about how a group was composed:
+/// *do not put two tasks that touch the same file in one group* is advice
+/// nothing enforces, and the `batch`'s evidence for it was an **absence** — no
+/// land-time conflicts across fifteen agents — which cannot be acted on. This
+/// is an observation instead, and it arrives at the barrier, which is exactly
+/// when the next group is being composed.
+///
+/// # Why the reflog and not the branch
+///
+/// After [`land`] the question has no answer left in the graph. `land` rebases
+/// the branch onto the trunk and fast-forwards the trunk onto it, so by the
+/// time a barrier asks, the branch's commits **are** the trunk's history: the
+/// merge base of the two is the branch tip, `trunk..branch` is empty, and
+/// `merge-base --fork-point` answers with the tip itself. Nothing about a
+/// landed branch says where it began.
+///
+/// The trunk's reflog does, exactly and cheaply. Every land is one
+/// fast-forward, so the entry whose value **is** this branch's tip has the
+/// trunk's previous value in the entry below it, and the diff between the two
+/// is precisely what this branch added — whoever else landed in between, and
+/// however many times it was rebased on the way. Measured against a repository
+/// with an unrelated commit landing between two members and all three rebased:
+/// each member came back with its own files and no one else's.
+///
+/// The reflog is read **once for the repository** and one `git diff
+/// --name-only` is spent per member, which is what makes this affordable to do
+/// for a whole group.
+///
+/// # What it cannot answer, and why that is said out loud
+///
+/// A reflog is local, is not in the repository anybody clones, and expires.
+/// None of that bites at a barrier crossed minutes after the land — but a
+/// branch landed by hand some other way, or a trunk reset, leaves a member
+/// this cannot place, and [`Landings::files`] answers `None` for it rather than
+/// an empty list. **The two must not be confused by the caller**: an empty list
+/// means the member changed nothing, and `None` means nobody knows what it
+/// changed. Reporting the second as the first is a clean bill of health nothing
+/// checked, which is the `batch`'s absence-as-evidence all over again.
+pub(crate) struct Landings {
+    /// The trunk's values, newest first.
+    values: Vec<String>,
+}
+
+impl Landings {
+    pub(crate) fn read(repo: &Path, trunk_branch: &str) -> Landings {
+        let values = git(repo, &["reflog", "show", "--format=%H", trunk_branch])
+            .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+            .unwrap_or_default();
+        Landings { values }
+    }
+
+    /// The files `branch` put on the trunk, or `None` where the reflog does not
+    /// place it. See the type's docs for why those are two different answers.
+    pub(crate) fn files(&self, repo: &Path, branch: &str) -> Option<Vec<String>> {
+        let tip = git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])?;
+        let tip = tip.trim();
+        let at = self.values.iter().position(|v| v == tip)?;
+        let base = self.values.get(at + 1)?;
+        let out = git(repo, &["diff", "--name-only", base, tip])?;
+        Some(out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    }
 }
 
 /// Serialise the moment two worktrees meet.

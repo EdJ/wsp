@@ -82,13 +82,12 @@ use crate::resolve::Index;
 use crate::store::Store;
 use crate::util;
 
-// The `#[allow(dead_code)]` markers left below are the convention the record
-// was built under: the attribute is the marker for "its caller has not landed
-// yet", and it comes off one item at a time with the `use` that reads it,
-// rather than as a blanket allow over the module that would go on hiding
-// something genuinely dead. Most of them came off when the sweep started
-// calling `position`; what is still marked is what `worklist next` and the
-// barrier will read, which is group 4.
+// The `#[allow(dead_code)]` markers this module was built under are all gone:
+// the attribute was the convention's marker for "its caller has not landed
+// yet", taken off one item at a time with the `use` that reads it rather than
+// as a blanket allow over the module that would go on hiding something
+// genuinely dead. The last of them came off with `wsp worklist next` and `go`,
+// which are what the whole module was written for.
 
 /// Which question is being asked of a member, because the two cost different
 /// amounts and are allowed to give different answers. See the module docs.
@@ -192,7 +191,6 @@ impl Standing {
     ///
     /// Nothing about the agent: who is standing on it is the claim's to say,
     /// and this module never asks herdr.
-    #[allow(dead_code)] // `wsp worklist next`, `worklist` group 4
     pub fn note(&self) -> String {
         match &self.landing {
             Some(Landing::Ahead { commits, trunk }) => {
@@ -253,6 +251,31 @@ pub struct Position {
     /// one reason: it is what lets [`sweep`] tell a caller that it is about to
     /// take trees an earlier `--keep` spared. See that function.
     pub passed: Vec<Behind>,
+    /// Members of a group the run has already passed that do not read as
+    /// finished. Empty in every ordinary run.
+    ///
+    /// This is the [`crate::model::Group::verdict`] floor's receipt, and it is
+    /// carried out rather than swallowed. **Passing a barrier sweeps the trees
+    /// behind it, and sweeping a tree deletes its branch** — `git branch -d`,
+    /// which refuses unless the work is merged — so the evidence that opened
+    /// the barrier is gone by design, and [`Standing::finished`] falls back on
+    /// the store for a member with no branch: settled means it landed and was
+    /// swept, unsettled means nothing ever ran for it.
+    ///
+    /// That fallback is right and it has one hole. A member whose branch landed
+    /// but whose task never reached `review` — an agent that landed and then
+    /// died, a status somebody forgot — reads as finished while its branch is
+    /// there and as *never started* the moment the sweep takes it. Without the
+    /// floor the position slips back onto a group already passed, and `wsp
+    /// worklist next` offers to start members whose work is on the trunk: a
+    /// second agent spawned onto landed work, which is the exact failure the
+    /// barrier exists to prevent, caused by the barrier's own cleanup.
+    ///
+    /// So the walk does not stop below the floor — and it says who made it
+    /// stop trying to. A member here is the disagreement this module exists to
+    /// surface rather than resolve, and a caller that prints nothing about it
+    /// is the floor quietly covering the thing it was put in to survive.
+    pub slipped: Vec<Standing>,
     /// Which of the two questions was asked.
     ///
     /// Carried so that [`sweep`] can refuse the free answer. `Settled` is a
@@ -265,7 +288,6 @@ pub struct Position {
 impl Position {
     /// Every group finished. Not the same as the worklist being `done`, which
     /// is somebody saying there is nothing left to want from it.
-    #[allow(dead_code)] // `wsp worklist next`, `worklist` group 4
     pub fn finished(&self) -> bool {
         self.at.is_none()
     }
@@ -287,18 +309,45 @@ impl Position {
 ///
 /// A worklist with no groups is finished, which is the honest answer: there is
 /// nothing left in it to start.
+///
+/// # The one written thing it reads, and why that is not a contradiction
+///
+/// It never stops **below the floor**: the last group carrying a
+/// [`crate::model::Group::verdict`], which is a barrier somebody passed. That
+/// is a written fact on a record whose whole design is that its position is
+/// derived — and it belongs here for the reason `status` does. Passing a
+/// barrier is a *decision*, and a decision does not un-happen because a task's
+/// status is missing. What is derived is where the work has got to; what is
+/// written is which barriers a person has crossed, and the position is the
+/// first group not finished **of those still in front of somebody**.
+///
+/// Without it the run goes backwards, and the mechanism is the barrier's own
+/// cleanup — see [`Position::slipped`], which is where the members that caused
+/// it are carried out to be printed.
+///
+/// It costs nothing in the ordinary case: no verdicts is a floor of zero and
+/// the walk is exactly what it was.
 pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
     let groups = w.groups();
+    let floor = groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1);
     let mut repos = Repos::new(store);
     let mut passed: Vec<Behind> = Vec::new();
+    let mut slipped: Vec<Standing> = Vec::new();
     for (i, g) in groups.iter().enumerate() {
         let members = group(store, &mut repos, g, reading);
-        if !members.iter().all(Standing::finished) {
-            return Position { at: Some(i + 1), of: groups.len(), members, passed, reading };
+        let done = members.iter().all(Standing::finished);
+        if !done && i + 1 > floor {
+            return Position { at: Some(i + 1), of: groups.len(), members, passed, slipped, reading };
         }
+        // Below the floor and not finished: walked past, and named. A group
+        // whose barrier was passed goes on the `passed` list whatever its
+        // members now say — `cmd_checkout::sweep_passed` judges every tree
+        // again before it removes it, so a member that is genuinely not landed
+        // is kept there and named rather than taken on this list's word.
+        slipped.extend(members.iter().filter(|s| !s.finished()).cloned());
         passed.extend(members.into_iter().map(|member| Behind { group: i + 1, member }));
     }
-    Position { at: None, of: groups.len(), members: Vec::new(), passed, reading }
+    Position { at: None, of: groups.len(), members: Vec::new(), passed, slipped, reading }
 }
 
 /// Every member of one group, in the order the group names them.
@@ -425,7 +474,6 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
 /// in, are passed over: there is no repository to find a tree in. They are
 /// still named by [`dangling`], which is a different question and a different
 /// moment.
-#[allow(dead_code)] // `wsp worklist go`, `worklist` group 4
 pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
     if p.reading != Reading::Landed {
         return Err("a tree is removed on the landed reading and never on the settled one".into());
@@ -460,7 +508,6 @@ pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
 
 /// What one barrier's sweep did, and the part of it the caller has to say out
 /// loud.
-#[allow(dead_code)]
 pub struct Sweep {
     /// What was removed, what branch outlived its tree, and what was left
     /// standing and why — [`cmd_checkout::sweep_passed`]'s own answer.
@@ -678,6 +725,82 @@ pub fn running_position(store: &Store, list: &str) -> Option<Position> {
     Some(position(store, &w, Reading::Settled))
 }
 
+// ---- what a group that has just landed touched ---------------------------
+
+/// Which members of a group put their hands on the same file.
+///
+/// Empty is the ordinary answer and it is the one worth having: it is the
+/// composition rule holding, said as an observation rather than as an absence.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Overlap {
+    /// One entry per file more than one member changed, and who changed it.
+    /// Sorted by file, so two runs of the same group read the same.
+    pub shared: Vec<(String, Vec<String>)>,
+    /// Members whose change could not be read back at all — see
+    /// [`cmd_checkout::Landings`], which distinguishes "changed nothing" from
+    /// "nobody knows".
+    ///
+    /// **Named rather than dropped**, and that is the whole reason this field
+    /// exists. A member nobody could read contributes no overlaps, so silently
+    /// skipping it turns "we could not look" into "we looked and it was clean"
+    /// — which is the `batch`'s absence-as-evidence, produced by the very
+    /// report written to replace it.
+    pub unread: Vec<String>,
+}
+
+/// What the members of a group that has just landed touched, and where two of
+/// them touched the same file.
+///
+/// **Feedback on how the group was composed, not a check on it.** Mutual
+/// exclusion is deliberately not machinery in this design — it is the rule
+/// *do not put two tasks that touch the same file in one group*, which is
+/// advice to whoever composes the next group. This is the one thing that stops
+/// that advice being taken on faith: the `batch` ran fifteen agents with zero
+/// land-time conflicts, which is evidence of nothing, because an absence cannot
+/// be acted on. A named pair of members and the file they shared can be.
+///
+/// It arrives at the barrier because that is when the next group is being
+/// composed, and it is read off the trunk rather than out of the trees, so it
+/// still answers after the trees are gone. Called **before** the sweep all the
+/// same: [`cmd_checkout::Landings::files`] finds a member by its branch tip,
+/// and the sweep deletes the branch.
+///
+/// One `git reflog` per repository — a group's members are routinely in two or
+/// three — and one `git diff --name-only` per member, which is the cost the
+/// design priced.
+pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
+    let mut repos = Repos::new(store);
+    let mut logs: HashMap<PathBuf, cmd_checkout::Landings> = HashMap::new();
+    let mut touched: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut out = Overlap::default();
+
+    for id in members {
+        // No project, no root, or no repository is not a member that could not
+        // be read: it is design-only work with nothing to look in, and it is
+        // passed over exactly as the sweep passes over it.
+        let Some(trunk) = store.task(id).and_then(|t| t.project).and_then(|p| repos.of(&p)) else {
+            continue;
+        };
+        let log = logs
+            .entry(trunk.dir.clone())
+            .or_insert_with(|| cmd_checkout::Landings::read(&trunk.dir, &trunk.branch));
+        // The branch is asked for under every name the task has had, for the
+        // reason `Repos::branches` gives: a tree made before a renumbering is
+        // on a branch of the old id, and that is the ref the reflog holds.
+        match repos.branches(id).iter().find_map(|b| log.files(&trunk.dir, b)) {
+            None => out.unread.push(id.clone()),
+            Some(files) => {
+                for f in files {
+                    touched.entry(f).or_default().push(id.clone());
+                }
+            }
+        }
+    }
+
+    out.shared = touched.into_iter().filter(|(_, who)| who.len() > 1).collect();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +874,56 @@ mod tests {
         let mut w = Worklist::new("batch", "Overnight batch");
         w.body = format!("## Groups\n{groups}");
         w
+    }
+
+    /// The one piece of feedback the composition rule ever gets, proved against
+    /// real branches that have already landed — which is the only state it is
+    /// ever asked in, and the state where the graph no longer holds the answer.
+    ///
+    /// Three members: two that share a file and one that does not, with an
+    /// unrelated commit landing on the trunk in the middle and every branch
+    /// rebased on the way in. That is the arrangement the reflog reading exists
+    /// for, and the arrangement a merge base cannot answer.
+    #[test]
+    fn a_group_that_has_landed_says_which_of_its_members_put_hands_on_one_file() {
+        let (_env, store, repo) = scratch("overlap");
+        // Room in the file, so two members can share it and still rebase clean.
+        // A conflict is the other outcome of the same fact and it stops the
+        // land rather than reaching this.
+        std::fs::write(repo.join("shared.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git_run(&repo, &["add", "shared.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "shared"]);
+
+        for (id, line) in [("wsp-1", 0usize), ("wsp-2", 9)] {
+            task(&store, id, "review");
+            let dir = committed(&repo, id);
+            let mut lines: Vec<String> =
+                std::fs::read_to_string(dir.join("shared.txt")).unwrap().lines().map(String::from).collect();
+            lines[line] = id.to_string();
+            std::fs::write(dir.join("shared.txt"), lines.join("\n") + "\n").unwrap();
+            git_run(&dir, &["commit", "--quiet", "--all", "--message", "shared"]);
+        }
+        task(&store, "wsp-3", "review");
+        committed(&repo, "wsp-3");
+        // Somebody else's work, landing between two of the group's members.
+        std::fs::write(repo.join("theirs.txt"), "not ours\n").unwrap();
+        git_run(&repo, &["add", "theirs.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "theirs"]);
+        for id in ["wsp-1", "wsp-3", "wsp-2"] {
+            git_run(&repo.join(cmd_checkout::WORKTREES).join(id), &["rebase", "--quiet", "master"]);
+            land(&repo, id);
+        }
+        // A member with a repository to look in and no branch in it: nothing
+        // ran for it, and what it changed is unknown rather than nothing.
+        task(&store, "wsp-4", "review");
+
+        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into(), "wsp-3".into(), "wsp-4".into()]);
+        assert_eq!(
+            o.shared,
+            vec![("shared.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
+            "the file two of them shared, and only that file"
+        );
+        assert_eq!(o.unread, ["wsp-4"], "and the one nobody could place is named, not dropped");
     }
 
     /// The whole of what "derived" means, asserted as arithmetic: the position

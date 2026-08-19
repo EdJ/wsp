@@ -1,12 +1,32 @@
-//! `wsp worklist` — composing a queue of groups, and the window a hand may
-//! edit it in.
+//! `wsp worklist` — composing a queue of groups, running it, and the barrier
+//! between the two.
 //!
 //! The record is [`crate::model::Worklist`] and where it is up to is
 //! [`crate::worklist`]; this is the noun in between, with the same shape as
 //! `project` and `machine` — a subcommand, a slug, and `ls` when nothing else
-//! is said. What it owns is **editing**: `new`, `add`, `rm`, `mv`, `group`, and
-//! the two reading verbs. Running a list is the barrier's — `next`, `go`,
-//! `hold`, `done` — and lands here after this.
+//! is said. Two halves, and the line between them is the barrier: **composing**
+//! is `new`, `add`, `rm`, `mv`, `group`, `edit` and the two reading verbs;
+//! **running** is `next`, `go`, `hold`, `done`.
+//!
+//! # The barrier, which is what the second half is
+//!
+//! A queue of groups has a barrier between every pair of groups, and a run is
+//! the sequence of them being passed. [`next`] says which of four things is
+//! true of the one in front — members may start, members are going, the barrier
+//! is shut, or there is nothing left — and each answer names the one command to
+//! run next. [`go`] passes a barrier. [`hold`] stops the queue handing out any
+//! more work, and takes nothing back. [`done`] closes the list.
+//!
+//! **Nothing spawns.** `next` names what may start and the governor runs `wsp
+//! spawn` per member: the moment the queue spawns it needs a spawn policy —
+//! kind, tier, machine, mandate — and every one of those was a judgement in all
+//! three real runs.
+//!
+//! Two facts are written by the running half and neither is a position. The
+//! list's `status` is one — to start, to stop, to be finished with it — and
+//! [`crate::model::Group::verdict`] is the other, which is the sentence
+//! somebody wrote to pass a barrier. Both are *decisions*; where the run has
+//! got to is still derived and still never written.
 //!
 //! # The write-ahead-only window, and why it needs no field
 //!
@@ -48,7 +68,7 @@ use serde_json::json;
 use crate::model::{Group, Worklist, WorklistStatus};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::worklist::{self, Position, Reading, Standing};
+use crate::worklist::{self, Landing, Position, Reading, Standing};
 use crate::Args;
 
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
@@ -62,8 +82,14 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "rm" | "remove" => rm(store, args),
         "mv" | "move" => mv(store, args),
         "group" => group(store, args),
+        "edit" => edit(store, args),
         "ls" | "list" => list(store, args),
         "show" | "get" => show(store, args),
+        // Running it, which is the barrier. Everything above composes a plan.
+        "next" => next(store, args),
+        "go" | "start" => go(store, args),
+        "hold" | "stop" => hold(store, args),
+        "done" | "finish" => done(store, args),
         other => {
             eprintln!("wsp worklist: unknown subcommand `{other}`");
             2
@@ -132,6 +158,12 @@ struct Window {
     members: Vec<Standing>,
 }
 
+/// The window, through [`worklist::reached`] rather than off the raw position, and that
+/// matters in the one direction that loses something. A position that has
+/// slipped back onto a group already passed reports a *smaller* ordinal, which
+/// makes `first_open` smaller, which unfreezes the group actually being run —
+/// the frozen-window failure arrived at from underneath. The verdict floor
+/// stops it, and the reading is free either way.
 fn window(store: &Store, w: &Worklist) -> Window {
     let p: Position = worklist::position(store, w, Reading::Settled);
     Window {
@@ -330,7 +362,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
 
     let new_group = ordinal > groups.len();
     if new_group {
-        groups.push(Group { members: members.clone(), cap: None, stop: String::new() });
+        groups.push(Group { members: members.clone(), ..Group::default() });
     } else {
         groups[ordinal - 1].members.extend(members.iter().cloned());
     }
@@ -623,7 +655,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     }
 
     if fresh {
-        groups.insert(at - 1, Group { members: vec![id.clone()], cap: None, stop: String::new() });
+        groups.insert(at - 1, Group { members: vec![id.clone()], ..Group::default() });
     } else {
         groups[at - 1].members.push(id.clone());
     }
@@ -872,6 +904,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                     "ordinal": i + 1,
                     "parallel": g.cap,
                     "stop": g.stop,
+                    "verdict": g.verdict,
                     "members": g.members,
                 })).collect::<Vec<_>>(),
                 "at": pos.at,
@@ -957,13 +990,30 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                     println!("{}{}  {}", " ".repeat(members_at), s.id, p.dim(s.settlement.word()));
                 }
             }
+            let indent = " ".repeat(members_at);
+            // Wrapped against the column it starts in, so the whole block
+            // sits inside 80 however deep the ordinals go.
+            let width = 72usize.saturating_sub(members_at);
             if !g.stop.trim().is_empty() {
-                let indent = " ".repeat(members_at);
-                // Wrapped against the column it starts in, so the whole block
-                // sits inside 80 however deep the ordinals go.
-                let width = 72usize.saturating_sub(members_at);
                 for (n, line) in util::wrap(g.stop.trim(), width).iter().enumerate() {
                     println!("{indent}{}", p.dim(&format!("{}{line}", if n == 0 { "stop: " } else { "      " })));
+                }
+            }
+            // The verdict under the stop condition it answers. A group with a
+            // stop condition and no verdict under it is a barrier that has not
+            // been passed, which is a thing worth being able to see in the plan
+            // rather than only at `next`.
+            if !g.verdict.trim().is_empty() {
+                let (when, said) = verdict_parts(&g.verdict);
+                let lead = match when.is_empty() {
+                    true => "went: ".to_string(),
+                    false => format!("went: {when}  "),
+                };
+                for (n, line) in util::wrap(said, width).iter().enumerate() {
+                    println!(
+                        "{indent}{}",
+                        p.dim(&format!("{}{line}", if n == 0 { lead.clone() } else { " ".repeat(lead.chars().count()) }))
+                    );
                 }
             }
         }
@@ -997,6 +1047,1036 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         );
     }
     0
+}
+
+// ---- running it: the barrier ------------------------------------------
+//
+// `next`, `go`, `hold`, `done`. Everything above this line composes a plan;
+// everything below it runs one, and the line between the two is the barrier.
+
+/// Which barrier is shut, when one is.
+///
+/// There is one in front of every group, including the first, and a run is the
+/// sequence of them being passed. What differs is where the prose to read at it
+/// lives and what passing it means.
+enum Gate {
+    /// **Barrier zero.** The list has not been started, and the prose is its own
+    /// `## Overview` — per `wsp-092`, a start condition on group N is stop
+    /// prose on group N−1, and group 1 has no group before it, so the list
+    /// carries it.
+    ///
+    /// This is the start condition nobody is made to read, because there is no
+    /// barrier in front of it — `worklist-004` found that and named it rather
+    /// than inventing a verb outside its brief. It is a barrier here, which is
+    /// what makes the overview load-bearing rather than decorative.
+    ///
+    /// It needs no verdict field: the decision to pass it is the status moving
+    /// off `draft`, which is already written. One written fact per barrier and
+    /// no barrier with two.
+    Start,
+    /// The barrier behind group `n`, which has finished and has not been
+    /// passed. [`Group::verdict`] is what says whether it has.
+    After(usize),
+    /// Somebody said stop. Nothing more starts until a `go` reopens it, and the
+    /// prose is the sentence they wrote.
+    Held,
+}
+
+/// The front of the run: what may be started now, and what is already going.
+struct Front {
+    /// The members `wsp spawn` may be run on, in the order the group names
+    /// them, with the cap already applied.
+    ready: Vec<String>,
+    /// The members something is already doing, and the one thing worth saying
+    /// about each — who is holding it, or what git says is outstanding.
+    waiting: Vec<(Standing, String)>,
+    /// How many more would be ready but for the cap. Reported because a
+    /// governor told "2 may start now" about a group of five otherwise goes
+    /// looking for the three that are missing.
+    capped: usize,
+    cap: Option<usize>,
+}
+
+/// What `next` has to say, which is one of four things and never a fifth.
+///
+/// The whole design of this verb is that a governor runs it on repeat and
+/// each answer names the one command to run next: spawn, wait, `go`/`hold`,
+/// `done`. Everything an agent runs repeatedly is paid for in context on every
+/// request of every session, so a state that does not fit on two lines is a
+/// state that has to earn it.
+enum State {
+    /// Members may start. `wsp spawn <id>` each.
+    Ready(Front),
+    /// Nothing may start and the group is not finished. Wait.
+    Waiting(Front),
+    /// A barrier that has not been passed. `wsp worklist go` or `hold`.
+    ///
+    /// `flight` is how many members are still going despite it, which is only
+    /// ever non-zero for [`Gate::Held`]: holding stops the queue handing out
+    /// work and leaves what is already in a tree to land, and a reader of a
+    /// held list has to be told that rather than left to assume it stopped.
+    Shut { gate: Gate, prose: String, flight: usize },
+    /// Every group finished. `wsp worklist done`.
+    Nothing,
+}
+
+/// The mark a held list's reason is logged under, and the thing that reads it
+/// back.
+///
+/// Archaeology over the log, and it is worth saying why rather than hiding it.
+/// `hold` writes a sentence and `next` has to be able to show it — somebody
+/// walking up to a stopped list wants to know why it stopped, and the
+/// alternative is a second place for the same sentence to live on a record
+/// whose entire design is that nothing is written twice. The log is where the
+/// sentence already goes, one function writes the mark, and a line nobody can
+/// parse costs the reason and nothing else.
+const HELD: &str = "held —";
+
+fn last_logged(w: &Worklist, mark: &str) -> Option<String> {
+    let log = w.section("Log").unwrap_or_default();
+    log.lines()
+        .rev()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest.trim()))
+        .find_map(|rest| rest.strip_prefix(mark).map(|s| s.trim().to_string()))
+}
+
+/// A verdict as stored — `<instant> <sentence>` — taken apart for printing.
+fn verdict_parts(v: &str) -> (String, &str) {
+    match v.trim().split_once(' ') {
+        Some((stamp, rest)) if stamp.len() == 20 && util::is_stamp(stamp) => {
+            (util::local_ymd(stamp), rest.trim())
+        }
+        _ => (String::new(), v.trim()),
+    }
+}
+
+/// A verdict as it is written: the instant, then the sentence.
+///
+/// Dated because a plan's history is worth having and this is the one entry in
+/// it that is a judgement — "the barrier after group 2 was passed on the 19th,
+/// and here is what was said" is the sentence somebody reconstructs a night
+/// from. `passed` where no sentence was asked for, because the field being
+/// non-empty is what says the barrier is behind us, and an empty string would
+/// make an unanswered barrier and an answered one look the same.
+fn verdict_of(said: &str) -> String {
+    let text = said.trim();
+    format!("{} {}", util::now_iso(), if text.is_empty() { "passed" } else { text })
+}
+
+/// The list a running verb is about, and the words after it.
+///
+/// **The first positional is a slug when it names a list and the start of the
+/// sentence when it does not.** `wsp worklist go batch` and `wsp worklist go
+/// "the three landed clean"` are both what somebody types, and a list is named
+/// by one word while a verdict is a sentence, so the ambiguity is real and
+/// narrow: a one-word verdict that happens to be a worklist slug. That case
+/// answers "there is no such list" in the only direction that loses nothing —
+/// the sentence is refused, not silently filed against the wrong list.
+///
+/// `-` as the whole of the words reads the sentence from a stream, for the
+/// reason `--stop -` does: a verdict is written in the vocabulary of the work,
+/// which means backticks and identifiers, and every backtick inside the double
+/// quotes a shell needs for a paragraph runs a command.
+fn list_and_words(store: &Store, args: &Args) -> Result<(Worklist, String, bool), i32> {
+    let first = args.rest.get(1).cloned().unwrap_or_default();
+    if !first.is_empty() {
+        if let Some(w) = find(store, &first) {
+            return Ok((w, words(args, 2)?, false));
+        }
+    }
+    match seated(store, args) {
+        Some(w) => Ok((w, words(args, 1)?, true)),
+        None => {
+            if first.is_empty() {
+                eprintln!("wsp: no worklist named, and this workspace is the seat for none");
+                eprintln!("     wsp worklist ls names them · wsp govern <slug> takes the seat");
+            } else {
+                eprintln!("{}", worklist_or_why(store, &first).err().unwrap_or_default());
+            }
+            Err(1)
+        }
+    }
+}
+
+/// The sentence, from the words typed or from the stream a lone `-` names.
+fn words(args: &Args, from: usize) -> Result<String, i32> {
+    let typed = args.text(from);
+    if typed.trim() != "-" {
+        return Ok(fold(&typed));
+    }
+    if util::stdin_is_tty() {
+        eprintln!("wsp: nothing is piped in — `-` reads the sentence from a stream");
+        return Err(2);
+    }
+    match crate::cmd_task::read_source("-") {
+        Ok(text) => Ok(fold(&text)),
+        Err(e) => {
+            eprintln!("wsp: cannot read stdin: {e}");
+            Err(1)
+        }
+    }
+}
+
+/// The worklist this workspace is the seat for, if it is the seat for one.
+///
+/// This is what makes the governor's loop three words. `wsp govern <slug>` is
+/// how a workspace comes to hold a worklist seat, and one key space means the
+/// scope it holds is either a project or a list with no ambiguity to settle.
+fn seated(store: &Store, args: &Args) -> Option<Worklist> {
+    let ws = args.get("workspace").or_else(|| crate::herdr::Env::read().workspace_id)?;
+    let scope = crate::cmd_govern::governs(&store.governors(), &ws)?;
+    store.worklist(&scope)
+}
+
+/// Where the run is up to, and which of the four things is true of it.
+///
+/// The order of the questions is the order they override each other in. A held
+/// list opens no barrier whatever its tasks say; a list that has not started
+/// has passed nothing; and a barrier behind the position is shut until a
+/// verdict is written on the group behind it.
+fn state(store: &Store, w: &Worklist, p: &Position) -> State {
+    let groups = w.groups();
+    if w.status() == WorklistStatus::Held {
+        let flight = front(store, groups.get(p.at.unwrap_or(1) - 1), &p.members).waiting.len();
+        return State::Shut {
+            gate: Gate::Held,
+            prose: last_logged(w, HELD).unwrap_or_default(),
+            flight,
+        };
+    }
+    let draft = w.status() == WorklistStatus::Draft;
+    if draft {
+        let overview = w.section("Overview").unwrap_or_default();
+        if !overview.trim().is_empty() {
+            return State::Shut { gate: Gate::Start, prose: fold(&overview), flight: 0 };
+        }
+    }
+
+    // The barrier this run has reached: the one behind the group at the
+    // position, or — where everything is finished — the one behind the last
+    // group there is. That last one is not a formality: `worklist-008`'s stop
+    // prose is the gate on phase two, and a run that fell straight through to
+    // "nothing left" would pass the one barrier the whole exercise exists for.
+    //
+    // **Every barrier is shut until `go`, and not only the ones carrying
+    // prose.** The design says a group with no stop condition passes on landing
+    // alone, and that is about the *judgement*: nothing is demanded of a reader
+    // there, and `go` at such a barrier is one word with no argument. It is
+    // still `go` that runs, because passing a barrier is three other things as
+    // well — the at-most-one-running check, the sweep of the trees behind it,
+    // and the report of which members touched the same file — and the whole
+    // argument for the sweep being automatic is that a step nobody is made to
+    // run is a step that happened zero times in two nights and left 18
+    // worktrees. A `next` that named the next group here would put that step
+    // back on the honour system it has already failed.
+    let crossed = p.at.map(|at| at - 1).unwrap_or(p.of);
+    if !draft && crossed >= 1 {
+        if let Some(g) = groups.get(crossed - 1).filter(|g| g.verdict.trim().is_empty()) {
+            return State::Shut {
+                gate: Gate::After(crossed),
+                prose: g.stop.trim().to_string(),
+                flight: 0,
+            };
+        }
+    }
+
+    match p.at {
+        None => State::Nothing,
+        Some(at) => {
+            let f = front(store, groups.get(at - 1), &p.members);
+            match f.ready.is_empty() {
+                true => State::Waiting(f),
+                false => State::Ready(f),
+            }
+        }
+    }
+}
+
+/// Split the group being run into what may start and what is already going.
+///
+/// **The claim decides, and it decides first.** Who is standing on a task is
+/// the claim's to say — `crate::worklist` deliberately never asks — and it is
+/// what separates the two answers that otherwise look identical: a member with
+/// no branch has either never been started or has an agent on it that has not
+/// committed yet, and spawning the second one twice is two agents in one tree.
+/// Everything git can say comes after that.
+fn front(store: &Store, g: Option<&Group>, members: &[Standing]) -> Front {
+    let claims = store.claims();
+    let mut ready: Vec<String> = Vec::new();
+    let mut waiting: Vec<(Standing, String)> = Vec::new();
+    for s in members.iter().filter(|s| !s.finished()) {
+        if let Some(c) = claims.get(&s.id) {
+            waiting.push((s.clone(), crate::cmd_agent::claim_where(c)));
+        } else if matches!(s.landing, None | Some(Landing::NoBranch) | Some(Landing::NoRepo)) {
+            // No branch and nobody holding it: nothing has run for this member.
+            // A member with no repository to look in — design-only work — is
+            // the same answer for a different reason, and it is the reason
+            // `Landing::NoRepo` is not an error.
+            ready.push(s.id.clone());
+        } else {
+            waiting.push((s.clone(), s.note()));
+        }
+    }
+
+    // The machine's half of the cap is `None` and that is not an oversight: it
+    // is set per executor and the seat — the machine all of this actually runs
+    // on — has no record to carry one (see `Machine::agents`). It goes through
+    // `parallelism` rather than being ignored so that the day the seat gets a
+    // record, this line is the only one that changes and the rule stays where
+    // the rule is.
+    let cap = g.and_then(|g| g.parallelism(None));
+    let room = cap.map(|n| n.saturating_sub(waiting.len())).unwrap_or(ready.len()).min(ready.len());
+    let capped = ready.len() - room;
+    ready.truncate(room);
+    Front { ready, waiting, capped, cap }
+}
+
+// ---- next -------------------------------------------------------------
+
+/// `wsp worklist next [<slug>]` — what may start now, or the prose.
+///
+/// **The verb the whole concept turns on, and the one a governor runs on
+/// repeat**, which is why it says one of four things and says each of them in
+/// two lines. Ids and no titles: the caller is about to run `wsp spawn <id>`,
+/// which prints the title itself, and seven titles here is seven lines on every
+/// barrier check instead of one. `--json` carries the rest.
+///
+/// [`Reading::Landed`], and this is the one caller that has to pay for it. A
+/// group is finished when every member's branch is on the trunk, because both
+/// cheap signals are wrong: `done` never arrives, and `review` arrives before
+/// the commit does — which is the `batch`'s costliest failure with a barrier's
+/// authority behind it.
+///
+/// It reads and it never writes. A governor polls this; a verb that appended to
+/// the log every time it was asked would leave a log made of its own polling.
+/// The dangling members it finds are therefore printed here and written to the
+/// log by [`go`], which happens once per barrier.
+pub fn next(store: &Store, args: &Args) -> i32 {
+    let (w, seat) = match named_list(store, args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let pos = worklist::position(store, &w, Reading::Landed);
+    let st = state(store, &w, &pos);
+    let gone = worklist::dangling(store, &w);
+
+    if args.json() {
+        println!("{}", serde_json::to_string_pretty(&next_json(&w, &pos, &st, &gone)).unwrap_or_default());
+        return 0;
+    }
+    report(&w, &pos, &st, &gone, seat);
+    0
+}
+
+/// The list a reading verb is about: the one named, or the one this workspace
+/// is the seat for.
+fn named_list(store: &Store, args: &Args) -> Result<(Worklist, bool), i32> {
+    match args.rest.get(1) {
+        Some(needle) => match worklist_or_why(store, needle) {
+            Ok(w) => Ok((w, false)),
+            Err(why) => {
+                eprintln!("{why}");
+                Err(1)
+            }
+        },
+        None => match seated(store, args) {
+            Some(w) => Ok((w, true)),
+            None => {
+                eprintln!("wsp: no worklist named, and this workspace is the seat for none");
+                eprintln!("     wsp worklist ls names them · wsp govern <slug> takes the seat");
+                Err(1)
+            }
+        },
+    }
+}
+
+/// `wsp worklist go`, with the slug where the caller needs one.
+///
+/// Left off when the workspace holds the seat, because that is the form the
+/// governor's loop actually types and this line is read on every barrier of
+/// every run. Named when it does not, because a command that will not work as
+/// printed is worse than a longer one.
+fn how(verb: &str, w: &Worklist, seat: bool) -> String {
+    match seat {
+        true => format!("wsp worklist {verb}"),
+        false => format!("wsp worklist {verb} {}", w.id),
+    }
+}
+
+/// Four states, and the line each of them ends on is the command to run next.
+fn report(w: &Worklist, pos: &Position, st: &State, gone: &[String], seat: bool) {
+    let p = Paint::new();
+    let of = pos.of;
+
+    // Printed in every state and above everything, which is what "a line that
+    // cannot be missed" means. A member no task answers to has been archived or
+    // deleted under a plan that still names it: it never holds the barrier, so
+    // nothing else here will ever mention it again, and the moment to put
+    // something back is while there are still groups ahead.
+    if !gone.is_empty() {
+        println!("{}  {}", p.bold("gone"), gone.join("  "));
+        println!("      {}", p.dim("no task answers to these — nothing here removes them"));
+    }
+    // The other line that cannot be missed, and it is rarer and stranger: a
+    // member of a group this run has already passed that does not read as
+    // finished. See `worklist::reached` — the run does not go back for it, and somebody
+    // has to be told it is there rather than have the floor quietly cover it.
+    if !pos.slipped.is_empty() {
+        println!(
+            "{}  {}",
+            p.bold("behind"),
+            pos.slipped.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join("  ")
+        );
+        println!(
+            "        {}",
+            p.dim("in a group already passed, and not finished — the run does not go back for them")
+        );
+    }
+
+    match st {
+        State::Ready(f) => {
+            let mut tail = String::new();
+            if !f.waiting.is_empty() {
+                tail.push_str(&format!(" · {} in flight", f.waiting.len()));
+            }
+            if f.capped > 0 {
+                if let Some(cap) = f.cap {
+                    tail.push_str(&format!(" · x{cap} holds {} back", f.capped));
+                }
+            }
+            // A list nobody has started: the ids are what group 1 *is*, and the
+            // command is `go` and not `spawn`. Spawning here would leave the
+            // run at `draft`, where routing does not find it and no barrier
+            // exists to wait at.
+            if w.status() == WorklistStatus::Draft {
+                tail.push_str(&format!(" · {} starts the list", how("go", w, seat)));
+            }
+            println!(
+                "group {} of {of} — {} may start now{tail}",
+                pos.at.unwrap_or(0),
+                f.ready.len()
+            );
+            println!("{}", f.ready.join("  "));
+        }
+        State::Waiting(f) => {
+            let tail = match (f.capped, f.cap) {
+                (0, _) | (_, None) => String::new(),
+                (n, Some(cap)) => format!(" · x{cap} holds {n} back"),
+            };
+            println!("group {} of {of} — waiting on {}{tail}", pos.at.unwrap_or(0), f.waiting.len());
+            let w_id = f.waiting.iter().map(|(s, _)| s.id.chars().count()).max().unwrap_or(8);
+            for (s, note) in &f.waiting {
+                println!(
+                    "{}  {}  {}",
+                    util::pad(&s.id, w_id),
+                    util::pad(s.settlement.word(), 7),
+                    p.dim(note)
+                );
+            }
+        }
+        State::Shut { gate, prose, flight } => {
+            let (head, verbs) = match gate {
+                Gate::Start => (
+                    format!("not started — {of} groups · read this before starting it"),
+                    format!(
+                        "{} \"…\"  starts it · {} \"…\"  shelves it",
+                        how("go", w, seat),
+                        how("hold", w, seat)
+                    ),
+                ),
+                Gate::Held => (
+                    match flight {
+                        0 => "held — nothing more starts".to_string(),
+                        n => format!("held — nothing more starts · {n} still in flight, and finishing"),
+                    },
+                    format!("{} \"…\"  starts it again", how("go", w, seat)),
+                ),
+                Gate::After(n) if prose.trim().is_empty() => (
+                    // No prose is no judgement asked for, and it is still a
+                    // barrier: the sweep behind it and the same-file report are
+                    // `go`'s, and neither of them is anybody's to remember.
+                    format!(
+                        "group {n} of {of} finished — {}  passes the barrier",
+                        how("go", w, seat)
+                    ),
+                    String::new(),
+                ),
+                Gate::After(n) => (
+                    format!("group {n} of {of} finished — read this before going on"),
+                    format!(
+                        "{} \"…\"  to go on · {} \"…\"  to stop",
+                        how("go", w, seat),
+                        how("hold", w, seat)
+                    ),
+                ),
+            };
+            println!("{head}");
+            if !prose.trim().is_empty() {
+                println!();
+                for line in util::wrap(prose.trim(), 72) {
+                    println!("  {line}");
+                }
+                println!();
+            }
+            if !verbs.is_empty() {
+                println!("{}", p.dim(&verbs));
+            }
+        }
+        State::Nothing => {
+            println!(
+                "nothing left — {of} group{}, all finished · wsp worklist done {}",
+                if of == 1 { "" } else { "s" },
+                w.id
+            );
+        }
+    }
+}
+
+fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String]) -> serde_json::Value {
+    let mut v = json!({
+        "worklist": w.id,
+        "status": w.status().as_str(),
+        "at": pos.at,
+        "of": pos.of,
+        "dangling": gone,
+    });
+    match st {
+        State::Ready(f) | State::Waiting(f) => {
+            v["state"] = json!(if f.ready.is_empty() { "waiting" } else { "ready" });
+            v["start"] = json!(f.ready);
+            v["cap"] = json!(f.cap);
+            v["held_back"] = json!(f.capped);
+            v["waiting"] = json!(f
+                .waiting
+                .iter()
+                .map(|(s, note)| json!({ "id": s.id, "status": s.settlement.word(), "note": note }))
+                .collect::<Vec<_>>());
+        }
+        State::Shut { gate, prose, flight } => {
+            v["state"] = json!("barrier");
+            v["gate"] = json!(match gate {
+                Gate::Start => "start".to_string(),
+                Gate::Held => "held".to_string(),
+                Gate::After(n) => format!("after {n}"),
+            });
+            v["prose"] = json!(prose);
+            v["in_flight"] = json!(flight);
+        }
+        State::Nothing => v["state"] = json!("finished"),
+    }
+    v
+}
+
+// ---- go ---------------------------------------------------------------
+
+/// `wsp worklist go [<slug>] ["the verdict"]` — start a list, or pass a
+/// barrier.
+///
+/// Four things happen here and only the first is about prose.
+///
+/// 1. **The verdict is recorded**, where the barrier asked for one. wsp does
+///    not make the judgement: `fork`'s real rule was *"if any of the three goes
+///    badly, flag and stop rather than push through"*, which no boolean
+///    expresses. What wsp contributes is the **obligation** to make one and the
+///    record that one was made — which is the thing a handbook nobody is made
+///    to re-read could not contribute. A barrier with no stop prose asks for
+///    nothing and is passed with three words.
+/// 2. **The at-most-one-running constraint is checked**, because this is the
+///    moment a person can act on it. A task may be in one *running* worklist
+///    and in any number of drafts, held lists and finished ones.
+/// 3. **The trees of every group behind the barrier are swept**, unless
+///    `--keep`. See [`worklist::sweep`] — and note that `--keep` *defers*
+///    rather than opts out, which is why [`worklist::Sweep::earlier`] is
+///    printed here and is not optional.
+/// 4. **The members of the group that just landed are reported where two of
+///    them touched the same file.** The `batch`'s evidence for the composition
+///    rule was an absence, which cannot be acted on; this is an observation,
+///    and it arrives exactly when the next group is being composed.
+///
+/// Nothing spawns. `next` names what may start and the governor runs `wsp
+/// spawn` per member: the moment the queue spawns it needs a spawn policy —
+/// kind, tier, machine, mandate — and every one of those was a judgement in all
+/// three real runs.
+pub fn go(store: &Store, args: &Args) -> i32 {
+    let (mut w, said, seat) = match list_and_words(store, args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    if w.status() == WorklistStatus::Done {
+        eprintln!("wsp: `{}` is done — nothing in it is waiting to start", w.id);
+        return 1;
+    }
+    let pos = worklist::position(store, &w, Reading::Landed);
+    let st = state(store, &w, &pos);
+
+    // Checked at every `go` and not only at the first, because a group ahead of
+    // the work can be edited by hand between two barriers, and this is the last
+    // moment before those members are named as startable.
+    if let Some(code) = only_one_running(store, &w) {
+        return code;
+    }
+
+    // Starting is not conditional on a barrier being shut. A list with nothing
+    // written in its `## Overview` has no prose at barrier zero and so reads as
+    // `Ready`, and `go` is still what starts it: spawning members of a draft
+    // list leaves the run at `draft`, where routing does not find it and there
+    // is no barrier to wait at.
+    let starting = w.status() == WorklistStatus::Draft;
+    let shut = match &st {
+        State::Shut { gate, prose, .. } => Some((gate, prose.clone())),
+        _ => None,
+    };
+    if !starting && shut.is_none() {
+        // Not an error: a governor that types `go` twice has done nothing
+        // wrong and wants to know where it is, which is what `next` says.
+        println!("{}", Paint::new().dim("no barrier is shut — nothing to pass"));
+        report(&w, &pos, &st, &worklist::dangling(store, &w), seat);
+        return 0;
+    }
+    let prose = shut.as_ref().map(|(_, prose)| prose.clone()).unwrap_or_default();
+
+    // **The design's one piece of machinery around judgement.** Where there is
+    // prose, the next group is not named until somebody has written a sentence
+    // about it, and the sentence is dated into the record.
+    if !prose.trim().is_empty() && said.trim().is_empty() {
+        eprintln!("wsp: this barrier has something written at it, and passing it takes a sentence");
+        eprintln!();
+        for line in util::wrap(prose.trim(), 72) {
+            eprintln!("  {line}");
+        }
+        eprintln!();
+        eprintln!("     {} \"what you decided\"   · `-` reads it from a stream", how("go", &w, seat));
+        eprintln!("     {} \"why\"                stops instead", how("hold", &w, seat));
+        return 1;
+    }
+
+    let mut groups = w.groups();
+    let behind = pos.at.map(|at| at - 1).unwrap_or(pos.of);
+    let resuming = matches!(shut, Some((Gate::Held, _)));
+
+    // Which barrier was crossed, taken from the gate rather than from the
+    // ordinal. Starting a list crosses none: the groups a freshly-started list
+    // has already "passed" are work that was finished before it existed, and
+    // taking their trees would be a blast radius nobody at this barrier asked
+    // for. Resuming a held list crosses the barrier in front of it only if that
+    // barrier is still shut — a `hold` taken in the middle of a group has none.
+    let crossed = match (&shut, starting) {
+        (_, true) => None,
+        (Some((Gate::After(n), _)), _) => Some(*n),
+        (Some((Gate::Held, _)), _) => (behind >= 1
+            && groups.get(behind - 1).is_some_and(|g| g.verdict.trim().is_empty()))
+        .then_some(behind),
+        _ => None,
+    };
+
+    // Read before anything is removed, and that ordering is load-bearing: the
+    // report finds a member by its branch tip and the sweep deletes the branch.
+    let overlap = match crossed {
+        Some(n) => worklist::overlaps(store, &groups[n - 1].members),
+        None => worklist::Overlap::default(),
+    };
+
+    let swept = match (crossed, args.has("keep")) {
+        // The very position the barrier was read off, handed on rather than
+        // recomputed: two walks under one `rm -rf` is two answers that can
+        // disagree, and the one holding the removal is the wrong one to be
+        // second. That is `worklist::sweep`'s own seam and its argument.
+        (Some(_), false) => match worklist::sweep(store, &pos, args.has("dry-run")) {
+            Ok(s) => Some(s),
+            Err(why) => {
+                eprintln!("wsp: the sweep was refused: {why}");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    // The record. A verdict goes on the group the barrier is behind, so it
+    // travels with the group rather than with an ordinal that is rewritten on
+    // every write.
+    let verdict = verdict_of(&said);
+    match starting {
+        // Groups already finished when the list started were passed by nobody,
+        // and marking them says so rather than leaving a run that has to be
+        // walked through barriers for work it never did.
+        true => {
+            for g in groups.iter_mut().take(behind) {
+                if g.verdict.trim().is_empty() {
+                    g.verdict = format!("{} already finished when the list started", util::now_iso());
+                }
+            }
+        }
+        false => {
+            if let Some(n) = crossed {
+                groups[n - 1].verdict = verdict.clone();
+            }
+        }
+    }
+    if starting || resuming {
+        w.set_status(WorklistStatus::Running);
+    }
+
+    // The log names the members and not the ordinal, for the reason every other
+    // line in it does: an ordinal is a position and is rewritten the moment a
+    // group is inserted above it.
+    let entry = match (starting, resuming, crossed) {
+        (true, _, _) => format!("started · {}", said.trim()),
+        (_, true, _) => format!("started again · {}", said.trim()),
+        (_, _, Some(n)) => format!("passed {} · {}", groups[n - 1].members.join(" "), said.trim()),
+        _ => format!("go · {}", said.trim()),
+    };
+    w.log(entry.trim_end_matches(" · ").trim_end());
+
+    // Written here rather than by `next`, which a governor polls: once per
+    // barrier is a record and once per poll is a log made of its own polling.
+    let gone = worklist::dangling(store, &w);
+    if !gone.is_empty() {
+        w.log(&format!("no task answers to {}", gone.join(" ")));
+    }
+
+    let msg = format!("go {}", w.id);
+    let saved = save(store, &mut w, &groups, "go", &msg);
+    if saved != 0 {
+        return saved;
+    }
+    store.log_event(
+        "worklist-go",
+        json!({ "id": w.id, "passed": crossed, "started": starting, "verdict": said }),
+    );
+
+    if args.json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "worklist": w.id,
+                "started": starting,
+                "passed": crossed,
+                "verdict": said,
+                "same_file": overlap.shared.iter().map(|(f, who)| json!({ "file": f, "members": who })).collect::<Vec<_>>(),
+                "unread": overlap.unread,
+                "swept": swept.as_ref().map(|s| json!({
+                    "removed": s.swept.removed,
+                    "branches": s.swept.branches,
+                    "kept": s.swept.kept.iter().map(|(t, why)| json!({ "task": t, "why": why })).collect::<Vec<_>>(),
+                    "earlier": s.earlier,
+                })),
+                "dangling": gone,
+            }))
+            .unwrap_or_default()
+        );
+        return 0;
+    }
+
+    let p = Paint::new();
+    match (starting, resuming, crossed) {
+        (true, _, _) => println!("{} {}", p.bold(&w.id), p.dim("started")),
+        (_, true, _) => println!("{} {}", p.bold(&w.id), p.dim("started again")),
+        (_, _, Some(n)) => println!("{} {}", p.bold(&w.id), p.dim(&format!("group {n} passed"))),
+        _ => println!("{}", p.bold(&w.id)),
+    }
+    if !gone.is_empty() {
+        println!("{}  {}", p.bold("gone"), gone.join("  "));
+    }
+    // Only where a barrier was crossed. Starting a list has no group behind it
+    // to have touched anything, and "none" there would be an answer to a
+    // question nobody asked.
+    if crossed.is_some() {
+        say_overlap(&p, &overlap);
+    }
+    say_swept(&p, swept.as_ref(), crossed.is_some() && args.has("keep"), args.has("dry-run"));
+    println!("{}", p.dim(&format!("{}  what may start now", how("next", &w, seat))));
+    0
+}
+
+/// A task is in one *running* worklist and in as many plans as anybody cares to
+/// write.
+///
+/// Checked here because this is where somebody can act on it — the moment a
+/// list starts, and every barrier after it, since a group ahead of the work can
+/// be edited between two of them. What it protects is the routing step in front
+/// of `cmd_govern::seat_for`, which has to have one answer: a hand raised at 3am
+/// must reach whoever is running the list this task is in tonight, and two
+/// running lists holding it is a question with no answer.
+fn only_one_running(store: &Store, w: &Worklist) -> Option<i32> {
+    let running = worklist::Running::read(store);
+    let clash: Vec<String> = w
+        .groups()
+        .iter()
+        .flat_map(|g| g.members.clone())
+        .filter_map(|m| {
+            running.list_of(&m).filter(|l| *l != w.id).map(|l| format!("{m} is in `{l}`"))
+        })
+        .collect();
+    if clash.is_empty() {
+        return None;
+    }
+    eprintln!("wsp: `{}` cannot run — a task runs in one worklist at a time", w.id);
+    for line in clash.iter().take(6) {
+        eprintln!("     {line}");
+    }
+    if clash.len() > 6 {
+        eprintln!("     …and {} more", clash.len() - 6);
+    }
+    eprintln!("     take them out of one of the two, or hold the other — wsp worklist hold <slug> \"why\"");
+    Some(1)
+}
+
+/// What the group that just landed touched, where two of them touched one file.
+///
+/// Silence is the answer nearly every time and it is the answer worth having:
+/// the composition rule held. It says so in one line rather than printing
+/// nothing, because "no output" is exactly the absence the `batch` could not
+/// act on.
+fn say_overlap(p: &Paint, o: &worklist::Overlap) {
+    if o.shared.is_empty() && o.unread.is_empty() {
+        println!("{}", p.dim("same file  none — no two members touched one file"));
+        return;
+    }
+    for (file, who) in &o.shared {
+        println!("{}  {}  {}", p.bold("same file"), file, p.dim(&who.join(" ")));
+    }
+    if !o.unread.is_empty() {
+        // The honest half. A member nobody could place contributes no overlaps,
+        // so leaving it out would turn "we could not look" into "we looked and
+        // it was clean" — the absence-as-evidence this report exists to replace.
+        println!(
+            "{}  {}",
+            p.dim(&util::pad("", 9)),
+            p.dim(&format!("{} could not be read back off the trunk", o.unread.join(" ")))
+        );
+    }
+}
+
+/// What the sweep did, and the one line of it that is an obligation.
+fn say_swept(p: &Paint, swept: Option<&worklist::Sweep>, kept: bool, dry: bool) {
+    if kept {
+        // `--keep` from the other side: it is a deferral, and saying so here is
+        // the same honesty `earlier` owes at the barrier that finally takes
+        // them. Somebody who keeps a tree to go and look at it should know how
+        // long they have.
+        println!("{}", p.dim("kept — no trees swept · the next barrier takes them, --keep defers"));
+        return;
+    }
+    let Some(s) = swept else { return };
+    if s.swept.removed.is_empty() && s.swept.kept.is_empty() {
+        return;
+    }
+    let what = if dry { "would sweep" } else { "swept" };
+    // **The obligation.** `earlier` names the trees an earlier `--keep` spared,
+    // and it has to arrive where the decision is being made: somebody who kept
+    // a tree in order to go and look at it would otherwise lose it one barrier
+    // later without being told, which is the failure `--keep` exists to
+    // prevent, delayed by one group.
+    let n = s.swept.removed.len();
+    let trees = if n == 1 { "tree" } else { "trees" };
+    match s.earlier.len() {
+        0 => println!("{} {n} {trees}", p.dim(what)),
+        earlier => {
+            println!("{} {n} {trees}, {earlier} of them from groups passed earlier", p.dim(what));
+            println!("      {}", p.dim(&format!("{} — an earlier --keep spared these", s.earlier.join("  "))));
+        }
+    }
+    if !s.swept.branches.is_empty() {
+        println!(
+            "      {}",
+            p.dim(&format!("{} — the branch outlived the tree, it holds commits the trunk has not", s.swept.branches.join("  ")))
+        );
+    }
+    for (task, why) in &s.swept.kept {
+        println!("{}  {}  {}", p.dim("kept"), task, p.dim(why));
+    }
+}
+
+// ---- hold -------------------------------------------------------------
+
+/// `wsp worklist hold [<slug>] "why"` — start nothing more.
+///
+/// **It means exactly that and nothing stronger.** Agents already running are
+/// left to finish: work in flight cannot be unwound, and a verb that pretended
+/// otherwise would be promising the one thing in this design that could not be
+/// built. So this writes a decision and stops the queue handing out any more
+/// work; what is already in a tree lands the way it would have landed.
+///
+/// The sentence is required. `held` is a state somebody walks up to hours
+/// later, and a stop with no reason on it is the notification failure in its
+/// purest form — a run that will not go on and nothing anywhere saying why.
+pub fn hold(store: &Store, args: &Args) -> i32 {
+    let (mut w, said, seat) = match list_and_words(store, args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    if said.trim().is_empty() {
+        eprintln!("wsp: {} \"why\" — a hold with no reason on it is a run nobody can restart", how("hold", &w, seat));
+        eprintln!("     `-` reads the sentence from a stream, where a shell never sees it");
+        return 2;
+    }
+    if w.status() == WorklistStatus::Held {
+        println!("{} {}", w.id, Paint::new().dim("is already held"));
+        return 0;
+    }
+
+    let pos = worklist::position(store, &w, Reading::Landed);
+    let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members);
+
+    w.set_status(WorklistStatus::Held);
+    w.log(&format!("{HELD} {}", said.trim()));
+    let groups = w.groups();
+    let msg = format!("hold {}", w.id);
+    let code = save(store, &mut w, &groups, "hold", &msg);
+    if code != 0 {
+        return code;
+    }
+    store.log_event("worklist-held", json!({ "id": w.id, "why": said }));
+
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "worklist": w.id,
+                "status": w.status().as_str(),
+                "why": said,
+                "in_flight": flight.waiting.iter().map(|(s, _)| s.id.clone()).collect::<Vec<_>>(),
+            })
+        );
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.bold(&w.id), p.dim("held — nothing more starts"));
+    match flight.waiting.len() {
+        0 => {}
+        n => {
+            // Said out loud rather than assumed: somebody who holds a run
+            // expects it to stop, and what is in a tree is going to land anyway.
+            println!(
+                "{}",
+                p.dim(&format!("{n} still in flight and left to finish — work in flight cannot be unwound"))
+            );
+            for (s, note) in &flight.waiting {
+                println!("  {}  {}  {}", s.id, util::pad(s.settlement.word(), 7), p.dim(note));
+            }
+        }
+    }
+    println!("{}", p.dim(&format!("{} \"…\"  starts it again", how("go", &w, seat))));
+    0
+}
+
+// ---- done -------------------------------------------------------------
+
+/// `wsp worklist done <slug>` — there is nothing left to want from this list.
+///
+/// The slug is required and is not optional the way `next`, `go` and `hold`
+/// take it from the seat. This is the one verb here that is final, it is run
+/// once at the end of a night, and typing the name is the whole of the
+/// confirmation it needs.
+///
+/// It does not check that the list finished. `done` is *somebody's decision*
+/// that there is nothing left to want, and a run abandoned two groups from the
+/// end is a real and ordinary thing to be finished with — but it says what it
+/// is closing over, because a plan closed with work still open in it is worth
+/// one line at the moment it happens rather than a surprise in `worklist ls`.
+pub fn done(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp worklist done <slug>");
+        eprintln!("       (named rather than taken from the seat: this one is final)");
+        return 2;
+    };
+    let mut w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    if w.status() == WorklistStatus::Done {
+        println!("{} {}", w.id, Paint::new().dim("is already done"));
+        return 0;
+    }
+    let pos = worklist::position(store, &w, Reading::Settled);
+    let left: Vec<String> = pos.holding().iter().map(|s| s.id.clone()).collect();
+
+    w.set_status(WorklistStatus::Done);
+    w.log(&match pos.at {
+        None => "done — every group finished".to_string(),
+        Some(at) => format!("done at group {at} of {} — {}", pos.of, left.join(" ")),
+    });
+    let groups = w.groups();
+    let msg = format!("done {}", w.id);
+    let code = save(store, &mut w, &groups, "done", &msg);
+    if code != 0 {
+        return code;
+    }
+    store.log_event("worklist-done", json!({ "id": w.id, "at": pos.at, "open": left }));
+
+    if args.json() {
+        println!("{}", json!({ "worklist": w.id, "status": "done", "at": pos.at, "open": left }));
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.bold(&w.id), p.dim("done"));
+    if !pos.finished() {
+        println!(
+            "{}",
+            p.dim(&format!(
+                "closed at group {} of {} · {} still open in it",
+                pos.at.unwrap_or(0),
+                pos.of,
+                match left.is_empty() {
+                    true => "nothing".to_string(),
+                    false => left.join(" "),
+                }
+            ))
+        );
+    }
+    0
+}
+
+// ---- edit -------------------------------------------------------------
+
+/// `wsp worklist edit <slug> --overview -` — the prose around the queue.
+///
+/// **Built, and the reason is the barrier rather than convenience.** Per
+/// `wsp-092`, a start condition on group N is stop prose on group N−1, except
+/// for group 1, whose start condition is the worklist's own `## Overview` —
+/// and nothing wrote that section, which `worklist-004` found and correctly
+/// named rather than inventing a verb outside its brief. The gap matters more
+/// than it sounds: **the first group's start condition is the one nobody is
+/// made to read, because there is no barrier in front of it.**
+///
+/// It is the barrier's to close. [`Gate::Start`] makes the overview the prose
+/// read at barrier zero, on exactly the machinery every other barrier uses, so
+/// a list that says something about starting itself now refuses to start until
+/// somebody has answered it. A section nothing can write would have made that
+/// barrier permanently empty, which is a verb missing from the one place a
+/// missing verb is load-bearing.
+///
+/// `## Groups` is deliberately not in [`WORKLIST_PROSE`]: the queue has verbs
+/// of its own and a window they may edit it in, and an editor that could
+/// rewrite it would be a way around both. What this reaches is the prose the
+/// structure sits in.
+pub fn edit(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp worklist edit <slug> [--overview | --decisions] [-]");
+        return 2;
+    };
+    let w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    crate::cmd_task::edit_prose(
+        store,
+        args,
+        crate::cmd_task::Prose {
+            what: "worklist",
+            id: w.id.clone(),
+            body: w.body.clone(),
+            path: store.worklist_path(&w.id),
+            sections: &crate::model::WORKLIST_PROSE,
+        },
+    )
 }
 
 /// One worklist, for `--json`: what it is, and where it is up to.
@@ -1305,4 +2385,246 @@ mod tests {
         assert_eq!(run(&store, &["rm", "batch", "wl-002"]), 0);
         assert_eq!(groups_of(&store, "batch")[0].members, ["wl-001"]);
     }
+    /// A store of its own **and** an environment of its own, which the verbs
+    /// above do not need and the verbs below do.
+    ///
+    /// `go` reaches `cmd_checkout::Occupied::now`, which asks herdr who is
+    /// standing in a tree — and on a machine where herdr is answering, that is
+    /// a test talking to whoever is working today. `util::isolated` points the
+    /// socket at nothing and the store at a directory of its own; it holds an
+    /// environment lock, so these run one at a time, which is the price of the
+    /// running verbs touching the world at all.
+    fn running(tag: &str) -> (util::Isolated, Store) {
+        let env = util::isolated(&format!("wlrun-{tag}"));
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        (env, store)
+    }
+
+    /// Where a run is, read the way the barrier reads it. `Settled` because
+    /// these tests are about the queue and not about git — the landed reading
+    /// has its own tests, in `worklist`, against real branches.
+    fn at(store: &Store, id: &str) -> (Worklist, Position) {
+        let w = store.worklist(id).expect("the list");
+        let p = worklist::position(store, &w, Reading::Settled);
+        (w, p)
+    }
+
+    fn gate_of(store: &Store, id: &str) -> String {
+        let (w, p) = at(store, id);
+        match state(store, &w, &p) {
+            State::Ready(f) => format!("ready {}", f.ready.join(" ")),
+            State::Waiting(f) => format!("waiting {}", f.waiting.len()),
+            State::Shut { gate: Gate::Start, prose, .. } => format!("start {prose}"),
+            State::Shut { gate: Gate::Held, prose, .. } => format!("held {prose}"),
+            State::Shut { gate: Gate::After(n), prose, .. } => format!("after {n} {prose}"),
+            State::Nothing => "nothing".to_string(),
+        }
+    }
+
+    fn verdicts(store: &Store, id: &str) -> Vec<String> {
+        groups_of(store, id).into_iter().map(|g| g.verdict).collect()
+    }
+
+    /// The design's one piece of machinery around judgement, and the whole of
+    /// what wsp contributes to it. wsp does not make the call — `fork`'s real
+    /// rule was *"if any of the three goes badly, flag and stop rather than
+    /// push through"*, which no boolean expresses. What it contributes is the
+    /// obligation to make one, and the record that one was made.
+    #[test]
+    fn a_barrier_with_prose_at_it_will_not_pass_until_somebody_writes_a_sentence() {
+        let (_env, store) = running("verdict");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        flagged(&store, &["group", "batch", "1"], &[("stop", "it has to land clean")]);
+        started(&store, "batch");
+
+        assert_eq!(gate_of(&store, "batch"), "after 1 it has to land clean");
+        assert_eq!(run(&store, &["go", "batch"]), 1, "no sentence, no passage");
+        assert_eq!(verdicts(&store, "batch")[0], "", "and nothing was written");
+
+        assert_eq!(run(&store, &["go", "batch", "it", "landed", "clean"]), 0);
+        assert!(
+            verdicts(&store, "batch")[0].ends_with("it landed clean"),
+            "the sentence is on the group the barrier is behind, dated"
+        );
+        assert_eq!(gate_of(&store, "batch"), "ready wl-002", "and now the next group is named");
+    }
+
+    /// A group with no stop condition asks for no judgement — and it is still a
+    /// barrier, because passing one is three other things as well: the
+    /// at-most-one-running check, the sweep of the trees behind it, and the
+    /// same-file report. The whole argument for the sweep being automatic is
+    /// that a step nobody is made to run happened zero times in two nights and
+    /// left 18 worktrees, so `next` must not walk past one.
+    #[test]
+    fn a_barrier_with_nothing_written_at_it_is_still_a_barrier_and_still_takes_go() {
+        let (_env, store) = running("silent");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+
+        assert_eq!(gate_of(&store, "batch"), "after 1 ", "shut, with nothing to read at it");
+        assert_eq!(run(&store, &["go", "batch"]), 0, "and three words pass it");
+        assert_eq!(gate_of(&store, "batch"), "ready wl-002");
+    }
+
+    /// Per `wsp-092`, a start condition on group N is stop prose on group N−1 —
+    /// except for group 1, whose start condition is the worklist's own
+    /// `## Overview`. That is the one nobody is made to read, because there is
+    /// no barrier in front of it. This is that barrier, on exactly the
+    /// machinery every other barrier uses, and it is what `worklist edit`
+    /// exists to be able to write.
+    #[test]
+    fn the_overview_is_group_ones_start_condition_and_a_list_that_has_one_stops_at_it() {
+        let (_env, store) = running("overview");
+        task(&store, "wl-001", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+
+        assert_eq!(gate_of(&store, "batch"), "ready wl-001", "nothing written, nothing to read");
+
+        let mut w = store.worklist("batch").unwrap();
+        crate::model::set_section_in(&mut w.body, "Overview", "wait for the tuning table");
+        store.save_worklist(&w).unwrap();
+
+        assert_eq!(gate_of(&store, "batch"), "start wait for the tuning table");
+        assert_eq!(run(&store, &["go", "batch"]), 1, "a start condition is a sentence too");
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Draft);
+
+        assert_eq!(run(&store, &["go", "batch", "the", "table", "is", "agreed"]), 0);
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
+        assert_eq!(gate_of(&store, "batch"), "ready wl-001");
+    }
+
+    /// The constraint the routing step rests on: a hand raised at 3am reaches
+    /// whoever is running the list this task is in tonight, and two running
+    /// lists holding it is a question with no answer. Checked at `go`, which is
+    /// the moment somebody can act on it, and named rather than counted.
+    #[test]
+    fn a_task_running_in_one_worklist_will_not_start_in_a_second() {
+        let (_env, store) = running("exclusive");
+        task(&store, "wl-001", "todo");
+        run(&store, &["new", "night", "n"]);
+        run(&store, &["add", "night", "wl-001"]);
+        run(&store, &["new", "other", "o"]);
+        run(&store, &["add", "other", "wl-001"]);
+
+        assert_eq!(run(&store, &["go", "night"]), 0);
+        assert_eq!(run(&store, &["go", "other"]), 1, "the same task, in a second run");
+        assert_eq!(store.worklist("other").unwrap().status(), WorklistStatus::Draft);
+
+        // A plan is not a run: holding the first frees the task for the second.
+        assert_eq!(run(&store, &["hold", "night", "not", "tonight"]), 0);
+        assert_eq!(run(&store, &["go", "other"]), 0);
+    }
+
+    /// `hold` means *start nothing more* and means nothing stronger. Work in
+    /// flight cannot be unwound, and a verb that pretended otherwise would be
+    /// promising the one part of this design that could not be built.
+    #[test]
+    fn holding_starts_nothing_more_and_takes_nothing_back() {
+        let (_env, store) = running("hold");
+        task(&store, "wl-001", "doing");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["go", "batch"]);
+
+        assert_eq!(run(&store, &["hold", "batch"]), 2, "a stop with no reason on it");
+        assert_eq!(run(&store, &["hold", "batch", "the", "table", "moved"]), 0);
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Held);
+        assert_eq!(gate_of(&store, "batch"), "held the table moved", "and the reason is readable back");
+        assert_eq!(
+            store.task("wl-001").unwrap().status_raw,
+            "doing",
+            "what was already going is untouched — holding is about what starts next"
+        );
+
+        assert_eq!(run(&store, &["go", "batch", "settled", "again"]), 0);
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
+    }
+
+    /// Passing a barrier sweeps the trees behind it, and sweeping a tree
+    /// deletes its branch — so a member that landed but never reached `review`
+    /// reads as *never started* the moment its tree goes, and the position
+    /// slips back onto a group already passed. `next` would then offer to start
+    /// work that is on the trunk: a second agent on landed work, caused by the
+    /// barrier's own cleanup. The verdict is what stops it, and the member that
+    /// caused it is named rather than covered up.
+    #[test]
+    fn the_run_does_not_go_back_past_a_barrier_somebody_passed_and_says_who_made_it_try() {
+        let (_env, store) = running("floor");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["go", "batch"]);
+        run(&store, &["go", "batch"]);
+        assert_eq!(at(&store, "batch").1.at, Some(2), "group 1 is behind it");
+
+        // The member of the passed group stops looking finished.
+        task(&store, "wl-001", "doing");
+        let (_, p) = at(&store, "batch");
+        assert_eq!(p.at, Some(2), "the run stays where somebody put it");
+        assert_eq!(
+            p.slipped.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["wl-001"],
+            "and the member that would have dragged it back is named"
+        );
+    }
+
+    /// `xN` is a cap on the work — "only two of these at once, they sit near
+    /// each other" — and the number that is held back is reported, because a
+    /// governor told "1 may start now" about a group of three otherwise goes
+    /// looking for the two that are missing.
+    #[test]
+    fn a_groups_cap_holds_back_what_it_will_not_run_at_once_and_says_how_many() {
+        let (_env, store) = running("cap");
+        for id in ["wl-001", "wl-002", "wl-003"] {
+            task(&store, id, "todo");
+        }
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001", "wl-002", "wl-003"]);
+        flagged(&store, &["group", "batch", "1"], &[("parallel", "1")]);
+        run(&store, &["go", "batch"]);
+
+        let (w, p) = at(&store, "batch");
+        let State::Ready(f) = state(&store, &w, &p) else { panic!("nothing has started") };
+        assert_eq!(f.ready, ["wl-001"], "one at a time, in the order the group names them");
+        assert_eq!(f.capped, 2, "and the other two are said to be held back, not lost");
+    }
+
+    /// `done` is somebody's decision that there is nothing left to want, not a
+    /// check that the list finished — a run abandoned two groups from the end
+    /// is an ordinary thing to be finished with. What it owes is saying what it
+    /// closed over, at the moment it happens.
+    #[test]
+    fn done_is_a_decision_and_names_what_was_still_open_when_it_was_taken() {
+        let (_env, store) = running("done");
+        task(&store, "wl-001", "doing");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["go", "batch"]);
+
+        assert_eq!(run(&store, &["done"]), 2, "and it is named rather than taken from the seat");
+        assert_eq!(run(&store, &["done", "batch"]), 0);
+        let w = store.worklist("batch").unwrap();
+        assert_eq!(w.status(), WorklistStatus::Done);
+        assert!(
+            w.section("Log").unwrap_or_default().contains("done at group 1 of 2 — wl-001"),
+            "the log says where it was closed and what was open in it"
+        );
+    }
+
 }

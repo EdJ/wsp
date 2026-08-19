@@ -2448,7 +2448,7 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
 /// claimed onto anot…` — so the label restates the id already in the sentence
 /// and arrives elided, with the ellipsis landing mid-clause. The id is the part
 /// the reader cannot reconstruct: it says which screen to go and look at.
-fn claim_where(claim: &serde_json::Value) -> String {
+pub(crate) fn claim_where(claim: &serde_json::Value) -> String {
     let get = |k: &str| claim.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let (label, id) = (get("workspace_label"), get("workspace_id"));
     match (id.is_empty(), label.is_empty()) {

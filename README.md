@@ -101,6 +101,20 @@ wsp spawn 003 --agent       # open a workspace on it and put an agent in it
 wsp despawn 003             # end it: the agent, the claim and the worktree
 ```
 
+Running a worklist is three words on repeat, and each answer names the command
+after it:
+
+```sh
+wsp worklist next           # …or `next <slug>` where the workspace holds no seat
+                            #   group 2 of 4 — 4 may start now      → wsp spawn each
+                            #   group 2 of 4 — waiting on 2         → wait
+                            #   group 1 of 4 finished — read this…  → go, or hold
+                            #   nothing left — 4 groups, all …      → done
+wsp worklist go "…"         # pass the barrier: the verdict, the sweep behind it,
+                            #   and which members of that group touched one file
+wsp worklist hold "…"       # start nothing more; what is running is left to finish
+```
+
 ## The panel
 
 `wsp panel` is a sidebar that runs in a pane of its own. herdr's own sidebar
@@ -3413,7 +3427,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/fm.rs` | the small YAML-frontmatter subset |
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
-| `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, and the sweep a passed group licenses |
+| `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, and what a landed group touched |
 | `src/guard.rs` | the stash guard: one stack per repository however many worktrees, and the git hook that refuses it inside the command that would have taken it |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
@@ -3444,7 +3458,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
 | `src/cmd_machine.rs` | the machines agents can be run on |
-| `src/cmd_worklist.rs` | composing a queue of groups, and the window a hand may still edit it in |
+| `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |

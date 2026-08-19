@@ -1293,6 +1293,7 @@ mod tests {
             of: 5,
             members: Vec::new(),
             passed: Vec::new(),
+            slipped: Vec::new(),
             reading: crate::worklist::Reading::Settled,
         };
         r.seat_at = Some(at(Some(2)));
