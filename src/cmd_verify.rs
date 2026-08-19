@@ -1116,7 +1116,7 @@ fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> 
     }
     // Progress only to a terminal, and on one line. An agent's captured output
     // is charged for every byte of it on every later request, so seven hundred
-    // counter lines in a transcript cost more than the ten minutes did.
+    // counter lines in a transcript cost more than the ~90s did.
     let tick = !json_out && util::stdout_is_tty();
     let mut bad = Vec::new();
     for (i, (exe, name)) in names.iter().enumerate() {
@@ -1130,9 +1130,9 @@ fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> 
                 print!("\r\x1b[K");
             }
             if !json_out {
-                // Printed as it happens rather than collected: ten minutes is
-                // long enough that a failure at minute two is worth having at
-                // minute two, and it is the only output this makes.
+                // Printed as it happens rather than collected: ~90s is long
+                // enough that a failure at ten seconds is worth having at ten
+                // seconds, and it is the only output this makes.
                 match &f.at {
                     Some(at) => println!("{} {} {}", p.red("✗"), p.bold(&f.name), p.dim(at)),
                     None => println!("{} {}", p.red("✗"), p.bold(&f.name)),
@@ -1377,9 +1377,9 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // cannot overwrite each other's.
     //
     // `--alone` is the exception, and the header says why: a warm slot is one
-    // of three and that pass holds a tree for ten minutes, which is not a
-    // build's worth of borrowing. It builds in the agent's own tree instead and
-    // pays 21s for it.
+    // of three and that pass holds a tree for a minute and a half, against the
+    // twenty seconds an ordinary build borrows one for. It builds in the
+    // agent's own tree instead and pays 21s for it.
     let alone_pass_asked = args.has("alone");
     let warm = (!alone_pass_asked)
         .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES))

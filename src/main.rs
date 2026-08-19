@@ -605,8 +605,8 @@ fn help() {
                                     yours alone while it builds, and cold only
                                     when they are all busy; --rm drops the one
                                     you built in, --all every free one
-  wsp verify --alone                …or every test in a process of its own, ~10
-                                    minutes, naming the failures and nothing
+  wsp verify --alone                …or every test in a process of its own,
+                                    ~90s, naming the failures and nothing
                                     else — what to reach for when a test goes
                                     red and then green
   wsp install [<path>] [--why "…"] [-n] [--force] [--to PATH]
