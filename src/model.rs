@@ -1298,14 +1298,17 @@ impl Machine {
 
 // ---- worklists --------------------------------------------------------
 //
-// Every item below carries `#[allow(dead_code)]` and none of them will keep
-// it. The record is built one group ahead of the verbs that read it —
-// `worklist` group 1 against groups 2 to 5 — deliberately, because everything
+// Every item below carried `#[allow(dead_code)]` while its callers were still
+// a group away. The record was built one group ahead of the verbs that read it
+// — `worklist` group 1 against groups 2 to 5 — deliberately, because everything
 // after this types against these shapes and a shape changed later is four
-// rebuilds. The attribute is the marker for "its caller has not landed yet",
-// and it comes off with the `use`, one item at a time, rather than a blanket
-// allow over the whole record that would go on hiding a genuinely dead
-// function years from now.
+// rebuilds. `cmd_worklist` is the caller, and the markers came off with it, one
+// item at a time rather than as a blanket allow over the record that would go
+// on hiding a genuinely dead function years from now.
+//
+// Two are still here, each on the one item it covers and each naming the caller
+// it is waiting for. That is the whole discipline: a marker with no named
+// caller is a dead item nobody has admitted to yet.
 
 /// Where a worklist is, and it is the only state the file holds.
 ///
@@ -1320,7 +1323,6 @@ impl Machine {
 /// groups still ahead of it; `done` is somebody saying there is nothing left
 /// to want from it. Collapsing them would lose the only distinction a reader
 /// looking at a stalled list actually needs.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorklistStatus {
     Draft,
@@ -1329,7 +1331,6 @@ pub enum WorklistStatus {
     Done,
 }
 
-#[allow(dead_code)]
 impl WorklistStatus {
     pub fn parse(s: &str) -> Option<WorklistStatus> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -1355,6 +1356,12 @@ impl WorklistStatus {
     /// and only a running list has a barrier to wait at. Draft, held and done
     /// lists are plans, and a task may be in as many of those as somebody
     /// cares to plan it into.
+    ///
+    /// The editing verbs deliberately do not use it — their question is whether
+    /// the run has *begun*, and `held` freezes a group exactly as `running`
+    /// does, so `!= Draft` is the honest test there and this would have been
+    /// the convenient wrong one. `worklist::passed_by_running` is the caller
+    /// that wants it read literally, and the seat routing will be the next.
     pub fn is_running(&self) -> bool {
         *self == WorklistStatus::Running
     }
@@ -1375,7 +1382,6 @@ impl WorklistStatus {
 /// is advice about how to compose a group rather than machinery. It is what
 /// produced zero land-time conflicts across fifteen agents, and it needs no
 /// primitive to keep saying so.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Group {
     /// Task ids, referenced and not owned: a member stays in whatever project
@@ -1400,7 +1406,6 @@ pub struct Group {
     pub stop: String,
 }
 
-#[allow(dead_code)]
 impl Group {
     /// How many of this group may actually be running at once: **the smaller
     /// of the group's `xN` and the machine's cap**, and `None` when neither
@@ -1425,6 +1430,12 @@ impl Group {
     /// The machine's cap is passed in rather than read from a [`Machine`]
     /// because the machine everything runs on today — the seat — has no
     /// record to read it off. See [`Machine::agents`].
+    ///
+    /// Still waiting for its caller, which is the barrier: nothing computes an
+    /// effective parallelism until something is deciding how many of a group to
+    /// start, and `wsp worklist next` is where that happens. The editing verbs
+    /// only ever write the number down.
+    #[allow(dead_code)] // `wsp worklist next`, `worklist` group 4
     pub fn parallelism(&self, machine_cap: Option<usize>) -> Option<usize> {
         match (self.cap, machine_cap) {
             (Some(group), Some(machine)) => Some(group.min(machine)),
@@ -1436,9 +1447,7 @@ impl Group {
 /// The columns a wrapped `stop:` breaks to, and the indent its continuations
 /// carry — chosen so a group and its prose sit inside 80 with the two-space
 /// leader, because this is a file people read and hand-edit ahead of the work.
-#[allow(dead_code)]
 const STOP_INDENT: &str = "        ";
-#[allow(dead_code)]
 const STOP_WIDTH: usize = 70;
 
 /// The `## Groups` section, parsed. Line order is the queue.
@@ -1455,7 +1464,6 @@ const STOP_WIDTH: usize = 70;
 /// `batch` handbook's table was not — so anything in it that is not a group
 /// does not survive the next write, and there is nowhere in it for a comment
 /// to live.
-#[allow(dead_code)]
 pub fn parse_groups(text: &str) -> Vec<Group> {
     let cap_of = |t: &str| -> Option<usize> {
         // `x` and `×` both, because the design wrote one and the keyboard has
@@ -1512,7 +1520,6 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
 /// pair round-trips: the ordinals are the positions, `xN` is emitted in ASCII
 /// whatever it was read as, and a `stop` that wraps comes back as the one
 /// paragraph it was.
-#[allow(dead_code)]
 pub fn render_groups(groups: &[Group]) -> String {
     let mut out = String::new();
     for (i, g) in groups.iter().enumerate() {
@@ -1542,7 +1549,6 @@ pub fn render_groups(groups: &[Group]) -> String {
 /// A worklist's body sections. `Groups` is second because it is what the file
 /// is for; `Overview` above it is where the first group's start condition
 /// lives, there being no group before it to carry one.
-#[allow(dead_code)]
 pub const WORKLIST_SECTIONS: [&str; 4] = ["Overview", "Groups", "Decisions", "Log"];
 
 /// A queue of groups of task references, run in order, with a barrier between
@@ -1566,7 +1572,6 @@ pub const WORKLIST_SECTIONS: [&str; 4] = ["Overview", "Groups", "Decisions", "Lo
 /// and the `batch` handbook was not — that table described a structure held
 /// somewhere else and went stale within the hour, and this section *is* the
 /// structure, so it has nothing to disagree with.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct Worklist {
     /// The slug, and the file stem. It shares a key space with project ids,
@@ -1579,7 +1584,6 @@ pub struct Worklist {
     pub body: String,
 }
 
-#[allow(dead_code)]
 impl Worklist {
     pub fn new(id: &str, title: &str) -> Worklist {
         Worklist {
@@ -1598,6 +1602,12 @@ impl Worklist {
         WorklistStatus::parse(&self.status_raw).unwrap_or(WorklistStatus::Draft)
     }
 
+    /// Still waiting for its caller, which is `go`, `hold` and `done` — the
+    /// three verbs that take the decision this field records. Composing a list
+    /// never moves it: `new` writes `draft` and every editing verb leaves it
+    /// alone, which is the point of the status holding only what somebody
+    /// decided.
+    #[allow(dead_code)] // `wsp worklist go|hold|done`, `worklist` group 4
     pub fn set_status(&mut self, s: WorklistStatus) {
         self.status_raw = s.as_str().to_string();
     }

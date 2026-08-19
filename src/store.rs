@@ -434,7 +434,6 @@ impl Store {
         Some(Worklist::from_doc(&fm::parse(&text), id))
     }
 
-    #[allow(dead_code)] // the verbs that read it are the next group; see `model`
     pub fn save_worklist(&self, w: &Worklist) -> std::io::Result<()> {
         fs::create_dir_all(self.worklists_dir())?;
         let path = self.worklist_path(&w.id);
@@ -467,7 +466,6 @@ impl Store {
     ///
     /// `excluding` is the scope keeping its own name: a rename to what it is
     /// already called is not a collision.
-    #[allow(dead_code)] // the verbs that read it are the next group; see `model`
     pub fn scope_taken(&self, scope: &str, excluding: Option<&str>) -> Option<String> {
         if Some(scope) == excluding {
             return None;

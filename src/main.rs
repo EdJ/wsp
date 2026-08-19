@@ -24,6 +24,7 @@ mod cmd_sandbox;
 mod cmd_spawn;
 mod cmd_task;
 mod cmd_verify;
+mod cmd_worklist;
 mod daemon;
 mod detail;
 mod detect_override;
@@ -103,6 +104,9 @@ const BOOL_FLAGS: &[&str] = &[
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it.
     "govern", "remove",
+    // And `worklist add <slug> <parent> --sub`, whose positionals are the list
+    // and the parent, and `worklist show <slug> --log`.
+    "sub", "log",
 ];
 
 /// Flags that keep their meaning inside a command's payload.
@@ -463,6 +467,9 @@ fn main() {
         "resume" => cmd_resume::resume(&store, &args),
         "despawn" => cmd_spawn::despawn(&store, &args),
         "machine" | "machines" => cmd_machine::dispatch(&store, &args),
+        // The verbs that compose a list. Running one — `next`, `go`, `hold`,
+        // `done` — extends this same dispatch and lands after it.
+        "worklist" | "wl" => cmd_worklist::dispatch(&store, &args),
         "mandate" => cmd_mandate::mandate(&store, &args),
         "govern" => cmd_govern::govern(&store, &args),
         "release" => cmd_agent::release(&store, &args),
@@ -695,6 +702,27 @@ fn help() {
   wsp machine set <name> k=v…       ssh/backend_at/os/arch/status
   wsp machine rm <name> [--force]   retire it; --force removes the record
 
+{worklists}
+  wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,
+                                    outside the projects its members live in —
+                                    it references them, nothing moves
+  wsp worklist add <slug> <task>…   one call, one group; its members run at
+                                    the same time. --group N joins a group
+                                    that exists instead of making one
+  wsp worklist add <slug> <parent> --sub   …or that parent's open sub-tasks as
+                                    one group, resolved now and not live
+  wsp worklist rm <slug> <task>…    take members out; a group left empty goes
+  wsp worklist mv <slug> <task> --group N   between groups, or --after N for a
+                                    new one between two that exist
+  wsp worklist group <slug> N [--parallel N|none] [--stop "…"|-]
+                                    a cap on the work, and the prose read at
+                                    the barrier after that group — `-` reads it
+                                    from a stream, where a shell never sees it
+  wsp worklist ls|show <slug>       every list, or one: the groups, where it is
+                                    up to, and which of them may still be edited
+  Editing is write-ahead-only: a group at or behind where the list is up to has
+  either run or is running, and is refused with what may be edited instead.
+
 {plumbing}
   wsp panel [--full]                the sidebar replacement (runs in a pane);
                                     --full is the whole tree at the width of the
@@ -752,6 +780,7 @@ the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
         tasks = h("TASKS"),
         agents = h("AGENTS"),
         machines = h("MACHINES"),
+        worklists = h("WORKLISTS"),
         plumbing = h("PLUMBING"),
     );
 }

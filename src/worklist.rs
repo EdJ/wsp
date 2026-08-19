@@ -96,7 +96,6 @@ use crate::util;
 pub enum Reading {
     /// The store alone: a task at `review` or closed is finished with. Free,
     /// and what a surface redrawing four times a second can afford.
-    #[allow(dead_code)]
     Settled,
     /// Git as well: the member's branch is on the trunk. One process per
     /// member, and the only reading a barrier may open on.
@@ -129,7 +128,6 @@ impl Settlement {
 
     /// The word for a column, which is the status where there is one and the
     /// fact of absence where there is not.
-    #[allow(dead_code)]
     pub fn word(&self) -> &str {
         match self {
             Settlement::Open(s) => s.as_str(),
@@ -194,7 +192,7 @@ impl Standing {
     ///
     /// Nothing about the agent: who is standing on it is the claim's to say,
     /// and this module never asks herdr.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // `wsp worklist next`, `worklist` group 4
     pub fn note(&self) -> String {
         match &self.landing {
             Some(Landing::Ahead { commits, trunk }) => {
@@ -267,14 +265,13 @@ pub struct Position {
 impl Position {
     /// Every group finished. Not the same as the worklist being `done`, which
     /// is somebody saying there is nothing left to want from it.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // `wsp worklist next`, `worklist` group 4
     pub fn finished(&self) -> bool {
         self.at.is_none()
     }
 
     /// The members holding the current group, in the order the group names
     /// them. What a barrier reports when it will not open.
-    #[allow(dead_code)]
     pub fn holding(&self) -> Vec<&Standing> {
         self.members.iter().filter(|s| !s.finished()).collect()
     }
@@ -336,7 +333,6 @@ pub fn member(store: &Store, repos: &mut Repos, id: &str, reading: Reading) -> S
 /// while there is still time to put something back. The caller prints it and
 /// writes it to the worklist's log — this only finds it, because removing it is
 /// the one thing nothing here is allowed to do.
-#[allow(dead_code)]
 pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
     let mut out = Vec::new();
     for g in w.groups() {
@@ -429,7 +425,7 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
 /// in, are passed over: there is no repository to find a tree in. They are
 /// still named by [`dangling`], which is a different question and a different
 /// moment.
-#[allow(dead_code)]
+#[allow(dead_code)] // `wsp worklist go`, `worklist` group 4
 pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
     if p.reading != Reading::Landed {
         return Err("a tree is removed on the landed reading and never on the settled one".into());
