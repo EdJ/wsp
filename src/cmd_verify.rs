@@ -115,6 +115,105 @@
 //! decided by the run that failed; the re-run alone is evidence printed beside
 //! it, never a second opinion that overrules it.
 //!
+//! # Every test in a process of its own, which is a different instrument
+//!
+//! `--alone` runs the suite one test per process and prints the tests that
+//! failed and nothing else. It is not a slower `cargo test`. It sees a class of
+//! bug the ordinary suite cannot see, and on this tree it has now found two:
+//!
+//! - `robustness-072`: a parent waiting on a file appearing rather than on the
+//!   child. Alone, on a quiet machine, **0 passed / 50 failed**.
+//! - `robustness-074`: `fake.rs` handing the accepted connection the listener's
+//!   `O_NONBLOCK`, so the first `read_line` answered `WouldBlock` and the server
+//!   hung up on a client mid-sentence. Alone, **14 failed in 60**.
+//!
+//! Both were written up as "flaky under load" and both were the opposite:
+//! **concurrency was hiding them.** A parent competing with seven hundred other
+//! tests gets descheduled after its first poll, which hands the child exactly
+//! the milliseconds it needed — so the busier the machine, the greener the
+//! suite, and the thing everybody reached for to reproduce a flake was the
+//! thing making it go away. Twice is a pattern. The signal is clean: before the
+//! `074` fix, two of three passes flagged one test and nothing else; after it,
+//! two passes flagged nothing at all.
+//!
+//! ## What it costs, which is a quarter of what the record says
+//!
+//! Measured here on 2026-08-19, two builds on the machine:
+//!
+//! | | 728 tests |
+//! |---|---|
+//! | `cargo test`, threads, what `verify` runs | **24.6s** |
+//! | one process each, warm tree | **85s** |
+//! | one process each, counting the cold build | 4m11s |
+//!
+//! So **3.5× the suite, not the twenty the record implies.** `robustness-074`
+//! recorded "701 tests, one process each, about ten minutes", and that number
+//! is what made the instrument look like something you schedule rather than
+//! something you run. Two things separate it from 85s, and only one of them is
+//! method: a `cargo test --exact` per test pays ~48ms of freshness check before
+//! libtest starts (measured, five runs), which over 728 tests is ~35s — so
+//! running the compiled binary directly accounts for about half a minute of it.
+//! The rest is the machine: that pass ran with six agents on this laptop at
+//! load 200–350. It is worth knowing which is which, because 85s is a step in
+//! a task and ten minutes is not.
+//!
+//! ## Why it is a flag on this command rather than a script or a `just` target
+//!
+//! Because the hard part is not the loop, it is the tree. Every property that
+//! makes a `verify` result mean anything — a private index at HEAD, a patch of
+//! this agent's change and nobody else's, a tree nobody else is standing in —
+//! is the same property an alone-pass needs, and a script in the repository
+//! would either reinvent all of it or run in the shared checkout and measure
+//! whatever four other agents had half-finished. There is no `justfile` here
+//! and adding one to hold nine lines would be a second place for the tree rules
+//! to drift out of. So the pass reuses the whole of this command up to the
+//! build, and adds a loop and a printer.
+//!
+//! It also inherits the failure parser, which matters more than it sounds: a
+//! failure reads identically whether the suite found it or the pass did.
+//!
+//! ## It does not take a warm tree, and it does not run tests in parallel
+//!
+//! Two deliberate differences. A warm slot is one of three on this machine and
+//! an ordinary build holds it for twenty seconds; this holds a tree for a
+//! minute and a half, and cold for four. So `--alone` builds in the agent's own
+//! tree — cold the first time, warm after, and dying with the checkout like
+//! everything else here. Measured above, that trade is ~2m of extra compile
+//! once, against never taking a third of the machine's build capacity away.
+//!
+//! And it is sequential, which is not laziness: contention between processes is
+//! a weaker version of exactly the effect that hid both bugs, and an instrument
+//! that reintroduces the thing it exists to remove is a faster way of learning
+//! nothing. The 85s is what buys the isolation, and it is the whole product.
+//!
+//! ## When to run it, which is the harder half
+//!
+//! Not on an ordinary `verify`. 85s against a 30s verify is not the twenty-fold
+//! penalty it was thought to be, but an agent verifies many times in one task and
+//! build time is already the scarce resource here (`robustness-077`). Three
+//! moments, and one rejected:
+//!
+//! - **When a test goes red and then green.** The moment both real occasions
+//!   actually were, and the one that is mechanised rather than documented: a
+//!   red run already re-runs the named test by itself, and when that passes —
+//!   the flake signature — the line saying so now names this pass. One line of
+//!   output, on red runs only, in front of the only person with a reason to act
+//!   on it.
+//! - **Before `wsp review`, when the change touched tests.** This is what 85s
+//!   buys that ten minutes did not: 85s against a task measured in tens of
+//!   minutes is 3%, and it is the only moment that catches an order-dependent
+//!   test *on the day it is written* rather than months later by an agent
+//!   investigating something else — which is how both of these were found.
+//! - **Before a release**, against the trunk, once. Deliberately *not* wired
+//!   into `wsp install`: a check on the install path is a check people route
+//!   around, and one they choose is worth more than one they resent.
+//! - **Not on a schedule.** The machine is almost never idle — six agents was
+//!   ordinary while this was written — and a pass that runs at 04:00 reports to
+//!   nobody. Ten minutes, or 85 seconds, of output no one owns is the same as
+//!   no instrument, which is the failure this whole task is written against. If
+//!   it ever does run unattended it has to file a task with the names in it,
+//!   and that is a larger thing than this.
+//!
 //! # The trees are separate; the machine is not
 //!
 //! A tree per task means a *cold* build per task, and each `cargo` takes `-j8`
@@ -141,7 +240,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -809,6 +908,298 @@ fn rerun_alone(tree: &Path, target: &Path, name: &str, share: &Share) -> Option<
     text.contains("1 passed; 0 failed").then_some(true)
 }
 
+/// How long one test alone may take before the pass calls it a failure.
+///
+/// A deadlock is exactly the class of bug this pass hunts — `robustness-072`
+/// was a wait on a file that never appeared, and the fix was to wait on the
+/// child instead — so a test that hangs is a result and not an accident. With
+/// no limit the first one to hang costs the whole ten minutes and prints
+/// nothing at the end of it, which is the one failure mode an instrument
+/// nobody is watching cannot have.
+///
+/// Sixty seconds against tests that average 117ms alone (728 in 85s, measured
+/// 2026-08-19). It is deliberately nowhere near tight: this laptop runs six
+/// agents at load 200–350 often enough, and a timeout that fires under load
+/// would report the machine rather than the test — which is the exact mistake
+/// this instrument exists to stop people making.
+const ALONE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The compiled test binaries, out of cargo's own JSON.
+///
+/// `--no-run` rather than a `cargo test` per test: cargo spends ~48ms deciding
+/// nothing has changed before libtest starts (measured over five runs), which
+/// across 728 tests is ~35s of the pass spent asking a question whose answer
+/// cannot have moved. The point is one *test* process each, not one *cargo*
+/// each. What comes back is the executable itself, which the pass runs directly.
+///
+/// The JSON is on stdout and everything a human reads is on stderr, so the two
+/// halves separate on the leading brace — which is also how a compile failure
+/// gets reported here without printing a build log made of objects.
+fn test_binaries(tree: &Path, target: &Path, share: &Share) -> Result<Vec<PathBuf>, String> {
+    let argv = &["test", "--no-run", "--message-format=json"];
+    let (ok, text) = cargo(tree, target, argv, false, share);
+    if !ok {
+        let msg: Vec<&str> = text.lines().filter(|l| !l.starts_with('{')).collect();
+        return Err(msg.join("\n"));
+    }
+    let exes = executables(&text);
+    if exes.is_empty() {
+        return Err("cargo built no test binaries".to_string());
+    }
+    Ok(exes)
+}
+
+/// The test binaries in a `--message-format=json` run, and nothing else in it.
+///
+/// `profile.test` rather than the target kind: a build script and the crate's
+/// own `lib` both come past as artifacts, and only the ones compiled with the
+/// test harness can be handed a test name.
+fn executables(text: &str) -> Vec<PathBuf> {
+    let mut exes = Vec::new();
+    for line in text.lines().filter(|l| l.starts_with('{')) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v["reason"] != "compiler-artifact" || v["profile"]["test"] != true {
+            continue;
+        }
+        if let Some(e) = v["executable"].as_str() {
+            exes.push(PathBuf::from(e));
+        }
+    }
+    exes
+}
+
+/// Every test in one binary, asked of the binary rather than guessed.
+///
+/// Doc tests are not here and are not missing: rustdoc compiles and runs each
+/// one as its own process already, so they are the one part of `cargo test`
+/// that this pass would have nothing to add to.
+fn test_names(exe: &Path) -> Vec<String> {
+    let Ok(out) = Command::new(exe).args(["--list", "--format", "terse"]).output() else {
+        return Vec::new();
+    };
+    listed(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `name: test` per line, and a trailing count line that is not one.
+///
+/// Benchmarks list themselves the same way with `: benchmark`, and are left
+/// out: `--exact` on one runs it as a test, which measures nothing and takes as
+/// long as a benchmark.
+fn listed(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Run one test in a process of its own and say what happened to it.
+///
+/// The output goes to a file rather than a pipe because the process is waited
+/// on with a timeout: a pipe nobody is draining fills and stops the writer, so
+/// a test that printed enough would hang here and be reported as the hang this
+/// is looking for. One file, reused, in the agent's own scratch directory.
+///
+/// Waiting is `try_wait` in a loop, which asks the kernel about the child
+/// rather than about anything standing in for it. Five milliseconds is under a
+/// percent of the time one test takes and two seconds across the whole pass.
+fn run_alone(exe: &Path, name: &str, log: &Path, timeout: Duration) -> Option<Failure> {
+    let Ok(file) = std::fs::File::create(log) else {
+        return Some(Failure { name: name.into(), at: None, message: Some("no log file".into()) });
+    };
+    let Ok(err) = file.try_clone() else {
+        return Some(Failure { name: name.into(), at: None, message: Some("no log file".into()) });
+    };
+    let child = Command::new(exe)
+        .args(["--exact", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::from(err))
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(Failure { name: name.into(), at: None, message: Some(format!("{e}")) })
+        }
+    };
+    let started = Instant::now();
+    let mut ok = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                ok = Some(st.success());
+                break;
+            }
+            Err(_) => break,
+            Ok(None) => {}
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let Some(ok) = ok else {
+        return Some(Failure {
+            name: name.into(),
+            at: None,
+            message: Some(format!("no answer in {timeout:?} — killed")),
+        });
+    };
+    if ok {
+        return None;
+    }
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    // The same parser the suite's own red runs use, so a failure reads the same
+    // whichever run found it. A name it cannot find a block for is still the
+    // failure — the exit status already said so.
+    Some(
+        failures(&text)
+            .into_iter()
+            .find(|f| f.name == name)
+            .unwrap_or(Failure { name: name.into(), at: None, message: None }),
+    )
+}
+
+/// Every test in the suite, one process each, and the names of the ones that
+/// did not survive it.
+///
+/// The tree and target are the agent's own — see the header for why this one
+/// does not take a warm slot — and the compile has already happened by the time
+/// anything here runs, so the 85s is test time and nothing else.
+///
+/// The printed failure is the record. There is no per-test log kept: the name,
+/// the panic site and the assertion are what the suite's own red runs give and
+/// what both investigations here worked from, and a named test is one command
+/// to run again.
+fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> (usize, Vec<Failure>) {
+    let log = dir.join("alone.out");
+    let names: Vec<(PathBuf, String)> = exes
+        .iter()
+        .flat_map(|e| test_names(e).into_iter().map(move |n| (e.clone(), n)))
+        .collect();
+    if !json_out {
+        println!(
+            "{} {}",
+            p.dim("alone"),
+            p.bold(&format!("{} tests, one process each", names.len()))
+        );
+    }
+    // Progress only to a terminal, and on one line. An agent's captured output
+    // is charged for every byte of it on every later request, so seven hundred
+    // counter lines in a transcript cost more than the ten minutes did.
+    let tick = !json_out && util::stdout_is_tty();
+    let mut bad = Vec::new();
+    for (i, (exe, name)) in names.iter().enumerate() {
+        if tick {
+            use std::io::Write;
+            print!("\r{} {}/{}  ", p.dim("alone"), i + 1, names.len());
+            let _ = std::io::stdout().flush();
+        }
+        if let Some(f) = run_alone(exe, name, &log, ALONE_TIMEOUT) {
+            if tick {
+                print!("\r\x1b[K");
+            }
+            if !json_out {
+                // Printed as it happens rather than collected: ten minutes is
+                // long enough that a failure at minute two is worth having at
+                // minute two, and it is the only output this makes.
+                match &f.at {
+                    Some(at) => println!("{} {} {}", p.red("✗"), p.bold(&f.name), p.dim(at)),
+                    None => println!("{} {}", p.red("✗"), p.bold(&f.name)),
+                }
+                if let Some(m) = &f.message {
+                    println!("    {}", util::truncate(m, 200));
+                }
+            }
+            bad.push(f);
+        }
+    }
+    if tick {
+        print!("\r\x1b[K");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+    let _ = std::fs::remove_file(&log);
+    (names.len(), bad)
+}
+
+/// `wsp verify --alone`: compile the change, then run every test in the suite
+/// in a process of its own, and print the ones that did not survive it.
+///
+/// Everything before this point is ordinary `verify` — the private index, the
+/// patch, a tree reset to HEAD with the patch on it — so what is measured is
+/// this agent's change and not whatever is in the checkout.
+fn alone(
+    p: &util::Paint,
+    state: &Path,
+    dir: &Path,
+    tree: &Path,
+    target: &Path,
+    json_out: bool,
+    started: Instant,
+) -> i32 {
+    // The share covers the compile and is dropped before the pass. Ten minutes
+    // of running one test at a time is not a build: a machine that counted it
+    // as one would hand every other agent a smaller slice of the cores for the
+    // whole of it, and this pass wants one core and the machine quiet.
+    let exes = {
+        let share = sharing::take(state);
+        if !json_out {
+            if let Some(note) = share.note() {
+                println!("{} {}", p.dim("machine"), p.dim(&note));
+            }
+            println!("{} cargo test --no-run", p.dim("→"));
+        }
+        match test_binaries(tree, target, &share) {
+            Ok(e) => e,
+            Err(msg) => {
+                eprintln!("{msg}");
+                eprintln!("{} nothing to run alone — the build failed", p.red("✗"));
+                return 1;
+            }
+        }
+    };
+
+    let (n, bad) = alone_pass(p, dir, &exes, json_out);
+    let secs = started.elapsed().as_secs_f64();
+
+    if json_out {
+        println!(
+            "{}",
+            json!({
+                "ok": bad.is_empty(),
+                "alone": true,
+                "tests": n,
+                "tree": util::contract(tree),
+                "failures": bad
+                    .iter()
+                    .map(|f| json!({"test": f.name, "at": f.at, "message": f.message}))
+                    .collect::<Vec<_>>(),
+                "seconds": (secs * 10.0).round() / 10.0,
+            })
+        );
+        return i32::from(!bad.is_empty());
+    }
+
+    let took = util::duration_human(secs as i64);
+    if bad.is_empty() {
+        println!("{} {} in {took}", p.green("✓"), p.bold(&format!("{n} tests each passed alone")));
+        0
+    } else {
+        // The count and nothing else: the names are already above, printed as
+        // each one happened, and repeating them here would double the only
+        // output this command has.
+        println!(
+            "{} {} in {took}",
+            p.red("✗"),
+            p.bold(&format!("{} of {n} failed alone", bad.len()))
+        );
+        1
+    }
+}
+
 pub fn verify(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let json_out = args.json();
@@ -956,15 +1347,27 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // the build is done, and only the tree and its target move: the index, the
     // patch and the log stay in this agent's own directory, where two agents
     // cannot overwrite each other's.
-    let warm = sharing::warm(&store.state, &named_for, sharing::WARM_TREES);
+    //
+    // `--alone` is the exception, and the header says why: a warm slot is one
+    // of three and that pass holds a tree for ten minutes, which is not a
+    // build's worth of borrowing. It builds in the agent's own tree instead and
+    // pays 21s for it.
+    let alone_pass_asked = args.has("alone");
+    let warm = (!alone_pass_asked)
+        .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES))
+        .flatten();
     let (tree, target) = match &warm {
         Some(w) => (w.tree(), w.target()),
         None => (tree, target),
     };
     // Where this build put its artefacts, for `wsp install` to read: it looks
     // for the release binary this command produced, and after this change that
-    // is no longer a path it can work out from the checkout alone.
-    let _ = std::fs::write(&dir.join(BUILT_AT), format!("{}\n", target.display()));
+    // is no longer a path it can work out from the checkout alone. Not written
+    // by `--alone`, which builds no release binary and would only point
+    // `install` at a tree that has none.
+    if !alone_pass_asked {
+        let _ = std::fs::write(&dir.join(BUILT_AT), format!("{}\n", target.display()));
+    }
 
     let started = Instant::now();
     let fresh = match ensure_tree(&repo, &tree, &head) {
@@ -984,6 +1387,10 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: the patch is at {}", util::contract(&patch_path));
             return 1;
         }
+    }
+
+    if alone_pass_asked {
+        return alone(&p, &store.state, &dir, &tree, &target, json_out, started);
     }
 
     let mut steps: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -1095,10 +1502,21 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     // The flake signature, and the reason the re-run happens at
                     // all. Yellow because it is the interesting answer, not
                     // green: the suite is still red and still failed.
-                    Some(true) => println!(
-                        "{}",
-                        p.yellow(&format!("{} failed in the suite, passed alone", first.name))
-                    ),
+                    Some(true) => {
+                        println!(
+                            "{}",
+                            p.yellow(&format!("{} failed in the suite, passed alone", first.name))
+                        );
+                        // The one moment this pass is mechanised into, and the
+                        // reason it costs a line here rather than a paragraph
+                        // in a document: twice now this exact signature has
+                        // meant a test that is broken outright, with the suite's
+                        // own concurrency hiding it. See the header.
+                        println!(
+                            "{}",
+                            p.dim("wsp verify --alone runs every test in its own process (~90s) — twice now this signature has meant broken, not flaky")
+                        );
+                    }
                     Some(false) => println!("{}", p.dim(&format!("{} fails alone too", first.name))),
                     None => {}
                 }
@@ -1135,6 +1553,107 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test that never answers has to be a *result*, not a hung pass.
+    ///
+    /// The alone-pass is meant to be started and left — that is the whole
+    /// difference between an instrument and somebody watching a terminal — and
+    /// a deadlock is precisely the class of bug it hunts (`robustness-072` was
+    /// a wait on a file that never appeared). Without the timeout the first
+    /// test to hang costs the whole ten minutes and prints nothing at the end
+    /// of it, which is the one way this can fail silently.
+    #[test]
+    fn a_test_that_never_answers_is_a_failure_rather_than_a_hung_pass() {
+        let dir = scratch_dir("alone-hang");
+        let exe = dir.join("hangs");
+        std::fs::write(&exe, "#!/bin/sh\nsleep 30\n").unwrap();
+        chmod_x(&exe);
+
+        let started = Instant::now();
+        let out = run_alone(&exe, "whatever::hangs", &dir.join("log"), Duration::from_millis(150));
+        let took = started.elapsed();
+
+        let f = out.expect("a test that never returned was reported as passing");
+        assert_eq!(f.name, "whatever::hangs");
+        assert!(
+            f.message.as_deref().unwrap_or_default().contains("no answer"),
+            "the failure does not say it was killed: {:?}",
+            f.message
+        );
+        // The child slept for thirty seconds; the pass moved on in under two.
+        assert!(took < Duration::from_secs(5), "the timeout did not kill it: {took:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A red test alone reads exactly as it does in the suite, because it is
+    /// the same parser: the pass adds a loop, not a second opinion about what a
+    /// failure is.
+    #[test]
+    fn a_test_that_fails_alone_keeps_the_assertion_the_suite_would_have_shown() {
+        let dir = scratch_dir("alone-red");
+        let exe = dir.join("fails");
+        // libtest's own shape, which is what the real binary prints.
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\ncat <<'OUT'\nrunning 1 test\ntest a::b ... FAILED\n\nfailures:\n\n---- a::b stdout ----\nthread 'a::b' panicked at src/a.rs:12:9:\nthe seat was empty\n\nfailures:\n    a::b\n\ntest result: FAILED. 0 passed; 1 failed\nOUT\nexit 101\n",
+        )
+        .unwrap();
+        chmod_x(&exe);
+
+        let f = run_alone(&exe, "a::b", &dir.join("log"), Duration::from_secs(5))
+            .expect("a failing test was reported as passing");
+        assert_eq!(f.at.as_deref(), Some("src/a.rs:12:9"), "the panic site was lost");
+        assert_eq!(f.message.as_deref(), Some("the seat was empty"), "the assertion was lost");
+
+        let ok = dir.join("passes");
+        std::fs::write(&ok, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod_x(&ok);
+        assert!(
+            run_alone(&ok, "a::b", &dir.join("log"), Duration::from_secs(5)).is_none(),
+            "a passing test was reported as a failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What gets run, and what it gets run against, are both read out of
+    /// something else's output — so both are parsed rather than assumed.
+    ///
+    /// The `lib` artifact in the middle is the one that matters: it is a real
+    /// line from a real `cargo test --no-run`, it has no executable, and taking
+    /// it would put a `None` in the list of things to run.
+    #[test]
+    fn the_binaries_come_from_cargos_json_and_the_names_from_the_binary() {
+        let text = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"wsp","kind":["lib"]},"#,
+            r#""profile":{"test":false},"executable":null}"#,
+            "
+",
+            r#"{"reason":"compiler-artifact","target":{"name":"wsp","kind":["bin"]},"#,
+            r#""profile":{"test":true},"executable":"/t/deps/wsp-1a2b"}"#,
+            "
+",
+            "   Compiling wsp v0.1.0
+",
+            r#"{"reason":"build-finished","success":true}"#,
+        );
+        assert_eq!(executables(text), vec![PathBuf::from("/t/deps/wsp-1a2b")]);
+
+        assert_eq!(
+            listed("store::tests::a: test
+bench::b: benchmark
+
+2 tests, 1 benchmark
+"),
+            vec!["store::tests::a".to_string()],
+            "the count line or the benchmark was taken for a test"
+        );
+    }
+
+    /// `chmod +x`, without a dependency for it.
+    fn chmod_x(p: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-verify-{}-{}", name, std::process::id()));
@@ -1175,6 +1694,11 @@ mod tests {
     /// exported still gets its own staging read correctly.
     #[test]
     fn a_caller_holding_a_private_index_still_gets_its_own_diff() {
+        // `GIT_INDEX_FILE` is process-wide, and this test exports one over
+        // the whole process while it runs — so any test in another thread that
+        // shells out to git during it would read this staging instead of its
+        // own. One process-wide resource, one lock.
+        let _env = util::env_lock();
         let dir = scratch_dir("index");
         repo(&dir);
         std::fs::write(dir.join("kept.txt"), "one\ntwo\n").unwrap();
@@ -1271,6 +1795,12 @@ mod tests {
     /// same agent wanting the same warm tree.
     #[test]
     fn the_build_tree_is_this_agents_and_not_this_panes() {
+        // `WSP_AGENT` and `HERDR_WORKSPACE_ID` are what every caller of
+        // `agent_key` reads, and this test removes one of them — so a test in
+        // another thread asking which agent it is would be answered by this
+        // one's teardown. Bare rather than `isolated`: `Store::at` is explicit
+        // here and nothing reaches a herdr.
+        let _env = util::env_lock();
         std::env::set_var("WSP_AGENT", "w1");
         assert_eq!(agent_key(), "w1");
         std::env::set_var("WSP_AGENT", "  ");

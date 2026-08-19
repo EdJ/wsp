@@ -86,7 +86,7 @@ const BOOL_FLAGS: &[&str] = &[
     "headless",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
-    "release", "check", "rm",
+    "release", "check", "rm", "alone",
     // And `resume`, whose positional is a task or a project.
     "print",
     // And `checkout`, whose positional is a task id.
@@ -599,6 +599,10 @@ fn help() {
                                     yours alone while it builds, and cold only
                                     when they are all busy; --rm drops the one
                                     you built in, --all every free one
+  wsp verify --alone                …or every test in a process of its own, ~10
+                                    minutes, naming the failures and nothing
+                                    else — what to reach for when a test goes
+                                    red and then green
   wsp install [<path>] [--why "…"] [-n] [--force] [--to PATH]
                                     put that build at ~/.local/bin/wsp, one
                                     install at a time — the one file nothing can
@@ -849,7 +853,14 @@ mod tests {
     /// resolved at parse time.
     #[test]
     fn terse_is_the_flag_or_the_variable() {
-        // Serialised by being one test: these mutate the process environment.
+        // `WSP_TERSE` is process-wide and cargo runs tests in threads, so being
+        // one test only serialises this against itself. The lock is what
+        // serialises it against the test next door — the suite's rule is one
+        // process-wide resource, one lock, and this was one of the last three
+        // places still relying on nobody else happening to look
+        // (`robustness-074`). Bare rather than `isolated` because nothing under
+        // it reaches a store or a herdr.
+        let _env = crate::util::env_lock();
         std::env::remove_var("WSP_TERSE");
         assert!(!super::Args::synth("brief", &[], &[]).terse());
         assert!(super::Args::synth("brief", &[], &[("terse", "true")]).terse());

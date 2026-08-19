@@ -2854,6 +2854,38 @@ happens to be watching. It does not re-run the *suite*: a flake that is
 automatically swallowed stops being observable, and the exit status stays the
 failing run's.
 
+**`wsp verify --alone` runs the same suite one test per process**, and prints
+the tests that failed and nothing else. It is not a slower `cargo test`: it sees
+a class of bug the ordinary suite cannot, and it has found two here.
+`robustness-072` was a parent waiting on a file appearing rather than on its
+child — alone, **0 passed of 50**. `robustness-074` was `fake.rs` handing the
+accepted socket the listener's `O_NONBLOCK` — alone, **14 failed in 60**. Both
+were filed as "flaky under load" and both were the opposite: a descheduled
+thread handed the other side the milliseconds it needed, so **concurrency was
+hiding them**, and the busier the machine the greener the suite. Twice is a
+pattern.
+
+It is a quarter as expensive as the record says. Measured 2026-08-19 with two
+builds on the machine: 728 tests **24.6s** in threads, **85s** one process each
+on a warm tree, 4m11s including the cold build — 3.5×, not the twenty implied by
+the "about ten minutes" `robustness-074` recorded. About 35s of that gap is
+method (a `cargo test` per test pays ~48ms of freshness check before libtest
+starts; running the compiled binary directly does not) and the rest was six
+agents at load 200–350. It matters which, because 85s is a step in a task and
+ten minutes is not.
+
+So: run it **when a test goes red and then green** — a red `verify` already
+re-runs the named test alone, and the line saying it passed there now names this
+pass. Run it **before `wsp review` if your change touched tests**, which is the
+only moment that catches an order-dependent test on the day it is written rather
+than months later by an agent investigating something else. Run it **before a
+release**. It is deliberately not wired into `wsp install` — a check on that path
+is one people route around — and deliberately not on a schedule, because a pass
+that runs at 04:00 reports to nobody, and output no one owns is the same as no
+instrument. It does not take a warm tree, since a slot is one of three and this
+holds one far longer than a build does, and it does not run tests in parallel,
+because contention is a weaker form of the very thing that hid both bugs.
+
 What it does not do is commit. Steps 1, 2 and 4 are still yours, and the
 `read-tree` immediately before the commit is still the one that stops a silent
 revert.
