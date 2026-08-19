@@ -320,6 +320,63 @@ struct Patience<'a> {
     /// ever paid by a spawn that has genuinely failed, because one reading of a
     /// live agent clears it.
     gone: Duration,
+    /// How many further starts a seat gets when the first one does not survive.
+    ///
+    /// **What this retries is a start, and never a work order.** The three
+    /// failures [`hand_over`] can end in all leave the same ambiguity — no turn
+    /// running, and possibly a work order sitting in a composer — and the only
+    /// safe answer to that is a fresh agent, which herdr has no verb for: its
+    /// one way to end an agent is `pane.close`, which takes the seat with it.
+    /// So a handover that failed is reported and not retried, and what is
+    /// retried is the case where the seat is already empty because the agent
+    /// died on its way up. That is the case Ed measured on 2026-08-18 and the
+    /// one an overloaded API keeps producing.
+    ///
+    /// Two, and the number is a judgement rather than a measurement, which is
+    /// worth saying plainly because the numbers above are measurements. The rate
+    /// this used to be calibrated against cannot be read any more: the
+    /// 2026-08-18 sightings are a wsp fault (robustness-083's `done` agent,
+    /// which could not be told anything at all) and an API fault added together,
+    /// in a proportion nobody can now recover. With 083 fixed this is the rare
+    /// residue rather than the common case, so it is set to cost little and
+    /// catch the easy half.
+    attempts: u32,
+    /// How long to wait before starting again, multiplied by [`Patience::steeper`]
+    /// each time.
+    ///
+    /// Backoff rather than an immediate retry because the fault it answers is an
+    /// overloaded API — six sessions opening inside thirty seconds failed and the
+    /// same six spaced out succeeded — and an immediate retry is another
+    /// connection into the same overload. Three seconds and then nine bounds the
+    /// added wait on a spawn that is going to fail anyway at twelve, which is
+    /// under the thirty [`Patience::ready`] already spends.
+    backoff: Duration,
+    /// What each backoff is multiplied by. Three, so two attempts span an order
+    /// of magnitude rather than doubling into the same overload.
+    steeper: u32,
+    /// How long to wait for a seat to be able to hold an agent again.
+    ///
+    /// **This wait is the retry, and it is a wait rather than a call.** herdr
+    /// refuses `agent.start` into a pane while `is_agent_terminal()` holds, and
+    /// the agent *name* outlives the process, so a seat whose agent has died is
+    /// briefly one that will answer `TargetBusy`. There is no verb to clear it:
+    /// `pane.release_agent` is a no-op for exactly this case
+    /// (`is_official_agent_source("herdr:claude", "claude")` is true and the
+    /// handler returns early), and `pane.clear_agent_authority` drops the hook
+    /// authority without touching the name.
+    ///
+    /// What does clear it is `agent.get`, which calls
+    /// `reconcile_managed_agent_target` before it answers — so the polling
+    /// [`Place::state`] already does is itself what re-arms the seat. Waiting
+    /// for [`State::Empty`] is therefore both the test and the mechanism, and it
+    /// is the same reading that tells `available_shell_name` the pane's
+    /// foreground is a shell again.
+    ///
+    /// A seat that has not emptied inside this is one holding an agent that is
+    /// alive and not working, which is the case this must not retry into: it
+    /// stops and reports. Five seconds against the 620ms herdr was measured
+    /// taking to notice an agent at all.
+    rearm: Duration,
     /// What time it is, and how to wait for the next look.
     ///
     /// Handed in rather than read, and this line was written by a flaky test
@@ -352,6 +409,10 @@ impl Default for Patience<'static> {
             nudges: 2,
             poll: Duration::from_millis(150),
             gone: Duration::from_millis(2_000),
+            attempts: 2,
+            backoff: Duration::from_millis(3_000),
+            steeper: 3,
+            rearm: Duration::from_millis(5_000),
             clock: &util::Wall,
         }
     }
@@ -417,6 +478,110 @@ fn wait_ready(
         }
         if now() >= deadline {
             return Err(format!("{kind} started but never became ready for input"));
+        }
+        wait.clock.rest(wait.poll);
+    }
+}
+
+/// Start an agent in a seat, and try again if it does not survive the attempt.
+///
+/// **The retry this task asked for, and the whole of the argument for why it is
+/// here and not one step later.** `spawn` reports success on its own records
+/// rather than on the far side's state — that is the house failure and this file
+/// is where it lives — and `fork-015` closed the detection half: herdr now waits
+/// for the turn and wsp knows when a work order did not land. What was left was
+/// the recovery, and the recovery is only safe for one of the two failures.
+///
+/// **A failed handover is not retried, deliberately.** All three ways
+/// [`hand_over`] can end leave the same ambiguity — no turn running, and a work
+/// order that may be sitting in a composer — so the only retry that could not
+/// duplicate it is a fresh agent. herdr has no verb for that: `pane.close` is
+/// the one thing that ends an agent and it takes the seat with it, and re-opening
+/// a seat means rebinding a claim, which is `cmd_agent`'s and is not paid for by
+/// a transient fault. So that case reports, names the agent it could not reach,
+/// and exits non-zero exactly as it did.
+///
+/// **A start that did not survive is retried, and that is the measured case.**
+/// The agent died on its way up — six of six on 2026-08-18, an overloaded API
+/// opening six model connections inside thirty seconds — leaving a seat with a
+/// shell in it and nothing to duplicate into. Backoff is the answer to that
+/// fault by construction rather than by hope.
+///
+/// The order of the two waits below is what makes it safe. [`re_arm`] runs
+/// *before* the next start and refuses to proceed while anything is still in the
+/// seat, so this can never start a second agent beside a first one that was
+/// merely slow — and that same wait is what clears herdr's stale agent name; see
+/// [`Patience::rearm`].
+///
+/// The name is reused across attempts rather than freshened, which is a decision
+/// and not an oversight. `agent_commands::mint` is deterministic on purpose — the
+/// same string at `agent.start`, in a failed spawn's recovery sentence, and to
+/// anything later addressing the session channel — and a per-attempt suffix would
+/// cost all three to dodge a `DuplicateName` that only fires while the seat has
+/// not cleared, which is the condition [`re_arm`] already refuses to start under.
+fn start_agent(
+    place: &dyn Place,
+    how: &dyn agent_commands::Kind,
+    spawn: &agent_commands::Spawn,
+    agent: &Agent,
+    kind: &str,
+    wait: &Patience,
+) -> Result<(), String> {
+    let seat = spawn.seat;
+    let mut backoff = wait.backoff;
+    for left in (0..=wait.attempts).rev() {
+        let why = match place
+            .start(seat, agent)
+            .map_err(|e| e.to_string())
+            .and_then(|()| wait_ready(place, how, spawn, kind, wait))
+        {
+            Ok(()) => return Ok(()),
+            Err(why) => why,
+        };
+        if left == 0 {
+            return Err(why);
+        }
+        // Said before the wait rather than after it, so a person watching a
+        // spawn that has gone quiet knows what it is waiting for. The seat is
+        // named because a spawn that retries is a spawn somebody will go and
+        // look at.
+        eprintln!("wsp: {kind} did not start in {seat}: {why}");
+        if let Err(stuck) = re_arm(place, seat, wait) {
+            return Err(format!("{why}, and {stuck}"));
+        }
+        eprintln!("wsp: trying {seat} again in {}s", backoff.as_secs());
+        wait.clock.rest(backoff);
+        backoff *= wait.steeper;
+    }
+    // Unreachable: the loop runs at least once and every path out of it returns.
+    Err(format!("{kind} was never started in {seat}"))
+}
+
+/// Wait until a seat will take an agent again, or say why it will not.
+///
+/// [`State::Empty`] is a seat that exists with nothing in it, which is both the
+/// condition `agent.start` needs and — because [`Place::state`] is `agent.get`,
+/// and `agent.get` reconciles the managed agent before it answers — the thing
+/// that brings it about. [`Patience::rearm`] carries that mechanism in full.
+///
+/// The failure is the interesting return. A seat that will not empty is holding
+/// an agent that is alive and is not working, and starting a second agent beside
+/// it is the one thing a retry must never do — so this refuses, and its caller
+/// stops at reporting.
+fn re_arm(place: &dyn Place, seat: &Seat, wait: &Patience) -> Result<(), String> {
+    let now = || wait.clock.now();
+    let deadline = now() + wait.rearm;
+    loop {
+        match place.state(seat) {
+            Ok(State::Empty) => return Ok(()),
+            // Nothing is coming back from a seat that has been closed, and a
+            // retry into it would open nothing. The same reading `wait_ready`
+            // takes, for the same reason.
+            Err(Refusal::NoSeat(_)) => return Err(format!("{seat} is gone")),
+            Ok(_) | Err(_) => {}
+        }
+        if now() >= deadline {
+            return Err("it is still holding what failed, so it was not tried again".to_string());
         }
         wait.clock.rest(wait.poll);
     }
@@ -909,12 +1074,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         };
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
         // Two waits, and they are different questions: `start` comes back when
-        // the agent exists, `wait_ready` when it will listen. Whatever a backend
-        // has to do to make the first one true — retry a shell that is not ready,
-        // clear a half-typed line — happens on its side of the seam now.
-        match place.start(&seat, &agent).map_err(|e| e.to_string())
-            .and_then(|()| wait_ready(place, how, &spawn, &kind, &Patience::default()))
-        {
+        // the agent exists, `wait_ready` when it will listen. Both are inside
+        // `start_agent` now, because the thing worth retrying is the pair — an
+        // agent that started and then died failed the spawn exactly as one that
+        // never started did, and only the second wait can tell.
+        match start_agent(place, how, &spawn, &agent, &kind, &Patience::default()) {
             Ok(()) => {
                 started = Some(kind.clone());
                 // A task gives an agent something to be told, and so — since
@@ -1850,15 +2014,154 @@ mod tests {
     ) -> Result<(), String> {
         let spawn =
             agent_commands::Spawn { full: false, name: "t-260817-010", seat, model: None, effort: None, resume: None };
-        let wait = Patience {
+        // The retry fields come from `retrying` because this test is about a
+        // single attempt: a literal here would have to be updated every time the
+        // retry's numbers move, for a wait that never reads them.
+        let wait = Patience { ready: READY, taken: TAKEN, nudges: PRESSES, poll: STEP, gone: GRACE, clock, ..retrying(clock) };
+        wait_ready(place, how, &spawn, "claude", &wait)
+    }
+
+    /// A backend that can be started into more than once, counting the starts.
+    ///
+    /// The states come off [`Reads`]' single script rather than one per attempt,
+    /// which is deliberate: what a retry is has to be readable as a *sequence*
+    /// over one seat — died, emptied, started, ready — and a fake that resets
+    /// its script per attempt would let a test pass that only ever saw the
+    /// first.
+    ///
+    /// `tell` still panics, and that is an assertion rather than a stub: nothing
+    /// in the retry path may send a work order, because a work order that may
+    /// already be sitting in a composer is the one thing this must not
+    /// duplicate. Every test below would fail loudly if it did.
+    struct Restarts {
+        reads: Reads,
+        starts: std::cell::Cell<u32>,
+    }
+
+    impl Restarts {
+        fn of(script: Vec<crate::place::Result<State>>) -> Restarts {
+            Restarts { reads: Reads::of(script), starts: std::cell::Cell::new(0) }
+        }
+    }
+
+    impl Place for Restarts {
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            self.starts.set(self.starts.get() + 1);
+            Ok(())
+        }
+        fn state(&self, seat: &Seat) -> crate::place::Result<State> {
+            self.reads.state(seat)
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("a retry must never send a work order")
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("a retry stays in the seat it was given")
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a retry does not end the seat")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("a retry is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("a retry does not subscribe")
+        }
+        fn here(&self) -> Option<Seat> {
+            panic!("a retry is about a seat it was handed")
+        }
+    }
+
+    /// Two further starts, a backoff of one poll and a re-arm of one grace, on
+    /// the test's clock. The numbers are small so the counts below are
+    /// arithmetic rather than a statement about the machine.
+    fn retrying<'a>(clock: &'a util::Dial) -> Patience<'a> {
+        Patience {
             ready: READY,
             taken: TAKEN,
             nudges: PRESSES,
             poll: STEP,
             gone: GRACE,
+            attempts: 2,
+            backoff: STEP,
+            steeper: 1,
+            rearm: GRACE,
             clock,
-        };
-        wait_ready(place, how, &spawn, "claude", &wait)
+        }
+    }
+
+    fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
+        let spawn =
+            agent_commands::Spawn { full: false, name: "robustness-080", seat, model: None, effort: None, resume: None };
+        let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
+        start_agent(place, how, &spawn, &agent, "claude", wait)
+    }
+
+    /// **The failure this task is named for, recovered.** An agent that starts
+    /// and dies on its way up leaves a seat with a shell in it and nothing in
+    /// the composer, so there is nothing a second start could duplicate — which
+    /// is the whole reason this one case is retried and a failed handover is
+    /// not.
+    ///
+    /// The script is the sequence Ed measured on 2026-08-18: the seat reads
+    /// empty past the grace, the runtime cannot say the agent is alive, and the
+    /// spawn used to stop there and report a claimed task nobody was working.
+    #[test]
+    fn an_agent_that_died_on_its_way_up_is_started_again() {
+        let dead = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Restarts::of(
+            std::iter::repeat_with(|| Ok(State::Empty))
+                .take(32)
+                .chain([Ok(State::Idle)])
+                .collect(),
+        );
+        assert_eq!(starting(&place, &dead, &Seat::new("w64:p1"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.starts.get(), 2, "the first start died and the second was made");
+    }
+
+    /// And the seat that will not clear is the one a retry must leave alone.
+    ///
+    /// An agent alive and never ready is the case where a second `agent.start`
+    /// would either be refused by herdr — `is_agent_terminal()` still holds —
+    /// or, worse, land beside the first. So [`re_arm`] refuses and the spawn
+    /// stops at reporting, which is what the governor's decision asked for: a
+    /// partial retry, not a rewrite of the seat model.
+    #[test]
+    fn a_seat_that_will_not_empty_is_never_started_into_twice() {
+        let quiet = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Restarts::of(vec![Ok(State::Working)]);
+        let why = starting(&place, &quiet, &Seat::new("w64:p1"), &retrying(&dial)).unwrap_err();
+        assert_eq!(place.starts.get(), 1, "one agent in the seat, and it stayed one");
+        assert!(why.contains("still holding"), "it says why it did not try again: {why}");
+    }
+
+    /// A spawn that works costs nothing, which is the bill every healthy spawn
+    /// pays for this feature and the reason the backoff is not a sleep before
+    /// the first attempt.
+    #[test]
+    fn a_start_that_works_first_time_pays_no_backoff() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Restarts::of(vec![Ok(State::Idle)]);
+        let began = dial.now();
+        assert_eq!(starting(&place, &alive, &Seat::new("w64:p1"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.starts.get(), 1);
+        assert_eq!(dial.now(), began, "a healthy spawn waits for nothing");
+    }
+
+    /// The bound, and it is what stops a retry becoming a loop. Three starts for
+    /// two further attempts, and then the failure is reported rather than tried
+    /// a fourth time.
+    #[test]
+    fn a_seat_that_never_holds_an_agent_is_given_up_on() {
+        let dead = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Restarts::of(vec![Ok(State::Empty)]);
+        let why = starting(&place, &dead, &Seat::new("w64:p1"), &retrying(&dial)).unwrap_err();
+        assert_eq!(place.starts.get(), 3, "the first attempt and the two it is allowed");
+        assert!(why.contains("started and then stopped"), "the last failure is what is said: {why}");
     }
 
     /// **The failure this task is named for, at the moment it is decided.** A
@@ -2078,14 +2381,10 @@ mod tests {
             effort: None,
             resume: None,
         };
-        let wait = Patience {
-            ready: READY,
-            taken: TAKEN,
-            nudges: PRESSES,
-            poll: STEP,
-            gone: GRACE,
-            clock,
-        };
+        // The retry fields come from `retrying` because this test is about a
+        // single attempt: a literal here would have to be updated every time the
+        // retry's numbers move, for a wait that never reads them.
+        let wait = Patience { ready: READY, taken: TAKEN, nudges: PRESSES, poll: STEP, gone: GRACE, clock, ..retrying(clock) };
         hand_over(place, &Speaks, &spawn, "you have been claimed onto robustness-035", &wait)
     }
 
