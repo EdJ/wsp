@@ -779,15 +779,13 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         // --body` and `tell` already spell; until this it was delivered to the
         // governor as the literal word `-`, which is the same defect `wsp note`
         // was fixed for, one file along.
-        let text = match typed.trim() == "-" {
-            true => match crate::cmd_agent::piped_message() {
-                Ok(t) => t,
-                Err(code) => return code,
-            },
-            false => match crate::cmd_agent::typed_message(&typed) {
-                Ok(t) => t,
-                Err(code) => return code,
-            },
+        // And `--from FILE` beside it, because a governor brief is the longest
+        // prose anything in wsp sends and the brief that asks for one says to
+        // pass it through a file. One function for all four telling verbs —
+        // see [`crate::cmd_agent::from_source`].
+        let text = match crate::cmd_agent::from_source(args, &typed) {
+            Ok(t) => t,
+            Err(code) => return code,
         };
         return tell(store, &governors, &scope, &text, args);
     }

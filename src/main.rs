@@ -5,7 +5,8 @@
 //! joins them, and pushes the join back into herdr's sidebar as metadata
 //! tokens.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 mod agent_commands;
 mod arrange;
@@ -173,6 +174,16 @@ pub struct Args {
     pub cmd: String,
     pub rest: Vec<String>,
     flags: HashMap<String, Vec<String>>,
+    /// Flag names that took a word off the command line — `--from FILE`,
+    /// `--title=T` — as against the ones that stand for themselves.
+    ///
+    /// This is half of the answer to `worklist-036`'s second question, and
+    /// [`Args::dropped`] is the other half.
+    valued: HashSet<String>,
+    /// Which flags anything actually looked at. Interior mutability because
+    /// every command takes `&Args` and a read is a read whether or not the
+    /// caller holds it mutably; nothing here crosses a thread.
+    read: RefCell<HashSet<String>>,
 }
 
 impl Args {
@@ -195,6 +206,10 @@ impl Args {
     fn scan(argv: &[String], literal_after: Option<usize>, owned: &[&str]) -> Args {
         let mut positional: Vec<String> = Vec::new();
         let mut flags: HashMap<String, Vec<String>> = HashMap::new();
+        // Which of them ate a word. See [`Args::dropped`]: a flag that stands
+        // for itself costs nothing when nobody reads it, and one that took the
+        // token after it has taken something that was going somewhere.
+        let mut valued: HashSet<String> = HashSet::new();
         let mut i = 0;
         while i < argv.len() {
             let a = argv[i].clone();
@@ -233,10 +248,12 @@ impl Args {
                 let entry = flags.entry(name.clone()).or_default();
                 if let Some(v) = inline {
                     entry.push(v);
+                    valued.insert(name.clone());
                 } else if BOOL_FLAGS.contains(&name.as_str()) {
                     entry.push("true".into());
                 } else if i + 1 < argv.len() && !argv[i + 1].starts_with('-') {
                     entry.push(argv[i + 1].clone());
+                    valued.insert(name.clone());
                     i += 1;
                 } else {
                     entry.push("true".into());
@@ -253,6 +270,7 @@ impl Args {
                     entry.push("true".into());
                 } else if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
                     entry.push(argv[i + 1].clone());
+                    valued.insert(name.clone());
                     i += 1;
                 } else {
                     entry.push("true".into());
@@ -264,7 +282,7 @@ impl Args {
         }
 
         let cmd = if positional.is_empty() { String::new() } else { positional.remove(0) };
-        Args { cmd, rest: positional, flags }
+        Args { cmd, rest: positional, flags, valued, read: RefCell::default() }
     }
 
     /// A command line one command builds for another, instead of shelling out
@@ -285,16 +303,24 @@ impl Args {
             cmd: cmd.to_string(),
             rest: rest.iter().map(|s| (*s).to_string()).collect(),
             flags: map,
+            // A command line one command builds for another was never on a
+            // command line, so there is no word to have been taken off one.
+            // [`Args::dropped`] is asked about the invocation, once, in `main`.
+            valued: HashSet::new(),
+            read: RefCell::default(),
         }
     }
 
     pub fn has(&self, name: &str) -> bool {
+        self.mark(name);
         self.flags.contains_key(name)
     }
     pub fn get(&self, name: &str) -> Option<String> {
+        self.mark(name);
         self.flags.get(name).and_then(|v| v.first().cloned())
     }
     pub fn all(&self, name: &str) -> Vec<String> {
+        self.mark(name);
         self.flags
             .get(name)
             .map(|v| {
@@ -336,6 +362,65 @@ impl Args {
             Err(_) => false,
         }
     }
+    /// A flag was looked at. Every read goes through here, and that is the
+    /// whole of the bookkeeping [`Args::dropped`] needs.
+    fn mark(&self, name: &str) {
+        self.read.borrow_mut().insert(name.to_string());
+    }
+
+    /// Every flag that took a word off the command line and that nothing read.
+    ///
+    /// # Why this and not a list of the flags each verb knows
+    ///
+    /// `worklist-036`: **wsp refuses no flag it does not know**, and a flag it
+    /// does not know still eats the token after it. `wsp flag <id> --from FILE`
+    /// bound the path to an option nothing read, raised a hand with `"text":
+    /// ""` and exited 0 — the message lost inside the record, by the one verb
+    /// whose whole job is to not lose one, through the spelling every brief
+    /// tells an agent to use. Unattended, nobody reads the receipt: a
+    /// governor's script with one wrong word raises empty hands all night and
+    /// every command exits 0.
+    ///
+    /// The obvious repair is a vocabulary — each verb declaring what it takes,
+    /// checked before dispatch, the way `cmd_task::edit_prose` already does for
+    /// itself. It was weighed and not taken, and the reason is that the
+    /// vocabulary is a *second copy* of what every verb already knows by
+    /// reading its own flags: sixty entries kept by hand, whose omissions
+    /// refuse commands that were always valid, and which nothing in the build
+    /// can check, because a flag read three helpers deep is unreachable to any
+    /// grep. The failure it fixes is silence; the failure it introduces is a
+    /// verb that stops taking an argument it has always taken.
+    ///
+    /// So the thing refused is not an unknown *name* but a **dropped word**. A
+    /// value that came off the command line and that nothing looked at is,
+    /// exactly and by construction, a thing the caller said and wsp did not
+    /// hear — no vocabulary, nothing to maintain, and no way for it to be
+    /// wrong about a verb it has never heard of. It costs `--no-focus` nothing,
+    /// which is the compatibility case the alternative had to argue with:
+    /// a flag that stands for itself takes no word, so nobody reading it is
+    /// nobody losing anything.
+    ///
+    /// What it does not catch is named where it will be read: a mistyped flag
+    /// that stands alone — `wsp ls --al` for `--all` — drops no word and goes
+    /// on being ignored, because a bare flag nothing read is indistinguishable
+    /// from one a verb reads only down the branch this run did not take
+    /// (`--force`, `--yes`, `--again`), and complaining about those would put
+    /// noise on commands that are correct. That half needs the vocabulary, and
+    /// is `worklist-038`.
+    ///
+    /// Checked in `main` after the command has run, which is the one honest
+    /// place: a read happens while the verb runs, so nothing before dispatch
+    /// can know. The command has therefore already done what it did — the
+    /// message says so — and the exit code is what carries the failure to the
+    /// script that would otherwise never hear.
+    pub fn dropped(&self) -> Vec<String> {
+        let read = self.read.borrow();
+        let mut out: Vec<String> =
+            self.valued.iter().filter(|n| !read.contains(*n)).cloned().collect();
+        out.sort();
+        out
+    }
+
     /// Every flag name given, for a command that would rather refuse one it
     /// does not know than guess at what was meant. `edit` is the case that
     /// forced this: it took an unrecognised `--<section>` for "no section
@@ -545,7 +630,42 @@ fn main() {
             2
         }
     };
-    std::process::exit(code);
+    std::process::exit(dropped_words(&args, code));
+}
+
+/// Say what the command line gave and nothing read, and fail if there was any.
+///
+/// The argument is on [`Args::dropped`]. Two things are settled here.
+///
+/// **A command that already failed is left alone.** It has said why in its own
+/// words, and a verb that stopped early may not have reached the flag it does
+/// read — so the same message would be both noise and a lie about the verb.
+/// What this is for is the *other* case, which is the whole of `worklist-036`:
+/// success reported over a word that went nowhere.
+///
+/// **And it does not say the verb has no such flag**, because it cannot know
+/// that: nothing read it *on this path* is all a read tally can honestly claim.
+/// It says what happened to the word, which is the part the caller needs.
+fn dropped_words(args: &Args, code: i32) -> i32 {
+    // Said in its own words already. See above.
+    if code != 0 {
+        return code;
+    }
+    let dropped = args.dropped();
+    if dropped.is_empty() {
+        return code;
+    }
+    let p = util::Paint::new();
+    for name in &dropped {
+        let value = args.get(name).unwrap_or_default();
+        eprintln!(
+            "wsp: {} took `{value}` off the command line and nothing read it — check the spelling.",
+            p.bold(&format!("--{name}")),
+        );
+    }
+    eprintln!("     The rest of `wsp {}` did what it says; that word went nowhere,", args.cmd);
+    eprintln!("     and this is the only way you would have heard. `wsp help` has the flags.");
+    2
 }
 
 fn help() {
@@ -690,9 +810,9 @@ fn help() {
   wsp govern <proj> --tell "…" | -  say something to whoever is in that seat —
                                     the panel's T, from a shell. Direction is
                                     long prose full of identifiers, so reach for
-                                    `--tell -` and pipe it: between double quotes
-                                    a shell runs every backtick in it, and the
-                                    message arrives fluent with the nouns gone
+                                    `--tell -`, or `--from FILE`: between double
+                                    quotes a shell runs every backtick in it, and
+                                    the message arrives fluent with the nouns gone
   wsp spawn -p <proj> --govern      …or start one: a workspace on the project, an
                                     agent in it, the seat taken, and a custodial
                                     work order rather than a claim
@@ -729,11 +849,12 @@ fn help() {
                                     how long to review, and whether it came back
   wsp peek [panel|view|board|<task>]  what is on that pane, or the frame the
                                     sidebar surface last drew
-  wsp tell <id> "…" | -             say something to the agent holding that
+  wsp tell <id> "…" | - | --from F  say something to the agent holding that
                                     task, without ending it — `-` reads the
-                                    message from stdin. The repair for an agent
-                                    whose turn stopped: the conversation is
-                                    intact, and a respawn throws it away.
+                                    message from stdin, --from from a file. The
+                                    repair for an agent whose turn stopped: the
+                                    conversation is intact, and a respawn throws
+                                    it away.
                                     The same sentence twice inside two minutes
                                     is read as a retry and refused; `--again`
                                     means it
@@ -815,11 +936,11 @@ fn help() {
   wsp flag <id> --ask claim         …and a question a keypress answers
   wsp flag [--clear <id>] [--seat]  what is raised, and whose it is; --seat
                                     narrows it to this seat's own; --clear lowers
-  wsp ask <id> ["the question"|-]   a question about a task, with a return path:
+  wsp ask <id> ["…"|-|--from F]     a question about a task, with a return path:
                                     the answer comes back to you and lands on a
                                     task's log. `wsp tell` is still for prose
   wsp ask                           what is open, who is waiting, and how long
-  wsp answer <mid> "…" | -          close one: the log first, then whoever asked
+  wsp answer <mid> "…"|-|--from F   close one: the log first, then whoever asked
   wsp answer <mid> --abandon "…"    the other ending, and it also goes home
   wsp ack <mid>                     an answer read, or a notification taken on
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
@@ -842,6 +963,8 @@ more than one task now lists them rather than answering "no such task".
 Text that starts with a flag is text: `wsp note <id> "--parent is add-only"` and
 `wsp tag <id> +dsp -ui` both mean what they say. `--` still ends flag parsing,
 for the one case that needs it — a payload that is a single flag-shaped word.
+A flag wsp does not know still takes the word after it, so a command that ends
+with a value nothing read says so and exits 2 — the word went nowhere.
 Every command takes --json. Set WSP_HOME to relocate the store.
 --terse, or WSP_TERSE=1 for a whole session, leaves out what you already have:
 the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
@@ -1089,6 +1212,55 @@ mod tests {
         // pass exists only to answer this.
         assert_eq!(parse(&["-p", "wsp", "ls"]).cmd, "ls");
         assert_eq!(parse(&["--json", "note", "028", "text"]).cmd, "note");
+    }
+
+    /// **The class behind `worklist-036`**: a word taken off the command line
+    /// that nothing read is a thing the caller said and wsp did not hear.
+    ///
+    /// `wsp flag <id> --from FILE` raised a hand with `"text": ""` and exited 0
+    /// because `flag` had no `--from` and an unknown flag still eats the token
+    /// after it. Unattended that is a night of empty hands and no failure
+    /// anywhere. Asserted on both directions, because the reason this is a
+    /// dropped *word* and not an unknown *name* is the second one: a flag that
+    /// stands for itself takes nothing, so a verb that never reads it has lost
+    /// nothing, and `--no-focus` — parsed on purpose and read by nobody — goes
+    /// on costing nothing.
+    #[test]
+    fn a_word_taken_off_the_line_that_nothing_read_is_reported() {
+        use super::Args;
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+
+        let a = parse(&["flag", "acc-005", "--form", "finding.txt"]);
+        assert_eq!(a.dropped(), vec!["form"], "the path went nowhere and nothing said so");
+        assert_eq!(super::dropped_words(&a, 0), 2, "and the exit code carried it");
+
+        // Read is read, however it was read.
+        let a = parse(&["flag", "acc-005", "--from", "finding.txt"]);
+        assert_eq!(a.get("from").as_deref(), Some("finding.txt"));
+        assert!(a.dropped().is_empty(), "a flag the verb read is not dropped");
+
+        // A flag that took no word costs nothing when nobody reads it, which is
+        // what keeps `spawn --no-focus` parsing and free.
+        let a = parse(&["spawn", "wsp-001", "--no-focus"]);
+        assert!(a.dropped().is_empty());
+        let a = parse(&["ls", "-p", "acc", "--wibble"]);
+        assert_eq!(a.get("project").as_deref(), Some("acc"));
+        assert!(a.dropped().is_empty(), "a bare unknown flag ate nothing");
+
+        // `--name=Reverb Lab` took a word too — the `=` is a spelling, not a
+        // different act.
+        let a = parse(&["project", "add", "verb", "--nmae=Reverb Lab"]);
+        assert_eq!(a.dropped(), vec!["nmae"]);
+
+        // A command that already failed is left alone entirely: it has said why
+        // in its own words, and a verb that stopped early may simply not have
+        // reached the flag it does read.
+        assert_eq!(super::dropped_words(&a, 1), 1);
+
+        // A command line one command builds for another never met a shell, so
+        // there is nothing on it to have been dropped.
+        let a = Args::synth("flag", &["acc-005"], &[("from", "finding.txt")]);
+        assert!(a.dropped().is_empty());
     }
 
     /// A rule that names a command nobody dispatches is a rule that does

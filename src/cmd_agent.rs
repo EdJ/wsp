@@ -1582,11 +1582,55 @@ fn message(args: &Args) -> Result<String, i32> {
 /// phrases were executed by the shell instead of delivered, and the message
 /// arrived fluent with the load-bearing nouns missing.
 pub(crate) fn prose(args: &Args, skip: usize) -> Result<String, i32> {
-    let rest = args.rest.get(skip..).unwrap_or_default();
-    if !matches!(rest, [one] if one == "-") {
-        return typed_message(&args.text(skip));
+    from_source(args, &args.text(skip))
+}
+
+/// The paragraph, out of the three places a paragraph comes from: typed on the
+/// line, a stream, or a file named by `--from`.
+///
+/// **The file form is `worklist-036` beyond the row it was found on.** `flag`
+/// lost the message because it had no `--from` and the parser bound the path to
+/// an option nothing read — and `flag` was not alone in the first half of that:
+/// `tell`, `ask`, `answer` and `govern --tell` all took `-` and none of them
+/// took a file, while the house rule printed in every brief is *give a wsp verb
+/// its prose through a file*, because a shell evaluates backticks inside double
+/// quotes. Four verbs told agents to use a spelling four verbs did not have.
+/// The dropped-word guard in `main` now says so out loud instead of losing it
+/// (see [`crate::Args::dropped`]); this is the other half, which is that the
+/// spelling should simply work, and it works the same way on all of them
+/// because they are one act and share this function.
+///
+/// Two sources is refused rather than resolved: `--from` beside a typed
+/// sentence is a caller who does not know which one is being sent, and picking
+/// either is the same silent loss in a smaller hat.
+pub(crate) fn from_source(args: &Args, typed: &str) -> Result<String, i32> {
+    let Some(path) = args.get("from") else {
+        return match typed.trim() == "-" {
+            true => piped_message(),
+            false => typed_message(typed),
+        };
+    };
+    if !typed.trim().is_empty() && typed.trim() != "-" {
+        eprintln!("wsp: a sentence and --from are two messages — send one");
+        return Err(2);
     }
-    piped_message()
+    // A lone `--from`, or `--from -`, is the stream: a dash is not a value, it
+    // is the conventional name for stdin, and `prose_source` reads it the same
+    // way for `note` and its neighbours.
+    if matches!(path.as_str(), "true" | "-") {
+        return piped_message();
+    }
+    match crate::cmd_task::read_source(&path) {
+        Ok(text) if text.trim().is_empty() => {
+            eprintln!("wsp: {path} is empty — nothing sent");
+            Err(2)
+        }
+        Ok(text) => Ok(text.trim().to_string()),
+        Err(e) => {
+            eprintln!("wsp: cannot read {path}: {e}");
+            Err(1)
+        }
+    }
 }
 
 /// A message given on the command line, checked for the one thing that says it
@@ -5018,6 +5062,43 @@ mod tests {
 
         let up = crate::message::raised(&store);
         assert!(hand_rows(&up[0], &Paint::new()).is_empty(), "words appeared from nowhere");
+    }
+
+    /// The same spelling on the other three telling verbs.
+    ///
+    /// `tell`, `ask` and `answer` share [`from_source`] with `govern --tell`,
+    /// and until `worklist-036` all four took `-` and none took a file — while
+    /// the house rule printed in every brief is to pass prose through a file,
+    /// because a shell evaluates backticks inside double quotes. Driven at the
+    /// function, because that is where the four of them are one thing; the
+    /// verbs above it differ only in what they do with the paragraph.
+    #[test]
+    fn a_message_can_come_out_of_a_file_on_every_verb_that_sends_one() {
+        let env = crate::util::isolated("prose-from-file");
+        let path = env.path("brief.txt");
+        std::fs::write(&path, "the `--refs` pass is the one to run first\n").unwrap();
+        let args = Args::synth("tell", &["worklist-002"], &[("from", path.to_str().unwrap())]);
+
+        assert_eq!(
+            from_source(&args, "").unwrap(),
+            "the `--refs` pass is the one to run first",
+            "the backticks are why a file is the way to send this at all",
+        );
+
+        // A sentence as well as a file is a caller who does not know which one
+        // is being sent, and choosing either loses the other silently.
+        let args = Args::synth("tell", &["worklist-002"], &[("from", path.to_str().unwrap())]);
+        assert_eq!(from_source(&args, "and one typed too"), Err(2));
+
+        // A file with nothing in it is the empty hand again by another road.
+        let empty = env.path("empty.txt");
+        std::fs::write(&empty, "\n").unwrap();
+        let args = Args::synth("tell", &["worklist-002"], &[("from", empty.to_str().unwrap())]);
+        assert_eq!(from_source(&args, ""), Err(2));
+
+        // And the typed form is untouched.
+        let args = Args::synth("tell", &["worklist-002"], &[]);
+        assert_eq!(from_source(&args, "come and look at this").unwrap(), "come and look at this");
     }
 
     /// A hand that a keypress would answer says so in the listing.
