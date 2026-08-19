@@ -2448,6 +2448,66 @@ mod tests {
         assert_eq!(store.find_task("t-260815-024").map(|t| t.id), Some("data-009".into()));
     }
 
+    /// The renumbering has to reach `worklists/` too, and the reason it is
+    /// asserted separately from the rest is what it costs when it does not.
+    ///
+    /// A worklist's membership is a list of task ids in its body, and a running
+    /// list reads each one to decide whether its barrier may open. Left
+    /// unrewritten, the list goes on naming a member by an id nothing answers
+    /// to, `worklist::member` reads that as `Gone`, and `Gone` is *settled* —
+    /// so the member stops holding the barrier and the run walks on past work
+    /// still sitting on a branch. Reproduced 2026-08-19 on `worklist-015`,
+    /// against a store and a repository of its own.
+    ///
+    /// Asserted against [`Store::record_dirs`] rather than against a list of
+    /// directories written out again here: the failure was a hand-kept list
+    /// that nobody revisited when a record kind was added, and a test that
+    /// keeps its own copy of that list is the same mistake with a green tick
+    /// over it.
+    #[test]
+    fn a_renumbering_reaches_every_kind_of_record_the_store_holds() {
+        let store = scratch("ids-rename-all");
+        proj(&store, "data", "");
+
+        let mut t = Task::new("the member", "t-260815-014");
+        t.project = Some("data".into());
+        store.save_task(&t).unwrap();
+
+        let mut w = Worklist::new("batch", "Overnight batch");
+        w.body = "## Groups\n- 1  t-260815-014\n".into();
+        store.save_worklist(&w).unwrap();
+
+        let mut m = Machine::new("mb2", "mb2.tail");
+        m.body = "## Notes\ncut from t-260815-014\n".into();
+        store.save_machine(&m).unwrap();
+
+        // Every record directory is a target, and the archive months inside it
+        // are expanded — so the count is the floor a caller can rely on and not
+        // an exact shape of one store.
+        let dirs = store.record_dirs();
+        for kind in ["projects", "tasks", "worklists", "machines", "archive/projects"] {
+            assert!(
+                dirs.iter().any(|d| d.ends_with(kind)),
+                "{kind} is not among the record directories: {dirs:?}"
+            );
+        }
+
+        let mut map = BTreeMap::new();
+        map.insert("t-260815-014".to_string(), "data-002".to_string());
+        store.rename_tasks(&map).unwrap();
+
+        let back = store.worklist("batch").expect("the list is still there");
+        assert_eq!(
+            back.groups()[0].members,
+            ["data-002"],
+            "a member that was renumbered is named by the id it now answers to"
+        );
+        assert!(
+            store.machine("mb2").is_some_and(|m| m.body.contains("data-002")),
+            "and a citation in any other record kind came too"
+        );
+    }
+
     /// "No such task" was a lie about a suffix that named two, and it is the
     /// lie that cost Ed his afternoon reading the wrong `022`.
     #[test]

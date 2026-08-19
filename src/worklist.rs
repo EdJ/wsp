@@ -1148,6 +1148,49 @@ mod tests {
         assert!(position(&store, &w, Reading::Landed).finished(), "and landing that branch finishes it");
     }
 
+    /// The store's half of the same fact, and it fails in the dangerous
+    /// direction where git's fails in the safe one.
+    ///
+    /// A renumbering that reached everything except `worklists/` left the list
+    /// naming a member by an id nothing answered to. The raw path read came
+    /// back nothing, that read as `Gone`, and `Gone` is *settled* — so the
+    /// member stopped holding the barrier and the run walked on past work still
+    /// on its branch, while `go` wrote "no task answers to it" into the log
+    /// where it reads later as evidence somebody archived it. The neighbouring
+    /// test is the git half of this: there the same blindness merely *stalls* a
+    /// barrier, which is why it was found first and this was not.
+    ///
+    /// The list here still names the old id on purpose. Every list written
+    /// before the migration walk learned about `worklists/` is in exactly that
+    /// state, and the store rewriting new ones does nothing for them.
+    #[test]
+    fn a_member_renumbered_out_from_under_a_list_still_holds_its_barrier() {
+        let (_env, store, repo) = scratch("renumbered-member");
+        task(&store, "wsp-9", "doing");
+        committed(&repo, "wsp-9");
+        std::fs::write(store.ids_path(), r#"{"old-3":"wsp-9"}"#).unwrap();
+        let w = list("- 1  old-3\n");
+
+        assert!(dangling(&store, &w).is_empty(), "a task answers to it perfectly well");
+
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.at, Some(1), "the barrier is held by work that is still on its branch");
+        assert_eq!(p.members[0].settlement, Settlement::Open(Status::Doing), "not gone: doing");
+        assert_eq!(p.members[0].note(), "1 commit not on master");
+        assert_eq!(
+            p.members[0].id, "wsp-9",
+            "named by the id it answers to now, not the one the list still uses — \
+             that is the identity a tree is cut under and what `passed_by_running` \
+             expands backwards from"
+        );
+
+        land(&repo, "wsp-9");
+        assert!(
+            position(&store, &w, Reading::Landed).finished(),
+            "and it opens on the landing, through the renumbering"
+        );
+    }
+
     /// Design-only work has no branch and never will, and there is nothing
     /// wrong with it — `wsp-095` sits in a group of phase one and produces
     /// prose. It finishes on the store, like anything else with nowhere to ask.
