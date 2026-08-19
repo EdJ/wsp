@@ -2348,6 +2348,113 @@ mod tests {
         );
     }
 
+    /// What a popover owes the panel behind it: every row it lies on keeps the
+    /// columns the box does not cover.
+    ///
+    /// Read as a diff between the frame with the popup up and the frame
+    /// without, and bounded by the box's own border rather than by the
+    /// arithmetic that placed it — a test handed `left` and `box_w` checks the
+    /// geometry against itself, where this asks the only question a reader has.
+    /// The box says where it is: it is the one thing on the panel drawn with a
+    /// frame.
+    fn covers_only_its_own_footprint(before: &[panel::Line], after: &[panel::Line], w: usize) {
+        let chars = |l: &panel::Line| {
+            let mut c: Vec<char> = l.text().chars().collect();
+            c.resize(w, ' ');
+            c
+        };
+        let corner = |c: char| {
+            after.iter().position(|l| l.text().contains(c)).unwrap_or_else(|| {
+                panic!("no popup is up: nothing in the frame is drawn with a `{c}`")
+            })
+        };
+        let (top, bottom) = (corner('┌'), corner('└'));
+        let rule = chars(&after[top]);
+        let left = rule.iter().position(|&c| c == '┌').unwrap();
+        let right = rule.iter().position(|&c| c == '┐').unwrap();
+        assert!(
+            left > 0 && right < w - 1,
+            "the box is flush against an edge, so nothing beside it is at risk",
+        );
+
+        // At least one row under the box has to have had something on it, or
+        // the frame proves nothing — which is how the fault shipped: a menu
+        // over the blank tail of a fixture's tree looks exactly right.
+        let mut proved = false;
+        for y in top..=bottom {
+            let (was, now) = (chars(&before[y]), chars(&after[y]));
+            assert_eq!(
+                was[..left],
+                now[..left],
+                "row {y} lost the tree to the left of the box\n  was: {}\n  now: {}",
+                before[y].text(),
+                after[y].text(),
+            );
+            assert_eq!(
+                was[right + 1..],
+                now[right + 1..],
+                "row {y} lost the tree to the right of the box\n  was: {}\n  now: {}",
+                before[y].text(),
+                after[y].text(),
+            );
+            proved |= was[..left].iter().any(|c| !c.is_whitespace());
+        }
+        assert!(
+            proved,
+            "every row the box covers was blank beside it, so this frame tests nothing",
+        );
+    }
+
+    /// The menu is a popover and not a pane: it lies over the tree and the tree
+    /// is still there beside it.
+    ///
+    /// Ed, the day the menu landed: *"it wipes the horizontal space from the
+    /// rest of the panel — the menu spawns on the right hand side, and
+    /// everything on its left is undrawn. herdr's menu is a pseudo-popover
+    /// menu, as if it were a right-click action in a GUI environment."* It was
+    /// four lines that built each row from an empty line, padded it out to the
+    /// box and appended it: the padding read as spacing and was an eraser.
+    #[test]
+    fn the_menu_lies_over_the_tree_rather_than_wiping_the_rows_it_sits_on() {
+        let w = world();
+        let mut view = panel::View::default();
+        let mut ui = ui_of(&w, &view);
+
+        let before = panel::frame(&ui, &mut view, W, H);
+        panel::apply_key(Key::Char('q'), &mut ui, &mut view);
+        assert_eq!(view.mode_name(), "the menu");
+        let after = panel::frame(&ui, &mut view, W, H);
+
+        covers_only_its_own_footprint(&before, &after, W);
+    }
+
+    /// And the card, which had the same fault and got away with it because a
+    /// card is nearly as wide as the pane — so what it wiped was the two
+    /// columns its own doc promised would show the tree.
+    ///
+    /// Drawn at a width where the card stops growing and the tree does not,
+    /// which is where the gap either side is wide enough to see and wide enough
+    /// to lose.
+    #[test]
+    fn a_card_shows_the_tree_at_both_its_edges_the_way_its_inset_promises() {
+        const WIDE: usize = 100;
+        let f = flagged_world();
+        let (mut ui, mut view) = showing(&f, &[]);
+        assert!(
+            matches!(view.mode, panel::Mode::Card(_)),
+            "an unread ask should come up on its own",
+        );
+        let after = panel::frame(&ui, &mut view, WIDE, H);
+
+        // `esc` is *not now*: the card goes, the hand stays up, and the tree
+        // under it is the tree that was under it.
+        panel::apply_key(Key::Esc, &mut ui, &mut view);
+        assert_eq!(view.mode_name(), "browse");
+        let before = panel::frame(&ui, &mut view, WIDE, H);
+
+        covers_only_its_own_footprint(&before, &after, WIDE);
+    }
+
     /// The shape Ed asked for, held to: *"a sidebar menu, where close can be
     /// the first option"*.
     ///
@@ -6047,14 +6154,21 @@ mod tests {
     /// blank, and the tail. This takes the middle — everything between the two
     /// blanks — so a test can weigh what a reader got rather than what the
     /// renderer was asked for.
+    ///
+    /// Between the outermost bars, not what is left after trimming the ends: a
+    /// card is a popover and the tree it is lying on is still drawn either side
+    /// of it, so the row a reader sees is a task, then the box, then the rest of
+    /// the task.
     fn card_body(snap: &Snapshot, w: usize, h: usize) -> Vec<String> {
         let (ui, mut view) = showing(snap, &[]);
         let drawn = panel::frame(&ui, &mut view, w, h);
         let inside: Vec<String> = drawn
             .iter()
             .map(|l| l.text())
-            .filter(|t| t.contains('\u{2502}'))
-            .map(|t| t.trim().trim_matches('\u{2502}').trim().to_string())
+            .filter_map(|t| {
+                let (a, b) = (t.find('\u{2502}')?, t.rfind('\u{2502}')?);
+                (a < b).then(|| t[a + '\u{2502}'.len_utf8()..b].trim().to_string())
+            })
             .collect();
         assert!(!inside.is_empty(), "no card at {w}x{h}");
         // Past the heading and its blank line, and stop at the blank before the

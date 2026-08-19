@@ -111,6 +111,50 @@ impl Line {
         self.spans = out;
     }
 
+    /// The columns from `n` on. The other half of [`fit`]: `fit` keeps the head
+    /// of a line and this keeps the tail, and an overlay needs both because
+    /// what it covers is a hole in the middle.
+    fn from_column(&self, n: usize) -> Vec<Span> {
+        let mut skip = n;
+        let mut out: Vec<Span> = Vec::new();
+        for s in &self.spans {
+            let len = s.text.chars().count();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            out.push(Span { text: s.text.chars().skip(skip).collect(), style: s.style });
+            skip = 0;
+        }
+        out
+    }
+
+    /// Lay `over` on this line at column `left`, keeping what is behind it on
+    /// both sides.
+    ///
+    /// The one way anything floats over the panel, because the obvious way is
+    /// wrong and looks right. A popup used to be placed by building a fresh
+    /// line, padding it out to `left` and appending the box — and that padding
+    /// is not spacing, it is an eraser: every row the box occupied lost the
+    /// tree beside it, so a menu at the right-hand edge blanked the whole width
+    /// of the panel to its left. Ed, 2026-08-19: *"it wipes the horizontal
+    /// space from the rest of the panel"*. A popover keeps what is behind it
+    /// and covers only its own footprint, which is three steps rather than two
+    /// — clip to `left`, the box, then whatever the row had after it.
+    ///
+    /// The highlight is what a composite cannot keep. `selected` is a property
+    /// of a whole line ([`crate::draw`] re-asserts inverse per span across the
+    /// row), so a row half covered cannot be half inverse, and inverting the
+    /// box along with the row under it is the louder wrong. The thing in front
+    /// wins.
+    pub(crate) fn overlay(&mut self, left: usize, over: Line) {
+        let tail = self.from_column(left + over.width());
+        self.fit(left);
+        self.spans.extend(over.spans);
+        self.spans.extend(tail);
+        self.selected = false;
+    }
+
     /// Style stripped — what the row says. For assertions, once the storyboard
     /// grows checks as well as frames.
     #[allow(dead_code)]
@@ -469,6 +513,14 @@ pub(super) const CARD_W: usize = 76;
 /// whole difference between a card lying on top of the tree and a pane that has
 /// replaced it, and it costs two columns of a pane that has thirty-four.
 ///
+/// The gap is a column this returns nothing for, not a blank one it draws. It
+/// used to be a leading space per line, which is a column of the tree painted
+/// out rather than left showing — the same mistake as the padding
+/// [`Line::overlay`] exists to undo, in the one place it happened to be nearly
+/// invisible because a card is nearly full width. `w` is therefore what the
+/// card is *allotted*; the box inside it is two columns narrower, and the
+/// caller places it one column in.
+///
 /// `room` is what the tree has, not what a card is allowed: how tall this one
 /// gets is decided here, out of [`CARD_CHARS`] and the width, and `room` is the
 /// wall it cannot go through.
@@ -484,13 +536,11 @@ pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec
     let text_w = box_w.saturating_sub(4).max(6);
     let rule = |left: &str, right: &str| {
         let mut l = Line::default();
-        l.push(Style::Plain, " ");
         l.push(Style::Warn, format!("{left}{}{right}", "─".repeat(box_w - 2)));
         l
     };
     let row = |body: Line| {
         let mut l = Line::default();
-        l.push(Style::Plain, " ");
         l.push(Style::Warn, "│");
         l.push(Style::Plain, " ");
         let mut body = body;
@@ -639,9 +689,9 @@ pub(super) fn menu_lines(menu: &super::keys::Menu, w: usize) -> Vec<Line> {
         let mut body = Line::default();
         // Marked in the margin rather than by inverting the line. `Line`'s
         // inverse is the whole line, and the whole line here includes the box's
-        // own border — and, once the frame has padded it out to the left edge,
-        // the empty tree beside it. So the mark is a column, and the label is
-        // loud instead.
+        // own border — and, once the frame has composited it over the tree, the
+        // tree beside it too, which is now really there. So the mark is a
+        // column, and the label is loud instead.
         let picked = i == menu.sel;
         body.push(Style::Accent, if picked { format!("{} ", glyph::CLOSED) } else { "  ".into() });
         body.push(
@@ -1151,10 +1201,11 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         let top = g.head + tree_rows.saturating_sub(card.len()) / 2;
         for (i, l) in card.into_iter().enumerate() {
             if let Some(slot) = lines.get_mut(top + i) {
-                let mut placed = Line::default();
-                placed.pad(left);
-                placed.spans.extend(l.spans);
-                *slot = placed;
+                // `left + 1`: the inset the card's doc promises is a column of
+                // the tree showing at either edge, so it is a column the box
+                // does not cover — not one it paints blank, which is what
+                // drawing the gap inside [`card_lines`] amounted to.
+                slot.overlay(left + 1, l);
             }
         }
     }
@@ -1417,10 +1468,7 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         let (top, left, box_w) = menu_box(menu, w, h);
         for (i, l) in menu_lines(menu, box_w).into_iter().enumerate() {
             if let Some(slot) = lines.get_mut(top + i) {
-                let mut placed = Line::default();
-                placed.pad(left);
-                placed.spans.extend(l.spans);
-                *slot = placed;
+                slot.overlay(left, l);
             }
         }
     }
