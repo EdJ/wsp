@@ -420,7 +420,7 @@ fn slash_comments(text: &str) -> Vec<(usize, usize)> {
             b'\'' => i = end_of_char(text, i),
             // A raw string, but only where one can begin: the `r` of `for` is
             // not a prefix.
-            b'r' | b'b' if !i.checked_sub(1).is_some_and(|prev| is_word(b[prev])) => {
+            b'r' | b'b' if !i.checked_sub(1).is_some_and(|prev| is_ident(b[prev])) => {
                 i = end_of_raw(text, i).unwrap_or(i + 1);
             }
             _ => i += 1,
@@ -429,7 +429,9 @@ fn slash_comments(text: &str) -> Vec<(usize, usize)> {
     out
 }
 
-fn is_word(c: u8) -> bool {
+/// A byte that can sit inside an identifier — so the `r` of `for` is one and
+/// the `r` of `r"…"` is not.
+fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
