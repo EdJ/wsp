@@ -182,16 +182,64 @@
 //! the numbering turning out to work differently (`robustness-084`; the
 //! measurement is in [`crate::place_herdr`]).
 //!
-//! What that leaves undefended is worth naming rather than implying. A
-//! generation on the slot says nothing about the [`Surface`] bound to it, and a
-//! surface *can* come round again — a workspace id above the surviving maximum
-//! is reissued after a restart, and `w3:p1` with it. [`plan`] treats a bound
-//! surface that resolves as ours, so a reissued one is a stranger's pane we
-//! relabel and re-point. Nothing here corroborates the binding; `robustness-089`
-//! is open on it. And nothing is identified by
-//! position: `panel/install.rs:80` had to stop taking "first in the list" as
-//! "the pane to split off", which is D-53's positional-identity failure in
-//! miniature.
+//! And nothing is identified by position: `panel/install.rs:80` had to stop
+//! taking "first in the list" as "the pane to split off", which is D-53's
+//! positional-identity failure in miniature.
+//!
+//! **A binding is corroborated, not trusted — and the witness is not the
+//! label.** A generation on the slot says nothing about the [`Surface`] bound to
+//! it, and a surface *can* come round again: herdr's workspace counter is
+//! process-local and a restore reserves only `max(surviving) + 1`, so every id
+//! above that mark is handed out again and `w3:p1` with it (`robustness-084`).
+//! [`plan`] used to read a bound surface that still resolved as ours, and so
+//! relabelled and re-pointed a pane in somebody else's workspace.
+//!
+//! So [`Held`] carries a **witness** — what the runtime says is *behind* a pane,
+//! recorded when the slot was bound — and [`Live::witness`] is what it says is
+//! behind it now. A binding is believed only while those two do not disagree.
+//! herdr supplies it for free as `terminal_id`, on every `pane.list` row.
+//! Measured against 0.8.0 on 2026-08-19 by driving a sandbox through the
+//! restarts rather than by reading it (`robustness-089`):
+//!
+//! - It is per pane and never comes round. Four splits into one workspace, each
+//!   pane closed before the next: four ids, none reused.
+//! - **Every pane gets a fresh one across a restart, including the panes whose
+//!   ids survive.** `w1:p2` came back as `w1:p2`, still labelled `wsp`, with a
+//!   new terminal behind it. That is the truth rather than a quirk — the same
+//!   restart kills every process, so what wsp drew in is gone whether or not the
+//!   handle for it is.
+//! - The reissued `w3:p1` has a fresh one too, because it is a fresh pane.
+//!
+//! One field answers both failure directions, and for one reason: a handle that
+//! still resolves is not evidence that what wsp bound is still behind it.
+//!
+//! It is deliberately not the label. Requiring the live label to match would
+//! collide head-on with [`Op::Label`], whose whole purpose is to repair a label
+//! that does *not* match — a slot's wanted label moves every time a task's title
+//! or an agent's sentence does. A witness is a fact the reconciler never asks
+//! for and never corrects, which is exactly what makes it usable as evidence.
+//!
+//! What to *do* about an unbelieved binding is rule 5's, already written and
+//! unchanged: it is not a binding, so the slot falls through to the orphan
+//! branch and the pane it named stops counting as one of ours. After a restart
+//! that is right — our pane is still there wearing our label, and is adopted
+//! rather than duplicated. After a reissue it is right the other way — the
+//! stranger's pane wears the stranger's label, so nothing adopts it, nothing
+//! relabels it, and ours is opened fresh.
+//!
+//! Two things the witness deliberately does not do. It does not let an
+//! unbelieved binding *disprove* ownership: [`World::widest_foreign`] still
+//! counts every recorded surface as ours, because declining to split off one
+//! pane is a smaller error than splitting off a stranger's. And it closes
+//! nothing — a pane at a surface we can no longer prove is ours may be
+//! somebody's brand-new workspace — so the sweep of slots the spec does not name
+//! leaves it alone and says so.
+//!
+//! A backend with no witness to give leaves both sides empty and is believed
+//! exactly as before; so is a binding written before the field existed. Absence
+//! is not disagreement. [`Held::corroborated_by`] is where that is stated,
+//! because it is the only reading under which a renderer with nothing behind its
+//! panes can implement this port at all.
 //!
 //! **2. Reconcile, never rebuild.** `panel/install.rs` opens with the scar:
 //! *never `layout.apply`: herdr rebuilds the whole tree from that call and every
@@ -299,6 +347,18 @@
 //!   `place::State::Gone` while its pane remains, a spec can ask for it to be
 //!   refilled without reopening — and until then it would be a verb with no
 //!   caller, which is the tax this store keeps warning about.
+//!
+//!   Rule 1's witness moves that line and is worth knowing about before the
+//!   observe half arrives, because it is the first evidence this port has ever
+//!   had on the question. A pane that is still there with a *different* witness
+//!   is a pane whose occupant was certainly replaced — after a herdr restart,
+//!   every one of them is. What the witness cannot say is whether the pane is
+//!   ours with a dead shell in it or a stranger's at a recycled id, so it is
+//!   half an answer: today both are treated the same way, by not believing the
+//!   binding, and the adopt that follows re-binds a husk. Closing that gap means
+//!   a second field — the label wsp last *wrote*, which is not the label the
+//!   spec now wants, and is `said.json`'s trick one level over — and it should
+//!   arrive with the op that needs it rather than before.
 //! - **An op that swaps two panes.** Same test, same answer. Swapping is how a
 //!   new pane gets onto the correct side ([`Arrange::swap`] is in the trait for
 //!   it), but the plan cannot name a surface that does not exist yet — and
@@ -375,7 +435,9 @@ pub const DRAW_PENDING_MS: u64 = 2_000;
 /// to be — which is why identity is a [`Slot`] and a surface is only ever the
 /// answer to "where is this slot right now". It fails in both directions: a
 /// closed pane's id names nothing ever again, and a reissued workspace makes the
-/// same string name a stranger's pane. Neither is a thing to hold identity in.
+/// same string name a stranger's pane. Neither is a thing to hold identity in,
+/// which is also why a binding carries a witness beside the surface: it is what
+/// tells a surface that resolves from one that is still ours. Rule 1.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Surface(String);
 
@@ -464,6 +526,16 @@ pub struct Live {
     pub tab: String,
     pub label: String,
     pub rect: Rect,
+    /// What the runtime says is *behind* this pane right now. Rule 1's witness.
+    ///
+    /// herdr's `terminal_id`, which is minted per pane, never comes round, and
+    /// is fresh for every pane after a restart — including the panes whose ids
+    /// survive one. Carried and never parsed, exactly like a [`Surface`], and
+    /// only ever compared against another one read the same way.
+    ///
+    /// Empty is a backend saying it has nothing to offer here, not a value: see
+    /// [`Held::corroborated_by`] for what that costs and why it is allowed.
+    pub witness: String,
 }
 
 /// What should be drawn in a rendered pane.
@@ -685,6 +757,25 @@ impl Spec {
 pub struct Held {
     pub surface: Surface,
     pub filled: bool,
+    /// What the runtime said was behind [`Held::surface`] when the slot was
+    /// bound. Rule 1: a binding is believed only while it still says the same.
+    pub witness: String,
+}
+
+impl Held {
+    /// Whether this live pane is the pane the binding was made against.
+    ///
+    /// **Disagreement is the test, not agreement**, and that asymmetry is the
+    /// whole of it. Two witnesses that differ are proof the pane changed under
+    /// us; a witness missing on either side is proof of nothing, so the binding
+    /// is believed exactly as it was before the field existed. That is what a
+    /// record written by an older wsp gets, and what a renderer with nothing
+    /// behind its panes gets for ever — a port that refused every binding it
+    /// could not corroborate would be unimplementable by half the backends it
+    /// was written for, which is a worse failure than the one being fixed.
+    pub fn corroborated_by(&self, live: &Live) -> bool {
+        self.witness.is_empty() || live.witness.is_empty() || self.witness == live.witness
+    }
 }
 
 /// What we have seen, and what we remember calling it.
@@ -728,15 +819,22 @@ impl World {
         self.heard
     }
 
-    /// Remember a pane wsp draws in.
-    pub fn binding(mut self, slot: Slot, surface: Surface) -> World {
-        self.bound.insert(slot, Held { surface, filled: false });
+    /// Remember a pane, and what the runtime said was behind it.
+    pub fn held(mut self, slot: Slot, held: Held) -> World {
+        self.bound.insert(slot, held);
         self
     }
-    /// Remember a pane with somebody's work in it.
-    pub fn filling(mut self, slot: Slot, surface: Surface) -> World {
-        self.bound.insert(slot, Held { surface, filled: true });
-        self
+    /// Remember a pane wsp draws in, with nothing corroborating it.
+    ///
+    /// What a record written before rule 1's witness existed amounts to, and
+    /// what a backend with no witness to give leaves behind. Both are believed;
+    /// [`Held::corroborated_by`] says why that is the only workable reading.
+    pub fn binding(self, slot: Slot, surface: Surface) -> World {
+        self.held(slot, Held { surface, filled: false, witness: String::new() })
+    }
+    /// Remember a pane with somebody's work in it, likewise uncorroborated.
+    pub fn filling(self, slot: Slot, surface: Surface) -> World {
+        self.held(slot, Held { surface, filled: true, witness: String::new() })
     }
     pub fn in_flight(mut self, slot: Slot, since: u64) -> World {
         self.pending.insert(slot, since);
@@ -756,6 +854,13 @@ impl World {
     /// `panel/install.rs:80`, as a pure function. Ours means bound to a slot —
     /// which is stronger than the label test the code uses today, and is what
     /// rule 1 buys.
+    ///
+    /// **Every recorded surface, corroborated or not**, and that is the one
+    /// place the witness is deliberately not consulted. Elsewhere an unbelieved
+    /// binding is not evidence that a pane is ours; here it would have to be
+    /// evidence that a pane is *not*, which it never is. The two errors are not
+    /// the same size: declining to split off one pane costs a worse anchor,
+    /// splitting off the pane a stranger is working in costs them their column.
     fn widest_foreign(&self, tab: Option<&str>) -> Option<&Live> {
         let ours: BTreeSet<&Surface> = self.bound.values().map(|h| &h.surface).collect();
         self.live
@@ -877,6 +982,16 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
     }
 
     let tab = spec.tab.as_deref();
+    // The surfaces we can still prove are ours: bound, live, and still carrying
+    // the witness the binding was made against. Rule 1. A recorded surface that
+    // fails that test is absent here on purpose, and present in
+    // `widest_foreign` on purpose; the module docs argue both.
+    let believed: BTreeSet<&Surface> = world
+        .bound
+        .values()
+        .filter(|h| world.find(&h.surface).is_some_and(|l| h.corroborated_by(l)))
+        .map(|h| &h.surface)
+        .collect();
     let mut opened: Vec<Op> = Vec::new();
     let mut changed: Vec<Op> = Vec::new();
     let mut closed: Vec<Op> = Vec::new();
@@ -888,7 +1003,23 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
             .bound
             .iter()
             .find(|(s, _)| s.same_name(&want.slot))
-            .and_then(|(s, held)| world.find(&held.surface).map(|l| (s.clone(), l)));
+            .and_then(|(s, held)| world.find(&held.surface).map(|l| (s.clone(), held, l)));
+
+        // Rule 1. A binding is evidence only while the runtime still agrees
+        // about what is behind the pane. A surface that resolves to a pane with
+        // a different witness has come round again — a reissued workspace, or
+        // our own pane with a fresh terminal after a restart — and reading it as
+        // ours is how wsp relabels and re-points a stranger.
+        let here = match here {
+            Some((slot, held, live)) if !held.corroborated_by(live) => {
+                out.note(format!(
+                    "{} is a different pane now — {slot} is treated as unbound",
+                    held.surface
+                ));
+                None
+            }
+            other => other.map(|(slot, _, live)| (slot, live)),
+        };
 
         match here {
             // The pane exists and is ours. Rule 2: change it in place.
@@ -950,19 +1081,24 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
                 // left to recognise it by, which is the one place a label is a
                 // key and is why the policy is stated rather than assumed.
                 //
-                // "A restart that reissued the ids" used to head that list and
-                // has been taken out of it: a restart preserves the binding and
-                // the ids under a workspace that survives, and a workspace that
-                // does not survive takes its panes with it — so there is no
-                // orphan to adopt. The reissue that is real goes the other way,
-                // and this branch never runs for it, because the stale surface
-                // still resolves. See the module docs.
+                // A restart is the case this branch was once said never to see,
+                // and it sees both halves of it. The ids under a surviving
+                // workspace come back and the terminals behind them do not, so
+                // the binding is no longer believed and the pane arrives here
+                // wearing our label — an orphan, adopted rather than duplicated.
+                // A reissued workspace arrives here too, wearing somebody
+                // else's, and is left where it is. Rule 1's witness is what
+                // makes both true; see the module docs.
+                //
+                // "Not one of ours" is therefore the *believed* set and not the
+                // recorded one. Excluding a surface we can no longer prove is
+                // ours would hide the one orphan this branch exists to find.
                 let orphan = (!want.label.is_empty())
                     .then(|| {
                         world.live.iter().find(|l| {
                             l.label == want.label
                                 && tab.is_none_or(|t| l.tab == t)
-                                && !world.bound.values().any(|h| h.surface == l.surface)
+                                && !believed.contains(&l.surface)
                         })
                     })
                     .flatten();
@@ -1007,6 +1143,14 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
                 let off = match &want.at {
                     Anchor::Root => None,
                     Anchor::Slot(s) => {
+                        // This plan's own answer first, then the record — and
+                        // the record only where the runtime still corroborates
+                        // it. Rule 1: "hang this off my other pane" is a
+                        // sentence about a pane of ours, so a surface we cannot
+                        // prove is ours is not an anchor, it is a stranger's
+                        // workspace to split. Where the slot is genuinely ours
+                        // and merely lost, the orphan branch has already adopted
+                        // it into `placed` above.
                         let found = placed
                             .get(&s.name)
                             .cloned()
@@ -1016,6 +1160,7 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
                                     .iter()
                                     .find(|(b, _)| b.same_name(s))
                                     .map(|(_, held)| held.surface.clone())
+                                    .filter(|surface| believed.contains(&surface))
                             });
                         match found {
                             Some(surface) => Some(surface),
@@ -1063,6 +1208,18 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
     // spec to say so with `Body::Done`.
     for (slot, held) in &world.bound {
         if spec.want(slot).is_some() || world.find(&held.surface).is_none() {
+            continue;
+        }
+        // Rule 1, and the reason the witness is worth a field on its own: this
+        // is the one place the plan closes a pane on the strength of a record
+        // rather than a reading. A surface that has come round again is now
+        // somebody's brand-new workspace, and closing it on our own stale note
+        // is the worst thing in this file.
+        if !believed.contains(&held.surface) {
+            out.note(format!(
+                "{slot} is not in this spec and {} is a different pane now — left alone",
+                held.surface
+            ));
             continue;
         }
         if held.filled {
@@ -1229,13 +1386,30 @@ pub trait Arrange {
 mod tests {
     use super::*;
 
+    /// A pane with the runtime's own witness behind it. Every pane in these
+    /// tests has one, because every pane herdr reports has one — a `Live` with
+    /// an empty witness is the *other* case and is written out where it is meant.
     fn live(id: &str, label: &str, w: u32) -> Live {
         Live {
             surface: Surface::new(id),
             tab: "t0".into(),
             label: label.into(),
             rect: Rect { x: 0, y: 0, w, h: 40 },
+            witness: format!("term_{id}"),
         }
+    }
+
+    /// The same pane with something else behind it: a restart replaced the
+    /// terminal, or the id came round again on somebody else's workspace.
+    fn behind(mut l: Live, witness: &str) -> Live {
+        l.witness = witness.into();
+        l
+    }
+
+    /// A binding made while `witness` was behind the pane — what the executor
+    /// writes down, and what [`live`] above corroborates.
+    fn held(surface: &str, witness: &str) -> Held {
+        Held { surface: Surface::new(surface), filled: false, witness: witness.into() }
     }
 
     fn rendered(name: &str, view: &str) -> Want {
@@ -1586,6 +1760,162 @@ mod tests {
             plan(&world, &spec).ops,
             vec![Op::Focus { slot: Slot::new("view"), surface: Surface::new("p2") }]
         );
+    }
+
+    /// Rule 1's second half, and the bug it was written for. herdr hands out a
+    /// workspace id above the surviving maximum again after a restart, so
+    /// `w3:p1` comes back on a workspace wsp has never seen. The binding still
+    /// resolves and is still worthless: what is behind the pane is not what was
+    /// behind it when the slot was bound, and relabelling and re-pointing it
+    /// would be doing that to a stranger's work.
+    #[test]
+    fn a_surface_that_came_round_again_is_not_the_pane_it_was_bound_to() {
+        let spec = Spec::new(vec![
+            Want::new(Slot::new("view"), Body::Rendered(Content::on("detail", "t-1")))
+                .labelled("view")
+                .at(Anchor::Widest, Dir::Right, 0.5),
+        ]);
+        // `p1` resolves, wears somebody else's label, and has a terminal behind
+        // it that this binding has never seen.
+        let world = World::heard(vec![
+            behind(live("p1", "somebody else", 100), "term_new"),
+            live("p2", "shell", 60),
+        ])
+        .held(Slot::new("view"), held("p1", "term_old"));
+
+        let p = plan(&world, &spec);
+        assert!(
+            !p.ops.iter().any(|o| o.expects() == Some(&Surface::new("p1"))),
+            "a stranger's pane was relabelled or re-pointed: {:?}",
+            p.ops
+        );
+        assert_eq!(opens(&p), 1, "and ours is opened instead of assumed");
+        assert!(!p.notes.is_empty(), "silently is the one way not to do this");
+    }
+
+    /// The other direction, and the reason the answer is a witness rather than a
+    /// blanket distrust of surfaces. A restart keeps the pane id under a
+    /// workspace that survives and keeps the label on it, and replaces the
+    /// terminal — so the binding is not believed, the pane falls to rule 5's
+    /// orphan branch wearing our label, and is adopted. Distrusting the surface
+    /// without the label to fall back on would install a second panel beside the
+    /// first, which is the bug `panel/install.rs:142` already exists to prevent.
+    #[test]
+    fn a_pane_that_survived_a_restart_is_adopted_and_not_duplicated() {
+        let spec = Spec::new(vec![rendered("panel", "panel").at(Anchor::Widest, Dir::Right, 0.22)]);
+        let world = World::heard(vec![
+            behind(live("p1", "panel", 30), "term_after_restart"),
+            live("p2", "shell", 100),
+        ])
+        .held(Slot::new("panel"), held("p1", "term_before_restart"));
+
+        let p = plan(&world, &spec);
+        assert_eq!(opens(&p), 0, "a second panel beside the first");
+        assert!(
+            p.ops.iter().any(|o| matches!(o, Op::Adopt { surface, .. } if surface == &Surface::new("p1"))),
+            "{:?}",
+            p.ops
+        );
+    }
+
+    /// The compatibility rule, stated as a test because it is the line that
+    /// decides whether this port can be implemented at all. Absence of a witness
+    /// is not disagreement: a record written before the field existed, and a
+    /// renderer with nothing behind its panes to name, are both believed exactly
+    /// as they were.
+    #[test]
+    fn a_binding_nothing_witnesses_is_believed_exactly_as_before() {
+        let spec = Spec::new(vec![rendered("view", "detail")]);
+
+        // The old record: a surface and no witness, against a runtime that has one.
+        let upgraded = World::heard(vec![live("p2", "view", 60)])
+            .binding(Slot::new("view"), Surface::new("p2"));
+        assert!(plan(&upgraded, &spec).is_empty(), "an upgrade unbound a live pane");
+
+        // The other half: a backend with no witness to give, against a record
+        // that wanted one.
+        let bare = World::heard(vec![behind(live("p2", "view", 60), "")])
+            .held(Slot::new("view"), held("p2", "term_p2"));
+        assert!(plan(&bare, &spec).is_empty(), "a renderer with no witness cannot be served");
+
+        // And the ordinary case, so the three read together: agreement is quiet.
+        let agreed = World::heard(vec![live("p2", "view", 60)])
+            .held(Slot::new("view"), held("p2", "term_p2"));
+        assert!(plan(&agreed, &spec).is_empty());
+    }
+
+    /// The most expensive line in [`plan`] and the only one that closes a pane on
+    /// the strength of a record rather than a reading. A slot the spec has
+    /// stopped naming is taken down — unless the surface it names has come round
+    /// again, in which case the pane belongs to whoever got the id next.
+    #[test]
+    fn a_slot_the_spec_forgot_is_not_closed_at_a_surface_that_came_round_again() {
+        let ours = World::heard(vec![live("p1", "view", 60)])
+            .held(Slot::new("view"), held("p1", "term_p1"));
+        assert_eq!(
+            plan(&ours, &Spec::new(Vec::new())).ops,
+            vec![Op::Close { slot: Slot::new("view"), surface: Surface::new("p1") }],
+            "wsp drew it and can draw it again"
+        );
+
+        let theirs = World::heard(vec![behind(live("p1", "somebody else", 60), "term_new")])
+            .held(Slot::new("view"), held("p1", "term_old"));
+        let p = plan(&theirs, &Spec::new(Vec::new()));
+        assert!(p.is_empty(), "closed a pane on a stale note: {:?}", p.ops);
+        assert_eq!(p.notes.len(), 1, "and said so, or it looks like there was nothing to do");
+    }
+
+    /// The one place the witness is deliberately not consulted, and the asymmetry
+    /// is the argument. An unbelieved binding is not evidence that a pane is
+    /// ours; it is never evidence that a pane is *not*. So a surface we recorded
+    /// stays out of the anchor search, because splitting off the pane a stranger
+    /// is working in costs them their column, and declining to split off a pane
+    /// of our own costs a worse anchor.
+    #[test]
+    fn a_surface_we_can_no_longer_prove_is_ours_is_still_not_split_off() {
+        let world = World::heard(vec![
+            behind(live("p1", "somebody else", 120), "term_new"),
+            live("p2", "shell", 100),
+        ])
+        .held(Slot::new("view"), held("p1", "term_old"));
+        // Both slots named, so nothing here is about the sweep: `p1` is the
+        // widest pane on the screen and the only question is whether it is a
+        // candidate to split.
+        let spec = Spec::new(vec![
+            rendered("view", "detail").at(Anchor::Widest, Dir::Right, 0.5),
+            rendered("panel", "panel").at(Anchor::Widest, Dir::Right, 0.22),
+        ]);
+
+        let p = plan(&world, &spec);
+        assert!(opens(&p) > 0, "nothing was opened, so nothing was anchored: {:?}", p.ops);
+        for op in &p.ops {
+            if let Op::Open { off, slot, .. } = op {
+                assert_ne!(
+                    off.as_ref(),
+                    Some(&Surface::new("p1")),
+                    "{slot} was split off a pane we recorded and can no longer vouch for"
+                );
+            }
+        }
+    }
+
+    /// An anchor is a sentence about a pane of *ours*, so it is answered from the
+    /// believed record and never from the bare one. A slot whose surface has come
+    /// round again does not name a pane to hang anything off — it names a
+    /// stranger's workspace, and splitting it is the same harm as adopting it.
+    #[test]
+    fn a_pane_will_not_hang_off_a_slot_whose_surface_came_round_again() {
+        // `panel` is bound to `p1`, `p1` is live, and what is behind it is not
+        // what was behind it when the slot was bound.
+        let world = World::heard(vec![behind(live("p1", "somebody else", 100), "term_new")])
+            .held(Slot::new("panel"), held("p1", "term_old"));
+        let spec = Spec::new(vec![
+            rendered("view", "detail").at(Anchor::Slot(Slot::new("panel")), Dir::Down, 0.45),
+        ]);
+
+        let p = plan(&world, &spec);
+        assert!(p.is_empty(), "split a stranger's pane: {:?}", p.ops);
+        assert!(p.notes.iter().any(|n| n.contains("not open")), "{:?}", p.notes);
     }
 
     /// Nothing in the port reads an id. The closest a test can get: a surface is
