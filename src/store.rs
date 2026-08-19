@@ -1652,16 +1652,6 @@ impl Store {
         }
     }
 
-    /// When that census was taken. What a person is asked after a restart is
-    /// "here is what you had running", and how long ago is half of it.
-    pub fn roster_at(&self) -> String {
-        self.read_json("resumable.json")
-            .get("at")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    }
-
     /// Replace it. Silent when the rows have not changed, because this runs on
     /// every daemon tick and an unchanged file rewritten every twenty seconds
     /// is wear for no reader — which is also why the timestamp is beside the

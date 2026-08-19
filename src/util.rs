@@ -738,6 +738,7 @@ impl Paint {
     /// compared rather than looked at. A test that asserts on a line of output
     /// should not be asserting on escape codes, and it should not be quietly
     /// passing or failing on whether the harness happened to keep a tty.
+    #[cfg(test)]
     pub fn plain() -> Self {
         Paint { on: false }
     }
