@@ -1769,6 +1769,7 @@ mod tests {
                 worked: Default::default(),
                 bindings: Default::default(),
                 panes: Vec::new(),
+                messages: Vec::new(),
                 columns: Vec::new(),
             },
             scroll: 0,

@@ -5,6 +5,7 @@
 //! panel's `Snapshot` makes, for the same reason.
 
 use crate::live::{self, AgentRef};
+use crate::message::{self, Message};
 use crate::model::{Priority, Status, Task};
 use crate::panel::{self, line, Line, Style};
 use crate::resolve::{self, Index};
@@ -70,6 +71,16 @@ pub(crate) struct Ctx {
     pub worked: std::collections::BTreeMap<String, serde_json::Value>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub panes: Vec<AgentRef>,
+    /// Every message on this machine, so a task can be asked what is raised
+    /// about it.
+    ///
+    /// `worklist-018`: the card cuts a long paragraph at five hundred
+    /// characters and says *"… 6 more lines · o"*, and `o` opened a page that
+    /// drew the task and nothing about the hand — so the rest of the message
+    /// was not anywhere. A surface that says where the rest is has to be right
+    /// about it, or it is the flag receipt's fault one level down: a near side
+    /// reporting on a far side it has not looked at.
+    pub messages: Vec<Message>,
     /// The sections in the editor columns beside this pane, left to right.
     ///
     /// Cannot be derived from `panes`: a pane row carries no geometry, so which
@@ -110,6 +121,7 @@ impl Ctx {
             worked: store.worked(),
             bindings: store.bindings(),
             panes,
+            messages: message::all(store),
             columns: Vec::new(),
         }
     }
@@ -120,6 +132,25 @@ impl Ctx {
             (b.get("task_id").and_then(|t| t.as_str()) == Some(task)).then(|| pane.clone())
         })?;
         self.panes.iter().find(|p| p.pane == pane_id)
+    }
+
+    /// The hands up about one task, oldest first.
+    ///
+    /// [`Message::needs_attention`] and not `is_open`, because a record whose
+    /// state this build cannot parse is a record to put in front of somebody
+    /// rather than one to go quiet about — the installed binary is routinely
+    /// not the tree, and *"I cannot read this"* is a reason to fetch a human.
+    ///
+    /// Answers are left out because they are already here: `message::answer`
+    /// writes the reply to the asker's task log before it delivers it, so a
+    /// section drawing them too would put the same sentence on the page twice
+    /// and in two voices.
+    fn raised_for(&self, task: &str) -> Vec<&Message> {
+        self.messages
+            .iter()
+            .filter(|m| m.about.task() == Some(task))
+            .filter(|m| m.reply_to.is_none() && m.needs_attention())
+            .collect()
     }
 }
 
@@ -313,6 +344,52 @@ fn section_key(section: &str) -> char {
     }
 }
 
+/// One raised hand's first line: the mark, and who is asking for what.
+///
+/// The headline and not a heading taken from somewhere else. `worklist-018` is
+/// the whole reason: a flag carried a heading, a sentence and a paragraph in
+/// three fields, and every surface picked a different one, so a hand raised
+/// with only the third drew as an empty row. A message is one text whose first
+/// line is the headline ([`Message::title`]), and there is no second field here
+/// to prefer over it.
+fn hand(m: &Message, w: usize) -> Line {
+    let mut l = Line::default();
+    l.push(Style::Warn, format!("{} ", panel::glyph::FLAG));
+    // Empty is not a fault and is not an error either — `wsp flag <id>` on its
+    // own means *look at this task, it exists*, and the words for that are the
+    // sender's absence rather than anything to invent.
+    let head = match m.title() {
+        "" => "raised this, with nothing written on it".to_string(),
+        t => t.to_string(),
+    };
+    l.push(Style::Bold, util::truncate(&head, w.saturating_sub(2)));
+    l
+}
+
+/// The line under a hand: who is asking, how long they have been, and the verb
+/// that ends it.
+///
+/// The verb is named because this page is where a person reads the whole of a
+/// question, and a question read and not answered is `worklist-013` — a hand
+/// that stayed up for 2h14m after the answer had been given down another
+/// channel. Naming `wsp answer <id>` beside the words is the cheapest place to
+/// put the two together.
+fn answering(m: &Message) -> String {
+    let mut parts = vec![m.from.byline()];
+    if let Some(crate::message::Ask::Claim) = m.ask() {
+        parts.push("asks to take it".into());
+    }
+    let held = util::since(&m.at);
+    if held > 0 {
+        parts.push(util::duration_human(held));
+    }
+    parts.push(match m.shape() {
+        Some(crate::message::Shape::Question) => format!("wsp answer {} \"…\"", m.id),
+        _ => format!("wsp ack {}", m.id),
+    });
+    parts.join(" · ")
+}
+
 fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
     let Some(t) = ctx.tasks.iter().find(|t| t.id == id) else {
         out.push(line(Style::Warn, format!("no task {id}")));
@@ -390,6 +467,26 @@ fn task_frame(ctx: &Ctx, id: &str, w: usize, out: &mut Vec<Line>) {
             out.push(field("pane", &format!("{} · {what} {}", p.pane, p.state), Style::Plain));
         }
         None => out.push(field("pane", "", Style::Dim)),
+    }
+
+    // The hands up about this task, before anything that is merely true about
+    // it. This is the page a card sends you to when it has cut a paragraph —
+    // `o` on a card is `Focus::Task` — so the words it cut have to be here, in
+    // full, and above the fold rather than under the prose.
+    let raised = ctx.raised_for(&t.id);
+    if !raised.is_empty() {
+        out.push(Line::default());
+        out.push(heading(&format!("raised · {}", raised.len())));
+        for m in raised {
+            out.push(hand(m, measure(w)));
+            for l in util::wrap(m.text.trim(), measure(w).saturating_sub(2)) {
+                let mut ln = Line::default();
+                ln.push(Style::Dim, "  ");
+                ln.push(Style::Plain, l);
+                out.push(ln);
+            }
+            out.push(line(Style::Muted, format!("  {}", answering(m))));
+        }
     }
 
     // What is under it. The panel shows this as indentation and a count; here
@@ -612,8 +709,74 @@ mod tests {
             worked: Default::default(),
             bindings: Default::default(),
             panes: Vec::new(),
+            messages: Vec::new(),
             columns: Vec::new(),
         }
+    }
+
+    /// A hand up about `task`, carrying `text`.
+    fn raised(task: &str, text: &str) -> Message {
+        crate::message::Message::question(
+            crate::message::Party::pane("w4:p2", "w4"),
+            crate::message::Kind::Note,
+            text,
+            crate::message::Waiting::new("w4:p2", task),
+        )
+        .about(crate::message::About::Task(task.to_string()))
+    }
+
+    /// `worklist-018`. The card cuts a paragraph at five hundred characters and
+    /// says *"… 6 more lines · o"*; `o` is `Focus::Task` and lands here. Before
+    /// this, the page it landed on drew the task and said nothing about the
+    /// hand at all — so a card that told you where the rest was was wrong, and
+    /// the only way to read a long raised hand was `flags.json` by hand, which
+    /// is exactly how the fault this task exists for was found.
+    #[test]
+    fn the_page_a_card_sends_you_to_has_the_words_the_card_cut() {
+        let mut t = crate::model::Task::new("the panel work, in order", "wsp-013");
+        t.project = Some("wsp".into());
+        let long = format!("this is next — can I take it?\n\n{}\n\nand the last line of it.", "x".repeat(900));
+        let ctx = Ctx { messages: vec![raised("wsp-013", &long)], ..task_ctx(t) };
+
+        let page = text_of(&frame(&ctx, &Focus::Task("wsp-013".into()), 96, 60, Placed::Page, &mut 0));
+        assert!(page.contains("raised · 1"), "the section is there:\n{page}");
+        assert!(page.contains("this is next — can I take it?"), "the headline:\n{page}");
+        assert!(
+            page.contains("and the last line of it."),
+            "and the end of a paragraph no card could hold — this is the whole point:\n{page}",
+        );
+        assert!(page.contains("wsp answer "), "with the verb that ends it:\n{page}");
+    }
+
+    /// `wsp flag <id>` on its own is a complete thing to say — *look at this
+    /// task, it exists* — and it is the one input that leaves the record with
+    /// no words in it. It draws as a sentence rather than as an empty row,
+    /// because an empty row and a hand about a task that has been retired are
+    /// the two things a reader must never have to tell apart by guessing.
+    #[test]
+    fn a_hand_with_nothing_written_on_it_says_that_rather_than_drawing_blank() {
+        let mut t = crate::model::Task::new("the panel work, in order", "wsp-013");
+        t.project = Some("wsp".into());
+        let ctx = Ctx { messages: vec![raised("wsp-013", "")], ..task_ctx(t) };
+
+        let page = text_of(&frame(&ctx, &Focus::Task("wsp-013".into()), 96, 60, Placed::Page, &mut 0));
+        assert!(page.contains("nothing written on it"), "said out loud:\n{page}");
+    }
+
+    /// An answer is on the page already — `message::answer` writes it to the
+    /// asker's task log before it delivers it — so drawing replies here too
+    /// would put one sentence on one page twice, in two voices, and leave a
+    /// reader deciding which of them is the record.
+    #[test]
+    fn an_answer_is_not_a_second_raised_hand() {
+        let mut t = crate::model::Task::new("the panel work, in order", "wsp-013");
+        t.project = Some("wsp".into());
+        let mut reply = raised("wsp-013", "yes, take it");
+        reply.reply_to = Some("m-1".to_string());
+        let ctx = Ctx { messages: vec![reply], ..task_ctx(t) };
+
+        let page = text_of(&frame(&ctx, &Focus::Task("wsp-013".into()), 96, 60, Placed::Page, &mut 0));
+        assert!(!page.contains("raised · "), "an answer raises nothing:\n{page}");
     }
 
     fn text_of(lines: &[Line]) -> String {
@@ -758,6 +921,7 @@ mod tests {
             worked: Default::default(),
             bindings: Default::default(),
             panes: Vec::new(),
+            messages: Vec::new(),
             columns: Vec::new(),
         };
         let mut out = Vec::new();
@@ -791,6 +955,7 @@ mod tests {
             worked: Default::default(),
             bindings: Default::default(),
             panes: Vec::new(),
+            messages: Vec::new(),
             columns: Vec::new(),
         };
         let mut out = Vec::new();
