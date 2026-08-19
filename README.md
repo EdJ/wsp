@@ -231,8 +231,8 @@ all. `W` on any agent row, in the list or in the section at the foot or under
 the task it claimed, brings the tree back with the cursor already on that task,
 and uncovers it if the tree was holding it out of sight: the projects above it
 unfold, the cap comes off the list it is in, and a filter that would leave it
-out — `A` for work that is finished, `R` for work that is not at review — goes
-off, in that order, stopping at the first that is enough. Each of those is a
+out — `A` for work that is finished, `R` for work the review filter does not
+draw — goes off, in that order, stopping at the first that is enough. Each of those is a
 decision you made, so only the ones actually in the way are undone, and the two
 filters say so in the footer as they go. An agent holding nothing is told so
 rather than moved: that is a pane to give work to, which is `f` or `c`.
@@ -1805,6 +1805,14 @@ is the tree describing a tree that is not there. The pane groups go, since a
 terminal is not work waiting on you. The footer says the filter is up, because
 one left on silently reads as an empty backlog — and `R` again is the whole
 tree.
+
+**Open work under a review comes through the filter with it**, drawn beneath
+the parent it contradicts: a parent handed back while a sub-task under it is
+still being written is not waiting on you, and narrowing by status is precisely
+what removes the row that says so. `wsp ls -s review` is the same question at a
+shell, and there the parent's `(n open)` was counted over the filtered list too
+— so it under-reported rather than merely omitting. Both count against the
+store now; the argument is on `open_under_review` in `resolve.rs`.
 
 (`r` was taken: it syncs. Uppercase is what the panel already means by a
 view-level key — `A`, `E`, `O`, `X` — and lowercase stays the verbs.)

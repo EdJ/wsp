@@ -734,6 +734,13 @@ impl Paint {
     pub fn new() -> Self {
         Paint { on: colour_enabled() }
     }
+    /// No colour, whatever the terminal says — for text that is going to be
+    /// compared rather than looked at. A test that asserts on a line of output
+    /// should not be asserting on escape codes, and it should not be quietly
+    /// passing or failing on whether the harness happened to keep a tty.
+    pub fn plain() -> Self {
+        Paint { on: false }
+    }
     fn wrap(&self, code: &str, s: &str) -> String {
         if self.on {
             format!("\x1b[{code}m{s}\x1b[0m")

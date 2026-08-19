@@ -204,7 +204,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if let Some(s) = &scope {
         println!("{}", p.dim(&format!("{}  ({} open)", s, tasks.len())));
     }
-    print_tasks(&tasks, &p, scope.is_none());
+    print_tasks(&tasks, &store.tasks(), &p, scope.is_none());
     0
 }
 
@@ -408,7 +408,7 @@ pub fn inbox(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     println!("{}", p.dim(&format!("inbox  ({})", tasks.len())));
-    print_tasks(&tasks, &p, false);
+    print_tasks(&tasks, &store.tasks(), &p, false);
     0
 }
 
@@ -423,15 +423,28 @@ pub fn paint_prio(p: &Paint, prio: Priority) -> String {
     }
 }
 
-fn print_tasks(tasks: &[Task], p: &Paint, show_project: bool) {
-    let idw = tasks.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
+/// `shown` is what the filters left; `all` is the store. Two arguments because
+/// the count on a parent is not a fact about the list — see
+/// [`crate::resolve::open_under_review`], where `wsp ls -s review` printing
+/// `(1 open)` over four is the case they were one argument for.
+fn print_tasks(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) {
+    for l in task_lines(shown, all, p, show_project) {
+        println!("{l}");
+    }
+}
+
+/// The rows, as text. Separate from printing them so the count on a parent is
+/// something a test can read — which is what this exists for.
+fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Vec<String> {
+    let idw = shown.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
     // Children under their parent, indented. The parent carries what is still
     // open beneath it, because a one-line parent that says nothing about its
     // children is a task you would tick off without looking.
-    for (t, depth) in crate::resolve::nest(tasks) {
+    let mut out: Vec<String> = Vec::new();
+    for (t, depth) in crate::resolve::nest(shown) {
         let t = &t;
         let indent = "  ".repeat(depth);
-        let under = crate::resolve::counts_under(tasks, &t.id);
+        let under = crate::resolve::counts_under(all, &t.id);
         let kids = if under.open > 0 {
             p.dim(&format!("  ({} open)", under.open))
         } else if under.done > 0 {
@@ -451,7 +464,7 @@ fn print_tasks(tasks: &[Task], p: &Paint, show_project: bool) {
         } else {
             String::new()
         };
-        println!(
+        out.push(format!(
             "  {} {} {} {}{}{}{}",
             p.dim(&util::pad(&t.id, idw)),
             st,
@@ -460,8 +473,9 @@ fn print_tasks(tasks: &[Task], p: &Paint, show_project: bool) {
             util::truncate(&t.title, 62usize.saturating_sub(indent.len())),
             kids,
             project
-        );
+        ));
     }
+    out
 }
 
 pub fn show(store: &Store, args: &Args) -> i32 {
@@ -1950,6 +1964,39 @@ mod tests {
         t.priority_raw = level.into();
         store.save_task(&t).unwrap();
         t
+    }
+
+    /// The shape `fork-003` was actually in on 2026-08-19, under the filter it
+    /// was found with. A count taken over the filtered list is not absent, it
+    /// is wrong — and wrong in the direction that makes the parent look ready.
+    #[test]
+    fn a_parent_counts_the_work_under_it_and_not_the_work_the_filter_left() {
+        let store = scratch("ls-under-filter");
+        let mut parent = Task::new("What the fork could own of agent spawning", "fork-003");
+        parent.project = Some("fork".into());
+        parent.status_raw = "review".into();
+        store.save_task(&parent).unwrap();
+        for (id, status) in [("fork-014", "todo"), ("fork-015", "review"), ("fork-016", "todo")] {
+            let mut kid = Task::new("a piece of it", id);
+            kid.project = Some("fork".into());
+            kid.status_raw = status.into();
+            kid.parent = Some("fork-003".into());
+            store.save_task(&kid).unwrap();
+        }
+
+        let all = store.tasks();
+        let shown: Vec<Task> =
+            all.iter().filter(|t| t.status() == Status::Review).cloned().collect();
+        let lines = task_lines(&shown, &all, &Paint::plain(), false);
+
+        let parent_line = lines.iter().find(|l| l.contains("fork-003")).expect("the parent");
+        assert!(
+            parent_line.contains("(3 open)"),
+            "the parent should count every open sub-task, not the one the filter kept: {parent_line}"
+        );
+        // And the rows themselves are still the filter's: the count is the
+        // whole of what the parent borrows from outside the list.
+        assert_eq!(lines.len(), 2, "the filter still decides which rows there are: {lines:?}");
     }
 
     /// A scope nobody typed has to be able to say what it hid.

@@ -1105,6 +1105,17 @@ fn ident_of(task: &Task, under: Option<&str>) -> String {
     }
 }
 
+/// Does `R` keep this row? At `review`, or open work still sitting under
+/// something that is — see [`resolve::open_under_review`], which is where the
+/// second half is argued and where `unfinished` comes from.
+///
+/// One function because the predicate is asked in three places — the inbox,
+/// each project's tasks, and the counts on the project rows — and three
+/// copies of it is how the counts came to describe a tree that was not there.
+pub(super) fn under_review(t: &Task, unfinished: &[String]) -> bool {
+    t.status() == Status::Review || unfinished.contains(&t.id)
+}
+
 /// Rows for the tasks of one project — or, when `project` is `None`, the tasks
 /// belonging to no project at all. The inbox went unrendered for a while
 /// because it had no equivalent of the project walk; sharing this makes that
@@ -1115,6 +1126,7 @@ pub(super) fn task_rows(
     depth: usize,
     view: &View,
     index: &Index,
+    unfinished: &[String],
     agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
     rows: &mut Vec<Row>,
 ) {
@@ -1123,7 +1135,7 @@ pub(super) fn task_rows(
         .filter(|t| t.project.as_deref() == project)
         .filter(|t| {
             if view.review_only {
-                t.status() == Status::Review
+                under_review(t, unfinished)
             } else {
                 view.show_done || t.status().is_open()
             }
@@ -1350,9 +1362,15 @@ fn uncap(view: &mut View, snap: &Snapshot, task: &str) -> bool {
 }
 
 /// The filters that would leave it out: `/` for a phrase it does not hold, `A`
-/// for work that is finished, `R` for work that is not at review. All three say
-/// so in the footer, which is what makes them safe to turn off from here — the
-/// tree changing under you is explained on the line beneath it.
+/// for work that is finished, `R` for work the review filter does not draw.
+/// All three say so in the footer, which is what makes them safe to turn off
+/// from here — the tree changing under you is explained on the line beneath
+/// it.
+///
+/// `R` is asked with [`under_review`] rather than by status, because the
+/// filter draws more than the status: a sub-task an agent is still writing
+/// under a review is on screen already, and dropping the filter to reach a row
+/// that was never hidden is the tree rearranging itself for nothing.
 ///
 /// Each is undone only when it is actually the one in the way, which is what
 /// makes undoing all three in one step honest: a task that is at review and
@@ -1366,7 +1384,7 @@ fn unfilter(view: &mut View, snap: &Snapshot, task: &str) -> bool {
         view.filter.clear();
         moved = true;
     }
-    if view.review_only && t.status() != Status::Review {
+    if view.review_only && !under_review(t, &resolve::open_under_review(&snap.tasks)) {
         view.review_only = false;
         moved = true;
     }
@@ -1384,12 +1402,29 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // hits and nothing else. A project row reading `105 ▸10 ■5` beside the two
     // rows a search left under it is the tree describing a tree that is not
     // there — the same rule `review_only` follows one field down.
-    let counts = match view.filter.is_empty() {
-        true => resolve::counts_by_project(&index, &tasks),
-        false => {
-            let hits: Vec<Task> =
-                tasks.iter().filter(|t| t.matches(&view.filter)).cloned().collect();
-            resolve::counts_by_project(&index, &hits)
+    let base: Vec<Task> = match view.filter.is_empty() {
+        true => tasks.clone(),
+        false => tasks.iter().filter(|t| t.matches(&view.filter)).cloned().collect(),
+    };
+    let counts = resolve::counts_by_project(&index, &base);
+    // The rows `R` leaves, and the counts of exactly those. A parent handed
+    // back for review over a sub-task that is still running is the one thing
+    // the filter used to remove, so it keeps that work too — and the project
+    // row has to be counting the tree it is standing over, not the one it
+    // would have drawn a moment ago.
+    let unfinished = match view.review_only {
+        true => resolve::open_under_review(&tasks),
+        false => Vec::new(),
+    };
+    let review_counts = view.review_only.then(|| {
+        let shown: Vec<Task> =
+            base.iter().filter(|t| under_review(t, &unfinished)).cloned().collect();
+        resolve::counts_by_project(&index, &shown)
+    });
+    let shown_counts = |id: &str| -> Counts {
+        match &review_counts {
+            Some(m) => m.get(id).copied().unwrap_or_default(),
+            None => counts.get(id).copied().unwrap_or_default(),
         }
     };
     let bindings = &snap.bindings;
@@ -1665,7 +1700,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         }
         // Under the review filter a branch earns its row only by holding
         // something at review. A project row with nothing beneath it is the
-        // whole tree pretending the filter did nothing.
+        // whole tree pretending the filter did nothing. Still `review` and not
+        // the shown count: unfinished work earns no branch of its own, because
+        // it is only ever drawn beside the parent that makes it interesting —
+        // and a sub-task lives in its parent's project, so the two can never
+        // disagree anyway.
         if view.review_only {
             return c.review > 0;
         }
@@ -1699,7 +1738,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         t.project.is_none()
             && t.matches(&view.filter)
             && if view.review_only {
-                t.status() == Status::Review
+                under_review(t, &unfinished)
             } else {
                 view.show_done || t.status().is_open()
             }
@@ -1718,7 +1757,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             collapsed: folded,
         });
         if !folded {
-            task_rows(&tasks, None, 1, view, &index, &agent_for_task, &mut rows);
+            task_rows(&tasks, None, 1, view, &index, &unfinished, &agent_for_task, &mut rows);
         }
     }
 
@@ -1736,6 +1775,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         interesting: &dyn Fn(&str) -> bool,
         agent_for_task: &dyn Fn(&str) -> Option<AgentRef>,
         seats: &std::collections::BTreeMap<String, (Option<AgentRef>, bool)>,
+        unfinished: &[String],
+        shown_counts: &dyn Fn(&str) -> Counts,
     ) {
         for p in index.children(parent) {
             if !interesting(&p.id) {
@@ -1749,15 +1790,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                 depth,
                 // Under the review filter the right-hand column counts what
                 // is *shown*. A project reading `5 ▸3 ■1` beside one visible
-                // row is the tree describing a tree that is not there.
-                counts: {
-                    let c = counts.get(&p.id).copied().unwrap_or_default();
-                    if view.review_only {
-                        crate::resolve::Counts { open: c.review, ..Default::default() }
-                    } else {
-                        c
-                    }
-                },
+                // row is the tree describing a tree that is not there — which
+                // is also why the unfinished work `R` now keeps is in this
+                // number, and why `▸` beside it is the one thing on a project
+                // row worth reading under the filter: it says which of these
+                // reviews has an agent still writing underneath it.
+                counts: shown_counts(&p.id),
                 collapsed: is_collapsed,
                 // Zero under either filter for the same reason as the counts:
                 // three agents at work is true and is not what this view is
@@ -1812,11 +1850,11 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             }
 
             // This project's own tasks, attention first.
-            task_rows(tasks, Some(&p.id), depth + 1, view, index, agent_for_task, rows);
+            task_rows(tasks, Some(&p.id), depth + 1, view, index, unfinished, agent_for_task, rows);
 
             walk(
                 index, Some(&p.id), depth + 1, rows, counts, live, view, tasks, loose, interesting,
-                agent_for_task, seats,
+                agent_for_task, seats, unfinished, shown_counts,
             );
 
             // Then the panes that resolve here but are working on nothing
@@ -1868,6 +1906,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         &interesting,
         &agent_for_task,
         &seats,
+        &unfinished,
+        &shown_counts,
     );
 
     // Panes belonging to no project. Some are there because nothing resolved;
@@ -2890,6 +2930,84 @@ mod tests {
         assert!(paths(&collect(&tree(), &searching)).is_empty());
         let reviewing = View { review_only: true, ..Default::default() };
         assert!(paths(&collect(&tree(), &reviewing)).is_empty());
+    }
+
+    /// A snapshot whose one project holds a review handed back over work that
+    /// is not finished — the shape [`resolve::open_under_review`] exists for.
+    fn premature_review() -> Snapshot {
+        let mut parent = task("render-100", Some("render"), "review");
+        parent.title = "the whole of it".into();
+        let mut running = task("render-101", Some("render"), "doing");
+        running.title = "still being written".into();
+        running.parent = Some("render-100".into());
+        let mut finished = task("render-102", Some("render"), "done");
+        finished.title = "landed yesterday".into();
+        finished.parent = Some("render-100".into());
+        let mut elsewhere = task("render-103", Some("render"), "doing");
+        elsewhere.title = "nothing to do with it".into();
+        Snapshot { tasks: vec![parent, running, finished, elsewhere], ..tree() }
+    }
+
+    /// Which task ids the tree drew, in order.
+    fn task_ids(ui: &Ui) -> Vec<String> {
+        ui.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Task { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `R` is asked to answer "what is waiting on me", and a parent handed
+    /// back over a sub-task an agent is still writing is not. The status
+    /// filter is exactly what removed the only row that said so, so it keeps
+    /// that row too — beneath the parent it contradicts, where it is read as
+    /// part of the same piece of work rather than as one more thing in the
+    /// pile.
+    ///
+    /// Finished work under it stays out. A review whose children are all done
+    /// is the ordinary case, and drawing them would make the filter noisiest
+    /// on exactly the reviews that are ready.
+    #[test]
+    fn a_review_handed_back_over_unfinished_work_draws_that_work_under_it() {
+        let ui = collect(&premature_review(), &View { review_only: true, ..Default::default() });
+        assert_eq!(
+            task_ids(&ui),
+            vec!["render-100".to_string(), "render-101".to_string()],
+            "the review, and the one thing under it that is not finished"
+        );
+        // Indented under it, not standing beside it: two rows at the same
+        // depth would read as two things to review.
+        let depths: Vec<usize> = ui
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Task { id, depth, .. } => Some((id.clone(), *depth)),
+                _ => None,
+            })
+            .map(|(_, d)| d)
+            .collect();
+        assert!(depths[1] > depths[0], "the unfinished work hangs off the review: {depths:?}");
+    }
+
+    /// The project's own count is of the tree it is standing over. It used to
+    /// be `c.review` — right while the filter drew nothing but reviews, and a
+    /// number short of the rows beneath it the moment it drew anything else.
+    #[test]
+    fn the_project_row_counts_what_the_review_filter_actually_drew() {
+        let ui = collect(&premature_review(), &View { review_only: true, ..Default::default() });
+        let c = ui
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Project { id, counts, .. } if id == "render" => Some(*counts),
+                _ => None,
+            })
+            .expect("the project row");
+        assert_eq!(c.open, 2, "one review and the unfinished work under it");
+        assert_eq!(c.doing, 1, "and it says one of them has somebody on it");
+        assert_eq!(c.done, 0, "the filter never draws finished work, so it never counts it");
     }
 
     /// Cut from the front, where a title is cut from the back. Every root here

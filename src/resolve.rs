@@ -291,6 +291,38 @@ pub fn counts_under(tasks: &[Task], id: &str) -> Counts {
     total
 }
 
+/// The open work still sitting under a task at `review`, by id.
+///
+/// A parent goes to `review` while a sub-task under it is still being written,
+/// and every surface that narrows to the status — `wsp ls -s review`, the
+/// panel's `R` — removes the one fact that says the review is premature.
+/// Measured 2026-08-19: `fork-003` sat at `review` over three untouched
+/// sub-tasks and a fourth at `review`, and the row read `(1 open)`, because
+/// the count had been taken over the filtered list too.
+///
+/// So the filter keeps this work as well, drawn under the parent it
+/// contradicts. A count answers *how much* is unfinished; the rows answer
+/// *what* it is and who is standing on it, which is the question a reviewer
+/// is actually asking before opening anything.
+///
+/// Ids rather than tasks because both callers want membership: one decides
+/// which rows survive the filter, the other keeps the project's own count
+/// agreeing with them. Tasks already at `review` are left out — they survive
+/// on their own status, and counting them here would count them twice.
+pub fn open_under_review(tasks: &[Task]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for parent in tasks.iter().filter(|t| t.status() == Status::Review) {
+        for id in descendants_of(tasks, &parent.id) {
+            let Some(kid) = tasks.iter().find(|t| t.id == id) else { continue };
+            let keep = kid.status().is_open() && kid.status() != Status::Review;
+            if keep && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
 /// Reading order: each task followed by its own children, with the depth to
 /// indent it by.
 ///
@@ -489,6 +521,59 @@ pub fn resolve(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The filter that narrows to work at `review` is the one place the fact
+    /// that a review is premature is most easily lost, so the rule keeps it:
+    /// open work under a task at `review` comes through the filter with it.
+    #[test]
+    fn open_work_under_a_review_comes_through_the_review_filter_with_it() {
+        let mut running = task("t-2", "fork", "doing");
+        running.parent = Some("t-1".into());
+        let mut waiting = task("t-3", "fork", "todo");
+        waiting.parent = Some("t-1".into());
+        let mut handed_back = task("t-4", "fork", "review");
+        handed_back.parent = Some("t-1".into());
+        let mut finished = task("t-5", "fork", "done");
+        finished.parent = Some("t-1".into());
+        // Two levels down, because a parent is finished over its whole
+        // sub-tree and not over its first row of children.
+        let mut deeper = task("t-6", "fork", "doing");
+        deeper.parent = Some("t-2".into());
+        let tasks = vec![
+            task("t-1", "fork", "review"),
+            running,
+            waiting,
+            handed_back,
+            finished,
+            deeper,
+        ];
+
+        let mut kept = open_under_review(&tasks);
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec!["t-2".to_string(), "t-3".to_string(), "t-6".to_string()],
+            "every open thing under the review, however deep"
+        );
+        assert!(
+            !kept.contains(&"t-4".to_string()),
+            "a review of its own is kept by its status, and here it would be counted twice"
+        );
+        assert!(
+            !kept.contains(&"t-5".to_string()),
+            "finished work under a review is what a finished review looks like"
+        );
+    }
+
+    /// Nothing at review, nothing to keep — the filter is a filter, and work
+    /// under an ordinary parent is not somebody's review pile.
+    #[test]
+    fn open_work_under_a_parent_that_is_not_at_review_is_nobodys_review() {
+        let mut kid = task("t-2", "fork", "doing");
+        kid.parent = Some("t-1".into());
+        let tasks = vec![task("t-1", "fork", "doing"), kid];
+        assert!(open_under_review(&tasks).is_empty());
+    }
 
     /// Parked work is open work that wants nothing. Both halves matter: a
     /// parent with a parked child still has a child, so `wsp done` goes on
