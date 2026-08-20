@@ -548,6 +548,18 @@ fn ask(bin: &Path) -> Option<Stamp> {
     Some(Stamp { commit, dirty })
 }
 
+/// What the binary at `dst` says it carries, as the one word a register or a
+/// record can be compared against, or `None` when it will not say.
+///
+/// Every caller of this used to reach for the record beside the file instead.
+/// The record is the only thing that knows *who* installed it, *when* and
+/// *why*, and it is not what knows *what*: a binary put there with `install -m
+/// 755` — which is how every install before this command was made — writes no
+/// record at all, and the bytes still answer.
+fn carried_by(dst: &Path) -> Option<String> {
+    ask(dst).map(|s| crate::stamp_word(&s.commit, s.dirty)).filter(|w| !w.is_empty())
+}
+
 /// What `doctor` says about the binary every pane re-execs into.
 ///
 /// Notes rather than problems, all of them, and the reason is the same one
@@ -876,11 +888,9 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         // a binary put there by hand writes no record at all, and a record
         // written by a wsp older than `worklist-042` holds whatever that
         // agent's tree HEAD happened to be rather than what it shipped.
-        let says = live
-            .and_then(|_| ask(&dst))
-            .map(|s| crate::stamp_word(&s.commit, s.dirty))
-            .filter(|w| !w.is_empty());
-        let what = says.or_else(|| recorded.and_then(|r| r.commit.clone()));
+        let what = live
+            .and_then(|_| carried_by(&dst))
+            .or_else(|| recorded.and_then(|r| r.commit.clone()));
         // A hand install writes nothing down, so its age used to be all that
         // could be said about it. The stamp travels in the bytes, so what is in
         // it can now be said too — which is the one line of the shared-state
@@ -928,9 +938,10 @@ pub fn install(store: &Store, args: &Args) -> i32 {
 
     let backwards = overtaken(ours.built, written(&dst), recorded, &ours);
     if backwards && !args.has("force") {
-        let held = recorded
-            .map(|r| r.line())
-            .unwrap_or_else(|| "by hand — nothing here says what is in it".to_string());
+        let held = recorded.map(|r| r.line()).unwrap_or_else(|| match carried_by(&dst) {
+            Some(c) => format!("{c}, by hand — nothing beside it says who or why"),
+            None => "by hand — nothing here says what is in it".to_string(),
+        });
         if json_out {
             println!(
                 "{}",
@@ -999,9 +1010,10 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     if !args.has("force")
         && overtaken(ours.built, written(&dst), recorded_now, &ours)
     {
-        let held = recorded_now
-            .map(|r| r.line())
-            .unwrap_or_else(|| "by hand — nothing there says what is in it".to_string());
+        let held = recorded_now.map(|r| r.line()).unwrap_or_else(|| match carried_by(&dst) {
+            Some(c) => format!("{c}, by hand — nothing beside it says who or why"),
+            None => "by hand — nothing there says what is in it".to_string(),
+        });
         if json_out {
             println!("{}", json!({"ok": false, "installed": false, "reason": "overtaken", "live": held}));
         } else {
@@ -1402,6 +1414,16 @@ mod tests {
         );
 
         assert!(ask(&dir.join("absent")).is_none(), "a binary that is not there answered");
+
+        // And the one word the rest of the file compares against, made through
+        // `main` so a `wsp watch`'s register and an install record cannot come
+        // to hold two shapes for one build.
+        assert_eq!(carried_by(&fake("word", "wsp 0.1.0 (c52f3c8+dirty)")).as_deref(), Some("c52f3c8+dirty"));
+        assert_eq!(carried_by(&fake("plain", "wsp 0.1.0 (c52f3c8)")).as_deref(), Some("c52f3c8"));
+        // An unstamped binary answers, and what it says is that it cannot say.
+        // A word that is not a build is worse than no word: it would be
+        // compared, and it would match every other one of its kind.
+        assert!(carried_by(&fake("mute", "wsp 0.1.0")).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
