@@ -1113,6 +1113,10 @@ fn payload_source(payload: &[String]) -> Option<String> {
 /// `cmd_install` folds its `--why` through here for the neighbouring reason: a
 /// lock line is one sentence long — "held by w1:p6 for 3s — installing fdefcab"
 /// — and a paragraph pasted into one is a line nobody can read either side of.
+/// `cmd_worklist` folds stop prose and barrier verdicts through it for the
+/// first reason exactly: `## Groups` is read line by line too, so a blank line
+/// inside a `stop:` block ends the block, and prose stored with one comes back
+/// next read truncated at the gap.
 pub(crate) fn fold(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }

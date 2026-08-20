@@ -1363,7 +1363,8 @@ fn help_text() -> String {
   wsp worklist group <slug> N [--parallel N|none] [--stop "…"|-]
                                     a cap on the work, and the prose read at
                                     the barrier after that group — `-` reads it
-                                    from a stream, where a shell never sees it
+                                    from a stream and --stop --from FILE out of
+                                    a file, where a shell never sees it
   wsp worklist edit <slug> --overview -    what has to be true before group 1
                                     starts — there is no barrier in front of it
                                     to carry a stop condition, so the list does
@@ -1378,17 +1379,21 @@ fn help_text() -> String {
   wsp worklist next [<slug>]        what may start now, what is holding it, the
                                     prose to read at a barrier, or nothing left.
                                     No slug when the workspace holds the seat
-  wsp worklist go [<slug>] ["…"]    start the list, or pass a barrier: records
-                                    the verdict, sweeps the trees of the groups
-                                    behind it, and says which members of the
-                                    group that just landed touched one file
-  wsp worklist hold [<slug>] "why"  start nothing more. What is already running
-                                    is left to finish — work in flight cannot
-                                    be unwound
+  wsp worklist go [<slug>] ["…"|-|--from FILE]   start the list, or pass a
+                                    barrier: records the verdict, sweeps the
+                                    trees of the groups behind it, and says
+                                    which members of the group that just landed
+                                    touched one file
+  wsp worklist hold [<slug>] "why"|-|--from FILE   start nothing more. What is
+                                    already running is left to finish — work in
+                                    flight cannot be unwound
   wsp worklist done <slug>          nothing left to want from it
   A barrier with prose at it will not pass until `go` is given a sentence, and
   the sentence is dated onto the group. Nothing spawns: `next` names the members
   and the governor runs `wsp spawn` per member.
+  Every sentence here — a stop condition, a verdict, a reason to hold — takes
+  `-` for a stream and `--from FILE` for a file, because a shell runs every
+  backtick inside the double quotes a paragraph needs.
 
 {plumbing}
   wsp panel [--full]                the sidebar replacement (runs in a pane);

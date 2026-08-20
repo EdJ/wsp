@@ -785,6 +785,17 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
     // else — a body for the paragraph a row cannot hold, and an ask for the one
     // thing a keypress can answer.
     let title = args.get("title").unwrap_or_default();
+    // A heading has no `-` form for the same reason the row text has none — it
+    // is one line, and `--body -` is where a paragraph goes — and it gets the
+    // same check for the same reason. The heading is what is quoted onto
+    // somebody's panel, so a `--title` that came back carrying a command's
+    // output instead of the command's name is the one part of the card nobody
+    // can read past. See [`crate::util::terminal_output`].
+    if let Some(why) = util::terminal_output(&title) {
+        eprintln!("wsp: --title {why}");
+        eprintln!("     a backtick inside double quotes runs a command. `wsp flag {} --from FILE` reads a paragraph out of a file", task.id);
+        return 2;
+    }
     // Where the paragraph comes from, and there are three spellings of it
     // because `worklist-036` is what having only two cost.
     //
@@ -5135,6 +5146,30 @@ mod tests {
             rows.iter().any(|r| r.contains("and the tree is shared")),
             "and the rest of the file is under it: {rows:?}",
         );
+    }
+
+    /// The heading is quoted onto somebody's panel too.
+    ///
+    /// The row text has had this check since it was written, and `--title` —
+    /// which is what *replaces* the row text when it is given — did not. Same
+    /// reason neither has a `-` form: a heading is one line, and `--body -` is
+    /// where a paragraph goes. That is an argument about length and not about
+    /// what a shell does to a sentence on the way in, which is what this is.
+    /// `worklist-047`, found by enumerating the typed intakes.
+    #[test]
+    fn a_title_that_is_captured_terminal_output_is_refused() {
+        let (_env, store) = scratch("flag-title-ctl");
+        a_task(&store, "wsp-001");
+
+        assert_eq!(
+            raise_one(&store, &["wsp-001", "the tree is shared"], &[("title", "alone 87/745  \ralone 88/745")]),
+            2,
+        );
+        assert!(
+            crate::message::raised(&store).is_empty(),
+            "a hand went up wearing a captured progress bar as its heading",
+        );
+        assert_eq!(raise_one(&store, &["wsp-001", "the tree is shared"], &[("title", "the store is corrupt")]), 0);
     }
 
     /// A source that was given and came back empty is told about, not raised.

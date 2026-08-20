@@ -67,6 +67,12 @@ use std::collections::BTreeSet;
 
 use serde_json::json;
 
+// The same fold, and not a second copy of it: this is one act — prose arriving
+// on several lines and being stored on one — and `## Groups` and `## Log` are
+// both parsed line by line, so a divergence between two implementations would
+// be a divergence in what each section can hold. `worklist-045` made it
+// `pub(crate)` for its second caller; this is the third.
+use crate::cmd_task::fold;
 use crate::model::{Group, Worklist, WorklistStatus};
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -684,7 +690,8 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
 // ---- group ------------------------------------------------------------
 
 pub fn group(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "usage: wsp worklist group <slug> N [--parallel N|none] [--stop \"…\"|-]";
+    const USAGE: &str =
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--stop \"…\"|-|--stop --from FILE]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -705,6 +712,16 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         Ok(n) => n,
         Err(code) => return code,
     };
+    // `--from` is where a `--stop` is read from and it is nothing else here.
+    // The verb sets two fields and the check below already refuses to run
+    // without being told which, so a `--from` naming no field is answered with
+    // the shape rather than guessed at. The guess is cheap to make today, while
+    // `--stop` is the only prose on this verb; it is a reading that would have
+    // to be taken back the first time there is a second sentence to give.
+    if args.has("from") && !args.has("stop") {
+        eprintln!("wsp: --from is where a stop condition is read from — `wsp worklist group <slug> N --stop --from FILE`");
+        return 2;
+    }
     if !args.has("parallel") && !args.has("stop") {
         eprintln!("{USAGE}");
         eprintln!("       --parallel caps the work; --stop is the prose read at the barrier after it");
@@ -771,7 +788,8 @@ pub fn group(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// The prose read at a barrier: the text as typed, or the stream it names.
+/// The prose read at a barrier: the text as typed, the stream, or the file
+/// `--stop --from` names.
 ///
 /// `-` because this is the sentence a shell is worst at carrying. Stop prose is
 /// the reason a night stopped — *"if any of the three goes badly, flag and stop
@@ -779,43 +797,102 @@ pub fn group(store: &Store, args: &Args) -> i32 {
 /// work, which means backticks and identifiers, and every backtick inside
 /// double quotes runs a command. `-` is the path that never meets a shell.
 ///
+/// **And a file, which is the spelling this field is actually reached for by.**
+/// A stop condition is written *ahead* of the run, by whoever is composing the
+/// list, and it is written in a file — so `-` alone means `cat`ing that file
+/// into a pipe in order to name it, and that friction is what ends with
+/// somebody typing the sentence between double quotes after all. Every other
+/// prose intake in the CLI takes both spellings — [`crate::cmd_task`]'s
+/// `payload_source` and `prose_source`, [`crate::cmd_agent::from_source`] — and
+/// this one took one. A lesser gap than `install --why`'s, since the safe form
+/// worked here and nobody was returned to the unsafe one, and still the half
+/// that gets used. `worklist-047`.
+///
+/// `--from` is read only once `--stop` has asked for it. This verb sets two
+/// fields and already refuses to run without being told which — `--parallel`
+/// and `--stop` with neither given is a usage error — so a `--from` naming no
+/// field would be the first thing here that guesses. See [`group`], which
+/// answers a bare `--from` with the shape rather than obeying it.
+///
 /// Folded to one paragraph, and that is not tidying. `## Groups` is a structure
 /// parsed line by line: a blank line inside a `stop:` block ends it, so prose
 /// stored with one would come back next read as prose that stops at the gap.
 fn stop_prose(args: &Args) -> Result<String, i32> {
     let raw = args.get("stop").unwrap_or_default();
-    let src = match raw.trim() {
-        // `--stop` with nothing usable after it names the stream, on the same
-        // reading `edit --from` gives it: a missing argument is a mistake worth
-        // answering, not an editor session nobody asked for.
-        "-" | "true" => "-",
-        "" | "none" => return Ok(String::new()),
-        _ => return Ok(fold(&raw)),
+    // `--stop` with nothing usable after it names the stream, on the same
+    // reading `edit --from` gives it: a missing argument is a mistake worth
+    // answering, not an editor session nobody asked for.
+    let asked_for_prose = matches!(raw.trim(), "-" | "true");
+    let (src, named) = match args.get("from") {
+        // Two sources for one sentence, refused rather than resolved: a caller
+        // who gave both does not know which is being recorded, and picking
+        // either is the same silent loss in a smaller hat. The reading
+        // `cmd_agent::from_source` gives the same collision.
+        Some(_) if !asked_for_prose => {
+            eprintln!("wsp: a sentence and --from are two stop conditions — give one");
+            return Err(2);
+        }
+        // A lone `--from`, or `--from -`: a dash is not a path, it is the
+        // conventional name for the stream.
+        Some(path) if matches!(path.as_str(), "true" | "-") => ("-".into(), "stdin".to_string()),
+        // Named the way the rest of the CLI names a path, so the receipt says
+        // `~/lists/phase-five/g2.md` and not an absolute one nobody typed.
+        Some(path) => {
+            let named = util::contract(&util::expand(&path));
+            (path, named)
+        }
+        None => match raw.trim() {
+            "-" | "true" => ("-".to_string(), "stdin".to_string()),
+            "" | "none" => return Ok(String::new()),
+            // Not `raw.trim()`: see [`typed_stop`], which has to see the
+            // whitespace before anything trims or folds it away.
+            _ => return typed_stop(&raw),
+        },
     };
-    if util::stdin_is_tty() {
+    if src == "-" && util::stdin_is_tty() {
         eprintln!("wsp: nothing is piped in — `--stop -` reads the prose from a stream");
         return Err(2);
     }
-    match crate::cmd_task::read_source(src) {
+    match crate::cmd_task::read_source(&src) {
         Ok(text) => {
             let text = fold(&text);
             if text.is_empty() {
                 // An empty stream reads exactly like "take the stop condition
                 // off", and the two want different things done about them.
-                eprintln!("wsp: nothing on stdin — `--stop none` is how a stop condition is taken off");
+                eprintln!("wsp: nothing on {named} — `--stop none` is how a stop condition is taken off");
                 return Err(2);
             }
             Ok(text)
         }
         Err(e) => {
-            eprintln!("wsp: cannot read stdin: {e}");
+            eprintln!("wsp: cannot read {named}: {e}");
             Err(1)
         }
     }
 }
 
-fn fold(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// A stop condition typed on the command line, checked for the one thing that
+/// says it is not one.
+///
+/// Every other typed intake makes this check — `add`, `rename`, `say`, `flag`'s
+/// row text, `project set`, `note` and its neighbours — and these two did not.
+/// It is what catches the substitution the caller cannot see: the backticks a
+/// stop condition is full of ran before wsp was handed anything, and what
+/// arrives is fluent prose with the load-bearing nouns replaced by a command's
+/// output. See [`crate::util::terminal_output`].
+///
+/// Before the fold, because folding collapses runs of whitespace and a carriage
+/// return is whitespace: the evidence that this came off a terminal is the
+/// first thing `fold` would destroy.
+fn typed_stop(raw: &str) -> Result<String, i32> {
+    if let Some(why) = util::terminal_output(raw) {
+        eprintln!("wsp: {why}");
+        // Names the cause, because the shape of the mistake is not visible in
+        // what arrived.
+        eprintln!("     a backtick inside double quotes runs a command. `--stop --from FILE` reads the prose out of a file, where a shell never sees it");
+        return Err(2);
+    }
+    Ok(fold(raw))
 }
 
 /// Write the queue back and record it: the file, the event, the commit.
@@ -1378,10 +1455,11 @@ fn verdict_of(said: &str) -> String {
 /// answers "there is no such list" in the only direction that loses nothing —
 /// the sentence is refused, not silently filed against the wrong list.
 ///
-/// `-` as the whole of the words reads the sentence from a stream, for the
-/// reason `--stop -` does: a verdict is written in the vocabulary of the work,
-/// which means backticks and identifiers, and every backtick inside the double
-/// quotes a shell needs for a paragraph runs a command.
+/// `-` as the whole of the words reads the sentence from a stream and
+/// `--from FILE` reads it out of a file, for the reason `--stop` takes both: a
+/// verdict is written in the vocabulary of the work, which means backticks and
+/// identifiers, and every backtick inside the double quotes a shell needs for a
+/// paragraph runs a command. See [`words`].
 fn list_and_words(store: &Store, args: &Args) -> Result<(Worklist, String, bool), i32> {
     let first = args.rest.get(1).cloned().unwrap_or_default();
     if !first.is_empty() {
@@ -1403,20 +1481,76 @@ fn list_and_words(store: &Store, args: &Args) -> Result<(Worklist, String, bool)
     }
 }
 
-/// The sentence, from the words typed or from the stream a lone `-` names.
+/// The sentence: the words typed, the stream a lone `-` names, or the file
+/// `--from` names.
+///
+/// The file form is `worklist-047`, and it is here for the reason the stream
+/// form is — a verdict is written in the vocabulary of the work, so it is full
+/// of backticks and identifiers, and every backtick inside the double quotes a
+/// shell needs for a paragraph runs a command — plus one the stream does not
+/// cover. A verdict at a barrier is composed before it is given, often while
+/// the last member is still landing, and where it is composed is a file. `-`
+/// alone makes naming that file a `cat` into a pipe, and that friction is what
+/// ends with the sentence going between double quotes after all. `note`,
+/// `flag`, `tell`, `ask` and `answer` all take both spellings; these two verbs
+/// took one.
+///
+/// A sentence and `--from` together is refused rather than resolved. Two
+/// verdicts arrived for one barrier and only one of them is going on the
+/// record; choosing is the same silent loss `cmd_agent::from_source` refuses.
 fn words(args: &Args, from: usize) -> Result<String, i32> {
     let typed = args.text(from);
-    if typed.trim() != "-" {
-        return Ok(fold(&typed));
-    }
-    if util::stdin_is_tty() {
+    let (src, named) = match args.get("from") {
+        Some(path) => {
+            if !typed.trim().is_empty() && typed.trim() != "-" {
+                eprintln!("wsp: a sentence and --from are two verdicts — give one");
+                return Err(2);
+            }
+            match path.as_str() {
+                // A lone `--from`, or `--from -`: a dash is not a path, it is
+                // the conventional name for the stream.
+                "true" | "-" => ("-".to_string(), "stdin".to_string()),
+                _ => {
+                    let named = util::contract(&util::expand(&path));
+                    (path, named)
+                }
+            }
+        }
+        None if typed.trim() == "-" => ("-".to_string(), "stdin".to_string()),
+        // The typed form, and the check every other typed intake makes. See
+        // [`typed_stop`], whose argument is this one: what a shell substituted
+        // arrives fluent, so the caller cannot see it. Before the fold, because
+        // a carriage return is whitespace and folding is what destroys the
+        // evidence.
+        None => {
+            if let Some(why) = util::terminal_output(&typed) {
+                eprintln!("wsp: {why}");
+                eprintln!("     a backtick inside double quotes runs a command. `--from FILE` reads the sentence out of a file, where a shell never sees it");
+                return Err(2);
+            }
+            return Ok(fold(&typed));
+        }
+    };
+    if src == "-" && util::stdin_is_tty() {
         eprintln!("wsp: nothing is piped in — `-` reads the sentence from a stream");
         return Err(2);
     }
-    match crate::cmd_task::read_source("-") {
-        Ok(text) => Ok(fold(&text)),
+    match crate::cmd_task::read_source(&src) {
+        Ok(text) => {
+            let text = fold(&text);
+            if text.is_empty() {
+                // No words at all is a legal thing to say to `go` — a barrier
+                // with no prose at it asks for no judgement — but a *named*
+                // source that turned out to hold nothing is a caller whose
+                // verdict went nowhere, which is the whole of `worklist-036`.
+                // The two read the same and want different answers.
+                eprintln!("wsp: nothing on {named} — nothing recorded");
+                return Err(2);
+            }
+            Ok(text)
+        }
         Err(e) => {
-            eprintln!("wsp: cannot read stdin: {e}");
+            eprintln!("wsp: cannot read {named}: {e}");
             Err(1)
         }
     }
@@ -2279,7 +2413,7 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     };
     if said.trim().is_empty() {
         eprintln!("wsp: {} \"why\" — a hold with no reason on it is a run nobody can restart", how("hold", &w, seat));
-        eprintln!("     `-` reads the sentence from a stream, where a shell never sees it");
+        eprintln!("     `--from FILE` reads the sentence out of a file and `-` off a stream, where a shell never sees it");
         return 2;
     }
     if w.status() == WorklistStatus::Done {
@@ -2708,6 +2842,82 @@ mod tests {
         );
     }
 
+    /// **`worklist-047`.** The house rule printed in every brief is *give a
+    /// wsp verb its prose through a file*, and this field took a quoted string
+    /// or a stream and nothing else — so the documented spelling meant `cat`ing
+    /// the file into a pipe in order to name it, and that friction is what ends
+    /// with the sentence going between double quotes after all. A stop
+    /// condition is the case that makes it worst: it is composed *ahead* of the
+    /// run, in a file, by whoever is composing the list.
+    ///
+    /// Three readings are asserted and they are one token apart. `--from` after
+    /// `--stop` is the file. `--from` with no `--stop` names no field on a verb
+    /// that sets two, and is answered with the shape. `--from` beside a typed
+    /// sentence is two stop conditions for one barrier, and choosing between
+    /// them is the silent loss in a smaller hat.
+    #[test]
+    fn a_stop_condition_comes_out_of_the_file_from_names() {
+        let store = scratch("stopfile");
+        task(&store, "wl-001", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+
+        let file = store.root.join("g1.md");
+        let path = file.to_str().expect("a utf-8 temp dir").to_string();
+        std::fs::write(&file, "If any of the three goes badly,\n\nflag and stop rather\nthan push through.\n")
+            .unwrap();
+
+        assert_eq!(flagged(&store, &["group", "batch", "1"], &[("stop", "true"), ("from", &path)]), 0);
+        assert_eq!(
+            groups_of(&store, "batch")[0].stop,
+            "If any of the three goes badly, flag and stop rather than push through.",
+            "a `stop:` block is one line, and the paragraph was not folded onto it"
+        );
+
+        assert_eq!(
+            flagged(&store, &["group", "batch", "1"], &[("from", &path)]),
+            2,
+            "a --from naming no field, on a verb that sets two"
+        );
+        assert_eq!(
+            flagged(&store, &["group", "batch", "1"], &[("stop", "typed"), ("from", &path)]),
+            2,
+            "two stop conditions for one barrier"
+        );
+
+        // An empty file reads exactly like `--stop none`, and the two want
+        // different things done about them: one is a caller taking the
+        // condition off, the other is a caller whose sentence went nowhere.
+        std::fs::write(&file, "   \n\n").unwrap();
+        assert_eq!(flagged(&store, &["group", "batch", "1"], &[("stop", "true"), ("from", &path)]), 2);
+        assert!(
+            groups_of(&store, "batch")[0].stop.starts_with("If any"),
+            "a refused read took the condition off anyway"
+        );
+    }
+
+    /// The check every other typed intake in the CLI makes — `add`, `rename`,
+    /// `say`, `flag`'s row text, `project set`, `note` and its neighbours — and
+    /// that these two did not. It is what catches the substitution the caller
+    /// cannot see: the backticks a stop condition is written in ran before wsp
+    /// was handed anything, and what arrives is fluent.
+    ///
+    /// The carriage return is the case that makes the ordering matter. It is
+    /// whitespace, so `fold` destroys the evidence, which is why the check is
+    /// made on the text before anything trims or folds it.
+    #[test]
+    fn a_stop_condition_that_is_captured_terminal_output_is_refused() {
+        let store = scratch("stopctl");
+        task(&store, "wl-001", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        assert_eq!(
+            flagged(&store, &["group", "batch", "1"], &[("stop", "alone 87/745  \ralone 88/745")]),
+            2
+        );
+        assert_eq!(groups_of(&store, "batch")[0].stop, "", "and it was not stored");
+    }
+
     /// `--sub` is a resolution, not a rule. It puts in what was open when it
     /// was typed, and a sub-task filed under that parent tomorrow is not in the
     /// list — a group that grows under a governor at 3am is the stale-plan
@@ -3024,6 +3234,65 @@ mod tests {
             "the sentence is on the group the barrier is behind, dated"
         );
         assert_eq!(gate_of(&store, "batch"), "ready wl-002", "and now the next group is named");
+    }
+
+    /// The other half of `worklist-047`: the sentence `go` and `hold` take.
+    ///
+    /// A verdict is composed before it is given — often while the last member
+    /// is still landing — and where it is composed is a file, so the same
+    /// argument the stop condition makes is made here by the two verbs that
+    /// read one. And an empty file is refused rather than recorded: no words at
+    /// all is a legal thing to say to `go`, since a barrier with no prose at it
+    /// asks for no judgement, but a named source that turned out to hold
+    /// nothing is `worklist-036` exactly — the message lost inside the record,
+    /// under a success receipt nobody reads at three in the morning.
+    #[test]
+    fn a_verdict_and_a_hold_come_out_of_the_file_from_names() {
+        let (_env, store) = running("verdictfile");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        flagged(&store, &["group", "batch", "1"], &[("stop", "it has to land clean")]);
+        started(&store, "batch");
+
+        let file = store.root.join("verdict.md");
+        let path = file.to_str().expect("a utf-8 temp dir").to_string();
+        std::fs::write(&file, "All three landed.\n\n`worklist-045` carries the fix.\n").unwrap();
+
+        assert_eq!(
+            flagged(&store, &["go", "batch", "the three landed"], &[("from", &path)]),
+            2,
+            "two verdicts arrived for one barrier"
+        );
+        assert_eq!(verdicts(&store, "batch")[0], "", "and neither of them was written");
+
+        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &path)]), 0);
+        assert!(
+            verdicts(&store, "batch")[0]
+                .ends_with("All three landed. `worklist-045` carries the fix."),
+            "the backticks did not survive a shell they never met, or it was not folded: {:?}",
+            verdicts(&store, "batch")[0]
+        );
+
+        std::fs::write(&file, "  \n\n").unwrap();
+        assert_eq!(flagged(&store, &["hold", "batch"], &[("from", &path)]), 2, "an empty file");
+        assert_eq!(
+            store.worklist("batch").unwrap().status(),
+            WorklistStatus::Running,
+            "a hold with no reason on it is a run nobody can restart, and it was taken"
+        );
+
+        std::fs::write(&file, "wl-002 is blocked on a decision\nthat is Ed's.\n").unwrap();
+        assert_eq!(flagged(&store, &["hold", "batch"], &[("from", &path)]), 0);
+        let w = store.worklist("batch").unwrap();
+        assert_eq!(w.status(), WorklistStatus::Held);
+        assert_eq!(
+            gate_of(&store, "batch"),
+            "held wl-002 is blocked on a decision that is Ed's.",
+            "the reason somebody walking up hours later reads"
+        );
     }
 
     /// `-n` is a dry run of the whole verb. Half a dry run — the verdict

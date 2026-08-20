@@ -112,6 +112,7 @@ wsp worklist next           # …or `next <slug>` where the workspace holds no s
                             #   nothing left — 4 groups, all …      → done
 wsp worklist go "…"         # pass the barrier: the verdict, the sweep behind it,
                             #   and which members of that group touched one file
+wsp worklist go --from FILE # …the verdict out of the file it was composed in
 wsp worklist hold "…"       # start nothing more; what is running is left to finish
 ```
 
@@ -1331,11 +1332,28 @@ Two rules came out of that, and both are about refusing to guess:
 wsp note   <id> -            wsp block <id> -       wsp edit <id> --overview -
 wsp decide <id> -            wsp park  <id> -       wsp flag <id> --body -
 wsp tell   <id> -            wsp govern <proj> --tell -
+wsp install --why -          wsp worklist go [<slug>] -    wsp worklist hold [<slug>] -
+wsp worklist group <slug> N --stop -
 ```
 
 Every verb whose payload is routinely a paragraph reads it from stdin, spelled
 `-` the way `cat -` spells it, and every one of them still takes the sentence
 on the line for the one-liner that is the common case.
+
+**And every one of them also names a file.** `--from FILE` is the same prose by
+the other route, and it is the route most of it actually arrives by: a governor
+brief, a stop condition and a barrier verdict are all *composed* before they are
+sent, and where they are composed is a file. Without it the documented spelling
+is `cat`ing that file into a pipe, and the friction of that is what ends with
+somebody typing the paragraph between double quotes after all — which is the
+thing this whole section exists to prevent. So `--from` is spelled the same
+everywhere: `--from FILE` for the file, a bare `--from` or `--from -` for the
+stream, and a typed sentence *beside* it refused rather than resolved, because
+two payloads arrived for one record and choosing between them is the same
+silent loss in a smaller hat. Two verbs read it only after the field has asked
+— `wsp install --why --from FILE` and `wsp worklist group <slug> N --stop
+--from FILE` — because both own another argument a bare `--from` would read as,
+and obeying the wrong reading is worse than answering with the shape.
 
 The reason is not convenience. Prose written here is prose *about this CLI* —
 file names, verb names, code identifiers — which is exactly the text that wants
@@ -1355,8 +1373,9 @@ choosing between and naming a shape here means naming a verb. What separates
 the verbs that have `-` from the ones that do not is whether single quotes are
 a real defence: they stop a shell dead, and they are usable right up until the
 text contains an apostrophe, which a paragraph always does and a title never
-does. So `wsp add`, `wsp rename`, `wsp say`, `wsp flag <id> "why"` and
-`wsp project set … brief=…` stay argv-only and are quoted `'like this'`.
+does. So `wsp add`, `wsp rename`, `wsp say`, `wsp flag <id> "why"`, `wsp flag
+<id> --title T` and `wsp project set … brief=…` stay argv-only and are quoted
+`'like this'`.
 
 Nothing detected either failure, and that is the other half. A store cannot see
 that a shell rewrote its argument — the command it receives is well-formed and
