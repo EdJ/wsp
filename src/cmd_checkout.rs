@@ -789,6 +789,29 @@ fn remove(repo: &Path, dir: &Path) -> Removed {
     Removed { existed, kept }
 }
 
+/// The same answer [`remove`] would give, without giving it.
+///
+/// `-n` on `--rm` is only worth having if what it prints is what happens when
+/// you drop the flag, and the two lines a removal prints are *whether there was
+/// a tree* and *whether the branch outlives it*. The first is a directory that
+/// is either there or not. The second is the one that could lie, and it cannot,
+/// because both readings key on the same question — [`remove`] keeps the branch
+/// exactly when `git branch -d` refuses it, and `git branch -d` refuses exactly
+/// a branch holding commits the trunk has not got, which is [`ahead`]. That
+/// equivalence is already written down at the top of [`strays`] and is load
+/// bearing in both directions; this is the second place that leans on it.
+///
+/// The branch is read off the tree for [`remove`]'s reason and not taken from
+/// the task's id: a tree made before its task was renumbered is on a branch of
+/// the id it had then, and a prediction naming a branch that does not exist
+/// would print *kept* over work that has all landed, or nothing over work that
+/// has not.
+fn foresee(repo: &Path, dir: &Path, onto: &str) -> Removed {
+    let at = trunk(repo).unwrap_or_else(|| repo.to_path_buf());
+    let kept = trunk_branch(dir).filter(|b| !ahead(&at, onto, b).is_empty());
+    Removed { existed: dir.exists(), kept }
+}
+
 struct Removed {
     existed: bool,
     /// The branch that outlived the tree, named rather than flagged: it is what
@@ -1506,7 +1529,16 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
             );
             return 2;
         }
-        let r = remove(&w.repo, &w.dir);
+        // After both refusals and not before them, so `-n` answers the question
+        // that was asked: what `--rm` would do here *is* refuse, on a tree with
+        // uncommitted work in it or one somebody is standing in, and a dry run
+        // that reported a removal those would have stopped would be lying in
+        // the one direction that costs work.
+        let dry = args.has("dry-run");
+        let r = match dry {
+            true => foresee(&w.repo, &w.dir, &w.branch),
+            false => remove(&w.repo, &w.dir),
+        };
         if args.json() {
             println!(
                 "{}",
@@ -1516,6 +1548,7 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
                     "branch": r.kept,
                     "path": util::contract(&w.dir),
                     "looked": w.looked.iter().map(|t| util::contract(t)).collect::<Vec<_>>(),
+                    "dry_run": dry,
                 })
             );
         } else if !r.existed {
@@ -1530,15 +1563,79 @@ pub fn checkout(store: &Store, args: &Args) -> i32 {
                 p.dim("nothing removed — if it was worked in another repository, `git worktree list` there names it")
             );
         } else {
-            println!("removed {}", util::contract(&w.dir));
+            // The sweep's words, and deliberately the same ones: `--sweep -n`
+            // and `--rm -n` are the two halves of one question and reading
+            // differently would be two answers to it.
+            println!("{} {}", if dry { "would remove" } else { "removed" }, util::contract(&w.dir));
             if let Some(branch) = &r.kept {
-                println!("{}", p.yellow(&format!("branch {branch} kept — it has commits the trunk has not")));
+                let verb = if dry { "would be kept" } else { "kept" };
+                println!("{}", p.yellow(&format!("branch {branch} {verb} — it has commits the trunk has not")));
             }
         }
         return 0;
     }
 
     let head = git(&w.trunk, &["rev-parse", "--short", &w.branch]).map(|s| s.trim().to_string()).unwrap_or_default();
+
+    // `-n` on the branch that *makes* a tree, which is here because the flag is
+    // read per verb and not per branch. `wsp checkout` says `-n` in the help on
+    // the sweep's line, so a caller who typed it on this line was told by the
+    // help that the word was real and would have had it silently ignored —
+    // the same defect as `--rm`, one branch along, and invisible to
+    // `unknown_flags` for exactly that reason.
+    //
+    // Worth having on its own account, not only for consistency: what it prints
+    // is whether there is already a tree, which branch the work would be on,
+    // and whether an earlier id of this task is holding commits — the three
+    // things an agent arriving at a task wants before it starts editing, and
+    // all three are reads.
+    if args.has("dry-run") {
+        let exists = w.dir.join(".git").exists();
+        let on = w.on();
+        let commits = on.as_deref().map(|b| ahead(&w.repo, &w.branch, b)).unwrap_or_default();
+        // Only for a tree that is not there: [`ensure`] looks for a former id's
+        // branch only on the arm that creates, and a dry run that reported one
+        // the real run would not is a difference between the two.
+        let former = if exists { None } else { orphan(&w.repo, &w.branch, &w.task) };
+        if args.json() {
+            println!(
+                "{}",
+                json!({
+                    "task": w.task,
+                    "path": util::contract(&w.dir),
+                    "branch": on,
+                    "from": w.branch,
+                    "new": !exists,
+                    "ahead": commits.len(),
+                    "former": former.as_ref().map(|o| json!({ "branch": o.branch, "commits": o.commits })),
+                    "dry_run": true,
+                })
+            );
+            return 0;
+        }
+        println!(
+            "{} {}{}",
+            p.dim("tree"),
+            util::contract(&w.dir),
+            match exists {
+                true => p.dim("  already made"),
+                false => p.dim(&format!("  would be made, from {} {head}", w.branch)),
+            }
+        );
+        if !commits.is_empty() {
+            println!("{} {}", p.dim("ahead"), p.bold(&format!("{} commit(s) to land", commits.len())));
+        }
+        if let Some(o) = &former {
+            println!(
+                "{} {}",
+                p.dim("former"),
+                p.yellow(&format!("{} holds {} that {} has not — the tree would not be on it", o.branch, n_commits(o.commits), w.branch))
+            );
+        }
+        println!("{}", p.dim("nothing made — drop -n to make it"));
+        return 0;
+    }
+
     let made = match ensure(&w.repo, &w.dir, &w.task, &w.branch) {
         Ok(m) => m,
         Err(e) => {
@@ -2608,6 +2705,49 @@ mod tests {
             git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/inbox-002"]).is_none(),
             "the branch outlived work that is on the trunk"
         );
+    }
+
+    /// `-n` on `--rm` is only worth having if it is a promise, so the promise
+    /// is what is asserted: [`foresee`] and [`remove`] are asked about the same
+    /// tree, in that order, and have to agree on both facts a removal reports.
+    ///
+    /// Both branches of the interesting one. A tree holding commits the trunk
+    /// has not got keeps its branch; the same tree after those commits land
+    /// does not — and the prediction has to turn over with it, because a dry
+    /// run that always said "kept" would be right often enough to be trusted
+    /// and wrong on the run that mattered.
+    ///
+    /// The branch is read off the *tree* and not from the task's id, which is
+    /// the trap [`remove`] was fixed for: this tree is on `inbox-004` while the
+    /// store calls the task `proj-004`, so a prediction taking the name from
+    /// the task would ask [`ahead`] about a branch that does not exist and
+    /// answer the same empty list a landed one gives.
+    #[test]
+    fn what_a_dry_run_of_rm_says_is_what_the_removal_then_does() {
+        let (_env, dir) = scratch("foresee");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "inbox-004");
+        ensure(&dir, &wt, "inbox-004", "master").unwrap();
+        std::fs::write(wt.join("unlanded.txt"), "mine
+").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", "never landed"]);
+        std::fs::write(Store::open().ids_path(), r#"{"inbox-004":"proj-004"}"#).unwrap();
+
+        let said = foresee(&dir, &wt, "master");
+        assert!(said.existed, "the tree it is standing in front of was not seen");
+        assert_eq!(said.kept.as_deref(), Some("inbox-004"), "the branch holding the work was not named");
+        assert!(wt.join("unlanded.txt").exists(), "a dry run removed the tree");
+
+        let did = remove(&dir, &wt);
+        assert_eq!((did.existed, did.kept), (said.existed, said.kept), "the removal disagreed with the preview");
+
+        // The same tree again, with its work on the trunk: nothing to keep.
+        git_ok(&dir, &["merge", "--ff-only", "--quiet", "inbox-004"]).unwrap();
+        ensure(&dir, &wt, "inbox-004", "master").unwrap();
+        let said = foresee(&dir, &wt, "master");
+        assert_eq!(said.kept, None, "a branch with nothing on it was predicted kept");
+        assert_eq!(remove(&dir, &wt).kept, said.kept, "the removal disagreed with the preview");
     }
 
     /// `worklist-027`, the third and last of the renumbering conflations, and

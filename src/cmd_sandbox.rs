@@ -486,11 +486,12 @@ fn sessions_with_processes() -> Vec<(String, usize)> {
 /// Said out loud rather than counted silently: a teardown that killed something
 /// is a fact about what the sandbox was running, and the whole reason this
 /// exists is that "torn down" was printed once while a daemon carried on.
-fn reaped_note(n: usize) -> String {
+fn reaped_note(n: usize, dry: bool) -> String {
+    let reaped = if dry { "would be reaped" } else { "reaped" };
     match n {
         0 => String::new(),
-        1 => " — 1 process it started reaped".to_string(),
-        n => format!(" — {n} processes it started reaped"),
+        1 => format!(" — 1 process it started {reaped}"),
+        n => format!(" — {n} processes it started {reaped}"),
     }
 }
 
@@ -790,7 +791,7 @@ fn up(store: &Store, args: &Args) -> i32 {
             let (_, reaped) = stop_session(&sb.name);
             let _ = std::fs::remove_dir_all(&sb.dir);
             if !json_out {
-                println!("{}", p.dim(&format!("sandbox {} torn down{}", sb.name, reaped_note(reaped))));
+                println!("{}", p.dim(&format!("sandbox {} torn down{}", sb.name, reaped_note(reaped, false))));
             }
         } else if !json_out {
             println!("{}", p.dim(&format!("sandbox {} kept — wsp sandbox rm {}", sb.name, sb.name)));
@@ -1045,8 +1046,23 @@ fn ls(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// Drop a sandbox: its session, the processes it started, and its directory.
+///
+/// **`-n` is read here, and `--all` is why.** Every other flag on this verb
+/// names what it acts on; `--all` is the one that does not, and what it matches
+/// is a directory listing crossed with herdr's session list crossed with a
+/// process table — three sources, none of which the caller can see from where
+/// they are typing. A wildcard whose extent is only knowable by running it is
+/// the exact case a dry run is for, and until `worklist-050` this verb parsed
+/// `-n`, ignored it, and dropped every sandbox that was up.
+///
+/// What the dry run reads is what the real run reads, one call short of acting:
+/// [`session`] rather than `herdr session stop`, [`session_children`] rather
+/// than the signal to them. So the counts printed are the counts that would be
+/// reaped, taken from the same place at the same moment.
 fn rm(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
+    let dry = args.has("dry-run");
     let root = store.state.join("sandbox");
 
     // Through the same naming as `up`, so `rm selftest` drops what `--name
@@ -1080,24 +1096,40 @@ fn rm(store: &Store, args: &Args) -> i32 {
     let mut removed: Vec<Value> = Vec::new();
     for name in &names {
         let dir = root.join(name);
-        let (had_session, reaped) = stop_session(name);
+        // The directory before anything else under `-n` too, and for the same
+        // reason it is read before the removal below: it is the fact the answer
+        // turns on, and the real run destroys it.
         let had_dir = dir.exists();
-        let _ = std::fs::remove_dir_all(&dir);
+        let (had_session, reaped) = match dry {
+            true => (session(name).is_some(), session_children(name).len()),
+            false => stop_session(name),
+        };
+        if !dry {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         if had_session || had_dir || reaped > 0 {
             removed.push(json!({ "name": name, "processes": reaped }));
         }
     }
 
     if args.json() {
-        println!("{}", json!({ "removed": removed, "asked": names }));
+        println!("{}", json!({ "removed": removed, "asked": names, "dry_run": dry }));
         return 0;
     }
     if removed.is_empty() {
-        println!("{}", p.dim(&format!("no sandbox called {}", names.join(", "))));
+        // `--all` with nothing up asked about no name at all, and "no sandbox
+        // called " was the sentence that came out — a blank where the answer
+        // goes, on the invocation most likely to be typed by somebody checking
+        // whether anything is running.
+        match names.is_empty() {
+            true => println!("{}", p.dim("no sandboxes")),
+            false => println!("{}", p.dim(&format!("no sandbox called {}", names.join(", ")))),
+        }
     } else {
         for r in &removed {
             let n = r["processes"].as_u64().unwrap_or(0) as usize;
-            println!("removed {}{}", r["name"].as_str().unwrap_or(""), reaped_note(n));
+            let verb = if dry { "would remove" } else { "removed" };
+            println!("{verb} {}{}", r["name"].as_str().unwrap_or(""), reaped_note(n, dry));
         }
     }
     0
@@ -1443,6 +1475,32 @@ mod tests {
             assert!(name.starts_with(PREFIX), "--name {given} produced a session nobody can find again");
             assert!(!name.contains('/'), "--name {given} escaped its own directory as {name}");
         }
+    }
+
+    /// `worklist-050`: `--all` is a wildcard over directories, herdr sessions
+    /// and a process table, and `wsp sandbox rm --all -n` — the invocation you
+    /// type *because* you cannot see what it matched — parsed the word, ignored
+    /// it, and dropped every sandbox that was up.
+    ///
+    /// Asserted on the directory rather than on the printed line: a sandbox is
+    /// a directory, a session and a set of processes, and the directory is the
+    /// one of the three a test can own outright. Only the dry half runs here —
+    /// the other half shells out to herdr, and a unit test that stopped a
+    /// session would be reaching for the live one.
+    #[test]
+    fn a_dry_run_of_rm_all_leaves_every_sandbox_where_it_is() {
+        let root = std::env::temp_dir().join(format!("wsp-sandbox-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone(), root.join("state"));
+        let dir = store.state.join("sandbox").join("wsp-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), "here\n").unwrap();
+
+        let dry = &[("all", "true"), ("dry-run", "true")];
+        assert_eq!(rm(&store, &Args::synth("sandbox", &["rm"], dry)), 0);
+
+        assert!(dir.join("marker").exists(), "-n on `sandbox rm --all` removed the sandbox");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `rm` takes a name typed at a shell and hands it to `remove_dir_all`.

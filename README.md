@@ -3826,6 +3826,33 @@ more thing that can be left behind — which is what the sweep and `wsp doctor`
 between them are for. The reasoning is in `src/cmd_checkout.rs` and on
 `t-260815-022` and `t-260817-018`.
 
+### `-n` means "do not", and a verb that cannot must say so
+
+`-n` expands to `--dry-run` in the parser, for every verb there is. Five read
+it. The rest let it parse, ignored it, and did the thing — so `wsp checkout
+<id> --rm -n`, `wsp despawn <id> -n`, `wsp sandbox rm --all -n` and `wsp
+project rm <id> --force -n` all removed for real, and the notice that the word
+had gone nowhere arrived, when it arrived at all, after the removal. **The
+careful invocation was the destructive one**, on the four verbs where being
+careful was the point. It is the same defect `wsp archive --all -n` shipped
+with, which swept 266 tasks; that one was found by somebody running it.
+
+The refusal has to arrive **before** the act, and the check that catches
+mistyped flags cannot do it: it is a tally of what the verb read, and a tally is
+only complete once the verb has finished asking. So `-n` gets a check of its own,
+ahead of dispatch, and it is the only flag that can have one — every other flag
+means what its verb decides it means, and this one means *do not do it, tell me
+what you would do* on all forty. A verb now earns `-n` by **reading** it, and
+anything else refuses the word before opening the store.
+
+Four verbs then answer it properly rather than refusing: `checkout` in all three
+of its branches, `sandbox rm`, `project rm`, and `archive`. `despawn` refuses on
+its merits and says why — ending an agent is a run of steps across herdr, each
+one decided by the last one's answer, and its own rule is that every step reports
+what it *did* rather than what it attempted. A preview would be a report of what
+it intended, wrong on exactly the runs that matter. `wsp checkout <id> --rm -n`
+answers the half people are actually asking about.
+
 ### What none of it fixes
 
 A tree each closes the sweeps and does not close everything. Two agents editing

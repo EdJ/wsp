@@ -1261,6 +1261,29 @@ pub(crate) fn workspace_of(seat: &Seat) -> Option<String> {
 /// written against, and a cleanup that prints "removed" over a tree still on
 /// disk is worse than one that never ran.
 ///
+/// **It will not show you first, and `-n` is refused rather than ignored.**
+/// This verb removes a working tree — the same tree, through the same
+/// [`cmd_checkout::discard`] — so it was one of the five that `worklist-050`
+/// found parsing `-n`, never reading it, and doing the real thing. Four of the
+/// five grew a dry run; this one says it cannot, and the reason is the
+/// paragraph above about reporting what was *done*.
+///
+/// What a despawn does is a run of steps across a live backend, each one
+/// decided by the previous one's answer: the claim is released only if the seat
+/// closed, the tree is taken only if nobody is standing in it and it holds
+/// nothing uncommitted, the build trees go only if herdr says the workspace has
+/// actually gone. Every one of those is a question that can only be asked by
+/// doing the step before it. A preview would therefore print what it *intends*,
+/// which is exactly the sentence this verb was written to stop printing — and
+/// it would be wrong on precisely the runs that matter, the ones where a tree
+/// is kept because somebody turned out to be in it.
+///
+/// So the refusal is the honest answer, and it names the read that does work:
+/// `wsp checkout <id> --rm -n` answers the tree half, which is the half people
+/// are asking about when they type it. The refusal is in `main`, ahead of
+/// dispatch, because a word meaning "do not act" that is answered by the verb
+/// has already been answered too late.
+///
 /// No guard on an agent that is busy, and that is a decision rather than an
 /// omission. `claim`'s live-holder guard protects you from a *third party* you
 /// may not have known was there; this verb is aimed at a seat by somebody who

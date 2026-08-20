@@ -507,6 +507,19 @@ fn no_project(store: &Store, needle: &str) -> String {
 /// delete. Refusing outright would be wrong — emptying a project and removing
 /// it is the correct flow, and it was followed. The bug was that one field went
 /// quietly, which is why the line it prints now says what was kept and where.
+///
+/// **`-n` shows all of that before any of it happens**, and it is nearly free:
+/// this verb already counts the tasks and the children before it acts, because
+/// that count is what it refuses on without `--force`. A dry run is the same
+/// count printed on the other branch. Until `worklist-050` the word parsed, was
+/// never read, and `wsp project rm batch --force -n` did the whole thing — the
+/// invocation somebody types precisely because they do not know what is under
+/// the project.
+///
+/// It is also the one of these whose damage is *dispersed* rather than
+/// contained: a removed tree is one directory, and `--force` here writes a new
+/// `project:` on every task the project held. Which tasks those are is the
+/// question, and the answer is the list below.
 pub fn rm(store: &Store, args: &Args) -> i32 {
     // rest[0] is the `rm` subcommand itself; the id follows it.
     let Some(needle) = args.rest.get(1).cloned() else {
@@ -531,6 +544,13 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
             children.len()
         );
         return 1;
+    }
+    // After the refusal above and not before it: on a project that still holds
+    // work, what `rm` *would* do is refuse, and it says so in the sentence
+    // above with the counts already in it. A dry run that printed a removal
+    // there would be answering a question nobody asked.
+    if args.has("dry-run") {
+        return would_remove(&p, &tasks, &children, args);
     }
 
     for mut t in tasks {
@@ -581,6 +601,72 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
     }
     0
 }
+
+/// `wsp project rm <id> -n` — the same removal, said and not done.
+///
+/// Three lists, because `--force` does three different things and only the
+/// first is visible from where the caller stands. The tasks are **named** and
+/// not counted: `--force` writes a new `project:` onto every one of them, the
+/// refusal above already gives the count, and a count is not something anybody
+/// can check against what they meant. Capped, because a project holding two
+/// hundred tasks would otherwise answer a safety question with two hundred
+/// lines nobody reads to the end of — and the count is on the line above the
+/// list either way, which is what makes cutting it honest.
+///
+/// The archive filename is deliberately not predicted. [`Store::archive_project`]
+/// picks it, and it is not always `<id>.md` — the archive may already hold that
+/// name from an earlier project that wore the id. A dry run that named a file
+/// and was wrong about it would be worse than one that names the directory.
+fn would_remove(proj: &Project, tasks: &[crate::model::Task], children: &[Project], args: &Args) -> i32 {
+    let p = Paint::new();
+    let kept = prose_in(proj);
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "removed": proj.id,
+                "archived": true,
+                "kept": kept,
+                "orphaned": tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+                "reparented": children.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+                "to": proj.parent,
+                "dry_run": true,
+            })
+        );
+        return 0;
+    }
+
+    println!("would remove project {} {}", proj.id, p.dim("(archived, not deleted)"));
+    if !tasks.is_empty() {
+        println!("  {} task(s) would go to the inbox:", tasks.len());
+        for t in tasks.iter().take(RM_MAX) {
+            println!("    {} {}", p.dim(&t.id), util::truncate(&t.title, 60));
+        }
+        if tasks.len() > RM_MAX {
+            println!("    {}", p.dim(&format!("… and {} more", tasks.len() - RM_MAX)));
+        }
+    }
+    if !children.is_empty() {
+        let to = match &proj.parent {
+            Some(parent) => format!("under {parent}"),
+            None => "to the top level".to_string(),
+        };
+        println!("  {} child project(s) would move {to}:", children.len());
+        for c in children {
+            println!("    {}", p.dim(&c.id));
+        }
+    }
+    if !kept.is_empty() {
+        println!("  {} kept in archive/projects/", kept.join(", "));
+    }
+    println!("{}", p.dim("nothing moved — drop -n to do it"));
+    0
+}
+
+/// How many orphaned tasks a dry run names before it starts counting. Twenty is
+/// a screen: enough to recognise a project you did not mean, short enough that
+/// the last line — the one saying nothing has happened — is still on it.
+const RM_MAX: usize = 20;
 
 /// The prose a project would take with it, section by section, for the line
 /// `rm` prints.
@@ -803,6 +889,39 @@ mod tests {
             vec!["brief".to_string(), "handbook (2 lines)".to_string()],
             "and the line it prints says what it kept"
         );
+    }
+
+    /// `worklist-050`. `--force` here rewrites the `project:` of every task the
+    /// project held, and until this the invocation that says *show me which
+    /// ones* did the rewrite and then said nothing. So the assertion is on the
+    /// store rather than on the output: after `-n`, the project is still there,
+    /// the tasks are still in it, and the child is still under it.
+    ///
+    /// The exit code matters as much as the state. `-n` is a question that was
+    /// answered, so it succeeds — a dry run that exited non-zero would put
+    /// every careful caller's script in the branch it takes for failure.
+    #[test]
+    fn a_dry_run_of_project_rm_moves_no_task_and_keeps_the_project() {
+        let store = scratch("project-rm-dry");
+        proj(&store, "batch", None);
+        proj(&store, "batch-sub", Some("batch"));
+        let mut t = crate::model::Task::new("a lane", "t-260817-050");
+        t.project = Some("batch".into());
+        store.save_task(&t).unwrap();
+
+        let dry = &[("force", "true"), ("dry-run", "true")];
+        assert_eq!(rm(&store, &Args::synth("project", &["rm", "batch"], dry)), 0, "a dry run is an answer, not a failure");
+
+        assert!(store.project("batch").is_some(), "the dry run retired the project");
+        assert_eq!(store.task("t-260817-050").unwrap().project.as_deref(), Some("batch"), "a task was orphaned by a dry run");
+        assert_eq!(store.project("batch-sub").unwrap().parent.as_deref(), Some("batch"), "a child was reparented by a dry run");
+        assert!(store.archived_projects().is_empty(), "the dry run filed it in the archive");
+
+        // And the same words without `-n` do all three, so the preview was of
+        // something real.
+        assert_eq!(rm(&store, &Args::synth("project", &["rm", "batch"], &[("force", "true")])), 0);
+        assert!(store.project("batch").is_none());
+        assert_eq!(store.task("t-260817-050").unwrap().project, None);
     }
 
     /// A project with nothing written on it says so plainly rather than

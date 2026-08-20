@@ -370,6 +370,17 @@ impl Args {
         self.mark(name);
         self.flags.contains_key(name)
     }
+    /// Was the flag given — asked *without* counting it as read.
+    ///
+    /// One caller, [`dry_run`]'s check in `main`, and the exception is the
+    /// whole point of it: that check runs before dispatch, and marking the word
+    /// there would tell [`Args::dropped`] and [`unknown_flags`] that something
+    /// had looked at it. The read tally is what catches a verb wrongly listed
+    /// as reading `-n`, so the check that decides on the strength of the list
+    /// must not be the thing that silences the tally.
+    fn given(&self, name: &str) -> bool {
+        self.flags.contains_key(name)
+    }
     pub fn get(&self, name: &str) -> Option<String> {
         self.mark(name);
         self.flags.get(name).and_then(|v| v.first().cloned())
@@ -530,6 +541,94 @@ fn die_on_broken_pipe() {
     }
 }
 
+/// The verbs that look first, in the words a refusal names them by.
+///
+/// Paired with [`dry_run`] by a test rather than derived from it: the list is
+/// read by somebody who has just been refused and needs the nearest verb that
+/// would have answered, and generating it from the match would print
+/// `checkout` for the arm that also covers `--rm`, which is the sentence they
+/// need. It is short because the property it describes is rare, and it going
+/// stale is the one failure here that costs nothing but a wrong signpost.
+const LOOKS_FIRST: &str = "archive, checkout, install, migrate, project rm, sandbox rm, worklist go";
+
+/// Whether this invocation reads `-n`, and what to call it if it does not.
+///
+/// # Why a check before dispatch, when [`unknown_flags`] is after it
+///
+/// `-n` expands to `--dry-run` for **every** verb in [`expand_short`], and
+/// until `worklist-050` five verbs read it and the other thirty-odd let it
+/// parse, ignored it, and did what they were going to do. On a reading verb
+/// that is noise the tally cleans up afterwards. On `wsp checkout <id> --rm -n`
+/// it was the fault `worklist-044` was written about, arriving four more times:
+/// **the word that means "show me first" is the word that does it anyway**, and
+/// the only notice comes once the tree is gone.
+///
+/// [`unknown_flags`] cannot be that notice and says so in its own last
+/// paragraph — it is a read tally, and a tally is only complete once the verb
+/// has finished asking. The refusal has to arrive before the act, which is
+/// available only to a check with **no read tally behind it**. This is that
+/// check, and it is possible for exactly one word: `--dry-run` is the only flag
+/// in wsp whose meaning does not vary by verb. Every other flag means what its
+/// verb decides it means, which is why the vocabulary for those had to be read
+/// off the help and consulted afterwards. *Do not do it, tell me what you would
+/// do* needs no vocabulary — it needs one list of who honours it.
+///
+/// # Why a match and not a table
+///
+/// This is the shape of `main`'s own dispatch, ten lines below, aliases and
+/// subcommands and all — a table would be that shape written a second time in a
+/// different notation and would drift from it in the same edit. And it is one
+/// flag over forty verbs rather than sixty flags, which is the size that made
+/// [`Args::dropped`] refuse a vocabulary.
+///
+/// **Both ways of being wrong are safe, and that is the argument for keeping it
+/// by hand.** A verb missing from here refuses a command that would have worked
+/// and says so before doing anything. A verb wrongly here reads nothing, and
+/// falls back to exactly the after-the-fact tally of today — because the check
+/// asks through [`Args::given`] and never marks the word read.
+///
+/// The naming is folded in rather than computed beside it for the same reason:
+/// the arms that dispatch on a subcommand are the arms whose refusal has to say
+/// `worklist rm` rather than `worklist`, and that is one fact about a verb, not
+/// two.
+fn dry_run(args: &Args) -> (bool, String) {
+    let sub = args.rest.first().map(String::as_str).unwrap_or_default();
+    let named = |reads: bool| (reads, format!("{} {sub}", args.cmd).trim_end().to_string());
+    match args.cmd.as_str() {
+        // `checkout` is here whole, and all three of its branches read the
+        // word: the sweep always did, `--rm` does now, and so does making a
+        // tree. Leaving the making branch out would put the same defect back
+        // one branch along — the help says `checkout` takes `-n`, so nothing
+        // downstream would have caught it either.
+        "migrate" | "install" | "archive" | "checkout" => (true, args.cmd.clone()),
+        "project" | "proj" | "p" => named(matches!(sub, "rm" | "remove" | "delete")),
+        "sandbox" => named(matches!(sub, "rm" | "remove" | "stop")),
+        "worklist" | "wl" => named(matches!(sub, "go" | "start")),
+        "machine" | "machines" => named(false),
+        _ => (false, args.cmd.clone()),
+    }
+}
+
+/// Say that `-n` is not read here, before anything has happened.
+///
+/// The one line that matters is *nothing has been done*, because the reader
+/// typed `-n` precisely to find out what would be, and every previous version
+/// of this sentence arrived after the answer had been acted on.
+fn refuse_dry_run(verb: &str) -> i32 {
+    let p = util::Paint::new();
+    eprintln!("wsp: `wsp {verb}` does not look first, so {} is refused. Nothing has been done.", p.bold("-n"));
+    // The verbs that removed things on this word are the reason the refusal
+    // exists, so the one with a real dry run for the thing people are usually
+    // asking about gets named rather than left to be looked up.
+    if verb == "despawn" {
+        eprintln!("     Ending an agent is a run of steps across herdr, each one decided by");
+        eprintln!("     the last one's answer, so what it would do is not knowable until it");
+        eprintln!("     does it. For the half that is a directory: `wsp checkout <id> --rm -n`.");
+    }
+    eprintln!("     Verbs that do look first: {}", p.dim(LOOKS_FIRST));
+    2
+}
+
 /// Whether this invocation has to have a store to mean anything.
 ///
 /// Three commands do not. `init` is what makes one. `doctor` reports on the
@@ -562,6 +661,15 @@ fn main() {
     if args.cmd.is_empty() || args.cmd == "help" || args.has("help") {
         help();
         return;
+    }
+
+    // Before the store is even opened, which is what "before the act" has to
+    // mean for a word whose whole content is "do not act". See [`dry_run`].
+    if args.given("dry-run") {
+        let (reads, verb) = dry_run(&args);
+        if !reads {
+            std::process::exit(refuse_dry_run(&verb));
+        }
     }
 
     if args.has("no-commit") {
@@ -1033,8 +1141,9 @@ fn help_text() -> String {
                                     work is for, and which file in the repo
                                     holds the map of the code
   wsp project set <id> k=v…         name/parent/status/brief/tags/roots
-  wsp project rm <id> [--force]     retire it to the archive; --force orphans
-                                    the tasks and children it still held
+  wsp project rm <id> [--force] [-n]  retire it to the archive; --force orphans
+                                    the tasks and children it still held, and -n
+                                    names them without moving anything
 
 {tasks}
   wsp add "title" [-p proj] [-t tag]… [--prio high] [--ref PATH]
@@ -1091,13 +1200,15 @@ fn help_text() -> String {
                                     SessionStart hook's call — paid once at the
                                     top of a session, not on every brief after
   wsp commit-help                   how to commit in a tree somebody else is in
-  wsp checkout [<id>]               a working tree of your own for the task in
+  wsp checkout [<id>] [-n]          a working tree of your own for the task in
                                     hand, under .worktrees/, on its own branch —
                                     nobody else's edits are in it and yours are
                                     in nobody else's commit
-  wsp checkout [<id>] --rm [--force]  end it, when the task is genuinely over;
-                                    the branch stays if it holds work, and
-                                    --force is needed to lose uncommitted work
+  wsp checkout [<id>] --rm [--force] [-n]  end it, when the task is genuinely
+                                    over; the branch stays if it holds work, and
+                                    --force is needed to lose uncommitted work.
+                                    -n on any of the three says what it would do
+                                    and does none of it
   wsp checkout --sweep [-n]         …or every tree here whose task is closed and
                                     nobody removed; skips any tree somebody is
                                     standing in or has work in, -n to look first
@@ -1135,7 +1246,9 @@ fn help_text() -> String {
                                     answers the socket out of a state you write
                                     down, so wsp can be driven through the ones
                                     a real herdr cannot be put in
-  wsp sandbox ls|rm [<name>] [--all]  what is up, and how to drop it
+  wsp sandbox ls|rm [<name>] [--all] [-n]  what is up, and how to drop it —
+                                    --all drops every one, so -n names them
+                                    first
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
                  [--model <m>] [--effort <e>]
@@ -1815,6 +1928,88 @@ mod tests {
         assert_eq!(u.len(), 1, "the unknown flag was not named");
         assert_eq!(u[0].meant.as_deref(), Some("from"));
         assert_eq!(a.dropped(), vec!["form"], "and it did take the path with it");
+    }
+
+    /// The whole of `worklist-050` in one assertion: on a verb that does not
+    /// look first, `-n` is refused, and refused *before* the verb runs. The
+    /// check is asked here in isolation because that is the only way to see the
+    /// ordering — in `main` it is two lines above the dispatch, and a test that
+    /// ran the dispatch to find out would be a test of the removal.
+    ///
+    /// Five verbs are named because five is the enumeration this row was filed
+    /// on: four in it, and `wsp rm` found by driving the rest.
+    #[test]
+    fn a_verb_that_cannot_look_first_refuses_n_rather_than_ignoring_it() {
+        for argv in [
+            &["despawn", "t-1"][..],
+            &["verify", "--rm", "--all"][..],
+            &["rm", "t-1"][..],
+            &["machine", "rm", "seat"][..],
+            &["worklist", "rm", "night", "t-1"][..],
+        ] {
+            let mut with_n: Vec<&str> = argv.to_vec();
+            with_n.push("-n");
+            let a = args(&with_n);
+            let (reads, _) = super::dry_run(&a);
+            assert!(!reads, "`wsp {}` accepted -n and would have done the real thing", argv.join(" "));
+        }
+    }
+
+    /// The five that do, including the two subcommands whose siblings do not:
+    /// `wsp worklist go` looks first and `wsp worklist rm` does not, so the
+    /// answer cannot be a property of the verb alone.
+    #[test]
+    fn a_verb_that_does_look_first_is_let_through_with_its_aliases() {
+        for argv in [
+            &["archive", "--days", "0"][..],
+            &["checkout", "t-1", "--rm"][..],
+            &["install"][..],
+            &["migrate"][..],
+            &["project", "rm", "batch"][..],
+            &["p", "delete", "batch"][..],
+            &["sandbox", "rm", "--all"][..],
+            &["wl", "start", "night"][..],
+        ] {
+            let a = args(argv);
+            assert!(super::dry_run(&a).0, "`wsp {}` reads -n and was refused it", argv.join(" "));
+        }
+    }
+
+    /// A refusal has to say which verb, and a verb that dispatches on a
+    /// subcommand has to be named by both words — "wsp worklist does not look
+    /// first" is false, since `wsp worklist go` does.
+    #[test]
+    fn the_refusal_names_the_subcommand_when_the_verb_has_one() {
+        assert_eq!(super::dry_run(&args(&["worklist", "rm", "night"])).1, "worklist rm");
+        assert_eq!(super::dry_run(&args(&["sandbox", "ls"])).1, "sandbox ls");
+        assert_eq!(super::dry_run(&args(&["despawn", "t-1"])).1, "despawn");
+        assert_eq!(super::dry_run(&args(&["verify"])).1, "verify");
+    }
+
+    /// The signpost in the refusal is read by somebody who has just been told
+    /// no and wants the nearest verb that would have answered, so a name on it
+    /// that is not one is worse than a short list.
+    #[test]
+    fn every_verb_the_refusal_signposts_really_does_look_first() {
+        for name in super::LOOKS_FIRST.split(", ") {
+            let argv: Vec<&str> = name.split(' ').collect();
+            assert!(
+                super::dry_run(&args(&argv)).0,
+                "the refusal sends people to `wsp {name}`, which does not read -n"
+            );
+        }
+    }
+
+    /// The check runs before dispatch, so it must not be the thing that tells
+    /// the tally somebody looked. If it marked the word, a verb wrongly listed
+    /// as reading `-n` would go on ignoring it *and* have `unknown_flags`
+    /// silenced — the one fallback the list's mistakes have.
+    #[test]
+    fn asking_whether_n_was_given_is_not_reading_it() {
+        let a = args(&["ls", "-n"]);
+        assert!(a.given("dry-run"), "the word was on the command line");
+        assert_eq!(a.dropped(), Vec::<String>::new(), "-n stands alone and takes no word");
+        assert_eq!(super::unknown_flags(&a).len(), 1, "the tally stopped seeing an unread -n");
     }
 
     fn args(argv: &[&str]) -> super::Args {
