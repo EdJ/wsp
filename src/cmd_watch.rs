@@ -1542,7 +1542,7 @@ fn stalled_seats(
         let where_ = in_lists.iter().copied().collect::<Vec<_>>().join(", ");
         // Ids and not titles, and a bounded number of them: this line is read on
         // a phone at 3am by somebody who knows their own ids.
-        let held = match ids.len() {
+        let waiting = match ids.len() {
             0..=3 => ids.join(" "),
             n => format!("{} +{}", ids[..3].join(" "), n - 3),
         };
@@ -1554,7 +1554,7 @@ fn stalled_seats(
             .map(|s| s.scope)
             .unwrap_or_else(|| EVERYONE.to_string());
         let detail = format!(
-            "{} · no turn here and none under it — {where_} still waiting on {held} \
+            "{} · no turn here and none under it — {where_} still waiting on {waiting} \
              · wsp govern {scope} --tell -",
             panes[0].pane
         );
@@ -1603,6 +1603,11 @@ impl<'a> Poll<'a> {
     /// Asked of the store and not of the level read, for exactly that reason: a
     /// `todo` member with no agent on it is invisible to every predicate in
     /// this file and is the whole of what makes the zero misleading.
+    ///
+    /// The unseated answer is `false` before anything is read, which is the
+    /// same guard [`nothing_addressed`] applies and is here so it costs
+    /// nothing: a watch on a named project asks this question, gets the answer
+    /// it always had, and does not pay a store sweep for it.
     fn owes_a_run(&self) -> bool {
         if !self.scope.seated {
             return false;
