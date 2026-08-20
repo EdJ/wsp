@@ -1077,7 +1077,11 @@ fn help_text() -> String {
   wsp prio <id> high|normal|low     what comes first inside its project
   wsp next [-p proj]                highest-priority actionable task
   wsp rm <id>                       retire it to the archive
-  wsp archive [--all]               sweep done tasks older than 30d
+  wsp archive [--days N] [-n] [--full]
+                                    sweep done tasks older than 30d into
+                                    archive/tasks/<month>/; --days 0 for every
+                                    finished task there is, -n for which ones
+                                    first and --full for all of that list
 
 {agents}
   wsp brief                         what this pane is for, and who else is working

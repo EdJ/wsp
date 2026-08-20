@@ -2158,31 +2158,128 @@ fn edit_file(store: &Store, path: &std::path::Path, msg: &str) -> i32 {
     code
 }
 
+/// Sweep finished tasks out of `tasks/` and into `archive/tasks/<month>/`.
+///
+/// **`-n` is the whole point of this verb having a shape at all.** Every other
+/// sweeping verb in wsp has one — `checkout --sweep -n`, `migrate -n`,
+/// `install -n` — and `archive` was the sweep without it. Worse than absent:
+/// `-n` expands to `--dry-run` for every verb in the parser, so
+/// `wsp archive --all -n` — the careful invocation, the one an agent types
+/// precisely because it does not know what is about to move — parsed, archived
+/// 266 tasks, and *then* said the word had gone nowhere. `unknown_flags` is
+/// honest and it is after the fact, which is all it can be; the repair is for
+/// the verb to read the flag.
+///
+/// **The cutoff-remover is a number, not `--all`.** It was `--all`, which is
+/// the most-typed word in the CLI and everywhere else in wsp widens what is
+/// *looked at* — `ls --all`, `find --all`, `attempts --all`. Here it widened
+/// what was *moved*, and it was the only thing standing between two words and
+/// the whole store. `--days 0` already meant exactly this and still does; what
+/// changed is that the guard now comes off by a number you chose rather than by
+/// muscle memory.
+///
+/// The word is refused here rather than left to `unknown_flags`, for two
+/// reasons that are the same reason. `unknown_flags` runs *after* the verb —
+/// it is a read tally, and a tally is only complete once the command has
+/// finished asking — so leaving `--all` to it means the thirty-day sweep runs
+/// and commits before anyone is told the word went nowhere. And its suggestion
+/// was `--full`, the nearest name on this verb's help within two edits, which
+/// widens the *listing* and would send somebody reaching for "sweep
+/// everything" to a flag that sweeps nothing extra. A retired flag is the one
+/// case where the verb knows what was meant, so the verb says it.
+///
+/// Oldest first, because that is what a cutoff is about, and because the tail
+/// the cap drops is then the newest — the least likely to be the record
+/// somebody is citing. The count above the list is the whole answer either way,
+/// which is what makes a cut list honest.
 pub fn archive(store: &Store, args: &Args) -> i32 {
+    if args.has("all") {
+        eprintln!("wsp: `wsp archive --all` is now `--days 0`");
+        eprintln!("     It removed the thirty-day cutoff, which is the only thing between");
+        eprintln!("     this verb and the whole store — so it is a number now rather than");
+        eprintln!("     the most-typed word in the CLI. `wsp archive --days 0 -n` first.");
+        return 2;
+    }
     let cutoff: i64 = args.get("days").and_then(|d| d.parse().ok()).unwrap_or(30);
-    let all = args.has("all");
-    let mut moved = 0;
-    for t in store.tasks() {
-        if t.status() != Status::Done {
-            continue;
-        }
-        if !all && util::age_days(&t.updated) < cutoff {
-            continue;
-        }
-        if store.archive_task(&t).is_ok() {
-            moved += 1;
+    let dry = args.has("dry-run");
+    // Read whether or not it is a dry run, so the flag is always in the tally
+    // `unknown_flags` reads and `wsp archive --full` is never refused on the
+    // strength of which branch this run happened to take.
+    let full = args.has("full");
+
+    let mut due: Vec<Task> = store
+        .tasks()
+        .into_iter()
+        .filter(|t| t.status() == Status::Done && util::age_days(&t.updated) >= cutoff)
+        .collect();
+    due.sort_by(|a, b| a.updated.cmp(&b.updated).then_with(|| a.id.cmp(&b.id)));
+
+    let mut moved: Vec<Task> = Vec::new();
+    for t in due {
+        if dry || store.archive_task(&t).is_ok() {
+            moved.push(t);
         }
     }
-    if moved > 0 {
-        store.git_commit(&format!("wsp: archive {moved} tasks"));
+    if !dry && !moved.is_empty() {
+        store.git_commit(&format!("wsp: archive {} tasks", moved.len()));
     }
+
     if args.json() {
-        println!("{}", json!({ "archived": moved }));
-    } else {
-        println!("archived {moved} task(s)");
+        // Uncapped: a caller parsing this is not reading it.
+        println!(
+            "{}",
+            json!({
+                "archived": moved.len(),
+                "dry_run": dry,
+                "tasks": moved.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            })
+        );
+        return 0;
+    }
+
+    let p = Paint::new();
+    println!(
+        "{} {} task(s)",
+        if dry { "would archive" } else { "archived" },
+        moved.len()
+    );
+    if !dry {
+        return 0;
+    }
+    let shown = if full { moved.len() } else { moved.len().min(ARCHIVE_MAX) };
+    let idw = moved[..shown].iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
+    for t in &moved[..shown] {
+        println!(
+            "  {} {} {}",
+            p.dim(&util::pad(&t.id, idw)),
+            p.dim(&archive_month(t)),
+            util::truncate(&t.title, 62)
+        );
+    }
+    if shown < moved.len() {
+        println!(
+            "{}",
+            p.dim(&format!("  … {} more · --full lists them all", moved.len() - shown))
+        );
     }
     0
 }
+
+/// The month directory `archive_task` would file this under — `updated`'s
+/// year and month, which is also the only thing the reader needs to find the
+/// file again. Kept beside the sweep rather than taken from `archive_task`,
+/// which does not compute it until it is moving something.
+fn archive_month(t: &Task) -> String {
+    match t.updated.len() >= 7 {
+        true => t.updated[0..7].to_string(),
+        false => "unknown".into(),
+    }
+}
+
+/// Rows a dry run prints before it says how many it is not printing. The same
+/// twenty `find` stops at, for the same reason: past that the list is telling
+/// you to look at the count instead.
+const ARCHIVE_MAX: usize = 20;
 
 #[cfg(test)]
 mod tests {
@@ -2254,6 +2351,64 @@ mod tests {
         assert!(path.ends_with("2026-08/render-018.md"), "{}", path.display());
 
         assert_eq!(show(&store, &parse(&["show", "render-999"])), 1, "and nothing is still nothing");
+    }
+
+    /// Two done tasks, one on either side of the cutoff — enough to say both
+    /// halves of what a dry run is for.
+    fn swept_store(tag: &str) -> Store {
+        let store = scratch(tag);
+        let mut old = Task::new("Overscrolling has dead travel", "render-018");
+        old.updated = "2025-11-02T09:00:00Z".into();
+        old.status_raw = "done".into();
+        store.save_task(&old).unwrap();
+        let mut recent = Task::new("the barrier design rests on this", "wsp-084");
+        recent.updated = util::now_iso();
+        recent.status_raw = "done".into();
+        store.save_task(&recent).unwrap();
+        store
+    }
+
+    /// The fault this row was written about, and it was sharper than "the flag
+    /// is missing". `-n` expands to `--dry-run` for every verb in the parser,
+    /// so `wsp archive -n` parsed, swept for real, and only afterwards said the
+    /// word had gone nowhere — the careful invocation was the destructive one.
+    ///
+    /// Asserted on the store rather than on the printed line, because printing
+    /// "would archive" while the file has already moved is exactly the failure
+    /// being fixed: a saying-so version that does the damage anyway.
+    #[test]
+    fn a_dry_run_says_what_it_would_sweep_and_leaves_every_file_where_it_is() {
+        let store = swept_store("archive-dry");
+        assert_eq!(archive(&store, &parse(&["archive", "-n"])), 0);
+        assert!(
+            store.tasks().iter().any(|t| t.id == "render-018"),
+            "a dry run moved the file it was only asked about"
+        );
+        assert!(store.archived_task("render-018").is_none(), "and nothing is in the archive");
+
+        assert_eq!(archive(&store, &parse(&["archive"])), 0, "now for real");
+        assert!(!store.tasks().iter().any(|t| t.id == "render-018"), "the sweep did not run");
+        assert!(store.archived_task("render-018").is_some(), "and this is where it went");
+    }
+
+    /// `--all` is the most-typed word in the CLI and everywhere else in wsp it
+    /// widens what is *looked at*. On this verb it widened what was *moved*,
+    /// and it was the only thing between two words and the whole store. The
+    /// cutoff now comes off by a number, and the retired word is refused by the
+    /// verb rather than left to `unknown_flags` — which runs after the sweep has
+    /// already committed, and whose nearest suggestion was `--full`.
+    ///
+    /// The store is asserted beside the exit code, because a refusal arriving
+    /// after the write is the failure being fixed and reads identically from
+    /// the exit code alone.
+    #[test]
+    fn the_cutoff_comes_off_by_a_number_and_no_longer_by_the_word_all() {
+        let store = swept_store("archive-all");
+        assert_eq!(archive(&store, &parse(&["archive", "--all"])), 2, "and it says why");
+        assert_eq!(store.tasks().len(), 2, "the refusal came before the sweep, not after it");
+
+        assert_eq!(archive(&store, &parse(&["archive", "--days", "0"])), 0);
+        assert!(!store.tasks().iter().any(|t| t.id == "wsp-084"), "--days 0 is the way to ask");
     }
 
     /// `worklist-018`. A hand carrying a paragraph and no sentence drew as a
