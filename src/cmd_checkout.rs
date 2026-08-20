@@ -318,6 +318,28 @@ struct Made {
 /// task that has actually been renumbered: [`former_ids`] is empty for every
 /// task in a store that has never renamed anything, and that store has no file
 /// at all.
+///
+/// # The branch this names is a branch [`prune`] can delete
+///
+/// Said here because the two landed four hours apart and the next person to
+/// touch either will not be looking at the other. `--sweep` now takes branches
+/// with no tree, and a former id's branch is exactly that: the tree it was made
+/// for was named after the old id and was swept, which is the whole case this
+/// function exists for.
+///
+/// They do not collide, and not by luck — **both key on the same question**,
+/// `ahead(trunk, branch)`. This reports only a branch holding commits the trunk
+/// has not got, and `git branch -d` refuses to delete exactly that. So a branch
+/// worth a sentence here cannot be taken there, and a former id's branch whose
+/// every commit is on the trunk is dead in both readings: nothing to carry
+/// forward, and nothing lost by removing the name.
+///
+/// The asymmetry to keep, if either side is ever widened: this **reports and
+/// never adopts** — see the rule above — so the sentence it prints is the only
+/// pointer wsp ever gives at that branch, and it prints only while a tree is
+/// being made. [`strays`] is the other end of that: the same branch, found
+/// again by anybody running `wsp doctor`, rather than once in output that has
+/// scrolled away.
 fn orphan(repo: &Path, onto: &str, task: &str) -> Option<Orphan> {
     former_ids(task).into_iter().find_map(|branch| {
         // Asked before it is compared, because `ahead()` on a branch that does
@@ -657,6 +679,12 @@ pub(crate) fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
 /// into *my task branch*" — which refuses in the safe direction for a branch
 /// the trunk has and this one has not, and in the unsafe direction for one this
 /// tree merged and the trunk never saw.
+///
+/// The guard is load-bearing beyond this function, and [`orphan`] is where that
+/// is written down: a renumbered task's work lives on a branch of the id it had
+/// then, with no tree, which is precisely what this is pointed at. The two rest
+/// on one predicate — `ahead(trunk, branch)` — so widening either side without
+/// the other is what would break it.
 fn prune(trunk: &Path, branch: &str) -> bool {
     git(trunk, &["branch", "-d", branch]).is_some()
 }
@@ -2267,6 +2295,47 @@ mod tests {
         let out = sweep(&dir, &|_| false, &|_| false, &renamed, &|_| None, false);
         assert!(out.pruned.is_empty(), "a branch holding unreachable work was taken");
         assert_eq!(out.stranded.len(), 1);
+    }
+
+    /// The interaction between the two halves of the renumbering story, pinned
+    /// because they landed four hours apart and rest on one predicate.
+    ///
+    /// [`orphan`] names a former id's branch so that work is not walked past,
+    /// and [`prune`] deletes a branch with no tree — and those are the *same*
+    /// branches, because the tree a renumbered task's work was committed in was
+    /// named after the old id and is exactly what gets swept. They do not
+    /// collide, and not by luck: both ask `ahead(trunk, branch)`. A branch
+    /// worth naming is one `branch -d` refuses; a branch `-d` takes is one
+    /// [`orphan`] would have said nothing about.
+    ///
+    /// Asserted as both answers about one branch at one moment, because the
+    /// claim is that they agree rather than that either is right on its own.
+    /// Widen one side without the other and this is what breaks.
+    #[test]
+    fn a_former_ids_branch_is_named_while_it_holds_work_and_taken_once_it_does_not() {
+        let (_env, dir) = scratch("orphan-vs-prune");
+        repo(&dir);
+        abandoned(&dir, "old-3", false);
+        std::fs::write(Store::open().ids_path(), r#"{"old-3":"wsp-9"}"#).unwrap();
+        let renamed = |b: &str| match b == "old-3" {
+            true => Whose::Former("wsp-9".into()),
+            false => Whose::Stranger,
+        };
+
+        // Holding: named by one, refused by the other.
+        assert_eq!(orphan(&dir, "master", "wsp-9").map(|o| o.commits), Some(1));
+        assert!(
+            sweep(&dir, &|_| false, &|_| false, &renamed, &|_| None, false).pruned.is_empty(),
+            "the branch `orphan` had just named as work was taken"
+        );
+
+        // Landed: nothing to carry forward, so nothing to say and nothing to
+        // keep. The name is the only thing the removal costs.
+        run(&dir, &["merge", "--ff-only", "--quiet", "old-3"]);
+        assert!(orphan(&dir, "master", "wsp-9").is_none(), "a landed branch was offered as work");
+        let out = sweep(&dir, &|_| false, &|_| false, &renamed, &|_| None, false);
+        assert_eq!(out.pruned, vec!["old-3"], "a dead former id was left standing");
+        assert!(dir.join("old-3.txt").exists(), "the work is not on the trunk");
     }
 
     /// What the store makes of a branch name, which is where the three readings
