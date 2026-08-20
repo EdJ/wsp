@@ -4,11 +4,12 @@
 //! `status`, `draft | running | held | done` — because that is a *decision*
 //! somebody takes: to start it, to stop starting things, to be finished with
 //! it. **Where the run is up to is derived and never written**: the position is
-//! the first group not finished, computed from the tasks and from git every
-//! time it is asked for. The evidence is the `batch` handbook, whose written
-//! table of where the night had got to disagreed with what was actually
-//! happening inside the hour while the membership stayed true. A status you can
-//! compute cannot go stale, and this module is the computation.
+//! the first group whose barrier nobody has passed, and what is holding that
+//! group is computed from the tasks and from git every time it is asked for.
+//! The evidence is the `batch` handbook, whose written table of where the night
+//! had got to disagreed with what was actually happening inside the hour while
+//! the membership stayed true. A status you can compute cannot go stale, and
+//! this module is the computation.
 //!
 //! It also holds the one act in this design that *destroys* anything —
 //! [`sweep`], which removes the working trees of the members a passed group
@@ -302,7 +303,13 @@ pub struct Behind {
 /// the number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
-    /// The first group not finished, or `None` when every group is.
+    /// The first group whose barrier has not been passed, or `None` when every
+    /// one of them has.
+    ///
+    /// **Not the first group whose members are finished.** Those are two
+    /// different events and the distance between them is where a reading goes;
+    /// see [`position`], and [`at_barrier`](Position::at_barrier) for the state
+    /// that used to be drawn as a group already behind the run.
     pub at: Option<usize>,
     /// How many groups there are.
     pub of: usize,
@@ -315,9 +322,19 @@ pub struct Position {
     ///
     /// Carried back for a reason rather than for tidiness: the sweep a passed
     /// group licenses stands on exactly the fact that opened the barrier —
-    /// the branch is on the trunk **and** a worklist says this group is behind
-    /// it — so one walk has to answer both, or the destructive half is standing
+    /// the branch is on the trunk **and** somebody wrote a verdict on the group
+    /// — so one walk has to answer both, or the destructive half is standing
     /// on a second computation that can disagree with the first.
+    ///
+    /// **The second half of that sentence used to be "and its members read as
+    /// finished", which is not a barrier being passed and is not anybody's
+    /// decision.** Driven on 2026-08-20: a two-group run whose first group had
+    /// landed and whose barrier nobody had read, and `wsp checkout --sweep`
+    /// took both of its trees and both of its branches with no `go` ever run —
+    /// the licence for it manufactured by the walk itself. Nothing committed
+    /// was lost, because every refusal below it held, and the trees a person
+    /// was standing at that barrier to read were gone anyway. Groups below the
+    /// floor are the whole of this list now.
     ///
     /// Every passed group and not only the one immediately behind, because the
     /// licence is word for word the same for all of them: a run where `--keep`
@@ -373,8 +390,20 @@ pub struct Position {
 }
 
 impl Position {
-    /// Every group finished. Not the same as the worklist being `done`, which
-    /// is somebody saying there is nothing left to want from it.
+    /// Every barrier passed. Not the same as the worklist being `done`, which
+    /// is somebody saying there is nothing left to want from it — and not the
+    /// same as every group's *work* being over, which is [`at_barrier`] on the
+    /// last group there is.
+    ///
+    /// That last distinction is the one that cost something. This used to
+    /// answer true the moment the final group's members finished, so a list
+    /// whose last barrier nobody had ever read reported itself complete — and
+    /// a list that says *every one of 4 finished* is a list nobody goes back
+    /// to, which makes the final group's verdict the one most likely to be
+    /// skipped and the one a person is most likely to read later as the
+    /// summary of the whole run.
+    ///
+    /// [`at_barrier`]: Position::at_barrier
     pub fn finished(&self) -> bool {
         self.at.is_none()
     }
@@ -384,46 +413,114 @@ impl Position {
     pub fn holding(&self) -> Vec<&Standing> {
         self.members.iter().filter(|s| !s.finished()).collect()
     }
+
+    /// The group at the position has nothing left holding it, so what the run
+    /// is waiting for is the barrier and not the work.
+    ///
+    /// **The third state, and the one no surface could draw.** `at` says which
+    /// group, `holding` says what is still outstanding in it, and between them
+    /// there was no way to tell a group whose work was done and whose verdict
+    /// nobody had written from a group that had been passed — so every surface
+    /// drew it as passed. It is not a fourth thing to compute: the members are
+    /// already read and carried, and this reads them.
+    ///
+    /// **It answers under the reading it was asked with**, which matters here
+    /// more than anywhere else in the module. Under [`Reading::Settled`] it
+    /// says the store has nothing outstanding, which arrives before the commit
+    /// is on the trunk; only [`Reading::Landed`] may be spoken of as a barrier
+    /// about to open, and a caller on the free reading owes its sentence that
+    /// caveat.
+    ///
+    /// A group with no members at all is at its barrier from the moment the
+    /// run reaches it, which is the honest answer: there is nothing in it to
+    /// wait for and somebody still has to say so.
+    pub fn at_barrier(&self) -> bool {
+        self.at.is_some() && self.holding().is_empty()
+    }
 }
 
-/// Where the run is up to: the first group not finished, under `reading`.
+/// Where the run is up to: the first group whose barrier has not been passed,
+/// under `reading`.
 ///
-/// Walks from the front and **stops at the first group that is not finished**,
-/// which is what makes the expensive reading affordable at a barrier: the
-/// groups ahead of the position are not asked about at all, and a git process
-/// is spent only on the members of the group actually being waited on and the
-/// ones behind it that have already passed.
+/// # A barrier is crossed by `go`, and the members finishing is not that event
+///
+/// This walked past a group the moment its members read as finished, and that
+/// is `worklist-049`. Two different facts were being used as one: *the work
+/// landed*, which git and the store answer, and *a barrier was crossed*, which
+/// only a person does and which the [`crate::model::Group::verdict`] is the
+/// record of. The whole design exists to put a reading between them — so a
+/// group whose work is done and whose verdict nobody has written is not behind
+/// the run. It is where the run is standing, and [`Position::at_barrier`] is
+/// what says so.
+///
+/// Driven on 2026-08-20 against a two-group list. `wsp worklist show` reported
+/// `at group 2 of 2` and drew `✓` on the group `wsp worklist next` was at that
+/// same minute asking for a sentence about. With the second group landed as
+/// well it said *every one of 2 finished*, and the `go` that followed wrote a
+/// verdict on the last group only: the first barrier's stop condition was
+/// never put to anybody and that group carries no verdict to this day. The
+/// barrier was not merely mis-drawn, it was skipped.
+///
+/// # So the position is the floor, and that is the whole of it
+///
+/// `floor` is the group after the last one carrying a verdict. Because it is
+/// the *last* such group, nothing above it has one, and "the first group not
+/// finished, of those still in front of somebody" and "the first group whose
+/// barrier is shut" stop being two questions. Collapsing them is the fix.
+///
+/// It is still derived and still never written. What it is derived from is the
+/// record of which barriers a person crossed rather than a status somebody has
+/// to remember to set, which is the same argument `status` makes one field up.
+/// Where the *work* has got to is the members carried back on the answer, read
+/// every time and written down nowhere — the `batch` handbook's failure is
+/// closed where it was always closed.
+///
+/// # What it costs
+///
+/// Groups ahead of the position are not asked about at all, so the expensive
+/// reading is one git process per member of the group being waited on and of
+/// the ones behind it. That is what it always was and it is now strictly less:
+/// the walk stops at the floor instead of running on through every group whose
+/// members happened to be finished.
 ///
 /// A worklist with no groups is finished, which is the honest answer: there is
 /// nothing left in it to start.
 ///
-/// # The one written thing it reads, and why that is not a contradiction
+/// # Below the floor
 ///
-/// It never stops **below the floor**: the last group carrying a
-/// [`crate::model::Group::verdict`], which is a barrier somebody passed. That
-/// is a written fact on a record whose whole design is that its position is
-/// derived — and it belongs here for the reason `status` does. Passing a
-/// barrier is a *decision*, and a decision does not un-happen because a task's
-/// status is missing. What is derived is where the work has got to; what is
-/// written is which barriers a person has crossed, and the position is the
-/// first group not finished **of those still in front of somebody**.
+/// [`Position::slipped`] is unchanged and is still needed. A group *below* the
+/// floor whose members do not read as finished is a barrier somebody crossed
+/// over work that is not there — the run does not go back for it, and it is
+/// carried out to be printed rather than swallowed.
 ///
-/// Without it the run goes backwards, and the mechanism is the barrier's own
-/// cleanup — see [`Position::slipped`], which is where the members that caused
-/// it are carried out to be printed.
+/// # The one list where the two questions do not diverge
 ///
-/// It costs nothing in the ordinary case: no verdicts is a floor of zero and
-/// the walk is exactly what it was.
+/// **A list nobody has started has no barrier behind any of its groups.** The
+/// only barrier a draft has is the one in front of group 1, which is the list's
+/// own `## Overview` — see `Gate::Start`. So there is nothing there for the
+/// walk to stop at, and the honest answer for a plan is the one somebody
+/// reading it wants: the first group not finished, which is where the run will
+/// begin. `wsp worklist go` stamps everything before that as having been
+/// finished before the list existed, and from the moment it does, this is the
+/// barrier walk for the rest of the run.
 pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
     let groups = w.groups();
+    let draft = w.status() == crate::model::WorklistStatus::Draft;
     let floor = groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1);
     let mut repos = Repos::new(store);
     let mut passed: Vec<Behind> = Vec::new();
     let mut slipped: Vec<Standing> = Vec::new();
     for (i, g) in groups.iter().enumerate() {
         let members = group(store, &mut repos, g, reading);
-        let done = members.iter().all(Standing::finished);
-        if !done && i + 1 > floor {
+        // The first group nobody has written a verdict on — or, on a plan with
+        // no barriers in it yet, the first one that is not finished. Whether
+        // the group being stopped at is finished is a different answer, and it
+        // is on the record this returns rather than in this condition.
+        let stop = match draft {
+            true => !members.iter().all(Standing::finished),
+            false => i + 1 > floor,
+        };
+        if stop {
             return Position { at: Some(i + 1), of: groups.len(), members, passed, slipped, reading };
         }
         // Below the floor and not finished: walked past, and named. A group
@@ -496,7 +593,15 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
     out
 }
 
-/// Take away the trees of the members this worklist has passed.
+/// Take away the trees of the members behind this barrier, and of the group
+/// whose barrier is being crossed.
+///
+/// **The group being crossed is the one the position is standing at**, not the
+/// one before it: `at` is the first group nobody has written a verdict on, so
+/// the group whose trees this barrier releases is on [`Position::members`] and
+/// not yet on [`Position::passed`]. `worklist-049` moved that line, and reading
+/// the sweep off `passed` alone would now leave every crossed group's trees
+/// standing where the last thing anybody wanted was more of them.
 ///
 /// **This is the one destructive thing in the whole worklist design, and the
 /// only part of this module that is not a question.** A sentence belongs in the
@@ -582,17 +687,24 @@ pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
     }
     let mut repos = Repos::new(store);
     let mut members = Vec::new();
-    for b in &p.passed {
-        // `b.member.id` is already the id the task answers to now — `member`
-        // resolved it — but the read goes through `Store::task_now` anyway so
-        // that nothing here depends on that having been done upstream.
-        let Some(project) = store.task_now(&repos.renamed, &b.member.id).and_then(|t| t.project)
-        else {
+    // Every group behind the position, **and the group at it**. `at` is the
+    // first group nobody has written a verdict on, so the group whose barrier
+    // this call is crossing is the one the position is standing at rather than
+    // the one before it — and it is on `members`, not on `passed`. Taken only
+    // when nothing is holding it: a group still being worked is not a group
+    // whose barrier anybody is crossing, and this is the end of the design
+    // that removes directories.
+    let crossing = p.at_barrier().then(|| p.members.iter()).into_iter().flatten();
+    for m in p.passed.iter().map(|b| &b.member).chain(crossing) {
+        // `m.id` is already the id the task answers to now — `member` resolved
+        // it — but the read goes through `Store::task_now` anyway so that
+        // nothing here depends on that having been done upstream.
+        let Some(project) = store.task_now(&repos.renamed, &m.id).and_then(|t| t.project) else {
             continue;
         };
         let Some(trunk) = repos.of(&project) else { continue };
         members.push(cmd_checkout::Passed {
-            task: b.member.id.clone(),
+            task: m.id.clone(),
             trunk: trunk.dir,
             trunk_branch: trunk.branch,
         });
@@ -601,10 +713,11 @@ pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
     let occupied = cmd_checkout::Occupied::now(store);
     let swept = cmd_checkout::sweep_passed(&members, &closed, &|t, d| occupied.of(t, d), dry);
 
-    // The group this barrier is the far side of. `at` is the first group not
-    // finished, so the one just crossed is the one before it — and when nothing
-    // is left, it is the last group there is.
-    let crossed = p.at.map(|a| a - 1).unwrap_or(p.of);
+    // The group this barrier is the far side of, which is the one the position
+    // is standing at — and when there is no position left, the last group
+    // there is. Its own members are on `p.members`, so the filter below never
+    // finds them on `passed` and never calls them earlier work.
+    let crossed = p.at.unwrap_or(p.of);
     let earlier = swept
         .removed
         .iter()
@@ -631,9 +744,23 @@ pub struct Sweep {
 ///
 /// The same licence [`sweep`] acts on, in the shape `wsp checkout --sweep` and
 /// `wsp doctor` want it: they walk directories and ask about names, where the
-/// barrier walks members. Former ids are in it because a tree made before its
-/// task was renumbered is still named after the id it had then, and a directory
-/// walk only ever sees that name.
+/// barrier walks members.
+///
+/// **Passed means a verdict was written on the group**, and this is the caller
+/// where that matters most, because it is the one that hands a licence to a
+/// command run by somebody who is not at the barrier at all. It used to mean
+/// *the members read as finished*, and a `wsp checkout --sweep` typed in the
+/// repository then took the trees and the branches of a group whose stop
+/// condition nobody had answered, with no `go` ever run. Reproduced
+/// 2026-08-20; see [`Position::passed`].
+///
+/// It deliberately does **not** include the group at the position, however
+/// finished its work reads. That group's trees go when its barrier is crossed
+/// and [`sweep`] takes them, which is the moment somebody is looking.
+///
+/// Former ids are in it because a tree made before its task was renumbered is
+/// still named after the id it had then, and a directory walk only ever sees
+/// that name.
 ///
 /// **Free when nothing is running**, which is nearly always: the store is read,
 /// no worklist comes back `running`, and not one git process is started. That
@@ -1020,10 +1147,24 @@ mod tests {
         git_run(repo, &["merge", "--ff-only", "--quiet", id]);
     }
 
+    /// A list that is **running**, because that is what the barrier walk is a
+    /// walk over. A draft has no barrier behind any of its groups and takes the
+    /// other arm of [`position`] entirely, so the tests that are about a plan
+    /// rather than a run say `Draft` out loud.
     fn list(groups: &str) -> Worklist {
         let mut w = Worklist::new("batch", "Overnight batch");
         w.body = format!("## Groups\n{groups}");
+        w.set_status(crate::model::WorklistStatus::Running);
         w
+    }
+
+    /// A barrier somebody passed, written the way `wsp worklist go` writes it.
+    /// The one written fact the position reads, so a test that wants the run to
+    /// have got past a group has to say that a person took it past.
+    fn passed(w: &mut Worklist, n: usize, said: &str) {
+        let mut groups = w.groups();
+        groups[n - 1].verdict = format!("2026-08-20T09:00:00Z {said}");
+        w.set_groups(&groups);
     }
 
     /// The one piece of feedback the composition rule ever gets, proved against
@@ -1221,25 +1362,39 @@ mod tests {
         );
     }
 
-    /// The whole of what "derived" means, asserted as arithmetic: the position
-    /// moves because the *tasks* moved, and nothing wrote it down. This is the
-    /// `batch` handbook's failure made impossible rather than warned about —
-    /// there is no second copy to disagree with the first.
+    /// The whole of what "derived" means, asserted as arithmetic — and the line
+    /// between the two things that used to be one number.
+    ///
+    /// **Where the run is** moves when somebody passes a barrier. **What is
+    /// holding the group in front of it** moves because the tasks moved. Both
+    /// are computed every time and neither is written down, which is the
+    /// `batch` handbook's failure made impossible rather than warned about.
+    /// Running them together is `worklist-049`: the run walked on past a
+    /// barrier nobody had read the moment its members went quiet.
     #[test]
-    fn the_position_is_the_first_group_not_finished_and_moves_on_its_own() {
+    fn the_position_is_the_first_barrier_nobody_has_passed() {
         let (_env, store, _repo) = scratch("derived");
         for id in ["wsp-1", "wsp-2", "wsp-3"] {
             task(&store, id, "todo");
         }
-        let w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
 
         let p = position(&store, &w, Reading::Settled);
         assert_eq!(p.at, Some(1), "nothing is finished, so it is at the front");
         assert_eq!(p.of, 2);
         assert_eq!(p.members.len(), 1, "and it carries back the group being waited on");
+        assert!(!p.at_barrier(), "what it is waiting on is the work");
 
         task(&store, "wsp-1", "review");
-        assert_eq!(position(&store, &w, Reading::Settled).at, Some(2), "the group behind it settled");
+        let p = position(&store, &w, Reading::Settled);
+        assert_eq!(p.at, Some(1), "the members finishing is not a barrier being crossed");
+        assert!(p.at_barrier(), "and what it waits on now is the barrier, not the work");
+        assert!(p.passed.is_empty(), "nothing is behind a barrier nobody has passed");
+
+        passed(&mut w, 1, "the two of them agreed");
+        let p = position(&store, &w, Reading::Settled);
+        assert_eq!(p.at, Some(2), "somebody passed it, and that is what moves a run");
+        assert!(!p.at_barrier());
 
         task(&store, "wsp-2", "done");
         let p = position(&store, &w, Reading::Settled);
@@ -1248,8 +1403,52 @@ mod tests {
 
         task(&store, "wsp-3", "review");
         let p = position(&store, &w, Reading::Settled);
-        assert!(p.finished(), "every group is finished");
+        assert!(p.at_barrier(), "the work is over");
+        assert!(
+            !p.finished(),
+            "and a list whose last barrier nobody has read is not a list that has finished"
+        );
+
+        passed(&mut w, 2, "the record reads right");
+        let p = position(&store, &w, Reading::Settled);
+        assert!(p.finished(), "every barrier passed, and that is the whole of it");
         assert_eq!(p.at, None);
+    }
+
+    /// The other arm, and the one the fix nearly took away: **a plan has no
+    /// barriers behind its groups**, so a draft's position is the first group
+    /// not finished — which is where the run will begin.
+    ///
+    /// A list is routinely composed over work that is already done: design-only
+    /// members reach `review` before anything is spawned, and the `batch` was
+    /// written around 26 tasks in flight. Reading such a plan as standing at
+    /// group 1 would tell somebody the wrong place, and `wsp worklist next`
+    /// would name a group of finished members as what may start. It is `go`
+    /// that turns those groups into barriers somebody passed, and from then on
+    /// the walk is the barrier walk.
+    #[test]
+    fn a_plan_has_no_barriers_so_its_position_is_where_the_run_would_begin() {
+        let (_env, store, _repo) = scratch("plan");
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            task(&store, id, "todo");
+        }
+        task(&store, "wsp-1", "review");
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
+        w.set_status(crate::model::WorklistStatus::Draft);
+
+        let p = position(&store, &w, Reading::Settled);
+        assert_eq!(p.at, Some(2), "group 1 was finished before the list was written");
+        assert_eq!(
+            p.members.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["wsp-2", "wsp-3"],
+            "and the members carried back are the ones that would start"
+        );
+
+        // Started, with group 1 marked the way `go` marks it. From here the two
+        // are the same walk, because there is now a verdict to walk over.
+        w.set_status(crate::model::WorklistStatus::Running);
+        passed(&mut w, 1, "already finished when the list started");
+        assert_eq!(position(&store, &w, Reading::Settled).at, Some(2), "and it did not move");
     }
 
     /// The disagreement the design asks for, in one assertion: the same group,
@@ -1257,6 +1456,11 @@ mod tests {
     /// and `landed` says the commit is still on a branch — which is exactly the
     /// "land it" read as "finish it" that cost the `batch` its most expensive
     /// hour, surfaced while somebody can still go and look.
+    ///
+    /// The two readings answer the same `at`, because a barrier nobody passed
+    /// is a barrier nobody passed however the work reads. Where they part is
+    /// [`Position::at_barrier`], which is the whole of what each reading is
+    /// entitled to say.
     #[test]
     fn a_member_at_review_is_settled_and_the_barrier_still_will_not_open() {
         let (_env, store, repo) = scratch("disagree");
@@ -1265,17 +1469,22 @@ mod tests {
         committed(&repo, "wsp-1");
         let w = list("- 1  wsp-1\n- 2  wsp-2\n");
 
-        assert_eq!(position(&store, &w, Reading::Settled).at, Some(2), "the free reading has moved on");
+        let free = position(&store, &w, Reading::Settled);
+        assert_eq!(free.at, Some(1), "no verdict, so neither reading has gone anywhere");
+        assert!(free.at_barrier(), "and the free reading has nothing left holding group 1");
 
         let p = position(&store, &w, Reading::Landed);
-        assert_eq!(p.at, Some(1), "and the barrier has not");
+        assert_eq!(p.at, Some(1), "nor has the expensive one");
+        assert!(!p.at_barrier(), "which says the work is not done, where the free one said it was");
         let held = p.holding();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].settlement, Settlement::Review, "both answers are on the one member");
         assert_eq!(held[0].note(), "1 commit not on master", "and the note says where the work is");
 
         land(&repo, "wsp-1");
-        assert_eq!(position(&store, &w, Reading::Landed).at, Some(2), "landing it opens the barrier");
+        let p = position(&store, &w, Reading::Landed);
+        assert!(p.at_barrier(), "landing it leaves the barrier and nothing else");
+        assert_eq!(p.at, Some(1), "which is still a barrier, and still nobody has passed it");
     }
 
     /// The state `ahead()` alone does not have. A group nobody has spawned for
@@ -1313,7 +1522,7 @@ mod tests {
 
         task(&store, "wsp-1", "review");
         let p = position(&store, &w, Reading::Landed);
-        assert!(p.finished(), "a swept tree on a settled task is finished, not started");
+        assert!(p.at_barrier(), "a swept tree on a settled task is finished, not started");
     }
 
     /// The same state at the other end, and the one that was actually costing
@@ -1339,7 +1548,7 @@ mod tests {
         // makes and this one must not.
         task(&store, "wsp-1", "review");
         assert!(
-            position(&store, &w, Reading::Landed).finished(),
+            position(&store, &w, Reading::Landed).at_barrier(),
             "design-only work is finished when the store says so, branch or no branch"
         );
     }
@@ -1410,7 +1619,7 @@ mod tests {
         let w = list("- 1  wsp-1  wsp-gone\n- 2  wsp-also-gone\n");
 
         let p = position(&store, &w, Reading::Landed);
-        assert!(p.finished(), "a deleted task does not hold the barrier");
+        assert!(p.at_barrier(), "a deleted task does not hold the barrier");
         assert_eq!(dangling(&store, &w), ["wsp-gone", "wsp-also-gone"], "and both are reported, ahead of the position");
         assert_eq!(
             member(&store, &mut Repos::new(&store), "wsp-gone", Reading::Landed).settlement,
@@ -1453,7 +1662,7 @@ mod tests {
             "the trunk branch is read from the repository, not assumed"
         );
         land(&other, "wsp-1");
-        assert!(position(&store, &w, Reading::Landed).finished());
+        assert!(position(&store, &w, Reading::Landed).at_barrier());
     }
 
     /// A task renumbered mid-run keeps its work on a branch of the name it had
@@ -1473,7 +1682,10 @@ mod tests {
         assert_eq!(p.members[0].note(), "1 commit not on master");
 
         land(&repo, "old-3");
-        assert!(position(&store, &w, Reading::Landed).finished(), "and landing that branch finishes it");
+        assert!(
+            position(&store, &w, Reading::Landed).at_barrier(),
+            "and landing that branch finishes it"
+        );
     }
 
     /// The store's half of the same fact, and it fails in the dangerous
@@ -1521,7 +1733,7 @@ mod tests {
         land(&repo, "wsp-9");
         task(&store, "wsp-9", "review");
         assert!(
-            position(&store, &w, Reading::Landed).finished(),
+            position(&store, &w, Reading::Landed).at_barrier(),
             "and it opens on the landing, through the renumbering"
         );
     }
@@ -1545,7 +1757,7 @@ mod tests {
         let mut t = store.task("wsp-1").unwrap();
         t.status_raw = "review".into();
         store.save_task(&t).unwrap();
-        assert!(position(&store, &w, Reading::Landed).finished());
+        assert!(position(&store, &w, Reading::Landed).at_barrier());
     }
 
     /// The free reading is free: the panel redraws four times a second and a
@@ -1560,7 +1772,7 @@ mod tests {
         let w = list("- 1  wsp-1\n");
 
         let p = position(&store, &w, Reading::Settled);
-        assert!(p.finished());
+        assert!(p.at_barrier());
         assert_eq!(
             member(&store, &mut Repos::new(&store), "wsp-1", Reading::Settled).landing,
             None,
@@ -1568,38 +1780,56 @@ mod tests {
         );
     }
 
-    /// The sweep a passed group licenses, end to end, and the two halves of the
-    /// predicate pulled apart. The group behind the barrier is swept; the group
-    /// the barrier is waiting on is not touched, however landed a member of it
-    /// happens to be — being behind the position is half the evidence and there
-    /// is no such thing as three quarters of it.
+    /// The sweep a barrier licenses, end to end, and the two halves of the
+    /// predicate pulled apart. The group whose barrier is being crossed goes,
+    /// and everything behind it goes; the group **ahead** of that barrier is
+    /// not touched, however landed a member of it happens to be.
+    ///
+    /// The group being crossed is the one the position is standing **at**, not
+    /// the one before it — `worklist-049`. That is the half of the fix that had
+    /// to be made in the same change as the position itself: read the sweep off
+    /// `passed` alone, as it was, and a barrier would now leave every tree it
+    /// crosses standing.
     #[test]
-    fn passing_a_barrier_sweeps_the_group_behind_it_and_not_the_one_it_waits_on() {
+    fn passing_a_barrier_sweeps_the_group_it_crosses_and_not_the_one_ahead() {
         let (_env, store, repo) = scratch("sweep");
         for id in ["wsp-1", "wsp-2", "wsp-3"] {
             task(&store, id, "review");
         }
         // Group 1 is done with and on the trunk. Group 2 has one member landed
-        // and one still holding commits, so the barrier stays shut.
+        // and one still holding commits, so its own barrier stays shut.
         committed(&repo, "wsp-1");
         land(&repo, "wsp-1");
         committed(&repo, "wsp-2");
         land(&repo, "wsp-2");
         committed(&repo, "wsp-3");
-        let w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
 
         let p = position(&store, &w, Reading::Landed);
-        assert_eq!(p.at, Some(2), "the barrier is where it should be");
-        assert_eq!(p.passed.iter().map(|b| b.member.id.as_str()).collect::<Vec<_>>(), ["wsp-1"]);
-        assert_eq!(p.passed[0].group, 1, "and it remembers which group it was in");
+        assert_eq!(p.at, Some(1), "the run has not gone past a barrier nobody has read");
+        assert!(p.at_barrier(), "and the work of the group it is standing at is over");
+        assert!(p.passed.is_empty(), "nothing is behind it yet");
 
         let out = sweep(&store, &p, false).expect("the landed reading licenses it");
-        assert_eq!(out.swept.removed, ["wsp-1"]);
+        assert_eq!(out.swept.removed, ["wsp-1"], "the group whose barrier is being crossed");
         assert!(out.earlier.is_empty(), "the group just crossed is not an earlier one");
         assert!(!repo.join(cmd_checkout::WORKTREES).join("wsp-1").exists(), "the passed tree is still here");
         assert!(
             repo.join(cmd_checkout::WORKTREES).join("wsp-2").join(".git").exists(),
-            "a member of the group being waited on was swept"
+            "a member of the group ahead of the barrier was swept"
+        );
+
+        // And with the verdict written, group 1 is behind the run rather than
+        // under it, which is the state `passed` is for.
+        passed(&mut w, 1, "clean");
+        let p = position(&store, &w, Reading::Landed);
+        assert_eq!(p.at, Some(2), "the verdict is what moved it");
+        assert_eq!(p.passed.iter().map(|b| b.member.id.as_str()).collect::<Vec<_>>(), ["wsp-1"]);
+        assert_eq!(p.passed[0].group, 1, "and it remembers which group it was in");
+        assert!(!p.at_barrier(), "wsp-3 has not landed, so this barrier is not one to cross");
+        assert!(
+            sweep(&store, &p, false).expect("still licensed").swept.removed.is_empty(),
+            "a group still being worked is not swept because the run is standing at it"
         );
     }
 
@@ -1617,7 +1847,7 @@ mod tests {
         for id in ["wsp-1", "wsp-2", "wsp-3"] {
             task(&store, id, "review");
         }
-        let w = list("- 1  wsp-1\n- 2  wsp-2\n- 3  wsp-3\n");
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2\n- 3  wsp-3\n");
         let worktrees = repo.join(cmd_checkout::WORKTREES);
         // All three trees up front, because a member with no branch at all is a
         // member nothing has run for — worklist-002's own distinction — and the
@@ -1626,11 +1856,14 @@ mod tests {
             committed(&repo, id);
         }
 
-        // Barrier 1. `--keep` is the caller not calling us at all, so nothing
-        // happens — which is exactly what the flag promises, at this barrier.
+        // Barrier 1, passed with `--keep`, which is the caller writing the
+        // verdict and not calling us at all — so nothing happens, which is
+        // exactly what the flag promises, at this barrier.
         land(&repo, "wsp-1");
         let p = position(&store, &w, Reading::Landed);
-        assert_eq!(p.at, Some(2), "group 1 has landed and group 2 has not");
+        assert_eq!(p.at, Some(1), "group 1 has landed and nobody has read its barrier");
+        assert!(p.at_barrier());
+        passed(&mut w, 1, "kept, to go and look at it");
         assert!(worktrees.join("wsp-1").join(".git").exists(), "nobody swept anything");
 
         // Barrier 2, passed without it. Group 1's tree goes too, because by now
@@ -1643,11 +1876,12 @@ mod tests {
         git_run(&worktrees.join("wsp-2"), &["rebase", "--quiet", "master"]);
         land(&repo, "wsp-2");
         let p = position(&store, &w, Reading::Landed);
-        assert_eq!(p.at, Some(3), "the barrier moved on");
+        assert_eq!(p.at, Some(2), "the verdict moved it on, and this is the barrier behind group 2");
+        assert!(p.at_barrier());
         let out = sweep(&store, &p, false).expect("the landed reading licenses it");
         assert_eq!(out.swept.removed, ["wsp-1", "wsp-2"], "the deferred tree did not go with this one");
         assert_eq!(out.earlier, ["wsp-1"], "and the caller cannot say which one it kept last time");
-        assert!(worktrees.join("wsp-3").join(".git").exists(), "the group being waited on was swept");
+        assert!(worktrees.join("wsp-3").join(".git").exists(), "the group ahead of the barrier was swept");
     }
 
     /// The one refusal that is about the *reading* rather than the tree, and it
@@ -1664,7 +1898,11 @@ mod tests {
         let w = list("- 1  wsp-1\n- 2  wsp-2\n");
 
         let p = position(&store, &w, Reading::Settled);
-        assert_eq!(p.at, Some(2), "the free reading has moved past a member that has not landed");
+        assert_eq!(p.at, Some(1), "nobody has passed a barrier, on either reading");
+        assert!(
+            p.at_barrier(),
+            "and on the free reading the group looks done, which is what makes this the dangerous one"
+        );
         assert!(sweep(&store, &p, false).is_err(), "a tree was removed on a status");
         assert!(repo.join(cmd_checkout::WORKTREES).join("wsp-1").join(".git").exists());
     }
@@ -1682,10 +1920,19 @@ mod tests {
         task(&store, "wsp-2", "todo");
 
         let mut w = list("- 1  wsp-1\n- 2  wsp-2\n");
+        w.set_status(crate::model::WorklistStatus::Draft);
         store.save_worklist(&w).unwrap();
         assert!(passed_by_running(&store).is_empty(), "a draft plan licensed a removal");
 
         w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        assert!(
+            passed_by_running(&store).is_empty(),
+            "group 1 has landed and nobody has read its barrier — that is not a licence, \
+             and `wsp checkout --sweep` took both of its trees on it (worklist-049)"
+        );
+
+        passed(&mut w, 1, "clean");
         store.save_worklist(&w).unwrap();
         assert_eq!(passed_by_running(&store).into_iter().collect::<Vec<_>>(), ["wsp-1"]);
 
@@ -1728,6 +1975,7 @@ mod tests {
         let mut w = list("- 1  wsp-1\n- 2  wsp-2  wsp-3\n");
 
         // Drafted and not started: a plan, and no claim on anything in it.
+        w.set_status(crate::model::WorklistStatus::Draft);
         store.save_worklist(&w).unwrap();
         assert_eq!(Running::read(&store).of("wsp-1"), None, "a draft list is not a run");
 
@@ -1776,9 +2024,16 @@ mod tests {
 
         let at = running_position(&store, "batch").expect("it is running");
         assert_eq!((at.at, at.of), (Some(1), 2));
+        assert!(!at.at_barrier());
 
         task(&store, "wsp-1", "review");
-        assert_eq!(running_position(&store, "batch").unwrap().at, Some(2), "and it moves on its own");
+        let at = running_position(&store, "batch").unwrap();
+        assert_eq!(at.at, Some(1), "the work moving does not take the run past a barrier");
+        assert!(at.at_barrier(), "and what changed is what the group is waiting for");
+
+        passed(&mut w, 1, "clean");
+        store.save_worklist(&w).unwrap();
+        assert_eq!(running_position(&store, "batch").unwrap().at, Some(2), "the verdict moves it");
 
         w.set_status(crate::model::WorklistStatus::Draft);
         store.save_worklist(&w).unwrap();

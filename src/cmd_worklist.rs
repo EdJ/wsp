@@ -225,7 +225,14 @@ impl Window {
                     .map(|s| format!("{} {}", s.id, s.settlement.word()))
                     .collect();
                 if holding.is_empty() {
-                    eprintln!("     group {at} of {} is where it is up to", self.of);
+                    // Nothing holding it and still the position: its work is
+                    // done and its barrier has not been passed, which is a
+                    // better answer than "where it is up to" for somebody who
+                    // has just been refused an edit to the group behind it.
+                    eprintln!(
+                        "     group {at} of {} is settled and its barrier has not been passed",
+                        self.of
+                    );
                 } else {
                     // Truncated rather than wrapped: a group of eleven is a
                     // group whose count is the useful part, and the first few
@@ -985,6 +992,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                     "members": g.members,
                 })).collect::<Vec<_>>(),
                 "at": pos.at,
+                // The third state, for the reader that cannot see the `at`
+                // line. `waiting_on` being empty is the same fact only if you
+                // already know `at` stops at an unpassed barrier, which is the
+                // knowledge every reader of this object was missing.
+                "barrier": pos.at_barrier(),
                 "waiting_on": pos.holding().iter().map(|s| json!({
                     "id": s.id,
                     "status": s.settlement.word(),
@@ -1006,15 +1018,28 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     println!();
     println!("{}  {}", p.dim(&util::pad("status", 8)), w.status().as_str());
     // Where it is up to, and — on a list nobody has started — the fact that
-    // this is where it *would* start. The position is derived off the members
-    // whatever the status says, and a draft whose first group is already at
-    // review would otherwise read as a run that has got somewhere.
+    // this is where it *would* start. A plan has no barriers behind its groups
+    // and its position says where the run would begin, which is a different
+    // sentence from where a run has got to; the suffix is what keeps the two
+    // apart on one line.
+    //
+    // The middle arm is the third state, and it is why this row used to lie.
+    // A group with nothing holding it and no verdict was drawn as a group the
+    // run had gone past, so `show` said `at group 3 of 3` while `next` was
+    // asking for a sentence about group 2. It says **settled** and not
+    // *finished* on purpose: this is the free reading, which is a task's
+    // status and arrives before the commit is on the trunk, and only the
+    // barrier's own reading may promise that it will open.
     let draft = w.status() == WorklistStatus::Draft;
     println!(
         "{}  {}",
         p.dim(&util::pad("at", 8)),
         match pos.at {
             Some(n) if draft => format!("group {n} of {} · nothing started", pos.of),
+            Some(n) if pos.at_barrier() => format!(
+                "group {n} of {} · every member settled — its barrier has not been passed",
+                pos.of
+            ),
             Some(n) => format!("group {n} of {}", pos.of),
             None if pos.of == 0 => "no groups yet".to_string(),
             None => format!("every one of {} finished", pos.of),
@@ -1350,11 +1375,17 @@ fn state(store: &Store, w: &Worklist, p: &Position) -> State {
         }
     }
 
-    // The barrier this run has reached: the one behind the group at the
-    // position, or — where everything is finished — the one behind the last
-    // group there is. That last one is not a formality: `worklist-008`'s stop
-    // prose is the gate on phase two, and a run that fell straight through to
-    // "nothing left" would pass the one barrier the whole exercise exists for.
+    // The barrier this run has reached: the one behind the group the position
+    // is standing at, shut exactly when nothing is holding that group any more.
+    //
+    // It reads no verdict of its own and it no longer arithmetics its way back
+    // a group. `Position::at` is the first group nobody has written a verdict
+    // on, so the barrier in question is always the one behind `at` — including
+    // when `at` is the last group there is, which is the case the old form
+    // reached through `unwrap_or(p.of)` and which is not a formality:
+    // `worklist-008`'s stop prose is the gate on phase two, and a run that fell
+    // straight through to "nothing left" would pass the one barrier the whole
+    // exercise exists for.
     //
     // **Every barrier is shut until `go`, and not only the ones carrying
     // prose.** The design says a group with no stop condition passes on landing
@@ -1367,15 +1398,12 @@ fn state(store: &Store, w: &Worklist, p: &Position) -> State {
     // run is a step that happened zero times in two nights and left 18
     // worktrees. A `next` that named the next group here would put that step
     // back on the honour system it has already failed.
-    let crossed = p.at.map(|at| at - 1).unwrap_or(p.of);
-    if !draft && crossed >= 1 {
-        if let Some(g) = groups.get(crossed - 1).filter(|g| g.verdict.trim().is_empty()) {
-            return State::Shut {
-                gate: Gate::After(crossed),
-                prose: g.stop.trim().to_string(),
-                flight: 0,
-            };
-        }
+    if let Some(at) = p.at.filter(|_| !draft && p.at_barrier()) {
+        return State::Shut {
+            gate: Gate::After(at),
+            prose: groups.get(at - 1).map(|g| g.stop.trim().to_string()).unwrap_or_default(),
+            flight: 0,
+        };
     }
 
     match p.at {
@@ -1672,6 +1700,10 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String]) -> serde
         "status": w.status().as_str(),
         "at": pos.at,
         "of": pos.of,
+        // `state` already says `barrier`, but it says it for `start` and `held`
+        // too, and a governor polling this wants to know that the *work* of the
+        // group at `at` is over without matching on the gate string.
+        "barrier": pos.at_barrier(),
         // What `report` prints and this object did not, which made the machine
         // half of the same verb the quieter one — and a governor polling
         // `--json` is the reader least likely to go and look.
@@ -1794,7 +1826,6 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     }
 
     let mut groups = w.groups();
-    let behind = pos.at.map(|at| at - 1).unwrap_or(pos.of);
     let resuming = matches!(shut, Some((Gate::Held, _)));
 
     // Which barrier was crossed, taken from the gate rather than from the
@@ -1802,14 +1833,24 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     // has already "passed" are work that was finished before it existed, and
     // taking their trees would be a blast radius nobody at this barrier asked
     // for. Resuming a held list crosses the barrier in front of it only if that
-    // barrier is still shut — a `hold` taken in the middle of a group has none.
+    // barrier is still shut — a `hold` taken in the middle of a group has none,
+    // and holding does not move the position, so the barrier a resume crosses
+    // is simply the one the position is standing at.
     let crossed = match (&shut, starting) {
         (_, true) => None,
         (Some((Gate::After(n), _)), _) => Some(*n),
-        (Some((Gate::Held, _)), _) => (behind >= 1
-            && groups.get(behind - 1).is_some_and(|g| g.verdict.trim().is_empty()))
-        .then_some(behind),
+        (Some((Gate::Held, _)), _) => pos.at.filter(|_| pos.at_barrier()),
         _ => None,
+    };
+
+    // How much of the list was already finished before anybody started it.
+    // A draft has no barriers behind its groups, so its position is the first
+    // group not finished and everything before it is work that was done before
+    // the list existed. Nothing is removed on this: `crossed` is `None` when
+    // starting, so no barrier is passed and no tree is swept.
+    let already = match starting {
+        true => pos.at.map(|at| at - 1).unwrap_or(pos.of),
+        false => 0,
     };
 
     // Read before anything is removed, though nothing now depends on that
@@ -1848,7 +1889,7 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         // and marking them says so rather than leaving a run that has to be
         // walked through barriers for work it never did.
         true => {
-            for g in groups.iter_mut().take(behind) {
+            for g in groups.iter_mut().take(already) {
                 if g.verdict.trim().is_empty() {
                     g.verdict = format!("{} already finished when the list started", util::now_iso());
                 }
@@ -2246,7 +2287,14 @@ pub fn done(store: &Store, args: &Args) -> i32 {
 
     w.set_status(WorklistStatus::Done);
     w.log(&match pos.at {
-        None => format!("done — every group finished{tail}"),
+        None => format!("done — every barrier passed{tail}"),
+        // Nothing open in the group and the run still standing at it: what was
+        // being closed over is the barrier itself, and saying so is the point
+        // of writing this line at the moment the decision is taken. The old
+        // form ended on a dash with nothing after it.
+        Some(at) if left.is_empty() => {
+            format!("done at group {at} of {} — its barrier was never passed{tail}", pos.of)
+        }
         Some(at) => format!("done at group {at} of {} — {}{tail}", pos.of, left.join(" ")),
     });
     let groups = w.groups();
@@ -2273,12 +2321,16 @@ pub fn done(store: &Store, args: &Args) -> i32 {
         println!(
             "{}",
             p.dim(&format!(
-                "closed at group {} of {} · {} still open in it",
+                "closed at group {} of {} · {}",
                 pos.at.unwrap_or(0),
                 pos.of,
                 match left.is_empty() {
-                    true => "nothing".to_string(),
-                    false => left.join(" "),
+                    // The work of that group was over and its barrier was not
+                    // crossed, which is the closing this line exists to record:
+                    // "nothing still open in it" said the opposite of what
+                    // happened.
+                    true => "its barrier was never passed".to_string(),
+                    false => format!("{} still open in it", left.join(" ")),
                 }
             ))
         );
@@ -2392,6 +2444,19 @@ mod tests {
         store.save_worklist(&w).unwrap();
     }
 
+    /// A barrier somebody passed, written the way `go` writes it.
+    ///
+    /// The position is the first group nobody has done this to, so a test that
+    /// wants a run to be standing *at* group 2 has to say that a person took it
+    /// past group 1. Members finishing does not do it and must not.
+    fn crossed(store: &Store, id: &str, n: usize) {
+        let mut w = store.worklist(id).expect("the list");
+        let mut groups = w.groups();
+        groups[n - 1].verdict = "2026-08-20T09:00:00Z passed".into();
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+    }
+
     /// The shape the composing path actually takes: a list, then one call per
     /// group, in the order the groups run. Each call is a group of its own,
     /// because that is what "one group, then the next" means when you are
@@ -2453,8 +2518,10 @@ mod tests {
         run(&store, &["add", "batch", "wl-002"]);
         run(&store, &["add", "batch", "wl-003"]);
         started(&store, "batch");
+        crossed(&store, "batch", 1);
 
-        // Group 1 has landed, group 2 is being waited on, group 3 is ahead.
+        // Group 1 has landed and its barrier was passed, group 2 is being
+        // waited on, group 3 is ahead.
         assert_eq!(run(&store, &["rm", "batch", "wl-001"]), 1, "behind the position: history");
         assert_eq!(run(&store, &["rm", "batch", "wl-002"]), 1, "at the position: the barrier");
         assert_eq!(
@@ -2476,6 +2543,49 @@ mod tests {
         );
     }
 
+    /// The window **at** a barrier, which is the moment the next group is
+    /// composed.
+    ///
+    /// A group whose barrier nobody has passed is where the run is standing,
+    /// and the group after it has not started: nothing is spawned for it,
+    /// because `next` will not name it until somebody writes a verdict. So it
+    /// is open — and that is the point rather than a leniency. The barrier is
+    /// exactly when the same-file report arrives and the next group gets
+    /// composed, and `go` re-checks the at-most-one-running rule at every
+    /// barrier precisely because a group ahead of the work is hand-editable
+    /// between two of them.
+    ///
+    /// It used to be shut, because the position had already walked past the
+    /// unread barrier onto that group and frozen it there.
+    #[test]
+    fn the_group_after_a_standing_barrier_is_open_because_nothing_has_started_in_it() {
+        let store = scratch("barrier-window");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        task(&store, "wl-003", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+
+        let w = store.worklist("batch").unwrap();
+        let win = window(&store, &w);
+        assert_eq!(win.at, Some(1), "group 1 is finished and nobody has passed its barrier");
+        assert_eq!(win.first_open(), 2, "so group 2 — which nothing has run for — is editable");
+        assert!(!win.allows(1), "and group 1, whose barrier is being read, is not");
+        assert_eq!(
+            flagged(&store, &["add", "batch", "wl-003"], &[("group", "2")]),
+            0,
+            "composing the next group is what a governor does standing at a barrier"
+        );
+
+        // Once the barrier is behind the run, group 2 is what the run is at and
+        // shuts on the ordinary rule.
+        crossed(&store, "batch", 1);
+        let w = store.worklist("batch").unwrap();
+        assert_eq!(window(&store, &w).first_open(), 3, "the verdict is what closes it");
+    }
+
     /// A refusal that only says no sends somebody to edit the file by hand,
     /// which is the failure the window exists to prevent, arrived at from the
     /// other end. So it names the group, what is holding it, and what is open.
@@ -2490,6 +2600,7 @@ mod tests {
         run(&store, &["add", "batch", "wl-002"]);
         run(&store, &["add", "batch", "wl-003"]);
         started(&store, "batch");
+        crossed(&store, "batch", 1);
 
         let w = store.worklist("batch").unwrap();
         let win = window(&store, &w);
