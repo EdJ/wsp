@@ -2307,7 +2307,7 @@ thing any of those six monitors reported was `worklist-004`: task status
 `doing` and says nothing, because nothing changed. A watch on the agent sees
 `blocked` and cannot tell it from a seat idling between the agents it is
 sequencing. Only the conjunction is a signal — and wsp already had it, as
-`cmd_govern::needs_a_person`. So the vocabulary is six named predicates and no
+`cmd_govern::needs_a_person`. So the vocabulary is seven named predicates and no
 row selectors:
 
 ```
@@ -2317,6 +2317,7 @@ blocked          stopped on a question
 flag             a hand up, addressed to this seat, with nothing owed back
 unanswered       …and one that is waiting for a sentence
 agent-gone       a binding whose pane is gone, or alive with the agent gone
+seat-stalled     a governor that has stopped answering, and its run with it
 ```
 
 `flag` and `unanswered` are one population — every raised message — split by
@@ -2343,9 +2344,53 @@ A stalled agent that has said why it stopped draws only the `unanswered` line.
 again: the answer going down the channel with no memory while the question stays
 open. A modal holding the keyboard is exempt, because that is a different repair.
 
+`seat-stalled` is the odd one and the last to arrive. Every other predicate is
+about **work**; this one is about the **reporter**, and it exists because
+`needs_a_person` is `stopped && doing && !seat` — a seat is exempt however
+stopped it is. That exemption is right (a governor is idle *between* the agents
+it sequences, which is most of the time) and it means the one agent whose
+failure ends a run raises nothing when it fails: its members land cleanly, the
+barrier never advances, and the run ceases with every signal healthy. So a seat
+gets a different predicate, not none:
+
+```
+the seat is running no turn, and nothing it answers for is running one either,
+and it answers for an unsettled member of a running worklist
+```
+
+The third clause is the load-bearing half. `worklist-037` proposed *something is
+addressed to it* — `standing > 0` — and driven against the live store that fires
+on **every healthy seat on this machine**: 42 levels stood on one, 10 on the
+other, and 51 of the 52 were `review`, which is where worklist work stops
+because `done` is Ed's. Those are levels a seat cannot take down, and they
+accumulate for the life of a project. `standing` counts what is *pointed at* a
+seat; what makes a stopped agent a person's problem is what it *owes*. A running
+worklist is a seat's `doing` — somebody committed to driving that queue and its
+members are written down — and a seat with no run under it is silent however
+long it sits.
+
+Two things follow that no other signal needed. Its **subject is a seat**, not a
+task, so it is addressed where it is built rather than from the map of task
+routing. And its **address escapes its own level**: `cmd_govern::seat_for` stops
+at the first seat it finds, which here is the one that failed, so the news walks
+`seat_above` — the same chain started one step past that scope, terminating at
+`everyone`. A worklist seat always terminates there, and that is the walk's
+shape rather than a gap: the list step is the *front* of `seat_for`'s chain, so
+what lies past a list is the project chain of one member, and a list cutting
+across projects has as many of those as it has members.
+
+It says, and it does not act. Nothing vacates a slot, ends a pane or advances a
+barrier on a computed level — `robustness-090` d1 — and a seat that looks
+stalled may be one you are about to talk to. It is also the only derived
+predicate louder than a `note`: nothing beneath it will arrive later to say the
+same thing, and nothing under it will resolve it.
+
 `wsp watch <project>` and `--about <id>` narrow the *subject*, which is a filter
-and not a subscription. There is a sixth word, `blind`, which you cannot
-subscribe to and cannot switch off: it says wsp has lost sight of the agents,
+and not a subscription. `seat-stalled` is read only by a subscriber with **no
+boundary** — the daemon's unattended pass — because a seated scope *is* "what is
+addressed to me", so no seat can honestly evaluate it about another one and the
+seat it is about is the last agent whose answer is worth having. There is an
+eighth word, `blind`, which you cannot subscribe to and cannot switch off: it says wsp has lost sight of the agents,
 and it is the difference between a quiet fleet and half a world.
 
 **It subscribes to the level and streams edges only for liveness.** A poll is

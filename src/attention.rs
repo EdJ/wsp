@@ -46,14 +46,30 @@
 //!   `wsp doctor` printed *no problems* while the pane that was supposed to be
 //!   sequencing the run sat there.
 //!
-//!   The cause is structural rather than a missing arm: **every [`Kind`] in
-//!   this vocabulary takes a task as its subject** — `Signal::subject` says so,
-//!   [`cmd_watch::in_scope`] tests a `Task`, and [`addressee`] answers
-//!   `everyone` for anything `store.task()` cannot find. A fact whose subject
-//!   is a *seat* has nowhere to sit. That is worklist-037's decision and the
-//!   predicate it specifies is `stopped && standing > 0 && seat`; nothing here
-//!   computes it yet, and this pass is where it would go, because the one agent
-//!   that cannot report a stalled seat is that seat.
+//!   The cause was structural rather than a missing arm: **every [`Kind`] in
+//!   this vocabulary took a task as its subject** — `Signal::subject` said so,
+//!   [`cmd_watch::in_scope`] tests a `Task`, and the address is walked from a
+//!   map keyed by task id. A fact whose subject was a *seat* had nowhere to
+//!   sit.
+//!
+//!   **[`cmd_watch::Kind::SeatStalled`] is that fact, and this pass is its only
+//!   reader** — worklist-041. The subject is the seat's scope and the address
+//!   is [`cmd_govern::seat_above`], the routing walk started one step past the
+//!   seat it is about, because that seat is what failed. It is derived in
+//!   [`cmd_watch::stalled_seats`] and not here, for the reason every other
+//!   predicate is: the census, the store sweep and the routing have to be one
+//!   reading, and a second herdr probe a tick later is how a pane comes to be
+//!   in one listing and not the other. What is this pass's alone is that only a
+//!   reader with **no boundary** produces it, and [`cmd_watch::Scope::machine`]
+//!   is unreachable from argv — so the one agent that cannot report a stalled
+//!   seat is never the one asked.
+//!
+//!   worklist-037 specified the predicate as `stopped && standing > 0 && seat`
+//!   and **that turned out to be false**: driven against the live store, it
+//!   fires on every healthy seat on this machine, because most of what stands
+//!   on a seat is `review` and a seat cannot take `review` down. The clause
+//!   that replaced it — a seat owes a *run*, not a count — is argued on
+//!   [`cmd_watch::stalled_seats`].
 //! - *Is an hour right unattended?* Not asked here. The pass reads
 //!   [`cmd_watch::Poll`], which measures how long a level has actually held
 //!   rather than guessing from a proxy.

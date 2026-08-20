@@ -329,7 +329,24 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             // Absent when nothing is standing, which is the common case and
             // costs the row nothing: `report_pane_tokens` is given `None` and
             // the sidebar has no column to keep.
-            ("needs", t.and_then(|t| waiting.get(&t.id)).map(|w| (*w).to_string())),
+            //
+            // **The seat is the fallback, and it is the one row this token
+            // could never reach.** A custodian holds no task, so `t` is `None`
+            // and every reading above it was blank — which is exactly the pane
+            // whose silence ends a run (`worklist-041`,
+            // `cmd_watch::Kind::SeatStalled`). That level's subject *is* the
+            // scope, so the row that is the seat draws the word about itself.
+            // Note that this is not the level being addressed to it: the
+            // address escalates past this seat by construction, because this
+            // seat is what failed. Drawing a fact on the row it is about and
+            // sending the news somewhere that can act on it are two different
+            // jobs, and the sidebar is doing the first.
+            (
+                "needs",
+                t.and_then(|t| waiting.get(&t.id))
+                    .or_else(|| seat.as_ref().and_then(|s| waiting.get(s)))
+                    .map(|w| (*w).to_string()),
+            ),
         ];
         let fingerprint = tokens
             .iter()

@@ -341,6 +341,38 @@ pub fn seat_for(
         .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
 }
 
+/// The same walk, started **one step past** a scope that cannot answer for
+/// itself.
+///
+/// [`seat_for`] stops at the first seat it finds, which is the right answer to
+/// *who answers for this work* and the wrong one to *who hears that this seat
+/// has stopped*: the seat it reaches is the one the news is about. So this is
+/// the chain with that scope's own step removed, terminating — like every other
+/// address in this tree — at [`crate::cmd_watch::EVERYONE`] when nothing above
+/// is filled. `worklist-041`.
+///
+/// **A worklist has nothing above it, and that is the walk's shape rather than
+/// a gap.** [`seat_for`]'s chain is `list, project, ancestors(project)`, so the
+/// list step is the *front*: what lies past it is the project chain of one
+/// member, and a list that cuts across projects — which is what a list is for —
+/// has as many of those as it has members. There is no single scope above a
+/// run, so a stalled worklist seat escalates to everybody, which is the honest
+/// answer and is also the loudest one available. A project scope walks
+/// [`Index::ancestors`], and `robustness` stalling reaches `wsp` exactly as a
+/// hand raised in `robustness` would while that seat is away.
+///
+/// `ancestors` answers empty for anything it has never heard of, so the
+/// worklist case needs no test of its own: one expression covers both.
+pub fn seat_above(governors: &BTreeMap<String, Value>, index: &Index, scope: &str) -> Option<Seat> {
+    if governors.is_empty() {
+        return None;
+    }
+    index
+        .ancestors(scope)
+        .into_iter()
+        .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
+}
+
 /// The scope this workspace is the custodian of — a project or a worklist — if
 /// it is the custodian of one.
 ///

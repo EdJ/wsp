@@ -273,6 +273,24 @@ pub(crate) enum Kind {
     /// the agent gone. Covers *an agent died* and *an agent never started*,
     /// which look identical from here and want the same first move.
     AgentGone,
+    /// **A seat that has stopped answering** — the one failure the fleet had no
+    /// way to state, because [`cmd_govern::needs_a_person`] exempts a seat by
+    /// construction and every other variant here takes a *task* as its subject.
+    ///
+    /// The subject is the seat's scope, and this is the only [`Signal`] in the
+    /// vocabulary that is about the reporter rather than about the work.
+    /// `worklist-041`; the predicate, and the live evidence that the one the row
+    /// specified was false, are on [`stalled_seats`].
+    ///
+    /// **Produced only by a reader with no boundary**, which is
+    /// [`Scope::machine`] and therefore [`crate::attention`]'s pass alone. That
+    /// is not a rule about who may subscribe — it is what the predicate means. A
+    /// seated scope *is* "what is addressed to me", so a seat asking this of
+    /// another seat would be asking about a population it cannot see, and a seat
+    /// asking it of itself is the one agent whose answer is worthless. The
+    /// daemon is the only thing in wsp that looks when nobody asked, and this is
+    /// the level that matters when nobody is.
+    SeatStalled,
     /// wsp cannot see the agents at all. Never subscribed to and never filtered
     /// out: it is liveness, not news, and it is the difference between a quiet
     /// fleet and a watcher reporting on half a world.
@@ -290,6 +308,7 @@ impl Kind {
             Kind::Flag => "flag",
             Kind::Unanswered => "unanswered",
             Kind::AgentGone => "agent-gone",
+            Kind::SeatStalled => "seat-stalled",
             Kind::Blind => "blind",
         }
     }
@@ -303,6 +322,7 @@ impl Kind {
             Kind::Flag,
             Kind::Unanswered,
             Kind::AgentGone,
+            Kind::SeatStalled,
         ]
     }
 
@@ -324,7 +344,15 @@ impl Kind {
     fn clears(&self) -> bool {
         matches!(
             self,
-            Kind::NeedsAPerson | Kind::Flag | Kind::Unanswered | Kind::AgentGone | Kind::Blind
+            Kind::NeedsAPerson
+                | Kind::Flag
+                | Kind::Unanswered
+                | Kind::AgentGone
+                // *The run is moving again* is the whole reason a reader was
+                // told it had stopped: the repair is to go and prod a seat, and
+                // one that started turning on its own must not be prodded.
+                | Kind::SeatStalled
+                | Kind::Blind
         )
     }
 
@@ -350,7 +378,7 @@ impl Kind {
     /// actually see it.
     fn needs_herdr(&self) -> bool {
         match self {
-            Kind::NeedsAPerson | Kind::AgentGone => true,
+            Kind::NeedsAPerson | Kind::AgentGone | Kind::SeatStalled => true,
             // The store answers these whether or not anything else does, which
             // is what makes saying `blind` worth anything at all.
             Kind::Review | Kind::Blocked | Kind::Flag | Kind::Unanswered => false,
@@ -373,8 +401,20 @@ impl Kind {
     /// literal `"note"` until the record landed, which is two vocabularies
     /// agreeing by hand — and the one thing the fleet has paid for repeatedly
     /// is a word spelled out in a second place drifting from the first.
+    ///
+    /// [`Kind::SeatStalled`] is the second exception and the first that is a
+    /// fact about the *predicate*. Every other level here says a piece of work
+    /// wants somebody; that one says **nothing in a run is moving and the thing
+    /// responsible for moving it is not turning**, so no member-level line
+    /// beneath it will arrive later to say the same thing and nothing under it
+    /// will resolve it. `note` is *act when convenient*, and this state does not
+    /// improve while nobody is convenient — it is what `robustness-083` cost
+    /// three agents in one day, unread, with every other signal healthy.
     fn loudness(&self) -> crate::message::Kind {
-        crate::message::Kind::Note
+        match self {
+            Kind::SeatStalled => crate::message::Kind::Direction,
+            _ => crate::message::Kind::Note,
+        }
     }
 }
 
@@ -387,8 +427,19 @@ impl Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Signal {
     pub(crate) kind: Kind,
-    /// A task id, mostly. A pane for a binding whose task is gone, and the
-    /// literal `herdr` for [`Kind::Blind`].
+    /// A task id, mostly. A pane for a binding whose task is gone, the literal
+    /// `herdr` for [`Kind::Blind`], and **a seat's scope** for
+    /// [`Kind::SeatStalled`] — a project id or a worklist slug, which share one
+    /// key space with each other and with nothing else here.
+    ///
+    /// *Mostly* is load-bearing and was nearly a defect. [`Poll::sample`]
+    /// addresses on the way out from a map keyed by task id, so a subject that
+    /// is not a task silently keeps the [`EVERYONE`] it was built with. That is
+    /// right for `herdr` and for a record wsp cannot place — nobody in
+    /// particular owns either — and it is exactly wrong for a stalled seat,
+    /// whose whole point is that it must reach somebody *other than itself*. So
+    /// [`stalled_seats`] addresses its levels where it builds them, after that
+    /// map has been applied rather than before.
     pub(crate) subject: String,
     /// The clause after the id: what to do, or why. Never the task's title —
     /// `wsp-095` Part 13 holds this to `wsp worklist next`'s bar, *ids not
@@ -1324,6 +1375,148 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
     Some(s.of(&m.id))
 }
 
+/// [`Poll::sample`]'s arm (e): **a seat that has stopped answering** — the one
+/// agent whose failure ends a run, and the one that cannot report it.
+///
+/// Pure, and separate from [`Poll::sample`] for [`asking`]'s reason: every input
+/// is a reading somebody else already took, so the predicate, its exemptions and
+/// the escalating address can all be driven by a test on a machine with no herdr
+/// socket — which is where `wsp verify` runs.
+///
+/// `worklist-041`. [`cmd_govern::needs_a_person`] is `stopped && doing &&
+/// !seat`, so a seat is exempt however stopped it is, and the exemption is
+/// correct: a governor is idle *between* the agents it is sequencing, which is
+/// most of the time, and reading that as a stall marked the busiest agent on the
+/// machine as stuck. A seat needs a different predicate, not none, and this is
+/// it:
+///
+///     the seat is running no turn
+///  && nothing it answers for is running one either
+///  && it answers for an unsettled member of a running worklist
+///
+/// # The third clause is the whole of it, and the row as filed had another one
+///
+/// The row specified `stopped && standing > 0 && seat` — *something is addressed
+/// to it*, standing in for the `doing` a custodian deliberately has not got.
+/// **Driven against the live store on 2026-08-20, that fires on every healthy
+/// seat on this machine.** Both were running no turn, and the daemon's own
+/// ledger held 42 levels addressed to one of them and 10 to the other; 51 of
+/// those 52 were `review`.
+///
+/// Which is the reason and not a coincidence. `review` is where worklist work
+/// stops — `done` is Ed's, on every task — so a `review` addressed to a seat is
+/// a level that seat **cannot take down**, and they accumulate for the life of a
+/// project. A seat sitting under forty-two of them is not stalled; it is doing
+/// exactly what a seat is for. `standing` counts what is *pointed at* a seat,
+/// and what makes a stopped agent a person's problem is what it *owes*. Those
+/// are one number for a worker, whose task is both, and they are nothing like
+/// one number for a seat.
+///
+/// So the obligation is named rather than inferred: **a running worklist is a
+/// seat's `doing`**. Somebody committed to driving that queue, its members are
+/// written down, and [`worklist::Settlement::settled`] already says which of
+/// them are still somebody's to finish. A seat with no run under it owes nothing
+/// and stays silent however long it sits — which is the exemption clause the row
+/// wanted `standing == 0` to be, in the one shape that survives this store.
+///
+/// # The second clause, which is `robustness-083` read backwards
+///
+/// Absence of movement is not evidence: a seat is *supposed* to be still. What
+/// is evidence is that the seat is still **and so is everything it answers
+/// for**, with a queue under it that is not finished. One turning agent anywhere
+/// in the scope exempts the seat — the broadest exemption available, taken
+/// deliberately, because a seat with work moving under it is being driven by
+/// something whether or not this predicate can see what.
+///
+/// # Read by the machine reader alone, which is a fact about the predicate
+///
+/// See [`Kind::SeatStalled`]. A seated scope *is* "what is addressed to me", so
+/// no seat can honestly evaluate this about another one, and the seat it is
+/// about is the last agent whose answer is worth having. [`Scope::machine`] is
+/// unreachable from argv, so this is [`crate::attention`]'s pass and nothing
+/// else — which is where the row asked for it, for the same reason.
+///
+/// # It says, it does not act
+///
+/// `robustness-090` d1. Nothing here vacates a slot, ends a pane or advances a
+/// barrier. A seat that looks stalled may be one Ed is about to talk to.
+fn stalled_seats(
+    tasks: &[Task],
+    rows: &[cmd_agent::WipRow],
+    to: &BTreeMap<String, String>,
+    lists: &worklist::Running,
+    governors: &BTreeMap<String, Value>,
+    index: &Index,
+) -> Vec<Signal> {
+    // Which seats have something moving under them, read off the same map the
+    // levels above were addressed from — so *my scope* means one thing in both.
+    let moving: BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| r.turning)
+        .filter_map(|r| to.get(&r.task_id).map(String::as_str))
+        .collect();
+    // What each seat still owes a run for. `Settlement::of` rather than a status
+    // test written out here: `review` being the end of the line is
+    // `worklist.rs`'s sentence, and this is its second reader.
+    let mut owed: BTreeMap<&str, (BTreeSet<&str>, Vec<&str>)> = BTreeMap::new();
+    for t in tasks.iter() {
+        let Some(list) = lists.list_of(&t.id) else { continue };
+        if worklist::Settlement::of(t).settled() {
+            continue;
+        }
+        // A member nobody answers for is nobody's stall. That a running list
+        // with no seat anywhere above it is invisible here is `worklist-037`'s
+        // question 3 and its documented no — absence of a decision to have a
+        // seat is not a vacancy — and this arm reports occupants, not posts.
+        let Some(seat) = to.get(&t.id).filter(|s| s.as_str() != EVERYONE) else { continue };
+        let e = owed.entry(seat.as_str()).or_default();
+        e.0.insert(list);
+        e.1.push(t.id.as_str());
+    }
+    // Per seat and not per row, because [`cmd_govern::governs`] falls back to the
+    // *room* for a record naming no pane — `wsp govern -w` writes one — and a
+    // workspace holds more than one agent. Asked row by row, a seat with a busy
+    // pane and an idle pane in the same room would report itself stalled out of
+    // the idle one.
+    let mut seats: BTreeMap<&str, Vec<&cmd_agent::WipRow>> = BTreeMap::new();
+    for r in rows.iter() {
+        if let Some(scope) = r.seat.as_deref() {
+            seats.entry(scope).or_default().push(r);
+        }
+    }
+    let mut out: Vec<Signal> = Vec::new();
+    for (scope, panes) in seats {
+        if panes.iter().any(|r| r.turning) || moving.contains(scope) {
+            continue;
+        }
+        let Some((in_lists, ids)) = owed.get(scope) else { continue };
+        let where_ = in_lists.iter().copied().collect::<Vec<_>>().join(", ");
+        // Ids and not titles, and a bounded number of them: this line is read on
+        // a phone at 3am by somebody who knows their own ids.
+        let held = match ids.len() {
+            0..=3 => ids.join(" "),
+            n => format!("{} +{}", ids[..3].join(" "), n - 3),
+        };
+        // **Never to the seat this is about.** [`cmd_govern::seat_for`] stops at
+        // the first seat it finds, which here is the one that failed;
+        // [`cmd_govern::seat_above`] is the same walk started one step past it,
+        // terminating at [`EVERYONE`].
+        let above = cmd_govern::seat_above(governors, index, scope)
+            .map(|s| s.scope)
+            .unwrap_or_else(|| EVERYONE.to_string());
+        let detail = format!(
+            "{} · no turn here and none under it — {where_} still waiting on {held} \
+             · wsp govern {scope} --tell -",
+            panes[0].pane
+        );
+        // Settling, because a seat between two turns is stopped for seconds and
+        // a barrier crossing is a seat turning. Five minutes of neither, with a
+        // queue open under it, is not a gap between turns.
+        out.push(Signal::new(Kind::SeatStalled, scope, &detail).settling().to(&above));
+    }
+    out
+}
+
 /// The polling implementation: one store sweep and three herdr calls per tick.
 pub(crate) struct Poll<'a> {
     store: &'a Store,
@@ -1550,11 +1743,6 @@ impl Source for Poll<'_> {
             ));
         }
 
-        out.retain(|s| {
-            s.kind == Kind::Blind
-                || (self.want.contains(&s.kind)
-                    && self.about.as_deref().is_none_or(|a| s.subject == a))
-        });
         // Addressed on the way out, in one place, so no branch above can build
         // a level that does not know who answers for it. A subject that is not
         // a task — `herdr`, for [`Kind::Blind`], and a message record the
@@ -1566,6 +1754,21 @@ impl Source for Poll<'_> {
                 s.to = seat.clone();
             }
         }
+
+        // (e) A seat that has stopped answering — [`stalled_seats`], which holds
+        // the predicate and the argument for it. **After** the addressing above
+        // and not before: its subject is a seat, its address is the walk started
+        // one step past that seat, and a map keyed by task id must not get the
+        // chance to say otherwise. See [`Signal::subject`].
+        if self.scope.all {
+            out.extend(stalled_seats(&wip.tasks, &rows, &to, &lists, &wip.governors, &wip.index));
+        }
+
+        out.retain(|s| {
+            s.kind == Kind::Blind
+                || (self.want.contains(&s.kind)
+                    && self.about.as_deref().is_none_or(|a| s.subject == a))
+        });
         self.routing = match self.scope.all {
             true => Routing::Machine,
             false => Routing::Scoped {
@@ -3358,5 +3561,311 @@ mod tests {
         l.prime(&[sig(Kind::Flag, "a-1").to("phase-four")], 0);
         let back = Ledger::of_json(&l.json());
         assert_eq!(back.told().next().map(|s| s.to.clone()).as_deref(), Some("phase-four"));
+    }
+
+    // ---- a seat that has stopped answering ---------------------------------
+    //
+    // `worklist-041`. Every input to [`stalled_seats`] is a reading somebody
+    // else took, so the whole predicate is driven here with no herdr socket in
+    // the room — which is the point of it being a function rather than an arm.
+
+    use crate::model::{Group, Worklist, WorklistStatus};
+
+    /// The fleet on a given night, as the five readings the predicate joins.
+    struct Night {
+        _env: util::Isolated,
+        store: Store,
+        governors: BTreeMap<String, Value>,
+        index: Index,
+        rows: Vec<cmd_agent::WipRow>,
+    }
+
+    impl Night {
+        fn new(tag: &str) -> Night {
+            let env = util::isolated(&format!("stalled-{tag}"));
+            let store = Store::at(env.home(), env.state());
+            store.ensure_dirs().unwrap();
+            Night {
+                _env: env,
+                store,
+                governors: BTreeMap::new(),
+                index: Index::new(Vec::new()),
+                rows: Vec::new(),
+            }
+        }
+
+        /// A project, and its parent where it has one — the chain
+        /// [`cmd_govern::seat_above`] walks.
+        fn projects(mut self, of: &[(&str, Option<&str>)]) -> Night {
+            self.index = Index::new(
+                of.iter()
+                    .map(|(id, parent)| {
+                        let mut p = crate::model::Project::new(id);
+                        p.parent = parent.map(str::to_string);
+                        p
+                    })
+                    .collect(),
+            );
+            self
+        }
+
+        fn task(self, id: &str, project: &str, status: Status) -> Night {
+            let mut t = Task::new("a task", id);
+            t.project = Some(project.into());
+            t.set_status(status);
+            self.store.save_task(&t).unwrap();
+            self
+        }
+
+        /// A running list over those members. `Running::read` only ever sees a
+        /// running one, which is the half of the obligation that is a decision
+        /// somebody took rather than a state wsp inferred.
+        fn running(self, slug: &str, members: &[&str]) -> Night {
+            let mut w = Worklist::new(slug, slug);
+            w.set_status(WorklistStatus::Running);
+            w.set_groups(&[Group {
+                members: members.iter().map(|m| m.to_string()).collect(),
+                ..Default::default()
+            }]);
+            self.store.save_worklist(&w).unwrap();
+            self
+        }
+
+        /// A custodian in a pane: `seat` is what `governs` answers for it.
+        fn seat(mut self, scope: &str, pane: &str, turning: bool) -> Night {
+            self.governors.insert(
+                scope.to_string(),
+                json!({ "workspace": pane.split(':').next().unwrap_or(pane), "pane": pane }),
+            );
+            self.rows.push(row_for(pane, "", Some(scope), turning));
+            self
+        }
+
+        /// A worker in a pane, on a task.
+        fn worker(mut self, pane: &str, task: &str, turning: bool) -> Night {
+            self.rows.push(row_for(pane, task, None, turning));
+            self
+        }
+
+        fn read(&self) -> Vec<Signal> {
+            let tasks = self.store.tasks();
+            let lists = worklist::Running::read(&self.store);
+            let to: BTreeMap<String, String> = tasks
+                .iter()
+                .map(|t| (t.id.clone(), addressed_to(&self.index, &self.governors, &lists, t)))
+                .collect();
+            stalled_seats(&tasks, &self.rows, &to, &lists, &self.governors, &self.index)
+        }
+    }
+
+    fn row_for(pane: &str, task: &str, seat: Option<&str>, turning: bool) -> cmd_agent::WipRow {
+        cmd_agent::WipRow {
+            project: String::new(),
+            task: String::new(),
+            task_id: task.into(),
+            pane: pane.into(),
+            workspace: pane.split(':').next().unwrap_or(pane).into(),
+            state: String::new(),
+            turning,
+            needs_you: false,
+            seat: seat.map(str::to_string),
+        }
+    }
+
+    /// **The failure the row was filed on**, and the one nothing in wsp could
+    /// state: `robustness-083`, which hit three agents in one day. The seat's
+    /// pane is alive and its turn is abandoned, its member landed cleanly and
+    /// went quiet, and the barrier never advances — with every other signal
+    /// healthy, because `needs_a_person` exempts a seat by construction.
+    #[test]
+    fn a_run_that_has_stopped_moving_raises_a_hand_about_the_seat_that_stopped_it() {
+        let night = Night::new("stopped")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Review)
+            .task("nightly-2", "nightly", Status::Todo)
+            .running("tonight", &["nightly-1", "nightly-2"])
+            .seat("nightly", "w1:p1", false);
+
+        let up = night.read();
+        assert_eq!(up.len(), 1, "one hand, about the seat: {up:?}");
+        assert_eq!(up[0].kind, Kind::SeatStalled);
+        assert_eq!(up[0].subject, "nightly", "the subject is a seat, not a task");
+        assert!(up[0].detail.contains("nightly-2"), "and names what is waiting: {}", up[0].detail);
+        assert!(up[0].detail.contains("tonight"), "and which run: {}", up[0].detail);
+        assert!(
+            !up[0].at_once,
+            "a seat between two turns is stopped for seconds — this must settle first"
+        );
+    }
+
+    /// **The half of the address that makes this more than an arm.** The fact
+    /// must never reach the seat it is about: that seat is what failed.
+    /// `seat_for` stops at the first seat it finds, which here is the dead one,
+    /// so the walk starts one step past it — and `robustness` stalling reaches
+    /// `wsp` exactly as a hand raised in `robustness` would while that seat is
+    /// away.
+    #[test]
+    fn a_stalled_seats_hand_goes_to_the_seat_above_it_and_never_to_itself() {
+        let night = Night::new("above")
+            .projects(&[("robustness", Some("wsp")), ("wsp", None)])
+            .task("r-1", "robustness", Status::Doing)
+            .running("tonight", &["r-1"])
+            .seat("robustness", "w1:p1", false)
+            .seat("wsp", "w2:p1", true);
+
+        let up = night.read();
+        assert_eq!(up.len(), 1, "the seat above is turning, so only one is stalled: {up:?}");
+        assert_eq!(up[0].subject, "robustness");
+        assert_eq!(up[0].to, "wsp", "addressed above its own level, never to itself");
+    }
+
+    /// And it terminates at *everyone*, which is not a fallback: `seat_for`'s
+    /// chain is `list, project, ancestors`, so the list step is the front of it
+    /// and what lies past a list is the project chain of one member. A list
+    /// cutting across projects — which is what a list is for — has as many of
+    /// those as it has members, so there is no single scope above a run.
+    #[test]
+    fn a_stalled_worklist_seat_escalates_to_everyone_because_a_list_has_nothing_above_it() {
+        let night = Night::new("everyone")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Doing)
+            .running("tonight", &["nightly-1"])
+            .seat("tonight", "w1:p1", false);
+
+        let up = night.read();
+        assert_eq!(up.len(), 1, "{up:?}");
+        assert_eq!(up[0].subject, "tonight");
+        assert_eq!(up[0].to, EVERYONE);
+    }
+
+    /// **The row as filed was `stopped && standing > 0 && seat`, and this is
+    /// why that is false.** Driven against the live store on 2026-08-20: both
+    /// seats on the machine were running no turn, with 42 levels addressed to
+    /// one and 10 to the other, and both were healthy. Fifty-one of the
+    /// fifty-two were `review` — the status worklist work actually reaches,
+    /// since `done` is Ed's — so they are levels the seat cannot take down and
+    /// they accumulate for the life of a project.
+    ///
+    /// A seat sitting under a pile of finished work is not stalled. It is doing
+    /// what a seat is for.
+    #[test]
+    fn a_seat_under_a_pile_of_finished_work_is_not_stalled_however_long_it_sits() {
+        let night = Night::new("review")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Review)
+            .task("nightly-2", "nightly", Status::Review)
+            .task("nightly-3", "nightly", Status::Done)
+            .running("tonight", &["nightly-1", "nightly-2", "nightly-3"])
+            .seat("nightly", "w1:p1", false);
+
+        assert!(night.read().is_empty(), "review is what a run reaches, not a debt the seat owes");
+    }
+
+    /// The exemption's own reason, kept rather than deleted. A governor is idle
+    /// *between* the agents it is sequencing, which is most of the time, and a
+    /// project seat with no run under it owes nothing at all — which is what
+    /// `standing == 0` was reaching for and could not express.
+    #[test]
+    fn a_seat_with_no_run_under_it_is_silent_however_long_it_sits() {
+        let night = Night::new("norun")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Todo)
+            .seat("nightly", "w1:p1", false);
+
+        assert!(night.read().is_empty(), "an open backlog is not a commitment to drive it");
+    }
+
+    /// Absence of movement is not evidence — the lesson that killed two
+    /// hand-rolled watchdogs in one night. What is evidence is the seat being
+    /// still *and everything it answers for* being still too, so one turning
+    /// agent anywhere in the scope exempts it, whatever else is true.
+    #[test]
+    fn a_seat_with_work_moving_under_it_is_being_driven_by_something() {
+        let night = Night::new("moving")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Doing)
+            .running("tonight", &["nightly-1"])
+            .seat("nightly", "w1:p1", false)
+            .worker("w2:p1", "nightly-1", true);
+
+        assert!(night.read().is_empty(), "a member is turning, so the run is moving");
+    }
+
+    /// And the seat turning is the first clause, said the obvious way round.
+    #[test]
+    fn a_seat_that_is_taking_its_turn_is_not_stalled() {
+        let night = Night::new("turning")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Todo)
+            .running("tonight", &["nightly-1"])
+            .seat("nightly", "w1:p1", true);
+
+        assert!(night.read().is_empty());
+    }
+
+    /// `worklist-035`'s finding, arriving from the other side. A record naming
+    /// no pane falls back to the *room*, and a workspace holds more than one
+    /// agent — so this is asked per seat and not per row. Asked per row, the
+    /// idle pane in a busy custodian's workspace would report its own seat
+    /// stalled while the seat sat beside it working.
+    #[test]
+    fn a_seat_is_judged_by_its_whole_room_and_not_by_one_idle_pane_in_it() {
+        let night = Night::new("room")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Todo)
+            .running("tonight", &["nightly-1"])
+            .seat("nightly", "w1:p1", false)
+            .seat("nightly", "w1:p2", true);
+
+        assert!(night.read().is_empty(), "one pane of the seat is turning");
+    }
+
+    /// It settles like a stall and clears like one, and both are the table's
+    /// answer rather than this arm's. A run that starts moving again must take
+    /// the hand down: the repair is to go and prod a seat, and one that has
+    /// started turning on its own must not be prodded.
+    #[test]
+    fn a_run_that_starts_moving_again_takes_the_hand_down() {
+        let s = Signal::new(Kind::SeatStalled, "nightly", "no turn here").settling();
+        let mut l = Ledger::default();
+
+        assert!(l.advance(&[s.clone()], &Routing::Machine, 0, 300).is_empty(), "it settles first");
+        let out = l.advance(&[s], &Routing::Machine, 300, 300);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].edge, Edge::Up);
+
+        let out = l.advance(&[], &Routing::Machine, 360, 300);
+        assert_eq!(out.len(), 1, "and going away is news");
+        assert_eq!(out[0].edge, Edge::Down);
+    }
+
+    /// Silence is not evidence, and the census is the half that goes missing.
+    /// A tick that could not reach herdr says nothing about whether a seat is
+    /// turning, so a level of this kind is **held** across it rather than read
+    /// as a run that resumed — one herdr restart would otherwise be a false
+    /// all-clear per stalled run, at whatever hour it was restarted.
+    #[test]
+    fn a_stalled_seat_is_held_across_a_tick_that_could_not_see_the_agents() {
+        assert!(Kind::SeatStalled.needs_herdr());
+
+        let s = Signal::new(Kind::SeatStalled, "nightly", "no turn here").settling();
+        let mut l = Ledger::default();
+        l.advance(&[s], &Routing::Machine, 0, 0);
+        assert_eq!(l.standing(), 1);
+
+        let blind = Signal::new(Kind::Blind, "herdr", "no herdr socket");
+        let out = l.advance(&[blind], &Routing::Machine, 60, 0);
+        assert_eq!(l.standing(), 2, "the stall is held, not cleared");
+        assert!(out.iter().all(|e| e.edge == Edge::Up), "nothing was reported as over: {out:?}");
+    }
+
+    /// A `note` is *act when convenient*. This one says nothing in a run is
+    /// moving and the thing responsible for moving it is not turning, so
+    /// nothing beneath it will arrive later to say the same thing and nothing
+    /// under it will resolve it.
+    #[test]
+    fn a_stalled_seat_is_the_one_derived_predicate_that_may_take_more_than_a_note() {
+        assert_eq!(Kind::SeatStalled.loudness(), crate::message::Kind::Direction);
+        assert_eq!(Kind::Review.loudness(), crate::message::Kind::Note);
     }
 }

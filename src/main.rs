@@ -1175,7 +1175,9 @@ fn help_text() -> String {
   wsp wip                           everything in flight, with agents
   wsp watch [<project>] [<signal>…]  the few facts a governor acts on, as they
                                     become true: needs-a-person, review,
-                                    blocked, flag, unanswered, agent-gone. No
+                                    blocked, flag, unanswered, agent-gone, and
+                                    seat-stalled — the one whose subject is a
+                                    governor rather than a piece of work. No
                                     arguments is this seat's whole scope. It
                                     says what it is watching, one line per
                                     change, a heartbeat while nothing happens,

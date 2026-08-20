@@ -158,6 +158,22 @@ pub enum Settlement {
 }
 
 impl Settlement {
+    /// What the store says about a task already in hand.
+    ///
+    /// [`member`] asks the same question by id, and this is the half of it that
+    /// is pure. A caller holding the whole task list — the watch's level read
+    /// sweeps it once a tick — must not go back to the store per member, and
+    /// must not spell *settled* out a second time: `review` is where worklist
+    /// work stops, and a second copy of that sentence is how the two come to
+    /// disagree.
+    pub fn of(t: &Task) -> Settlement {
+        match t.status() {
+            Status::Review => Settlement::Review,
+            Status::Done => Settlement::Closed,
+            other => Settlement::Open(other),
+        }
+    }
+
     pub fn settled(&self) -> bool {
         matches!(self, Settlement::Review | Settlement::Closed | Settlement::Gone)
     }
@@ -445,11 +461,7 @@ pub fn member(store: &Store, repos: &mut Repos, id: &str, reading: Reading) -> S
     let task = store.task_now(&repos.renamed, id);
     let settlement = match &task {
         None => Settlement::Gone,
-        Some(t) => match t.status() {
-            Status::Review => Settlement::Review,
-            Status::Done => Settlement::Closed,
-            other => Settlement::Open(other),
-        },
+        Some(t) => Settlement::of(t),
     };
     let landing = match (reading, &task) {
         (Reading::Settled, _) => None,
