@@ -2392,6 +2392,13 @@ shape rather than a gap: the list step is the *front* of `seat_for`'s chain, so
 what lies past a list is the project chain of one member, and a list cutting
 across projects has as many of those as it has members.
 
+The same fact fixed a second thing on `worklist-037`'s line. `wsp watch` in a
+seat at `0 standing` used to add *nothing is addressed to this seat — `wsp
+govern --clear` stands it down*, and a seat with a group nobody has started is
+honestly at zero: its members are `todo` with no agent on them, which no
+predicate here can see. That advice is now offered only when the seat owes no
+run.
+
 It says, and it does not act. Nothing vacates a slot, ends a pane or advances a
 barrier on a computed level — `robustness-090` d1 — and a seat that looks
 stalled may be one you are about to talk to. It is also the only derived

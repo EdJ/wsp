@@ -1464,6 +1464,21 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 ///
 /// `robustness-090` d1. Nothing here vacates a slot, ends a pane or advances a
 /// barrier. A seat that looks stalled may be one Ed is about to talk to.
+/// The run a task is an outstanding member of, if it is one of those.
+///
+/// **One sentence, two readers**, which is the discipline this file keeps: a
+/// seat's obligation is asked from the stall side by [`stalled_seats`] and from
+/// the stand-down side by [`Poll::owes_a_run`], and those are one predicate read
+/// from its two ends — `worklist-037` said so before either existed. Written out
+/// twice, they would be one install away from disagreeing about whether a
+/// governor may go home.
+///
+/// `Settlement::of` and not a status test spelled out here, for the same reason
+/// one level up: `review` being the end of the line is `worklist.rs`'s sentence.
+fn outstanding<'a>(t: &Task, lists: &'a worklist::Running) -> Option<&'a str> {
+    lists.list_of(&t.id).filter(|_| !worklist::Settlement::of(t).settled())
+}
+
 fn stalled_seats(
     tasks: &[Task],
     rows: &[cmd_agent::WipRow],
@@ -1493,10 +1508,7 @@ fn stalled_seats(
     let mut owed: BTreeMap<&str, (BTreeSet<&str>, Vec<&str>)> = BTreeMap::new();
     let mut held: BTreeSet<&str> = BTreeSet::new();
     for t in tasks.iter() {
-        let Some(list) = lists.list_of(&t.id) else { continue };
-        if worklist::Settlement::of(t).settled() {
-            continue;
-        }
+        let Some(list) = outstanding(t, lists) else { continue };
         // A member nobody answers for is nobody's stall. That a running list
         // with no seat anywhere above it is invisible here is `worklist-037`'s
         // question 3 and its documented no — absence of a decision to have a
@@ -1575,6 +1587,33 @@ pub(crate) struct Poll<'a> {
 impl<'a> Poll<'a> {
     pub(crate) fn new(store: &'a Store, scope: Scope, want: BTreeSet<Kind>, about: Option<String>) -> Poll<'a> {
         Poll { store, scope, want, about, routing: Routing::Unknown }
+    }
+
+    /// Whether this scope still answers for a run that is not finished.
+    ///
+    /// **The other side of [`stalled_seats`]'s third clause, and what closes
+    /// the ambiguity `worklist-037` had to leave open.** That row could offer a
+    /// seat the stand-down at `0 standing` and no more, because nothing in wsp
+    /// could tell *nothing left to answer for* from *nobody is answering*. Half
+    /// of that is now answerable: a seat at zero with an unstarted group under
+    /// it is not finished, it has not begun — and the members of a group nobody
+    /// has spawned raise no level at all, so the count is zero and the sentence
+    /// underneath it said *stand down*.
+    ///
+    /// Asked of the store and not of the level read, for exactly that reason: a
+    /// `todo` member with no agent on it is invisible to every predicate in
+    /// this file and is the whole of what makes the zero misleading.
+    fn owes_a_run(&self) -> bool {
+        if !self.scope.seated {
+            return false;
+        }
+        let index = Index::new(self.store.projects());
+        let governors = self.store.governors();
+        let lists = worklist::Running::read(self.store);
+        self.store.tasks().iter().any(|t| {
+            outstanding(t, &lists).is_some()
+                && addressed_to(&index, &governors, &lists, t) == self.scope.name
+        })
     }
 }
 
@@ -2102,10 +2141,23 @@ fn aside(at: i64, said: &str, p: &Paint) -> String {
 /// So anything that wired this number to an act would stand down a seat for
 /// having died. The exemption is the joint: `standing == 0` is what makes an
 /// idle seat *correct*, and `standing > 0` held past [`SETTLE`] is what would
-/// make it a stall. One predicate, read from its two sides — see
-/// [`crate::attention`], where the missing half belongs.
-fn nothing_addressed(scope: &Scope, standing: usize) -> Option<&'static str> {
-    (scope.seated && standing == 0)
+/// make it a stall.
+///
+/// # `owes`, which is worklist-041 arriving on this line
+///
+/// The other half turned out not to be a predicate over `standing` at all — see
+/// [`stalled_seats`], where the row's `stopped && standing > 0 && seat` is
+/// driven and found false. What it produced instead is a seat's *obligation*,
+/// and that fixes a second thing this line got wrong on its own terms.
+///
+/// **A seat at zero with a group nobody has started is not finished; it has not
+/// begun.** The members of an unspawned group are `todo` with no agent on them,
+/// which is invisible to every predicate in this file, so the count is honestly
+/// zero — and the sentence under it said *stand down*, to a governor with a run
+/// in front of it. [`Poll::owes_a_run`] is the fact that was missing, and the
+/// advice is now offered only where it is safe to take.
+fn nothing_addressed(scope: &Scope, standing: usize, owes: bool) -> Option<&'static str> {
+    (scope.seated && standing == 0 && !owes)
         .then_some("nothing is addressed to this seat — wsp govern --clear stands it down")
 }
 
@@ -2374,7 +2426,7 @@ fn level_read(poll: &mut Poll, spec: &Spec) -> i32 {
     }
     let p = Paint::new();
     if now.is_empty() {
-        let said = match nothing_addressed(&spec.scope, 0) {
+        let said = match nothing_addressed(&spec.scope, 0, poll.owes_a_run()) {
             Some(note) => format!("nothing is up on {} — read just now · {note}", spec.scope.name),
             None => format!("nothing is up on {} — read just now", spec.scope.name),
         };
@@ -2498,7 +2550,7 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
                     // [`nothing_addressed`]. On every other line this is the
                     // empty string, so a watch on a project is byte-for-byte
                     // what it was.
-                    nothing_addressed(&spec.scope, ledger.standing())
+                    nothing_addressed(&spec.scope, ledger.standing(), poll.owes_a_run())
                         .map(|note| format!(" · {note}"))
                         .unwrap_or_default()
                 ),
@@ -2547,7 +2599,7 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
                         spec.scope.name,
                         util::duration_human(at - started),
                         ledger.standing(),
-                        nothing_addressed(&spec.scope, ledger.standing())
+                        nothing_addressed(&spec.scope, ledger.standing(), poll.owes_a_run())
                             .map(|note| format!(" · {note}"))
                             .unwrap_or_default()
                     ),
@@ -2737,7 +2789,8 @@ mod tests {
     /// than running it.
     #[test]
     fn a_seat_with_nothing_standing_is_told_what_that_means() {
-        let note = nothing_addressed(&scope("phase-two", true), 0).expect("a seat at zero is told");
+        let note =
+            nothing_addressed(&scope("phase-two", true), 0, false).expect("a seat at zero is told");
         assert!(note.contains("nothing is addressed to this seat"), "{note}");
         assert!(note.contains("wsp govern --clear"), "it names the stand-down: {note}");
     }
@@ -2747,7 +2800,7 @@ mod tests {
     /// what the level says.
     #[test]
     fn a_seat_with_something_standing_is_not_offered_the_stand_down() {
-        assert_eq!(nothing_addressed(&scope("phase-two", true), 1), None);
+        assert_eq!(nothing_addressed(&scope("phase-two", true), 1, false), None);
     }
 
     /// A watch on a project this pane does not sit in gets nothing added, and
@@ -2758,8 +2811,47 @@ mod tests {
     /// night is held to.
     #[test]
     fn a_watch_on_a_scope_it_does_not_sit_in_is_told_nothing_about_standing_down() {
-        assert_eq!(nothing_addressed(&scope("robustness", false), 0), None);
-        assert_eq!(nothing_addressed(&Scope::machine(), 0), None, "and neither is the daemon's pass");
+        assert_eq!(nothing_addressed(&scope("robustness", false), 0, false), None);
+        assert_eq!(
+            nothing_addressed(&Scope::machine(), 0, false),
+            None,
+            "and neither is the daemon's pass"
+        );
+    }
+
+    /// `worklist-041` on `worklist-037`'s line. A seat at zero with a group
+    /// nobody has started is not finished, it has not begun — the members are
+    /// `todo` with no agent on them, which no predicate in this file can see, so
+    /// the count is honestly zero and the advice under it was *go home*.
+    #[test]
+    fn a_seat_with_a_run_it_has_not_started_is_not_offered_the_stand_down() {
+        assert_eq!(nothing_addressed(&scope("phase-two", true), 0, true), None);
+    }
+
+    /// And the fact itself, read off the store rather than off the level set,
+    /// because the members that make the zero misleading are exactly the ones
+    /// no level is derived from.
+    #[test]
+    fn a_seat_owes_a_run_until_every_member_of_it_is_settled() {
+        let night = Night::new("owes")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Todo)
+            .running("tonight", &["nightly-1"])
+            .seat("nightly", "w1:p1", false);
+        let seated = Scope {
+            name: "nightly".into(),
+            seated: true,
+            workspace: "w1".into(),
+            pane: "w1:p1".into(),
+            all: false,
+        };
+        let poll = |store| Poll::new(store, seated.clone(), BTreeSet::new(), None);
+        assert!(poll(&night.store).owes_a_run(), "a member nobody has spawned is still owed");
+
+        let mut t = night.store.task("nightly-1").unwrap();
+        t.set_status(Status::Review);
+        night.store.save_task(&t).unwrap();
+        assert!(!poll(&night.store).owes_a_run(), "and review is where a run's work stops");
     }
 
     // ---- the questions somebody wrote down ---------------------------------
@@ -3679,11 +3771,14 @@ mod tests {
         }
 
         /// A custodian in a pane: `seat` is what `governs` answers for it.
+        ///
+        /// Written to the store as well as held here, because the two readers
+        /// under test take it from different places — [`stalled_seats`] is
+        /// handed the map and [`Poll::owes_a_run`] reads its own.
         fn seat(mut self, scope: &str, pane: &str, turning: bool) -> Night {
-            self.governors.insert(
-                scope.to_string(),
-                json!({ "workspace": pane.split(':').next().unwrap_or(pane), "pane": pane }),
-            );
+            let rec = json!({ "workspace": pane.split(':').next().unwrap_or(pane), "pane": pane });
+            self.governors.insert(scope.to_string(), rec.clone());
+            self.store.set_governor(scope, rec);
             self.rows.push(row_for(pane, "", Some(scope), turning));
             self
         }
