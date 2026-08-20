@@ -3638,8 +3638,18 @@ log` and no reason to look.
 wsp install                    # what `wsp verify --release` built — HEAD plus your patch
 wsp install -n                 # what it would do, and who is holding the lock
 wsp install <path> --why "…"   # a binary you name, and a reason worth reading tomorrow
+wsp install --why -            # …or that reason from a stream, where a shell never sees it
+wsp install --why --from FILE  # …or out of a file. The binary stays the positional
 wsp install --to <path>        # somewhere that is not the live one
 ```
+
+The `--why` is prose and takes prose's spellings, because it is read by
+somebody who was not here and is written in the vocabulary of the work — which
+means backticks, and a shell runs every backtick inside double quotes. `--from`
+is where the *sentence* comes from and never where the build comes from; a bare
+`--from` is refused with both readings rather than obeyed, because this verb
+already owns `--to` and the counterpart reading would record a path as the
+reason and install something else without saying so.
 
 Three things, and it is worth being clear which is the point:
 

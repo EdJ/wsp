@@ -1114,6 +1114,14 @@ fn help_text() -> String {
                                     install at a time — the one file nothing can
                                     isolate; defaults to your verify tree's
                                     release build, -n to look without touching it
+  wsp install --why - | --why --from FILE
+                                    …with the reason read from a stream or a
+                                    file, where a shell never sees it — it is
+                                    the sentence the next agent reads off the
+                                    lock, and prose typed between double quotes
+                                    has every backtick in it run. The binary
+                                    stays the positional: `--from` is where the
+                                    sentence comes from, not the build
   wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own herdr session,
                                     store and state — and the exports to use it;
                                     inside it `wsp` is the binary you ran

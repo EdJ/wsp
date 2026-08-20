@@ -1001,7 +1001,11 @@ fn payload_source(payload: &[String]) -> Option<String> {
 /// them, and it would push every other entry out of the brief that every
 /// session on the task pays for. Folding keeps every word and costs the
 /// paragraph breaks; the alternative costs the reader.
-fn fold(text: &str) -> String {
+///
+/// `cmd_install` folds its `--why` through here for the neighbouring reason: a
+/// lock line is one sentence long — "held by w1:p6 for 3s — installing fdefcab"
+/// — and a paragraph pasted into one is a line nobody can read either side of.
+pub(crate) fn fold(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

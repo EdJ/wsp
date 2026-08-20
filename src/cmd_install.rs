@@ -698,8 +698,8 @@ struct Source {
 /// own build of your own tree: accountable, just not pinned to HEAD. In the
 /// trunk it is whatever the tree happened to hold at build time, including half
 /// of somebody else's edit, and that is the one worth a warning.
-fn source(store: &Store, args: &Args) -> Result<Source, String> {
-    if let Some(named) = args.rest.first() {
+fn source(store: &Store, named: Option<&str>) -> Result<Source, String> {
+    if let Some(named) = named {
         let p = util::real(named);
         for c in [p.clone(), p.join("target/release/wsp"), p.join("wsp")] {
             if c.is_file() {
@@ -757,6 +757,169 @@ fn built_here(store: &Store, repo: &Path) -> Result<Source, String> {
     })
 }
 
+/// The sentence the next agent reads off the lock, and what saying it cost the
+/// positional argument.
+#[derive(Debug, PartialEq)]
+struct Why {
+    /// `None` when nobody gave one — the caller's cue to fall back to the
+    /// commit.
+    text: Option<String>,
+    /// The bare `-` on the command line was this flag's stream and not the
+    /// binary to install. See [`why_given`].
+    took_dash: bool,
+}
+
+/// Where the `--why` comes from: typed, a stream, or the file `--from` names.
+///
+/// **`worklist-045`.** This field had one spelling and it was the one the house
+/// rule forbids. Every brief in the fleet says *give a wsp verb its prose
+/// through a file*, because a shell evaluates backticks inside double quotes
+/// and a `--tell` carrying a code span once ran it — and `block`, `park`,
+/// `decide`, `note`, `flag`, `tell` and the prose editors all take `-` or
+/// `--from`. `--why` took neither. So an agent doing the documented thing got
+/// `wsp: no binary at -`, and the failure is worse than an absent form in two
+/// ways: a lone dash is one character and no flag was taking it as a value, so
+/// the parser handed it to the optional `<path>` and the error named an
+/// argument nobody had mentioned; and it is the same message a genuinely
+/// missing binary produces, so it is indistinguishable from a real fault about
+/// a real file. What a caller does next is fall back to a quoted string, which
+/// is the spelling the rule exists to prevent — the gap did not merely lack a
+/// safe form, it returned you to the unsafe one.
+///
+/// It is not a minor field. `worklist-042` counted seven outputs of the install
+/// identity, and this is the one written for a person: the sentence the next
+/// agent reads off the lock, and the reason quoted back by every later `-n`.
+/// The custodian's own `--why` at the phase-four barrier ran to three lines and
+/// carried a self-correction — a paragraph, typed between double quotes,
+/// because the safe spelling was not there.
+///
+/// # Why `--from` is read only after `--why`
+///
+/// `--to` is where the binary goes, so a bare `--from` reads as where it comes
+/// from, and that is the one misreading this addition invites — it would record
+/// a path as the reason and install something else entirely, quietly, which is
+/// the fault this whole command exists to refuse. `--why --from FILE` cannot be
+/// read that way, so that is the shape, and `--from` on its own is answered
+/// with both readings rather than obeyed. Everywhere else in the CLI a bare
+/// `--from` is complete, and it is not here for the one reason that this verb
+/// already owns the other half of the pair.
+fn why_given(args: &Args) -> Result<Why, i32> {
+    let (reason, took_dash) = reason_given(args)?;
+    let (raw, named) = match reason {
+        Reason::Absent => return Ok(Why { text: None, took_dash }),
+        Reason::Typed(s) => {
+            // The check every other intake makes, on the one path a shell can
+            // reach: a `--why` typed between double quotes comes back carrying
+            // a command's output instead of the command's name. See
+            // [`crate::util::terminal_output`] — and the second line is the
+            // repair, because the caller cannot see the substitution in what
+            // arrived.
+            if let Some(what) = util::terminal_output(&s) {
+                eprintln!("wsp: {what}");
+                eprintln!("     a backtick inside double quotes runs a command. `--why -` reads the sentence from a stream, where a shell never sees it");
+                return Err(2);
+            }
+            return Ok(Why { text: Some(crate::cmd_task::fold(&s)), took_dash });
+        }
+        Reason::Stream => (piped()?, "stdin".to_string()),
+        Reason::File(path) => {
+            let named = util::contract(&util::expand(&path));
+            match crate::cmd_task::read_source(&path) {
+                Ok(text) => (text, named),
+                Err(e) => {
+                    eprintln!("wsp: cannot read {named}: {e}");
+                    return Err(1);
+                }
+            }
+        }
+    };
+
+    // Folded, because the lock and the record are one-line sentences —
+    // "held by w1:p6 for 3s — installing fdefcab" — and a paragraph pasted into
+    // one is a line nobody can read either side of. Folding keeps every word
+    // and costs the paragraph breaks, which is the trade `note` makes for the
+    // same reason.
+    let text = crate::cmd_task::fold(&raw);
+    if text.is_empty() {
+        // An empty stream reads exactly like no `--why` at all, and the two
+        // want different things done about them: one is a caller who left the
+        // default alone, the other is a caller whose paragraph went nowhere.
+        eprintln!("wsp: nothing on {named} — the lock would say nothing about why");
+        return Err(2);
+    }
+    Ok(Why { text: Some(text), took_dash })
+}
+
+/// The three places a `--why` comes from, settled before anything is read.
+///
+/// Separate from the reading so the grammar can be tested as grammar. What went
+/// wrong here was a parse — one token read as a different argument — and a test
+/// that has to pipe a stream in to reach it is a test of the wrong thing.
+#[derive(Debug, PartialEq)]
+enum Reason {
+    /// Nobody gave one, and the commit will stand in.
+    Absent,
+    Typed(String),
+    Stream,
+    File(String),
+}
+
+/// Which of the three, and whether it took the bare `-` off the positionals.
+fn reason_given(args: &Args) -> Result<(Reason, bool), i32> {
+    let typed = args.get("why");
+    // `--why` that swallowed nothing: the token after it began with `-`, so the
+    // parser left the flag standing for itself. That, and an explicit `--why -`,
+    // are the stream — the reading `cmd_task::prose_source` gives a lone
+    // `--from` and `cmd_worklist::stop_prose` gives a lone `--stop`.
+    let asked_for_prose = matches!(typed.as_deref(), Some("true" | "-"));
+    // And this is where the dash went. `wsp install --why -` reaches here as
+    // the flag above plus a bare `-` among the positionals, which is the slot
+    // the binary to install lives in; `wsp install -` on its own is the same
+    // positional with no flag in front of it, and is still an error about a
+    // binary. The two readings are one token apart and the flag is what tells
+    // them apart.
+    let took_dash = typed.as_deref() == Some("true") && args.rest.iter().any(|a| a == "-");
+    let sentence = typed.filter(|_| !asked_for_prose).filter(|s| !s.trim().is_empty());
+
+    match (args.get("from"), sentence) {
+        (Some(_), Some(_)) => {
+            // Two sources for one sentence is refused rather than resolved:
+            // picking either is the silent loss in a smaller hat, which is the
+            // reading `cmd_agent::from_source` gives the same collision.
+            eprintln!("wsp: a sentence and --from are two reasons — give one");
+            Err(2)
+        }
+        (Some(_), None) if !asked_for_prose => {
+            eprintln!("wsp: --from is where a --why is read from — `wsp install --why --from FILE`");
+            eprintln!("     the binary to install is the positional: `wsp install <path>`");
+            Err(2)
+        }
+        // A lone `--from`, or `--from -`, is the stream: a dash is not a path,
+        // it is the conventional name for stdin.
+        (Some(path), None) if matches!(path.as_str(), "true" | "-") => Ok((Reason::Stream, took_dash)),
+        (Some(path), None) => Ok((Reason::File(path), took_dash)),
+        (None, None) if asked_for_prose => Ok((Reason::Stream, took_dash)),
+        (None, None) => Ok((Reason::Absent, took_dash)),
+        (None, Some(s)) => Ok((Reason::Typed(s), took_dash)),
+    }
+}
+
+/// The stream, refused before it is read when there is nobody on the other end.
+///
+/// Reading a terminal is not an empty reason, it is a command that stops and
+/// says nothing while it swallows the keys — the one failure worse than the
+/// silent one this is all about.
+fn piped() -> Result<String, i32> {
+    if util::stdin_is_tty() {
+        eprintln!("wsp: nothing is piped in — `--why -` reads the sentence from a stream");
+        return Err(2);
+    }
+    crate::cmd_task::read_source("-").map_err(|e| {
+        eprintln!("wsp: cannot read stdin: {e}");
+        1
+    })
+}
+
 pub fn install(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let json_out = args.json();
@@ -778,7 +941,21 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         return 2;
     }
 
-    let Source { path: src, tree, origin } = match source(store, args) {
+    // Before the source is resolved, because `--why -` puts a bare `-` exactly
+    // where the binary to install goes and this is what takes it back. Reading
+    // the stream here also means a `--why` that could not be read is answered
+    // before anything has been said about what would be installed.
+    let why = match why_given(args) {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
+    let mut positional = args.rest.iter().map(String::as_str);
+    let named = match why.took_dash {
+        true => positional.find(|a| *a != "-"),
+        false => positional.next(),
+    };
+
+    let Source { path: src, tree, origin } = match source(store, named) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("wsp: {e}");
@@ -801,13 +978,12 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         .as_ref()
         .filter(|r| live.map(|(size, mtime)| r.size == size && r.mtime == mtime).unwrap_or(false));
 
-    let why = args
-        .get("why")
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| match &ours.commit {
-            Some(c) => format!("installing {c}"),
-            None => "installing".to_string(),
-        });
+    // A default rather than nothing: the lock and the record are read by
+    // somebody who was not here, and "installing fdefcab" at least says what.
+    let why = why.text.unwrap_or_else(|| match &ours.commit {
+        Some(c) => format!("installing {c}"),
+        None => "installing".to_string(),
+    });
 
     let bytes = match fs::read(&src) {
         Ok(b) => b,
@@ -1169,6 +1345,132 @@ mod tests {
             size: 1,
             mtime: 0,
         }
+    }
+
+    fn line(argv: &[&str]) -> crate::Args {
+        crate::Args::parse(argv.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    /// The fault, at the altitude it happened at. `wsp install --why -` was
+    /// read as an install of a binary called `-`, because a lone dash is one
+    /// character, no flag was taking it as a value, and the optional `<path>`
+    /// was standing there to catch it. The error then named an argument nobody
+    /// had typed.
+    ///
+    /// The two readings are one token apart, so both are asserted here: the
+    /// dash belongs to `--why` when `--why` is in front of it, and to the
+    /// binary when it is not. A test of only the first would pass on a fix that
+    /// swallowed every dash on the line.
+    #[test]
+    fn a_dash_after_why_is_the_stream_and_a_dash_on_its_own_is_still_a_binary() {
+        let (reason, took) = reason_given(&line(&["install", "--why", "-"])).unwrap();
+        assert_eq!(reason, Reason::Stream);
+        assert!(took, "the dash was left in the positionals for `<path>` to eat");
+
+        let (reason, took) = reason_given(&line(&["install", "-"])).unwrap();
+        assert_eq!(reason, Reason::Absent, "a bare dash is not a reason");
+        assert!(!took, "nothing asked for a stream, so nothing may take the path");
+        // A store this never reads — the named-path branch answers before it
+        // asks — but `source` takes one, and pointing it at the real one is how
+        // a test comes to read whoever is working today.
+        let dir = scratch("dash");
+        let store = Store::at(dir.clone(), dir.clone());
+        assert_eq!(
+            source(&store, Some("-")).err().as_deref(),
+            Some("no binary at -"),
+            "the error a genuinely missing binary should still get"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And the binary is still found when both are on the line, in either
+    /// order — the dash is the one positional `--why` may take, and it takes
+    /// exactly that one.
+    #[test]
+    fn the_stream_takes_the_dash_and_leaves_the_path() {
+        for argv in [
+            ["install", "--why", "-", "/tmp/wsp"],
+            ["install", "/tmp/wsp", "--why", "-"],
+        ] {
+            let args = line(&argv);
+            let (_, took) = reason_given(&args).unwrap();
+            let mut positional = args.rest.iter().map(String::as_str);
+            let named = match took {
+                true => positional.find(|a| *a != "-"),
+                false => positional.next(),
+            };
+            assert_eq!(named, Some("/tmp/wsp"), "{argv:?} lost the binary");
+        }
+    }
+
+    /// `--why --from FILE` is the file form, and a bare `--from` is not.
+    ///
+    /// Everywhere else in the CLI `--from FILE` on its own is complete. Here it
+    /// is not, and the reason is `--to`: this verb already owns the other half
+    /// of that pair, so `--from` reads as *where the binary comes from* — and
+    /// obeying that reading would record a path as the reason and install
+    /// something else, silently, which is the whole class of fault this command
+    /// exists to refuse. So it is answered with both readings instead.
+    #[test]
+    fn from_names_the_file_a_why_is_read_from_only_once_a_why_has_asked() {
+        assert_eq!(
+            reason_given(&line(&["install", "--why", "--from", "why.md"])).unwrap(),
+            (Reason::File("why.md".into()), false)
+        );
+        assert_eq!(
+            reason_given(&line(&["install", "--from", "why.md"])),
+            Err(2),
+            "a bare --from was obeyed as prose, and it reads as the build"
+        );
+        assert_eq!(
+            reason_given(&line(&["install", "--why", "typed", "--from", "why.md"])),
+            Err(2),
+            "two sources for one sentence"
+        );
+    }
+
+    /// A sentence still goes on the line, and the paragraph it is not still
+    /// arrives whole.
+    #[test]
+    fn a_typed_why_is_read_as_the_sentence_it_is() {
+        assert_eq!(
+            reason_given(&line(&["install", "--why", "installing the barrier fix"])).unwrap(),
+            (Reason::Typed("installing the barrier fix".into()), false)
+        );
+        assert_eq!(
+            reason_given(&line(&["install"])).unwrap(),
+            (Reason::Absent, false),
+            "no --why at all is the commit's job, not an error"
+        );
+    }
+
+    /// The reason this field needed a stream at all: the house rule is *give a
+    /// wsp verb its prose through a file*, because a shell runs every backtick
+    /// inside double quotes. A stream never meets one, so what a file holds is
+    /// what the lock says — code spans, line breaks and all, folded to the one
+    /// line the lock and the record are written on.
+    #[test]
+    fn what_a_file_holds_is_what_the_lock_says() {
+        let dir = scratch("why");
+        let path = dir.join("why.md");
+        fs::write(&path, "Phase four G1.\n\nCarries `worklist-045` — the stream form.\n").unwrap();
+
+        let args = line(&["install", "--why", "--from", path.to_str().unwrap()]);
+        let why = why_given(&args).unwrap();
+        assert_eq!(
+            why.text.as_deref(),
+            Some("Phase four G1. Carries `worklist-045` — the stream form."),
+            "the backticks did not survive, or the paragraph was not folded onto one line"
+        );
+        assert!(!why.took_dash);
+
+        fs::write(&path, "   \n\n").unwrap();
+        assert_eq!(
+            why_given(&line(&["install", "--why", "--from", path.to_str().unwrap()])),
+            Err(2),
+            "a file with nothing in it read as a caller who wanted the default"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The whole point: while one install is in flight the next one is refused,
