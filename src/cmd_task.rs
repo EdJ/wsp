@@ -484,16 +484,32 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp show <id> [--log]");
         return 2;
     };
-    let t = match store.task_or_why(&needle) {
-        Ok(t) => t,
-        Err(why) => {
-            eprintln!("{why}");
+    // The one reader that opts in to an archived record rather than settling
+    // for the sentence about it. Every other verb here resolves through
+    // `task_or_why` and gets `Found::Archived`'s message, which is right for
+    // them — `claim`, `edit` and `rm` have nothing sane to do with a task that
+    // has left the live store. `show` does: displaying the record *is* the
+    // verb, and a reader who followed `render-026`'s citation of `render-018`
+    // wants the prose it points at, not the path it is filed under.
+    let (t, archived) = match store.resolve_task(&needle) {
+        crate::store::Found::One(t) => (*t, None),
+        crate::store::Found::Archived(t, path) => (*t, Some(path)),
+        other => {
+            eprintln!("{}", other.why(&needle).unwrap_or_default());
             return 1;
         }
     };
     if args.json() {
         let mut v = t.json();
         v["body"] = json!(t.body);
+        // Present only when it is, on the same rule as `list` below: a reader
+        // of this payload sees what it always saw until there is something to
+        // say. An agent reading a cited id back gets the record *and* the fact
+        // that it is no longer live, which is the difference between quoting a
+        // decision and reopening it.
+        if let Some(path) = &archived {
+            v["archived"] = json!(util::contract(path));
+        }
         // Who has it and who had it. An agent reading this back is usually
         // asking exactly that, and the alternative is reading two state files
         // it has no business knowing the names of.
@@ -530,16 +546,37 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     println!("{} {}", p.dim(&util::pad("created", 9)), t.created);
     println!("{} {}", p.dim(&util::pad("updated", 9)), t.updated);
+    // Above the prose rather than after it. Everything below this point reads
+    // as a live record — a status, a parent, a log that stops — and a reader
+    // who learns at the bottom that none of it is current has already acted on
+    // the top.
+    if let Some(path) = &archived {
+        println!("{} {}", p.dim(&util::pad("archived", 9)), util::contract(path));
+    }
 
     // Where it sits in the work, both ways. A sub-task read on its own is
     // missing the thing that says why it exists.
     let all = store.tasks();
-    if let Some(parent) = t.parent.as_ref().and_then(|id| all.iter().find(|x| &x.id == id)) {
+    // Read from the archive only when the live store does not have it, which
+    // on nearly every task is never — `show` is run constantly and the walk is
+    // a directory read per archive month. What it buys is that the line stops
+    // *disappearing*: a parent that gets swept took the whole `under` row with
+    // it, so a sub-task read on its own lost the one thing that says why it
+    // exists, and said nothing about having lost it. Silence about what was
+    // not looked at is the defect this row is named for, and `show` had its
+    // own copy.
+    if let Some((parent, filed)) = t.parent.as_ref().and_then(|id| {
+        all.iter()
+            .find(|x| &x.id == id)
+            .map(|x| (x.clone(), false))
+            .or_else(|| store.archived_task(id).map(|(x, _)| (x, true)))
+    }) {
         println!(
-            "{} {}  {}",
+            "{} {}  {}{}",
             p.dim(&util::pad("under", 9)),
             p.dim(&parent.id),
-            util::truncate(&parent.title, 56)
+            util::truncate(&parent.title, 56),
+            if filed { p.dim("  · archived") } else { String::new() }
         );
     }
     let kids = crate::resolve::children_of(&all, &t.id);
@@ -2153,6 +2190,66 @@ mod tests {
         let store = Store::at(root.clone(), root.join("state"));
         store.ensure_dirs().unwrap();
         store
+    }
+
+    /// The `under` line did not go wrong when its parent was swept — it went
+    /// *away*, which is worse. A sub-task read on its own is missing the one
+    /// thing that says why it exists, and a row that vanishes silently cannot
+    /// be told from a task that never had a parent at all.
+    ///
+    /// Asserted through `store` rather than through printed output because
+    /// `show` prints: what the fix turns on is that the parent is findable, and
+    /// that the live store is asked first so a live parent never pays for the
+    /// archive walk.
+    #[test]
+    fn a_parent_that_was_swept_is_still_found_rather_than_quietly_dropped() {
+        let store = scratch("show-archived-parent");
+        let mut parent = Task::new("the argument this hangs from", "wsp-020");
+        parent.updated = "2026-08-14T00:00:00Z".into();
+        store.save_task(&parent).unwrap();
+        let mut child = Task::new("still open", "wsp-021");
+        child.parent = Some("wsp-020".into());
+        store.save_task(&child).unwrap();
+
+        assert!(store.tasks().iter().any(|x| x.id == "wsp-020"), "live first, and it is");
+        store.archive_task(&parent).unwrap();
+
+        assert!(!store.tasks().iter().any(|x| x.id == "wsp-020"), "now it is not");
+        let (found, _) = store.archived_task("wsp-020").expect("but show can still name it");
+        assert_eq!(found.title, "the argument this hangs from");
+        assert_eq!(show(&store, &parse(&["show", "wsp-021"])), 0);
+    }
+
+    /// The verb that reads a record has to be able to read an archived one.
+    ///
+    /// Every other verb stops at the sentence — `claim` and `edit` have nothing
+    /// sane to do with a task that has left the live store, and handing them one
+    /// would put a live file beside the archived one under a single name. `show`
+    /// is the exception because *displaying the record is the verb*, and this
+    /// project reads by citation: `render-026`'s prose says "same seam as
+    /// render-018" and `render-018` was swept, so the reader following that
+    /// reference wanted the argument in it and got `no such task`.
+    ///
+    /// The exit code is the assertion because it is the load-bearing change —
+    /// `show` answered 1 and printed nothing, and it now answers 0 and prints
+    /// the record. The prose being reachable at all is asserted beside it, since
+    /// an exit code alone would pass on a `show` that found the file and had
+    /// nothing to say about it.
+    #[test]
+    fn show_reads_an_archived_task_because_reading_the_record_is_the_verb() {
+        let store = scratch("show-archived");
+        let mut t = Task::new("Overscrolling has dead travel", "render-018");
+        t.updated = "2026-08-15T22:08:05Z".into();
+        t.body = "## Overview\nThe wheel moved the cursor and the view was derived from it.\n".into();
+        store.save_task(&t).unwrap();
+        store.archive_task(&t).unwrap();
+
+        assert_eq!(show(&store, &parse(&["show", "render-018"])), 0, "it is there and it is readable");
+        let (found, path) = store.archived_task("render-018").expect("and this is what it read");
+        assert!(found.body.contains("the view was derived from it"), "the argument came with it");
+        assert!(path.ends_with("2026-08/render-018.md"), "{}", path.display());
+
+        assert_eq!(show(&store, &parse(&["show", "render-999"])), 1, "and nothing is still nothing");
     }
 
     /// `worklist-018`. A hand carrying a paragraph and no sentence drew as a

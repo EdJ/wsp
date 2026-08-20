@@ -47,6 +47,27 @@ pub const INBOX_CODE: &str = "inbox";
 pub enum Found {
     One(Box<Task>),
     Ambiguous(Vec<Task>),
+    /// Not in the live store, but the archive holds it — the task, and the
+    /// file it is in.
+    ///
+    /// A separate variant rather than a second kind of `One` because the
+    /// difference is not cosmetic. Counted 2026-08-20: twenty-three places
+    /// outside this file resolve a typed id, and seventeen of them go on to
+    /// write — `claim`, `done`, `edit`, `mv`, `rm`, `prio`, `decide`, `flag`,
+    /// `release`, `spawn`, `ask`, `--tell`, `add --parent`, `resume` and the
+    /// three worklist composers. Every one ends at [`Store::save_task`], which
+    /// writes `tasks/<id>.md` while the archived file stays where it is, so
+    /// resolving an archived task *into* `One` would make `wsp claim wsp-020`
+    /// quietly produce two files answering to one name — the exact failure
+    /// [`Store::file_away`]'s `~2` and [`Store::highest_seq`]'s live-or-archived
+    /// scan exist to prevent, and one `doctor` has a check for.
+    ///
+    /// So the id resolves as far as the sentence and no further. The six
+    /// readers — `show`, `detail`, `peek`, `attempts` and the two lookups —
+    /// lose nothing by it: one of them wants the record and asks for this
+    /// variant by name, and the rest were asking whether there is live work
+    /// here, which there is not.
+    Archived(Box<Task>, PathBuf),
     Nothing,
 }
 
@@ -57,6 +78,18 @@ impl Found {
         match self {
             Found::One(_) => None,
             Found::Nothing => Some(format!("wsp: no such task `{needle}`")),
+            // `no such task` is a true statement about the live set and a false
+            // one about the world. This project reads by citation — source
+            // comments and task prose name ids by the dozen — so the answer
+            // that matters is not "no" but *where it went*: a reader who
+            // followed a reference has to be able to tell "this never existed"
+            // from "this was swept last Tuesday", and only one of those is
+            // worth going and looking at a file for.
+            Found::Archived(t, path) => Some(format!(
+                "wsp: `{}` is archived — {}",
+                t.id,
+                util::contract(path)
+            )),
             Found::Ambiguous(ts) => {
                 let mut s = format!("wsp: `{needle}` names {} tasks:", ts.len());
                 for t in ts {
@@ -667,11 +700,23 @@ impl Store {
     }
 
     /// Resolve a user-typed id: exact, then a retired id, then bare suffix
-    /// (`003`), then unique case-insensitive title substring.
+    /// (`003`), then unique case-insensitive title substring — and, when the
+    /// live store has nothing at all, the archive.
     ///
     /// The retired-id step is what keeps three days of git history, every
     /// agent's notes and Ed's own memory working after the renumbering. See
     /// [`Store::renamed_ids`].
+    ///
+    /// The archive step is the same obligation one storey down, and it is last
+    /// on purpose: a live task always wins, so nothing that resolves today
+    /// starts resolving to something else. It answers with
+    /// [`Found::Archived`] rather than [`Found::One`] — see that variant for
+    /// why the difference is load-bearing rather than presentational. What it
+    /// buys is that every caller stops saying `no such task` about a file
+    /// sitting on disk without any of them being edited: measured on the store
+    /// on 2026-08-20, `render-026`'s prose cites `render-018` and `render-009`
+    /// cites `audio-001`, both archived, and following either reference got
+    /// `no such task` with no sweep and no accident involved.
     pub fn resolve_task(&self, needle: &str) -> Found {
         if let Some(t) = self.task(needle) {
             return Found::One(Box::new(t));
@@ -706,7 +751,10 @@ impl Store {
             .collect();
         match by_title.len() {
             1 => Found::One(Box::new(by_title.into_iter().next().expect("just checked"))),
-            0 => Found::Nothing,
+            0 => match self.archived_task(needle) {
+                Some((t, path)) => Found::Archived(Box::new(t), path),
+                None => Found::Nothing,
+            },
             _ => Found::Ambiguous(by_title),
         }
     }
@@ -1008,6 +1056,17 @@ impl Store {
     /// task a number an archived one already answers to is the collision the
     /// archive exists to have survived.
     pub fn archived_tasks(&self) -> Vec<Task> {
+        self.archived_tasks_filed().into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// The same, each with the file it is in — the shape [`Store::archived_task`]
+    /// needs, because "it is archived" is not a useful answer without the path
+    /// the reader is to go and look at.
+    ///
+    /// `archived_projects` is the same pair for the same reason, and the two
+    /// are deliberately alike: a record that has left the live list is found by
+    /// the same move whichever kind it is.
+    pub fn archived_tasks_filed(&self) -> Vec<(Task, PathBuf)> {
         let mut out = Vec::new();
         let Ok(months) = fs::read_dir(self.archive_dir()) else { return out };
         for m in months.flatten() {
@@ -1020,12 +1079,32 @@ impl Store {
                 let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else { continue };
                 let id = stem.split('~').next().unwrap_or(stem).to_string();
                 if let Ok(text) = fs::read_to_string(&path) {
-                    out.push(Task::from_doc(&fm::parse(&text), &id));
+                    out.push((Task::from_doc(&fm::parse(&text), &id), path));
                 }
             }
         }
-        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out.sort_by(|a, b| a.0.id.cmp(&b.0.id).then(a.1.cmp(&b.1)));
         out
+    }
+
+    /// The archived task an id names, and the file it is in.
+    ///
+    /// Exact id, then one hop through [`Store::renamed_ids`] — and no further.
+    /// The guessing steps in [`Store::resolve_task`] are deliberately not
+    /// repeated here: the archive is the largest set in the store and the one
+    /// nobody is looking at, so a title substring matched against it would let
+    /// a typo for open work land on something finished a year ago. An id is
+    /// what a citation carries, and an id is what this answers to.
+    ///
+    /// Filed twice under one name — `wsp-020` and `wsp-020~2` — the later
+    /// filing wins, because [`Store::file_away`] appends rather than
+    /// overwriting and the later one is the record the reader is most likely
+    /// after. `doctor` is what reports that there are two; this is not the
+    /// place to argue about it.
+    pub fn archived_task(&self, id: &str) -> Option<(Task, PathBuf)> {
+        let filed = self.archived_tasks_filed();
+        let hit = |want: &str| filed.iter().filter(|(t, _)| t.id == want).next_back().cloned();
+        hit(id).or_else(|| self.renamed_ids().get(id).and_then(|now| hit(now)))
     }
 
     /// The projects the archive holds, each with the file it is in.
@@ -2914,6 +2993,90 @@ mod tests {
         // A suffix has to land on a `-`, or a project code would match every
         // id in a project whose code merely ended in those letters.
         assert!(store.task_or_why("22").is_err(), "not a boundary");
+    }
+
+    /// The reason this row exists. This project reads by citation — source
+    /// comments and task prose name ids by the dozen — and `no such task` is a
+    /// true statement about the live set and a false one about the world,
+    /// delivered with total confidence. A reader who follows a reference has to
+    /// be able to tell "this never existed" from "this was swept last Tuesday",
+    /// so the path is asserted and not just the word: it is the half that turns
+    /// the answer into somewhere to go.
+    #[test]
+    fn an_archived_task_says_where_it_went_instead_of_saying_it_never_existed() {
+        let store = scratch("archived-resolve");
+        let mut t = Task::new("the precedent three agents cited", "wsp-020");
+        t.updated = "2026-08-14T00:00:00Z".into();
+        store.save_task(&t).unwrap();
+        store.archive_task(&t).unwrap();
+
+        let why = store.task_or_why("wsp-020").expect_err("it is not live");
+        assert!(why.contains("archived"), "{why}");
+        assert!(why.contains("archive/tasks/2026-08/wsp-020.md"), "and where to go and read it: {why}");
+        assert!(!why.contains("no such task"), "which is what it used to say: {why}");
+
+        assert!(
+            store.task_or_why("inbox-404").expect_err("nothing").contains("no such task"),
+            "and an id nothing ever answered to still gets the plain answer"
+        );
+    }
+
+    /// Resolving is not resurrecting. Seventeen of the twenty places that
+    /// resolve an id are mutators and each ends at `save_task`, which would
+    /// write `tasks/wsp-020.md` beside the archived file and leave one name
+    /// answering to two records — the failure `file_away`'s `~2` and
+    /// `highest_seq`'s live-or-archived scan exist to prevent. So the archive
+    /// answers the *question* and never the caller: `find_task`, which is what
+    /// a mutator reaches for, still says no.
+    #[test]
+    fn an_archived_task_is_answered_about_and_never_handed_over() {
+        let store = scratch("archived-not-handed-over");
+        let mut t = Task::new("swept", "wsp-021");
+        t.updated = "2026-08-14T00:00:00Z".into();
+        store.save_task(&t).unwrap();
+        store.archive_task(&t).unwrap();
+
+        assert!(store.find_task("wsp-021").is_none(), "a mutator cannot get hold of it");
+        assert!(matches!(store.resolve_task("wsp-021"), Found::Archived(..)), "but it is found");
+        assert!(store.archived_task("wsp-021").is_some(), "and a reader can ask for it by name");
+    }
+
+    /// A live task always wins. The archive step is last so that nothing which
+    /// resolves today starts resolving to something else — an id reused after
+    /// its first bearer was swept has to keep meaning the work in front of you.
+    #[test]
+    fn a_live_task_beats_an_archived_one_answering_to_the_same_name() {
+        let store = scratch("archived-live-wins");
+        let mut old = Task::new("the swept one", "wsp-033");
+        old.updated = "2026-08-14T00:00:00Z".into();
+        store.save_task(&old).unwrap();
+        store.archive_task(&old).unwrap();
+
+        let live = Task::new("the one in front of you", "wsp-033");
+        store.save_task(&live).unwrap();
+
+        assert_eq!(
+            store.task_or_why("wsp-033").map(|t| t.title),
+            Ok("the one in front of you".into())
+        );
+    }
+
+    /// The retired-id step and the archive step have to compose. An id that was
+    /// renumbered and *then* swept is cited in git history and in agents' notes
+    /// by the name it had first, and that name is the only one the reader has.
+    #[test]
+    fn an_id_that_was_renumbered_before_it_was_archived_still_finds_it() {
+        let store = scratch("archived-renamed");
+        let mut t = Task::new("renumbered, then swept", "t-260815-024");
+        t.updated = "2026-08-14T00:00:00Z".into();
+        store.save_task(&t).unwrap();
+        store.rename_tasks(&BTreeMap::from([("t-260815-024".to_string(), "data-009".to_string())]))
+            .unwrap();
+        let now = store.task("data-009").expect("renumbered");
+        store.archive_task(&now).unwrap();
+
+        let why = store.task_or_why("t-260815-024").expect_err("not live under either name");
+        assert!(why.contains("data-009") && why.contains("archived"), "{why}");
     }
 
     fn scratch(tag: &str) -> Store {

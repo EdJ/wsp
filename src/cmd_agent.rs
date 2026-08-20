@@ -4389,6 +4389,32 @@ fn herdr_health(
     }
 }
 
+/// What `doctor` says about a reference that names nothing in the live store.
+///
+/// `Err` is a problem and `Ok` is a note, so a caller cannot file one under the
+/// wrong heading by accident — which is the whole of the distinction being
+/// drawn here.
+///
+/// One function for two kinds because it is one judgement made twice: **a
+/// record that was retired is not a record that is missing.** Reporting
+/// `unknown parent wsp-020` about a file sitting in `archive/tasks/2026-08/`
+/// is a false statement, and it is a false statement made by the one tool
+/// somebody runs *to tell a broken store from a healthy one* — so it sends
+/// them hunting for a corruption that is not there, and it does it under a ✗.
+/// `worklist-043`: the same blindness `Store::resolve_task` had, one surface
+/// along, and the reason enumerating the readers came before fixing the one
+/// that was found.
+///
+/// The problem sentence is unchanged from before the archive was consulted. An
+/// id nothing ever answered to is still exactly as broken as it always was, and
+/// what this adds is only the ability to stop saying it about the other case.
+fn dangling(subject: &str, kind: &str, name: &str, filed: bool) -> Result<String, String> {
+    match filed {
+        true => Ok(format!("task {subject} references {kind} `{name}`, which is archived rather than missing")),
+        false => Err(format!("task {subject} references unknown {kind} `{name}`")),
+    }
+}
+
 pub fn doctor(store: &Store, args: &Args) -> i32 {
     let mut problems: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -4553,10 +4579,18 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // asked of the installed wsp rather than worked out from a tree.
     crate::cmd_install::health(&seen, &mut notes);
 
+    // Both "unknown" checks below ask the archive before they say the word —
+    // see [`dangling`] for why that is a correctness fix and not a politeness.
+    let archived_ids = store.archived_ids();
+    let archived_projects: Vec<String> =
+        store.archived_projects().into_iter().map(|(p, _)| p.id).collect();
     for t in &tasks {
         if let Some(proj) = &t.project {
             if index.get(proj).is_none() {
-                problems.push(format!("task {} references unknown project `{}`", t.id, proj));
+                match dangling(&t.id, "project", proj, archived_projects.contains(proj)) {
+                    Ok(note) => notes.push(note),
+                    Err(problem) => problems.push(problem),
+                }
             }
         }
         if t.title.trim().is_empty() {
@@ -4564,7 +4598,10 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         }
         if let Some(parent) = &t.parent {
             if !tasks.iter().any(|x| &x.id == parent) {
-                problems.push(format!("task {} references unknown parent `{}`", t.id, parent));
+                match dangling(&t.id, "parent", parent, archived_ids.contains(parent)) {
+                    Ok(note) => notes.push(note),
+                    Err(problem) => problems.push(problem),
+                }
             }
             if parent == &t.id {
                 problems.push(format!("task {} is its own parent", t.id));
@@ -6374,6 +6411,25 @@ mod tests {
 
 
     // ---- doctor and peek, offline ------------------------------------------
+
+    /// A retired record is not a missing one, and `doctor` is the one tool run
+    /// specifically to tell a broken store from a healthy one — so saying
+    /// `unknown parent wsp-020` about a file sitting in the archive is not a
+    /// small inaccuracy. It is a ✗ against a store with nothing wrong with it,
+    /// and it sends the reader hunting for a corruption that is not there.
+    ///
+    /// The other half is asserted in the same test on purpose: an id nothing
+    /// ever answered to is exactly as broken as it was before, in the same
+    /// words. Softening *that* is how a check stops being worth reading.
+    #[test]
+    fn a_reference_to_an_archived_record_is_a_note_and_a_reference_to_nothing_is_a_fault() {
+        let filed = dangling("worklist-027", "parent", "wsp-020", true).expect("a note, not a fault");
+        assert!(filed.contains("archived"), "{filed}");
+        assert!(!filed.contains("unknown"), "which is the word that was wrong: {filed}");
+
+        let gone = dangling("worklist-027", "parent", "wsp-999", false).expect_err("a fault");
+        assert_eq!(gone, "task worklist-027 references unknown parent `wsp-999`");
+    }
 
     /// Three answers, not two. A machine with no herdr is normal; a socket
     /// that will not answer is broken; a herdr answering with nothing is a
