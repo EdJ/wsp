@@ -23,13 +23,12 @@
 //!   and `busy` is not.
 //!
 //! - **The loser finds out.** Every install through here is written down beside
-//!   the binary: who, when, from where, at what commit the artefact says it
-//!   carries — see below for why that last clause is not a flourish. So the
-//!   next install can
-//!   say what it is replacing, and can refuse when the live binary was
-//!   installed *after* the one in your hand was built — which is precisely the
-//!   race, seen from the losing side, and the one moment when going ahead
-//!   quietly reverts somebody.
+//!   the binary: who, when, from where, and at what commit the artefact says it
+//!   carries — the last clause is not a flourish, and the section below is why.
+//!   So the next install can say what it is replacing, and can refuse when the
+//!   live binary was installed *after* the one in your hand was built — which
+//!   is precisely the race, seen from the losing side, and the one moment when
+//!   going ahead quietly reverts somebody.
 //!
 //! - **Nothing execs a half-written file.** The bytes go to a temporary in the
 //!   destination's own directory and arrive by `rename`, which is atomic and
@@ -370,7 +369,7 @@ impl Built {
     /// The printed output hedges a stand-in on the line itself; `--json` has no
     /// line to hedge, and a caller parsing this is exactly the caller that will
     /// not see a yellow word go past.
-    fn source(&self) -> &'static str {
+    fn commit_from(&self) -> &'static str {
         match (self.asked, self.commit.is_some()) {
             (true, _) => "artefact",
             (false, true) => "tree",
@@ -867,9 +866,8 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 _ => String::new(),
             };
             println!(
-                "{} {}",
-                p.yellow("stale"),
-                format!("the tree has changed since this was built{now} — `wsp verify --release` first")
+                "{} the tree has changed since this was built{now} — `wsp verify --release` first",
+                p.yellow("stale")
             );
         }
         // The shared checkout is the one build whose contents nobody can
@@ -928,7 +926,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "{}",
                 json!({"ok": true, "installed": false, "reason": "already live",
                        "source": util::contract(&src), "dest": util::contract(&dst),
-                       "commit": ours.commit, "commit_from": ours.source()})
+                       "commit": ours.commit, "commit_from": ours.commit_from()})
             );
         } else {
             println!("{} {}", p.green("✓"), "already live — byte for byte what you built");
@@ -939,7 +937,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     let backwards = overtaken(ours.built, written(&dst), recorded, &ours);
     if backwards && !args.has("force") {
         let held = recorded.map(|r| r.line()).unwrap_or_else(|| match carried_by(&dst) {
-            Some(c) => format!("{c}, by hand — nothing beside it says who or why"),
+            Some(c) => format!("{c} put there by hand — nothing beside it says who or why"),
             None => "by hand — nothing here says what is in it".to_string(),
         });
         if json_out {
@@ -968,7 +966,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "{}",
                 json!({"ok": true, "installed": false, "reason": "dry run",
                        "source": util::contract(&src), "dest": util::contract(&dst),
-                       "commit": ours.commit, "commit_from": ours.source(),
+                       "commit": ours.commit, "commit_from": ours.commit_from(),
                        "dirty": ours.dirty, "dirty_files": ours.dirty_files,
                        "stale": ours.left_behind(),
                        "lock": holder(&lock_path(&dst)).map(|h| h.line())})
@@ -1011,7 +1009,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         && overtaken(ours.built, written(&dst), recorded_now, &ours)
     {
         let held = recorded_now.map(|r| r.line()).unwrap_or_else(|| match carried_by(&dst) {
-            Some(c) => format!("{c}, by hand — nothing beside it says who or why"),
+            Some(c) => format!("{c} put there by hand — nothing beside it says who or why"),
             None => "by hand — nothing there says what is in it".to_string(),
         });
         if json_out {
@@ -1049,7 +1047,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "source": util::contract(&src),
                 "dest": util::contract(&dst),
                 "commit": ours.commit,
-                "commit_from": ours.source(),
+                "commit_from": ours.commit_from(),
                 "dirty": ours.dirty,
                 "dirty_files": ours.dirty_files,
                 "bytes": size,
@@ -1481,7 +1479,7 @@ mod tests {
             Some("be58dac"),
             "the tree's HEAD answered for a binary that was standing right there"
         );
-        assert_eq!(ours.source(), "artefact");
+        assert_eq!(ours.commit_from(), "artefact");
         assert_eq!(ours.head.as_deref(), Some(head.as_str()), "the tree's HEAD is kept, as the check");
         assert!(ours.left_behind(), "a build its tree has walked away from was not called stale");
 
@@ -1529,7 +1527,7 @@ mod tests {
         let mute = bin("old", "wsp 0.1.0");
         let stood_in = provenance(&mute, Some(repo.clone()));
         assert_eq!(stood_in.commit.as_deref(), Some(head.as_str()));
-        assert_eq!(stood_in.source(), "tree");
+        assert_eq!(stood_in.commit_from(), "tree");
         assert!(!stood_in.asked);
         // …and standing in, it is not evidence that the tree left anything
         // behind: there is nothing to disagree with.
@@ -1541,7 +1539,7 @@ mod tests {
         fs::write(&brick, b"not a program").unwrap();
         let nothing = provenance(&brick, None);
         assert!(nothing.commit.is_none(), "something was invented for a file that cannot answer");
-        assert_eq!(nothing.source(), "unknown");
+        assert_eq!(nothing.commit_from(), "unknown");
         let _ = fs::remove_dir_all(&dir);
     }
 
