@@ -4460,6 +4460,10 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // and left alone there is how eighteen of them came to be sitting in one
     // repository with nobody able to say which were safe to take.
     let passed = crate::worklist::passed_by_running(store);
+    // And the branch side of the same question, read once for the same reason.
+    // `stale` walks directories, so everything a removed tree left behind in
+    // `refs/heads` has been invisible to every reader wsp has.
+    let whose = crate::cmd_checkout::naming(store);
     for p in &index.projects {
         for r in &p.roots {
             let root = util::real(r);
@@ -4486,6 +4490,34 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
                     s.note,
                     s.why.fix(&s.task, seated)
                 ));
+            }
+            // The refs a removed tree left behind. Two findings and they are
+            // not equally interesting: a branch whose work is on the trunk is
+            // a name and nothing else, so however many there are they get one
+            // dim line — `doctor` is read often and seven lines of nothing is
+            // how a report trains its reader past the line that matters. A
+            // branch still holding commits is *work* nothing else mentions,
+            // and it gets a line each.
+            let strays = crate::cmd_checkout::strays(&root, &whose);
+            let (holding, litter): (Vec<_>, Vec<_>) = strays.iter().partition(|s| s.commits > 0);
+            if !litter.is_empty() {
+                notes.push(format!(
+                    "{}: {} whose trees have gone and whose work is on the trunk — `wsp checkout --sweep`",
+                    util::contract(&root),
+                    crate::cmd_checkout::n_branches(litter.len())
+                ));
+            }
+            for s in holding {
+                // A problem rather than a note, and only for the renumbered
+                // one: work under a task's own id is a `wsp checkout` away and
+                // nothing is at risk, but a former id is not reachable through
+                // wsp at all — which is the hazard `cmd_checkout::remove` names
+                // in its own docs and says it cannot repair from there.
+                let line = format!("{}: {}", util::contract(&root), crate::cmd_checkout::stranded_line(s));
+                match s.whose {
+                    crate::cmd_checkout::Whose::Former(_) => problems.push(line),
+                    _ => notes.push(line),
+                }
             }
             match tree_index_loss(&root) {
                 Some(lost) if lost > 0 => {

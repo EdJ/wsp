@@ -3751,7 +3751,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, the outcome |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
-| `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, and the three reasons one is finished with |
+| `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, the three reasons one is finished with, and the branches a removed tree leaves behind |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
 | `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker |

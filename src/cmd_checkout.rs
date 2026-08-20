@@ -78,6 +78,23 @@
 //! and never swept: it is indistinguishable from the tree made thirty seconds
 //! ago for an agent who has not typed yet.
 //!
+//! # And the leak the leak leaves
+//!
+//! Everything above is about *directories*, because [`stale`] reads
+//! `.worktrees`. Taking a tree away does not always take its branch — [`remove`]
+//! keeps one git refuses to delete, which is what makes the removal recoverable
+//! — so these verbs have been creating litter of their own that no reader wsp
+//! has could see. Seven refs in `~/claude/wsp` on 2026-08-20, against eight live
+//! trees.
+//!
+//! [`strays`] is that half, and it splits the same way. A branch whose commits
+//! are all on the trunk is a name and nothing else, and [`sweep`] takes it with
+//! `git branch -d` — git's own refusal is the guard, the same one [`remove`]
+//! leans on. A branch still holding commits is **work**, and the only thing
+//! wrong with it was that nothing said so: the sweep that made it named it once
+//! on stdout and nothing has mentioned it since. Now `doctor` does, which is
+//! the difference between a fact and a fact somebody reads.
+//!
 //! # The third reason, and it is evidence rather than a relaxed rule
 //!
 //! Eighteen worktrees and nineteen orphaned workspaces accumulated in a single
@@ -531,6 +548,119 @@ pub(crate) fn stale(
     out
 }
 
+/// A branch with no working tree on it, and what it is holding.
+///
+/// The other half of the question [`stale`] answers. `stale` reads `.worktrees`
+/// entries, so everything it can say is about a **directory**; what [`remove`]
+/// leaves behind when it declines to delete a branch is a **ref**, and until
+/// this nothing ever looked at one. Seven had collected in `~/claude/wsp` by
+/// 2026-08-20 against eight live trees.
+///
+/// The cheap half of that is litter — a name whose commits are all on the trunk
+/// — and the expensive half is *work*: [`remove`] keeps a branch precisely when
+/// git refuses to delete it, which is precisely when it still holds commits.
+/// The sweep that made it says so once, on stdout, and nothing mentions it
+/// again.
+pub(crate) struct Stray {
+    /// The branch. A branch name and never assumed to be a task id, for the
+    /// reason [`judge`] gives about reading it off a tree.
+    pub branch: String,
+    /// What the store makes of the name, which is the whole of the advice.
+    pub whose: Whose,
+    /// The commits it has that the trunk has not. Zero is litter: the work is
+    /// on the trunk and the ref is all that is left of it.
+    pub commits: usize,
+}
+
+/// What the store makes of a branch's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Whose {
+    /// A task the store still knows by this name. Nothing here is lost, only
+    /// unattended: [`ensure`] reuses `refs/heads/<task>` when it is there, so
+    /// `wsp checkout <name>` builds the tree again from this very branch.
+    Task,
+    /// An id a task used to have, carrying the id it has now.
+    ///
+    /// The expensive one, and the case [`remove`]'s own docs name and say they
+    /// cannot repair: nobody types the old id any more, and `wsp checkout`
+    /// under the new one cuts a fresh branch at the trunk tip, so commits left
+    /// here are unreachable through wsp however long they sit there. Naming the
+    /// current id is what makes the report actionable — it is the id the reader
+    /// knows the work by.
+    Former(String),
+    /// Not wsp's, and left entirely alone. A person's own branch that happens
+    /// to be merged is not litter because a tool did not make it, and this is
+    /// the only thing standing between [`sweep`] and somebody's topic branch.
+    Stranger,
+}
+
+/// The branches this repository has a working tree on.
+///
+/// From `git worktree list` rather than from the `.worktrees` directory,
+/// because the question is whether **any** tree holds the branch: a tree
+/// somebody made by hand elsewhere is still somebody working on it, and reading
+/// our own directory would call that branch abandoned and take it. Detached
+/// trees contribute nothing, which is right — they hold no branch.
+fn worktree_branches(repo: &Path) -> BTreeSet<String> {
+    git(repo, &["worktree", "list", "--porcelain"])
+        .map(|out| {
+            out.lines()
+                .filter_map(|l| l.strip_prefix("branch refs/heads/"))
+                .map(|b| b.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The branches under `repo` that no tree is on, and what each still holds.
+///
+/// The looking half again, and it reads and never touches anything — the same
+/// division [`stale`] and [`sweep`] are built on. `whose` is the store's to
+/// answer and comes in as a closure for the reason `closed` does: the rule is
+/// worth testing and a store is not worth needing in order to test it.
+///
+/// The trunk's own branch drops out without a special case, because the trunk
+/// is a working tree and [`worktree_branches`] sees it.
+pub(crate) fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
+    let Some(trunk) = trunk(repo) else { return Vec::new() };
+    let Some(onto) = trunk_branch(&trunk) else { return Vec::new() };
+    let held = worktree_branches(repo);
+    let Some(all) = git(repo, &["branch", "--format=%(refname:short)"]) else { return Vec::new() };
+
+    let mut out: Vec<Stray> = Vec::new();
+    for branch in all.lines().map(str::trim).filter(|b| !b.is_empty()) {
+        if held.contains(branch) {
+            continue;
+        }
+        let whose = whose(branch);
+        if whose == Whose::Stranger {
+            continue;
+        }
+        let commits = ahead(repo, &onto, branch).len();
+        out.push(Stray { branch: branch.to_string(), whose, commits });
+    }
+    out.sort_by(|a, b| a.branch.cmp(&b.branch));
+    out
+}
+
+/// Take a branch that has nothing left on it.
+///
+/// `-d` and never `-D`, which is [`remove`]'s guard reused rather than
+/// restated: git refuses to delete a branch holding commits the trunk has not
+/// got, so the worst this can do is lose a name whose every commit is on the
+/// trunk. Asked of git rather than decided from [`Stray::commits`], because the
+/// count was taken a moment ago and a ref is what is about to be destroyed.
+///
+/// **Run from the trunk**, and that is not incidental: `-d` compares against
+/// whatever HEAD the directory it runs in is on. `--sweep` is run by an agent
+/// standing in its own tree, so from there `-d` would be asking "is it merged
+/// into *my task branch*" — which refuses in the safe direction for a branch
+/// the trunk has and this one has not, and in the unsafe direction for one this
+/// tree merged and the trunk never saw.
+fn prune(trunk: &Path, branch: &str) -> bool {
+    git(trunk, &["branch", "-d", branch]).is_some()
+}
+
 /// Whether one tree is finished with, and why — or, in the `Err`, why it is
 /// not, in the words a caller that left it standing wants to print.
 ///
@@ -602,14 +732,16 @@ fn judge(repo: &Path, onto: &str, task: &str, dir: &Path, closed: bool, passed: 
 /// that had landed everything it held, on every removal of a renumbered task's
 /// tree.
 ///
-/// What that leaves behind is worse than the false line, and it is the one part
-/// reading the name here does not repair. [`checkout_dir`] finds an old id only
-/// while its *directory* stands, so once the tree is gone `wsp checkout` under
-/// the new id cuts a fresh branch at the trunk tip and unlanded commits are
-/// unreachable through wsp — which is exactly the recovery [`discard`] declines
-/// to refuse on the strength of. So the name is carried out to the caller: it
-/// cannot mend the lookup, and it does make the line that says where the work
-/// went name a branch somebody can check out.
+/// What that leaves behind is worse than the false line, and reading the name
+/// here does not repair it. [`checkout_dir`] finds an old id only while its
+/// *directory* stands, so once the tree is gone `wsp checkout` under the new id
+/// cuts a fresh branch at the trunk tip and unlanded commits are unreachable
+/// through wsp — which is exactly the recovery [`discard`] declines to refuse on
+/// the strength of. The name carried out to the caller is half the answer: it
+/// makes the line that says where the work went name a branch somebody can
+/// check out. The other half is [`strays`], which finds that branch again on
+/// every `doctor` afterwards, because a name printed once is a name that has
+/// scrolled away by the time anybody wants it.
 fn remove(repo: &Path, dir: &Path) -> Removed {
     let existed = dir.exists();
     // Before the removal: a tree that has gone cannot be asked what it was on.
@@ -620,7 +752,12 @@ fn remove(repo: &Path, dir: &Path) -> Removed {
     let _ = git(repo, &["worktree", "remove", "--force", &dir.display().to_string()]);
     let _ = std::fs::remove_dir_all(dir);
     let _ = git(repo, &["worktree", "prune"]);
-    let kept = branch.filter(|b| git(repo, &["branch", "-d", b]).is_none());
+    // From the trunk, not from `repo`: `-d` compares against the HEAD of the
+    // directory it runs in, and `repo` is whatever the caller was standing in —
+    // for `--sweep` and `--rm` that is routinely an agent's own task tree. See
+    // [`prune`], which is the same one-line rule from the other direction.
+    let at = trunk(repo).unwrap_or_else(|| repo.to_path_buf());
+    let kept = branch.filter(|b| git(&at, &["branch", "-d", b]).is_none());
     Removed { existed, kept }
 }
 
@@ -647,6 +784,14 @@ pub(crate) struct Swept {
     /// quietly skips things is one nobody can tell from a sweep that found
     /// nothing.
     pub kept: Vec<(String, String)>,
+    /// Branches whose tree had already gone before this sweep ran, taken
+    /// because their work is on the trunk. Separate from `branches` on
+    /// provenance rather than on kind: these are what an *earlier* removal left
+    /// behind, which is why nothing has mentioned them since.
+    pub pruned: Vec<String>,
+    /// Branches with no tree that still hold work. Named and never taken, for
+    /// the same reason [`remove`] left them there in the first place.
+    pub stranded: Vec<Stray>,
 }
 
 /// Remove the trees there is evidence about, and say what was left standing.
@@ -670,15 +815,41 @@ pub(crate) struct Swept {
 ///   sweep would then read a store pointed somewhere else as a repository full
 ///   of litter. The caller decides what "closed" means, and the answer for an
 ///   unknown id is no.
+///
+/// # And the branches, which are the same leak one layer down
+///
+/// Removing a tree does not always remove its branch — [`remove`] keeps one git
+/// refuses to delete — so this verb has been *creating* litter [`stale`] cannot
+/// see for as long as it has existed, seven refs' worth in `~/claude/wsp`. The
+/// branch half is [`strays`], and the two refusals it makes are the two above
+/// in different clothes: a branch still holding work is named and never taken,
+/// and a branch that is not wsp's is not touched at all.
 pub(crate) fn sweep(
     root: &Path,
     closed: &dyn Fn(&str) -> bool,
     passed: &dyn Fn(&str) -> bool,
+    whose: &dyn Fn(&str) -> Whose,
     busy: &dyn Fn(&str) -> Option<String>,
     dry: bool,
 ) -> Swept {
     let mut out = Swept::default();
     let Some(trunk) = trunk(root) else { return out };
+    // Before the trees go, so the two halves cannot report the same branch
+    // twice: what this run is about to leave behind comes back on `branches`,
+    // and `strays` is what some earlier run left and nothing has said since.
+    for s in strays(root, whose) {
+        if s.commits > 0 {
+            out.stranded.push(s);
+            continue;
+        }
+        // No `busy` question, because there is nothing to be busy in. A tree is
+        // a place an agent can be standing; a ref whose every commit is on the
+        // trunk is a name, and `wsp checkout` cuts an identical branch for
+        // whoever comes back to the task.
+        if dry || prune(&trunk, &s.branch) {
+            out.pruned.push(s.branch);
+        }
+    }
     for s in stale(root, closed, passed) {
         if s.why == Why::Idle {
             continue;
@@ -1435,7 +1606,8 @@ fn swept(store: &Store, args: &Args) -> i32 {
     let occupied = Occupied::now(store);
     let busy = |task: &str| -> Option<String> { occupied.of(task, &checkout_dir(&trunk, task)) };
 
-    let out = sweep(&repo, &closed, &|t| passed.contains(t), &busy, dry);
+    let whose = naming(store);
+    let out = sweep(&repo, &closed, &|t| passed.contains(t), &whose, &busy, dry);
 
     if args.json() {
         println!(
@@ -1443,6 +1615,12 @@ fn swept(store: &Store, args: &Args) -> i32 {
             json!({
                 "removed": out.removed,
                 "branches_kept": out.branches,
+                "branches_pruned": out.pruned,
+                "stranded": out.stranded.iter().map(|s| json!({
+                    "branch": s.branch,
+                    "commits": s.commits,
+                    "now": match &s.whose { Whose::Former(now) => Some(now), _ => None },
+                })).collect::<Vec<_>>(),
                 "kept": out.kept.iter().map(|(t, w)| json!({"task": t, "why": w})).collect::<Vec<_>>(),
                 "dry_run": dry,
             })
@@ -1457,13 +1635,60 @@ fn swept(store: &Store, args: &Args) -> i32 {
     for task in &out.branches {
         println!("{}", p.yellow(&format!("branch {task} kept — it has commits the trunk has not")));
     }
-    for (task, why) in &out.kept {
-        println!("{} {task} — {why}", p.dim("kept"));
+    // Dim, and one line however many there are: a name whose commits are all on
+    // the trunk is the least interesting thing this command does, and the seven
+    // that had collected here would otherwise be seven lines of nothing.
+    if !out.pruned.is_empty() {
+        println!(
+            "{}",
+            p.dim(&format!(
+                "{} {} whose tree had gone and whose work is on the trunk: {}",
+                if dry { "would take" } else { "took" },
+                n_branches(out.pruned.len()),
+                out.pruned.join(", ")
+            ))
+        );
     }
-    if out.removed.is_empty() && out.kept.is_empty() {
-        println!("{}", p.dim("no tree here belongs to a finished task"));
+    for s in &out.stranded {
+        println!("{}", p.yellow(&stranded_line(s)));
+    }
+    if out.removed.is_empty() && out.kept.is_empty() && out.pruned.is_empty() && out.stranded.is_empty() {
+        println!("{}", p.dim("no tree or branch here belongs to a finished task"));
     }
     0
+}
+
+/// `n branches`, singular at one — [`n_commits`]'s neighbour and there for the
+/// same reason: `doctor` and `--sweep` count the same refs and say so with the
+/// same words.
+pub(crate) fn n_branches(n: usize) -> String {
+    match n {
+        1 => "1 branch".to_string(),
+        n => format!("{n} branches"),
+    }
+}
+
+/// A branch holding work with no tree to find it from, in one sentence.
+///
+/// Written once and printed by both callers, because `--sweep` naming a branch
+/// as litter-that-is-not and `doctor` reporting the same branch have to be
+/// saying the same thing — the disagreement between a report and a removal is
+/// how eighteen worktrees came to be sitting in one repository with nobody able
+/// to say which were safe to take.
+///
+/// The two halves are the two readings of [`Whose`], and only one of them is
+/// urgent: a branch still under its own task's name is one `wsp checkout` away,
+/// and a former id is not reachable through wsp at all — so that one names the
+/// git command, which is the only thing that gets the work back.
+pub(crate) fn stranded_line(s: &Stray) -> String {
+    let held = format!("branch {} holds {} and has no tree", s.branch, n_commits(s.commits));
+    match &s.whose {
+        Whose::Former(now) => format!(
+            "{held} — it is {now} now, and `wsp checkout {now}` cuts a fresh branch rather than finding this one; `git switch {}` does",
+            s.branch
+        ),
+        _ => format!("{held} — `wsp checkout {}` builds it again", s.branch),
+    }
 }
 
 /// Whether the store considers a task finished — done, or archived out of the
@@ -1487,6 +1712,36 @@ pub(crate) fn finished(store: &Store) -> impl Fn(&str) -> bool {
             .find(|t| t.id == id)
             .map(|t| !t.status().is_open())
             .unwrap_or_else(|| archived.iter().any(|a| a == id))
+    }
+}
+
+/// What the store makes of a branch name, read once and asked of many.
+///
+/// [`finished`]'s counterpart for [`strays`], and the same shape: read the
+/// store once here, ask a closure many times there. It answers with the
+/// *current* id for a former one rather than with a boolean, because that is
+/// the id the reader knows the work by and the one they have to be told is no
+/// longer the way back to it.
+///
+/// An id the store has never heard of is [`Whose::Stranger`] — the same answer
+/// [`finished`] gives for the same reason, and here it carries more weight: it
+/// is what keeps a sweep run against a store pointed somewhere else from
+/// reading every branch in the repository as litter.
+pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Whose {
+    let known: BTreeSet<String> =
+        store.tasks().into_iter().map(|t| t.id).chain(store.archived_ids()).collect();
+    let renamed = store.renamed_ids();
+    move |branch: &str| {
+        if known.contains(branch) {
+            return Whose::Task;
+        }
+        // One hop and not a walk: [`Store::rename_tasks`] collapses chains as
+        // it writes, so no entry's value is another entry's key and an id
+        // renamed twice already points at where it ended up.
+        match renamed.get(branch).filter(|now| known.contains(*now)) {
+            Some(now) => Whose::Former(now.clone()),
+            None => Whose::Stranger,
+        }
     }
 }
 
@@ -1657,6 +1912,13 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Every branch in the repository is a task the store still knows by that
+    /// name — the ordinary case, and the one that leaves [`sweep`]'s tree rules
+    /// exactly as they were.
+    fn all_ours(_: &str) -> Whose {
+        Whose::Task
     }
 
     fn repo(dir: &Path) {
@@ -1853,6 +2115,220 @@ mod tests {
         found.iter().map(|s| s.task.as_str()).collect()
     }
 
+    /// A tree with one commit in it, taken away again the way a person does it
+    /// — leaving exactly what `remove` leaves and what nothing has ever looked
+    /// at: the branch, with no directory.
+    fn abandoned(dir: &Path, task: &str, land: bool) {
+        let wt = checkout_dir(dir, task);
+        ensure(dir, &wt, task, "master").unwrap();
+        std::fs::write(wt.join(format!("{task}.txt")), "work\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "--quiet", "-m", task]);
+        if land {
+            run(dir, &["merge", "--ff-only", "--quiet", task]);
+        }
+        run(dir, &["worktree", "remove", "--force", &wt.display().to_string()]);
+    }
+
+    fn stray_named<'a>(found: &'a [Stray], branch: &str) -> &'a Stray {
+        found.iter().find(|s| s.branch == branch).unwrap_or_else(|| {
+            panic!("{branch} was not among {:?}", found.iter().map(|s| &s.branch).collect::<Vec<_>>())
+        })
+    }
+
+    /// The half of the leak `stale` cannot see, because it reads directories
+    /// and this is a ref.
+    ///
+    /// `remove` keeps a branch git refuses to delete — that is the design, and
+    /// it is what makes taking a tree recoverable — so `--sweep` and `--rm`
+    /// have been *creating* this state since they existed, saying so once on
+    /// stdout and never again. Seven had collected in `~/claude/wsp` by
+    /// 2026-08-20 against eight live trees.
+    #[test]
+    fn a_branch_whose_tree_has_gone_is_seen_and_one_still_being_worked_in_is_not() {
+        let (_env, dir) = scratch("strays");
+        repo(&dir);
+
+        let live = checkout_dir(&dir, "t-live");
+        ensure(&dir, &live, "t-live", "master").unwrap();
+        abandoned(&dir, "t-landed", true);
+        abandoned(&dir, "t-holding", false);
+
+        let found = strays(&dir, &all_ours);
+        let seen: Vec<&str> = found.iter().map(|s| s.branch.as_str()).collect();
+        assert_eq!(seen, vec!["t-holding", "t-landed"], "wrong branches named");
+        // The trunk drops out by being a working tree, not by a special case.
+        assert!(!seen.contains(&"master"), "the trunk's own branch was called abandoned");
+        assert_eq!(stray_named(&found, "t-landed").commits, 0, "a landed branch is holding something");
+        assert_eq!(stray_named(&found, "t-holding").commits, 1, "the unlanded work was not counted");
+    }
+
+    /// The two answers a sweep can give about a branch, and they are the two it
+    /// already gives about a tree: take what the trunk has got, name what it
+    /// has not.
+    ///
+    /// The second is the whole point of looking. A branch with commits on it
+    /// and no tree is *work*, and until it was reported nothing in wsp
+    /// mentioned it after the sweep that made it scrolled off the screen.
+    #[test]
+    fn the_sweep_takes_a_landed_branch_with_no_tree_and_names_one_still_holding_work() {
+        let (_env, dir) = scratch("sweep-strays");
+        repo(&dir);
+        abandoned(&dir, "t-landed", true);
+        abandoned(&dir, "t-holding", false);
+
+        let out = sweep(&dir, &|_| false, &|_| false, &all_ours, &|_| None, false);
+        assert_eq!(out.pruned, vec!["t-landed"], "the wrong branch was taken");
+        assert_eq!(out.stranded.len(), 1, "the work was not named");
+        assert_eq!(out.stranded[0].branch, "t-holding");
+        assert_eq!(out.stranded[0].commits, 1);
+
+        let left = git(&dir, &["branch", "--format=%(refname:short)"]).unwrap();
+        assert!(!left.contains("t-landed"), "the landed branch is still here: {left}");
+        assert!(left.contains("t-holding"), "the unlanded work was taken: {left}");
+        assert!(
+            git(&dir, &["cat-file", "-e", "t-holding^{commit}"]).is_some(),
+            "the commits went with the ref"
+        );
+    }
+
+    /// `-n` on a removing command has to be free, and this one destroys refs
+    /// rather than directories — which is easier to do by accident and just as
+    /// hard to undo without the name.
+    #[test]
+    fn a_dry_sweep_names_the_branch_it_would_take_and_leaves_it() {
+        let (_env, dir) = scratch("sweep-strays-dry");
+        repo(&dir);
+        abandoned(&dir, "t-landed", true);
+
+        let out = sweep(&dir, &|_| false, &|_| false, &all_ours, &|_| None, true);
+        assert_eq!(out.pruned, vec!["t-landed"]);
+        assert!(
+            git(&dir, &["branch", "--format=%(refname:short)"]).unwrap().contains("t-landed"),
+            "a dry run took the branch"
+        );
+    }
+
+    /// The one thing standing between a removing verb and somebody's own work.
+    ///
+    /// A merged topic branch is indistinguishable from wsp's litter by every
+    /// git question there is; the only difference is that wsp did not make it.
+    /// Same refusal `finished` makes for an id the store has never heard of,
+    /// and it matters more here: a sweep run against a store pointed somewhere
+    /// else would otherwise read every branch in the repository as litter.
+    #[test]
+    fn a_branch_wsp_did_not_make_is_not_litter_however_landed_it_is() {
+        let (_env, dir) = scratch("stranger");
+        repo(&dir);
+        abandoned(&dir, "t-landed", true);
+        run(&dir, &["branch", "eds-experiment"]);
+
+        let ours = |b: &str| match b == "t-landed" {
+            true => Whose::Task,
+            false => Whose::Stranger,
+        };
+        let out = sweep(&dir, &|_| false, &|_| false, &ours, &|_| None, false);
+        assert_eq!(out.pruned, vec!["t-landed"]);
+        assert!(
+            git(&dir, &["branch", "--format=%(refname:short)"]).unwrap().contains("eds-experiment"),
+            "a branch wsp did not make was swept"
+        );
+    }
+
+    /// The expensive reading, and the reason the report carries a name rather
+    /// than a count.
+    ///
+    /// `remove`'s own docs name this case and say they cannot repair it: a tree
+    /// made before its task was renumbered is on a branch of the id it had
+    /// then, and once the tree is gone `wsp checkout` under the *new* id cuts a
+    /// fresh branch at the trunk tip — so telling a reader to run it is telling
+    /// them to walk past their work. The line has to name the git command, and
+    /// it has to name the id they know the task by, because nobody remembers
+    /// the old one.
+    #[test]
+    fn a_branch_of_an_id_a_task_no_longer_has_says_which_task_it_is_and_how_to_reach_it() {
+        let (_env, dir) = scratch("stray-renumbered");
+        repo(&dir);
+        abandoned(&dir, "old-3", false);
+
+        let renamed = |b: &str| match b == "old-3" {
+            true => Whose::Former("wsp-9".into()),
+            false => Whose::Stranger,
+        };
+        let found = strays(&dir, &renamed);
+        assert_eq!(found.len(), 1);
+        let line = stranded_line(&found[0]);
+        assert!(line.contains("old-3") && line.contains("wsp-9"), "both ids have to be in it: {line}");
+        assert!(line.contains("git switch old-3"), "the only command that gets the work back: {line}");
+        assert!(!line.contains("`wsp checkout old-3`"), "told to run the verb that cannot find it: {line}");
+
+        // And it is not taken: the whole point is that these commits are the
+        // ones nothing else can reach.
+        let out = sweep(&dir, &|_| false, &|_| false, &renamed, &|_| None, false);
+        assert!(out.pruned.is_empty(), "a branch holding unreachable work was taken");
+        assert_eq!(out.stranded.len(), 1);
+    }
+
+    /// What the store makes of a branch name, which is where the three readings
+    /// come from.
+    #[test]
+    fn the_store_tells_a_task_from_an_id_it_used_to_have_from_a_name_it_never_knew() {
+        let env = util::isolated("co-naming");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        store.save_task(&crate::model::Task::new("live", "wsp-9")).unwrap();
+        std::fs::write(store.ids_path(), r#"{"old-3":"wsp-9"}"#).unwrap();
+
+        let whose = naming(&store);
+        assert_eq!(whose("wsp-9"), Whose::Task);
+        assert_eq!(whose("old-3"), Whose::Former("wsp-9".into()));
+        assert_eq!(whose("eds-experiment"), Whose::Stranger);
+        // A renumbering onto an id the store no longer holds is a stranger too,
+        // rather than advice pointing at a task that is not there.
+        std::fs::write(store.ids_path(), r#"{"old-3":"gone-1"}"#).unwrap();
+        assert_eq!(naming(&store)("old-3"), Whose::Stranger);
+        drop(env);
+    }
+
+    /// `git branch -d` compares against the HEAD of the directory it runs in,
+    /// and `--sweep` is run by an agent standing in its own tree.
+    ///
+    /// So the question git was being asked was "is it merged into *my task
+    /// branch*", which is the wrong branch in both directions: it refuses a
+    /// branch the trunk has and this tree has not — safe, merely confusing —
+    /// and it *deletes* one this tree merged and the trunk never saw. `remove`
+    /// runs it from the trunk, so the ref that is destroyed and the commits
+    /// that are kept are measured against the same branch the tree was judged
+    /// against.
+    #[test]
+    fn a_branch_the_trunk_has_not_got_survives_a_removal_run_from_another_tree() {
+        let (_env, dir) = scratch("remove-from-tree");
+        repo(&dir);
+
+        // One agent's work, committed and never landed.
+        let theirs = checkout_dir(&dir, "t-theirs");
+        ensure(&dir, &theirs, "t-theirs", "master").unwrap();
+        std::fs::write(theirs.join("theirs.txt"), "theirs\n").unwrap();
+        run(&theirs, &["add", "."]);
+        run(&theirs, &["commit", "--quiet", "-m", "theirs"]);
+
+        // Another agent, standing in its own tree, which has taken that work in.
+        let mine = checkout_dir(&dir, "t-mine");
+        ensure(&dir, &mine, "t-mine", "master").unwrap();
+        run(&mine, &["merge", "--quiet", "--no-edit", "t-theirs"]);
+
+        let out = remove(&mine, &theirs);
+        assert_eq!(
+            out.kept.as_deref(),
+            Some("t-theirs"),
+            "the branch was deleted against the wrong HEAD — the trunk has not got it"
+        );
+        assert!(
+            git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/t-theirs"]).is_some(),
+            "the ref is gone and master never had the commit"
+        );
+    }
+
     /// Landing puts commits on the trunk and does nothing else to the tree it
     /// took them from.
     ///
@@ -1903,11 +2379,11 @@ mod tests {
 
         // `-n` says the same thing and touches nothing, which is what makes the
         // first run of a removing command typeable.
-        let looked = sweep(&dir, &closed, &none_passed, &busy, true);
+        let looked = sweep(&dir, &closed, &none_passed, &all_ours, &busy, true);
         assert_eq!(looked.removed, ["t-done"], "the dry run named the wrong trees");
         assert!(checkout_dir(&dir, "t-done").join(".git").exists(), "-n removed a tree");
 
-        let out = sweep(&dir, &closed, &none_passed, &busy, false);
+        let out = sweep(&dir, &closed, &none_passed, &all_ours, &busy, false);
         assert_eq!(out.removed, ["t-done"]);
         assert!(!checkout_dir(&dir, "t-done").exists(), "the finished tree is still here");
         for t in ["t-open", "t-held", "t-messy"] {
@@ -1940,7 +2416,7 @@ mod tests {
         assert_eq!(found[1].why, Why::Landed, "and the one a worklist has evidence about");
         assert!(found[1].note.contains("passed the group"), "the reason did not say what the evidence is");
 
-        let out = sweep(&dir, &never_closed, &passed, &|_| None, false);
+        let out = sweep(&dir, &never_closed, &passed, &all_ours, &|_| None, false);
         assert_eq!(out.removed, ["t-passed"]);
         assert!(checkout_dir(&dir, "t-fresh").join(".git").exists(), "an idle tree was swept on a guess");
     }
@@ -2168,7 +2644,7 @@ mod tests {
         run(&wt, &["add", "."]);
         run(&wt, &["commit", "--quiet", "-m", "never landed"]);
 
-        let out = sweep(&dir, &|_| true, &|_| false, &|_| None, false);
+        let out = sweep(&dir, &|_| true, &|_| false, &all_ours, &|_| None, false);
         assert_eq!(out.removed, ["t-7"]);
         assert_eq!(out.branches, ["t-7"], "the branch went with the tree, and the commit with it");
 
