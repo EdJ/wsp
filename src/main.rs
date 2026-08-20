@@ -1042,8 +1042,9 @@ fn help_text() -> String {
   wsp ls [-p proj] [-t tag] [-s status] [--all]
   wsp find <text> [-p proj] [--all] [--full]
                                     every task the words are in — the title or
-                                    the prose; the project you are in unless
-                                    --all, and it says when the answer is
+                                    the prose; the project you are in and open
+                                    work only, unless --all, which also reaches
+                                    the archive. It says when the answer is
                                     somewhere you did not look. Stops at 20
                                     hits and says how many more; --full for
                                     all of them

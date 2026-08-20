@@ -300,7 +300,8 @@ halves of the answer, and they are the same search.
 
 ```sh
 wsp find tuning              # the project you're standing in, and under it
-wsp find "tuning table" -a   # …or the whole store, finished work included
+wsp find "tuning table" -a   # …or the whole store — finished work, and the
+                             #   archive, marked `archived` on the row
 ```
 
 It looks in the **title, the id and the prose**. The prose is not an extra:
@@ -327,6 +328,15 @@ which key widens it. A scope you cannot see past is a dead end, and a dead end
 is what sends somebody back to reading the whole list. Every hit carries its
 status and its project, and a hit whose *title* does not hold the phrase
 carries the line of prose that put it there.
+
+`--all` widens past the live set as well, which is the same argument one
+boundary out. "1 in the archive" was honest and still a dead end, because it
+withheld the id — and the id is the whole of what a finding aid owes, since
+`wsp show` reads an archived record in full. So `--all` prints those hits as
+rows, `archived` standing where the status goes: a swept task is `done` and a
+removed one kept whatever it had on the way out, and neither is a fact about
+now. They sort last and are counted in the header, so the fact that the archive
+answered survives the cut.
 
 The list stops at twenty and says how many more there are — a short word over a
 store this size answers with a hundred rows, and most of what runs this is an

@@ -134,14 +134,22 @@ pub fn add(store: &Store, args: &Args) -> i32 {
 }
 
 fn filtered(store: &Store, args: &Args, index: &Index, scope: Option<String>) -> Vec<Task> {
+    keep(store.tasks(), args, index, scope)
+}
+
+/// The same filters over a set of tasks somebody else chose.
+///
+/// Split out of [`filtered`] because `find --all` reads the archive as well as
+/// the live store and the two halves have to be filtered by one rule: a hit
+/// that `-p` or `-t` would hide is hidden wherever the file sits.
+fn keep(tasks: Vec<Task>, args: &Args, index: &Index, scope: Option<String>) -> Vec<Task> {
     let want_status = args.get("status").and_then(|s| Status::parse(&s));
     let want_tag = args.get("tag");
     let show_all = args.has("all");
 
     let scope_ids: Option<Vec<String>> = scope.map(|s| index.subtree(&s));
 
-    let mut out: Vec<Task> = store
-        .tasks()
+    let mut out: Vec<Task> = tasks
         .into_iter()
         .filter(|t| match &want_status {
             Some(s) => t.status() == *s,
@@ -228,6 +236,14 @@ pub fn list(store: &Store, args: &Args) -> i32 {
 /// the scope has nothing and the store does, it says how many and what to
 /// type. A default scope you cannot see past is a dead end, and a dead end is
 /// what sends somebody back to reading the whole list.
+///
+/// `--all` reaches the archive too, and that is the same argument one boundary
+/// out. The sentence at the bottom could already see over it — "1 in the
+/// archive" — which is honest and was still a dead end, because it withheld
+/// the id, and the id is the whole of what a finding aid owes: `wsp show`
+/// reads an archived record in full, so the id is a working reference and not
+/// a consolation. Widening the verb rather than naming the ids in the sentence
+/// is what keeps working at three hits.
 pub fn find(store: &Store, args: &Args) -> i32 {
     let needle = args.text(0);
     let needle = needle.trim();
@@ -251,14 +267,34 @@ pub fn find(store: &Store, args: &Args) -> i32 {
         .filter(|t| t.matches(needle))
         .collect();
 
+    // The third thing `--all` widens past. It already takes off the status
+    // filter and the project scope; the live set was the one boundary it left
+    // in place, and `nothing` below has always been able to see over it — it
+    // would say the archive held one and stop, which is a dead end with the
+    // id, the one thing you needed, on the far side of it. Naming those ids in
+    // the sentence was the cheaper fix and it stops working at three.
+    let archived = archived_hits(store, args, &index, scope.clone(), needle);
+
     if args.json() {
-        let out: Vec<_> = hits.iter().map(|t| t.json()).collect();
+        // On every row, not just the archived ones: a caller that has to know
+        // the key is sometimes absent is being asked to guess at the half of
+        // the answer that matters most.
+        let out: Vec<_> = hits
+            .iter()
+            .map(|t| (t, false))
+            .chain(archived.iter().map(|t| (t, true)))
+            .map(|(t, filed)| {
+                let mut v = t.json();
+                v["archived"] = json!(filed);
+                v
+            })
+            .collect();
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
 
     let p = Paint::new();
-    if hits.is_empty() {
+    if hits.is_empty() && archived.is_empty() {
         println!("{}", p.dim(&nothing(store, &index, args, scope.as_deref(), needle)));
         return 0;
     }
@@ -267,7 +303,16 @@ pub fn find(store: &Store, args: &Args) -> i32 {
         Some(s) => format!(" in {s}"),
         None => String::new(),
     };
-    println!("{}", p.dim(&format!("{} matching \"{needle}\"{where_}", hits.len())));
+    // How many of the total are not live, said in the line that is the whole
+    // answer whether or not the list below it is cut. Archived rows sort last,
+    // so they are the first thing the cap takes; this is what keeps the fact
+    // that the archive answered from going with them.
+    let filed = match archived.len() {
+        0 => String::new(),
+        n => format!(" — {n} archived"),
+    };
+    let total = hits.len() + archived.len();
+    println!("{}", p.dim(&format!("{total} matching \"{needle}\"{where_}{filed}")));
 
     // A short word over a store this size answers with a hundred rows, and
     // most of what runs this is an agent that pays for every one of them in
@@ -279,15 +324,20 @@ pub fn find(store: &Store, args: &Args) -> i32 {
     // cut list honest: you can see that the phrase was too broad before you
     // have read a line of it. `--json` is uncapped, because a caller parsing
     // this is not reading it.
+    let rows: Vec<(Task, bool)> = hits
+        .into_iter()
+        .map(|t| (t, false))
+        .chain(archived.into_iter().map(|t| (t, true)))
+        .collect();
     let shown = match args.has("full") {
-        true => hits.len(),
-        false => hits.len().min(FIND_MAX),
+        true => rows.len(),
+        false => rows.len().min(FIND_MAX),
     };
-    print_hits(&hits[..shown], needle, &p);
-    if shown < hits.len() {
+    print_hits(&rows[..shown], needle, &p);
+    if shown < rows.len() {
         println!(
             "{}",
-            p.dim(&format!("  … {} more · wsp find {} --full", hits.len() - shown, quoted(needle)))
+            p.dim(&format!("  … {} more · wsp find {} --full", rows.len() - shown, quoted(needle)))
         );
     }
     0
@@ -307,6 +357,32 @@ fn quoted(needle: &str) -> String {
     }
 }
 
+/// The archive half of a `find`, which is empty unless `--all` was typed.
+///
+/// Separate from [`find`] so a test can ask what the archive answered without
+/// reading printed output, and so the one condition that gates the walk is in
+/// one place.
+fn archived_hits(
+    store: &Store,
+    args: &Args,
+    index: &Index,
+    scope: Option<String>,
+    needle: &str,
+) -> Vec<Task> {
+    if !args.has("all") {
+        return Vec::new();
+    }
+    let mut out: Vec<Task> = keep(store.archived_tasks(), args, index, scope)
+        .into_iter()
+        .filter(|t| t.matches(needle))
+        .collect();
+    // These rows print `archived` where a status would be, so ordering them by
+    // a rank they do not show reads as no order at all. Id order groups them
+    // by project, which is what the eye is using to read the column anyway.
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 /// What to say when the search found nothing, which is the answer a scoped
 /// search most often owes an explanation for.
 ///
@@ -314,8 +390,8 @@ fn quoted(needle: &str) -> String {
 /// reads as "that task does not exist" when what it means is "not here". So
 /// this looks once more, without the scope and without the status filter, and
 /// says which of the two was in the way — and then, when the store genuinely
-/// has nothing, whether the archive does. `--all` widens both at once, so both
-/// halves point at the same key.
+/// has nothing, whether the archive does. `--all` widens all three at once, so
+/// every half points at the same key.
 ///
 /// Only when nothing was found: three passes over the tasks already in memory,
 /// on a search that has otherwise printed a blank.
@@ -349,9 +425,21 @@ fn nothing(store: &Store, index: &Index, args: &Args, scope: Option<&str>, needl
     // Nothing live at all. A task can still be in the archive, which is where
     // `done` work goes after thirty days — and "I know I wrote that down" is
     // exactly the search that ends there.
+    //
+    // The key goes on the end for the same reason it does above: this sentence
+    // used to be the end of the road, and `--all` now prints those rows rather
+    // than counting them. Withheld under the rule this whole function follows
+    // — an explicit `-s` or `-t` is left alone — and withheld again when
+    // `--all` is already on the line, since that is how the archive came to be
+    // searched and it still answered nothing. What it can see from here are
+    // hits some visible filter hid, and naming a key already typed says
+    // nothing about which one to take off.
     match store.archived_tasks().iter().filter(|t| t.matches(needle)).count() {
         0 => format!("nothing matching \"{needle}\""),
-        n => format!("nothing matching \"{needle}\" — {n} in the archive"),
+        n if narrowed || args.has("all") => {
+            format!("nothing matching \"{needle}\" — {n} in the archive")
+        }
+        n => format!("nothing matching \"{needle}\" — {n} in the archive · wsp find {typed} --all"),
     }
 }
 
@@ -363,29 +451,49 @@ fn nothing(store: &Store, index: &Index, args: &Args, scope: Option<&str>, needl
 /// says nothing about what you typed looks like a mistake until it shows the
 /// line that put it there — and that line is usually the answer to "which of
 /// these is the one", which is the actual question a search is asked.
-fn print_hits(hits: &[Task], needle: &str, p: &Paint) {
-    let idw = hits.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
-    for t in hits {
-        let st = match t.status() {
-            Status::Doing => p.cyan(&util::pad("doing", 8)),
-            Status::Blocked => p.red(&util::pad("blocked", 8)),
-            Status::Review => p.yellow(&util::pad("review", 8)),
-            other => p.dim(&util::pad(other.as_str(), 8)),
+fn print_hits(hits: &[(Task, bool)], needle: &str, p: &Paint) {
+    for l in hit_lines(hits, needle, p) {
+        println!("{l}");
+    }
+}
+
+/// The rows, as text — the same split as [`task_lines`], and here for the same
+/// reason: what an archived row says about itself is the behaviour, so a test
+/// has to be able to read it rather than infer it from an exit code.
+fn hit_lines(hits: &[(Task, bool)], needle: &str, p: &Paint) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let idw = hits.iter().map(|(t, _)| t.id.chars().count()).max().unwrap_or(12);
+    for (t, filed) in hits {
+        // An archived row says so in the column that says what state a row is
+        // in, which is the one thing a reader needs before acting on it. The
+        // status underneath is not worth the width: a swept task is `done`, a
+        // removed one kept whatever it had on the way out, and neither is a
+        // fact about now. `wsp show <id>` reads the record in full and prints
+        // both, which is where the row is pointing anyway.
+        let st = match filed {
+            true => p.dim(&util::pad("archived", 8)),
+            false => match t.status() {
+                Status::Doing => p.cyan(&util::pad("doing", 8)),
+                Status::Blocked => p.red(&util::pad("blocked", 8)),
+                Status::Review => p.yellow(&util::pad("review", 8)),
+                other => p.dim(&util::pad(other.as_str(), 8)),
+            },
         };
-        println!(
+        out.push(format!(
             "  {} {} {} {}{}",
             p.dim(&util::pad(&t.id, idw)),
             st,
             paint_prio(p, t.priority()),
             util::truncate(&t.title, 62),
             p.dim(&format!("  [{}]", t.project.clone().unwrap_or_else(|| "inbox".into())))
-        );
+        ));
         if !t.title.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()) {
             if let Some(line) = t.prose_line(needle, 70) {
-                println!("  {}{}", " ".repeat(idw + 1), p.dim(&line));
+                out.push(format!("  {}{}", " ".repeat(idw + 1), p.dim(&line)));
             }
         }
     }
+    out
 }
 
 pub fn inbox(store: &Store, args: &Args) -> i32 {
@@ -2542,10 +2650,89 @@ mod tests {
         assert!(!nothing(&store, &index, &narrowed, Some("verb"), "reverb").contains("finished"));
 
         // Gone from the list entirely, which is where a task you half-remember
-        // most often is: retired, and still the one you meant.
+        // most often is: retired, and still the one you meant. The key goes on
+        // the end now that it prints those rows rather than counting them.
         store.archive_task(&t).unwrap();
         let said = nothing(&store, &index, &args, None, "reverb");
         assert!(said.contains("1 in the archive"), "{said}");
+        assert!(said.contains("--all"), "and it says what reaches them: {said}");
+
+        // Not when `--all` is already on the line. That is how the archive
+        // came to be searched at all, so the hits this can still see are ones
+        // `-p` or `-t` hid, and pointing at a key already typed says nothing
+        // about which of them to take off.
+        let all = Args::synth("find", &["reverb"], &[("all", ""), ("project", "wsp")]);
+        let said = nothing(&store, &index, &all, Some("wsp"), "reverb");
+        assert!(said.contains("1 in the archive") && !said.contains("--all"), "{said}");
+    }
+
+    /// The dead end this task was filed about: `find` could see the archive
+    /// and could not reach it.
+    ///
+    /// "nothing matching X — 1 in the archive" is honest and useless. It
+    /// withholds the id, and the id is the whole of what a finding aid owes,
+    /// because `wsp show` reads an archived record in full — so the id is a
+    /// working reference and not a consolation prize. `--all` already meant
+    /// "widen past the defaults"; the live set was the one boundary it left in
+    /// place.
+    #[test]
+    fn all_reaches_the_archive_and_a_search_without_it_still_does_not() {
+        let store = scratch("find-archived");
+        for id in ["render", "verb"] {
+            store.save_project(&crate::model::Project::new(id)).unwrap();
+        }
+        let mut t = Task::new("Overscrolling has dead travel", "render-018");
+        t.project = Some("render".into());
+        t.updated = "2026-08-15T22:08:05Z".into();
+        store.save_task(&t).unwrap();
+        store.archive_task(&t).unwrap();
+
+        let index = Index::new(store.projects());
+        let plain = Args::synth("find", &["dead travel"], &[]);
+        assert!(
+            archived_hits(&store, &plain, &index, None, "dead travel").is_empty(),
+            "the walk is a directory read per archive month and find runs constantly"
+        );
+
+        let all = Args::synth("find", &["dead travel"], &[("all", "")]);
+        let hits = archived_hits(&store, &all, &index, None, "dead travel");
+        assert_eq!(hits.len(), 1, "and this is the id the sentence used to withhold");
+        assert_eq!(hits[0].id, "render-018");
+
+        // `-p` is a scope somebody typed, and it means the same thing on both
+        // sides of the boundary — an archived task in another project is as
+        // much noise as a live one.
+        let elsewhere = Args::synth("find", &["dead travel"], &[("all", ""), ("project", "verb")]);
+        assert!(
+            archived_hits(&store, &elsewhere, &index, Some("verb".into()), "dead travel").is_empty(),
+            "a filter that is visible is not widened by the flag beside it"
+        );
+    }
+
+    /// What an archived row says about itself, which is the behaviour and not
+    /// a detail of it: a reader who acts on one of these rows as if it were
+    /// live has been misled by the list.
+    ///
+    /// The status underneath is deliberately not shown. A swept task is `done`
+    /// and one removed by hand kept whatever it had on the way out; neither is
+    /// a fact about now, and the column is worth more saying the record is not
+    /// live. Its live neighbour is asserted beside it, because a marker that
+    /// appeared on every row would say nothing.
+    #[test]
+    fn an_archived_row_says_so_where_a_live_row_says_its_status() {
+        let mut live = Task::new("Overscrolling still has dead travel", "render-041");
+        live.project = Some("render".into());
+        live.status_raw = "doing".into();
+        let mut filed = Task::new("Overscrolling has dead travel", "render-018");
+        filed.project = Some("render".into());
+        filed.status_raw = "done".into();
+
+        let rows = vec![(live, false), (filed, true)];
+        let lines = hit_lines(&rows, "dead travel", &Paint::plain());
+
+        assert!(lines[0].contains("render-041") && lines[0].contains("doing"), "{lines:?}");
+        assert!(lines[1].contains("render-018") && lines[1].contains("archived"), "{lines:?}");
+        assert!(!lines[1].contains("done"), "the stale status is not what the column is for: {lines:?}");
     }
 
     /// The floor this verb exists for: a level set at `add` used to be the
