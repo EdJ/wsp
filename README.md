@@ -2354,8 +2354,9 @@ barrier never advances, and the run ceases with every signal healthy. So a seat
 gets a different predicate, not none:
 
 ```
-the seat is running no turn, and nothing it answers for is running one either,
-and it answers for an unsettled member of a running worklist
+the seat is running no turn, nothing it answers for is running one either,
+it answers for an unsettled member of a running worklist,
+and no agent is bound to any of them
 ```
 
 The third clause is the load-bearing half. `worklist-037` proposed *something is
@@ -2368,6 +2369,18 @@ seat; what makes a stopped agent a person's problem is what it *owes*. A running
 worklist is a seat's `doing` — somebody committed to driving that queue and its
 members are written down — and a seat with no run under it is silent however
 long it sits.
+
+The fourth keeps it from doubling every other signal in the table. A member that
+stops while somebody is on it is reported *as that member* — `needs-a-person`,
+`agent-gone`, `blocked` — and adding *and the seat above it is idle* to each of
+those is two lines about one stoppage, which is how a governor learns to skim.
+So the run has to be **unattended**, which is `robustness-083`'s exact shape and
+the one stoppage with no agent to be its subject: the members landed cleanly and
+were despawned, the next group was never started, and there is nothing left in
+the fleet to raise a hand about except the seat that did not advance the
+barrier. It reads bindings rather than the census, so a binding whose pane has
+died stays `agent-gone`'s to report and this takes over on the tick after `wsp
+sync` reaps it — one line per stoppage, the whole way through.
 
 Two things follow that no other signal needed. Its **subject is a seat**, not a
 task, so it is addressed where it is built rather than from the map of task

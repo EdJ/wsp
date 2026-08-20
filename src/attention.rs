@@ -67,9 +67,11 @@
 //!   worklist-037 specified the predicate as `stopped && standing > 0 && seat`
 //!   and **that turned out to be false**: driven against the live store, it
 //!   fires on every healthy seat on this machine, because most of what stands
-//!   on a seat is `review` and a seat cannot take `review` down. The clause
-//!   that replaced it — a seat owes a *run*, not a count — is argued on
-//!   [`cmd_watch::stalled_seats`].
+//!   on a seat is `review` and a seat cannot take `review` down. What replaced
+//!   it is that a seat owes a *run* rather than a count, and that the run has
+//!   to be **unattended** — the one stoppage with no agent to be its subject,
+//!   which is what keeps this from doubling every other level in the table.
+//!   Argued on [`cmd_watch::stalled_seats`].
 //! - *Is an hour right unattended?* Not asked here. The pass reads
 //!   [`cmd_watch::Poll`], which measures how long a level has actually held
 //!   rather than guessing from a proxy.

@@ -1393,6 +1393,7 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 ///     the seat is running no turn
 ///  && nothing it answers for is running one either
 ///  && it answers for an unsettled member of a running worklist
+///  && no agent is bound to any of them
 ///
 /// # The third clause is the whole of it, and the row as filed had another one
 ///
@@ -1428,6 +1429,29 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 /// deliberately, because a seat with work moving under it is being driven by
 /// something whether or not this predicate can see what.
 ///
+/// # The fourth clause: this is the stoppage with no agent to be its subject
+///
+/// Without it the signal doubles every other one in the vocabulary. A member
+/// that stops while somebody is on it is reported *as that member* —
+/// [`Kind::NeedsAPerson`] if its pane is stopped, [`Kind::AgentGone`] if its
+/// pane has died, [`Kind::Blocked`] if it asked a question — and adding *and
+/// the seat above it is idle* to each of those is two lines about one stoppage,
+/// which is how a governor learns to skim. It would also be close to false: a
+/// governor is prompt-driven and does not poll, so five minutes of not having
+/// reacted to a member's stall is not a governor that has died.
+///
+/// So the run has to be **unattended**: no agent bound to any unsettled member.
+/// That is exactly `robustness-083`'s shape and it is the one stoppage with no
+/// agent to be its subject — the members landed cleanly and were despawned,
+/// the next group was never started, and there is nothing left in the fleet to
+/// raise a hand about except the seat that did not advance the barrier.
+///
+/// Bindings and not the census, because the two disagree in a useful direction:
+/// a binding whose pane has gone is [`Kind::AgentGone`]'s to report, and it
+/// keeps this quiet until `wsp sync` reaps it — at which point the member is
+/// genuinely unattended and this takes over. One line per stoppage, the whole
+/// way through.
+///
 /// # Read by the machine reader alone, which is a fact about the predicate
 ///
 /// See [`Kind::SeatStalled`]. A seated scope *is* "what is addressed to me", so
@@ -1443,6 +1467,7 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 fn stalled_seats(
     tasks: &[Task],
     rows: &[cmd_agent::WipRow],
+    bindings: &BTreeMap<String, Value>,
     to: &BTreeMap<String, String>,
     lists: &worklist::Running,
     governors: &BTreeMap<String, Value>,
@@ -1455,10 +1480,18 @@ fn stalled_seats(
         .filter(|r| r.turning)
         .filter_map(|r| to.get(&r.task_id).map(String::as_str))
         .collect();
+    // Who is standing on something. See the fourth clause above: a member with
+    // an agent bound to it has an agent to be the subject of its own stoppage,
+    // and this signal is the one for the stoppage that has none.
+    let attended: BTreeSet<&str> = bindings
+        .values()
+        .filter_map(|b| b.get("task_id").and_then(Value::as_str))
+        .collect();
     // What each seat still owes a run for. `Settlement::of` rather than a status
     // test written out here: `review` being the end of the line is
     // `worklist.rs`'s sentence, and this is its second reader.
     let mut owed: BTreeMap<&str, (BTreeSet<&str>, Vec<&str>)> = BTreeMap::new();
+    let mut held: BTreeSet<&str> = BTreeSet::new();
     for t in tasks.iter() {
         let Some(list) = lists.list_of(&t.id) else { continue };
         if worklist::Settlement::of(t).settled() {
@@ -1469,6 +1502,10 @@ fn stalled_seats(
         // question 3 and its documented no — absence of a decision to have a
         // seat is not a vacancy — and this arm reports occupants, not posts.
         let Some(seat) = to.get(&t.id).filter(|s| s.as_str() != EVERYONE) else { continue };
+        if attended.contains(t.id.as_str()) {
+            held.insert(seat.as_str());
+            continue;
+        }
         let e = owed.entry(seat.as_str()).or_default();
         e.0.insert(list);
         e.1.push(t.id.as_str());
@@ -1486,7 +1523,7 @@ fn stalled_seats(
     }
     let mut out: Vec<Signal> = Vec::new();
     for (scope, panes) in seats {
-        if panes.iter().any(|r| r.turning) || moving.contains(scope) {
+        if panes.iter().any(|r| r.turning) || moving.contains(scope) || held.contains(scope) {
             continue;
         }
         let Some((in_lists, ids)) = owed.get(scope) else { continue };
@@ -1761,7 +1798,15 @@ impl Source for Poll<'_> {
         // one step past that seat, and a map keyed by task id must not get the
         // chance to say otherwise. See [`Signal::subject`].
         if self.scope.all {
-            out.extend(stalled_seats(&wip.tasks, &rows, &to, &lists, &wip.governors, &wip.index));
+            out.extend(stalled_seats(
+                &wip.tasks,
+                &rows,
+                &wip.bindings,
+                &to,
+                &lists,
+                &wip.governors,
+                &wip.index,
+            ));
         }
 
         out.retain(|s| {
@@ -3576,6 +3621,7 @@ mod tests {
         _env: util::Isolated,
         store: Store,
         governors: BTreeMap<String, Value>,
+        bindings: BTreeMap<String, Value>,
         index: Index,
         rows: Vec<cmd_agent::WipRow>,
     }
@@ -3589,6 +3635,7 @@ mod tests {
                 _env: env,
                 store,
                 governors: BTreeMap::new(),
+                bindings: BTreeMap::new(),
                 index: Index::new(Vec::new()),
                 rows: Vec::new(),
             }
@@ -3641,9 +3688,18 @@ mod tests {
             self
         }
 
-        /// A worker in a pane, on a task.
+        /// A worker in a pane, on a task — which is a census row and the
+        /// binding that put it there.
         fn worker(mut self, pane: &str, task: &str, turning: bool) -> Night {
             self.rows.push(row_for(pane, task, None, turning));
+            self.bindings.insert(pane.to_string(), json!({ "task_id": task }));
+            self
+        }
+
+        /// A binding with nobody in it: the pane has gone and `wsp sync` has
+        /// not reaped it yet. Somebody is still recorded as holding the work.
+        fn bound(mut self, pane: &str, task: &str) -> Night {
+            self.bindings.insert(pane.to_string(), json!({ "task_id": task }));
             self
         }
 
@@ -3654,7 +3710,15 @@ mod tests {
                 .iter()
                 .map(|t| (t.id.clone(), addressed_to(&self.index, &self.governors, &lists, t)))
                 .collect();
-            stalled_seats(&tasks, &self.rows, &to, &lists, &self.governors, &self.index)
+            stalled_seats(
+                &tasks,
+                &self.rows,
+                &self.bindings,
+                &to,
+                &lists,
+                &self.governors,
+                &self.index,
+            )
         }
     }
 
@@ -3778,17 +3842,57 @@ mod tests {
     /// Absence of movement is not evidence — the lesson that killed two
     /// hand-rolled watchdogs in one night. What is evidence is the seat being
     /// still *and everything it answers for* being still too, so one turning
-    /// agent anywhere in the scope exempts it, whatever else is true.
+    /// agent anywhere in the scope exempts it, whatever else is true. Here that
+    /// agent is not on the run at all: a seat with work moving under it is
+    /// being driven by something, whether or not this predicate can see what.
     #[test]
     fn a_seat_with_work_moving_under_it_is_being_driven_by_something() {
         let night = Night::new("moving")
             .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Todo)
+            .task("nightly-9", "nightly", Status::Doing)
+            .running("tonight", &["nightly-1"])
+            .seat("nightly", "w1:p1", false)
+            .worker("w2:p1", "nightly-9", true);
+
+        assert!(night.read().is_empty(), "something in the scope is turning");
+    }
+
+    /// **The clause that keeps this from doubling every other signal.** A
+    /// member that stops while somebody is on it is reported as *that member* —
+    /// `needs-a-person`, `agent-gone`, `blocked` — and adding *and the seat
+    /// above it is idle* to each of those is two lines about one stoppage. It
+    /// would also be close to false: a governor is prompt-driven and does not
+    /// poll, so five minutes of not having reacted is not a governor that died.
+    #[test]
+    fn a_member_that_stopped_with_somebody_on_it_is_that_members_stall_and_not_the_seats() {
+        let night = Night::new("attended")
+            .projects(&[("nightly", None)])
             .task("nightly-1", "nightly", Status::Doing)
             .running("tonight", &["nightly-1"])
             .seat("nightly", "w1:p1", false)
-            .worker("w2:p1", "nightly-1", true);
+            .worker("w2:p1", "nightly-1", false);
 
-        assert!(night.read().is_empty(), "a member is turning, so the run is moving");
+        assert!(night.read().is_empty(), "needs-a-person is already saying this, about w2:p1");
+    }
+
+    /// And it hands over rather than overlapping. A binding whose pane has gone
+    /// is `agent-gone`'s to report, so this stays quiet while the record stands
+    /// — and takes over on the tick after `wsp sync` reaps it, when the member
+    /// is genuinely unattended and nothing else in the fleet is its subject.
+    #[test]
+    fn a_binding_nobody_is_in_keeps_this_quiet_until_something_reaps_it() {
+        let night = Night::new("reap")
+            .projects(&[("nightly", None)])
+            .task("nightly-1", "nightly", Status::Doing)
+            .running("tonight", &["nightly-1"])
+            .seat("nightly", "w1:p1", false);
+
+        let mut night = night.bound("w2:p1", "nightly-1");
+        assert!(night.read().is_empty(), "agent-gone owns this one");
+
+        night.bindings.clear();
+        assert_eq!(night.read().len(), 1, "and nothing else is left to be its subject");
     }
 
     /// And the seat turning is the first clause, said the obvious way round.
