@@ -938,8 +938,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // `--no-tree` for the case where you deliberately want the trunk, and a
     // spoken fallback when the tree cannot be made, because a spawn that fails
     // outright over this is worse than a spawn that says where it put you.
+    //
+    // Asked here rather than inside the arm: a flag nothing read and the help
+    // does not list is refused now (`main::unknown_flags`), and a project seat
+    // never reaches this arm, so asking down one branch only would refuse the
+    // word on the other.
+    let no_tree = args.has("no-tree");
     let cwd = match (&work.task, &cwd) {
-        (Some(task), Some(root)) if !args.has("no-tree") => {
+        (Some(task), Some(root)) if !no_tree => {
             Some(crate::cmd_checkout::tree_for(root, task).unwrap_or_else(|| {
                 eprintln!("wsp: no tree of its own for {task} — opening in {root}");
                 root.clone()

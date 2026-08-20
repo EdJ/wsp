@@ -196,6 +196,21 @@ const LITERAL_AFTER: &[(&str, usize)] =
 /// `--supersedes` — and `--` still ends flag parsing everywhere.
 const OWNED_AFTER: &[(&str, &str)] = &[("decide", "supersedes")];
 
+/// Flags a verb still accepts and no longer reads.
+///
+/// [`unknown_flags`] refuses a flag nothing read and the help does not list,
+/// and this is the one shape that is neither: a word kept alive on purpose so
+/// an old invocation still parses. `spawn --no-focus` asks for what already
+/// happens — the default flipped on 2026-08-17 — and it is in [`BOOL_FLAGS`]
+/// precisely so a script that still says it fails to eat the id after it. That
+/// compatibility has been paid for once; refusing the word now would spend it
+/// again from the other end.
+///
+/// One entry, and it should stay short. A verb that has genuinely stopped
+/// taking a flag deletes it from here and from [`BOOL_FLAGS`] together, which
+/// is the moment the refusal is the right answer.
+const ACCEPTED_UNREAD: &[(&str, &str)] = &[("spawn", "no-focus")];
+
 pub struct Args {
     pub cmd: String,
     pub rest: Vec<String>,
@@ -656,32 +671,47 @@ fn main() {
             2
         }
     };
-    std::process::exit(dropped_words(&args, code));
+    std::process::exit(misheard(&args, code));
 }
 
-/// Say what the command line gave and nothing read, and fail if there was any.
+/// Say what the command line gave and wsp did not hear, and fail if there was
+/// any.
 ///
-/// The argument is on [`Args::dropped`]. Two things are settled here.
+/// Two halves, and they answer the two ways a word goes missing. A flag that
+/// **took a word** nothing read is [`Args::dropped`] and `worklist-036`. A flag
+/// that **stands alone** and is no flag of this verb is [`unknown_flags`] and
+/// `worklist-038`. A flag that is both is reported once, as the second: "there
+/// is no such flag" is the more useful of the two sentences, and it makes the
+/// other one redundant.
 ///
 /// **A command that already failed is left alone.** It has said why in its own
 /// words, and a verb that stopped early may not have reached the flag it does
 /// read — so the same message would be both noise and a lie about the verb.
-/// What this is for is the *other* case, which is the whole of `worklist-036`:
-/// success reported over a word that went nowhere.
-///
-/// **And it does not say the verb has no such flag**, because it cannot know
-/// that: nothing read it *on this path* is all a read tally can honestly claim.
-/// It says what happened to the word, which is the part the caller needs.
-fn dropped_words(args: &Args, code: i32) -> i32 {
+/// What this is for is the *other* case: success reported over a word that
+/// went nowhere.
+fn misheard(args: &Args, code: i32) -> i32 {
     // Said in its own words already. See above.
     if code != 0 {
         return code;
     }
-    let dropped = args.dropped();
-    if dropped.is_empty() {
+    let unknown = unknown_flags(args);
+    let dropped: Vec<String> =
+        args.dropped().into_iter().filter(|d| !unknown.iter().any(|u| u.name == *d)).collect();
+    if unknown.is_empty() && dropped.is_empty() {
         return code;
     }
     let p = util::Paint::new();
+    for u in &unknown {
+        let name = p.bold(&format!("--{}", u.name));
+        let meant = match &u.meant {
+            Some(m) => format!(" — did you mean --{m}?"),
+            None => String::new(),
+        };
+        match &u.verb {
+            Some(v) => eprintln!("wsp: `wsp {v}` has no {name}{meant}"),
+            None => eprintln!("wsp: no wsp verb takes {name}{meant}"),
+        }
+    }
     for name in &dropped {
         let value = args.get(name).unwrap_or_default();
         eprintln!(
@@ -694,10 +724,289 @@ fn dropped_words(args: &Args, code: i32) -> i32 {
     2
 }
 
+/// A flag that was given, that nothing read, and that the verb does not take.
+struct Unknown {
+    name: String,
+    /// The help entry the verdict came from — `ls`, `project add` — or `None`
+    /// when the help does not describe this invocation and the claim is only
+    /// that no verb anywhere takes the name.
+    verb: Option<String>,
+    /// The nearest flag it could have been.
+    meant: Option<String>,
+}
+
+/// Every flag on the command line that wsp has no use for.
+///
+/// # Why the help and not a table
+///
+/// [`Args::dropped`] catches a flag that *ate a word*. The other half —
+/// `worklist-038` — is a flag that stands alone: `wsp ls --al` for `--all`
+/// drops nothing, so a read tally alone cannot tell it from `--force` on a
+/// branch this run did not take. Telling those apart needs a vocabulary.
+///
+/// The vocabulary the row proposed was a table beside [`LITERAL_AFTER`], sixty
+/// entries kept by hand, and its own overview said why that was not worth
+/// having: a second copy of what every verb already knows, whose omissions
+/// refuse commands that were always valid, and which nothing in the build can
+/// check because a flag read three helpers deep is unreachable to any grep.
+///
+/// So the table is not written; it is **read off the help**, which is the
+/// declaration that already exists. It is the document a person is sent to when
+/// a flag is refused, it is maintained because it is the map, and
+/// `every_verb_the_binary_answers_to_is_on_the_map` already checks it against
+/// the dispatch. A verb's flags stop being a second copy when they are the
+/// first one.
+///
+/// That still leaves the two failures the row feared, and both are closed by
+/// what the parser already tracks:
+///
+/// - **A flag the help does not mention.** `--socket`, `--payload`, `--ratio`,
+///   `--days` and eighteen others are real and undocumented, and refusing them
+///   would be exactly the regression the row warned of. So a flag **anything
+///   read** is never refused, whatever the help says — [`Args::mark`] records
+///   the ask, not the answer, so `args.has("force")` counts even when `--force`
+///   was not given. This also reaches what no grep can: `cmd_watch::spec`
+///   reads `--every`, `--settle` and `--heartbeat` through a closure over a
+///   `&str`, and the tally sees all three.
+/// - **A flag read only down the branch this run did not take.** Then nothing
+///   read it and the help must carry it. Two did not: `spawn --no-tree`, which
+///   now asks before it branches, and `spawn --no-focus`, which nothing reads
+///   by design and is in [`ACCEPTED_UNREAD`].
+///
+/// What is left is a name nobody asked about and no line of the help gives to
+/// this verb, which is a typo or a flag meant for a different command.
+///
+/// The hazard that stays is the second case appearing later: a return added
+/// ahead of a read turns an undocumented flag into a refused one, and no test
+/// can see it coming because it is a control-flow change three files away.
+/// Driving the verbs found two already — `peek --source`/`--lines`, which the
+/// surface branch returns before reading, and `flag --seen`, which is not read
+/// when no id is given — and both are now on the help, where they should have
+/// been. That is the shape of the repair every time: one line on the map, not
+/// an entry in a table nobody reads.
+///
+/// After the command has run, for [`Args::dropped`]'s reason: the read tally is
+/// only complete once the verb has finished asking. The row wanted the refusal
+/// ahead of the act; that is available only to a check with no read tally
+/// behind it, and the tally is what makes this one safe.
+fn unknown_flags(args: &Args) -> Vec<Unknown> {
+    let read = args.read.borrow();
+    let mut given: Vec<&str> = args
+        .flags
+        .keys()
+        .map(String::as_str)
+        .filter(|n| !read.contains(*n))
+        .filter(|n| !GLOBAL_FLAGS.contains(n))
+        .filter(|n| !ACCEPTED_UNREAD.iter().any(|(c, f)| *c == args.cmd && f == n))
+        .collect();
+    if given.is_empty() {
+        return Vec::new();
+    }
+    given.sort_unstable();
+
+    let table = vocabulary();
+    let entry = help_entry(&table, args);
+    let mut out = Vec::new();
+    for name in given {
+        // With an entry, the claim is about this verb. Without one — an alias
+        // the help spells differently, a subcommand it does not list — the only
+        // honest claim left is that no verb anywhere takes the name, which
+        // still catches a typo and never refuses a flag some verb does take.
+        let known: Vec<&str> = match &entry {
+            Some((_, set)) => set.iter().map(String::as_str).collect(),
+            None => table.values().flatten().map(String::as_str).collect(),
+        };
+        if known.contains(&name) {
+            continue;
+        }
+        out.push(Unknown {
+            name: name.to_string(),
+            verb: entry.as_ref().map(|(k, _)| (*k).to_string()),
+            meant: nearest(name, &known),
+        });
+    }
+    out
+}
+
+/// The help entry this invocation is answered by.
+///
+/// `wsp project add` is its own line with its own flags and `wsp show <id>` is
+/// not, so the subject is tried as a subcommand first and dropped when the help
+/// has no such line. A verb the help *does* split into subcommands — `project`,
+/// `worklist`, `panel` — answers for nothing but itself once a subject is
+/// given: `panel storyboard` takes flags `panel` does not, and borrowing
+/// `panel`'s list would refuse them.
+fn help_entry<'a>(
+    table: &'a HashMap<String, HashSet<String>>,
+    args: &Args,
+) -> Option<(&'a str, &'a HashSet<String>)> {
+    let found = |k: &str| table.get_key_value(k).map(|(k, v)| (k.as_str(), v));
+    if let Some(subject) = args.rest.first() {
+        if let Some(hit) = found(&format!("{} {subject}", args.cmd)) {
+            return Some(hit);
+        }
+        let prefix = format!("{} ", args.cmd);
+        if table.keys().any(|k| k.starts_with(&prefix)) {
+            return None;
+        }
+    }
+    found(&args.cmd)
+}
+
+/// The flags the help gives each verb, keyed by the words a caller types.
+///
+/// Entries are `  wsp <verb>` lines and the indented prose under them, because
+/// the help says `--focus` in the paragraph below `wsp spawn` as often as in
+/// the usage line above it. A second word is a subcommand only when it is one
+/// space along and made of letters, which is what separates `wsp project add`
+/// from `wsp brief` and its column of description. Short flags go through
+/// [`expand_short`], since that is the name [`Args`] stores.
+///
+/// Not cached: it is built at most once per process, and only on a run that
+/// already has a word nothing read.
+fn vocabulary() -> HashMap<String, HashSet<String>> {
+    let mut table: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut keys: Vec<String> = Vec::new();
+    for line in help_text().lines() {
+        // Column zero is a section heading or the closing notes, which belong
+        // to no verb.
+        if !line.starts_with("  ") || line.trim().is_empty() {
+            keys.clear();
+            continue;
+        }
+        if let Some(usage) = line.strip_prefix("  wsp ") {
+            keys = entry_keys(usage);
+            for k in &keys {
+                table.entry(k.clone()).or_default();
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        for f in flags_named(line) {
+            for k in &keys {
+                table.get_mut(k).expect("the key was just inserted").insert(f.clone());
+            }
+        }
+    }
+    table
+}
+
+/// `project ls|projects [--tag T] …` is `["project ls", "project projects"]`.
+fn entry_keys(usage: &str) -> Vec<String> {
+    let word = |w: &str| {
+        !w.is_empty()
+            && !w.starts_with('-')
+            && w.chars().all(|c| c.is_ascii_lowercase() || c == '-' || c == '|')
+    };
+    let verb = usage.split(' ').next().unwrap_or_default();
+    if !word(verb) {
+        return Vec::new();
+    }
+    // One space and then a word: `wsp machine ls`. Two or more spaces is the
+    // description column — `wsp brief          what this pane is for`.
+    let sub = usage[verb.len()..]
+        .strip_prefix(' ')
+        .map(|r| r.split(' ').next().unwrap_or_default())
+        .filter(|w| word(w));
+    let mut out = Vec::new();
+    for v in verb.split('|') {
+        match sub {
+            Some(s) => out.extend(s.split('|').map(|s| format!("{v} {s}"))),
+            None => out.push(v.to_string()),
+        }
+    }
+    out
+}
+
+/// Every flag name a line of help mentions.
+///
+/// A dash only starts a flag when the character before it is not part of a
+/// word, so `sub-task` and `write-ahead-only` name nothing, and `-ui` in
+/// `wsp tag <id> +dsp -ui` is two letters and so not a short flag either.
+fn flags_named(line: &str) -> Vec<String> {
+    let c: Vec<char> = line.chars().collect();
+    let wordish = |ch: char| ch.is_ascii_alphanumeric() || ch == '-';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] != '-' || (i > 0 && wordish(c[i - 1])) {
+            i += 1;
+            continue;
+        }
+        if c.get(i + 1) == Some(&'-') {
+            let start = i + 2;
+            let mut j = start;
+            while j < c.len() && (c[j].is_ascii_lowercase() || c[j].is_ascii_digit() || c[j] == '-')
+            {
+                j += 1;
+            }
+            if j > start && c[start].is_ascii_lowercase() {
+                let name: String = c[start..j].iter().collect();
+                out.push(name.trim_end_matches('-').to_string());
+            }
+            i = j.max(i + 2);
+        } else if c.get(i + 1).is_some_and(char::is_ascii_lowercase)
+            && !c.get(i + 2).copied().is_some_and(wordish)
+        {
+            out.push(expand_short(&c[i + 1].to_string()));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The flag a misspelling was probably reaching for, within two edits.
+///
+/// Worth the twenty lines because the refusal arrives *after* the command ran:
+/// the caller is being told to run it again, and the whole cost of that is
+/// finding the right word.
+fn nearest(name: &str, known: &[&str]) -> Option<String> {
+    if name.len() < 2 {
+        return None;
+    }
+    known
+        .iter()
+        .map(|k| (edits(name, k), *k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, k)| (*d, k.len()))
+        .map(|(_, k)| k.to_string())
+}
+
+/// Levenshtein distance, one row at a time.
+fn edits(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut row = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            row[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(row[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut row);
+    }
+    prev[b.len()]
+}
+
 fn help() {
+    println!("{}", help_text());
+}
+
+/// The help as one string, so that the check on flag names can read it.
+///
+/// The argument for building it rather than printing it is in [`vocabulary`]:
+/// this text is the only per-verb declaration of what a verb takes that already
+/// exists, is already read by people, and is already checked against the
+/// dispatch. Rendering it costs a `format!` of twelve kilobytes, paid only when
+/// something on the command line went unread — which is never on a run that
+/// spelled everything right.
+fn help_text() -> String {
     let p = util::Paint::new();
     let h = |s: &str| p.bold(s);
-    println!(
+    format!(
         r#"{name} {version} — workspace and task control plane for herdr
 
 {projects}
@@ -873,8 +1182,12 @@ fn help() {
   wsp attempts [<task|proj>] [--all]  every attempt at that work: the tier it was
                                     spawned at, the tier that actually served it,
                                     how long to review, and whether it came back
-  wsp peek [panel|view|board|<task>]  what is on that pane, or the frame the
-                                    sidebar surface last drew
+  wsp peek [panel|view|board|<task>] [--source recent] [--lines N]
+                                    what is on that pane, or the frame the
+                                    sidebar surface last drew; --source recent
+                                    reaches back through what has scrolled past,
+                                    for when the question is what happened
+                                    rather than what is showing
   wsp tell <id> "…" | - | --from F  say something to the agent holding that
                                     task, without ending it — `-` reads the
                                     message from stdin, --from from a file. The
@@ -960,8 +1273,11 @@ fn help() {
   wsp flag <id> --from FILE         …with that paragraph out of a file, the
                                     spelling every other prose verb takes
   wsp flag <id> --ask claim         …and a question a keypress answers
-  wsp flag [--clear <id>] [--seat]  what is raised, and whose it is; --seat
+  wsp flag [--clear <id>] [--seen <id>] [--seat]
+                                    what is raised, and whose it is; --seat
                                     narrows it to this seat's own; --clear lowers
+                                    one, and --seen puts the card away and
+                                    leaves the hand up
   wsp ask <id> ["…"|-|--from F]     a question about a task, with a return path:
                                     the answer comes back to you and lands on a
                                     task's log. `wsp tell` is still for prose
@@ -990,7 +1306,9 @@ Text that starts with a flag is text: `wsp note <id> "--parent is add-only"` and
 `wsp tag <id> +dsp -ui` both mean what they say. `--` still ends flag parsing,
 for the one case that needs it — a payload that is a single flag-shaped word.
 A flag wsp does not know still takes the word after it, so a command that ends
-with a value nothing read says so and exits 2 — the word went nowhere.
+with a value nothing read says so and exits 2 — the word went nowhere. A flag
+this page does not give the verb, and that the verb never asked about, is
+refused by name and exits 2 the same way.
 Every command takes --json. Set WSP_HOME to relocate the store.
 --terse, or WSP_TERSE=1 for a whole session, leaves out what you already have:
 the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
@@ -1002,7 +1320,7 @@ the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
         machines = h("MACHINES"),
         worklists = h("WORKLISTS"),
         plumbing = h("PLUMBING"),
-    );
+    )
 }
 
 #[cfg(test)]
@@ -1049,13 +1367,17 @@ mod tests {
         out
     }
 
-    fn help_text() -> &'static str {
+    /// The help as it is written, not as it is rendered — the tests that read
+    /// the map want the source. `fn help()` is the one-line printer and
+    /// `help_text` under it holds the string, so splitting on the printer's
+    /// signature reaches both.
+    fn help_source() -> &'static str {
         SRC.split("fn help()").nth(1).expect("the help moved")
     }
 
     #[test]
     fn every_verb_the_binary_answers_to_is_on_the_map() {
-        let help = help_text();
+        let help = help_source();
         // `wsp start|review|reopen` puts three verbs on one line, so a name
         // counts wherever it is followed by a space, a newline or the next
         // alternative.
@@ -1258,7 +1580,7 @@ mod tests {
 
         let a = parse(&["flag", "acc-005", "--form", "finding.txt"]);
         assert_eq!(a.dropped(), vec!["form"], "the path went nowhere and nothing said so");
-        assert_eq!(super::dropped_words(&a, 0), 2, "and the exit code carried it");
+        assert_eq!(super::misheard(&a, 0), 2, "and the exit code carried it");
 
         // Read is read, however it was read.
         let a = parse(&["flag", "acc-005", "--from", "finding.txt"]);
@@ -1281,7 +1603,7 @@ mod tests {
         // A command that already failed is left alone entirely: it has said why
         // in its own words, and a verb that stopped early may simply not have
         // reached the flag it does read.
-        assert_eq!(super::dropped_words(&a, 1), 1);
+        assert_eq!(super::misheard(&a, 1), 1);
 
         // A command line one command builds for another never met a shell, so
         // there is nothing on it to have been dropped.
@@ -1324,5 +1646,149 @@ mod tests {
         assert!(needs_store(&Args::synth("ls", &[], &[])));
         // And it is `panel storyboard`, not the word anywhere in the line.
         assert!(needs_store(&Args::synth("storyboard", &[], &[])));
+    }
+
+    /// The half of `worklist-036` that a read tally alone cannot reach: a flag
+    /// that stands for itself, drops no word, and is not the flag it was meant
+    /// to be. `--al` is `--all` mistyped, and it went by in silence.
+    #[test]
+    fn a_flag_the_verb_does_not_take_is_refused_by_name() {
+        let a = args(&["ls", "--al"]);
+        let u = super::unknown_flags(&a);
+        assert_eq!(u.len(), 1, "a mistyped flag went by");
+        assert_eq!(u[0].name, "al");
+        assert_eq!(u[0].verb.as_deref(), Some("ls"), "the verdict named the wrong entry");
+        assert_eq!(u[0].meant.as_deref(), Some("all"), "the near miss was not offered");
+        assert_eq!(super::misheard(&a, 0), 2, "and the exit code did not carry it");
+    }
+
+    /// A real flag on the wrong verb, which is the case a spell-check misses:
+    /// `--seat` is a flag, it is spelled right, and `ls` has never taken it.
+    #[test]
+    fn a_flag_of_another_verb_is_refused_on_this_one() {
+        let a = args(&["ls", "--seat"]);
+        let u = super::unknown_flags(&a);
+        assert_eq!(u.len(), 1, "a flag borrowed from another verb was accepted");
+        assert_eq!(u[0].verb.as_deref(), Some("ls"));
+    }
+
+    /// The refusal is never about the help alone. Twenty-odd flags are real and
+    /// undocumented — `--socket`, `--payload`, `--ratio` — and the tally of
+    /// what the verb *asked about* is what keeps them working. Whether they
+    /// were given is beside the point: `Args::mark` records the ask.
+    #[test]
+    fn a_flag_the_verb_asked_about_is_never_refused() {
+        let a = args(&["panel", "install", "--ratio", "0.3"]);
+        assert!(!super::unknown_flags(&a).is_empty(), "the help does not list --ratio");
+        a.get("ratio");
+        assert!(super::unknown_flags(&a).is_empty(), "a flag the verb read was still refused");
+    }
+
+    /// `--no-focus` asks for what already happens and nothing reads it, which
+    /// is the exact shape the row said this check would break. It is in
+    /// `ACCEPTED_UNREAD` and it goes on parsing.
+    #[test]
+    fn a_flag_kept_only_for_compatibility_is_still_accepted() {
+        assert!(super::unknown_flags(&args(&["spawn", "t-1", "--no-focus"])).is_empty());
+        // And only on the verb that keeps it. Anywhere else it is a word that
+        // means nothing, which is the honest answer.
+        assert!(!super::unknown_flags(&args(&["ls", "--no-focus"])).is_empty());
+    }
+
+    /// The net under the whole thing: every usage line the help prints has to
+    /// survive the check that is read off it. It is the same document twice,
+    /// which is the point — what it can still catch is the *reading* going
+    /// wrong: a continuation paragraph landing on the next verb's entry, a
+    /// subcommand mistaken for a description column, a short flag not expanded
+    /// to the name `Args` stores. Any of those refuses a command the help
+    /// documents, and this is how that is heard at build time rather than by
+    /// somebody typing it.
+    #[test]
+    fn every_flag_the_help_documents_is_accepted_by_the_verb_it_documents_it_for() {
+        let mut lines = 0;
+        for line in help_source().lines() {
+            let Some(usage) = line.strip_prefix("  wsp ") else { continue };
+            let keys = super::entry_keys(usage);
+            let Some(key) = keys.first() else { continue };
+            let flags = super::flags_named(line);
+            if flags.is_empty() {
+                continue;
+            }
+            lines += 1;
+            let mut argv: Vec<String> = key.split(' ').map(str::to_string).collect();
+            // A value, so the flag is not left standing at the end of the line
+            // where `scan` would read the next flag as its argument.
+            argv.extend(flags.iter().flat_map(|f| [format!("--{f}"), "x".into()]));
+            let a = super::Args::parse(argv);
+            let refused: Vec<String> =
+                super::unknown_flags(&a).into_iter().map(|u| u.name).collect();
+            assert!(refused.is_empty(), "`wsp {usage}` would be refused its own {refused:?}");
+        }
+        assert!(lines > 40, "the help parse found flags on only {lines} lines");
+    }
+
+    /// The other direction of `every_verb_the_binary_answers_to_is_on_the_map`,
+    /// and the one that catches the reading rather than the writing. Every
+    /// entry the vocabulary builds has to be a verb the binary answers to, or
+    /// the parse has invented a command out of a description column — and an
+    /// invented entry answers for a real invocation with the wrong list.
+    #[test]
+    fn every_entry_read_off_the_help_is_a_verb_the_binary_answers_to() {
+        let arms: Vec<String> = dispatch().into_iter().flatten().collect();
+        let table = super::vocabulary();
+        assert!(table.len() > 60, "the help parse found only {} entries", table.len());
+        let invented: Vec<&String> = table
+            .keys()
+            .filter(|k| !arms.contains(&k.split(' ').next().unwrap_or_default().to_string()))
+            .collect();
+        assert!(invented.is_empty(), "entries no verb answers to: {invented:?}");
+    }
+
+    /// A verb the help splits into subcommands answers for its subcommands and
+    /// for nothing else. `panel storyboard` takes flags `panel` does not, and
+    /// borrowing `panel`'s list would refuse them; `show <id>` is not a
+    /// subcommand at all and must still be answered by `show`.
+    #[test]
+    fn a_subject_is_a_subcommand_only_where_the_help_says_so() {
+        let table = super::vocabulary();
+        let key = |argv: &[&str]| {
+            let a = super::Args::parse(argv.iter().map(|s| (*s).to_string()).collect());
+            super::help_entry(&table, &a).map(|(k, _)| k.to_string())
+        };
+        assert_eq!(key(&["project", "add", "x"]).as_deref(), Some("project add"));
+        assert_eq!(key(&["show", "worklist-038"]).as_deref(), Some("show"));
+        assert_eq!(key(&["panel"]).as_deref(), Some("panel"));
+        assert_eq!(key(&["panel", "storyboard"]), None, "storyboard borrowed panel's flags");
+    }
+
+    /// An alias the help spells differently — `list` for `ls` — has no entry,
+    /// and the check drops to the only claim it can still make honestly: no
+    /// verb anywhere takes this name. It still catches the typo and it never
+    /// refuses a flag that is real somewhere.
+    #[test]
+    fn an_alias_the_help_does_not_spell_is_still_spell_checked() {
+        let a = args(&["list", "--al"]);
+        let u = super::unknown_flags(&a);
+        assert_eq!(u.len(), 1);
+        assert!(u[0].verb.is_none(), "it claimed to know what `list` takes");
+        assert_eq!(u[0].meant.as_deref(), Some("all"));
+        // `--seat` is no flag of `ls`, but the fallback cannot say so.
+        assert!(super::unknown_flags(&args(&["list", "--seat"])).is_empty());
+    }
+
+    /// Both halves report, and a flag that is both is one message. "There is no
+    /// such flag" says everything the dropped word would have, and saying both
+    /// about one word reads as two faults.
+    #[test]
+    fn a_word_lost_to_a_flag_that_does_not_exist_is_reported_once() {
+        let a = args(&["flag", "wsp-1", "--form", "/tmp/x"]);
+        let u = super::unknown_flags(&a);
+        assert_eq!(u.len(), 1, "the unknown flag was not named");
+        assert_eq!(u[0].meant.as_deref(), Some("from"));
+        assert_eq!(a.dropped(), vec!["form"], "and it did take the path with it");
+    }
+
+    fn args(argv: &[&str]) -> super::Args {
+        super::Args::parse(argv.iter().map(|s| (*s).to_string()).collect())
     }
 }
