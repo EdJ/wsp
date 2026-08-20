@@ -1885,9 +1885,20 @@ and never anything in between — it is a level, so it is said once and does not
 repeat on a timer. `.data` carries `kind`, which is the field to filter on:
 `direction` is the reading a keypress repairs (an agent stopped on a permission
 prompt), `stop` and the rest are whatever the asker said, and a derived level
-with nobody behind it is `note`. `to` is the seat that answers for it, or
+with nobody behind it is `note`. `to` is the seat this line is for, or
 `everyone`. On an `unanswered` level `.data.id` is the question's message id, so
 a hook can print what to type: `wsp answer <id> "…"`.
+
+There is a third kind and it is neither of those. `attention-moved` is a level
+that **did not go anywhere** — a seat was taken or stood down, or a worklist
+finished under it, and somebody else answers for it now. `to` is the seat that
+lost it and `.data.moved_to` names the seat that has it. It is deliberately not
+folded into `attention-cleared`, because a governor reading *cleared* for a hand
+somebody else is holding stops looking at a live hand — which is worse than
+never hearing, and is what `worklist-039` found happening four times in a night.
+A machine with only `on-attention-raised` installed hears nothing about a
+hand-over; `ln ~/wsp/hooks/on-attention-raised ~/wsp/hooks/on-attention-moved`
+is the whole of opting in.
 
 Nothing is shipped enabled, and `wsp doctor` says so while `hooks/` is empty —
 what may interrupt you at 3am is not a tool's decision, but a delivery path with
@@ -3766,7 +3777,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/fake.rs` | a backend that answers that socket out of a state we choose — `wsp sandbox --fake` |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh, and the pass that looks when nobody asked |
-| `src/attention.rs` | that pass: the level set derived on a timer, the ledger that survives the process, and the one edge that leaves it — `hooks/on-attention-raised` |
+| `src/attention.rs` | that pass: the level set derived on a timer, the ledger that survives the process, who each level is addressed to, and the three edges that leave it — `hooks/on-attention-{raised,cleared,moved}` |
 | `src/input.rs` | terminal bytes → keys: the escape-sequence parser |
 | `src/panel/rows.rs` | what is in the tree, and how each row draws |
 | `src/panel/render.rs` | `Line`/`Style`, the frame, and the ansi + html backends |
@@ -3784,7 +3795,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
 | `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker |
-| `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, and the five ways silence lies |
+| `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, who each one is addressed to, and the six ways silence lies |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
 | `src/cmd_machine.rs` | the machines agents can be run on |

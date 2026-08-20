@@ -96,12 +96,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::cmd_govern;
 use crate::cmd_watch::{Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source};
-use crate::resolve::Index;
 use crate::store::Store;
 use crate::util;
-use crate::worklist;
 
 /// How often the pass runs, in seconds.
 ///
@@ -145,55 +142,24 @@ const SETTLE: i64 = 5 * 60;
 /// a person wants the machine's own reading.
 pub(crate) const KEY: &str = "daemon";
 
-/// Who a signal is for, or `everyone`.
-///
-/// Per signal, which is the one thing a subscription cannot do: `wsp watch`
-/// asks one scope's question and every answer is that scope's, while the pass
-/// asks the machine's and every answer goes somewhere different.
-///
-/// [`cmd_govern::seat_for`] and not a walk of our own, so a signal reaches
-/// exactly the seat a hand raised on the same task would — including the
-/// running worklist's seat, which is tried before the project chain. A subject
-/// that is not a task at all (`herdr`, for [`Kind::Blind`]) has no chain to
-/// walk and is everybody's by construction, which is correct: wsp being unable
-/// to see the agents is not one seat's problem.
-///
-/// [`Store::task`] and deliberately not [`Store::task_now`], which is the
-/// resolving read every other place that turns a *recorded* id into a task now
-/// uses. A subject arrives here off the ledger, and the ledger persists in
-/// `watches.json` — so this looked like the fourth instance of the raw-read
-/// fault. It is not, because `watches.json` is in
-/// [`Store::state_files_with_ids`]: the ledger's subjects are rewritten by a
-/// renumbering, so an id that misses here is one that has genuinely gone, and a
-/// falling edge on work nobody can find belongs to everybody.
-fn addressee(
-    store: &Store,
-    index: &Index,
-    governors: &BTreeMap<String, Value>,
-    lists: &worklist::Running,
-    subject: &str,
-) -> String {
-    let Some(task) = store.task(subject) else { return EVERYONE.into() };
-    cmd_govern::seat_for(governors, index, lists.list_of(&task.id), task.project.as_deref())
-        .map(|s| s.scope)
-        .unwrap_or_else(|| EVERYONE.into())
-}
-
-/// The address of a signal nobody in particular answers for.
-///
-/// A word rather than an absent field, because the reader is a shell script:
-/// `everyone` is a thing to test for and a null is a thing to forget to test
-/// for. It is the panel's own last resort said out loud — `wsp flag`'s
-/// *"raised on every panel"* — and it is the common case on a machine with no
-/// seats, which is why `wsp-095` Part 9 asks that it be visible rather than
-/// silently universal.
-pub(crate) const EVERYONE: &str = "everyone";
+/// The address of a signal nobody in particular answers for, where the level
+/// that carries it is defined. See [`crate::cmd_watch::EVERYONE`].
+pub(crate) use crate::cmd_watch::EVERYONE;
 
 /// The event kind an edge is logged and hooked under.
+///
+/// Three words for three edges. `attention-moved` is deliberately not a
+/// `-cleared` with a field on it: a hook is `~/wsp/hooks/on-<kind>`, so the
+/// kind **is** the routing, and folding a move into `cleared` would hand every
+/// existing hook a hand-lowered event for a hand that is still up. A machine
+/// with no `on-attention-moved` hook hears nothing about a move, which is the
+/// silence it already had, and the one with a hook opts into a fact it did not
+/// have before — see [`Edge::Left`].
 fn event_kind(edge: Edge) -> &'static str {
     match edge {
         Edge::Up => "attention-raised",
         Edge::Down => "attention-cleared",
+        Edge::Left => "attention-moved",
     }
 }
 
@@ -327,7 +293,7 @@ pub(crate) fn tick(store: &Store, pass: &mut Pass, source: &mut dyn Source, at: 
     // whole of what makes this affordable is that `prime` keeps what it
     // recognises.
     let emits = match known {
-        true => ledger.advance(&now, at, SETTLE),
+        true => ledger.advance(&now, &source.routing(), at, SETTLE),
         false => ledger.prime(&now, at),
     };
     // The ledger is written **before** anything is delivered, and that order is
@@ -352,13 +318,23 @@ fn deliver(store: &Store, emits: &[Emit]) {
     if emits.is_empty() {
         return;
     }
-    let index = Index::new(store.projects());
-    let governors = store.governors();
-    let lists = worklist::Running::read(store);
     let stamp = util::now_iso();
     for e in emits {
-        let to = addressee(store, &index, &governors, &lists, &e.signal.subject);
-        store.log_event(event_kind(e.edge), payload(&e.signal, e.edge, &to, &stamp, e.held));
+        // **[`Emit::to`], and this line used to take the routing walk itself.**
+        // That is `worklist-039`'s daemon half. Addressing per signal is the
+        // one thing a subscription cannot do — `wsp watch` asks one scope's
+        // question and every answer is that scope's, while the pass asks the
+        // machine's and every answer goes somewhere different — but the walk
+        // was taken *here*, a tick after the reading, against a routing that
+        // moves in between. So a level going up and the same level coming down
+        // were addressed by two different readings and reached two different
+        // seats, and a hook can filter on nothing but `to`. Driven, and the
+        // pair of log lines it produced is in
+        // [`crate::cmd_watch::Signal::to`].
+        //
+        // The address is now taken once, with the predicate, and the ledger
+        // remembers it; what arrives here is who this particular line is for.
+        store.log_event(event_kind(e.edge), payload(&e.signal, e.edge, &e.to, &stamp, e.held));
     }
 }
 
@@ -520,15 +496,38 @@ mod tests {
 
     /// A source that answers with whatever the test is holding.
     ///
-    /// Three lines, and that is the argument for [`Source`] asking for a level
-    /// set rather than for news: the settle rule, the addressing, the ledger's
-    /// survival and the hook are all driven here without a herdr socket, on a
-    /// machine where `wsp verify` may be running with no herdr at all.
-    struct Fake(Vec<Signal>);
+    /// A dozen lines, and that is the argument for [`Source`] asking for a
+    /// level set rather than for news: the settle rule, the addressing, the
+    /// ledger's survival and the hook are all driven here without a herdr
+    /// socket, on a machine where `wsp verify` may be running with no herdr at
+    /// all.
+    ///
+    /// **It addresses what it answers with, out of the store, exactly as
+    /// [`Poll`] does.** That is not decoration: the address is now read *with*
+    /// the level rather than worked out where the level is sent, so a fake that
+    /// left it blank would be a fake that is wrong about the one behaviour half
+    /// of these tests are about — `fake.rs`'s own warning, that a fake encoding
+    /// a false belief makes tests green on a lie, arriving inside this file.
+    struct Fake<'a>(&'a Store, Vec<Signal>);
 
-    impl Source for Fake {
+    impl Source for Fake<'_> {
         fn sample(&mut self) -> Vec<Signal> {
-            self.0.clone()
+            let index = crate::resolve::Index::new(self.0.projects());
+            let governors = self.0.governors();
+            let lists = crate::worklist::Running::read(self.0);
+            self.1
+                .iter()
+                .map(|s| match self.0.task(&s.subject) {
+                    Some(t) => s.clone().to(&crate::cmd_watch::addressed_to(&index, &governors, &lists, &t)),
+                    None => s.clone(),
+                })
+                .collect()
+        }
+
+        /// The pass reads [`Scope::machine`], so nothing is ever out of scope
+        /// and a move arrives as the address changing under a standing level.
+        fn routing(&self) -> crate::cmd_watch::Routing {
+            crate::cmd_watch::Routing::Machine
         }
     }
 
@@ -565,9 +564,9 @@ mod tests {
         let mut pass = Pass::new();
 
         // Primed on a quiet machine, so the first tick has nothing to say.
-        assert!(tick(&store, &mut pass, &mut Fake(vec![]), 0).is_empty());
+        assert!(tick(&store, &mut pass, &mut Fake(&store, vec![]), 0).is_empty());
 
-        let mut src = Fake(vec![stall("a-1")]);
+        let mut src = Fake(&store, vec![stall("a-1")]);
         let out = tick(&store, &mut pass, &mut src, 60);
         assert_eq!(out.len(), 1, "the stall is news");
         let sent = delivered(&store);
@@ -585,9 +584,9 @@ mod tests {
         let (_env, store) = store("once");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
 
-        let mut src = Fake(vec![stall("a-1")]);
+        let mut src = Fake(&store, vec![stall("a-1")]);
         assert_eq!(tick(&store, &mut pass, &mut src, 60).len(), 1);
         for t in 2..20 {
             assert!(tick(&store, &mut pass, &mut src, t * 60).is_empty(), "tick {t} said it again");
@@ -604,14 +603,14 @@ mod tests {
         let (_env, store) = store("sidebar");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
         assert!(standing(&store).is_empty(), "a quiet machine costs the sidebar nothing");
 
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
         assert_eq!(standing(&store).get("a-1").copied(), Some("needs-a-person"));
 
         // …and it goes away with the fact, because it is the same level.
-        tick(&store, &mut pass, &mut Fake(vec![]), 120);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 120);
         assert!(standing(&store).get("a-1").is_none());
     }
 
@@ -624,9 +623,9 @@ mod tests {
         let (_env, store) = store("settling");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
 
-        let mut src = Fake(vec![Signal::new(Kind::NeedsAPerson, "a-1", "w1:p1 · no turn").settling()]);
+        let mut src = Fake(&store, vec![Signal::new(Kind::NeedsAPerson, "a-1", "w1:p1 · no turn").settling()]);
         tick(&store, &mut pass, &mut src, 60);
         assert!(standing(&store).is_empty(), "one minute in, this is a gap between turns");
 
@@ -642,10 +641,10 @@ mod tests {
         let (_env, store) = store("louder");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
 
         let asked = Signal::new(Kind::Unanswered, "a-1", "w1:p1 waiting · may I land?").loud();
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1"), asked]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1"), asked]), 60);
         assert_eq!(standing(&store).get("a-1").copied(), Some("unanswered"));
     }
 
@@ -658,7 +657,7 @@ mod tests {
         let (_env, store) = store("primed");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        assert!(tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 0).is_empty());
+        assert!(tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 0).is_empty());
         assert_eq!(standing(&store).get("a-1").copied(), Some("needs-a-person"));
     }
 
@@ -669,10 +668,10 @@ mod tests {
         let (_env, store) = store("clears");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
 
-        let out = tick(&store, &mut pass, &mut Fake(vec![]), 120);
+        let out = tick(&store, &mut pass, &mut Fake(&store, vec![]), 120);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].edge, Edge::Down);
         let sent = store.events_of("attention-cleared");
@@ -689,18 +688,18 @@ mod tests {
         let (_env, store) = store("restart");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        assert_eq!(tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 60).len(), 1);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        assert_eq!(tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60).len(), 1);
 
         // The exec: a new process, a new `Pass`, the same store.
         let mut after = Pass::new();
         assert!(
-            tick(&store, &mut after, &mut Fake(vec![stall("a-1")]), 120).is_empty(),
+            tick(&store, &mut after, &mut Fake(&store, vec![stall("a-1")]), 120).is_empty(),
             "the same stall arrived twice"
         );
         // And the far side still knows enough to report it clearing, which is
         // the case a ledger holding only timings would have lost.
-        assert_eq!(tick(&store, &mut after, &mut Fake(vec![]), 180).len(), 1);
+        assert_eq!(tick(&store, &mut after, &mut Fake(&store, vec![]), 180).len(), 1);
     }
 
     /// Say the ledger on disk was written by some other build, which is what
@@ -727,20 +726,20 @@ mod tests {
         let (_env, store) = store("rekeyed");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
         let hand = Signal::new(Kind::Flag, "a-1", "can I take this?");
-        assert_eq!(tick(&store, &mut pass, &mut Fake(vec![hand]), 60).len(), 1);
+        assert_eq!(tick(&store, &mut pass, &mut Fake(&store, vec![hand]), 60).len(), 1);
 
         written_by_another_build(&store);
         let rekeyed = Signal::new(Kind::Flag, "a-1", "can I take this?").of("m-1");
         let mut after = Pass::new();
-        let out = tick(&store, &mut after, &mut Fake(vec![rekeyed]), 120);
+        let out = tick(&store, &mut after, &mut Fake(&store, vec![rekeyed]), 120);
         assert!(out.is_empty(), "the hand never moved, so nothing is owed anybody: {out:?}");
         assert_eq!(delivered(&store).len(), 1, "one edge in the whole run, and it is the true one");
         assert_eq!(standing(&store).get("a-1").copied(), Some("flag"), "and it is still up on the sidebar");
 
         // The tick after is a diff again: the quiet is one tick, not a mode.
-        let out = tick(&store, &mut after, &mut Fake(vec![]), 180);
+        let out = tick(&store, &mut after, &mut Fake(&store, vec![]), 180);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].edge, Edge::Down);
     }
@@ -767,8 +766,8 @@ mod tests {
         let (_env, store) = store("renumbered");
         task(&store, "t-260815-014", Some("worklist"));
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![stall("t-260815-014")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("t-260815-014")]), 60);
         assert_eq!(store.events_of("attention-raised").len(), 1, "told once, as it should be");
 
         let map = std::collections::BTreeMap::from([(
@@ -779,7 +778,7 @@ mod tests {
 
         // The source computes its subjects from the store, so after the rename
         // it says the same thing under the new name.
-        let emits = tick(&store, &mut pass, &mut Fake(vec![stall("worklist-002")]), 120);
+        let emits = tick(&store, &mut pass, &mut Fake(&store, vec![stall("worklist-002")]), 120);
         assert!(
             emits.is_empty(),
             "the same level under its new name is not a change: {emits:?}",
@@ -799,8 +798,8 @@ mod tests {
         let (_env, store) = store("nostore");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
 
         assert!(store.messages().is_empty(), "a level is not a message");
         assert!(store.flags().is_empty(), "and it is not a hand somebody raised");
@@ -818,8 +817,8 @@ mod tests {
             json!({ "workspace": "w9", "pane": "w9:p1", "host": util::hostname() }),
         );
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1"), stall("b-1")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1"), stall("b-1")]), 60);
 
         let sent = store.events_of("attention-raised");
         let to = |about: &str| {
@@ -830,6 +829,84 @@ mod tests {
         };
         assert_eq!(to("a-1"), "robustness", "the seat that governs it");
         assert_eq!(to("b-1"), EVERYONE, "and no seat above it means a person, not nowhere");
+    }
+
+    /// **`worklist-039`, driven through the pass that actually reaches a
+    /// phone.**
+    ///
+    /// A hook is `~/wsp/hooks/on-<kind>` handed one line, and the only thing it
+    /// can filter on is `to`. So the fact that matters is not whether each edge
+    /// is correct on its own — both were — but whether the *pair* reaches one
+    /// seat. On 2026-08-20, against a fake herdr with one flag and one worklist
+    /// finishing under it, the log read
+    ///
+    ///     attention-raised   to=phase-four  flag demo-001  held=0
+    ///     attention-cleared  to=demo        flag demo-001  held=181
+    ///
+    /// — a seat told a hand went up and never told it came down, and a seat
+    /// told a hand came down that it had never been told went up. Neither could
+    /// tell from what it held.
+    ///
+    /// Asserted as a balance rather than as three expected lines, because the
+    /// failure is a property of the set and any single line looks right.
+    #[test]
+    fn a_seat_is_never_told_a_level_cleared_that_it_was_not_told_was_raised() {
+        let (_env, store) = store("routing");
+        task(&store, "a-1", Some("robustness"));
+        store.set_governor(
+            "robustness",
+            json!({ "workspace": "w9", "pane": "w9:p1", "host": util::hostname() }),
+        );
+        store.set_governor("tonight", json!({ "workspace": "w3", "pane": "w3:p1", "host": util::hostname() }));
+        let mut w = Worklist::new("tonight", "tonight");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[Group { members: vec!["a-1".into()], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+
+        let mut pass = Pass::new();
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
+        assert_eq!(store.events_of("attention-raised")[0]["to"], "tonight");
+
+        // The list finishes, so the same task now answers to the project chain.
+        // Nothing about the level changed and nothing left the pass's scope:
+        // `Scope::machine` has no boundary.
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 120);
+
+        // And now it clears, wherever it is.
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 180);
+
+        let seats = |kind: &str| {
+            store
+                .events_of(kind)
+                .iter()
+                .map(|v| v["to"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(seats("attention-cleared"), vec!["robustness".to_string()]);
+        assert_eq!(
+            seats("attention-raised"),
+            vec!["tonight".to_string(), "robustness".to_string()],
+            "the seat that gains a standing level is told about it, in the words it would have had anyway"
+        );
+        let moved = store.events_of("attention-moved");
+        assert_eq!(moved.len(), 1, "and the seat that lost it is told once, and not that it cleared");
+        assert_eq!(moved[0]["to"], "tonight");
+        assert_eq!(moved[0]["moved_to"], "robustness", "which is the only thing it can act on");
+        assert_eq!(moved[0]["held"], 60, "and how long the hand had been up while it was theirs");
+    }
+
+    /// `attention-moved` is its own hook kind and not a `cleared` with a field
+    /// on it. A hook is found by name, so folding a move into the clearing
+    /// would hand every hook that exists today a hand-lowered event for a hand
+    /// that is still up — which is the fault, delivered by the fix.
+    #[test]
+    fn a_move_is_a_hook_of_its_own_rather_than_a_clearing_with_a_field_on_it() {
+        assert_eq!(event_kind(Edge::Up), "attention-raised");
+        assert_eq!(event_kind(Edge::Down), "attention-cleared");
+        assert_eq!(event_kind(Edge::Left), "attention-moved");
     }
 
     /// The routing rule a worklist adds, on the surface that runs unattended.
@@ -857,8 +934,8 @@ mod tests {
         store.save_worklist(&w).unwrap();
 
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
         assert_eq!(store.events_of("attention-raised")[0]["to"], "tonight");
     }
 
@@ -881,8 +958,8 @@ mod tests {
         }
 
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
 
         let got = std::fs::read_to_string(&landed).expect("the hook ran");
         let v: Value = serde_json::from_str(&got).expect("and was handed JSON");
@@ -909,8 +986,8 @@ mod tests {
         )
         .loud();
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![blocked]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![blocked]), 60);
 
         let sent = store.events_of("attention-raised");
         assert_eq!(sent[0]["kind"], "direction", "the only kind that may reach a person at once");
@@ -924,7 +1001,7 @@ mod tests {
     fn the_pass_registers_as_something_that_can_be_reported_as_having_stopped() {
         let (_env, store) = store("register");
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
 
         let rec = store.watches().get(KEY).cloned().expect("registered");
         assert_eq!(rec["daemon"], true);
@@ -945,15 +1022,15 @@ mod tests {
         let (_env, store) = store("handover");
         task(&store, "a-1", None);
         let mut pass = Pass::new();
-        tick(&store, &mut pass, &mut Fake(vec![]), 0);
-        tick(&store, &mut pass, &mut Fake(vec![stall("a-1")]), 60);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![stall("a-1")]), 60);
         stand_down(&store);
 
         // The successor. It knows the stall was already said, and it still
         // knows enough to report it clearing.
         let mut next = Pass::new();
-        assert!(tick(&store, &mut next, &mut Fake(vec![stall("a-1")]), 120).is_empty());
-        assert_eq!(tick(&store, &mut next, &mut Fake(vec![]), 180).len(), 1, "the clearing was lost");
+        assert!(tick(&store, &mut next, &mut Fake(&store, vec![stall("a-1")]), 120).is_empty());
+        assert_eq!(tick(&store, &mut next, &mut Fake(&store, vec![]), 180).len(), 1, "the clearing was lost");
     }
 
     /// It is a passenger on the daemon's loop and keeps its own time, so a
@@ -964,7 +1041,7 @@ mod tests {
         let (_env, store) = store("due");
         let mut pass = Pass::new();
         assert!(pass.due(0), "a fresh daemon looks at once, whatever the clock says");
-        tick(&store, &mut pass, &mut Fake(vec![]), 1_000);
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 1_000);
         assert!(!pass.due(1_030));
         assert!(pass.due(1_000 + EVERY));
     }

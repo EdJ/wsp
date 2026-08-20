@@ -21,8 +21,9 @@
 #                                 arrives on `unanswered`, where it is the
 #                                 asker's own word and not wsp's judgement.
 #                                 Everything else is `note`.
-#      "edge":"up",               `attention-cleared` carries "down"
-#      "to":"wsp",                the seat that answers for it, or "everyone"
+#      "edge":"up",               `attention-cleared` carries "down", and
+#                                 `attention-moved` carries "left"
+#      "to":"wsp",                the seat this line is for, or "everyone"
 #      "about":"robustness-088",  the task
 #      "text":"w4P:p1 · stopped on a prompt only a person can answer — wsp peek <id>",
 #      "held":312,"held_human":"5m"}}
@@ -31,6 +32,22 @@
 # question's message id rather than anything of the level's own — a level has no
 # id. It is what turns this from a script that says somebody is waiting into one
 # that says what to type: `wsp answer <id> "…"`.
+#
+# THE THIRD KIND, AND WHY IT IS NOT THIS ONE. `~/wsp/hooks/on-attention-moved`
+# is a level that did not go anywhere — somebody else answers for it now,
+# because a seat was taken or stood down or a worklist finished under it. It
+# carries `"edge":"left"`, `"to"` is the seat that LOST it, and one more field,
+# `"moved_to"`, names the seat that has it. It is deliberately not folded into
+# `attention-cleared`: a seat reading `cleared` for a hand somebody else is
+# holding stops looking at a live hand, which is worse than never hearing.
+#
+# So a machine with only this file installed hears nothing when a level changes
+# hands. If that matters to you the whole fix is a second link:
+#
+#   ln ~/wsp/hooks/on-attention-raised ~/wsp/hooks/on-attention-moved
+#
+# and the `"kind"` filter below will log it and stay quiet, which is right — a
+# hand-over is not something to be woken for.
 #
 # Filtering is yours and belongs here rather than in wsp: the pass emits every
 # fact it can stand behind, and this file decides which of them is worth your

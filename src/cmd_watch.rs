@@ -111,9 +111,9 @@
 //! open question, and answering it independently here is how a transport gets
 //! chosen twice.
 //!
-//! # Silence must not look like success, in five places
+//! # Silence must not look like success, in six places
 //!
-//! The failure this file exists to prevent has five separate causes and each
+//! The failure this file exists to prevent has six separate causes and each
 //! one needs its own answer. Listing them because a partial answer here reads
 //! exactly like a complete one:
 //!
@@ -135,6 +135,16 @@
 //!    a quiet fleet.
 //! 5. **It ended and the reason was not said.** Every exit prints a line naming
 //!    why, and a fault exits non-zero. There is no silent return.
+//! 6. **The subject moved out from under it.** A correct reporter, ticking, on
+//!    the current build, watching a scope it answers for exactly — and the
+//!    routing changed, so a standing level is now somebody else's. That is
+//!    [`Edge::Left`] and it is `worklist-039`: it was found on `review`, where
+//!    the level left one seat's scope in silence, and driving it turned up the
+//!    louder half on `flag`, where the diff had a word for a level going away
+//!    and said `cleared` for a hand that is still up. The five above are all
+//!    faults of the *reporter*; this one is a fault of the **scope**, which is
+//!    why none of them caught it and why it needed a sixth entry rather than a
+//!    better answer to one of theirs.
 //!
 //! # What it costs when nothing is happening
 //!
@@ -411,7 +421,52 @@ pub(crate) struct Signal {
     /// that flap — an agent is briefly "stopped" between every pair of turns —
     /// and true for the ones that do not.
     pub(crate) at_once: bool,
+    /// **Who answers for this level right now** — a seat's scope, or
+    /// [`EVERYONE`].
+    ///
+    /// Read off the level rather than re-derived at delivery, and that is the
+    /// whole of `worklist-039`'s daemon half. [`crate::attention::deliver`]
+    /// used to walk [`cmd_govern::seat_for`] per *edge*, at the moment the edge
+    /// was sent, which addresses a raise and its clearing by two different
+    /// readings of a routing that moves under both. Driven on 2026-08-20
+    /// against a fake herdr: one flag, one seat swap in between, and the log
+    /// reads
+    ///
+    ///     attention-raised   to=phase-four  flag demo-001  held=0
+    ///     attention-cleared  to=demo        flag demo-001  held=181
+    ///
+    /// A hook can filter on nothing but `to`, so the seat that was told the
+    /// hand went up was never told it came down, and the seat that was told it
+    /// came down had never been told it went up. Neither line is wrong on its
+    /// own; the pair is, and no reader holding one of them could tell.
+    ///
+    /// Carrying it on the level fixes that by construction — the address is
+    /// read once, with the predicate, and the ledger remembers it — and it is
+    /// what makes a *change* of address a fact the diff can see at all. See
+    /// [`Routing`].
+    ///
+    /// It also leaves **one** derivation of the routing walk where there were
+    /// two. [`in_scope`] asked it for membership and the daemon asked it again
+    /// on the way out; both now go through [`addressed_to`], which is this
+    /// file's own standing argument — three definitions of `needs_a_person` is
+    /// how the exception for seats got quietly lost, and a fourth would have
+    /// been the same shape.
+    pub(crate) to: String,
 }
+
+/// The address of a level nobody in particular answers for.
+///
+/// A word rather than an absent field, because the reader is a shell script:
+/// `everyone` is a thing to test for and a null is a thing to forget to test
+/// for. It is the panel's own last resort said out loud — `wsp flag`'s
+/// *"raised on every panel"* — and it is the common case on a machine with no
+/// seats, which is why `wsp-095` Part 9 asks that it be visible rather than
+/// silently universal.
+///
+/// It lives beside [`Signal::to`] rather than in [`crate::attention`], where it
+/// was written, because the address is now a field on the level and a word
+/// spelled out in a second place is what this file keeps refusing.
+pub(crate) const EVERYONE: &str = "everyone";
 
 impl Signal {
     pub(crate) fn new(kind: Kind, subject: &str, detail: &str) -> Signal {
@@ -422,7 +477,17 @@ impl Signal {
             record: None,
             loud: None,
             at_once: true,
+            // Nobody in particular until a reader that knows the routing says
+            // otherwise. A signal built by hand — a test, or any caller with no
+            // store behind it — is honestly everybody's.
+            to: EVERYONE.to_string(),
         }
+    }
+
+    /// Addressed, by the one reader that knows the routing. See [`Signal::to`].
+    pub(crate) fn to(mut self, seat: &str) -> Signal {
+        self.to = seat.to_string();
+        self
     }
 
     pub(crate) fn settling(mut self) -> Signal {
@@ -508,15 +573,51 @@ impl Signal {
         if let (Some(r), Some(o)) = (&self.record, v.as_object_mut()) {
             o.insert("id".into(), json!(r));
         }
+        // Who answers for it now, on the one edge where that is not `to`.
+        // Present only there, for the reason every other optional here is
+        // absent rather than null: the reader is a shell script, and a field
+        // that can never be filled is noise on a wire. It is what lets a hook
+        // say *the hand you were told about is now demo's* without parsing the
+        // sentence, which is the thing this file refuses to make anybody do.
+        if let (Edge::Left, Some(o)) = (edge, v.as_object_mut()) {
+            o.insert("moved_to".into(), json!(self.to));
+        }
         v
     }
 }
 
 /// Which way a level moved.
+///
+/// Two of these are the level itself changing and the third is the level
+/// standing still while the routing changes under it — see [`Edge::Left`],
+/// which is `worklist-039`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Edge {
     Up,
     Down,
+    /// **The level did not go anywhere; the reader did.** Somebody else
+    /// answers for it now.
+    ///
+    /// `worklist-039`, and it is a third word rather than a `down` because a
+    /// seat reading `cleared` for a hand somebody else is now holding is being
+    /// told something false. Driven on 2026-08-20, two seats and one worklist
+    /// finishing under them: the seat that lost a `review` was told nothing at
+    /// all — [`Kind::clears`] is false for it — and the seat that lost a `flag`
+    /// was told `cleared · was up 0s` while `wsp flag` went on listing it.
+    ///
+    /// So `clears()` was never the fault line. It decides only **which** of the
+    /// two wrong things happens, and the quiet one is the kinder: a missed fact
+    /// costs a reader a look, and a false `cleared` costs them the look they
+    /// would otherwise have taken. Both are the fail-silent family with the
+    /// cause this row named — a correct reporter whose subject moved out from
+    /// under it — and neither is repairable by moving a kind from one side of
+    /// `clears()` to the other, because the predicate is still true and there
+    /// is nothing here to clear.
+    ///
+    /// It is emitted for **every** kind for that reason. `clears()` answers
+    /// *is this level going away worth a line*; this answers *is it still
+    /// mine*, and they are different questions about different events.
+    Left,
 }
 
 impl Edge {
@@ -524,6 +625,7 @@ impl Edge {
         match self {
             Edge::Up => "up",
             Edge::Down => "down",
+            Edge::Left => "left",
         }
     }
 }
@@ -567,6 +669,103 @@ pub(crate) struct Emit {
     /// How long the level had been up when this was said. Zero on the way up
     /// for anything that did not settle.
     pub(crate) held: i64,
+    /// **Who this line is for**, which is [`Signal::to`] for everything except
+    /// an [`Edge::Left`] — where the level has already moved on and the line is
+    /// for the seat it left.
+    ///
+    /// Carried on the emit rather than worked out where it is sent, because
+    /// *where it is sent* is a tick later than *what happened* and the routing
+    /// moves in between: see [`Signal::to`] for the pair of log lines that cost.
+    pub(crate) to: String,
+}
+
+// ---------------------------------------------------------------------------
+// what a level read cannot say
+// ---------------------------------------------------------------------------
+
+/// Where the subjects a reader was holding stand **now**.
+///
+/// [`Source::sample`] answers *what is up in my scope*, and that is the whole
+/// primitive — but a key that has gone from it has two possible histories, and
+/// they are opposite pieces of news:
+///
+/// - the predicate went false, which is the level clearing;
+/// - the subject moved out from under the reader, which is somebody else's
+///   level now and is still standing.
+///
+/// Nothing in two consecutive reads distinguishes them, so a diff that has only
+/// the reads must guess, and before `worklist-039` it guessed *cleared* — for
+/// the kinds that clear, out loud and falsely, and for the rest by saying
+/// nothing.
+///
+/// This is the fact that removes the guess, and it is deliberately **beside**
+/// the read rather than inside it: a level set stays the answer to *what is
+/// up*, which is what makes it self-healing after a disconnection
+/// (`robustness-075`), and a source that cannot answer this at all degrades to
+/// exactly the behaviour above rather than to nothing.
+///
+/// Three variants because there are three readers and their boundaries are
+/// three different shapes — see [`Scope`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum Routing {
+    /// A reader with no store behind it, which cannot say. Every departure is
+    /// read as the predicate going false — the behaviour this file had before
+    /// a move was a thing it could see, kept as the default so a new
+    /// [`Source`] is wrong in the old quiet way and never in a new loud one.
+    #[default]
+    Unknown,
+    /// A scope with a boundary: which subjects are still inside it, and who
+    /// answers for the ones that are not.
+    ///
+    /// This is both the seated case and the named-project case, and one
+    /// variant serves both because the question the diff asks is *is it still
+    /// mine* — which [`in_scope`] answers under either membership rule.
+    Scoped {
+        inside: BTreeSet<String>,
+        to: BTreeMap<String, String>,
+    },
+    /// The whole machine, where nothing is ever outside.
+    ///
+    /// The daemon's pass, and the reason it needs its own variant: a move
+    /// cannot show up here as a departure, because [`Scope::machine`] has no
+    /// boundary to depart. It shows up as [`Signal::to`] changing on a level
+    /// that never moved — which is invisible to a `Scoped` reader, where an
+    /// address change *is* the departure, and which must not be read as one on
+    /// a named project, where the seat above a scope can change without a
+    /// single task leaving it.
+    Machine,
+}
+
+impl Routing {
+    /// Whether the subject is still this reader's, and who has it if not.
+    ///
+    /// `None` means *still mine, or I cannot say* — both of which leave the
+    /// diff on its original path. `Some(seat)` is the departure, and it names
+    /// where the level went so the line can say it.
+    ///
+    /// A subject that is not in `to` at all has genuinely gone — a task
+    /// deleted, or an id a renumbering did not reach — and that is a level
+    /// clearing rather than a level moving. `wsp flag` cannot list it and no
+    /// seat can be pointed at it, so the honest word is the one already there.
+    fn left(&self, subject: &str) -> Option<&str> {
+        match self {
+            Routing::Unknown | Routing::Machine => None,
+            Routing::Scoped { inside, to } => match inside.contains(subject) {
+                true => None,
+                false => to.get(subject).map(String::as_str),
+            },
+        }
+    }
+
+    /// Whether a level standing still, with a new address on it, is news.
+    ///
+    /// Only for the machine reader. On a seat an address change **is** the
+    /// departure and is caught by [`Routing::left`]; on a named project the
+    /// address changes every time somebody takes the seat above it, with
+    /// nothing having moved and nothing to say.
+    fn readdresses(&self) -> bool {
+        matches!(self, Routing::Machine)
+    }
 }
 
 impl Ledger {
@@ -576,18 +775,31 @@ impl Ledger {
     /// one piece of behaviour here that depends on the clock, and it is the one
     /// worth being able to test without one.
     ///
-    /// Three things happen, in this order, and the order is load-bearing:
+    /// Four things happen, in this order, and the order is load-bearing:
     ///
     /// 1. every level in `now` that is new is recorded with its first-seen
-    ///    time, and **not** said;
-    /// 2. every level that has gone is dropped, and said if it had been said —
-    ///    a level that went away while still settling was never news, so its
-    ///    disappearance is not news either;
+    ///    time, and **not** said; every level that was already there and has
+    ///    been **readdressed** is said to have left, and re-armed for the seat
+    ///    that has it now;
+    /// 2. every level that has gone is dropped — and said, if it had been said,
+    ///    either as having left this scope or as having cleared, which
+    ///    `routing` is what tells them apart. A level that went away while
+    ///    still settling was never news, so its going is not news either;
     /// 3. every recorded level that has now held long enough is said.
     ///
     /// Doing (3) last is what makes a signal that appears and settles inside
-    /// one tick emit exactly once rather than not at all.
-    pub(crate) fn advance(&mut self, now: &[Signal], at: i64, settle: i64) -> Vec<Emit> {
+    /// one tick emit exactly once rather than not at all — and it is also what
+    /// carries a readdressed level's arrival, so the seat that gains one hears
+    /// about it in the same words, and at the same settle, as one raised there.
+    ///
+    /// # `routing`, and why the read alone is not enough
+    ///
+    /// See [`Routing`]. A key's absence from `now` is two different pieces of
+    /// news and this is what separates them; a [`Routing::Unknown`] leaves
+    /// every branch below on the path it took before `worklist-039`, which is
+    /// what a test with no store behind it wants and what a new [`Source`] gets
+    /// for free.
+    pub(crate) fn advance(&mut self, now: &[Signal], routing: &Routing, at: i64, settle: i64) -> Vec<Emit> {
         let mut out = Vec::new();
         let seen: BTreeSet<String> = now.iter().map(Signal::key).collect();
         // Half the predicates could not be evaluated at all this tick, so their
@@ -601,6 +813,25 @@ impl Ledger {
                 since: at,
                 told: false,
             });
+            // The level never moved and the seat answering for it did. Said to
+            // the seat that had it, and then re-armed — `told` back to false —
+            // so (3) below announces it to the seat that has it now, in the
+            // same words and after the same settle as a level raised there.
+            //
+            // **`since` is deliberately kept.** The new seat is told how long
+            // the hand has actually been up, which is the fact it needs and the
+            // one a fresh entry would have thrown away: a nine-hour stall
+            // handed over is not a stall that started at the hand-over.
+            let moved = routing.readdresses() && e.told && e.signal.to != s.to;
+            if moved {
+                out.push(Emit {
+                    edge: Edge::Left,
+                    signal: s.clone(),
+                    held: at - e.since,
+                    to: e.signal.to.clone(),
+                });
+                e.told = false;
+            }
             // The detail is refreshed and the key is not: a stall whose pane
             // changed its wording is the same stall, and re-keying it would
             // emit it twice.
@@ -614,10 +845,25 @@ impl Ledger {
             .map(|(k, _)| k.clone())
             .collect();
         for k in gone {
-            if let Some(h) = self.up.remove(&k) {
-                if h.told && h.signal.kind.clears() {
-                    out.push(Emit { edge: Edge::Down, signal: h.signal, held: at - h.since });
+            let Some(h) = self.up.remove(&k) else { continue };
+            if !h.told {
+                continue;
+            }
+            match routing.left(&h.signal.subject) {
+                // It is out of this scope and still standing. Said whatever
+                // `clears()` answers, because that answers a different question
+                // — see [`Edge::Left`] — and the line carries who has it now,
+                // which is the only thing the reader can act on.
+                Some(now_to) => out.push(Emit {
+                    edge: Edge::Left,
+                    to: h.signal.to.clone(),
+                    signal: h.signal.clone().to(now_to),
+                    held: at - h.since,
+                }),
+                None if h.signal.kind.clears() => {
+                    out.push(Emit { edge: Edge::Down, to: h.signal.to.clone(), signal: h.signal, held: at - h.since })
                 }
+                None => {}
             }
         }
 
@@ -628,7 +874,12 @@ impl Ledger {
             let ready = h.signal.at_once || at - h.since >= settle;
             if ready {
                 h.told = true;
-                out.push(Emit { edge: Edge::Up, signal: h.signal.clone(), held: at - h.since });
+                out.push(Emit {
+                    edge: Edge::Up,
+                    to: h.signal.to.clone(),
+                    signal: h.signal.clone(),
+                    held: at - h.since,
+                });
             }
         }
         out
@@ -683,7 +934,7 @@ impl Ledger {
             // this would be saying it twice, which is the shape of defect this
             // path exists to remove rather than one to add on the way.
             if s.kind == Kind::Blind && !said {
-                out.push(Emit { edge: Edge::Up, signal: s.clone(), held: at - e.since });
+                out.push(Emit { edge: Edge::Up, to: s.to.clone(), signal: s.clone(), held: at - e.since });
             }
         }
         out
@@ -723,6 +974,11 @@ impl Ledger {
                             "record": h.signal.record,
                             "loud": h.signal.loud.map(|k| k.as_str()),
                             "at_once": h.signal.at_once,
+                            // Who was answering for it when it was last read.
+                            // The ledger is the only thing that remembers, and
+                            // remembering is what makes a change of address a
+                            // fact rather than a silence — see [`Signal::to`].
+                            "to": h.signal.to,
                             "since": h.since,
                             "told": h.told,
                         }),
@@ -773,6 +1029,17 @@ impl Ledger {
                                 _ => v.as_str().and_then(crate::message::Kind::parse),
                             }),
                         at_once: rec.get("at_once").and_then(Value::as_bool).unwrap_or(true),
+                        // A record written before the address was on the level
+                        // reads as everybody's. It cannot produce a false
+                        // `left` on the next tick, because a ledger this build
+                        // did not key is primed rather than diffed and
+                        // [`Ledger::prime`] takes the whole signal from the
+                        // read — see [`resume`].
+                        to: rec
+                            .get("to")
+                            .and_then(Value::as_str)
+                            .unwrap_or(EVERYONE)
+                            .to_string(),
                     },
                     since: rec.get("since").and_then(Value::as_i64).unwrap_or(0),
                     told: rec.get("told").and_then(Value::as_bool).unwrap_or(false),
@@ -854,6 +1121,17 @@ pub(crate) fn resume(rec: &Value) -> (Ledger, bool) {
 pub(crate) trait Source {
     /// Everything up right now, in whatever order. The ledger sorts.
     fn sample(&mut self) -> Vec<Signal>;
+
+    /// Where the subjects of the **last** sample stand now — see [`Routing`].
+    ///
+    /// A second method rather than a second return value, and a defaulted one,
+    /// because it is the answer to a question the level read does not ask: a
+    /// source is still a thing that says what is up, and one that cannot say
+    /// where anything is addressed degrades to the diff this file made before
+    /// `worklist-039` rather than to no diff at all.
+    fn routing(&self) -> Routing {
+        Routing::Unknown
+    }
 }
 
 /// The scope a watch answers for: a project id or a worklist slug.
@@ -905,6 +1183,35 @@ impl Scope {
     }
 }
 
+/// Who answers for a task: the seat the routing walk reaches, or [`EVERYONE`].
+///
+/// **One walk, and this is the only one.** It is the same rule `wsp flag`
+/// addresses by, so what a watch reports, what a raised hand reaches and what
+/// the daemon's hook is told are one definition — which was the standing claim
+/// in this file's module docs and was not quite true: [`in_scope`] walked it
+/// for membership and `attention::addressee` walked it again at delivery, a
+/// tick later and against a routing that had moved in between. See
+/// [`Signal::to`] for the pair of log lines that produced.
+///
+/// The task is passed rather than an id on purpose. A subject arrives at the
+/// diff off a *persisted* ledger, which looks like the raw-read fault this tree
+/// has fixed three times — resolving a recorded id against a renumbering — and
+/// is not: `watches.json` is in [`crate::store::Store::state_files_with_ids`],
+/// so a renumbering rewrites the ledger's subjects, and an id that no longer
+/// names a task is one that has genuinely gone. A caller with only an id can
+/// therefore look it up plainly, and a miss means nobody rather than *ask
+/// again*.
+pub(crate) fn addressed_to(
+    index: &Index,
+    governors: &BTreeMap<String, Value>,
+    lists: &worklist::Running,
+    task: &Task,
+) -> String {
+    cmd_govern::seat_for(governors, index, lists.list_of(&task.id), task.project.as_deref())
+        .map(|s| s.scope)
+        .unwrap_or_else(|| EVERYONE.to_string())
+}
+
 /// Whether a task is this scope's to report on.
 pub(crate) fn in_scope(
     scope: &Scope,
@@ -917,8 +1224,7 @@ pub(crate) fn in_scope(
         return true;
     }
     if scope.seated {
-        return cmd_govern::seat_for(governors, index, lists.list_of(&task.id), task.project.as_deref())
-            .is_some_and(|s| s.scope == scope.name);
+        return addressed_to(index, governors, lists, task) == scope.name;
     }
     if lists.list_of(&task.id) == Some(scope.name.as_str()) {
         return true;
@@ -1026,11 +1332,19 @@ pub(crate) struct Poll<'a> {
     /// A subject filter, and it is a filter rather than a subscription — see
     /// the module docs on why "about X" is not the unit.
     about: Option<String>,
+    /// What the last [`Poll::sample`] saw of the routing, for [`Ledger`] to ask
+    /// about the levels that have gone from it.
+    ///
+    /// Held on the source rather than returned beside the read because the two
+    /// have different lifetimes: the read is consumed once, and this is
+    /// consulted for keys the read does not contain. Rebuilt every tick, so it
+    /// is never staler than the sample it belongs to.
+    routing: Routing,
 }
 
 impl<'a> Poll<'a> {
     pub(crate) fn new(store: &'a Store, scope: Scope, want: BTreeSet<Kind>, about: Option<String>) -> Poll<'a> {
-        Poll { store, scope, want, about }
+        Poll { store, scope, want, about, routing: Routing::Unknown }
     }
 }
 
@@ -1061,6 +1375,15 @@ impl Source for Poll<'_> {
             },
         };
         let lists = worklist::Running::read(self.store);
+        // The routing, taken once for every task in the store and before any
+        // predicate is evaluated — so the address a level carries and the
+        // membership test that kept it are the same reading, rather than two
+        // walks a tick apart. See [`Signal::to`].
+        let to: BTreeMap<String, String> = wip
+            .tasks
+            .iter()
+            .map(|t| (t.id.clone(), addressed_to(&wip.index, &wip.governors, &lists, t)))
+            .collect();
         let mine = |t: &Task| in_scope(&self.scope, &wip.index, &wip.governors, &lists, t);
         let task_of = |id: &str| wip.tasks.iter().find(|t| t.id == id);
 
@@ -1232,7 +1555,32 @@ impl Source for Poll<'_> {
                 || (self.want.contains(&s.kind)
                     && self.about.as_deref().is_none_or(|a| s.subject == a))
         });
+        // Addressed on the way out, in one place, so no branch above can build
+        // a level that does not know who answers for it. A subject that is not
+        // a task — `herdr`, for [`Kind::Blind`], and a message record the
+        // machine pass could not place — has no chain to walk and is
+        // everybody's by construction, which is right: wsp being unable to see
+        // the agents is not one seat's problem.
+        for s in out.iter_mut() {
+            if let Some(seat) = to.get(&s.subject) {
+                s.to = seat.clone();
+            }
+        }
+        self.routing = match self.scope.all {
+            true => Routing::Machine,
+            false => Routing::Scoped {
+                inside: wip.tasks.iter().filter(|t| mine(t)).map(|t| t.id.clone()).collect(),
+                to,
+            },
+        };
         out
+    }
+
+    /// See [`Routing`]. Rebuilt by every [`Poll::sample`], and
+    /// [`Routing::Unknown`] before the first one — a diff against a read that
+    /// never happened has nothing to be right about.
+    fn routing(&self) -> Routing {
+        self.routing.clone()
     }
 }
 
@@ -1438,11 +1786,26 @@ fn line(e: &Emit, at: i64, p: &Paint) -> String {
             false => p.yellow(&word),
         },
         Edge::Down => p.dim(&util::pad("cleared", 14)),
+        // Its own word in the column a reader scans, and dim like `cleared`
+        // because the level has left this stream either way. What separates
+        // them is the clause: one says it is over and the other says where it
+        // went, and a reader who acts on the wrong one either stops looking at
+        // a live hand or goes looking for one that is gone.
+        Edge::Left => p.dim(&util::pad("moved", 14)),
     };
     let detail = match e.edge {
         Edge::Up if !e.signal.at_once => format!("{} · held {}", e.signal.detail, util::duration_human(e.held)),
         Edge::Up => e.signal.detail.clone(),
         Edge::Down => format!("{} · was up {}", e.signal.kind.word(), util::duration_human(e.held)),
+        // **Still up** said out loud, because the whole risk of this line is
+        // being read as the other one. Then who has it, which is the only thing
+        // the reader can act on.
+        Edge::Left => format!(
+            "{} · still up, and {} answers for it now · was here {}",
+            e.signal.kind.word(),
+            e.signal.to,
+            util::duration_human(e.held)
+        ),
     };
     format!("{} {head} {}  {}", p.dim(&clock(at)), p.bold(&e.signal.subject), p.dim(&detail))
 }
@@ -1771,7 +2134,7 @@ fn level_read(poll: &mut Poll, spec: &Spec) -> i32 {
         return 0;
     }
     for s in &now {
-        println!("{}", line(&Emit { edge: Edge::Up, signal: s.clone(), held: 0 }, at, &p));
+        println!("{}", line(&Emit { edge: Edge::Up, to: s.to.clone(), signal: s.clone(), held: 0 }, at, &p));
     }
     0
 }
@@ -1797,7 +2160,7 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // event the daemon meets as an `exec`. See [`resume`].
     let (mut ledger, known) = resume(&rec);
     let emits = match known {
-        true => ledger.advance(&now, at, spec.settle),
+        true => ledger.advance(&now, &poll.routing(), at, spec.settle),
         false => ledger.prime(&now, at),
     };
     say(&emits, at, spec);
@@ -1866,7 +2229,7 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // `exec`s on it, and this cannot. See [`said_replaced`].
     let mut running = util::exe_stamp();
 
-    // The opening line, and it is item 1 of the five: a watcher that says
+    // The opening line, and it is item 1 of the six: a watcher that says
     // nothing at all from the first second is indistinguishable from one that
     // never started. It names the scope, the interval and the standing count,
     // which between them make the next hour of silence mean something.
@@ -1915,11 +2278,14 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
             }
         }
 
-        let emits = ledger.advance(&poll.sample(), at, spec.settle);
+        // Sampled first and asked for the routing after, because the routing
+        // is a fact about the read that has just happened. See [`Routing`].
+        let now = poll.sample();
+        let emits = ledger.advance(&now, &poll.routing(), at, spec.settle);
         say(&emits, at, spec);
         register(store, &key, spec, &ledger, ticks);
 
-        // Item 2 of the five. One line, and it carries the standing count
+        // Item 2 of the six. One line, and it carries the standing count
         // rather than a pulse, so it is a level read in miniature: `0 standing`
         // is a positive statement that nothing is wrong.
         if spec.heartbeat != i64::MAX && at - last_beat >= spec.heartbeat && !spec.json {
@@ -2212,11 +2578,11 @@ mod tests {
 
         let mut l = Ledger::default();
         l.prime(&[], 0);
-        assert_eq!(l.advance(&[first.clone(), second.clone()], 60, 0).len(), 2);
+        assert_eq!(l.advance(&[first.clone(), second.clone()], &Routing::Unknown, 60, 0).len(), 2);
         assert_eq!(l.standing(), 2);
 
         // The first is answered. The second is untouched and still up.
-        let out = l.advance(&[second], 120, 0);
+        let out = l.advance(&[second], &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1, "one clearing, not two");
         assert_eq!(out[0].edge, Edge::Down);
         assert_eq!(out[0].signal.record, first.record, "and it is the one that was answered");
@@ -2233,14 +2599,14 @@ mod tests {
         let up = asking(&q, "a-1", &[row("w1:p1", false)]).unwrap();
         let mut l = Ledger::default();
         l.prime(&[], 0);
-        assert_eq!(l.advance(&[up], 60, 0).len(), 1);
+        assert_eq!(l.advance(&[up], &Routing::Unknown, 60, 0).len(), 1);
 
         // `wsp answer` closed it, so it is simply absent from the next read.
         let mut answered = q.clone();
         answered.state_raw = "answered".into();
         assert!(asking(&answered, "a-1", &[]).is_none(), "a closed question is not a level");
 
-        let out = l.advance(&[], 120, 0);
+        let out = l.advance(&[], &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].edge, Edge::Down, "the governor is told it no longer needs them");
     }
@@ -2336,7 +2702,7 @@ mod tests {
         let mut l = Ledger::default();
         assert!(l.prime(&now, 0).is_empty());
         assert_eq!(l.standing(), 2, "primed levels are still up, they are just not news");
-        assert!(l.advance(&now, 60, SETTLE).is_empty(), "nothing changed, so nothing is said");
+        assert!(l.advance(&now, &Routing::Unknown, 60, SETTLE).is_empty(), "nothing changed, so nothing is said");
     }
 
     /// Emit on change, never on state. The difference between a watcher and one
@@ -2346,9 +2712,9 @@ mod tests {
         let now = vec![sig(Kind::Review, "a-1")];
         let mut l = Ledger::default();
         l.prime(&[], 0);
-        assert_eq!(l.advance(&now, 60, SETTLE).len(), 1);
+        assert_eq!(l.advance(&now, &Routing::Unknown, 60, SETTLE).len(), 1);
         for tick in 2..10 {
-            assert!(l.advance(&now, tick * 60, SETTLE).is_empty(), "tick {tick} said it again");
+            assert!(l.advance(&now, &Routing::Unknown, tick * 60, SETTLE).is_empty(), "tick {tick} said it again");
         }
     }
 
@@ -2361,8 +2727,8 @@ mod tests {
         l.prime(&[], 0);
         let first = vec![Signal::new(Kind::NeedsAPerson, "a-1", "w1:p1 · no turn for 5m")];
         let later = vec![Signal::new(Kind::NeedsAPerson, "a-1", "w1:p1 · no turn for 40m")];
-        assert_eq!(l.advance(&first, 60, 0).len(), 1);
-        assert!(l.advance(&later, 3000, 0).is_empty());
+        assert_eq!(l.advance(&first, &Routing::Unknown, 60, 0).len(), 1);
+        assert!(l.advance(&later, &Routing::Unknown, 3000, 0).is_empty());
     }
 
     /// **Silence is not evidence.** A tick that could not reach herdr has no
@@ -2379,18 +2745,18 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         let seeing = vec![sig(Kind::NeedsAPerson, "a-1"), sig(Kind::Review, "a-2")];
-        assert_eq!(l.advance(&seeing, 60, 0).len(), 2);
+        assert_eq!(l.advance(&seeing, &Routing::Unknown, 60, 0).len(), 2);
 
         // herdr goes away. The store half still answers, so `review` is a real
         // reading and stays; the agent half is unreadable, so it is held.
         let blind = vec![sig(Kind::Review, "a-2"), sig(Kind::Blind, "herdr")];
-        let out = l.advance(&blind, 120, 0);
+        let out = l.advance(&blind, &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1, "only `blind` itself is news");
         assert_eq!(out[0].signal.kind, Kind::Blind);
         assert_eq!(l.standing(), 3, "the stall is still up, it is just not being looked at");
 
         // And back. Nothing is re-announced, because nothing changed.
-        let out = l.advance(&seeing, 180, 0);
+        let out = l.advance(&seeing, &Routing::Unknown, 180, 0);
         assert_eq!(out.len(), 1, "the stall arrived again");
         assert_eq!(out[0].signal.kind, Kind::Blind, "and it is `blind` clearing");
         assert_eq!(out[0].edge, Edge::Down);
@@ -2403,10 +2769,10 @@ mod tests {
     fn a_level_that_went_away_while_blind_is_reported_once_the_view_comes_back() {
         let mut l = Ledger::default();
         l.prime(&[], 0);
-        l.advance(&[sig(Kind::NeedsAPerson, "a-1")], 60, 0);
-        l.advance(&[sig(Kind::Blind, "herdr")], 120, 0);
+        l.advance(&[sig(Kind::NeedsAPerson, "a-1")], &Routing::Unknown, 60, 0);
+        l.advance(&[sig(Kind::Blind, "herdr")], &Routing::Unknown, 120, 0);
 
-        let out = l.advance(&[], 180, 0);
+        let out = l.advance(&[], &Routing::Unknown, 180, 0);
         let cleared: Vec<Kind> = out.iter().map(|e| e.signal.kind).collect();
         assert!(cleared.contains(&Kind::NeedsAPerson), "the stall's clearing was owed and paid");
         assert_eq!(l.standing(), 0);
@@ -2421,9 +2787,9 @@ mod tests {
         let mut l = Ledger::default();
         let stalled = vec![sig(Kind::NeedsAPerson, "a-1").settling()];
         l.prime(&[], 0);
-        assert!(l.advance(&stalled, 60, 300).is_empty(), "one minute in, this is a gap between turns");
-        assert!(l.advance(&stalled, 240, 300).is_empty());
-        assert_eq!(l.advance(&stalled, 360, 300).len(), 1, "six minutes in, nothing is going to restart it");
+        assert!(l.advance(&stalled, &Routing::Unknown, 60, 300).is_empty(), "one minute in, this is a gap between turns");
+        assert!(l.advance(&stalled, &Routing::Unknown, 240, 300).is_empty());
+        assert_eq!(l.advance(&stalled, &Routing::Unknown, 360, 300).len(), 1, "six minutes in, nothing is going to restart it");
     }
 
     /// The worklist-004 case: a modal has the keyboard and one keypress fixes
@@ -2435,7 +2801,7 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         let prompt = vec![sig(Kind::NeedsAPerson, "a-1").loud()];
-        let out = l.advance(&prompt, 1, 300);
+        let out = l.advance(&prompt, &Routing::Unknown, 1, 300);
         assert_eq!(out.len(), 1);
         assert!(
             out[0].signal.shouts(),
@@ -2451,8 +2817,8 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         let stalled = vec![sig(Kind::NeedsAPerson, "a-1").settling()];
-        assert!(l.advance(&stalled, 60, 300).is_empty());
-        assert!(l.advance(&[], 120, 300).is_empty());
+        assert!(l.advance(&stalled, &Routing::Unknown, 60, 300).is_empty());
+        assert!(l.advance(&[], &Routing::Unknown, 120, 300).is_empty());
         assert_eq!(l.standing(), 0);
     }
 
@@ -2464,14 +2830,14 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         let up = vec![sig(Kind::NeedsAPerson, "a-1"), sig(Kind::Review, "a-2")];
-        assert_eq!(l.advance(&up, 60, 0).len(), 2);
-        let out = l.advance(&[], 120, 0);
+        assert_eq!(l.advance(&up, &Routing::Unknown, 60, 0).len(), 2);
+        let out = l.advance(&[], &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].signal.kind, Kind::NeedsAPerson);
         assert_eq!(out[0].edge, Edge::Down);
     }
 
-    /// Item 4 of the five ways silence lies. Everything else a blind watch does
+    /// Item 4 of the six ways silence lies. Everything else a blind watch does
     /// not print is meaningless, so this one is exempt from the rule that a
     /// starting watch is quiet.
     #[test]
@@ -2490,10 +2856,10 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         let up = vec![Signal::new(Kind::Review, "a-1", "waiting on you")];
-        assert_eq!(l.advance(&up, 60, 0).len(), 1);
+        assert_eq!(l.advance(&up, &Routing::Unknown, 60, 0).len(), 1);
 
         let mut back = Ledger::of_json(&l.json());
-        assert!(back.advance(&up, 120, 0).is_empty(), "it has already been said");
+        assert!(back.advance(&up, &Routing::Unknown, 120, 0).is_empty(), "it has already been said");
     }
 
     /// The defect running it found. A level that has *gone* is absent from the
@@ -2507,10 +2873,10 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         let up = vec![Signal::new(Kind::Flag, "a-1", "can I take this?")];
-        assert_eq!(l.advance(&up, 60, 0).len(), 1);
+        assert_eq!(l.advance(&up, &Routing::Unknown, 60, 0).len(), 1);
 
         let mut back = Ledger::of_json(&l.json());
-        let out = back.advance(&[], 120, 0);
+        let out = back.advance(&[], &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].edge, Edge::Down);
         assert_eq!(out[0].signal.kind, Kind::Flag);
@@ -2537,13 +2903,13 @@ mod tests {
     fn a_hand_that_never_moved_is_not_lowered_and_raised_by_an_install() {
         let mut before = Ledger::default();
         before.prime(&[], 0);
-        assert_eq!(before.advance(&[Signal::new(Kind::Flag, "a-1", "can I take this?")], 60, 0).len(), 1);
+        assert_eq!(before.advance(&[Signal::new(Kind::Flag, "a-1", "can I take this?")], &Routing::Unknown, 60, 0).len(), 1);
 
         // The same hand, read by a build that puts the record in the key.
         let after = vec![Signal::new(Kind::Flag, "a-1", "can I take this?").of("m-1")];
 
         let mut diffed = Ledger::of_json(&before.json());
-        let wrong = diffed.advance(&after, 120, 0);
+        let wrong = diffed.advance(&after, &Routing::Unknown, 120, 0);
         assert_eq!(wrong.len(), 2, "the defect itself, so this test fails if the keying stops moving: {wrong:?}");
 
         let (mut ledger, known) = resume(&record(&before, "another-build"));
@@ -2562,11 +2928,11 @@ mod tests {
         let up = vec![Signal::new(Kind::Flag, "a-1", "can I take this?")];
         let mut before = Ledger::default();
         before.prime(&[], 0);
-        assert_eq!(before.advance(&up, 60, 0).len(), 1);
+        assert_eq!(before.advance(&up, &Routing::Unknown, 60, 0).len(), 1);
 
         let (mut ledger, _) = resume(&record(&before, "another-build"));
         assert!(ledger.prime(&up, 600).is_empty());
-        let out = ledger.advance(&[], 660, 0);
+        let out = ledger.advance(&[], &Routing::Unknown, 660, 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].held, 600, "measured from when the hand went up, not from the install");
     }
@@ -2580,7 +2946,7 @@ mod tests {
     fn a_level_that_went_away_across_a_re_prime_is_dropped_and_not_cleared() {
         let mut before = Ledger::default();
         before.prime(&[], 0);
-        assert_eq!(before.advance(&[Signal::new(Kind::Flag, "a-1", "up")], 60, 0).len(), 1);
+        assert_eq!(before.advance(&[Signal::new(Kind::Flag, "a-1", "up")], &Routing::Unknown, 60, 0).len(), 1);
 
         let (mut ledger, _) = resume(&record(&before, "another-build"));
         assert!(ledger.prime(&[], 120).is_empty());
@@ -2595,11 +2961,11 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         let up = vec![Signal::new(Kind::Flag, "a-1", "up")];
-        assert_eq!(l.advance(&up, 60, 0).len(), 1);
+        assert_eq!(l.advance(&up, &Routing::Unknown, 60, 0).len(), 1);
 
         let (mut back, known) = resume(&record(&l, &crate::build_stamp()));
         assert!(known);
-        let out = back.advance(&[], 120, 0);
+        let out = back.advance(&[], &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1, "and the clearing still arrives: {out:?}");
         assert_eq!(out[0].edge, Edge::Down);
     }
@@ -2616,7 +2982,7 @@ mod tests {
         assert_eq!(resume(&Value::Null).0.standing(), 0);
     }
 
-    /// Item 4 of the five ways silence lies survives the re-prime in both
+    /// Item 4 of the six ways silence lies survives the re-prime in both
     /// directions: a watch that comes up blind says so, and one that was
     /// already saying so does not say it twice because its binary changed.
     #[test]
@@ -2808,5 +3174,189 @@ mod tests {
         assert!(!at(60).stale());
         assert!(!at(120).stale());
         assert!(at(600).stale());
+    }
+
+    // ---- a subject that moved out from under the reader --------------------
+    //
+    // `worklist-039`. Every one of these is a level that is **still true**, so
+    // anything the reader is told about it going away is false; the question is
+    // only whether the file can tell that from a level that genuinely went
+    // down. See [`Routing`].
+
+    /// A scope that has lost a subject to another seat, as the diff sees it.
+    fn moved_to(subject: &str, seat: &str) -> Routing {
+        Routing::Scoped {
+            inside: BTreeSet::new(),
+            to: [(subject.to_string(), seat.to_string())].into_iter().collect(),
+        }
+    }
+
+    /// **The half the row did not name, and the worse one.** `flag` clears, so
+    /// a seat swap did not merely lose the hand quietly — it said out loud that
+    /// it had been lowered. Driven on 2026-08-20 against a fake herdr, two
+    /// seats and a worklist finishing under them: `cleared  demo-001  flag ·
+    /// was up 0s`, while `wsp flag` went on listing it and the other seat now
+    /// held it.
+    #[test]
+    fn a_hand_that_another_seat_now_holds_is_not_reported_as_lowered() {
+        let up = [sig(Kind::Flag, "a-1")];
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        assert_eq!(l.advance(&up, &Routing::Unknown, 60, 0).len(), 1);
+
+        let out = l.advance(&[], &moved_to("a-1", "demo"), 120, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].edge, Edge::Left, "it did not clear — somebody else answers for it");
+        assert_eq!(out[0].to, EVERYONE, "and the line is for the seat that lost it");
+        assert_eq!(out[0].signal.to, "demo", "which needs to know where it went");
+        assert_eq!(out[0].held, 60, "and how long it had been up here");
+    }
+
+    /// The row's own finding, from the other side of `clears()`. A `review`
+    /// left one scope and went nowhere at all, because a review is not a thing
+    /// that goes away by itself and the diff had no other word for it.
+    #[test]
+    fn a_level_that_never_clears_still_says_something_when_it_leaves_the_scope() {
+        let up = [sig(Kind::Review, "a-1")];
+        assert!(!Kind::Review.clears(), "the premise: nothing about it going away is news");
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        assert_eq!(l.advance(&up, &Routing::Unknown, 60, 0).len(), 1);
+
+        let out = l.advance(&[], &moved_to("a-1", "demo"), 120, 0);
+        assert_eq!(out.len(), 1, "a hand one seat stops seeing and the other never started seeing");
+        assert_eq!(out[0].edge, Edge::Left);
+    }
+
+    /// And the thing that must not change with it: a predicate that genuinely
+    /// went false is still a clearing, and is still silent for the kinds that
+    /// do not clear.
+    #[test]
+    fn a_predicate_that_went_false_is_a_clearing_and_not_a_move() {
+        let still_mine = |subject: &str| Routing::Scoped {
+            inside: [subject.to_string()].into_iter().collect(),
+            to: [(subject.to_string(), "demo".to_string())].into_iter().collect(),
+        };
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        l.advance(&[sig(Kind::Flag, "a-1")], &Routing::Unknown, 60, 0);
+        let out = l.advance(&[], &still_mine("a-1"), 120, 0);
+        assert_eq!(out[0].edge, Edge::Down, "the subject never left; the hand came down");
+
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        l.advance(&[sig(Kind::Review, "a-1")], &Routing::Unknown, 60, 0);
+        assert!(
+            l.advance(&[], &still_mine("a-1"), 120, 0).is_empty(),
+            "and a review leaving review is nearly always the reader having just closed it"
+        );
+    }
+
+    /// A subject the routing cannot place at all has genuinely gone — a task
+    /// deleted, or an id a renumbering did not reach. Nobody can be pointed at
+    /// it, so `moved` would be a line with nowhere to send the reader.
+    #[test]
+    fn a_subject_that_is_no_longer_anywhere_is_a_clearing_rather_than_a_move() {
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        l.advance(&[sig(Kind::Flag, "a-1")], &Routing::Unknown, 60, 0);
+        let empty = Routing::Scoped { inside: BTreeSet::new(), to: BTreeMap::new() };
+        let out = l.advance(&[], &empty, 120, 0);
+        assert_eq!(out[0].edge, Edge::Down);
+    }
+
+    /// **The named-project case, which must not gain this.** A seat taken over
+    /// `wsp` readdresses every level under it and moves not one task out of the
+    /// scope somebody typed, so a watch on that project has nothing to say —
+    /// and saying it would be `robustness-088`'s named failure, a line per
+    /// standing level every time a governor sits down.
+    #[test]
+    fn a_watch_on_a_named_project_is_not_told_a_level_moved_because_the_seat_above_it_changed() {
+        let inside = |seat: &str| Routing::Scoped {
+            inside: ["a-1".to_string()].into_iter().collect(),
+            to: [("a-1".to_string(), seat.to_string())].into_iter().collect(),
+        };
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        assert_eq!(l.advance(&[sig(Kind::Flag, "a-1").to("phase-two")], &inside("phase-two"), 60, 0).len(), 1);
+        assert!(
+            l.advance(&[sig(Kind::Flag, "a-1").to("wsp")], &inside("wsp"), 120, 0).is_empty(),
+            "nothing left the project, so nothing happened to this reader"
+        );
+    }
+
+    /// **The daemon's half, and it is not a departure at all.**
+    /// [`Scope::machine`] has no boundary to leave, so a move shows up as the
+    /// address on a standing level changing under it — which is exactly what
+    /// nothing was watching on 2026-08-20, when a raise addressed to
+    /// `phase-four` was followed three minutes later by a clearing addressed to
+    /// `demo` and neither seat could see the pair.
+    #[test]
+    fn the_machine_pass_says_a_level_moved_when_the_seat_answering_for_it_changes() {
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        assert_eq!(l.advance(&[sig(Kind::Flag, "a-1").to("phase-four")], &Routing::Machine, 60, 0).len(), 1);
+
+        let out = l.advance(&[sig(Kind::Flag, "a-1").to("demo")], &Routing::Machine, 660, 0);
+        assert_eq!(out.len(), 2, "one seat lost it and another gained it");
+        assert_eq!(out[0].edge, Edge::Left);
+        assert_eq!(out[0].to, "phase-four", "the seat that was told the hand went up hears it went somewhere");
+        assert_eq!(out[1].edge, Edge::Up);
+        assert_eq!(out[1].to, "demo", "and the seat that has it now is told, in the words it would have had anyway");
+        assert_eq!(out[1].held, 600, "carrying how long the hand has actually been up, not how long it has been theirs");
+    }
+
+    /// A level still inside its settle window was never news here, so its
+    /// moving is not news either — the same judgement the clearing path makes,
+    /// and for the same reason: the flicker the settle exists to prevent must
+    /// not come back through the routing.
+    #[test]
+    fn a_level_that_had_not_been_said_yet_moves_without_a_word() {
+        let stalled = [Signal::new(Kind::NeedsAPerson, "a-1", "w1:p1 · no turn").settling()];
+        let moved = [Signal::new(Kind::NeedsAPerson, "a-1", "w1:p1 · no turn").settling().to("demo")];
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        assert!(l.advance(&stalled, &Routing::Machine, 60, 300).is_empty(), "one minute in, this is a gap between turns");
+        assert!(l.advance(&moved, &Routing::Machine, 120, 300).is_empty(), "and it has not been said, so it cannot have left");
+        let out = l.advance(&moved, &Routing::Machine, 400, 300);
+        assert_eq!(out.len(), 1, "it settles once, where it now is");
+        assert_eq!(out[0].edge, Edge::Up);
+        assert_eq!(out[0].to, "demo");
+    }
+
+    /// The `left` envelope names who has it now, as a field. A hook filters on
+    /// `to` and nothing else, so *the hand you were told about is now demo's*
+    /// has to be readable without parsing the sentence.
+    #[test]
+    fn a_move_says_on_the_wire_where_the_level_went() {
+        let v = sig(Kind::Flag, "a-1").to("demo").envelope(Edge::Left, "phase-four", "now");
+        assert_eq!(v["edge"], "left");
+        assert_eq!(v["to"], "phase-four", "the seat that lost it — this is the line addressed to them");
+        assert_eq!(v["moved_to"], "demo");
+        let up = sig(Kind::Flag, "a-1").envelope(Edge::Up, "demo", "now");
+        assert!(up.get("moved_to").is_none(), "a field that can never be filled is noise on a wire");
+    }
+
+    /// A source that cannot say where anything went is left on the path this
+    /// file took before it could see a move — quietly wrong in the old way,
+    /// rather than loudly wrong in a new one.
+    #[test]
+    fn a_reader_with_no_routing_behind_it_diffs_exactly_as_it_did_before() {
+        let mut l = Ledger::default();
+        l.prime(&[], 0);
+        l.advance(&[sig(Kind::Flag, "a-1")], &Routing::Unknown, 60, 0);
+        let out = l.advance(&[], &Routing::Unknown, 120, 0);
+        assert_eq!(out[0].edge, Edge::Down);
+    }
+
+    /// The address survives the file the ledger is written to, which is what
+    /// makes a move visible across the `exec` an install puts in the middle of
+    /// the daemon's loop.
+    #[test]
+    fn the_ledger_remembers_who_was_answering_for_a_level() {
+        let mut l = Ledger::default();
+        l.prime(&[sig(Kind::Flag, "a-1").to("phase-four")], 0);
+        let back = Ledger::of_json(&l.json());
+        assert_eq!(back.told().next().map(|s| s.to.clone()).as_deref(), Some("phase-four"));
     }
 }
