@@ -23,7 +23,9 @@
 //!   and `busy` is not.
 //!
 //! - **The loser finds out.** Every install through here is written down beside
-//!   the binary: who, when, from where, at what commit. So the next install can
+//!   the binary: who, when, from where, at what commit the artefact says it
+//!   carries — see below for why that last clause is not a flourish. So the
+//!   next install can
 //!   say what it is replacing, and can refuse when the live binary was
 //!   installed *after* the one in your hand was built — which is precisely the
 //!   race, seen from the losing side, and the one moment when going ahead
@@ -35,6 +37,34 @@
 //!   old inode rather than a file changing shape underneath it. Then the copy
 //!   is read back and compared, because `committing.md` step 6 asks for exactly
 //!   that check by hand and a check done by hand is a check that gets skipped.
+//!
+//! # What a binary carries is asked of the binary
+//!
+//! `worklist-042`. Every commit this command prints, records or compares comes
+//! out of the artefact's own stamp — the one `build.rs` compiles in and
+//! `--version` prints, read back by [`ask`] — on both sides of the copy. It
+//! used to come out of the git tree the source was sitting in, which is a
+//! different question with the same shape: a build tree has moved on from its
+//! last release build in the ordinary case, and that is the same case somebody
+//! runs `-n` in to decide whether to install. So the stand-in was wrong exactly
+//! when it was read, and wrong in the worst available form — a short hash under
+//! the word `carries`, printed by a tool, which nobody checks by hand.
+//!
+//! One reading fed seven outputs, and the printed line was the least of them:
+//! the default `--why` the next agent reads off the lock, the commit written
+//! into the record and quoted back by every later `-n`, the `installed … →`
+//! line, three `--json` bodies, the `keeps the old one` warning — whose other
+//! side is a running `wsp watch`'s [`crate::build_stamp`], so a tree and an
+//! artefact were being compared against each other — and [`overtaken`], whose
+//! one exception is *the two commits are equal*. Fed a tree's HEAD that
+//! exception could fire on a coincidence, and let through the silent revert
+//! this whole command exists to refuse.
+//!
+//! What the tree is still asked for is the one thing no stamp can carry: which
+//! files the uncommitted work was in. `+dirty` is a bit; a file list is not,
+//! and the build tree has it — for as long as the tree is still standing where
+//! the build left it, which [`Built::left_behind`] now checks rather than
+//! assumes.
 //!
 //! # What it will not do
 //!
@@ -276,27 +306,91 @@ fn remember(dst: &Path, rec: &Record) {
 
 // ---- what we are holding -----------------------------------------------
 
-/// What can be said about a built binary by looking at the tree it came out of.
+/// What the binary in our hands carries, asked of the binary.
 ///
-/// Not the same question as render-057's, which stamps the commit *into* the
-/// binary so that any copy of it can be asked. This is the weaker one that can
-/// be answered today, and it is enough for the decision in hand: the source is
-/// still sitting in the tree it was built in, so that tree's HEAD and dirt
-/// describe it — as long as nothing has moved since, which is why `newer`
-/// exists.
+/// The doc that stood here called this "the weaker question that can be
+/// answered today": render-057 would stamp the commit *into* the binary so any
+/// copy of it could be asked, and until then the tree the source sat in was
+/// the best stand-in available. render-057 shipped — `build.rs` stamps it,
+/// `--version` prints it, [`ask`] reads it back — and this went on asking the
+/// tree, with `newer` as the apology for the gap.
+///
+/// The gap is `worklist-042`. A build tree has moved on since its last release
+/// build in the ordinary case, which is the same case somebody runs `-n` in to
+/// decide; so the stand-in was wrong precisely when it was consulted, and it
+/// was wrong in the worst available shape — a short hash, printed by a tool,
+/// under the word `carries`. Nobody re-checks that by hand. `worklist-024`
+/// corrected a version number in prose by trusting this command, and was only
+/// right because it happened to read the `live` line, which comes from the
+/// installed file.
+///
+/// So the identity comes from the artefact, and the tree is kept for the one
+/// thing no stamp can carry — *which* files the uncommitted work was in — and
+/// only for as long as the tree still describes the artefact.
 struct Built {
+    /// What the artefact says it was built from. `None` when it will not say
+    /// and there was no tree to stand in for it either.
     commit: Option<String>,
-    /// Files the tree has that its HEAD does not. In a `wsp verify` tree this
-    /// is exactly the patch under test, which is the honest answer to "what
-    /// uncommitted work does this binary carry".
-    dirty: Vec<String>,
-    /// Whether a source file in that tree is younger than the binary. If one
-    /// is, the tree moved after the build and `commit` and `dirty` describe
-    /// something the binary is not.
+    /// Whether that build carried work no commit held. The `+dirty` half of
+    /// the stamp, and the load-bearing one: a hash describes everything about
+    /// a build except the patch on top of it, and the patch is what goes
+    /// missing.
+    dirty: bool,
+    /// Which files those were. Read from the tree, because nothing else knows,
+    /// and empty unless the tree still describes the artefact. In a `wsp
+    /// verify` tree it is exactly the patch under test.
+    dirty_files: Vec<String>,
+    /// Whether the artefact answered. False means `commit` is the tree's HEAD
+    /// standing in, and everything printed from it says so.
+    asked: bool,
+    /// The tree's own HEAD, where there is a tree. Not the answer any more —
+    /// the thing the answer is checked against, so a build its tree has walked
+    /// away from can be named as one.
+    head: Option<String>,
+    /// Whether a source file in that tree is younger than the binary.
     newer: bool,
     /// When it was built, from [`written`] — nanoseconds, and the reason for
     /// them is in that function.
     built: u64,
+}
+
+impl Built {
+    /// One word for this build, the same one a `wsp watch` registers for
+    /// itself: `c52f3c8`, `c52f3c8+dirty`, or empty.
+    ///
+    /// Through [`crate::stamp_word`] rather than formatted here. Both sides of
+    /// the comparison in [`stale_watchers`] have to be one shape, and this
+    /// file keeping its own copy of the rule — over its own idea of the commit
+    /// — is how they came to disagree about the same binary.
+    fn stamp(&self) -> String {
+        crate::stamp_word(self.commit.as_deref().unwrap_or_default(), self.dirty)
+    }
+
+    /// Where `commit` came from, in one word, for the reader that is a script.
+    /// The printed output hedges a stand-in on the line itself; `--json` has no
+    /// line to hedge, and a caller parsing this is exactly the caller that will
+    /// not see a yellow word go past.
+    fn source(&self) -> &'static str {
+        match (self.asked, self.commit.is_some()) {
+            (true, _) => "artefact",
+            (false, true) => "tree",
+            (false, false) => "unknown",
+        }
+    }
+
+    /// True when the tree the source sits in no longer describes it.
+    ///
+    /// Two ways, and the second is the one mtimes cannot see: a source file
+    /// younger than the binary, or a HEAD that is not the commit the binary
+    /// says it carries. `git commit` moves HEAD and touches no working file,
+    /// so the tree can leave a build behind without a single mtime moving.
+    fn left_behind(&self) -> bool {
+        self.newer
+            || matches!(
+                (&self.head, &self.commit),
+                (Some(h), Some(c)) if self.asked && h != c
+            )
+    }
 }
 
 /// When a file was last written, in nanoseconds since the epoch.
@@ -343,12 +437,12 @@ fn provenance(src: &Path, tree: Option<PathBuf>) -> Built {
     let built = written(src);
     let dir = src.parent().unwrap_or(Path::new("."));
     let tree = tree.filter(|t| t.is_dir()).or_else(|| toplevel(dir));
-    let commit = tree
+    let head = tree
         .as_deref()
         .and_then(|t| git(t, &["rev-parse", "--short", "HEAD"]))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let dirty: Vec<String> = tree
+    let files: Vec<String> = tree
         .as_deref()
         .and_then(|t| git(t, &["status", "--porcelain", "--untracked-files=all"]))
         .map(|out| {
@@ -364,7 +458,31 @@ fn provenance(src: &Path, tree: Option<PathBuf>) -> Built {
         newest(&t.join("src"), &mut youngest);
         youngest = youngest.max(written(&t.join("Cargo.toml")));
     }
-    Built { commit, dirty, newer: youngest > built, built }
+    let newer = youngest > built;
+
+    // The artefact first. Running it costs a process and is a strictly smaller
+    // act than the copy about to be made — `health` already runs the live one
+    // for the same answer, and a binary too broken to print its own version is
+    // one worth finding out about before every pane on the machine re-execs
+    // into it. A stamp with no commit in it is an unstamped binary, which is
+    // not an answer, so the tree gets to stand in for that too.
+    let stamp = ask(src).filter(|s| !s.commit.is_empty());
+    let asked = stamp.is_some();
+    let commit = stamp.as_ref().map(|s| s.commit.clone()).or_else(|| head.clone());
+    let dirty = match &stamp {
+        Some(s) => s.dirty,
+        None => !files.is_empty(),
+    };
+    // The stamp says *whether* there was uncommitted work and never which
+    // files, because nothing can carry that. The tree can, and its list is the
+    // artefact's for exactly as long as the tree is where the artefact left
+    // it: same HEAD, nothing rebuilt since. Past that it is a list of files
+    // about the tree, printed under the word `carries`, which is this row in
+    // miniature.
+    let describes = !asked || (!newer && head == commit);
+    let dirty_files = if describes && dirty { files } else { Vec::new() };
+
+    Built { commit, dirty, dirty_files, asked, head, newer, built }
 }
 
 /// True when what is live was installed *after* the binary in our hands was
@@ -381,7 +499,7 @@ fn overtaken(built: u64, live_at: u64, live: Option<&Record>, ours: &Built) -> b
     if live_at <= built {
         return false;
     }
-    if !ours.dirty.is_empty() {
+    if ours.dirty {
         return true;
     }
     match (live, ours.commit.as_deref()) {
@@ -705,52 +823,87 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 }
             ))
         );
-        match &ours.commit {
-            Some(c) if ours.dirty.is_empty() => println!("{} {}", p.dim("carries"), c),
-            Some(c) => println!(
-                "{} {}",
-                p.dim("carries"),
-                p.yellow(&format!("{c} + {} file(s) not committed", ours.dirty.len()))
-            ),
-            None => println!("{} {}", p.dim("carries"), p.yellow("unknown — not a git tree")),
-        }
-        for f in ours.dirty.iter().take(8) {
+        // What it carries, and — when the artefact would not say — that this
+        // is a stand-in. The word `carries` is read as a fact about the bytes,
+        // so a line under it that is really about the tree has to admit it on
+        // the same line, where somebody skimming three lines of output cannot
+        // miss it.
+        let carries = match (&ours.commit, ours.dirty, ours.dirty_files.len()) {
+            (None, _, _) => p.yellow("unknown — it does not say, and there is no tree to ask"),
+            (Some(c), false, _) => c.clone(),
+            // Dirt the artefact admits to and the tree can no longer itemise:
+            // the honest report is the fact without the list, rather than the
+            // tree's current list under a heading about the binary.
+            (Some(c), true, 0) => p.yellow(&format!("{c} + work no commit holds")),
+            (Some(c), true, n) => p.yellow(&format!("{c} + {n} file(s) not committed")),
+        };
+        println!(
+            "{} {}{}",
+            p.dim("carries"),
+            carries,
+            match ours.asked {
+                true => String::new(),
+                false => p.yellow(" — the binary does not say; this is the tree it sits in"),
+            }
+        );
+        for f in ours.dirty_files.iter().take(8) {
             println!("  {}", p.dim(f));
         }
-        if ours.newer {
+        if ours.left_behind() {
+            let now = match (&ours.head, &ours.commit) {
+                (Some(h), Some(c)) if ours.asked && h != c => format!(", which is at {h}"),
+                _ => String::new(),
+            };
             println!(
                 "{} {}",
                 p.yellow("stale"),
-                "the tree has changed since this was built — `wsp verify --release` first"
+                format!("the tree has changed since this was built{now} — `wsp verify --release` first")
             );
         }
         // The shared checkout is the one build whose contents nobody can
         // account for; committing.md step 5 is explicit that there is nothing
         // on the other side of that tradeoff.
-        if origin == "shared" && !ours.dirty.is_empty() {
+        if origin == "shared" && ours.dirty {
             println!(
                 "{} {}",
                 p.yellow("shared"),
                 "this build came out of the tree everybody is editing"
             );
         }
+        // What is live, asked of the file — the same rule this whole screen now
+        // follows. The record beside it keeps who, when and why, which nothing
+        // else on the machine knows, and it is the wrong place to learn *what*:
+        // a binary put there by hand writes no record at all, and a record
+        // written by a wsp older than `worklist-042` holds whatever that
+        // agent's tree HEAD happened to be rather than what it shipped.
+        let says = live
+            .and_then(|_| ask(&dst))
+            .map(|s| crate::stamp_word(&s.commit, s.dirty))
+            .filter(|w| !w.is_empty());
+        let what = says.or_else(|| recorded.and_then(|r| r.commit.clone()));
+        // A hand install writes nothing down, so its age used to be all that
+        // could be said about it. The stamp travels in the bytes, so what is in
+        // it can now be said too — which is the one line of the shared-state
+        // table this command could not fill in.
+        let by_hand = |m: u64, verb: &str, tail: &str| {
+            format!(
+                "{}{verb} {} ago{tail}",
+                what.as_deref().map(|c| format!("{c}, ")).unwrap_or_default(),
+                util::duration_human(util::epoch_secs() - m as i64)
+            )
+        };
         let standing = match (live, recorded, last.is_some()) {
             (None, _, _) => p.dim("nothing there"),
-            (Some(_), Some(r), _) => p.dim(&match &r.commit {
+            (Some(_), Some(r), _) => p.dim(&match &what {
                 Some(c) => format!("{c} {}", r.line()),
                 None => r.line(),
             }),
-            // A binary with no matching record is one somebody put there with
-            // `install -m 755`, which is how every install before this command
-            // was made. Its age is all that can honestly be said about it.
-            (Some((_, m)), None, true) => p.yellow(&format!(
-                "changed {} ago by hand — wsp's record is of an older one",
-                util::duration_human(util::epoch_secs() - m as i64)
-            )),
-            (Some((_, m)), None, false) => p.dim(&format!(
-                "installed {} ago, by nobody wsp knows",
-                util::duration_human(util::epoch_secs() - m as i64)
-            )),
+            (Some((_, m)), None, true) => {
+                p.yellow(&by_hand(m, "changed", " by hand — wsp's record is of an older one"))
+            }
+            (Some((_, m)), None, false) => {
+                p.dim(&by_hand(m, "installed", ", by nobody wsp knows"))
+            }
         };
         println!("{} {} {}", p.dim("live"), util::contract(&dst), standing);
     };
@@ -765,7 +918,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "{}",
                 json!({"ok": true, "installed": false, "reason": "already live",
                        "source": util::contract(&src), "dest": util::contract(&dst),
-                       "commit": ours.commit})
+                       "commit": ours.commit, "commit_from": ours.source()})
             );
         } else {
             println!("{} {}", p.green("✓"), "already live — byte for byte what you built");
@@ -804,7 +957,9 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "{}",
                 json!({"ok": true, "installed": false, "reason": "dry run",
                        "source": util::contract(&src), "dest": util::contract(&dst),
-                       "commit": ours.commit, "dirty": ours.dirty,
+                       "commit": ours.commit, "commit_from": ours.source(),
+                       "dirty": ours.dirty, "dirty_files": ours.dirty_files,
+                       "stale": ours.left_behind(),
                        "lock": holder(&lock_path(&dst)).map(|h| h.line())})
             );
         } else {
@@ -866,7 +1021,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         who: who(),
         why: why.clone(),
         commit: ours.commit.clone(),
-        dirty: !ours.dirty.is_empty(),
+        dirty: ours.dirty,
         size,
         mtime,
     };
@@ -882,7 +1037,9 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "source": util::contract(&src),
                 "dest": util::contract(&dst),
                 "commit": ours.commit,
+                "commit_from": ours.source(),
                 "dirty": ours.dirty,
+                "dirty_files": ours.dirty_files,
                 "bytes": size,
                 "who": rec.who,
                 "why": why,
@@ -936,11 +1093,17 @@ pub fn install(store: &Store, args: &Args) -> i32 {
 /// command — those are usually the same file and are not always, and the
 /// question a reader has is about the one that is now live.
 fn stale_watchers(store: &Store, ours: &Built) -> Vec<crate::cmd_watch::Registered> {
-    let Some(commit) = &ours.commit else { return Vec::new() };
-    let live = match ours.dirty.is_empty() {
-        true => commit.clone(),
-        false => format!("{commit}+dirty"),
-    };
+    // Both sides of this comparison are now what a binary says about itself: a
+    // watch registers [`crate::build_stamp`], and [`Built::stamp`] is the same
+    // rule applied to the stamp read back out of the artefact. Built from the
+    // tree instead, this named the wrong set in both directions — a watch
+    // already running these bytes reported as keeping the old one, and one
+    // genuinely a build behind passing unnamed, which is the fault this line
+    // exists to catch.
+    let live = ours.stamp();
+    if live.is_empty() {
+        return Vec::new();
+    }
     let watches: Vec<_> = crate::cmd_watch::registered(store)
         .into_iter()
         .filter(|w| w.watching() && !w.daemon && !w.build.is_empty() && w.build != live)
@@ -974,10 +1137,13 @@ mod tests {
         dir
     }
 
-    fn built(commit: Option<&str>, dirty: &[&str], at: u64) -> Built {
+    fn built(commit: Option<&str>, dirty: bool, at: u64) -> Built {
         Built {
             commit: commit.map(|s| s.to_string()),
-            dirty: dirty.iter().map(|s| s.to_string()).collect(),
+            dirty,
+            dirty_files: Vec::new(),
+            asked: true,
+            head: commit.map(|s| s.to_string()),
             newer: false,
             built: at,
         }
@@ -1052,7 +1218,7 @@ mod tests {
     /// where refusing beats warning.
     #[test]
     fn a_build_older_than_what_is_live_does_not_go_in_quietly() {
-        let ours = built(Some("0a2c9e2"), &[], 1_200);
+        let ours = built(Some("0a2c9e2"), false, 1_200);
         assert!(overtaken(ours.built, 1_500, Some(&record("4e1aac2", false)), &ours));
 
         // The ordinary case: what is live is older than our build, so our build
@@ -1092,7 +1258,7 @@ mod tests {
         );
         assert!(written(&late) > written(&early), "one second of resolution lost the order");
 
-        let ours = built(Some("0a2c9e2"), &[], written(&early));
+        let ours = built(Some("0a2c9e2"), false, written(&early));
         assert!(
             overtaken(ours.built, written(&late), Some(&record("4e1aac2", false)), &ours),
             "an install 760ms after our build read as simultaneous, and would have reverted it"
@@ -1107,10 +1273,10 @@ mod tests {
     /// hash says nothing about the patch on top of it.
     #[test]
     fn the_same_commit_installed_twice_is_not_a_revert_unless_something_is_uncommitted() {
-        let clean = built(Some("fdefcab"), &[], 1_200);
+        let clean = built(Some("fdefcab"), false, 1_200);
         assert!(!overtaken(clean.built, 1_500, Some(&record("fdefcab", false)), &clean));
 
-        let ours_dirty = built(Some("fdefcab"), &["src/cmd_install.rs"], 1_200);
+        let ours_dirty = built(Some("fdefcab"), true, 1_200);
         assert!(
             overtaken(ours_dirty.built, 1_500, Some(&record("fdefcab", false)), &ours_dirty),
             "a patched build went in over a newer install of the same commit"
@@ -1237,6 +1403,145 @@ mod tests {
 
         assert!(ask(&dir.join("absent")).is_none(), "a binary that is not there answered");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `worklist-042`, which is the whole of this row: what a build carries is
+    /// asked of the build, and the tree it is sitting in does not get to
+    /// answer for it.
+    ///
+    /// The tree has moved on from its last release build in the ordinary case
+    /// — that is what a build tree *is* between one `wsp verify --release` and
+    /// the next — and that is the same case somebody runs `-n` in, to decide
+    /// whether to install. So the tree's HEAD under the word `carries` was a
+    /// short hash, printed by a tool, wrong exactly when it was read.
+    #[test]
+    fn what_the_source_carries_is_asked_of_the_source_and_not_of_its_tree() {
+        let dir = scratch("provenance");
+        let repo = dir.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "--quiet", "-b", "master"]);
+        let commit = |n: &str| {
+            fs::write(repo.join("src/lib.rs"), format!("// {n}\n")).unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "--quiet", "-m", n]);
+            git(&repo, &["rev-parse", "--short", "HEAD"]).unwrap().trim().to_string()
+        };
+        commit("one");
+
+        // A binary that says what it is, in a tree that has since moved on.
+        let bin = |name: &str, says: &str| {
+            let b = dir.join(name);
+            fs::write(&b, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
+            fs::set_permissions(&b, fs::Permissions::from_mode(0o755)).unwrap();
+            b
+        };
+        let src = bin("stamped", "wsp 0.1.0 (be58dac)");
+        let head = commit("two");
+        assert_ne!(head, "be58dac");
+
+        let ours = provenance(&src, Some(repo.clone()));
+        assert_eq!(
+            ours.commit.as_deref(),
+            Some("be58dac"),
+            "the tree's HEAD answered for a binary that was standing right there"
+        );
+        assert_eq!(ours.source(), "artefact");
+        assert_eq!(ours.head.as_deref(), Some(head.as_str()), "the tree's HEAD is kept, as the check");
+        assert!(ours.left_behind(), "a build its tree has walked away from was not called stale");
+
+        // And a stale build is stale on the commit alone. `git commit` moves
+        // HEAD without touching one working file, so the mtime comparison that
+        // was the only test here cannot see it.
+        let untouched = provenance(&src, Some(repo.clone()));
+        assert!(!untouched.newer || untouched.left_behind());
+
+        // The word both sides of the watch comparison are made of. Formatted
+        // once, in `main`, so `stale_watchers` and a running `wsp watch` cannot
+        // come to disagree about one binary.
+        let dirty_src = bin("patched", "wsp 0.1.0 (be58dac+dirty)");
+        let patched = provenance(&dirty_src, Some(repo.clone()));
+        assert!(patched.dirty, "the +dirty half was dropped");
+        assert_eq!(patched.stamp(), "be58dac+dirty");
+        assert_eq!(crate::stamp_word("be58dac", true), patched.stamp());
+        // The tree has files no commit holds — this one's own `src/lib.rs` is
+        // committed, so it does not — but whatever it has, it is not this
+        // binary's patch, and a list of them under `carries` would be the same
+        // fault one level down.
+        assert!(
+            patched.dirty_files.is_empty(),
+            "the tree's uncommitted files were reported as the artefact's: {:?}",
+            patched.dirty_files
+        );
+
+        // Kept, and it is the reason the tree is still read at all: a tree that
+        // has *not* moved does describe the build sitting in it, and its list
+        // of uncommitted files is the only answer anywhere to "which patch is
+        // in these bytes". No stamp can carry a file list.
+        fs::write(repo.join("src/patch.rs"), "// no commit holds this\n").unwrap();
+        let here = bin("here", &format!("wsp 0.1.0 ({head}+dirty)"));
+        let standing = provenance(&here, Some(repo.clone()));
+        assert!(!standing.left_behind(), "a build its tree is still standing on was called stale");
+        assert_eq!(
+            standing.dirty_files,
+            vec!["src/patch.rs".to_string()],
+            "the patch under test stopped being named"
+        );
+
+        // What is left of the old behaviour, and it is the right amount of it:
+        // a binary that will not say — every wsp built before `build.rs`, and
+        // anything that is not a wsp — falls back to the tree, and says so.
+        let mute = bin("old", "wsp 0.1.0");
+        let stood_in = provenance(&mute, Some(repo.clone()));
+        assert_eq!(stood_in.commit.as_deref(), Some(head.as_str()));
+        assert_eq!(stood_in.source(), "tree");
+        assert!(!stood_in.asked);
+        // …and standing in, it is not evidence that the tree left anything
+        // behind: there is nothing to disagree with.
+        assert!(!stood_in.left_behind() || stood_in.newer);
+
+        // Nothing to ask and nothing to ask of: no tree, and a file that will
+        // not run. The one honest answer is that there is no answer.
+        let brick = dir.join("brick");
+        fs::write(&brick, b"not a program").unwrap();
+        let nothing = provenance(&brick, None);
+        assert!(nothing.commit.is_none(), "something was invented for a file that cannot answer");
+        assert_eq!(nothing.source(), "unknown");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The half of this that is not a printed line. `overtaken` is the refusal
+    /// that stops one agent's install silently reverting another's, and its one
+    /// exception turns on the two commits being equal. Fed the tree's HEAD, the
+    /// exception fired on a *coincidence* — my tree happens to stand where your
+    /// install came from — and let through the exact revert it exists to refuse.
+    #[test]
+    fn the_revert_check_compares_what_is_in_the_binaries_and_not_where_a_tree_stands() {
+        // Live is `c0f9113`, installed after our build. Our binary is really
+        // `be58dac`; the tree around it has since moved to `c0f9113`.
+        let ours = built(Some("be58dac"), false, 1_200);
+        assert!(
+            overtaken(ours.built, 1_500, Some(&record("c0f9113", false)), &ours),
+            "a newer install was overwritten because the tree agreed with it"
+        );
+
+        // And the exception it is worth keeping: the same build, arrived at in
+        // two trees, is not a revert.
+        let same = built(Some("c0f9113"), false, 1_200);
+        assert!(!overtaken(same.built, 1_500, Some(&record("c0f9113", false)), &same));
     }
 
     /// The question the whole task is about: is what is installed what was

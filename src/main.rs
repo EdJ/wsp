@@ -84,10 +84,24 @@ pub const DIRTY: bool = matches!(env!("WSP_DIRTY").as_bytes(), b"1");
 /// safe one: there is nothing to compare, and a comparison that always failed
 /// would put every reader of a stamp permanently in its unknown branch.
 pub fn build_stamp() -> String {
-    match (COMMIT.is_empty(), DIRTY) {
+    stamp_word(COMMIT, DIRTY)
+}
+
+/// The same word, made of a commit and a dirt flag that came from somewhere
+/// else — a binary that is not this one, asked what it carries.
+///
+/// Split out of [`build_stamp`] rather than written twice because the two
+/// sides of every comparison in the fleet are made here: a `wsp watch`
+/// registers [`build_stamp`], and `wsp install` reads a stamp back out of the
+/// artefact it is about to copy and has to produce the same word for the same
+/// build. `cmd_install` spelled that rule out a second time and spelled it
+/// against the *tree* instead, which is `worklist-042`: two shapes for one
+/// question is how they come to disagree.
+pub fn stamp_word(commit: &str, dirty: bool) -> String {
+    match (commit.is_empty(), dirty) {
         (true, _) => String::new(),
-        (false, false) => COMMIT.to_string(),
-        (false, true) => format!("{COMMIT}+dirty"),
+        (false, false) => commit.to_string(),
+        (false, true) => format!("{commit}+dirty"),
     }
 }
 

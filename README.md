@@ -3040,7 +3040,7 @@ spot of the check we were relying on at the time.
 | `wsp doctor` | a shared index holding something older than HEAD, in any declared project root | a shared index holding something *newer* — staged work is indistinguishable from staged work |
 | the stash guard | `git stash` itself, refused inside the command that would have taken it, in every worktree of the repository | a stash already on the stack when it was installed — `wsp doctor` names those, and `pop` is still the wrong way to take one back |
 | `cmp` build against installed binary | a stale or partial install | nothing, and it is the only reliable one |
-| `wsp install` | a second install while one is in flight, and a build older than what is already live | what the live binary *contains*, if somebody installed it by hand — the record beside it describes wsp's own installs and admits when it no longer matches |
+| `wsp install` | a second install while one is in flight, and a build older than what is already live | who put a hand-installed binary there and why — the record beside the file describes wsp's own installs and admits when it no longer matches. *What* is in it, it asks the file |
 | `wsp --version`, and `wsp doctor` against it | which commit is live, however it got there, and whether it carries work no commit holds | what that work *was* — `+dirty` names no files, and the tree it came out of may be gone |
 
 ### The index nobody looks at
@@ -3579,8 +3579,8 @@ Three things, and it is worth being clear which is the point:
   and `busy` is not.
 
 - **The loser finds out.** Every install is written down beside the binary: who,
-  when, at what commit, and the size and mtime of what landed. So the next one
-  can say what it is replacing — and refuse, before the copy, when what is live
+  when, at what commit the artefact says it carries, and the size and mtime of
+  what landed. So the next one can say what it is replacing — and refuse, before the copy, when what is live
   was installed *after* the binary in your hand was built. That is the race seen
   from the losing side and the one moment where refusing beats warning.
   `--force` is there for the deliberate rollback, and a newer install of the
@@ -3621,6 +3621,35 @@ still answers. The record beside the file keeps what only it knows — who
 installed it, when, and why — and still admits when the file no longer matches
 it, because every install before this command was a hand-run `install -m 755`,
 which writes nothing down.
+
+And `install` asks the bytes too, on both sides of the copy. It did not, which
+is `worklist-042`: the `carries` line of `wsp install -n` read the *tree's*
+HEAD, so it named a commit the binary does not contain whenever the tree had
+moved since the last release build — which is the ordinary state of a build
+tree, and the exact state somebody runs `-n` in to decide whether to install. A
+stand-in that is wrong precisely when it is consulted is worse than no answer,
+because it is a short hash printed by a tool and nobody re-checks it by hand.
+
+    source ~/…/warm/wsp-0/target/release/wsp built 10h2m ago
+    carries be58dac                      <- what the binary says, not what the tree says
+    stale   the tree has changed since this was built, which is at c0f9113
+    live    ~/.local/bin/wsp be58dac by w5B:p1 4m ago — installing be58dac
+
+That one reading fed six other outputs, which is the thing worth taking from
+this row rather than the line itself: the default `--why` the *next* agent reads
+off the lock, the commit written into the install record and quoted back by
+every later `-n`, the `installed … →` line, `--json`, the `keeps the old one`
+warning — whose other side is a running `wsp watch`'s own `build_stamp()`, so
+tree and artefact were being compared against each other — and, worst, the
+`overtaken` refusal, whose one exception is *the two commits are equal*. Fed a
+tree's HEAD, that exception could fire on a coincidence — my tree happens to
+stand where your install came from — and let through the silent revert the whole
+command exists to refuse.
+
+What the tree is still asked is the one thing no stamp can carry: *which* files
+the uncommitted work was in. `+dirty` is a bit. A file list is not, and the
+build tree has it — for as long as the tree is still where the build left it,
+which is now checked rather than assumed.
 
 ### `wsp checkout`, because the tree itself was the shared thing
 
