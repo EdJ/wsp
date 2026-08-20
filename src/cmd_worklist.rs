@@ -1096,7 +1096,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             let indent = " ".repeat(members_at);
             // Wrapped against the column it starts in, so the whole block
             // sits inside 80 however deep the ordinals go.
-            let width = 72usize.saturating_sub(members_at);
+            let width = prose_width(groups.len());
             if !g.stop.trim().is_empty() {
                 for (n, line) in util::wrap(g.stop.trim(), width).iter().enumerate() {
                     println!("{indent}{}", p.dim(&format!("{}{line}", if n == 0 { "stop: " } else { "      " })));
@@ -1106,18 +1106,8 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             // stop condition and no verdict under it is a barrier that has not
             // been passed, which is a thing worth being able to see in the plan
             // rather than only at `next`.
-            if !g.verdict.trim().is_empty() {
-                let (when, said) = verdict_parts(&g.verdict);
-                let lead = match when.is_empty() {
-                    true => "went: ".to_string(),
-                    false => format!("went: {when}  "),
-                };
-                for (n, line) in util::wrap(said, width).iter().enumerate() {
-                    println!(
-                        "{indent}{}",
-                        p.dim(&format!("{}{line}", if n == 0 { lead.clone() } else { " ".repeat(lead.chars().count()) }))
-                    );
-                }
+            for line in verdict_lines(&p, g, &w.id, width, args.has("verdicts")) {
+                println!("{indent}{line}");
             }
         }
     }
@@ -1255,6 +1245,85 @@ fn last_logged(w: &Worklist, mark: &str) -> Option<String> {
         .find_map(|rest| rest.strip_prefix(mark).map(|s| s.trim().to_string()))
 }
 
+/// The column a group's prose is wrapped to in [`show`], off the widest
+/// ordinal there is.
+///
+/// A function rather than a local because `go` needs the same answer: what it
+/// tells the writer about their verdict is a count of the lines `show` will
+/// draw, and a count taken at a different width is a number about nothing.
+fn prose_width(groups: usize) -> usize {
+    72usize.saturating_sub(groups.to_string().chars().count() + 9)
+}
+
+/// How much of a verdict [`show`] draws before it counts it instead.
+///
+/// Six, and the corpus chose it rather than taste: of the nineteen verdicts
+/// written in this store, six run to 1–4 lines and thirteen to 13–54, with
+/// nothing at all in between. So the cap sits in an empty band — every
+/// verdict is comfortably one side of it or the other, and no barrier's prose
+/// is near enough the line for the number to be arguable.
+const VERDICT_LINES: usize = 6;
+
+/// The lines a group's verdict draws under it, most of them usually not drawn.
+///
+/// Split out to be asserted on, for [`crate::cmd_project::decision_lines`]'s
+/// reason: what this block does with a long verdict is the whole point of it,
+/// and printing straight to stdout would have left that untestable.
+///
+/// **Counted, never cut**, and the difference from the decisions block two
+/// files over is the argument. A decision is written the way a commit message
+/// is — the rule first, the argument after — so an index of first sentences is
+/// a true index of them. **A verdict is written to no such convention**, and
+/// `worklist-046` is what assuming one costs: phase four's group-2 verdict
+/// opens *"THIS IS THE G2 VERDICT. The barrier passed without one"* — a
+/// sentence about where the record had to be filed — and any reading that
+/// stops there has the group's own record saying the group has none. There is
+/// no length of lead that is right when the writer was never told the lead was
+/// load-bearing, so what is drawn is the two facts the plan reading wants and
+/// can stand behind: that the barrier was passed, and when.
+///
+/// **The cap is the same idea `## Log` is held to one screen above** — that
+/// section is named and counted rather than printed into every reading,
+/// because it grows for ever. Verdicts grow for ever in exactly the same way,
+/// one per barrier and unbounded prose each, and the rule had not reached
+/// them: `wsp worklist show phase-four` was 278 lines, 157 of them last
+/// night's four verdicts, and every later barrier paid for all of it. Across
+/// the five lists here it is 380 lines of history drawn as 22.
+///
+/// Under the cap the block is what it always was. A `went: <date>  passed`
+/// announcing itself as one line held somewhere else would be a round trip
+/// bought for nothing, which is how a reader learns to type the escape flag
+/// past every cap it meets — [`crate::cmd_task::log_lines`] declines the same
+/// trade in the same words.
+fn verdict_lines(p: &Paint, g: &Group, id: &str, width: usize, full: bool) -> Vec<String> {
+    if g.verdict.trim().is_empty() {
+        return Vec::new();
+    }
+    let (when, said) = verdict_parts(&g.verdict);
+    let lead = match when.is_empty() {
+        true => "went: ".to_string(),
+        false => format!("went: {when}  "),
+    };
+    let body = util::wrap(said, width);
+    // The count is of lines and the escape is named on the same line, so a
+    // reader who wants the prose never has to work out where it went. `--log`
+    // holds it too, in the entry `go` wrote; `--verdicts` is the one that puts
+    // it back where it is being read from.
+    if !full && body.len() > VERDICT_LINES {
+        return vec![p.dim(&format!(
+            "{lead}{} lines · wsp worklist show {id} --verdicts",
+            body.len()
+        ))];
+    }
+    body.iter()
+        .enumerate()
+        .map(|(n, line)| {
+            let margin = " ".repeat(lead.chars().count());
+            p.dim(&format!("{}{line}", if n == 0 { lead.as_str() } else { margin.as_str() }))
+        })
+        .collect()
+}
+
 /// A verdict as stored — `<instant> <sentence>` — taken apart for printing.
 fn verdict_parts(v: &str) -> (String, &str) {
     match v.trim().split_once(' ') {
@@ -1263,6 +1332,27 @@ fn verdict_parts(v: &str) -> (String, &str) {
         }
         _ => (String::new(), v.trim()),
     }
+}
+
+/// What `go` tells the writer about the verdict it has just recorded, when
+/// there is anything to tell.
+///
+/// **The writer is the one reader who never finds out that a verdict is
+/// abridged.** They read it back whole — out of `--log`, out of the file, out
+/// of the shell they composed it in — and go on writing twenty lines into a
+/// surface that draws a count of them. That is `worklist-046`'s second half:
+/// the cut is invisible from the writing end, so nothing ever tells the person
+/// choosing the words how many of them will be read.
+///
+/// It reports [`verdict_lines`]'s rule rather than restating it — same cap,
+/// same width, same count — because two sentences about the same abridgement
+/// that can disagree is worse than neither. Once per barrier, and nothing at
+/// all under the cap, where what was written is what is drawn.
+fn verdict_notice(id: &str, said: &str, groups: usize) -> Option<String> {
+    let n = util::wrap(said.trim(), prose_width(groups)).len();
+    (n > VERDICT_LINES).then(|| {
+        format!("went  {n} lines · the plan reading shows this line instead · wsp worklist show {id} --verdicts")
+    })
 }
 
 /// A verdict as it is written: the instant, then the sentence.
@@ -1982,6 +2072,11 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     }
     if dry {
         println!("{}", p.dim("-n — nothing was written and no tree was removed"));
+    }
+    if crossed.is_some() {
+        if let Some(line) = verdict_notice(&w.id, &said, groups.len()) {
+            println!("{}", p.dim(&line));
+        }
     }
     if !gone.is_empty() {
         println!("{}  {}", p.bold("gone"), gone.join("  "));
@@ -2793,6 +2888,114 @@ mod tests {
 
     fn verdicts(store: &Store, id: &str) -> Vec<String> {
         groups_of(store, id).into_iter().map(|g| g.verdict).collect()
+    }
+
+    /// The real one, kept whole: phase four's group-2 verdict as it was
+    /// written, whose opening sentence is about where the record had to be
+    /// filed rather than about how the group went.
+    const G2: &str = "2026-08-20T08:34:12Z **THIS IS THE G2 VERDICT.** The barrier passed \
+                      without one; the verb would not amend a barrier already behind it, so \
+                      it is recorded here. G2 was `worklist-041` alone, and it is the group \
+                      that falsified the predicate the seat carried into it. **FOUR COMMITS, \
+                      1106 GREEN, LANDED AT `8e8fd8f` AND CONFIRMED FROM THE TRUNK RATHER \
+                      THAN FROM `land`'s OUTPUT.** Only the first was the row; the other \
+                      three came out of driving it. The row specified `stopped && standing > \
+                      0 && seat`. Driven against the live store first, it fires on every \
+                      healthy seat on this machine — 51 of the 52 levels standing on the two \
+                      of them are `review`, and a seat cannot take review down. So the \
+                      predicate would have marked both working governors as permanently \
+                      stalled. The obligation is named instead: an unsettled member of a \
+                      running worklist.";
+
+    fn verdict_group(verdict: &str) -> Group {
+        Group { members: vec!["wl-001".into()], verdict: verdict.into(), ..Group::default() }
+    }
+
+    /// `worklist-046`, and the reason the answer is a count and not a longer
+    /// cut: **there is no first sentence of this verdict that is not a lie
+    /// about it.** Read to its first sentence the group's own record says the
+    /// group has no record, which is what the wsp seat reported off it. So the
+    /// abridged form says the two things nothing can misread — that the
+    /// barrier was passed, and when — and names what prints the rest.
+    #[test]
+    fn a_verdict_too_long_to_draw_is_counted_rather_than_cut_to_a_sentence_that_denies_it() {
+        let p = Paint::new();
+        let drawn = verdict_lines(&p, &verdict_group(G2), "phase-four", 62, false);
+        assert_eq!(drawn.len(), 1, "one line, whatever the verdict runs to: {drawn:?}");
+        let line = &drawn[0];
+        assert!(line.contains("2026-08-20"), "the date the barrier was passed survives: {line}");
+        assert!(line.contains("lines"), "and the weight of what is not drawn: {line}");
+        assert!(
+            line.contains("wsp worklist show phase-four --verdicts"),
+            "with the command that prints it, so nothing has to be hunted for: {line}",
+        );
+        assert!(
+            !line.contains("THIS IS THE G2 VERDICT"),
+            "and no lead is promoted to standing for the whole: {line}",
+        );
+    }
+
+    /// The other half of the cap, and it is not symmetry for its own sake: a
+    /// `passed` announcing itself as one line held elsewhere is a round trip
+    /// bought for nothing, and a cap that fires for no gain is the one a
+    /// reader learns to type past every time.
+    #[test]
+    fn a_verdict_short_enough_to_draw_is_drawn_and_not_announced() {
+        let p = Paint::new();
+        let drawn = verdict_lines(&p, &verdict_group("2026-08-20T09:00:00Z passed"), "batch", 62, false);
+        assert_eq!(drawn.len(), 1, "still one line");
+        assert!(drawn[0].contains("passed"), "but it is the verdict, not a count of it: {:?}", drawn[0]);
+        assert!(!drawn[0].contains("--verdicts"), "and nothing to go and fetch: {:?}", drawn[0]);
+    }
+
+    /// Nothing is lost, which is what makes the cap safe to take. `--verdicts`
+    /// is the same block with the cap off, in the place it was abridged in —
+    /// `--log` also holds the words, in the entry `go` wrote, but only here do
+    /// they sit under the group they are a judgement on.
+    #[test]
+    fn the_flag_draws_the_verdict_whole_where_it_was_abridged() {
+        let p = Paint::new();
+        let drawn = verdict_lines(&p, &verdict_group(G2), "phase-four", 62, true);
+        assert!(drawn.len() > VERDICT_LINES, "the cap is off: {} lines", drawn.len());
+        let whole = drawn.join(" ");
+        assert!(whole.contains("THIS IS THE G2 VERDICT"), "the lead is there");
+        assert!(whole.contains("falsified the predicate"), "and so is the middle of it");
+    }
+
+    /// The writer's end of the same fact. A verdict is composed by somebody who
+    /// then reads it back whole and never learns that the surface everybody
+    /// else reads draws a count of it — so `go` says so, once, and only when
+    /// the two differ.
+    #[test]
+    fn the_writer_is_told_when_what_they_wrote_is_not_what_will_be_drawn() {
+        let (_, said) = verdict_parts(G2);
+        let notice = verdict_notice("phase-four", said, 4).expect("a verdict over the cap is reported");
+        assert!(notice.contains("--verdicts"), "naming what draws it whole: {notice}");
+        assert_eq!(
+            verdict_notice("batch", "passed", 4),
+            None,
+            "and a verdict drawn as written is not remarked on at all",
+        );
+    }
+
+    /// The two ends agree because they are one rule read twice. A count taken
+    /// at a different width is a number about nothing, and the width follows
+    /// the widest ordinal, so both sides ask `prose_width` rather than each
+    /// wrapping to a constant of its own.
+    #[test]
+    fn what_go_counts_and_what_show_draws_are_the_same_lines() {
+        let p = Paint::new();
+        let (_, said) = verdict_parts(G2);
+        for groups in [1usize, 9, 10, 100] {
+            let width = prose_width(groups);
+            let whole = verdict_lines(&p, &verdict_group(G2), "phase-four", width, true);
+            let notice = verdict_notice("phase-four", said, groups).expect("over the cap at every width");
+            assert!(
+                notice.contains(&format!("{} lines", whole.len())),
+                "{groups} groups: go says `{notice}` and show draws {} lines",
+                whole.len(),
+            );
+        }
     }
 
     /// The design's one piece of machinery around judgement, and the whole of

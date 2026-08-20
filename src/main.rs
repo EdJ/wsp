@@ -153,8 +153,8 @@ const BOOL_FLAGS: &[&str] = &[
     // And `wsp watch <signal>…`, whose positionals are signal names.
     "now", "once", "status",
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
-    // and the parent, and `worklist show <slug> --log`.
-    "sub", "log",
+    // and the parent, and `worklist show <slug> --log|--verdicts`.
+    "sub", "log", "verdicts",
     // And the return path. `wsp answer <id> --abandon "the reason"` is the word
     // order somebody types, and without this the reason is eaten as the flag's
     // value and the verb refuses for want of a sentence it was given. `--again`
@@ -1367,8 +1367,11 @@ fn help_text() -> String {
   wsp worklist edit <slug> --overview -    what has to be true before group 1
                                     starts — there is no barrier in front of it
                                     to carry a stop condition, so the list does
-  wsp worklist ls|show <slug>       every list, or one: the groups, where it is
-                                    up to, and which of them may still be edited
+  wsp worklist ls|show <slug> [--verdicts]
+                                    every list, or one: the groups, where it is
+                                    up to, and which of them may still be edited.
+                                    A verdict past a few lines is counted rather
+                                    than drawn; --verdicts draws them whole
   Editing is write-ahead-only: a group at or behind where the list is up to has
   either run or is running, and is refused with what may be edited instead.
 
