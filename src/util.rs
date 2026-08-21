@@ -767,6 +767,29 @@ impl Paint {
     pub fn plain() -> Self {
         Paint { on: false }
     }
+    /// A paint that definitely writes escapes, whatever the harness's stdout
+    /// is.
+    ///
+    /// The counterpart to [`Paint::plain`] and it exists for one assertion: on
+    /// a machine with no tty `Paint::new()` and `Paint::plain()` are the same
+    /// object, so a test that a sink chose the right one would pass without
+    /// being able to fail. Compiled out of the binary.
+    #[cfg(test)]
+    pub fn painted() -> Self {
+        Paint { on: true }
+    }
+
+    /// Whether this one actually writes escapes.
+    ///
+    /// For a test that has to assert *which* paint something chose rather than
+    /// what it produced. Comparing the output cannot do it: with no tty both
+    /// paints render identically, so the assertion passes on a machine that
+    /// could never have shown the fault — which is the quiet pass
+    /// [`Paint::plain`]'s own docs warn about.
+    #[cfg(test)]
+    pub fn on(&self) -> bool {
+        self.on
+    }
     fn wrap(&self, code: &str, s: &str) -> String {
         if self.on {
             format!("\x1b[{code}m{s}\x1b[0m")

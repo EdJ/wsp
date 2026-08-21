@@ -1322,8 +1322,14 @@ fn help_text() -> String {
                                     rides the next one. Nothing is dropped.
                                     A held fact older than --defer-max is a
                                     wake by itself, so a quiet fleet still
-                                    delivers its backlog
-  wsp watch --drain                 print what a --wake watch is holding and
+                                    delivers its backlog.
+                                    A governor needs none of this: the daemon
+                                    runs the same triage for every seat and
+                                    types the result at it, so there is
+                                    nothing to start and nothing to remember.
+                                    `wsp govern <scope> --clear` is the off
+                                    switch, and it holds rather than drops
+  wsp watch --drain                 print what is being held for this seat and
                                     clear it — free, because you are already
                                     awake to be reading it
   wsp watch --now                   …or the level read on its own: everything

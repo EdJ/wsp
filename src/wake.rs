@@ -40,7 +40,7 @@
 //! seat hold something the table judged worth a context read — which is the
 //! same table, asked of the record rather than of what is fresh.
 //!
-//! # The turn gate is for durability, not for corruption
+//! # The gate is two questions, and only one of them is durability
 //!
 //! `core-021` d2, driven against a real Claude Code rather than a fake. A
 //! prompt delivered mid-turn is *queued* by Claude Code and answered when the
@@ -50,9 +50,33 @@
 //! read. Holding it costs ninety seconds and keeps the spool as the record for
 //! the whole window.
 //!
-//! Asked of the *kind* rather than written into this path, because it is a fact
-//! about a transport and not about waking a governor — see
-//! [`crate::agent_commands::Kind::queue_is_the_agents`].
+//! The second question is not about durability at all — it is about *where the
+//! keystrokes land*, and `core-019` is where this path was found not asking it.
+//! A wake is delivered by typing at a pane, and there are three states in which
+//! that is not a delivery: a pane stopped on a permission dialog takes the text
+//! *into the dialog*, an agent still coming up refuses it, and a pane herdr
+//! cannot be asked about may not hold an agent at all. `cmd_agent::tell` has
+//! refused all three since robustness-083; this path asked only
+//! `turn_in_flight`, which is `Working` and nothing else. It asks
+//! [`crate::place::State::will_take_a_prompt`] now — the question already
+//! written down for every caller that used to spell it `state == "idle"`.
+//!
+//! Both asked of the *kind* rather than written into this path, because both
+//! are facts about a transport that types at a pane and not about waking a
+//! governor — see [`crate::agent_commands::Kind::queue_is_the_agents`].
+//!
+//! # Always on, and the seat is the off switch
+//!
+//! `core-019`. Nothing here is opt-in and nothing is tunable, which was a
+//! constructor's side effect before it was a decision; it is a decision now,
+//! and [`crate::cmd_watch::Spec::for_wake`] carries the number it is argued
+//! from. The switch a person has is the seat itself — `wsp govern <scope>
+//! --clear` vacates it, this path answers *the seat is empty*, and the spool
+//! keeps everything until somebody sits down again. It is named on every wake
+//! by [`preamble`], reported by `wsp watch --status`, and a spool that has
+//! silently outlived `--defer-max` behind it is a `wsp doctor` problem — see
+//! [`crate::cmd_watch::health`], which is the seventh guard against a silence
+//! nobody can see in a file that already carried six.
 
 use crate::agent_commands;
 use crate::cmd_govern;
@@ -192,7 +216,81 @@ impl<'a> Tell<'a> {
 /// not a fault: it is what `core-017`'s table is for.
 const NOT_YET: &str = "nothing worth a wake yet";
 
+/// Why a pane would not take a wake, in the words `--status` and `doctor`
+/// print.
+///
+/// **One sentence per state rather than one for all of them**, because they
+/// want four different repairs and a reader who cannot tell them apart goes
+/// looking in the wrong place: mid-turn clears itself and is not a fault at
+/// all, `Blocked` needs a person at a keyboard, `Starting` clears itself in
+/// seconds, and `Unknown` means herdr could not be asked — which is a fault
+/// about the *reporter* and not about the seat.
+///
+/// No wildcard, for [`crate::cmd_watch::Line::disposition`]'s reason: a state
+/// added later has to come past here and say what a wake does about it, rather
+/// than inheriting a sentence that was written before it existed.
+pub(crate) fn held_because(state: crate::place::State) -> Option<&'static str> {
+    use crate::place::State;
+    match state {
+        // The one state a wake may be typed into, and it is
+        // [`crate::place::State::will_take_a_prompt`]'s whole definition. This
+        // function is the only thing [`Tell::deliver`] asks, so a test that
+        // enumerates it is reading the gate rather than a copy of it.
+        State::Idle => None,
+        State::Working => Some("the seat is mid-turn"),
+        State::Blocked => Some("the seat is stopped on a prompt only a person can answer"),
+        State::Starting => Some("the agent is still coming up"),
+        State::Empty | State::Gone => Some("the seat is empty"),
+        State::Unknown => Some("herdr cannot say what the seat is doing"),
+    }
+}
+
+/// What a governor is told about the thing that just typed at it.
+///
+/// **This is `core-019` question 3, and the answer is that it rides the wake
+/// rather than the work order.** Nothing in `cmd_spawn::work_order`, `wsp
+/// brief` or the handbook says a governor's session may receive prompts nobody
+/// typed, and a wake arrives through `Kind::tell` — herdr typing at the pane —
+/// so it is indistinguishable from Ed at a keyboard. That is a strange thing to
+/// meet unexplained, and the obvious repair is a clause in the custodian work
+/// order.
+///
+/// Two arguments against that clause, and they are both decisive:
+///
+/// - **It is absent exactly when it is needed.** A governor that has been
+///   `/clear`ed is still in the slot, still addressed, and still woken — and
+///   the work order it read is gone. The explanation has to travel with the
+///   thing it explains.
+/// - **It is the most expensive real estate in the system.** The work order is
+///   read on every spawn of every governor, for ever, whether or not a wake
+///   ever arrives. This is ~50 tokens against a context read measured at 208k
+///   — 0.02% of the thing it is explaining — and it is paid only by the seats
+///   that are actually woken, only when they are woken.
+///
+/// Repeated on every wake rather than only the first, for the first argument
+/// again: "only the first" is state, and the session it was told to may not be
+/// the session that takes the next one.
+///
+/// It also names the stand-down, which is the whole of this row's answer to
+/// *what is the off switch* — the seat is the switch, and a wake is the one
+/// place a governor reliably reads.
+fn preamble(scope: &str) -> String {
+    format!(
+        "wsp · nobody typed this. You are the custodian of `{scope}`, and wsp's attention pass judged the lines\n\
+         below worth a read of your context. No reply is expected — act on them, or don't, then stop.\n\
+         `wsp watch --drain` prints what else is held for this seat · `wsp govern {scope} --clear` stands the\n\
+         seat down and stops the wakes."
+    )
+}
+
 impl Sink for Tell<'_> {
+    /// **Never this process's stdout.** The far end is a composer, and
+    /// [`Sink::paint`] carries why that is a question about the destination
+    /// rather than about the daemon.
+    fn paint(&self) -> util::Paint {
+        util::Paint::plain()
+    }
+
     fn deliver(&mut self, said: &[String]) -> bool {
         if said.is_empty() {
             return true;
@@ -212,10 +310,16 @@ impl Sink for Tell<'_> {
         };
         let how = agent_commands::of(&pane.agent);
         let place = crate::place_herdr::Herdr::new();
-        // The gate. `core-021` d2: not corruption — Claude Code queues a
-        // mid-turn prompt and answers it at the boundary — but durability,
-        // because that queue is the agent's and dies with it while the spool
-        // does not.
+        // The gate: one state read, two questions, and both of them are about
+        // a transport that delivers by *typing at a pane*.
+        // [`agent_commands::Kind::queue_is_the_agents`] is that transport
+        // named — its docs open on `Place::tell`, herdr typing — so a kind
+        // carrying a queue of its own pays for neither question.
+        //
+        // **Mid-turn is the durability half.** `core-021` d2: not corruption —
+        // Claude Code queues a mid-turn prompt and answers it at the boundary —
+        // but durability, because that queue is the agent's and dies with it
+        // while the spool does not.
         //
         // **Asked of `agent.get` and not of the census row `occupant` hands
         // back.** `herdr::panes` is `pane.list`, and the whole reason
@@ -226,14 +330,28 @@ impl Sink for Tell<'_> {
         // delivered into an agent that `agent.get` reported as `working`
         // throughout. `place_herdr::turning` carries the same warning for the
         // same reason.
+        //
+        // **And where the keystrokes land is the other half**, which
+        // [`crate::place::State::turn_in_flight`] does not answer: it is
+        // `Working` and nothing else, so this path would type into a permission
+        // dialog, into an agent still coming up, and into a pane herdr could
+        // not be asked about — the three `cmd_agent::tell` has refused since
+        // robustness-083. The module docs carry it; the question is
+        // [`crate::place::State::will_take_a_prompt`], and asking the wider one
+        // costs nothing this path was not already paying, because refusing is
+        // the ordinary answer here.
         let addressee = Pane::new(&pane.pane_id);
-        if how.queue_is_the_agents()
-            && crate::place::Place::state(&place, &addressee).is_ok_and(|s| s.turn_in_flight())
-        {
-            self.why = "the seat is mid-turn";
-            return false;
+        if how.queue_is_the_agents() {
+            // `State::Unknown` when herdr could not be asked, which
+            // [`held_because`] refuses — an absence is not a fact, least of all
+            // the fact that somebody is there to read this.
+            let state = crate::place::Place::state(&place, &addressee).unwrap_or_default();
+            if let Some(why) = held_because(state) {
+                self.why = why;
+                return false;
+            }
         }
-        let text = said.join("\n");
+        let text = format!("{}\n{}", preamble(&self.scope), said.join("\n"));
         // No `Sent`, no `already_sent`, no `twice` — see this type's docs.
         match how.tell(&place, &addressee, &text) {
             Ok(_) => true,
@@ -441,6 +559,165 @@ mod tests {
             "escalation was reached, so a delivery was attempted and the reason it failed is on the record",
         );
         assert_eq!(spool_of(&store, "core").depth(), 1, "and it is still owed, because nothing took it");
+    }
+
+    // ---- what a wake is typed into, and what it says when it arrives -------
+
+    /// **The whole path, over a socket, into a seat in each of the six states
+    /// a pane can be in.**
+    ///
+    /// Everything else here asserts a predicate; this asserts what actually
+    /// leaves. It is the shape `core-021` d2 was driven in and the reason two
+    /// of that group's faults were found by driving rather than by reading —
+    /// the gate read a census row that could not tell a working agent from an
+    /// idle one, and nothing above the socket could have said so.
+    ///
+    /// What it pins: the wake reaches an `Idle` seat and nothing else reaches
+    /// anything; what arrives carries [`preamble`] and the news under it; and
+    /// there is not an escape code in it, because the far end is a composer.
+    #[test]
+    fn a_wake_reaches_an_idle_seat_and_arrives_as_something_a_composer_can_read() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+
+        let env = util::isolated("wake-driven");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+
+        // One seat per state, each governing a scope of its own, so one pass
+        // asks the question six times and the answers cannot be confused.
+        let states = [
+            (State::Idle, "s-idle"),
+            (State::Working, "s-working"),
+            (State::Blocked, "s-blocked"),
+            (State::Starting, "s-starting"),
+            (State::Gone, "s-gone"),
+            (State::Unknown, "s-unknown"),
+        ];
+        let mut stage = Stage::new();
+        for (i, (state, scope)) in states.iter().enumerate() {
+            let (space, pane) = (format!("w{}", i + 1), format!("w{}:p1", i + 1));
+            let mut spot = Spot::agent(&pane, "claude", scope, *state);
+            spot.space = space.clone();
+            stage.put(spot);
+            cmd_govern::take(&store, scope, &space, &pane);
+        }
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let news: Vec<Emit> =
+            states.iter().map(|(_, scope)| emit(Kind::Review, scope, &format!("{scope}-1"))).collect();
+        wake(&store, &news, 0);
+
+        // One delivery, to the one seat that will take a prompt.
+        let told: Vec<crate::fake::Asked> =
+            fake.asked().into_iter().filter(|a| a.verb == crate::fake::Verb::Tell).collect();
+        assert_eq!(told.len(), 1, "only the idle seat was typed at: {told:?}");
+        assert_eq!(told[0].seat.as_ref().map(|s| s.as_str()), Some("w1:p1"));
+
+        let said = &told[0].said;
+        assert!(said.contains("nobody typed this"), "the preamble rides the wake: {said}");
+        assert!(said.contains("`s-idle`"), "and names the scope this seat holds: {said}");
+        assert!(said.contains("s-idle-1"), "and the news is under it: {said}");
+        assert!(!said.contains('\x1b'), "a composer is not a terminal: {said:?}");
+
+        // And the five that were held say which of the five reasons it was, so
+        // `--status` and `doctor` can tell a fault from the design.
+        for (state, scope) in states.iter().skip(1) {
+            assert_eq!(spool_of(&store, scope).depth(), 1, "{scope} is still owed it");
+            assert_eq!(
+                holding(&store, scope),
+                held_because(*state).expect("a refusal has a sentence"),
+                "{scope} says why",
+            );
+        }
+    }
+
+    /// **The gate is not "is a turn in flight", and this is the state that
+    /// proved it.**
+    ///
+    /// `cmd_agent::tell` has refused a `Blocked` pane since robustness-083 and
+    /// says why: a permission dialog holds the keyboard, so the text does not
+    /// queue behind anything — it is typed *at the dialog*, where a sentence
+    /// about what to do next can select an answer nobody chose. This path asked
+    /// [`crate::place::State::turn_in_flight`], which is `Working` and nothing
+    /// else, so a wake would have gone straight into that dialog.
+    ///
+    /// Asserted through [`held_because`] because that is the whole of what
+    /// [`Tell::deliver`] asks — there is no second branch — so this is the gate
+    /// and not a copy of it.
+    #[test]
+    fn a_wake_is_never_typed_at_a_seat_that_will_not_take_a_prompt() {
+        use crate::place::State;
+
+        // Exactly one state takes a wake, and it is the one every caller that
+        // used to spell this `state == "idle"` was asking about.
+        for state in [State::Empty, State::Starting, State::Working, State::Blocked, State::Gone, State::Unknown] {
+            assert!(!state.will_take_a_prompt(), "{state:?}");
+            let why = held_because(state).unwrap_or_else(|| panic!("{state:?} has no sentence"));
+            assert_ne!(why, NOT_YET, "{state:?} is a refusal, not the ordinary state");
+        }
+        assert_eq!(held_because(State::Idle), None);
+
+        // The two the old gate let through, named so a revert has to argue with
+        // this rather than with a list.
+        assert!(!State::Blocked.turn_in_flight(), "which is why the old gate delivered into a modal");
+        assert!(!State::Unknown.turn_in_flight(), "and into a pane herdr could not be asked about");
+
+        // And each refusal reads as its own repair: a person at a keyboard, a
+        // spawn, and a reporter that could not be asked are three different
+        // errands.
+        let seen: std::collections::BTreeSet<&str> =
+            [State::Working, State::Blocked, State::Starting, State::Empty, State::Unknown]
+                .into_iter()
+                .filter_map(held_because)
+                .collect();
+        assert_eq!(seen.len(), 5, "one sentence per repair: {seen:?}");
+    }
+
+    /// **A governor is told what woke it, and it is told on the wake.**
+    ///
+    /// `core-019` question 3. A wake arrives through `Kind::tell` — herdr
+    /// typing at the pane — so it is indistinguishable from a person at a
+    /// keyboard, and nothing in the custodian work order, the brief or the
+    /// handbook says a governor's session may receive prompts nobody typed.
+    /// The clause rides the wake rather than the work order because a `/clear`
+    /// ed governor is still in the slot, still addressed and still woken, and
+    /// the work order it read is gone.
+    #[test]
+    fn a_told_wake_says_what_it_is_and_who_it_is_for() {
+        let said = preamble("core");
+
+        assert!(said.contains("nobody typed this"), "{said}");
+        assert!(said.contains("`core`"), "it names the scope this seat holds: {said}");
+        assert!(said.contains("No reply is expected"), "a wake is not a question: {said}");
+        // The off switch, named where a governor reliably reads. `core-019`
+        // question 2: the seat is the switch, and a switch nothing points at is
+        // one nobody finds — which is how `wsp watch` itself came to be started
+        // by nobody.
+        assert!(said.contains("wsp govern core --clear"), "{said}");
+        assert!(said.contains("wsp watch --drain"), "and what else is being held: {said}");
+    }
+
+    /// **Painting is a fact about the destination.** The far end of this sink
+    /// is a composer, and `Stream` used to build one `Paint::new()` for every
+    /// sink — a question about *this* process's stdout. `wsp doctor` tells a
+    /// person to run `wsp daemon` by hand when the daemon has wedged, and a
+    /// daemon started that way has a tty, so every wake would have arrived as
+    /// escape codes in a governor's prompt.
+    ///
+    /// That a `Stream` asks its sink at all is asserted next door, against a
+    /// sink that definitely paints — see
+    /// `cmd_watch::tests::a_stream_is_painted_for_its_sink_and_not_for_this_process`.
+    /// This is the half that says which answer *this* sink gives.
+    #[test]
+    fn a_wake_is_never_painted_for_a_terminal_that_is_not_there() {
+        let env = util::isolated("wake-paint");
+        let store = Store::at(env.home(), env.state());
+        let tell = Tell::new(&store, "core");
+
+        assert!(!Sink::paint(&tell).on(), "a composer cannot read escape codes");
     }
 
     /// The other half: a seat holding nothing costs nothing. The sweep above

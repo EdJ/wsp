@@ -2470,6 +2470,15 @@ pub(crate) struct Registered {
     /// seventh way silence lies in a file that already carries six. `--drain`
     /// is how a reader collects it.
     pub(crate) spooled: usize,
+    /// When the oldest thing still held happened, or zero when nothing is
+    /// held.
+    ///
+    /// The count above says *something is being held* and cannot say *and it
+    /// has been held past the bound*. [`DEFER_MAX`] is the promise that this
+    /// path is never silent for longer than four hours, and the only way to
+    /// find out whether the promise was kept is to compare it against this —
+    /// see [`health`].
+    pub(crate) oldest: i64,
 }
 
 impl Registered {
@@ -2539,6 +2548,18 @@ pub(crate) fn registered(store: &Store) -> Vec<Registered> {
             daemon: v.get("daemon").and_then(Value::as_bool).unwrap_or(false),
             build: v.get("build").and_then(Value::as_str).unwrap_or_default().to_string(),
             spooled: v.get("spool").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+            // The first entry, because a spool is appended to and settled from
+            // the front — `Spool::append`, `Spool::settle` — so position zero
+            // is the oldest. Read off the record rather than through `Spool`,
+            // which would re-parse every held line to answer a question about
+            // one stamp.
+            oldest: v
+                .get("spool")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("at"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
             wake: v.get("wake").and_then(Value::as_bool).unwrap_or(false),
             delivered: v.get("delivered").and_then(Value::as_u64).unwrap_or(0) as usize,
             holding: v.get("holding").and_then(Value::as_str).unwrap_or_default().to_string(),
@@ -2560,7 +2581,38 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
         return;
     }
     let live = crate::place_super::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
+    let now = util::epoch_secs();
     for w in &watches {
+        // **A seat's wake record fails in a way no liveness check can see.**
+        // There is no process to have died — `crate::wake` stamps `pid: 0` on
+        // purpose, because what the record describes is what the daemon *owes*
+        // a seat — so every check below reads it as healthy however long it has
+        // been holding. And holding is the normal state: the table spools a
+        // `flag` for ever and is right to.
+        //
+        // What is not normal is holding past [`DEFER_MAX`], because that number
+        // is the promise. Escalation says a spooled fact nobody collected
+        // becomes a wake by itself, which bounds how long this path may be
+        // silent; a spool older than the bound means the escalation fired and
+        // the delivery did not, and the reason it did not is on the record.
+        // `core-019`: the seat is the off switch, so it has to be a *visible*
+        // one — a governor stood down at 4am with news piling up behind it must
+        // not read the same as a quiet night.
+        if w.wake {
+            if w.spooled > 0 && w.oldest > 0 && now - w.oldest > DEFER_MAX {
+                problems.push(format!(
+                    "the {} seat is owed {} wake{} and the oldest has waited {} — past the {} bound `--defer-max` puts on how long this can be silent, because {}. Nothing is lost: `wsp watch --drain` prints what is held, and it is delivered as soon as somebody is there to take it. `wsp govern {}` says who that would be",
+                    w.scope,
+                    w.spooled,
+                    match w.spooled { 1 => "", _ => "s" },
+                    util::duration_human(now - w.oldest),
+                    util::duration_human(DEFER_MAX),
+                    match w.holding.is_empty() { true => "the last attempt did not say why", false => w.holding.as_str() },
+                    w.scope,
+                ));
+            }
+            continue;
+        }
         let dead = w.watching() && !live.contains(&w.pid);
         // Said before the two liveness faults and separately from them, because
         // it is the one that looks like nothing at all: this watcher is
@@ -2730,11 +2782,11 @@ fn note(class: Class, at: i64, spec: &Spec, said: &str, p: &Paint) -> String {
 /// absence under `--json` was failure 1, and a line nothing can construct is a
 /// line nothing can assert on. See
 /// [`a_json_watcher_says_it_started_before_anything_has_happened`].
-fn opening(spec: &Spec, standing: usize, owes: bool) -> Line {
+fn opening(store: &Store, spec: &Spec, standing: usize, owes: bool) -> Line {
     Line::Note(
         Class::Open,
         format!(
-            "watching {} · every {} · {} standing · {}{}",
+            "watching {} · every {} · {} standing · {}{}{}",
             spec.scope.name,
             util::duration_human(spec.every),
             standing,
@@ -2742,9 +2794,45 @@ fn opening(spec: &Spec, standing: usize, owes: bool) -> Line {
             // Only when it is a seat and only at zero — see
             // [`nothing_addressed`]. On every other line this is the empty
             // string, so a watch on a project is byte-for-byte what it was.
-            nothing_addressed(&spec.scope, standing, owes).map(|note| format!(" · {note}")).unwrap_or_default()
+            nothing_addressed(&spec.scope, standing, owes).map(|note| format!(" · {note}")).unwrap_or_default(),
+            already_woken(store, &spec.scope).map(|note| format!(" · {note}")).unwrap_or_default(),
         ),
     )
+}
+
+/// **The stopping half of `core-019`, said at the moment somebody makes the
+/// mistake.**
+///
+/// A `wsp watch` outlives the turn that started it. That is what the verb is
+/// for and it is also how `w1:p6` came to sit in the register as *watching* for
+/// twenty hours after its process died, and how the seat that filed `core-014`
+/// restarted its own watch twenty-two times in a day — see
+/// [`what_the_daemon_wake_path_costs_a_governor_over_the_measured_day`], which
+/// counts the openings.
+///
+/// `core-021` removed the reason to run one: the daemon wakes a seat whether or
+/// not anybody starts anything. So the honest thing to say to a governor
+/// opening a stream over its own scope is that the delivery is already handled
+/// and this is a stream to *read*, now, with a `^C` at the end of it.
+///
+/// Said here rather than in the work order for [`crate::wake::preamble`]'s
+/// reason, and one better: a governor that never runs this verb never pays for
+/// the sentence at all.
+///
+/// Only for a seat watching itself. A watch on somebody else's project, or on a
+/// scope with no seat, is a person reading a stream and is byte-for-byte what
+/// it was.
+fn already_woken(store: &Store, scope: &Scope) -> Option<&'static str> {
+    if !scope.seated {
+        return None;
+    }
+    // The daemon's own register row, and it has to be *ticking*: a daemon that
+    // has stopped is exactly when a governor should be running one of these by
+    // hand, and telling it not to would be the advice that does not work.
+    registered(store)
+        .iter()
+        .any(|w| w.daemon && w.watching() && !w.stale())
+        .then_some("the daemon already wakes this seat — this stream is yours to read now, and it ends with your turn")
 }
 
 /// The heartbeat.
@@ -2798,7 +2886,10 @@ pub(crate) struct Stream<'a, S: Sink = Stdout> {
 
 impl<'a, S: Sink> Stream<'a, S> {
     pub(crate) fn new(spec: &'a Spec, sink: S) -> Stream<'a, S> {
-        Stream { spec, p: Paint::new(), sink, hot: Vec::new(), cold: Vec::new() }
+        // Asked of the sink, because painting is a fact about where the words
+        // are going and not about where they come from — see [`Sink::paint`].
+        let p = sink.paint();
+        Stream { spec, p, sink, hot: Vec::new(), cold: Vec::new() }
     }
 
     /// Offer a line. Print now, or hold — there is no third outcome, and no
@@ -2942,6 +3033,25 @@ pub(crate) trait Sink {
     /// attempted. Everything downstream of this answer depends on the
     /// difference: it is what an entry clears on.
     fn deliver(&mut self, said: &[String]) -> bool;
+
+    /// How lines written here should be painted.
+    ///
+    /// **A property of the destination, and it was being read off the sending
+    /// process's own stdout.** [`Stream`] built one `Paint::new()` whatever the
+    /// sink was, and that call asks whether *this process* is attached to a
+    /// terminal — the right question for [`Stdout`] and the wrong one for a
+    /// sink that types at somebody else's pane.
+    ///
+    /// `core-019`, and it is reachable rather than theoretical: `wsp doctor`
+    /// tells a person to `run wsp daemon yourself` when the daemon has wedged,
+    /// and a daemon started that way has a tty, so every wake it delivered
+    /// would have arrived in a governor's composer as `\x1b[2m…\x1b[0m`.
+    /// Nothing was ever wrong in production only because herdr starts the
+    /// daemon with stdout on `/dev/null` — a fact about how it happens to be
+    /// launched, holding up a fact about what a composer can read.
+    fn paint(&self) -> Paint {
+        Paint::new()
+    }
 }
 
 /// A borrowed sink is a sink, so a caller that needs to read something back off
@@ -2950,6 +3060,13 @@ pub(crate) trait Sink {
 impl<S: Sink + ?Sized> Sink for &mut S {
     fn deliver(&mut self, said: &[String]) -> bool {
         (**self).deliver(said)
+    }
+
+    /// Forwarded, not defaulted. `crate::wake` lends its sink, so a default
+    /// here would silently hand back `Paint::new()` and undo the override the
+    /// borrow was made to carry.
+    fn paint(&self) -> Paint {
+        (**self).paint()
     }
 }
 
@@ -3096,9 +3213,47 @@ impl Spec {
     /// the same four questions [`Stream`] asks: which mode, which document, who
     /// it is for, and how long a fact may wait.
     ///
+    /// # Four fields decide anything, and the rest are the type's
+    ///
+    /// `wake`, `defer_max`, `json` and `scope` are read on this path. `want`,
+    /// `every`, `settle`, `heartbeat`, `stop_after` and `until` are not read at
+    /// all — they describe a *loop that polls*, and this has neither: the
+    /// polling is [`crate::attention::tick`]'s, which already ran, and the
+    /// stopping is the daemon's. Said here because `core-019` read the
+    /// constructor as ten hardcoded knobs and only four of them are knobs.
+    ///
     /// `json: false` because the far end is an agent reading prose, not a pipe;
     /// the classes and the columns are what a person or a monitor reads off
     /// stdout, and this path has no stdout.
+    ///
+    /// # Always on, every signal, four hours — as a decision
+    ///
+    /// **`core-019`.** There is no opt-in and no per-seat tuning, and that was
+    /// a constructor's side effect before it was argued. The argument, and the
+    /// number it rests on:
+    ///
+    /// - **A thing a governor has to enable is a thing that stays disabled.**
+    ///   `core-019` was filed because `wsp watch` is recommended *nowhere* —
+    ///   not in the custodian work order, not in `wsp brief`, not in the
+    ///   handbook — so it was discovered by reading `wsp help` end to end or
+    ///   not at all. An opt-in wake reproduces that exactly, one layer down.
+    /// - **It is affordable, counted rather than estimated.** Replayed against
+    ///   the same corpus [`DEFER_MAX`] is argued from, the daemon's wake path
+    ///   delivers **42 wakes where that seat actually took 134**, over the 24
+    ///   hours the corpus covers — see
+    ///   [`what_the_daemon_wake_path_costs_a_governor_over_the_measured_day`].
+    ///   Every one of the 42 carries news addressed to that seat by
+    ///   [`Emit::to`]; the 92 that go away are heartbeats, openings, cleared
+    ///   levels and flags a person had already been told about for free.
+    /// - **The off switch is the seat**, not a field here. `wsp govern <scope>
+    ///   --clear` vacates it and the spool holds everything until somebody
+    ///   sits down again, which is an off switch that cannot lose anything.
+    ///   A per-seat mute would be new state whose only effect is silence, in a
+    ///   file that carries six named arguments against exactly that.
+    ///
+    /// `want: Kind::every()` is therefore not "no narrowing" — it is inert, and
+    /// the narrowing that matters already happened at [`Emit::to`], which is
+    /// per-signal and finer than any subscription could be.
     pub(crate) fn for_wake(scope: &str) -> Spec {
         Spec {
             scope: Scope { name: scope.to_string(), seated: true, workspace: String::new(), pane: String::new(), all: false },
@@ -3506,7 +3661,7 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
 
     let first = poll.sample();
     let primed = ledger.prime(&first, started);
-    stream.put(started, opening(spec, ledger.standing(), poll.owes_a_run()));
+    stream.put(started, opening(store, spec, ledger.standing(), poll.owes_a_run()));
     for e in primed {
         stream.put(started, Line::News(e));
     }
@@ -3813,7 +3968,12 @@ fn status(store: &Store, args: &Args) -> i32 {
                 p.dim(&util::pad("wake", 10)),
                 p.dim(&util::pad(&format!("told {} ago", util::duration_human(util::since(&w.tick))), 22)),
                 match w.spooled {
-                    0 => p.dim(&format!("{} delivered · holding nothing", w.delivered)),
+                    // The stand-down named where the wake state is already
+                    // being read. `core-019`: the seat is the off switch, and
+                    // an off switch nothing points at is one nobody finds —
+                    // which is how `wsp watch` itself came to be recommended
+                    // nowhere and started by nobody.
+                    0 => p.dim(&format!("{} delivered · holding nothing · wsp govern {} --clear stops it", w.delivered, w.scope)),
                     n => p.dim(&format!("{} delivered · holding {n} — {}", w.delivered, w.holding)),
                 }
             );
@@ -4454,6 +4614,7 @@ mod tests {
             wake: false,
             delivered: 0,
             holding: String::new(),
+            oldest: 0,
         };
         assert!(!pull.watching());
         assert!(!pull.stale(), "a day old and still not a fault: nobody promised to tick");
@@ -4475,6 +4636,7 @@ mod tests {
             wake: false,
             delivered: 0,
             holding: String::new(),
+            oldest: 0,
         }
     }
 
@@ -4600,6 +4762,57 @@ mod tests {
         assert_eq!(duration("soon"), None);
     }
 
+    /// **The seventh guard, and the one that makes `core-019`'s answer to
+    /// *what is the off switch* an honest one.**
+    ///
+    /// The switch is the seat: `wsp govern <scope> --clear` vacates it and this
+    /// path answers *the seat is empty*, holding everything until somebody sits
+    /// down again. That is only safe if standing a seat down while news piles
+    /// up behind it does not read like a quiet night — and every check beside
+    /// this one is a liveness check, which a wake record cannot fail, because
+    /// there is no process in it to have died.
+    ///
+    /// So the fault this one names is the promise being broken. [`DEFER_MAX`]
+    /// is the bound on how long this path may be silent; a spool older than it
+    /// means the escalation fired and the delivery did not.
+    #[test]
+    fn a_seat_whose_wakes_have_outlived_the_bound_is_a_problem_and_not_a_quiet_night() {
+        let env = util::isolated("wake-health");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let now = util::epoch_secs();
+        let held = |ago: i64| {
+            json!({
+                "scope": "core",
+                "host": util::hostname(),
+                "pid": 0,
+                "wake": true,
+                "tick": util::now_iso(),
+                "delivered": 0,
+                "holding": "the seat is empty",
+                "spool": [{ "seq": 1, "at": now - ago, "class": "news", "text": "core-1  at review" }],
+            })
+        };
+
+        // Inside the bound: ordinary. This path holds things for hours on
+        // purpose and saying so every time would be the false alarm that
+        // teaches people to skip the section.
+        store.set_watch(&crate::wake::key_for("core"), held(DEFER_MAX - 60));
+        let mut quiet = Vec::new();
+        health(&store, &mut quiet);
+        assert!(quiet.is_empty(), "holding is the design, not a fault: {quiet:?}");
+
+        // Past it: the bound was the promise, and it was not kept.
+        store.set_watch(&crate::wake::key_for("core"), held(DEFER_MAX + 60));
+        let mut problems = Vec::new();
+        health(&store, &mut problems);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let said = &problems[0];
+        assert!(said.contains("core"), "{said}");
+        assert!(said.contains("the seat is empty"), "and why, which is the repair: {said}");
+        assert!(said.contains("--drain"), "and that nothing is lost: {said}");
+    }
+
     /// Three ticks and a floor. One slow tick is not a dead watcher, and a
     /// diagnostic that cries wolf is one nobody reads.
     #[test]
@@ -4619,6 +4832,7 @@ mod tests {
                 wake: false,
                 delivered: 0,
                 holding: String::new(),
+                oldest: 0,
             };
             r.tick = util::iso_at(util::epoch_secs() - ago);
             r
@@ -5265,12 +5479,59 @@ mod tests {
     fn a_json_watcher_says_it_started_before_anything_has_happened() {
         let p = util::Paint::plain();
         let spec = watching(true);
-        let v = parsed(&render_for(&opening(&spec, 0, false), 0, &spec, &p));
+        let env = util::isolated("watch-open-json");
+        let store = Store::at(env.home(), env.state());
+        let v = parsed(&render_for(&opening(&store, &spec, 0, false), 0, &spec, &p));
         assert_eq!(v["class"], "open");
         assert_eq!(v["to"], "wsp", "addressed, like every other line");
         let said = v["text"].as_str().expect("it says something");
         assert!(said.contains("0 standing"), "and it says how much is up: {said}");
         assert!(said.contains("watching wsp"), "and what it is watching: {said}");
+    }
+
+    /// **`core-019`'s stopping half, and the only reader it can reach is the
+    /// one about to make the mistake.**
+    ///
+    /// A `wsp watch` outlives the turn that started it — `w1:p6` sat in the
+    /// register as *watching* for twenty hours after its process died, and the
+    /// seat that filed `core-014` restarted its own watch twenty-two times in a
+    /// day. `core-021` removed the reason to run one at all, so a governor
+    /// opening a stream over its own scope is told the delivery is already
+    /// handled and this one ends with its turn.
+    ///
+    /// Three conditions, and each of the last two is a case where the sentence
+    /// would be wrong rather than merely unnecessary: a watch on somebody
+    /// else's project is a person reading a stream, and a daemon that has
+    /// stopped is exactly when a governor *should* run one by hand.
+    #[test]
+    fn a_seat_opening_its_own_watch_is_told_the_daemon_already_wakes_it() {
+        let env = util::isolated("watch-already-woken");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let said = |sc: &Scope| match opening(&store, &Spec { scope: sc.clone(), ..watching(false) }, 0, false) {
+            Line::Note(_, text) => text,
+            Line::News(_) => unreachable!("an opening is a note"),
+        };
+
+        // No daemon: nothing to defer to, and the line is what it always was.
+        assert!(!said(&scope("wsp", true)).contains("already wakes"));
+
+        let live = json!({
+            "scope": "this machine", "host": util::hostname(), "pid": std::process::id(),
+            "daemon": true, "every": 60, "tick": util::now_iso(),
+        });
+        store.set_watch("daemon", live.clone());
+        assert!(said(&scope("wsp", true)).contains("already wakes this seat"), "the seat's own watch");
+        assert!(!said(&scope("render", false)).contains("already wakes"), "somebody else's project");
+
+        // A daemon that has stopped ticking is the case where a governor should
+        // be running one of these, so the advice must not fire.
+        store.set_watch(
+            "daemon",
+            json!({ "scope": "this machine", "host": util::hostname(), "pid": std::process::id(),
+                    "daemon": true, "every": 60, "tick": util::iso_at(util::epoch_secs() - 86_400) }),
+        );
+        assert!(!said(&scope("wsp", true)).contains("already wakes"), "advice that does not work is worse than none");
     }
 
     // ---- the wake -----------------------------------------------------------
@@ -5294,6 +5555,37 @@ mod tests {
             self.said.extend(said.iter().cloned());
             true
         }
+    }
+
+    /// **A stream is painted for where its words are going, not for the
+    /// process sending them.**
+    ///
+    /// `Stream` built one `Paint::new()` for every sink, which asks whether
+    /// *this* process has a terminal. Right for [`Stdout`]; wrong for
+    /// `crate::wake::Tell`, whose far end is an agent's composer — and
+    /// reachable, because `wsp doctor` tells a person to run `wsp daemon`
+    /// themselves when it has wedged, and a daemon started that way has a tty.
+    ///
+    /// Both shapes, because the borrowed one is the one that ships: `wake`
+    /// lends its sink, so a blanket impl that defaulted rather than forwarded
+    /// would put `Paint::new()` back silently.
+    #[test]
+    fn a_stream_is_painted_for_its_sink_and_not_for_this_process() {
+        struct Loud;
+        impl Sink for Loud {
+            fn deliver(&mut self, _said: &[String]) -> bool {
+                true
+            }
+            fn paint(&self) -> Paint {
+                Paint::painted()
+            }
+        }
+
+        let spec = watching(false);
+        assert!(Stream::new(&spec, Loud).p.on(), "the sink's answer, not this process's stdout");
+
+        let mut loud = Loud;
+        assert!(Stream::new(&spec, &mut loud).p.on(), "and a borrowed sink forwards it");
     }
 
     fn classes(of: &[Spooled]) -> Vec<&str> {
@@ -5817,6 +6109,78 @@ mod tests {
         // **134 wakes to 71.** Said as an assertion so the claim cannot drift
         // away from the prose that quotes it.
         assert_eq!((ticks.len() - count(DEFER_MAX)) * 100 / ticks.len(), 47);
+    }
+
+    /// **What the daemon's wake path actually costs a governor, on the same
+    /// corpus.** `core-019`, and it is the number that decides whether
+    /// always-on is affordable — which is the question
+    /// [`Spec::for_wake`] answers.
+    ///
+    /// The test above measures `wsp watch --wake`: a stream, with an opening, a
+    /// heartbeat and an ending. `crate::wake` has none of those. Four of
+    /// [`Class`]'s five words describe a stream telling a reader it is alive,
+    /// and a told wake has no stream — so the only class that can reach a
+    /// governor is `news`, and the corpus is filtered to it here for exactly
+    /// that reason rather than to make the number smaller.
+    ///
+    /// **134 deliveries become 42, over the 24 hours the corpus covers.** The
+    /// 92 that go away are 45 heartbeats, 22 openings — that seat restarted its
+    /// watch 22 times in a day, which is `core-019`'s own row stated as a
+    /// number — five build-replaced notices, three endings, and the cleared
+    /// levels and flags the table already spooled.
+    ///
+    /// And escalation is nearly free here for the same reason it was there:
+    /// four hours costs one extra context read across the whole day.
+    #[test]
+    fn what_the_daemon_wake_path_costs_a_governor_over_the_measured_day() {
+        let corpus: Vec<Value> = include_str!("../fixtures/wake-2026-08-19-seat.jsonl")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("the fixture is one JSON document per line"))
+            .collect();
+
+        let mut ticks: Vec<(i64, Vec<Line>)> = Vec::new();
+        let mut deliveries = 0;
+        for rec in &corpus {
+            let at = rec["at"].as_i64().expect("a stamp");
+            let class = Class::parse(rec["class"].as_str().expect("a class")).expect("a known class");
+            // A new second is a new delivery whatever its class, because the
+            // 134 this is measured against counted every one of them.
+            if ticks.last().map(|(t, _)| *t) != Some(at) {
+                deliveries += 1;
+                ticks.push((at, Vec::new()));
+            }
+            // …and only `news` can reach a governor through `crate::wake`.
+            if class != Class::News {
+                continue;
+            }
+            let kind = Kind::parse(rec["kind"].as_str().expect("a signal")).expect("a known signal");
+            let edge = Edge::parse(rec["edge"].as_str().expect("an edge")).expect("a known edge");
+            ticks.last_mut().expect("a tick").1.push(news(kind, edge, "replayed"));
+        }
+        assert_eq!(deliveries, 134, "every context read that seat actually took");
+
+        let count = |defer_max: i64| {
+            let spec = waking(defer_max);
+            let mut spool = Spool::default();
+            let mut wakes = 0;
+            for (at, batch) in &ticks {
+                let mut stream = Stream::new(&spec, Recorded::default());
+                for l in batch {
+                    stream.put(*at, l.clone());
+                }
+                if !stream.tick(*at, &mut spool).is_empty() {
+                    wakes += 1;
+                }
+            }
+            wakes
+        };
+
+        assert_eq!(count(i64::MAX), 41, "the table alone");
+        assert_eq!(count(DEFER_MAX), 42, "and bounding the silence costs one context read in the day");
+
+        // **134 to 42**, asserted so the prose that quotes it cannot drift.
+        assert_eq!((deliveries - count(DEFER_MAX)) * 100 / deliveries, 68);
     }
 
     /// **The fourteen-wide column has one alphabet, and no word in it means
