@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wsp, in five pictures</title>
+<style>
+  /* ---- palette -------------------------------------------------------
+     One set of tokens, three grounds: screen-light, screen-dark, paper.
+     Every colour in the SVGs comes from here, so a diagram cannot end up
+     legible in one theme and invisible in the other. ------------------ */
+  :root {
+    --bg:#ffffff;      --ink:#15181d;   --ink-2:#464e59;  --ink-3:#6c7480;
+    --rule:#e3e7ec;    --panel:#f7f8fa; --panel-2:#eef1f5;
+    --accent:#2a56c6;  --accent-soft:#e9eefc; --accent-line:#bccdf1;
+    --warn:#8f5406;    --warn-soft:#fdf4e6;   --warn-line:#e9cd9a;
+    --ok:#1b6b40;      --ok-soft:#e7f5ed;     --ok-line:#aedcc2;
+    --stop:#b0261e;    --stop-soft:#fdeceb;   --stop-line:#f1bfba;
+    --alt:#6a3ec2;     --alt-soft:#f1ebfd;    --alt-line:#d6c8f6;
+    --code-bg:#f1f3f6; --code-br:#e2e6ea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#15171b;      --ink:#e7eaef;   --ink-2:#b6bdc8;  --ink-3:#8c94a1;
+      --rule:#2b3038;    --panel:#1c1f25; --panel-2:#232830;
+      --accent:#8fb3ff;  --accent-soft:#1b2740; --accent-line:#35486f;
+      --warn:#e0a75f;    --warn-soft:#2b2418;   --warn-line:#544428;
+      --ok:#79d4a2;      --ok-soft:#152820;     --ok-line:#2b4b38;
+      --stop:#f2a49d;    --stop-soft:#2d1c1a;   --stop-line:#5a332f;
+      --alt:#c3a8f8;     --alt-soft:#221c33;    --alt-line:#40345d;
+      --code-bg:#20242b; --code-br:#2f343d;
+    }
+  }
+  /* Paper last, so it wins over the dark block on a dark-set machine. */
+  @media print {
+    :root {
+      --bg:#ffffff;      --ink:#000000;   --ink-2:#333333;  --ink-3:#555555;
+      --rule:#cccccc;    --panel:#f6f6f6; --panel-2:#eeeeee;
+      --accent:#1f47ad;  --accent-soft:#eaf0fd; --accent-line:#a8bde8;
+      --warn:#7a4604;    --warn-soft:#fbf2e2;   --warn-line:#ddbf86;
+      --ok:#125a34;      --ok-soft:#e4f3ea;     --ok-line:#9ed2b4;
+      --stop:#96201a;    --stop-soft:#fbe9e8;   --stop-line:#e6b3ae;
+      --alt:#57309f;     --alt-soft:#efe9fb;    --alt-line:#cbbaf2;
+      --code-bg:#f2f2f2; --code-br:#dddddd;
+    }
+    .wrap { max-width:none; padding:0; }
+    section, figure { break-inside: avoid; }
+    header { break-after: avoid; }
+  }
+
+  /* ---- page ---------------------------------------------------------- */
+  html { -webkit-text-size-adjust:100%; }
+  body {
+    font:16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+         "Helvetica Neue", Arial, sans-serif;
+    color:var(--ink); background:var(--bg); margin:0;
+    font-feature-settings:"kern" 1; text-rendering:optimizeLegibility;
+  }
+  .wrap { max-width:940px; margin:0 auto; padding:56px 28px 72px; }
+
+  header { border-bottom:1px solid var(--rule); padding-bottom:26px; }
+  h1 { font-size:32px; line-height:1.2; letter-spacing:-0.021em; margin:0 0 10px; font-weight:640; }
+  .tagline { color:var(--ink-2); font-size:17px; line-height:1.5; margin:0 0 18px; max-width:62ch; }
+  .tagline + p { color:var(--ink-2); font-size:15.5px; margin:0 0 18px; max-width:62ch; }
+  .meta { color:var(--ink-3); font-size:12.5px; margin:0; letter-spacing:0.01em; }
+
+  section { margin-top:52px; }
+  h2 {
+    font-size:21px; letter-spacing:-0.012em; font-weight:640;
+    margin:0 0 12px; display:flex; align-items:baseline; gap:12px;
+  }
+  h2 .num {
+    color:var(--accent); font-variant-numeric:tabular-nums;
+    font-size:13px; font-weight:700; letter-spacing:0.08em;
+    border:1px solid var(--accent-line); background:var(--accent-soft);
+    border-radius:5px; padding:2px 7px; flex:none;
+  }
+  p.lede { margin:0 0 20px; color:var(--ink-2); max-width:74ch; }
+
+  figure {
+    margin:0; background:var(--panel); border:1px solid var(--rule);
+    border-radius:14px; padding:20px 20px 16px;
+  }
+  figcaption {
+    color:var(--ink-3); font-size:12.5px; line-height:1.5;
+    margin-top:14px; padding-top:12px; border-top:1px solid var(--rule);
+  }
+  svg { display:block; width:100%; height:auto; max-width:100%; }
+  svg text { font-family:inherit; }
+
+  ul.points { margin:20px 0 0; padding-left:0; list-style:none; }
+  ul.points li {
+    margin:0 0 10px; color:var(--ink-2); padding-left:18px; position:relative;
+    max-width:82ch;
+  }
+  ul.points li::before {
+    content:""; position:absolute; left:0; top:0.62em;
+    width:6px; height:6px; border-radius:50%; background:var(--accent-line);
+  }
+  ul.points li strong { color:var(--ink); font-weight:620; }
+
+  code {
+    font-family:ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size:0.855em; background:var(--code-bg); border:1px solid var(--code-br);
+    border-radius:5px; padding:1px 5px; white-space:nowrap; color:var(--ink);
+  }
+
+  table.terms {
+    width:100%; border-collapse:collapse; margin-top:22px;
+    font-size:14.5px; color:var(--ink-2);
+  }
+  table.terms caption {
+    text-align:left; font-size:13px; letter-spacing:0.06em;
+    text-transform:uppercase; color:var(--ink-3); padding-bottom:10px;
+    font-weight:600;
+  }
+  table.terms th, table.terms td {
+    text-align:left; vertical-align:top; padding:10px 14px 10px 0;
+    border-top:1px solid var(--rule);
+  }
+  table.terms th {
+    width:8.5em; font-weight:600; color:var(--ink); white-space:nowrap;
+    font-family:ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size:13.5px; padding-top:12px;
+  }
+
+  footer {
+    margin-top:60px; padding-top:18px; border-top:1px solid var(--rule);
+    color:var(--ink-3); font-size:13px; line-height:1.6;
+  }
+
+  /* ---- svg text roles ------------------------------------------------- */
+  .tb  { font-size:13.5px; font-weight:640; fill:var(--ink); }
+  .t   { font-size:13px;   fill:var(--ink); }
+  .ts  { font-size:11px;   fill:var(--ink-3); }
+  .tn  { font-size:11px;   fill:var(--ink-2); }
+  .ti  { font-size:12px;   fill:var(--ink-3); font-style:italic; }
+  .tw  { font-size:11px;   fill:var(--warn); font-weight:600;
+         letter-spacing:0.06em; }
+  .tm  { font-size:11px;   fill:var(--ink-2);
+         font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tmb { font-size:11px;   fill:var(--ink); font-weight:600;
+         font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tk  { font-size:11px;   fill:var(--accent);
+         font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .chip{ font-size:10.5px; font-weight:600; }
+
+  /* ---- svg shape roles ------------------------------------------------ */
+  .node   { fill:var(--bg);          stroke:var(--rule);        stroke-width:1; }
+  .node-a { fill:var(--accent-soft); stroke:var(--accent-line); stroke-width:1; }
+  .node-w { fill:var(--warn-soft);   stroke:var(--warn-line);   stroke-width:1; }
+  .node-o { fill:var(--ok-soft);     stroke:var(--ok-line);     stroke-width:1; }
+  .card   { fill:var(--panel-2);     stroke:var(--rule);        stroke-width:1; }
+  .rule   { stroke:var(--rule); stroke-width:1; }
+  .edge   { stroke:var(--ink-3); stroke-width:1.4; fill:none; stroke-dasharray:5 4; }
+  .lane   { stroke:var(--ink-3); stroke-width:1.5; fill:none; }
+  .bar    { stroke:var(--warn);  stroke-width:1.8; stroke-dasharray:7 5; }
+  .head   { fill:var(--ink-3); }
+  .dot    { fill:var(--accent); }
+  .dot-t  { font-size:11px; font-weight:700; fill:var(--bg); }
+  .c-do, .c-td, .c-rv, .c-bl, .c-pk, .c-ok { fill:var(--bg); stroke-width:1; }
+  .c-do { stroke:var(--accent-line); }  .x-do { fill:var(--accent); }
+  .c-td { stroke:var(--rule);        }  .x-td { fill:var(--ink-3); }
+  .c-rv { stroke:var(--alt-line);    }  .x-rv { fill:var(--alt); }
+  .c-bl { stroke:var(--stop-line);   }  .x-bl { fill:var(--stop); }
+  .c-pk { stroke:var(--rule);        }  .x-pk { fill:var(--ink-3); }
+  .c-ok { stroke:var(--ok-line);     }  .x-ok { fill:var(--ok); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>wsp, in five pictures</h1>
+  <p class="tagline">A control plane for work and for the agents doing it. <strong>wsp</strong> owns
+  the durable half — projects, tasks, decisions, worklists, as markdown in a git repository.
+  <strong>herdr</strong> owns the live half — workspaces, panes, and the agents running in them.
+  wsp joins the two and pushes the join back into herdr’s sidebar.</p>
+  <p>Five mechanisms carry nearly all of it: how work is filed, how an agent is put on a
+  piece of it, how you talk to that agent afterwards, how a queue of work is run in order,
+  and how any of that happens on a machine nobody is sitting at. Each picture below is one
+  of them. The vocabulary is exact — where two words look interchangeable on this page,
+  they are not.</p>
+  <p class="meta">Single file · nothing fetched · prints on paper · every fact checkable against the wsp README</p>
+</header>
+
+<!-- ══════════════ 01 · PROJECTS, SUB-PROJECTS, TASKS ══════════════ -->
+<section>
+  <h2><span class="num">01</span>Projects, sub-projects and tasks</h2>
+  <p class="lede">Projects form a tree. A <em>sub-project</em> is a project whose parent is
+  another project — the same kind of node, one level down — and that distinction carries
+  weight: tags, decisions and the handbook inherit down the chain, and a task takes its id
+  prefix from the project it lives in. Tasks hang off projects; sub-tasks hang off tasks.</p>
+
+  <figure>
+    <svg viewBox="0 0 900 440" role="img" aria-label="A project tree with a root project shop above two sub-projects, catalogue and checkout, with tags inheriting downward; below it the checkout project expanded into five task rows showing statuses and two sub-tasks; notes on the right explain ids, sub-tasks and the rule that a parent cannot finish over an open child.">
+      <defs>
+        <marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path class="head" d="M0,0L10,5L0,10z"/>
+        </marker>
+      </defs>
+
+      <!-- ── the tree ── -->
+      <rect class="node-a" x="70" y="16" width="150" height="50" rx="10"/>
+      <text class="tb" x="145" y="38" text-anchor="middle">shop</text>
+      <text class="ts" x="145" y="55" text-anchor="middle">project</text>
+      <text class="tk" x="234" y="36">tags: web</text>
+      <text class="ts" x="234" y="52">set here, inherited below</text>
+
+      <line class="edge" x1="145" y1="66" x2="97" y2="108" marker-end="url(#ar1)"/>
+      <line class="edge" x1="145" y1="66" x2="268" y2="108" marker-end="url(#ar1)"/>
+
+      <rect class="node" x="20" y="112" width="150" height="50" rx="10"/>
+      <text class="tb" x="95" y="134" text-anchor="middle">catalogue</text>
+      <text class="ts" x="95" y="151" text-anchor="middle">sub-project</text>
+
+      <rect class="node" x="195" y="112" width="150" height="50" rx="10"/>
+      <text class="tb" x="270" y="134" text-anchor="middle">checkout</text>
+      <text class="ts" x="270" y="151" text-anchor="middle">sub-project</text>
+
+      <text class="tn" x="430" y="60">a sub-project is a project whose parent is another project —</text>
+      <text class="tn" x="430" y="77">the same kind of node, one level down.</text>
+      <text class="tn" x="430" y="106">tags, decisions and the handbook inherit down the chain, so a</text>
+      <text class="tn" x="430" y="123">task in checkout also matches <tspan class="tm">-t web</tspan> from shop.</text>
+      <text class="tn" x="430" y="152">a project also carries roots — the checkouts its work lives in —</text>
+      <text class="tn" x="430" y="169">and an agent placed here is opened in one of them.</text>
+
+      <!-- ── the checkout project, opened ── -->
+      <line class="edge" x1="270" y1="162" x2="270" y2="190" marker-end="url(#ar1)"/>
+      <text class="ts" x="284" y="184">opened</text>
+      <rect class="card" x="20" y="196" width="600" height="228" rx="12"/>
+      <text class="tb" x="42" y="224">checkout</text>
+      <text class="ts" x="112" y="224">· its open work</text>
+      <line class="rule" x1="42" y1="234" x2="598" y2="234"/>
+
+      <text class="tmb" x="42" y="260">checkout-118</text>
+      <rect class="c-do" x="150" y="247" width="46" height="18" rx="9"/>
+      <text class="chip x-do" x="173" y="260" text-anchor="middle">doing</text>
+      <text class="t" x="232" y="260">Rewrite the address form</text>
+
+      <text class="tm" x="42" y="288">├─ 121</text>
+      <rect class="c-td" x="150" y="275" width="42" height="18" rx="9"/>
+      <text class="chip x-td" x="171" y="288" text-anchor="middle">todo</text>
+      <text class="t" x="232" y="288">Two fields, not nine</text>
+
+      <text class="tm" x="42" y="316">└─ 122</text>
+      <rect class="c-rv" x="150" y="303" width="54" height="18" rx="9"/>
+      <text class="chip x-rv" x="177" y="316" text-anchor="middle">review</text>
+      <text class="t" x="232" y="316">Postcode lookup</text>
+
+      <text class="tmb" x="42" y="344">checkout-119</text>
+      <rect class="c-bl" x="150" y="331" width="58" height="18" rx="9"/>
+      <text class="chip x-bl" x="179" y="344" text-anchor="middle">blocked</text>
+      <text class="t" x="232" y="344">which tax table? ■</text>
+
+      <text class="tmb" x="42" y="372">checkout-120</text>
+      <rect class="c-pk" x="150" y="359" width="52" height="18" rx="9"/>
+      <text class="chip x-pk" x="176" y="372" text-anchor="middle">parked</text>
+      <text class="t" x="232" y="372">when the new gateway lands ▪</text>
+
+      <text class="ti" x="42" y="404">121 and 122 are sub-tasks of 118 — and live where their parent lives.</text>
+
+      <!-- ── notes ── -->
+      <text class="tn" x="646" y="252">ids are <tspan class="tm">&lt;project&gt;-NNN</tspan>. The</text>
+      <text class="tn" x="646" y="269">prefix is the project’s code, so</text>
+      <text class="tn" x="646" y="286">an id says where a task lives.</text>
+
+      <text class="tn" x="646" y="322">direction lands on the parent;</text>
+      <text class="tn" x="646" y="339">the pieces beneath it are what</text>
+      <text class="tn" x="646" y="356">get claimed and worked.</text>
+
+      <text class="tn" x="646" y="392">a parent cannot be finished</text>
+      <text class="tn" x="646" y="409">while a child is open.</text>
+    </svg>
+    <figcaption>Inheritance runs down the project chain; direction lands on a parent task and the leaves beneath it are what an agent takes.</figcaption>
+  </figure>
+
+  <ul class="points">
+    <li><strong>Two node kinds, and one is nested.</strong> <code>shop</code> is a project;
+      <code>catalogue</code> and <code>checkout</code> are its sub-projects. A project carries
+      tags, decisions, a handbook and its <em>roots</em> — the checkouts its work lives in —
+      and every one of those inherits down the chain, root first.</li>
+    <li><strong>An id says where a task lives.</strong> <code>&lt;project&gt;-NNN</code>,
+      continuous within a project rather than within a day. The prefix is the project’s
+      <code>code</code>, which defaults to its slug, so a mistyped digit lands on an id that
+      does not exist rather than on a real task somewhere else.</li>
+    <li><strong>Six statuses, and two of them are stopped.</strong>
+      <code>todo → doing → review → done</code>, plus <code>blocked</code> — somebody owes you
+      an answer — and <code>parked</code>, which is a judgement that the moment is wrong and
+      names the trigger that would bring it back. Both insist on a sentence.</li>
+    <li><strong>Review is where an agent stops.</strong> <code>done</code> belongs to the
+      person the work is for.</li>
+    <li><strong>A parent cannot be finished while a child is open</strong> — the CLI refuses it
+      and names the count; <code>--force</code> is the override.</li>
+    <li><strong>The whole record is files.</strong> One markdown file per project, task and
+      worklist under <code>~/wsp</code>, and every command commits the files it wrote and only
+      those.</li>
+  </ul>
+</section>
+
+<!-- ══════════════ 02 · PUTTING AN AGENT ON A TASK ══════════════ -->
+<section>
+  <h2><span class="num">02</span>Putting an agent on a task</h2>
+  <p class="lede">One verb does it: <code>wsp spawn &lt;id&gt; --agent</code>. The order inside
+  the verb is the whole design — <strong>workspace, claim, agent, sentence</strong> — because the
+  claim has to be on record before the agent’s session starts and reads it.</p>
+
+  <figure>
+    <svg viewBox="0 0 900 336" role="img" aria-label="Four ordered steps — workspace, claim, agent, work order — with the claim written before the agent starts; beneath them the three steps of wsp despawn in reverse order: stop the agent, release the claim, remove the tree.">
+      <defs>
+        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path class="head" d="M0,0L10,5L0,10z"/>
+        </marker>
+      </defs>
+
+      <rect class="node" x="16" y="28" width="192" height="112" rx="11"/>
+      <circle class="dot" cx="36" cy="50" r="10"/>
+      <text class="dot-t" x="36" y="54" text-anchor="middle">1</text>
+      <text class="tb" x="54" y="54">workspace</text>
+      <text class="ts" x="30" y="78">a herdr workspace, rooted</text>
+      <text class="ts" x="30" y="94">in a git worktree of its</text>
+      <text class="ts" x="30" y="110">own under .worktrees/, on</text>
+      <text class="ts" x="30" y="126">its own branch</text>
+
+      <line class="lane" x1="210" y1="84" x2="230" y2="84" marker-end="url(#ar2)"/>
+
+      <rect class="node-a" x="236" y="28" width="192" height="112" rx="11"/>
+      <circle class="dot" cx="256" cy="50" r="10"/>
+      <text class="dot-t" x="256" y="54" text-anchor="middle">2</text>
+      <text class="tb" x="274" y="54">claim</text>
+      <text class="ts" x="250" y="78">that workspace now holds</text>
+      <text class="ts" x="250" y="94">the task. Written before</text>
+      <text class="ts" x="250" y="110">the agent exists — and it</text>
+      <text class="ts" x="250" y="126">is the step that can refuse</text>
+
+      <line class="lane" x1="430" y1="84" x2="450" y2="84" marker-end="url(#ar2)"/>
+
+      <rect class="node" x="456" y="28" width="192" height="112" rx="11"/>
+      <circle class="dot" cx="476" cy="50" r="10"/>
+      <text class="dot-t" x="476" y="54" text-anchor="middle">3</text>
+      <text class="tb" x="494" y="54">agent</text>
+      <text class="ts" x="470" y="78">started in that workspace.</text>
+      <text class="ts" x="470" y="94">Its SessionStart hook runs</text>
+      <text class="ts" x="470" y="110">wsp brief --session and</text>
+      <text class="ts" x="470" y="126">reads the claim going in</text>
+
+      <line class="lane" x1="650" y1="84" x2="670" y2="84" marker-end="url(#ar2)"/>
+
+      <rect class="node" x="676" y="28" width="192" height="112" rx="11"/>
+      <circle class="dot" cx="696" cy="50" r="10"/>
+      <text class="dot-t" x="696" y="54" text-anchor="middle">4</text>
+      <text class="tb" x="714" y="54">work order</text>
+      <text class="ts" x="690" y="78">one sentence into a fresh</text>
+      <text class="ts" x="690" y="94">context. It need not ask</text>
+      <text class="ts" x="690" y="110">for a briefing — the brief</text>
+      <text class="ts" x="690" y="126">is already in front of it</text>
+
+      <text class="ti" x="450" y="170" text-anchor="middle">the claim lands before the agent starts, so the briefing it opens with is already true</text>
+
+      <!-- ── despawn, in reverse ── -->
+      <text class="tb" x="16" y="212">ending it — <tspan class="tmb">wsp despawn</tspan></text>
+
+      <rect class="card" x="16" y="224" width="250" height="72" rx="11"/>
+      <text class="tb" x="34" y="250">1 · stop the agent</text>
+      <text class="ts" x="34" y="270">a seat that will not close</text>
+      <text class="ts" x="34" y="286">keeps its claim, and says so</text>
+
+      <line class="lane" x1="270" y1="260" x2="294" y2="260" marker-end="url(#ar2)"/>
+
+      <rect class="card" x="300" y="224" width="250" height="72" rx="11"/>
+      <text class="tb" x="318" y="250">2 · release the claim</text>
+      <text class="ts" x="318" y="270">the work stays, visibly</text>
+      <text class="ts" x="318" y="286">unstaffed — never handed over live</text>
+
+      <line class="lane" x1="554" y1="260" x2="578" y2="260" marker-end="url(#ar2)"/>
+
+      <rect class="card" x="584" y="224" width="250" height="72" rx="11"/>
+      <text class="tb" x="602" y="250">3 · remove the tree</text>
+      <text class="ts" x="602" y="270">only if it is clean — uncommitted</text>
+      <text class="ts" x="602" y="286">work, or somebody in it, keeps it</text>
+
+      <text class="tw" x="884" y="320" text-anchor="end">STOP FIRST · RELEASE LAST · TREE AFTER BOTH</text>
+    </svg>
+    <figcaption>The forward order is what makes the agent’s first briefing truthful; the reverse order is what makes ending it safe.</figcaption>
+  </figure>
+
+  <ul class="points">
+    <li><strong>The claim is the step that can refuse.</strong> Work another live pane holds is
+      refused and names the holder; work already <code>done</code> is refused because taking it
+      would silently reopen it. Both happen before anything is written, and each refusal is a
+      reason not to put an agent there.</li>
+    <li><strong>The duplicate briefing is gone by construction.</strong> Because the claim
+      exists first, <code>wsp brief --session</code> at session start describes the real task,
+      and the work order does not have to repeat it.</li>
+    <li><strong>A spawn does not move your screen.</strong> <code>--focus</code> asks for that;
+      <code>--model</code> and <code>--effort</code> say what tier to start at,
+      <code>--kind</code> picks the agent, and <code>--on &lt;machine&gt;</code> runs it on
+      another machine.</li>
+    <li><strong>Ending it is one verb.</strong> <code>wsp despawn</code> — the three-step hand
+      procedure left eighteen worktrees standing after one overnight batch. Nothing reaps on
+      idleness: an agent idle for ten minutes may be waiting on you.</li>
+  </ul>
+
+  <table class="terms">
+    <caption>Four words for four different things</caption>
+    <tbody>
+      <tr><th>claim</th><td>which task a <em>workspace</em> holds — the durable half of “who is doing this”. Claims outlive panes.</td></tr>
+      <tr><th>binding</th><td>which task a <em>pane</em> holds. Perishable, and rebuilt from the claims by <code>wsp reconcile</code>.</td></tr>
+      <tr><th>pin</th><td>what a workspace <em>is</em>, independent of any task; <code>--top</code> keeps it out of the project tree entirely.</td></tr>
+      <tr><th>mandate</th><td>standing direction for a workspace — work in this project without being asked again. It ends on <code>--clear</code> or when the backlog runs dry.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ══════════════ 03 · TALKING TO AN AGENT ══════════════ -->
+<section>
+  <h2><span class="num">03</span>Talking to a running agent</h2>
+  <p class="lede">Three channels between the work and whoever is coordinating it, and one
+  subscription for whoever is watching several. A <em>governor</em> is a slot on a project — a
+  third kind of node beside projects and tasks — so a raised hand has somewhere to go. The
+  chain always terminates, because the person is the governor of last resort.</p>
+
+  <figure>
+    <svg viewBox="0 0 900 400" role="img" aria-label="An agent on the left and the governing seat on the right, joined by three lanes: a flag raised from agent to seat, a tell sent from seat to agent, and an ask-and-answer question travelling in both directions; beneath them a band listing the seven predicates wsp watch subscribes to.">
+      <defs>
+        <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path class="head" d="M0,0L10,5L0,10z"/>
+        </marker>
+      </defs>
+
+      <rect class="node-a" x="24" y="52" width="214" height="258" rx="12"/>
+      <text class="tb" x="44" y="80">the agent</text>
+      <text class="ts" x="44" y="99">a pane holding one claim</text>
+      <text class="ts" x="44" y="130">· briefed at session start</text>
+      <text class="ts" x="44" y="150">· exactly one current task</text>
+      <text class="ts" x="44" y="170">· stops at review, never</text>
+      <text class="ts" x="44" y="186">  at done</text>
+      <text class="ts" x="44" y="212">· raises a hand when it is</text>
+      <text class="ts" x="44" y="228">  owed an answer</text>
+      <text class="ts" x="44" y="254">· says what it is doing, so</text>
+      <text class="ts" x="44" y="270">  nobody interrupts to ask</text>
+
+      <rect class="node-w" x="662" y="52" width="214" height="258" rx="12"/>
+      <text class="tb" x="682" y="80">the seat — or you</text>
+      <text class="ts" x="682" y="99">a slot on a project</text>
+      <text class="ts" x="682" y="130">· answers the hands raised</text>
+      <text class="ts" x="682" y="146">  beneath it</text>
+      <text class="ts" x="682" y="172">· sequences what runs next</text>
+      <text class="ts" x="682" y="198">· reviews against the code,</text>
+      <text class="ts" x="682" y="214">  not against the report</text>
+      <text class="ts" x="682" y="240">· consults nothing before</text>
+      <text class="ts" x="682" y="256">  a verb acts — it is a</text>
+      <text class="ts" x="682" y="272">  coordination point, not</text>
+      <text class="ts" x="682" y="288">  an approval gate</text>
+
+      <!-- lane 1 · flag -->
+      <text class="tb" x="450" y="92" text-anchor="middle">flag — a raised hand</text>
+      <line class="lane" x1="244" y1="104" x2="656" y2="104" marker-end="url(#ar3)"/>
+      <text class="ts" x="450" y="124" text-anchor="middle">goes to the seat that governs the task — or to every panel,</text>
+      <text class="ts" x="450" y="140" text-anchor="middle">if there is none. State, not store: no commit, no task file.</text>
+
+      <!-- lane 2 · tell -->
+      <text class="tb" x="450" y="174" text-anchor="middle">tell — words into the thread</text>
+      <line class="lane" x1="656" y1="186" x2="244" y2="186" marker-end="url(#ar3)"/>
+      <text class="ts" x="450" y="206" text-anchor="middle">queued behind the current turn, never mid-turn</text>
+      <text class="ts" x="450" y="222" text-anchor="middle">the same sentence inside two minutes is read as a retry, and refused</text>
+
+      <!-- lane 3 · ask / answer -->
+      <text class="tb" x="450" y="256" text-anchor="middle">ask · answer — a question with a return path</text>
+      <line class="lane" x1="244" y1="268" x2="656" y2="268" marker-start="url(#ar3)" marker-end="url(#ar3)"/>
+      <text class="ts" x="450" y="288" text-anchor="middle">the answer lands on the task’s log first, then reaches whoever asked</text>
+      <text class="ts" x="450" y="304" text-anchor="middle">abandoning it is the other ending, and that goes home too</text>
+
+      <!-- watch band -->
+      <rect class="card" x="24" y="330" width="852" height="58" rx="12"/>
+      <text class="tb" x="44" y="354">watch — the few facts a coordinator acts on, as they become true</text>
+      <text class="tm" x="44" y="374">needs-a-person · review · blocked · flag · unanswered · agent-gone · seat-stalled</text>
+    </svg>
+    <figcaption>Three channels that fail in different ways, and one subscription that names what it cares about instead of which field answers it.</figcaption>
+  </figure>
+
+  <ul class="points">
+    <li><strong>A flag is state, not store.</strong> It sits beside the claims — no commit,
+      nothing in the task file — and surfaces as a card pinned above the agents in the panel,
+      without anybody pressing anything. Two hands on one task are two hands.</li>
+    <li><strong>An ask is not a flag, and clearing is not answering.</strong>
+      <code>--clear</code> acknowledges a hand; a <em>question</em> ends only by being answered
+      or abandoned, both of which reach the asker. Clearing after answering down some other
+      channel once looked like answering while the asker sat waiting.</li>
+    <li><strong>Hands climb the project chain.</strong> One raised on a <code>checkout</code>
+      task asks <code>checkout</code>, then <code>shop</code>, then you.</li>
+    <li><strong>Seven predicates, and an eighth you cannot switch off.</strong>
+      <code>wsp watch</code> streams changes, not snapshots. <code>needs-a-person</code> is
+      stopped with no visible reason; <code>seat-stalled</code> exists because a governor is
+      idle between the agents it sequences and would otherwise raise nothing. The eighth word
+      is <code>blind</code> — wsp has lost sight of the fleet, which is the difference between
+      a quiet fleet and half a world.</li>
+    <li><strong>It says, and it does not act.</strong> Nothing vacates a seat, ends a pane or
+      advances a barrier on a computed level.</li>
+  </ul>
+</section>
+
+<!-- ══════════════ 04 · WORKLISTS ══════════════ -->
+<section>
+  <h2><span class="num">04</span>Worklists</h2>
+  <p class="lede">A worklist is an ordered queue of <em>groups</em> of task references, run group
+  by group with a barrier between them. It references its members across projects and owns
+  none of them. Running one is three words on repeat, and each answer names the command
+  that comes after it.</p>
+
+  <figure>
+    <svg viewBox="0 0 900 424" role="img" aria-label="On the left, four groups stacked in order with dashed barriers between them: group one passed, group two running with two members from different projects, groups three and four waiting. On the right, the four answers wsp worklist next gives and the command each names, with notes on go, hold, spawning and write-ahead-only editing.">
+
+      <!-- ── the queue ── -->
+      <rect class="node-o" x="28" y="20" width="330" height="66" rx="10"/>
+      <text class="tmb" x="46" y="44">group 1</text>
+      <rect class="c-ok" x="278" y="31" width="60" height="18" rx="9"/>
+      <text class="chip x-ok" x="308" y="44" text-anchor="middle">passed</text>
+      <text class="ts" x="46" y="66">verdict recorded · trees swept</text>
+
+      <line class="bar" x1="28" y1="106" x2="358" y2="106"/>
+      <text class="tw" x="46" y="100">BARRIER</text>
+
+      <rect class="node-a" x="28" y="118" width="330" height="82" rx="10"/>
+      <text class="tmb" x="46" y="142">group 2</text>
+      <rect class="c-do" x="274" y="129" width="64" height="18" rx="9"/>
+      <text class="chip x-do" x="306" y="142" text-anchor="middle">running</text>
+      <text class="tm" x="46" y="164">checkout-119 · catalogue-072</text>
+      <text class="ts" x="46" y="184">started together · capped x2</text>
+
+      <line class="bar" x1="28" y1="220" x2="358" y2="220"/>
+      <text class="tw" x="46" y="214">BARRIER</text>
+
+      <rect class="card" x="28" y="232" width="330" height="60" rx="10"/>
+      <text class="tmb" x="46" y="256">group 3</text>
+      <rect class="c-td" x="276" y="243" width="62" height="18" rx="9"/>
+      <text class="chip x-td" x="307" y="256" text-anchor="middle">waiting</text>
+      <text class="ts" x="46" y="276">waiting on group 2</text>
+
+      <line class="bar" x1="28" y1="312" x2="358" y2="312"/>
+      <text class="tw" x="46" y="306">BARRIER</text>
+
+      <rect class="card" x="28" y="324" width="330" height="60" rx="10"/>
+      <text class="tmb" x="46" y="348">group 4</text>
+      <rect class="c-td" x="276" y="335" width="62" height="18" rx="9"/>
+      <text class="chip x-td" x="307" y="348" text-anchor="middle">waiting</text>
+      <text class="ts" x="46" y="368">queued</text>
+
+      <!-- ── the loop ── -->
+      <rect class="node" x="390" y="20" width="486" height="364" rx="12"/>
+      <text class="tb" x="412" y="46">the loop — <tspan class="tmb">wsp worklist next</tspan>, on repeat</text>
+      <line class="rule" x1="412" y1="58" x2="854" y2="58"/>
+
+      <text class="tm" x="412" y="82">group 2 of 4 — 2 may start now</text>
+      <text class="tk" x="700" y="82">→ spawn each</text>
+      <text class="tm" x="412" y="104">group 2 of 4 — waiting on 2</text>
+      <text class="tk" x="700" y="104">→ wait</text>
+      <text class="tm" x="412" y="126">group 1 finished — read this…</text>
+      <text class="tk" x="700" y="126">→ go, or hold</text>
+      <text class="tm" x="412" y="148">nothing left</text>
+      <text class="tk" x="700" y="148">→ done</text>
+
+      <line class="rule" x1="412" y1="168" x2="854" y2="168"/>
+
+      <text class="tn" x="412" y="194">go — records the verdict, sweeps the trees of every group</text>
+      <text class="tn" x="412" y="211">behind the barrier, and names the members that touched one file</text>
+
+      <text class="tn" x="412" y="243">hold — nothing more starts; work already running is left to finish</text>
+
+      <text class="tn" x="412" y="275">nothing spawns — next names the members, and the governor</text>
+      <text class="tn" x="412" y="292">runs wsp spawn for each of them</text>
+
+      <text class="tn" x="412" y="324">editing is write-ahead-only — a group at or behind where the</text>
+      <text class="tn" x="412" y="341">list stands has run or is running, and is refused</text>
+
+      <text class="tn" x="412" y="373">the list’s overview holds what must be true before group 1</text>
+
+      <text class="ti" x="28" y="412">A worklist references its members: they keep their ids and their projects, and nothing moves.</text>
+    </svg>
+    <figcaption>Groups run together; the barrier between them is where the verdict is written and the finished trees are swept.</figcaption>
+  </figure>
+
+  <ul class="points">
+    <li><strong>A plan is references.</strong> Members keep their ids and their projects — a
+      list orders work from anywhere in the tree and owns none of it.</li>
+    <li><strong>A group’s members start together.</strong> <code>xN</code> caps the
+      <em>work</em>; a machine caps the fleet; the smaller of the two wins, so a group may ask
+      for fewer than it is allowed and never for more.</li>
+    <li><strong>The barrier is the verdict point.</strong> A barrier with prose at it will not
+      pass until <code>wsp worklist go</code> is given a sentence, and that sentence is dated
+      onto the group. Uncommitted work stops any sweep.</li>
+    <li><strong>Nothing spawns by itself.</strong> <code>next</code> answers for the caller and
+      names the command; a governor runs it. That is the difference between a queue and an
+      autopilot.</li>
+    <li><strong>Editing is write-ahead-only</strong>, and needs no field to say so: the line is
+      wherever the run has reached, and it moves on its own.</li>
+  </ul>
+</section>
+
+<!-- ══════════════ 05 · AGENTS ON ANOTHER MACHINE ══════════════ -->
+<section>
+  <h2><span class="num">05</span>Agents on another machine</h2>
+  <p class="lede">A second machine, driven from the one you are sitting at. The far machine is
+  an <em>executor</em> and never a seat: nobody sits at it, and it holds no store, no state and
+  no wsp binary — which is why there is no sync of <code>~/wsp</code>, no merge story for two
+  repositories that both autocommit, and nothing over there to hot-patch when you ship a fix.
+  The lower half of this picture is intent rather than shipped mechanism, and is marked as
+  such.</p>
+
+  <figure>
+    <svg viewBox="0 0 900 486" role="img" aria-label="Above: today's arrangement — a seat holding the store, the state and the only wsp binary, forwarding an executor's herdr socket over ssh, while every wsp verb an agent runs over there is sent back to the seat's binary. Below: the intended direction — a place-work port satisfied by a decorator that holds the connections, with herdr server, a process supervisor or a web runtime as candidate backends underneath it.">
+      <defs>
+        <marker id="ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path class="head" d="M0,0L10,5L0,10z"/>
+        </marker>
+      </defs>
+
+      <!-- ── today ── -->
+      <text class="tw" x="20" y="28">TODAY — ONE SEAT, N EXECUTORS</text>
+
+      <rect class="node-a" x="20" y="44" width="300" height="152" rx="12"/>
+      <text class="tb" x="40" y="72">the seat — this machine</text>
+      <text class="ts" x="40" y="94">· the store, the state, the panel,</text>
+      <text class="ts" x="40" y="110">  and the only wsp binary there is</text>
+      <text class="ts" x="40" y="132">· wsp daemon holds one ssh per</text>
+      <text class="ts" x="40" y="148">  machine, forwarding its socket</text>
+      <text class="ts" x="40" y="170">· nothing of ours runs long over</text>
+      <text class="ts" x="40" y="186">  there — no process, no state</text>
+
+      <rect class="node" x="580" y="44" width="300" height="152" rx="12"/>
+      <text class="tb" x="600" y="72">an executor — never a seat</text>
+      <text class="ts" x="600" y="94">· herdr server, headless, under</text>
+      <text class="ts" x="600" y="110">  launchd or systemd</text>
+      <text class="ts" x="600" y="132">· an agent, authenticated, with</text>
+      <text class="ts" x="600" y="148">  its session hooks</text>
+      <text class="ts" x="600" y="170">· two shell scripts: a wsp shim,</text>
+      <text class="ts" x="600" y="186">  and the hook that calls it</text>
+
+      <text class="tb" x="450" y="84" text-anchor="middle">ssh -L</text>
+      <line class="lane" x1="326" y1="96" x2="574" y2="96" marker-end="url(#ar5)"/>
+      <text class="ts" x="450" y="116" text-anchor="middle">the far herdr socket appears at</text>
+      <text class="ts" x="450" y="132" text-anchor="middle">a path here — forwarded, and</text>
+      <text class="ts" x="450" y="148" text-anchor="middle">not proxied</text>
+
+      <line class="lane" x1="574" y1="170" x2="326" y2="170" marker-end="url(#ar5)"/>
+      <text class="ts" x="450" y="190" text-anchor="middle">and every wsp verb an agent</text>
+      <text class="ts" x="450" y="206" text-anchor="middle">runs over there comes back here</text>
+
+      <text class="ti" x="450" y="234" text-anchor="middle">a remote pane is w0:p3@mb2 — the suffix picks the socket, and is stripped before the far herdr sees it</text>
+
+      <line class="rule" x1="20" y1="256" x2="880" y2="256"/>
+
+      <!-- ── where it is going ── -->
+      <text class="tw" x="20" y="284">WHERE IT IS GOING — DECIDED IN PRINCIPLE, NOT BUILT</text>
+
+      <rect class="node-a" x="250" y="300" width="400" height="94" rx="12"/>
+      <text class="tb" x="450" y="326" text-anchor="middle">the port: place work</text>
+      <text class="ts" x="450" y="348" text-anchor="middle">start an agent on this task, in this directory ·</text>
+      <text class="ts" x="450" y="364" text-anchor="middle">hand back a handle · say what state it is in ·</text>
+      <text class="ts" x="450" y="380" text-anchor="middle">take a prompt for it · say when it stopped</text>
+
+      <text class="tb" x="20" y="326">remote is a decorator</text>
+      <text class="ts" x="20" y="346">over whatever is underneath:</text>
+      <text class="ts" x="20" y="362">it holds the connections, takes</text>
+      <text class="ts" x="20" y="378">the machine off an id on the way</text>
+      <text class="ts" x="20" y="394">out and puts it back on the way in</text>
+
+      <text class="tb" x="670" y="326">a TTY is not required</text>
+      <text class="ts" x="670" y="346">so “place work” cannot mean</text>
+      <text class="ts" x="670" y="362">create a workspace and split a</text>
+      <text class="ts" x="670" y="378">pane — that is one way of</text>
+      <text class="ts" x="670" y="394">satisfying it, not the meaning</text>
+
+      <line class="edge" x1="420" y1="394" x2="230" y2="414" marker-end="url(#ar5)"/>
+      <line class="edge" x1="450" y1="394" x2="450" y2="414" marker-end="url(#ar5)"/>
+      <line class="edge" x1="480" y1="394" x2="670" y2="414" marker-end="url(#ar5)"/>
+      <text class="ts" x="786" y="436">satisfied by</text>
+      <text class="ts" x="786" y="452">any of these</text>
+
+      <rect class="node" x="130" y="418" width="200" height="46" rx="10"/>
+      <text class="tb" x="230" y="438" text-anchor="middle">herdr server</text>
+      <text class="ts" x="230" y="455" text-anchor="middle">what it runs on today</text>
+
+      <rect class="node" x="350" y="418" width="200" height="46" rx="10"/>
+      <text class="tb" x="450" y="438" text-anchor="middle">a process supervisor</text>
+      <text class="ts" x="450" y="455" text-anchor="middle">no multiplexer at all</text>
+
+      <rect class="node" x="570" y="418" width="200" height="46" rx="10"/>
+      <text class="tb" x="670" y="438" text-anchor="middle">a web runtime</text>
+      <text class="ts" x="670" y="455" text-anchor="middle">no terminal at all</text>
+
+      <text class="ti" x="450" y="480" text-anchor="middle">how code gets to the far machine, and how the work comes back, is deliberately still open</text>
+    </svg>
+    <figcaption>Today the far machine runs a headless herdr and the seat forwards its socket; the intent is that “run an agent over there” stops being a fact about herdr and becomes a wrapper over whatever is underneath.</figcaption>
+  </figure>
+
+  <ul class="points">
+    <li><strong>The seat is the one source of truth.</strong> <code>wsp</code> on the executor is
+      a shim that runs the seat’s binary back over the same connection, so the traffic goes both
+      ways: the seat ssh’s out to hold the tunnel, and every verb an agent runs over there ssh’s
+      back. A one-directional reading of that is the first thing that fails.</li>
+    <li><strong>The id is the routing key.</strong> herdr has no idea another herdr exists — its
+      socket API is 89 methods and not one of them has a host in it. A remote pane is
+      <code>w0:p3@mb2</code>; the <code>@machine</code> picks the socket and is stripped on the
+      way out. Calls that carry no id fan out across every reachable machine.</li>
+    <li><strong>Unreachable is not empty, and that is worth being paranoid about.</strong> A
+      machine that is down reports no workspaces, which looks exactly like a machine with
+      nothing running. So a machine must have been <em>heard from</em> before anything it holds
+      is released — otherwise one dropped link hands back every task the executor is holding
+      while its agents carry on working.</li>
+    <li><strong>The cap is on the machine, not on whoever asked.</strong> Two plans each holding
+      a number neither can honour is what that fixes. A worklist group’s <code>xN</code> caps
+      the work; the smaller of the two wins.</li>
+    <li><strong>Where it is going.</strong> The recorded direction is that <em>remote</em> is a
+      decorator over any backend rather than a property of herdr, and that the port is written
+      in wsp’s terms — “place work”, not “create a workspace and split a pane”. A headless
+      <code>herdr server</code> is the likely substrate on the far machine either way; what
+      changes is that it stops being the only thing that could be there.</li>
+    <li><strong>What is deliberately not decided.</strong> How code reaches the executor and how
+      the work comes back — push git to git, or work in a worktree over there. Until that
+      settles, an agent on an executor is a shell in a home directory that can reach the store.
+      There is no affinity either: placement is asked for with <code>--on</code>, never
+      inferred, because auto-placement hides the thing you most want to see.</li>
+  </ul>
+</section>
+
+<footer>
+  Drawn from the wsp README — its Glossary is the authority for every term used here.
+  Every command commits the files it wrote, and only those.
+</footer>
+
+</div>
+</body>
+</html>
