@@ -4290,6 +4290,32 @@ mod tests {
         assert!(said.contains("watching wsp"), "and what it is watching: {said}");
     }
 
+    /// **The fourteen-wide column has one alphabet, and no word in it means
+    /// two things.** [`Class`] and [`Kind`] both write into it, and so does
+    /// [`line`] with `cleared` and `moved`. Nothing collides today. A signal or
+    /// a class added next year that reused a word would break every text
+    /// consumer in silence — which is `core-016`'s own failure mode one layer
+    /// down, and the reason the field was worth adding at all.
+    ///
+    /// The width and the absence of whitespace are the same invariant from the
+    /// other side: a word longer than the column shifts the field after it, and
+    /// a word with a space in it breaks `awk '$2 != "beat"'`, which is the
+    /// filter `core-016` d1 tells a governor to use today.
+    #[test]
+    fn no_word_in_the_column_a_seat_scans_means_two_things() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let kinds = Kind::every().into_iter().chain(std::iter::once(Kind::Blind)).map(|k| k.word());
+        let classes = Class::every().into_iter().map(|c| c.word());
+        // `cleared` and `moved` are written once each, in `line`. This is the
+        // second place they appear on purpose: renaming one should have to come
+        // past this test.
+        for word in kinds.chain(classes).chain(["cleared", "moved"]) {
+            assert!(seen.insert(word), "{word} is written into that column by two vocabularies");
+            assert!(word.len() <= 14, "{word} is wider than the column, so it moves the field after it");
+            assert!(!word.contains(char::is_whitespace), "{word} has a space in it, so `awk '$2'` cannot read it");
+        }
+    }
+
     /// The stream is read down its second column, by eye, by two seats. The
     /// class word went where the `·` was and nothing else moved: five
     /// characters of clock, a space, exactly fourteen for the class-or-signal
