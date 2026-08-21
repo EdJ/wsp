@@ -637,26 +637,87 @@ impl Kind for Plain {
 /// `Claude`'s and is not.
 pub struct OpenCode;
 
+/// The wsp verbs a spawned opencode may run without asking.
+///
+/// **This list is not wsp's opinion; it is Ed's `~/.claude/settings.json`,
+/// verified against it verb for verb.** `core-020` d2 settles that the policy
+/// mirrors the shape of that file rather than inventing a second one, and the
+/// reason is the one d1 missed: allowing only `wsp brief` past the brake does
+/// not remove the stall, it moves it one command later to `wsp show`. An agent
+/// reads its brief, then reads the task, then the parent, then what binds it —
+/// and every one of those is a person's attention spent on a verb that changes
+/// nothing.
+///
+/// So the line is *read and record freely, stop before changing anything
+/// outside your own record*, which is exactly where Ed's own file draws it.
+///
+/// `say` is deliberately absent, because it is absent there. The handbook asks
+/// an agent to use it as its status line, so this is the one verb where a
+/// Claude Code is stopped too — noted rather than fixed here, since diverging
+/// would be this file inventing the second policy d2 exists to prevent.
+const WSP_ALLOWED: &[&str] = &[
+    "brief", "ls", "mv", "show", "tree", "wip", "where", "next", "overlap", "inbox", "mandate",
+    "add", "claim", "release", "note", "flag", "decide", "edit", "start", "block", "review",
+    "reopen", "tag",
+];
+
+/// The four a spawned opencode may not run at all, rather than be asked about.
+///
+/// Ed's file denies exactly these, and `deny` rather than `ask` is the whole
+/// point of naming them: `done` is Ed's by the decision of 2026-08-19, and an
+/// `ask` is an invitation for somebody to say yes on his behalf. The other three
+/// destroy or move records that other work cites.
+///
+/// Driven rather than read: opencode's permission map takes `deny` beside
+/// `allow` and `ask`, and a denied command is refused outright without the pane
+/// ever reaching `blocked`.
+const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
+
 /// What a wsp-spawned opencode is configured with, as the JSON that
 /// [`Kind::env`] hands it.
 ///
-/// **This is `core-020` d1 and it is a policy rather than a default.** opencode
-/// ships allowing `bash` and `edit` outright: driving one in `core-026`, it ran
-/// a shell command and wrote a file without asking anything. herdr's detection
-/// for the blocked state is correct and fires the moment something asks — but in
-/// the shipped configuration nothing ever asks, so `needs_a_person` is
-/// unreachable, and a kind whose only brake can never engage is a kind that
-/// cannot be given unattended work.
+/// **This is `core-020` d1 as amended by d2, and it is a policy rather than a
+/// default.** opencode ships allowing `bash` and `edit` outright: driving one in
+/// `core-026`, it ran a shell command and wrote a file without asking anything.
+/// herdr's detection for the blocked state is correct and fires the moment
+/// something asks — but in the shipped configuration nothing ever asks, so
+/// `needs_a_person` is unreachable, and a kind whose only brake can never engage
+/// is a kind that cannot be given unattended work.
 ///
 /// The price is accepted deliberately and is not small: more stalls, and each
 /// one wants a person. That is the trade Ed made, and the alternative — an agent
 /// that cannot be stopped and cannot ask — is the one thing `core-017` and the
 /// whole attention path exist to prevent.
 ///
+/// Built from the two lists rather than written out, so the correspondence with
+/// `~/.claude/settings.json` is one line per verb and checkable by eye, and
+/// composed through `serde_json` rather than by concatenation so a verb with a
+/// character in it that needs escaping cannot produce config that silently
+/// parses as something else.
+///
+/// **Order does not carry the precedence and must not be relied on to.** The
+/// specific patterns and the `*` catch-all live in one map; opencode resolves
+/// the most specific match rather than the first, which is what makes
+/// `"*": "ask"` safe to sit beside twenty-three allows. Driven, because a map
+/// that resolved by insertion order would have made every allow dead and the
+/// only symptom would have been a stall that looked like the policy working.
+///
 /// Scoped to the seat and not to the machine. Ed's own opencode is untouched by
 /// this, which is the other half of the decision: wsp configures the agents it
 /// starts and nothing else.
-const PERMISSION: &str = r#"{"permission":{"bash":"ask","edit":"ask"}}"#;
+fn permission() -> String {
+    let mut bash = serde_json::Map::new();
+    // Denies first only for readability; see the note above on precedence.
+    for verb in WSP_DENIED {
+        bash.insert(format!("wsp {verb}*"), Value::from("deny"));
+    }
+    for verb in WSP_ALLOWED {
+        bash.insert(format!("wsp {verb}*"), Value::from("allow"));
+    }
+    // Everything else a shell can do, which is the brake itself.
+    bash.insert("*".to_string(), Value::from("ask"));
+    serde_json::json!({ "permission": { "bash": bash, "edit": "ask" } }).to_string()
+}
 
 /// Where the model catalogue comes from, and the shape a model name has.
 ///
@@ -817,10 +878,10 @@ impl Kind for OpenCode {
         Ok(())
     }
 
-    /// [`PERMISSION`], which is the whole of it. The argument is on the
-    /// constant and on [`Kind::env`].
+    /// [`permission`], which is the whole of it. The argument is on that
+    /// function, on [`WSP_ALLOWED`] and on [`Kind::env`].
     fn env(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), PERMISSION.to_string())])
+        BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), permission())])
     }
 
     /// Yes — `--prompt`. The measurement is on [`Kind::order_in_args`].
@@ -1949,14 +2010,46 @@ mod tests {
     }
 
     #[test]
-    fn a_spawned_opencode_is_configured_to_ask_before_it_acts() {
+    fn a_spawned_opencode_can_read_and_record_freely_and_asks_before_anything_else() {
         let env = of("opencode").env();
         let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("the brake is armed on the seat");
-        assert!(cfg.contains("\"bash\":\"ask\""), "core-020 d1: bash asks — {cfg}");
-        assert!(cfg.contains("\"edit\":\"ask\""), "core-020 d1: edit asks — {cfg}");
+        let v: Value = serde_json::from_str(cfg).expect("valid config, composed not concatenated");
+        let bash = &v["permission"]["bash"];
+        // The catch-all is the brake: everything not named is a person's call.
+        assert_eq!(bash["*"], "ask", "core-020 d1 — {cfg}");
+        assert_eq!(v["permission"]["edit"], "ask", "core-020 d1 — {cfg}");
+        // And the named verbs are Ed's own file, which is what d2 settles: the
+        // stall that mattered was not `wsp brief`, it was every read after it.
+        assert_eq!(bash["wsp brief*"], "allow");
+        assert_eq!(bash["wsp show*"], "allow", "the verb the brief-only exception stalled on next");
+        assert_eq!(bash["wsp note*"], "allow", "recording is reading's other half");
+        // `done` is Ed's, so it is refused rather than offered — an ask is an
+        // invitation for somebody to say yes on his behalf.
+        assert_eq!(bash["wsp done*"], "deny", "the decision of 2026-08-19");
+        assert_eq!(bash["wsp archive*"], "deny");
+    }
+
+    /// The two lists are a copy of somebody else's file, and the only thing
+    /// that keeps a copy honest is saying what it is a copy of.
+    #[test]
+    fn the_verbs_a_spawned_opencode_may_run_are_the_ones_claude_code_is_allowed() {
+        assert_eq!(WSP_ALLOWED.len(), 23, "~/.claude/settings.json allows 23 wsp verbs");
+        assert_eq!(WSP_DENIED.len(), 4, "and denies four");
+        // `mv` is allowed there and `say` is not, both of which read as
+        // mistakes and are neither: diverging here would be a second policy.
+        assert!(WSP_ALLOWED.contains(&"mv"), "allowed in the file this mirrors");
+        assert!(!WSP_ALLOWED.contains(&"say"), "absent there, so absent here — see WSP_ALLOWED");
+        assert!(
+            WSP_DENIED.iter().all(|d| !WSP_ALLOWED.contains(d)),
+            "nothing may be both, whatever the precedence rule turns out to be"
+        );
+    }
+
+    #[test]
+    fn no_other_kinds_seat_is_touched() {
         assert!(
             of("claude").env().is_empty() && of("codex").env().is_empty(),
-            "no other kind's seat changes, which is the compatibility rule everywhere here"
+            "the compatibility rule everywhere here: an unmeasured kind is left exactly as it was"
         );
     }
 
