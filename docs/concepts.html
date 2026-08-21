@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Unlisted where it is served: reachable by URL, linked from no nav, and
+     out of the index too — the convention concept07.html set on joltsite. -->
+<meta name="robots" content="noindex,nofollow">
 <title>wsp, in five pictures</title>
 <style>
   /* ---- palette -------------------------------------------------------
@@ -61,7 +64,7 @@
   header { border-bottom:1px solid var(--rule); padding-bottom:26px; }
   h1 { font-size:32px; line-height:1.2; letter-spacing:-0.021em; margin:0 0 10px; font-weight:640; }
   .tagline { color:var(--ink-2); font-size:17px; line-height:1.5; margin:0 0 18px; max-width:62ch; }
-  .tagline + p { color:var(--ink-2); font-size:15.5px; margin:0 0 18px; max-width:62ch; }
+  header p:not(.tagline):not(.meta):not(.kicker) { color:var(--ink-2); font-size:15.5px; margin:0 0 18px; max-width:62ch; }
   .meta { color:var(--ink-3); font-size:12.5px; margin:0; letter-spacing:0.01em; }
 
   section { margin-top:52px; }
@@ -124,6 +127,27 @@
     font-size:13.5px; padding-top:12px;
   }
 
+  /* A scannable answer to "what do I get", above the answer to "how does it
+     work". Two columns so the whole list is one glance on a wide screen; one
+     column when there is not room for two. Not a section: no heading, no
+     number, and nothing below it depends on it. */
+  p.kicker {
+    font-size:12px; letter-spacing:0.09em; text-transform:uppercase;
+    color:var(--ink-3); font-weight:650; margin:26px 0 14px;
+  }
+  ul.summary { margin:0 0 22px; padding:0; list-style:none; columns:2; column-gap:38px; }
+  ul.summary li {
+    break-inside:avoid; -webkit-column-break-inside:avoid; page-break-inside:avoid;
+    margin:0 0 12px; padding-left:17px; position:relative;
+    color:var(--ink-2); font-size:15px; line-height:1.5;
+  }
+  ul.summary li::before {
+    content:""; position:absolute; left:0; top:0.58em;
+    width:5px; height:5px; border-radius:50%; background:var(--accent);
+  }
+  ul.summary li strong { color:var(--ink); font-weight:620; }
+  @media (max-width:760px) { ul.summary { columns:1; } }
+
   footer {
     margin-top:60px; padding-top:18px; border-top:1px solid var(--rule);
     color:var(--ink-3); font-size:13px; line-height:1.6;
@@ -176,6 +200,28 @@
   the durable half — projects, tasks, decisions, worklists, as markdown in a git repository.
   <strong>herdr</strong> owns the live half — workspaces, panes, and the agents running in them.
   wsp joins the two and pushes the join back into herdr’s sidebar.</p>
+  <p class="kicker">What you get</p>
+  <ul class="summary">
+    <li><strong>Work is plain files in git.</strong> One markdown file per project, task and
+      worklist; every command commits what it wrote and nothing else.</li>
+    <li><strong>Projects nest, and what you set on one applies below it</strong> — tags,
+      decisions, and the handbook an arriving agent is given.</li>
+    <li><strong>Every id says where its task lives</strong>, with six statuses and sub-tasks the
+      tool keeps honest: a parent cannot be finished over an open child.</li>
+    <li><strong>One command puts an agent on a task</strong> — its own worktree, its own branch,
+      and a briefing it opens with rather than has to ask for.</li>
+    <li><strong>One command ends it</strong> — agent stopped, work put down, checkout removed
+      only if it is clean.</li>
+    <li><strong>You can talk to an agent mid-run, and it can raise a hand back.</strong> A
+      question ends by being answered or abandoned, never by being ignored.</li>
+    <li><strong>A queue of work runs in order, group by group</strong>, stopping at a barrier for
+      your verdict before the next group starts.</li>
+    <li><strong>Agents run on another machine the same way they run here</strong> — with no
+      store, no state and no wsp binary to keep in sync over there.</li>
+    <li><strong>One person can hold all of it</strong> — a coordination seat per project, and a
+      subscription that names the seven things worth being interrupted for.</li>
+  </ul>
+
   <p>Five mechanisms carry nearly all of it: how work is filed, how an agent is put on a
   piece of it, how you talk to that agent afterwards, how a queue of work is run in order,
   and how any of that happens on a machine nobody is sitting at. Each picture below is one
