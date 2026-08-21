@@ -719,6 +719,20 @@ impl Spooled {
         }
     }
 
+    /// Whether the table judged this one worth a context read.
+    ///
+    /// An entry this build cannot read counts as one: the safe half of an
+    /// asymmetric choice, and the same one [`Line::disposition`] makes for
+    /// anything it did not foresee. A wake that was not needed costs one
+    /// context read; a silence that was wrong costs the thing this row exists
+    /// to protect.
+    fn wakes(&self) -> bool {
+        match &self.line {
+            Some(l) => l.disposition() == Disposition::Wake,
+            None => true,
+        }
+    }
+
     /// The line, in whichever document is being written.
     ///
     /// The stored words are the fallback and not the normal path: a build that
@@ -742,6 +756,17 @@ impl Spooled {
 impl Spool {
     pub(crate) fn depth(&self) -> usize {
         self.held.len()
+    }
+
+    /// Is anything in here already owed a context read?
+    ///
+    /// Normally nothing is — the spool is by definition what the table decided
+    /// *not* to wake for. It is not empty of them after a **failed delivery**,
+    /// which puts a whole flush back including its wake lines, and one of those
+    /// must be retried at the next tick rather than wait out `--defer-max` as
+    /// though it were a heartbeat.
+    pub(crate) fn owed(&self) -> bool {
+        self.held.iter().any(Spooled::wakes)
     }
 
     /// When the oldest thing here happened, which is what escalation reads.
@@ -2661,9 +2686,11 @@ fn heartbeat(spec: &Spec, standing: usize, owes: bool, since: i64) -> Line {
 /// so its output is byte-for-byte what it was before this existed: a person in
 /// front of a stream wants the heartbeat, and `core-014` d2 traded that away
 /// only for the reader that is asleep.
-struct Stream<'a> {
+struct Stream<'a, S: Sink = Stdout> {
     spec: &'a Spec,
     p: Paint,
+    /// Where a written line actually goes — see [`Sink`].
+    sink: S,
     /// Judged worth a context read this tick, in the order it happened.
     hot: Vec<Spooled>,
     /// Judged not worth one *on its own*, this tick. Merged into the durable
@@ -2671,9 +2698,9 @@ struct Stream<'a> {
     cold: Vec<Spooled>,
 }
 
-impl<'a> Stream<'a> {
-    fn new(spec: &'a Spec) -> Stream<'a> {
-        Stream { spec, p: Paint::new(), hot: Vec::new(), cold: Vec::new() }
+impl<'a, S: Sink> Stream<'a, S> {
+    fn new(spec: &'a Spec, sink: S) -> Stream<'a, S> {
+        Stream { spec, p: Paint::new(), sink, hot: Vec::new(), cold: Vec::new() }
     }
 
     /// Offer a line. Print now, or hold — there is no third outcome, and no
@@ -2692,6 +2719,15 @@ impl<'a> Stream<'a> {
         }
     }
 
+    /// Does this line, held or fresh, count as one somebody is owed?
+    ///
+    /// The table under `--wake`, and *everything* under a bare watch, which is
+    /// what keeps a bare watch's output in the order it happened rather than
+    /// re-grouped by a disposition it never consulted.
+    fn wakes(&self, h: &Spooled) -> bool {
+        !self.spec.wake || h.wakes()
+    }
+
     /// End of tick: decide, write, and hand back what is still held.
     ///
     /// `spool` is passed in rather than owned because **the register is the
@@ -2699,8 +2735,10 @@ impl<'a> Stream<'a> {
     /// it from another process since the last tick, and a spool kept only here
     /// would deliver those entries a second time. See [`run`], which re-reads
     /// it every tick.
-    /// Returns what was written, which is empty on a tick that earned no
-    /// wake. The count of non-empty ticks is this row's whole claim — see
+    ///
+    /// Returns what was written, which is empty on a tick that earned no wake
+    /// **and on one whose write did not arrive**. The count of non-empty ticks
+    /// is this row's whole claim — see
     /// [`the_measured_session_is_replayed_and_the_wake_count_is_counted`] —
     /// and a claim nothing can count is an estimate.
     fn tick(&mut self, at: i64, spool: &mut Spool) -> Vec<Spooled> {
@@ -2710,9 +2748,40 @@ impl<'a> Stream<'a> {
         // fact nobody has collected becomes justification by itself and carries
         // everything else out with it. See [`DEFER_MAX`].
         let overdue = spool.oldest().is_some_and(|o| at - o >= self.spec.defer_max);
-        if self.hot.is_empty() && !overdue {
+        // A wake that did not arrive last time is still owed, and must not wait
+        // out `--defer-max` as though it were a heartbeat. See [`Spool::owed`].
+        if self.hot.is_empty() && !overdue && !spool.owed() {
             return Vec::new();
         }
+
+        // Everything there is to say, oldest first: the spool holds earlier
+        // ticks, `hot` is this one.
+        let mut all = spool.take();
+        all.extend(std::mem::take(&mut self.hot));
+
+        // Sorted into the three things a line can be, **without moving any of
+        // them out of reach**. The first version of this took `hot` by value
+        // and cloned only the backlog into the written vector, so a failed
+        // write put back the clone and dropped everything else — it preserved
+        // the heartbeats and lost the `needs-a-person`, the `replaced` and the
+        // `over`, which is the asymmetry this row is built on, exactly
+        // inverted.
+        //
+        // The grouping is re-derived from the whole set on every tick rather
+        // than from `hot` alone, because after a failed write the wake lines
+        // *are* in the spool — and a retry that read them as backlog would put
+        // `over` in the middle of its own flush again.
+        let mut wake = Vec::new();
+        let mut ride = Vec::new();
+        let mut ending = Vec::new();
+        for h in all {
+            match (h.class == Class::Over.word(), self.wakes(&h)) {
+                (true, _) => ending.push(h),
+                (_, true) => wake.push(h),
+                (_, false) => ride.push(h),
+            }
+        }
+
         // The wake first, then the backlog under it. The backlog costs nothing:
         // the context read was already being paid for by the line above it.
         //
@@ -2724,36 +2793,78 @@ impl<'a> Stream<'a> {
         // carrying something, since `over` wakes unconditionally. Found by
         // running it: a watch ended holding five heartbeats and printed them
         // underneath the line saying it had stopped.
-        let mut out = std::mem::take(&mut self.hot);
-        let (ending, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|h| h.class == Class::Over.word());
-        out = rest;
-        let carried = spool.take();
-        out.extend(carried.iter().cloned());
+        let mut out = wake;
+        out.extend(ride);
         out.extend(ending);
-        if !self.write(&out) {
-            // Nothing arrived, so nothing clears. `core-021` is the case this
-            // is shaped for — a wake that cannot be typed at a pane whose turn
-            // is in flight — and the rule is the same either way: an entry
-            // clears when something arrived, never when a send was attempted.
-            spool.put_back(carried);
+
+        let said: Vec<String> = out.iter().map(|h| h.say(self.spec, &self.p)).collect();
+        if !self.sink.deliver(&said) {
+            // Nothing arrived, so **nothing** clears — not the half of it that
+            // happened to be cloned. `Spool::take` says the caller is expected
+            // to fail and put it back, and this is the caller doing all of it.
+            //
+            // Sorted so an earlier tick's line stays ahead of a later one's,
+            // which is what escalation reads and what a person reading a
+            // delivered backlog is entitled to. It does not need to do more
+            // than that: within one tick the three groups are re-derived from
+            // the whole spool on the next flush, which is also what keeps
+            // `over` last through a retry. `core-021` is the case this is
+            // shaped for — a wake that cannot be typed at a pane whose turn is
+            // in flight — where a refusal is routine rather than exotic.
+            out.sort_by_key(|h| h.at);
+            spool.put_back(out);
             return Vec::new();
         }
         out
     }
+}
 
-    /// Write, and say whether it arrived.
-    ///
-    /// A watch is read by an agent whose stdout is a pipe, and a pipe buffers.
-    /// News held in a buffer until the next line arrives is news that is late
-    /// by however long the fleet stays quiet, which on a quiet night is the
-    /// whole night — so the flush is not housekeeping, it is the delivery, and
-    /// its result is what the spool clears on.
-    fn write(&self, out: &[Spooled]) -> bool {
-        for h in out {
-            println!("{}", h.say(self.spec, &self.p));
-        }
+/// Where a line goes when it leaves this verb.
+///
+/// **One implementation ships and the seam is not speculation.** The branch
+/// below a failed delivery puts a whole flush back into the spool, and a branch
+/// nothing can exercise is a branch nothing checks — which is how the first
+/// version of [`Stream::tick`] shipped a drop with a test suite that could not
+/// see it. `core-021` is the second implementation, where the far end is a pane
+/// whose turn may be in flight and a refusal is an ordinary Tuesday.
+trait Sink {
+    /// Write these, and say whether they **arrived** — never whether a send was
+    /// attempted. Everything downstream of this answer depends on the
+    /// difference: it is what an entry clears on.
+    fn deliver(&mut self, said: &[String]) -> bool;
+}
+
+/// The one that ships.
+///
+/// A watch is read by an agent whose stdout is a pipe, and a pipe buffers. News
+/// held in a buffer until the next line arrives is news that is late by however
+/// long the fleet stays quiet, which on a quiet night is the whole night — so
+/// the flush is not housekeeping, it is the delivery, and its result is the
+/// answer this returns.
+struct Stdout;
+
+impl Sink for Stdout {
+    fn deliver(&mut self, said: &[String]) -> bool {
         use std::io::Write;
-        std::io::stdout().flush().is_ok()
+        let out = std::io::stdout();
+        let mut h = out.lock();
+        // **Asked, not asserted**, though on this sink the question is rarely
+        // the one that gets answered. A reader that closes the pipe kills this
+        // process outright — [`crate::die_on_broken_pipe`] puts `SIGPIPE` back
+        // to its default on purpose, so that `wsp ls | head` behaves like `ls |
+        // head` — and the loss there is bounded to the line in hand, because
+        // the register was written at the end of the previous tick and still
+        // holds everything this flush had taken out of the spool.
+        //
+        // So what a `false` from here actually covers is a flush that fails
+        // without a signal, and every sink that is not this one. That is not a
+        // hypothetical: `core-021`'s far end is a pane whose turn is in flight,
+        // where refusing is the normal answer rather than the end of the world.
+        //
+        // A partial write — three lines through, the fourth refused — puts all
+        // four back, so a later reader sees the first three twice. That is the
+        // trade this file makes everywhere: better said twice than lost once.
+        said.iter().all(|l| writeln!(h, "{l}").is_ok()) && h.flush().is_ok()
     }
 }
 
@@ -3181,6 +3292,54 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
 const REPLACED: &str = "wsp was replaced under this watch — it keeps the build it started with, \
                         so what follows is that build's logic and vocabulary. ^C and `wsp watch` again";
 
+/// What became of the ending — the one line this verb writes that has no next
+/// tick behind it.
+///
+/// An ordinary tick answers a write that did not arrive by keeping everything
+/// and trying again a minute later. The ending cannot: the loop is over, and
+/// there is nothing left to carry it. So the invariant that makes this
+/// readable is worth stating — **after the ending's flush, a spool that is not
+/// empty means the ending did not arrive**, because `over` wakes
+/// unconditionally and a successful flush therefore empties everything.
+///
+/// What a watch does about that is the decision on `core-017`: stderr, the
+/// register and the exit code, because each covers what the other two cannot.
+enum Ending {
+    /// It arrived. Nothing is held and the record goes.
+    Told,
+    /// It did not, and this many lines are still owed to somebody.
+    Untold(usize),
+}
+
+fn ended(spool: &Spool) -> Ending {
+    match spool.depth() {
+        0 => Ending::Told,
+        n => Ending::Untold(n),
+    }
+}
+
+/// Failure 5, arriving in the one form the stream itself cannot report.
+///
+/// On stderr, because it is a different descriptor from the one that just
+/// refused; and it names the verb that collects what is held, because a reader
+/// told only that something is missing has been given a worry rather than a
+/// repair.
+///
+/// **Not reachable through a closed stdout, and that is not a gap.** That case
+/// kills the process — [`crate::die_on_broken_pipe`] — and it is answered
+/// instead by the register, which still holds the spool from the previous
+/// tick and which `--status` and `doctor` already read as *the process is
+/// gone*. This is for a sink that refuses without killing us, which is every
+/// sink `core-021` adds.
+fn untold(spec: &Spec, key: &str, held: usize, over: &Over) -> String {
+    format!(
+        "wsp watch: stopped watching {} — {}. The stream would not take that line, so it is not in it: \
+         {held} held under {key} · wsp watch --drain",
+        spec.scope.name,
+        over.said()
+    )
+}
+
 /// The loop.
 fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     let key = watch_key();
@@ -3194,7 +3353,7 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // `exec`s on it, and this cannot. See [`said_replaced`].
     let mut running = util::exe_stamp();
 
-    let mut stream = Stream::new(spec);
+    let mut stream = Stream::new(spec, Stdout);
     // What the last watch under this key was holding, which is routinely
     // something: a spool that dies with the process that wrote it is a drop
     // wearing the words *the process ended*. See [`spool_of`].
@@ -3278,18 +3437,25 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // carries. See [`Class::envelope`].
     stream.put(at, Line::Note(Class::Over, format!("stopped watching {} — {}", spec.scope.name, over.said())));
     stream.tick(at, &mut spool);
-    match spool.depth() {
+    match ended(&spool) {
         // Nothing held, so the record goes and `doctor` stays quiet.
-        0 => {
+        Ending::Told => {
             store.clear_watch(&key);
+            over.code()
         }
-        // The ending could not be written — a closed pipe, most likely, which
-        // is the reader having gone away. The record stays, so the next watch
-        // in this pane resumes what this one was holding and `doctor` reports a
-        // watcher that stopped with a backlog rather than nothing at all.
-        _ => register(store, &key, spec, &ledger, ticks, &spool),
+        // It did not arrive, and there is no next tick to try again on. All
+        // three channels, because each reaches somebody the others cannot: the
+        // register survives the process, so the next watch in this pane resumes
+        // what this one held and `doctor` reports a watcher that stopped with a
+        // backlog rather than one that simply stopped; stderr reaches a person
+        // in front of the pane now; and the code reaches a wrapper that
+        // captured neither stream. See [`Ending`] and [`untold`].
+        Ending::Untold(held) => {
+            register(store, &key, spec, &ledger, ticks, &spool);
+            eprintln!("{}", untold(spec, &key, held, &over));
+            1
+        }
     }
-    over.code()
 }
 
 fn say(emits: &[Emit], at: i64, spec: &Spec) {
@@ -3332,7 +3498,7 @@ fn drain(store: &Store, spec: &Spec) -> i32 {
     let key = watch_key();
     let at = util::epoch_secs();
     let mut spool = spool_of(store, &key);
-    let stream = Stream::new(spec);
+    let mut stream = Stream::new(spec, Stdout);
     if spool.depth() == 0 {
         // Said, and said positively. Nothing held and no watch at all are
         // different facts and a reader draining a spool wants to know which.
@@ -3344,7 +3510,8 @@ fn drain(store: &Store, spec: &Spec) -> i32 {
         return 0;
     }
     let held = spool.take();
-    if !stream.write(&held) {
+    let said: Vec<String> = held.iter().map(|h| h.say(spec, &Paint::new())).collect();
+    if !stream.sink.deliver(&said) {
         spool.put_back(held);
         return 1;
     }
@@ -4886,6 +5053,31 @@ mod tests {
 
     // ---- the wake -----------------------------------------------------------
 
+    /// A sink that keeps what it was handed, and can be told to refuse.
+    ///
+    /// The refusing half is the point: a delivery that does not arrive is the
+    /// branch that shipped a drop, and it shipped because nothing could
+    /// exercise it. See [`Sink`].
+    #[derive(Default)]
+    struct Recorded {
+        said: Vec<String>,
+        refusing: bool,
+    }
+
+    impl Sink for Recorded {
+        fn deliver(&mut self, said: &[String]) -> bool {
+            if self.refusing {
+                return false;
+            }
+            self.said.extend(said.iter().cloned());
+            true
+        }
+    }
+
+    fn classes(of: &[Spooled]) -> Vec<&str> {
+        of.iter().map(|h| h.class.as_str()).collect()
+    }
+
     fn waking(defer_max: i64) -> Spec {
         Spec { wake: true, defer_max, ..watching(false) }
     }
@@ -4921,20 +5113,29 @@ mod tests {
             }
         }
         for spec in [waking(DEFER_MAX), watching(false)] {
-            let mut stream = Stream::new(&spec);
-            let mut spool = Spool::default();
-            for l in &every {
-                stream.put(0, l.clone());
+            // **And with the write refused**, which is the branch that shipped
+            // a drop: it put back the backlog it had cloned and lost the wake
+            // lines it had moved. Nothing arriving must hold everything, not
+            // the half of it that happened to survive by accident.
+            for refusing in [false, true] {
+                let mut stream = Stream::new(&spec, Recorded { refusing, ..Recorded::default() });
+                let mut spool = Spool::default();
+                for l in &every {
+                    stream.put(0, l.clone());
+                }
+                let written = stream.tick(0, &mut spool).len();
+                assert_eq!(
+                    written + spool.depth(),
+                    every.len(),
+                    "wake={} refusing={refusing}: {written} written and {} held, out of {} offered",
+                    spec.wake,
+                    spool.depth(),
+                    every.len()
+                );
+                if refusing {
+                    assert_eq!(written, 0, "nothing arrived, so nothing was written");
+                }
             }
-            let written = stream.tick(0, &mut spool).len();
-            assert_eq!(
-                written + spool.depth(),
-                every.len(),
-                "wake={}: {written} written and {} held, out of {} offered",
-                spec.wake,
-                spool.depth(),
-                every.len()
-            );
         }
     }
 
@@ -4949,7 +5150,7 @@ mod tests {
     #[test]
     fn a_heartbeat_never_wakes_a_governor_and_is_never_lost() {
         let spec = waking(DEFER_MAX);
-        let mut stream = Stream::new(&spec);
+        let mut stream = Stream::new(&spec, Recorded::default());
         let mut spool = Spool::default();
         for tick in 1..=5 {
             stream.put(tick * 60, beat());
@@ -4965,7 +5166,7 @@ mod tests {
     #[test]
     fn a_level_going_down_rides_the_next_thing_worth_waking_for() {
         let spec = waking(DEFER_MAX);
-        let mut stream = Stream::new(&spec);
+        let mut stream = Stream::new(&spec, Recorded::default());
         let mut spool = Spool::default();
 
         stream.put(0, news(Kind::Flag, Edge::Down, "a-1"));
@@ -4984,7 +5185,7 @@ mod tests {
     #[test]
     fn a_spooled_fact_nobody_collected_becomes_a_wake_on_its_own() {
         let spec = waking(4 * 60 * 60);
-        let mut stream = Stream::new(&spec);
+        let mut stream = Stream::new(&spec, Recorded::default());
         let mut spool = Spool::default();
 
         stream.put(0, news(Kind::Flag, Edge::Up, "a-1"));
@@ -5004,7 +5205,7 @@ mod tests {
     #[test]
     fn a_watch_that_ends_flushes_what_it_was_holding() {
         let spec = waking(DEFER_MAX);
-        let mut stream = Stream::new(&spec);
+        let mut stream = Stream::new(&spec, Recorded::default());
         let mut spool = Spool::default();
 
         stream.put(0, beat());
@@ -5031,7 +5232,7 @@ mod tests {
     #[test]
     fn a_build_landing_under_the_watch_wakes_it_at_once() {
         let spec = waking(DEFER_MAX);
-        let mut stream = Stream::new(&spec);
+        let mut stream = Stream::new(&spec, Recorded::default());
         let mut spool = Spool::default();
 
         stream.put(0, beat());
@@ -5054,7 +5255,7 @@ mod tests {
     #[test]
     fn a_spool_survives_the_process_that_wrote_it() {
         let spec = waking(DEFER_MAX);
-        let mut stream = Stream::new(&spec);
+        let mut stream = Stream::new(&spec, Recorded::default());
         let mut spool = Spool::default();
         stream.put(0, beat());
         stream.put(0, news(Kind::Flag, Edge::Up, "a-1"));
@@ -5082,12 +5283,124 @@ mod tests {
     #[test]
     fn a_bare_watch_prints_what_it_printed_before_this_change() {
         let spec = watching(false);
-        let mut stream = Stream::new(&spec);
+        let mut stream = Stream::new(&spec, Recorded::default());
         let mut spool = Spool::default();
         stream.put(0, beat());
         stream.put(0, news(Kind::Flag, Edge::Down, "a-1"));
         assert_eq!(stream.tick(0, &mut spool).len(), 2, "both, now, in the order they happened");
         assert_eq!(spool.depth(), 0, "a bare watch holds nothing back and so has nothing to hold");
+    }
+
+    /// **A flush that did not arrive is owed in full, not in half.**
+    ///
+    /// The first version of `tick` moved the wake lines out of `hot` and cloned
+    /// only the backlog into the vector it wrote, so a failed write put back the
+    /// clone and dropped the rest: it preserved the heartbeats and lost the
+    /// `needs-a-person`, the `replaced` and the `over`. The asymmetry this row
+    /// is built on, exactly inverted — everything the table judged worth a
+    /// context read was the part that vanished.
+    #[test]
+    fn a_flush_that_did_not_arrive_is_owed_in_full() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec, Recorded { refusing: true, ..Recorded::default() });
+        let mut spool = Spool::default();
+
+        stream.put(0, beat());
+        stream.put(0, news(Kind::NeedsAPerson, Edge::Up, "a-1"));
+        stream.put(0, Line::Note(Class::Replaced, REPLACED.into()));
+
+        assert!(stream.tick(0, &mut spool).is_empty(), "nothing arrived, so nothing was written");
+        let mut owed = classes(&spool.held);
+        owed.sort_unstable();
+        assert_eq!(owed, vec!["beat", "news", "replaced"], "and all three are still owed, not one of three");
+
+        // An earlier tick's line stays ahead of a later one's, which is what
+        // escalation reads and what a person reading a delivered backlog is
+        // entitled to. Within a tick the order is re-derived on the next flush
+        // — see [`a_retried_ending_is_still_the_last_line_of_the_stream`].
+        stream.put(60, news(Kind::Review, Edge::Up, "a-2"));
+        assert!(stream.tick(60, &mut spool).is_empty());
+        assert_eq!(spool.depth(), 4);
+        assert_eq!(spool.oldest(), Some(0), "and the oldest thing held is still the oldest");
+    }
+
+    /// …and it is retried at the next tick rather than waiting out
+    /// `--defer-max` as though it were a heartbeat. A wake that did not arrive
+    /// is still a wake; only its delivery failed.
+    #[test]
+    fn a_wake_that_did_not_arrive_is_retried_at_the_next_tick() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec, Recorded { refusing: true, ..Recorded::default() });
+        let mut spool = Spool::default();
+        stream.put(0, beat());
+        stream.put(0, news(Kind::Review, Edge::Up, "a-1"));
+        assert!(stream.tick(0, &mut spool).is_empty());
+        assert!(spool.owed(), "a wake is sitting in there");
+
+        // The next tick produces nothing new at all, and must still flush.
+        stream.sink.refusing = false;
+        let written = stream.tick(60, &mut spool);
+        assert_eq!(classes(&written), vec!["news", "beat"], "the wake, with its backlog under it");
+        assert_eq!(spool.depth(), 0);
+    }
+
+    /// And a retry still puts `over` last. After a failed write every line is
+    /// in the spool, including the ending — so the grouping has to be
+    /// re-derived from the whole set rather than from what is fresh this tick,
+    /// or the ending comes back in the middle of its own flush.
+    #[test]
+    fn a_retried_ending_is_still_the_last_line_of_the_stream() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec, Recorded { refusing: true, ..Recorded::default() });
+        let mut spool = Spool::default();
+        stream.put(0, beat());
+        stream.put(0, news(Kind::Review, Edge::Up, "a-1"));
+        stream.put(0, Line::Note(Class::Over, "stopped watching wsp".into()));
+        assert!(stream.tick(0, &mut spool).is_empty());
+        assert_eq!(spool.depth(), 3, "all of it, the ending included");
+
+        stream.sink.refusing = false;
+        assert_eq!(classes(&stream.tick(60, &mut spool)), vec!["news", "beat", "over"]);
+    }
+
+    /// **Failure 5, in the one place it cannot be answered by trying again.**
+    ///
+    /// Every other tick meets a write that did not arrive by holding
+    /// everything and flushing a minute later. The ending has no minute later,
+    /// so a stream that could not say it stopped is indistinguishable from a
+    /// process that died — which is the fault this whole file is against. The
+    /// decision is on `core-017`: the register, stderr and the exit code, each
+    /// reaching somebody the other two cannot.
+    #[test]
+    fn a_watch_whose_ending_did_not_arrive_says_so_somewhere_other_than_the_stream() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec, Recorded { refusing: true, ..Recorded::default() });
+        let mut spool = Spool::default();
+        stream.put(0, beat());
+        stream.put(0, Line::Note(Class::Over, "stopped watching wsp".into()));
+        stream.tick(0, &mut spool);
+
+        let Ending::Untold(held) = ended(&spool) else {
+            panic!("a spool that is not empty after the ending's flush means the ending did not arrive");
+        };
+        assert_eq!(held, 2);
+        let said = untold(&spec, "w1:p1", held, &Over::Elapsed);
+        assert!(said.contains("wsp watch --drain"), "it names the repair: {said}");
+        assert!(said.contains("w1:p1"), "and where the held lines are: {said}");
+        assert!(said.contains(&spec.scope.name), "and what stopped: {said}");
+    }
+
+    /// The other side of it: an ending that arrived leaves nothing behind, so
+    /// the record goes and `doctor` stays quiet.
+    #[test]
+    fn a_watch_whose_ending_arrived_holds_nothing_and_leaves_no_record() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec, Recorded::default());
+        let mut spool = Spool::default();
+        stream.put(0, beat());
+        stream.put(0, Line::Note(Class::Over, "stopped watching wsp".into()));
+        stream.tick(0, &mut spool);
+        assert!(matches!(ended(&spool), Ending::Told));
     }
 
     /// **This row's whole claim, counted rather than estimated.**
@@ -5140,7 +5453,7 @@ mod tests {
             let mut spool = Spool::default();
             let mut wakes = 0;
             for (at, batch) in &ticks {
-                let mut stream = Stream::new(&spec);
+                let mut stream = Stream::new(&spec, Recorded::default());
                 for l in batch {
                     stream.put(*at, l.clone());
                 }
