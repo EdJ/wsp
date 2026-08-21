@@ -392,13 +392,19 @@
     <li><strong>The duplicate briefing is gone by construction.</strong> Because the claim
       exists first, <code>wsp brief --session</code> at session start describes the real task,
       and the work order does not have to repeat it.</li>
-    <li><strong>A spawn does not move your screen.</strong> <code>--focus</code> asks for that;
+    <li><strong>The workspace carries where it is.</strong> It is labelled after the work and
+      holds <code>WSP_PROJECT</code> and <code>WSP_TASK</code> in its environment, so a verb run
+      inside it knows what it is standing in without being told.</li>
+    <li><strong>A spawn does not move your screen</strong>, and it is trimmed by default.
+      <code>--focus</code> asks to be taken there; <code>--full</code> starts the agent with the
+      sub-agents, workflows and MCP servers it is otherwise spawned without;
       <code>--model</code> and <code>--effort</code> say what tier to start at,
       <code>--kind</code> picks the agent, and <code>--on &lt;machine&gt;</code> runs it on
       another machine.</li>
     <li><strong>Ending it is one verb.</strong> <code>wsp despawn</code> — the three-step hand
-      procedure left eighteen worktrees standing after one overnight batch. Nothing reaps on
-      idleness: an agent idle for ten minutes may be waiting on you.</li>
+      procedure left eighteen worktrees standing after one overnight batch.
+      <code>--keep-tree</code> leaves the checkout where it is. Nothing reaps on idleness: an
+      agent idle for ten minutes may be waiting on you.</li>
   </ul>
 
   <table class="terms">
@@ -486,7 +492,13 @@
     <li><strong>An ask is not a flag, and clearing is not answering.</strong>
       <code>--clear</code> acknowledges a hand; a <em>question</em> ends only by being answered
       or abandoned, both of which reach the asker. Clearing after answering down some other
-      channel once looked like answering while the asker sat waiting.</li>
+      channel once looked like answering while the asker sat waiting. <code>--ask claim</code>
+      is the one ask there is so far, and it is a closed vocabulary deliberately: the answer is
+      a keystroke that runs a command, so an agent never names its own argv.</li>
+    <li><strong>A repeat has to be meant.</strong> The same sentence to the same pane inside two
+      minutes is read as a retry and refused — <code>--again</code> is how you say you meant
+      it — because a status probe’s timeout once stood in for the verdict on a message that had
+      already arrived.</li>
     <li><strong>Hands climb the project chain.</strong> One raised on a <code>checkout</code>
       task asks <code>checkout</code>, then <code>shop</code>, then you.</li>
     <li><strong>Seven predicates, and an eighth you cannot switch off.</strong>
@@ -494,7 +506,9 @@
       stopped with no visible reason; <code>seat-stalled</code> exists because a governor is
       idle between the agents it sequences and would otherwise raise nothing. The eighth word
       is <code>blind</code> — wsp has lost sight of the fleet, which is the difference between
-      a quiet fleet and half a world.</li>
+      a quiet fleet and half a world. For a reader who is not at the screen, <code>--wake</code>
+      prints only what is worth a context read and holds the rest to ride the next one; nothing
+      is dropped.</li>
     <li><strong>It says, and it does not act.</strong> Nothing vacates a seat, ends a pane or
       advances a barrier on a computed level.</li>
   </ul>
