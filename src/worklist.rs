@@ -115,7 +115,7 @@ use std::path::PathBuf;
 
 use crate::cmd_checkout;
 use crate::cmd_verify::{git, toplevel};
-use crate::model::{Group, Status, Task, Worklist};
+use crate::model::{Group, Status, Task, Worklist, WorklistStatus};
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util;
@@ -591,6 +591,270 @@ pub fn dangling(store: &Store, w: &Worklist) -> Vec<String> {
         }
     }
     out
+}
+
+// ---- the list of lists --------------------------------------------------
+//
+// Everything above answers "where is this run up to". This answers the
+// question one storey up, which nothing did: **of all the worklists there
+// have ever been, which ones want somebody.**
+//
+// It lives here rather than in `cmd_worklist` because it is the same kind of
+// thing as `position` — a reading over the store, derived and never written —
+// and because it has two callers that must not disagree: `wsp worklist ls`
+// and the panel's `worklists` section, which draws the same segments at both
+// sidebar widths (`worklist-ui-007`). A predicate spelled twice is two
+// predicates by the end of the month.
+
+/// Whose a worklist is now.
+///
+/// # Not `status`, and this is the trap the design was written around
+///
+/// `wsp worklist done` means *nothing left to want from the run*. It does not
+/// mean anybody judged what came out of it, and the two are not close. Counted
+/// on the live store on 2026-08-20: **five worklists were `done` and every one
+/// of their 47 members was sitting at `review`** — not one had been `done`-ed.
+/// A list segmented on `status == done` would therefore have hidden 100% of
+/// the work the surface exists to surface, and drawn an empty list.
+///
+/// That is `worklist-052`'s error one storey up: *the run is over* read as
+/// *there is nothing left*.
+///
+/// The store moved under that count while this was being built, which is the
+/// better evidence: by 2026-08-21 Ed had `done`-ed four of those five, and the
+/// axis moved with him — four `Closed`, and `phase-two` still `Unjudged` on a
+/// barrier nobody ever wrote at. A status filter would have drawn the same
+/// empty list on both days.
+///
+/// # So the axis is whose it is, and it needs no new state
+///
+/// `done` on a task is Ed's, on every task, and that is already decided. So
+/// the three segments fall out of what is already written down, and every part
+/// of the predicate reads the store alone: [`Settlement`], [`dangling`], and
+/// the verdict on a [`crate::model::Group`].
+///
+/// Ordering is by last activity, newest first — never by slug, which is what
+/// `ls` sorted on and which put `phase-five` above `phase-four` above
+/// `phase-one` above `phase-six`. See [`Listed::activity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Segment {
+    /// `draft`, `running` or `held`: the run is in motion, or stopped with its
+    /// reason in the log. Whether its rows have been judged is not the
+    /// question yet.
+    Running,
+    /// The run is over and something on it is still somebody's: a member at
+    /// `review`, a barrier nobody wrote a verdict at, or a member that has
+    /// gone. Every finished worklist in the store is here.
+    Unjudged,
+    /// Every member `done`, every barrier answered, nothing dangling. Nothing
+    /// left for anybody, and the only segment that may be hidden behind a
+    /// count.
+    ///
+    /// The design expected this to be empty for a while yet. It was not: on
+    /// 2026-08-21, four of the eight worklists in the store were here, because
+    /// Ed had worked through phases one, three, four and five in the interval.
+    /// The collapse is what stops the list going wrong in a month — at roughly
+    /// one new worklist a night and no verb anywhere that removes one — and it
+    /// is already carrying four rows.
+    Closed,
+}
+
+impl Segment {
+    /// The word a surface prints, and the same word in both of them.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Segment::Running => "running",
+            Segment::Unjudged => "unjudged",
+            Segment::Closed => "closed",
+        }
+    }
+}
+
+/// One worklist, read for a list of them.
+///
+/// **Nothing here starts a process.** Every field is the store — a small file
+/// per member and the record's own text — which is what lets the panel redraw
+/// it four times a second and keeps `wsp worklist ls` the cheap verb an agent
+/// runs at every barrier. The membership is walked twice over: once by
+/// [`position`], which stops where the run is, and once here, which is what
+/// the count of rows still standing needs and what [`position`] must not be
+/// made to pay for.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    pub list: Worklist,
+    pub segment: Segment,
+    /// Where the run is up to, under [`Reading::Settled`]. **The one
+    /// computation**, and the reason this struct carries it rather than
+    /// leaving each surface to ask: `worklist-049` drew a tick on a barrier
+    /// nobody had read, three times, once into a permanent record, and every
+    /// one of those was a surface that had worked the position out for itself.
+    pub at: Position,
+    /// Members the store does not say `done` about — the rows standing between
+    /// this list and [`Segment::Closed`], and the number both surfaces draw on
+    /// the right.
+    ///
+    /// A member that has gone is not counted here and is on [`Listed::gone`]
+    /// instead: the count is of rows somebody can act on, and there is no row
+    /// left to act on. It still keeps the list out of `Closed`.
+    pub open: usize,
+    /// [`dangling`]'s answer: members no task answers to. **A worklist with
+    /// one is never `Closed`** — the `gone` line exists to be the last chance
+    /// to put something back, and hiding the list behind a count is how that
+    /// chance is lost.
+    pub gone: Vec<String>,
+    /// The ordinals of groups the run walked past with nothing written at
+    /// their barrier. See [`passed_unwritten`].
+    pub no_verdict: Vec<usize>,
+    /// When anything last happened on this run, in epoch seconds — the sort
+    /// key, and the only ordering the list has ever had that carries
+    /// information.
+    ///
+    /// **Two clocks, because neither alone is activity.** The worklist's own
+    /// `## Log` holds what happened to the *run* — composed, started, each
+    /// barrier passed, done — and nothing else writes there; the members hold
+    /// what happened to the *work*, and a group grinding away between two
+    /// barriers moves those and touches the log not at all. The half that
+    /// matters most for a finished list is the second one: Ed judging rows out
+    /// of a run that ended last week is activity on it, and it is invisible in
+    /// the log.
+    ///
+    /// Falls back to `created` — and only falls back to it, because creation
+    /// is the first thing that happened to a list rather than a third clock to
+    /// take the maximum of.
+    pub activity: i64,
+}
+
+/// Every worklist, segmented and ordered: the answer both surfaces draw.
+///
+/// Sorted by segment and then by last activity, newest first, with the slug as
+/// the tie-break so that two lists touched in the same second do not swap
+/// places between two redraws.
+pub fn listing(store: &Store, lists: Vec<Worklist>) -> Vec<Listed> {
+    let mut out: Vec<Listed> = lists.into_iter().map(|w| listed(store, w)).collect();
+    out.sort_by(|a, b| {
+        a.segment
+            .cmp(&b.segment)
+            .then(b.activity.cmp(&a.activity))
+            .then(a.list.id.cmp(&b.list.id))
+    });
+    out
+}
+
+/// One worklist read: the whole membership, not only the group being waited
+/// on.
+///
+/// [`position`] deliberately does not read the groups ahead of where the run
+/// is — that is what makes the expensive reading affordable — so the count of
+/// rows still standing has to walk the membership itself. Under
+/// [`Reading::Settled`] that is one small file read per member, which is what
+/// `position` costs for the group it is at.
+fn listed(store: &Store, w: Worklist) -> Listed {
+    let at = position(store, &w, Reading::Settled);
+    let gone = dangling(store, &w);
+    let no_verdict = passed_unwritten(&w, at.at);
+
+    let renamed = store.renamed_ids();
+    let mut open = 0usize;
+    let mut worked = 0i64;
+    for g in w.groups() {
+        for m in &g.members {
+            // `task_now`, not `task`: a member the worklist names by an id it
+            // was written down under is not at the path that id spells, and
+            // reading it as absent would count a live row as gone. The same
+            // read `member` makes, for the same reason.
+            let Some(t) = store.task_now(&renamed, m) else { continue };
+            worked = worked.max(util::epoch_of(&t.updated));
+            if !matches!(Settlement::of(&t), Settlement::Closed) {
+                open += 1;
+            }
+        }
+    }
+
+    let segment = match w.status() {
+        WorklistStatus::Draft | WorklistStatus::Running | WorklistStatus::Held => Segment::Running,
+        // Every member done, every barrier answered, nothing dangling — and
+        // `at.is_none()` is the second half of "every barrier answered": it
+        // says the walk found no barrier still shut, where `no_verdict` says
+        // none of the ones behind it was crossed in silence.
+        WorklistStatus::Done
+            if open == 0 && gone.is_empty() && at.finished() && no_verdict.is_empty() =>
+        {
+            Segment::Closed
+        }
+        WorklistStatus::Done => Segment::Unjudged,
+    };
+
+    // `created` is a fallback and not a third clock: it is the *first* thing
+    // that happened to a list, so folding it in with `max` would be harmless
+    // on any real record and is wrong on the one it is there for — a list
+    // composed a minute ago out of rows that last moved a fortnight back would
+    // read as activity that has not happened.
+    let activity = match worked.max(logged_at(&w)) {
+        0 => util::epoch_of(&w.created),
+        last => last,
+    };
+    Listed { list: w, segment, at, open, gone, no_verdict, activity }
+}
+
+/// The barriers the run walked past with nothing written at them.
+///
+/// **This is the fact that stops the list drawing a tick it has not got.**
+/// `phase-two` group 2 — three members, one of them from another project,
+/// 63.6M tokens — has no stop condition, no verdict and no log line recording
+/// it being passed, and `at` cannot see it: the floor is the group after the
+/// *last* one carrying a verdict, so a hole below the last verdict is stepped
+/// straight over. Counted on the store on 2026-08-21: of the 26 groups on the
+/// six worklists whose runs are over, 25 carry a verdict and that one does
+/// not.
+///
+/// Monotonicity is right and is not touched here — pointing `at` back at group
+/// 2 would reopen a barrier on a finished worklist and offer to spawn members
+/// whose work landed yesterday. What was missing is the report.
+///
+/// # One spelling, and where the rest of it goes
+///
+/// `worklist-ui-006` is the other half: the same ordinals carried on
+/// [`Position`], filled on the walk that already visits every one of those
+/// groups, and printed by `report` the way [`Position::slipped`] is. **It
+/// should move this function's body onto that walk rather than write the
+/// predicate a second time** — a second copy is how the list and the plan
+/// reading come to disagree about the same group.
+///
+/// A draft has crossed no barriers at all, whatever its members read as, so
+/// there is nothing here to have been silent about. Without that guard a plan
+/// composed out of work already at `review` would report every group in front
+/// of the first unfinished one as a barrier nobody wrote at.
+pub fn passed_unwritten(w: &Worklist, at: Option<usize>) -> Vec<usize> {
+    if w.status() == WorklistStatus::Draft {
+        return Vec::new();
+    }
+    let groups = w.groups();
+    let passed = at.map_or(groups.len(), |n| n.saturating_sub(1));
+    groups
+        .iter()
+        .take(passed)
+        .enumerate()
+        .filter(|(_, g)| g.verdict.trim().is_empty())
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// The last thing the run wrote about itself, in epoch seconds, or 0.
+///
+/// The shape is the store's own dated bullet — `- <stamp> …` — and both stamp
+/// shapes count, because a line written before 2026-08-17 stored a bare date
+/// and there is nothing to convert it from. The maximum rather than the last
+/// line, so a log somebody has hand-edited out of order still answers with the
+/// most recent thing in it.
+fn logged_at(w: &Worklist) -> i64 {
+    w.section("Log")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- ").and_then(|r| r.split_once(' ')))
+        .filter(|(stamp, _)| util::is_stamp(stamp))
+        .map(|(stamp, _)| util::epoch_of(stamp))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Take away the trees of the members behind this barrier, and of the group
@@ -2038,5 +2302,216 @@ mod tests {
         w.set_status(crate::model::WorklistStatus::Draft);
         store.save_worklist(&w).unwrap();
         assert_eq!(running_position(&store, "batch"), None, "a plan is not a run");
+    }
+
+    // ---- the list of lists ------------------------------------------------
+
+    /// A worklist with a slug, a status and a log of its own, so a test can say
+    /// what happened to the run as well as to its rows.
+    fn named(store: &Store, id: &str, status: WorklistStatus, groups: &str) -> Worklist {
+        let mut w = Worklist::new(id, id);
+        w.body = format!("## Groups\n{groups}");
+        w.set_status(status);
+        store.save_worklist(&w).unwrap();
+        w
+    }
+
+    /// A row that last moved at a stated instant, which is the half of activity
+    /// the worklist's own log never sees.
+    fn moved(store: &Store, id: &str, status: &str, when: &str) {
+        let mut t = Task::new(id, id);
+        t.project = Some("wsp".into());
+        t.status_raw = status.into();
+        t.updated = when.into();
+        store.save_task(&t).unwrap();
+    }
+
+    /// A line in the worklist's own log, stamped when we say rather than now.
+    /// `Worklist::log` writes the current instant, which is the one instant a
+    /// test about ordering cannot use.
+    fn logged(w: &mut Worklist, when: &str, what: &str) {
+        w.body.push_str(&format!("\n## Log\n- {when} {what}\n"));
+    }
+
+    fn segment_of(store: &Store, w: &Worklist) -> Segment {
+        listing(store, vec![w.clone()]).remove(0).segment
+    }
+
+    /// **The trap the whole axis exists to avoid.** `wsp worklist done` says
+    /// there is nothing left to want from the *run*; it says nothing about
+    /// whether anybody judged what came out of it. Measured on the store on
+    /// 2026-08-20: five worklists `done`, all 47 of their members at `review`,
+    /// none of them `done`-ed — so a list segmented on the status would have
+    /// hidden every row this surface exists to show and drawn an empty list.
+    ///
+    /// The assertion is deliberately in both halves: the status *is* `done`,
+    /// and the segment is not.
+    #[test]
+    fn a_finished_run_whose_rows_nobody_judged_is_unjudged_rather_than_closed() {
+        let (_env, store, _repo) = scratch("unjudged");
+        for id in ["wsp-1", "wsp-2"] {
+            task(&store, id, "review");
+        }
+        let mut w = named(&store, "phase", WorklistStatus::Done, "- 1  wsp-1\n- 2  wsp-2\n");
+        passed(&mut w, 1, "clean");
+        passed(&mut w, 2, "clean");
+        store.save_worklist(&w).unwrap();
+
+        assert_eq!(w.status(), WorklistStatus::Done, "the run is over, and says so");
+        assert_eq!(segment_of(&store, &w), Segment::Unjudged, "and the rows are still Ed's");
+        assert_eq!(listing(&store, vec![w]).remove(0).open, 2, "both of them");
+    }
+
+    /// The other end of the same predicate, one row at a time, because the
+    /// three conditions are an `and` and a surface that hid a list on any one
+    /// of them would hide work.
+    #[test]
+    fn a_run_is_closed_only_when_every_row_is_done_and_every_barrier_answered() {
+        let (_env, store, _repo) = scratch("closed");
+        task(&store, "wsp-1", "done");
+        task(&store, "wsp-2", "review");
+        let mut w = named(&store, "phase", WorklistStatus::Done, "- 1  wsp-1\n- 2  wsp-2\n");
+        passed(&mut w, 1, "clean");
+        passed(&mut w, 2, "clean");
+        store.save_worklist(&w).unwrap();
+        assert_eq!(segment_of(&store, &w), Segment::Unjudged, "one row still at review");
+
+        task(&store, "wsp-2", "done");
+        assert_eq!(segment_of(&store, &w), Segment::Closed, "and now nothing is anybody's");
+
+        let mut open = w.clone();
+        let mut groups = open.groups();
+        groups[1].verdict = String::new();
+        open.set_groups(&groups);
+        store.save_worklist(&open).unwrap();
+        assert_eq!(
+            segment_of(&store, &open),
+            Segment::Unjudged,
+            "a barrier nobody wrote at is as unfinished as a row nobody judged",
+        );
+    }
+
+    /// The `gone` line is the last chance to put something back, and a list
+    /// collapsed behind `⋯ N closed` is where that chance is lost. So a member
+    /// the store has never heard of keeps the list out of `Closed` — and is
+    /// not counted as an open row either, because there is no row left to act
+    /// on and the count is of things somebody can do something to.
+    #[test]
+    fn a_member_that_has_gone_keeps_a_run_out_of_closed_without_being_counted() {
+        let (_env, store, _repo) = scratch("gone");
+        task(&store, "wsp-1", "done");
+        let mut w = named(&store, "phase", WorklistStatus::Done, "- 1  wsp-1  wsp-2\n");
+        passed(&mut w, 1, "clean");
+        store.save_worklist(&w).unwrap();
+
+        let read = listing(&store, vec![w]).remove(0);
+        assert_eq!(read.segment, Segment::Unjudged);
+        assert_eq!(read.gone, ["wsp-2"], "named, so a caller can print which one");
+        assert_eq!(read.open, 0, "and not counted among the rows somebody can judge");
+    }
+
+    /// `phase-two` group 2, live in the store: three members, one of them from
+    /// another project, no stop condition, no verdict and no log line recording
+    /// it being passed. **`at` cannot see it** — the floor is the group after
+    /// the *last* one carrying a verdict, so a hole below that is stepped
+    /// straight over and the list drew the same `✓` as a run somebody read
+    /// every barrier of.
+    ///
+    /// Monotonicity is not touched: `at` still says the run is finished, which
+    /// is the answer that stops `next` offering to spawn work that landed
+    /// yesterday. What is added is the receipt.
+    #[test]
+    fn a_barrier_the_run_walked_past_in_silence_is_named_where_the_position_cannot_see_it() {
+        let (_env, store, _repo) = scratch("silent");
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            task(&store, id, "done");
+        }
+        let mut w = named(&store, "phase", WorklistStatus::Done, "- 1  wsp-1\n- 2  wsp-2\n- 3  wsp-3\n");
+        passed(&mut w, 1, "clean");
+        passed(&mut w, 3, "clean");
+        store.save_worklist(&w).unwrap();
+
+        let read = listing(&store, vec![w]).remove(0);
+        assert!(read.at.finished(), "the walk still says the run is over");
+        assert_eq!(read.no_verdict, [2], "and this is the group nobody wrote at");
+        assert_eq!(
+            read.segment,
+            Segment::Unjudged,
+            "so the run is not closed, however done its rows are",
+        );
+    }
+
+    /// A plan has crossed no barriers at all, whatever its members read as. The
+    /// guard is not hypothetical: a worklist composed out of the backlog
+    /// legitimately holds work already at `review` — design-only rows reach it
+    /// before anything is spawned — and without it every group in front of the
+    /// first unfinished one would be reported as a barrier nobody wrote at.
+    #[test]
+    fn a_plan_has_crossed_no_barriers_however_its_rows_read() {
+        let (_env, store, _repo) = scratch("plan");
+        task(&store, "wsp-1", "review");
+        task(&store, "wsp-2", "todo");
+        let w = named(&store, "phase", WorklistStatus::Draft, "- 1  wsp-1\n- 2  wsp-2\n");
+
+        let read = listing(&store, vec![w]).remove(0);
+        assert_eq!(read.at.at, Some(2), "the plan is where the run would begin");
+        assert!(read.no_verdict.is_empty(), "and nothing behind it was passed in silence");
+        assert_eq!(read.segment, Segment::Running, "a plan is the run's own segment");
+    }
+
+    /// Slug ordering carried no information at all — it put `phase-five` above
+    /// `phase-four` above `phase-one` above `phase-six` — so the order is by
+    /// last activity, newest first, under a segment order that puts what is in
+    /// motion first and what is finished with last.
+    ///
+    /// The slugs here sort the opposite way on purpose: an assertion that
+    /// passes under both orderings would prove nothing.
+    #[test]
+    fn the_list_orders_by_segment_and_then_by_what_happened_last() {
+        let (_env, store, _repo) = scratch("order");
+        for (id, when) in [("wsp-1", "2026-08-01T00:00:00Z"), ("wsp-2", "2026-08-02T00:00:00Z")] {
+            moved(&store, id, "done", when);
+        }
+        let mut old = named(&store, "aaa-old", WorklistStatus::Done, "- 1  wsp-1\n");
+        passed(&mut old, 1, "clean");
+        logged(&mut old, "2026-08-01T12:00:00Z", "done — every barrier passed");
+        store.save_worklist(&old).unwrap();
+
+        let mut new = named(&store, "zzz-new", WorklistStatus::Done, "- 1  wsp-2\n");
+        passed(&mut new, 1, "clean");
+        store.save_worklist(&new).unwrap();
+
+        let running = named(&store, "mmm-run", WorklistStatus::Running, "- 1  wsp-1\n");
+
+        let order: Vec<String> =
+            listing(&store, vec![old, new, running]).into_iter().map(|l| l.list.id).collect();
+        assert_eq!(
+            order,
+            ["mmm-run", "zzz-new", "aaa-old"],
+            "the run in motion first, then the newest thing to have happened",
+        );
+    }
+
+    /// **The half of activity the worklist's own log never sees.** Nothing
+    /// writes to a worklist's log when a row moves — the log holds what
+    /// happened to the *run*: composed, started, each barrier passed, done —
+    /// so a list ordered on it alone would be ordered by when its run ended and
+    /// would not move when Ed spent an evening judging its rows. That is the
+    /// activity this list exists to follow.
+    #[test]
+    fn a_row_moving_is_activity_on_the_run_and_the_log_never_hears_of_it() {
+        let (_env, store, _repo) = scratch("clock");
+        moved(&store, "wsp-1", "review", "2026-08-21T09:00:00Z");
+        let mut w = named(&store, "phase", WorklistStatus::Done, "- 1  wsp-1\n");
+        passed(&mut w, 1, "clean");
+        logged(&mut w, "2026-08-19T10:00:00Z", "done — every barrier passed");
+        store.save_worklist(&w).unwrap();
+
+        let read = listing(&store, vec![w]).remove(0);
+        assert_eq!(
+            read.activity,
+            util::epoch_of("2026-08-21T09:00:00Z"),
+            "the row moved two days after the run wrote its last line",
+        );
     }
 }

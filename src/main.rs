@@ -1392,11 +1392,16 @@ fn help_text() -> String {
   wsp worklist edit <slug> --overview -    what has to be true before group 1
                                     starts — there is no barrier in front of it
                                     to carry a stop condition, so the list does
-  wsp worklist ls|show <slug> [--verdicts]
-                                    every list, or one: the groups, where it is
-                                    up to, and which of them may still be edited.
-                                    A verdict past a few lines is counted rather
-                                    than drawn; --verdicts draws them whole
+  wsp worklist ls [--all]           every list, most recently active first, in
+                                    three segments: running, unjudged — the run
+                                    is over and its rows are not — and closed,
+                                    which is counted rather than drawn. --all
+                                    draws the closed ones too
+  wsp worklist show <slug> [--verdicts]
+                                    one list: the groups, where it is up to, and
+                                    which of them may still be edited. A verdict
+                                    past a few lines is counted rather than
+                                    drawn; --verdicts draws them whole
   Editing is write-ahead-only: a group at or behind where the list is up to has
   either run or is running, and is refused with what may be edited instead.
 

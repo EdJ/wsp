@@ -76,7 +76,7 @@ use crate::cmd_task::fold;
 use crate::model::{Group, Worklist, WorklistStatus};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::worklist::{self, Landing, Position, Reading, Standing};
+use crate::worklist::{self, Landing, Position, Reading, Segment, Standing};
 use crate::Args;
 
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
@@ -912,50 +912,163 @@ fn save(store: &Store, w: &mut Worklist, groups: &[Group], what: &str, msg: &str
 }
 
 // ---- ls ---------------------------------------------------------------
+//
+// Three segments, newest first, and the closed ones behind a count. The
+// predicate and the ordering are `worklist::listing` — the panel's
+// `worklists` section draws the same answer at both sidebar widths, and a
+// segment worked out twice is two segments by the end of the month.
+//
+// **This verb is on the expensive side of the context line.** A person opening
+// a panel pays nothing; `wsp worklist ls` is run by every governor at every
+// barrier and lands in a transcript that is re-read on every later request. So
+// what is added here is one column and at most three heading lines, and what
+// is taken away grows: the closed segment is one line however many worklists
+// are in it, and at roughly one new worklist a night that is the half of this
+// change that pays.
 
 pub fn list(store: &Store, args: &Args) -> i32 {
-    let all = store.worklists();
+    // Read once, whatever is drawn: `--all` reveals rows this already holds
+    // rather than asking a second question of the store.
+    let listed = worklist::listing(store, store.worklists());
+    let all = args.has("all");
 
     if args.json() {
-        let out: Vec<_> = all.iter().map(|w| worklist_json(store, w)).collect();
+        // No collapse and no `--all` here: an abridgement is a thing done for
+        // a reader, and a parser is not one.
+        let out: Vec<_> = listed.iter().map(listed_json).collect();
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
-    if all.is_empty() {
+    if listed.is_empty() {
         println!("no worklists yet — wsp worklist new <slug> \"title\"");
         return 0;
     }
+    for line in list_lines(&Paint::new(), &listed, all) {
+        println!("{line}");
+    }
+    0
+}
 
-    let p = Paint::new();
-    let w_id = all.iter().map(|w| w.id.chars().count()).max().unwrap_or(8).max(8);
-    println!(
-        "{}  {}  {}  {}  {}",
+/// The table: a heading per segment that has anything in it, its rows newest
+/// first, and the closed ones counted rather than drawn.
+///
+/// Built rather than printed so the segmenting can be asserted on. The width
+/// of the id column follows the widest slug drawn, so hiding the closed
+/// segment does not leave the table indented for a name that is not on it.
+fn list_lines(p: &Paint, listed: &[worklist::Listed], all: bool) -> Vec<String> {
+    let drawn: Vec<&worklist::Listed> =
+        listed.iter().filter(|l| all || l.segment != Segment::Closed).collect();
+    let hidden = listed.len() - drawn.len();
+
+    let w_id = drawn.iter().map(|l| l.list.id.chars().count()).max().unwrap_or(8).max(8);
+    let mut out = vec![format!(
+        "{}  {}  {}  {}  {}  {}",
         p.dim(&util::pad("WORKLIST", w_id)),
         p.dim(&util::pad("STATUS", 7)),
         p.dim("GROUPS"),
         p.dim("AT"),
+        p.dim("OPEN"),
         p.dim("TITLE")
-    );
-    for l in &all {
-        let pos = worklist::position(store, l, Reading::Settled);
-        // The position, or the mark for having no position left to have. A
-        // finished list reading `5` beside `5` groups would say it is on the
-        // last one, which is the one thing it is not.
-        let at = match (pos.at, pos.of) {
-            (Some(n), _) => n.to_string(),
-            (None, 0) => "·".to_string(),
-            (None, _) => "✓".to_string(),
-        };
-        println!(
-            "{}  {}  {}  {}  {}",
-            util::pad(&l.id, w_id),
-            util::pad(l.status().as_str(), 7),
-            util::pad(&pos.of.to_string(), 6),
-            util::pad(&at, 2),
-            p.dim(&util::truncate(&l.title, 40))
-        );
+    )];
+
+    let mut segment = None;
+    for l in &drawn {
+        if segment != Some(l.segment) {
+            segment = Some(l.segment);
+            out.push(p.dim(heading(l.segment)));
+        }
+        out.push(format!(
+            "{}  {}  {}  {}  {}  {}",
+            util::pad(&l.list.id, w_id),
+            util::pad(l.list.status().as_str(), 7),
+            util::pad(&l.at.of.to_string(), 6),
+            util::pad(&at_mark(l), 2),
+            util::pad(&count(l.open), 4),
+            p.dim(&util::truncate(&l.list.title, 40))
+        ));
     }
-    0
+
+    // Never hide quietly: a list with the closed segment taken out of it reads
+    // exactly like a list that has none, and the difference is a worklist
+    // somebody may still want to look at. `cmd_project.rs`'s abridged-decision
+    // line is the shape.
+    if hidden > 0 {
+        out.push(p.dim(&format!("⋯ {hidden} closed · wsp worklist ls --all")));
+    }
+    out
+}
+
+/// The segment heading, and the one place the axis is named.
+///
+/// `unjudged` carries its gloss because the word is doing the arguing: the
+/// rows under it are on worklists whose `status` says `done`, and a reader who
+/// takes the heading for a status reads the list as broken. `running` and
+/// `closed` say what they are.
+fn heading(s: Segment) -> &'static str {
+    match s {
+        Segment::Unjudged => "unjudged — the run is over, the rows are not",
+        other => other.word(),
+    }
+}
+
+/// Where the run is up to, in one column.
+///
+/// Four answers and the fourth is the one this column did not have. A finished
+/// list reading `5` beside `5` groups would say it is on the last one, which
+/// is the one thing it is not — so a run with no position left to have draws a
+/// mark. **But `✓` on a run that walked past a barrier nobody wrote at is a
+/// tick this surface has not got**: `phase-two` drew one, and the design read
+/// it off `wsp worklist ls` as one of the five and said so.
+///
+/// `!` is `group_mark`'s existing glyph for a group with something wrong with
+/// it, and it stands for both of the things that keep a finished run out of
+/// `Closed` while its `OPEN` count reads `·` — a barrier nobody wrote at, and
+/// a member that has gone. Which one, and which group or member, is
+/// `wsp worklist show <slug>` and the `--json` row; a table with a column for
+/// each would be two columns empty in every ordinary run.
+///
+/// **A run still in motion keeps its group number**, so a dangling member on
+/// one is not marked here. That is the honest trade rather than an oversight:
+/// where the run is up to is what a running row is read for, and `next` and
+/// `go` both name a dangling member at the barrier — loudly, and into the
+/// list's own log — which is while there is still time to put something back.
+fn at_mark(l: &worklist::Listed) -> String {
+    match (l.at.at, l.at.of) {
+        (Some(n), _) => n.to_string(),
+        (None, 0) => "·".to_string(),
+        (None, _) if !l.no_verdict.is_empty() || !l.gone.is_empty() => "!".to_string(),
+        (None, _) => "✓".to_string(),
+    }
+}
+
+/// A count, or the mark for none.
+///
+/// Zero is drawn as `·` rather than `0` for the reason the `AT` column takes
+/// one: a column of numbers with a `0` in it is read as a small number, and
+/// what is meant is that there is nothing there.
+fn count(n: usize) -> String {
+    match n {
+        0 => "·".to_string(),
+        n => n.to_string(),
+    }
+}
+
+/// One row for a parser: the worklist object every other verb emits, and the
+/// five facts this reading adds to it.
+///
+/// `gone` and `no_verdict` have no column in the table — the `AT` mark says
+/// only that one of them is not empty — so this is where a caller that wants
+/// to know *which* group, or *which* member, reads it without running `show`.
+fn listed_json(l: &worklist::Listed) -> serde_json::Value {
+    let mut out = worklist_json_at(&l.list, &l.at);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("segment".into(), json!(l.segment.word()));
+        o.insert("open".into(), json!(l.open));
+        o.insert("gone".into(), json!(l.gone));
+        o.insert("no_verdict".into(), json!(l.no_verdict));
+        o.insert("activity".into(), json!(util::iso_at(l.activity)));
+    }
+    out
 }
 
 // ---- what a passed group left behind ----------------------------------
@@ -2620,14 +2733,23 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
 
 /// One worklist, for `--json`: what it is, and where it is up to.
 fn worklist_json(store: &Store, w: &Worklist) -> serde_json::Value {
-    let pos = worklist::position(store, w, Reading::Settled);
+    worklist_json_at(w, &worklist::position(store, w, Reading::Settled))
+}
+
+/// The same object where the position is already in hand.
+///
+/// Split out for `ls`, which reads a position per list through
+/// `worklist::listing` and must not ask for a second one — two walks of the
+/// same groups is how a `--json` row comes to disagree with the table printed
+/// beside it, and it is the position that both of them are about.
+fn worklist_json_at(w: &Worklist, at: &Position) -> serde_json::Value {
     json!({
         "id": w.id,
         "title": w.title,
         "status": w.status().as_str(),
         "created": w.created,
-        "groups": pos.of,
-        "at": pos.at,
+        "groups": at.of,
+        "at": at.at,
     })
 }
 
@@ -3601,4 +3723,140 @@ mod tests {
         );
     }
 
+
+    // ---- the list of lists ------------------------------------------------
+
+    /// A run that is over: the status `wsp worklist done` records, set directly
+    /// because the verb refuses where a barrier is still shut and these tests
+    /// are about the reading rather than about the decision.
+    fn finished(store: &Store, id: &str) {
+        let mut w = store.worklist(id).expect("the list");
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+    }
+
+    fn drawn(store: &Store, all: bool) -> Vec<String> {
+        list_lines(&Paint::new(), &worklist::listing(store, store.worklists()), all)
+    }
+
+    fn row<'a>(lines: &'a [String], id: &str) -> Option<&'a String> {
+        lines.iter().find(|l| l.starts_with(id))
+    }
+
+    /// The collapse, and the notice that keeps it honest. A closed segment
+    /// taken out of the table reads exactly like a table that never had one —
+    /// so it is counted, and the flag that draws it is on the same line, which
+    /// is `cmd_project.rs`'s abridged-decision shape.
+    ///
+    /// **The count is what pays for this**: nothing removes a worklist, they
+    /// arrive at roughly one a night, and this is the only place they are ever
+    /// managed.
+    #[test]
+    fn the_closed_segment_is_counted_rather_than_quietly_dropped() {
+        let store = scratch("segments");
+        task(&store, "wl-001", "done");
+        task(&store, "wl-002", "review");
+        for (list, member) in [("shut", "wl-001"), ("open", "wl-002")] {
+            run(&store, &["new", list, list]);
+            run(&store, &["add", list, member]);
+            crossed(&store, list, 1);
+            finished(&store, list);
+        }
+
+        let lines = drawn(&store, false);
+        assert!(row(&lines, "open").is_some(), "the unjudged list is drawn: {lines:?}");
+        assert!(row(&lines, "shut").is_none(), "the closed one is not: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("⋯ 1 closed · wsp worklist ls --all")),
+            "and the table says so, and says what draws it: {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("unjudged — the run is over")),
+            "the segment is named where a reader would otherwise read `done` as finished: {lines:?}",
+        );
+
+        let all = drawn(&store, true);
+        assert!(row(&all, "shut").is_some(), "--all draws it: {all:?}");
+        assert!(!all.iter().any(|l| l.contains("⋯")), "and has nothing left to announce: {all:?}");
+    }
+
+    /// `worklist-049` drew a tick on a barrier nobody had read, and this is the
+    /// same tick one storey up: `phase-two` group 2 was passed in silence, and
+    /// because the floor is the group after the *last* one carrying a verdict,
+    /// `at` steps over the hole and the row drew `✓` — the same glyph as a run
+    /// somebody read every barrier of. The design read it off `wsp worklist ls`
+    /// and said one of the five ticks was not true.
+    #[test]
+    fn a_run_that_walked_past_a_barrier_in_silence_does_not_draw_a_tick() {
+        let store = scratch("silent");
+        task(&store, "wl-001", "done");
+        task(&store, "wl-002", "done");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        crossed(&store, "batch", 2);
+        finished(&store, "batch");
+
+        let lines = drawn(&store, false);
+        let line = row(&lines, "batch").expect("the row is drawn").clone();
+        assert!(line.contains(" ! "), "the mark says a barrier went unread: {line}");
+        assert!(!line.contains('✓'), "and not that every one was read: {line}");
+        assert!(
+            !lines.iter().any(|l| l.contains("closed")),
+            "and it is not closed either, however done its rows are: {lines:?}",
+        );
+    }
+
+    /// A member that has gone keeps a finished run out of `Closed` and adds
+    /// nothing to the count of rows anybody can act on — so with everything
+    /// else `done` the row would read `✓` and `·` and sit under a heading
+    /// saying something is still somebody's, with nothing on it saying what.
+    /// The mark is that sentence.
+    #[test]
+    fn a_finished_run_holding_a_member_that_has_gone_says_so_on_the_row() {
+        let store = scratch("gone-row");
+        task(&store, "wl-001", "done");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        // Named in the plan, and no task answers to it: the shape `wsp archive`
+        // left behind on 2026-08-20 when 266 tasks went at once.
+        let mut w = store.worklist("batch").unwrap();
+        let mut groups = w.groups();
+        groups[0].members.push("wl-404".into());
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        crossed(&store, "batch", 1);
+        finished(&store, "batch");
+
+        let lines = drawn(&store, false);
+        let line = row(&lines, "batch").expect("the row is drawn").clone();
+        assert!(line.contains(" ! "), "the mark stands for the member that is gone: {line}");
+        assert!(line.contains(" · "), "and the count is honest: there is no row left to judge: {line}");
+    }
+
+    /// The number no surface showed: how many rows on a list are still
+    /// somebody's. Zero is a mark rather than a `0`, because a column of counts
+    /// with a nought in it is read as a small number when what is meant is that
+    /// there is nothing there.
+    #[test]
+    fn the_row_carries_the_number_of_rows_still_standing_on_it() {
+        let store = scratch("open-count");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "done");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        crossed(&store, "batch", 1);
+        crossed(&store, "batch", 2);
+        finished(&store, "batch");
+
+        let lines = drawn(&store, false);
+        assert!(lines[0].contains("OPEN"), "the column is named: {:?}", lines[0]);
+        let line = row(&lines, "batch").expect("the row is drawn").clone();
+        assert!(line.contains(" 1 "), "one row is still Ed's: {line}");
+
+        task(&store, "wl-001", "done");
+        let line = row(&drawn(&store, true), "batch").expect("still drawn").clone();
+        assert!(line.contains(" · "), "and none is drawn as nothing, not as a nought: {line}");
+    }
 }

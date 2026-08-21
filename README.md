@@ -3896,7 +3896,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/model.rs` | `Project`, `Task`, `Machine`, `Worklist`, status/priority vocabulary |
 | `src/resolve.rs` | project resolution, tag inheritance, sub-tree walk, count rollup |
 | `src/message.rs` | the message record: one envelope, three shapes, and a question that can be answered back |
-| `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, and what a landed group touched |
+| `src/worklist.rs` | where a worklist is up to: the derived position, the two readings of finished, the sweep a passed group licenses, what a landed group touched, and — one storey up — which of all the lists there have ever been still want somebody |
 | `src/guard.rs` | the stash guard: one stack per repository however many worktrees, and the git hook that refuses it inside the command that would have taken it |
 | `src/herdr.rs` | newline-delimited JSON-RPC over herdr's unix socket |
 | `src/place.rs` | the place-work port: what wsp asks of whatever runs its agents |
