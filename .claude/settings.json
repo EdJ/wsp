@@ -3,5 +3,18 @@
 
   "enabledPlugins": {
     "figma@claude-plugins-official": false
+  },
+
+  "_worktrees": "wsp owns the working trees in this repo — `wsp checkout` makes them under .worktrees/<task>, on a branch named for the task, from local HEAD, with the stash guard installed. Claude Code's EnterWorktree makes its own under .claude/worktrees/ instead, and nothing in wsp can see one: not `wsp overlap`, not `wsp checkout --sweep`, not `wsp doctor`'s 'the tree for X is finished with'. Denied 2026-08-21 after a spawned agent reached for it — the tool fires on project instructions mentioning worktrees, and this project's handbook is made of them. A spawned agent's cwd is already inside its tree, so it needs neither mode. See agent-010.",
+  "permissions": {
+    "deny": [
+      "EnterWorktree",
+      "ExitWorktree"
+    ]
+  },
+
+  "_baseRef": "Not covered by the deny above: subagent worktree isolation still creates trees, and 'fresh' — the default — branches them from origin/<default-branch>. Measured 2026-08-21: origin/master was f2f9bd5 and local master was 12a1e4e, 207 commits ahead, last fetch two days earlier. So the default would hand an agent a clean tree of last week's code and say nothing. 'head' is the only correct reading here.",
+  "worktree": {
+    "baseRef": "head"
   }
 }
