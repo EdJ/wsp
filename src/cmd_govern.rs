@@ -279,6 +279,15 @@ pub fn slots(governors: &BTreeMap<String, Value>) -> Vec<Slot> {
 /// A workspace id is herdr's and means nothing on another host — the same
 /// reason a claim and a mandate each carry one. A seat on another machine is
 /// not a seat you can reach, so it reads as no seat rather than as a wrong one.
+/// The seat on a scope, from the governors record.
+///
+/// The wake path's entry to the same resolution `--tell` takes: a scope names a
+/// post, a post names a workspace and a pane, and only then is there anything
+/// to say a sentence to.
+pub fn seat_of_scope(scope: &str, governors: &BTreeMap<String, Value>) -> Option<Seat> {
+    governors.get(scope).and_then(|rec| seat_of(scope, rec))
+}
+
 fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
     let host = rec.get("host").and_then(Value::as_str).unwrap_or("");
     if !host.is_empty() && host != util::hostname() {

@@ -324,6 +324,13 @@ pub(crate) fn tick(store: &Store, pass: &mut Pass, source: &mut dyn Source, at: 
     // register and in `wsp wip`, `doctor` and the panel.
     save(store, &ledger, pass.ticks);
     deliver(store, &emits);
+    // The third audience, and the one that spends tokens. `deliver` above puts
+    // every edge on the event log for a hook to read at no cost to anybody;
+    // this decides which of them are worth re-invoking a governor for, and
+    // tells the ones that are. See `crate::wake` — and note that it writes its
+    // spool before it attempts anything, because the at-most-once the line
+    // above is content with is not affordable for a reader that is asleep.
+    crate::wake::wake(store, &emits, at);
     emits
 }
 

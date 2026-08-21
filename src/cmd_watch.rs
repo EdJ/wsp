@@ -233,7 +233,7 @@ const HEARTBEAT: i64 = 30 * 60;
 /// delivered to a person for free. None of it is time-critical by construction.
 /// Escalation is not a delivery deadline; it is a bound on how long this can be
 /// silent, which is the one thing `core-014` will not allow to be unbounded.
-const DEFER_MAX: i64 = 4 * 60 * 60;
+pub(crate) const DEFER_MAX: i64 = 4 * 60 * 60;
 
 /// How stale a register entry may be before `doctor` calls it dead: three ticks
 /// plus slack. Three rather than one because a tick that ran long is not a
@@ -772,6 +772,16 @@ impl Spool {
     /// When the oldest thing here happened, which is what escalation reads.
     pub(crate) fn oldest(&self) -> Option<i64> {
         self.held.first().map(|h| h.at)
+    }
+
+    /// Hold this, whatever the table would have said about it.
+    ///
+    /// For a caller that writes the record down **before** anything is
+    /// attempted rather than after — `crate::wake`, where the pass has already
+    /// saved its ledger and at-most-once is not affordable. The table still
+    /// decides when the spool leaves: that is [`Spool::owed`].
+    pub(crate) fn put(&mut self, at: i64, line: Line) {
+        self.held.push(Spooled::of(at, line));
     }
 
     /// Everything held, in the order it happened — **taken, not copied**.
@@ -2368,6 +2378,25 @@ pub(crate) struct Registered {
     /// from; this is cheaper, it travels to another machine's records, and it
     /// is the same field [`resume`] already needed.
     pub(crate) build: String,
+    /// A seat's wake record rather than a watcher's — `crate::wake`.
+    ///
+    /// It describes what the daemon owes a governor, so almost every other
+    /// field here means nothing about it: there is no process, no interval and
+    /// no ledger. Only the two counts are its own, and they are the answer to
+    /// *what has this told somebody, and what is it still holding*.
+    pub(crate) wake: bool,
+    /// How many lines this seat has actually been told, since the record was
+    /// made. Delivery, not attempts — see `crate::wake::Tell`.
+    pub(crate) delivered: usize,
+    /// Why it is still holding what it is holding, in the words the wake path
+    /// wrote. Empty when it holds nothing.
+    ///
+    /// **Three of the reasons are faults and one is the design**, and a record
+    /// that could not tell them apart cost an hour on the day this was written:
+    /// a wake sitting at `0 delivered · holding 2` reads identically whether
+    /// nobody holds the seat, the agent is mid-turn, or the table has simply
+    /// not judged anything worth a context read.
+    pub(crate) holding: String,
     /// How many facts this watch is holding for its reader — see [`Spool`].
     ///
     /// A watcher that has decided not to wake somebody is a watcher with
@@ -2444,6 +2473,9 @@ pub(crate) fn registered(store: &Store) -> Vec<Registered> {
             daemon: v.get("daemon").and_then(Value::as_bool).unwrap_or(false),
             build: v.get("build").and_then(Value::as_str).unwrap_or_default().to_string(),
             spooled: v.get("spool").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+            wake: v.get("wake").and_then(Value::as_bool).unwrap_or(false),
+            delivered: v.get("delivered").and_then(Value::as_u64).unwrap_or(0) as usize,
+            holding: v.get("holding").and_then(Value::as_str).unwrap_or_default().to_string(),
         })
         .collect()
 }
@@ -2686,7 +2718,7 @@ fn heartbeat(spec: &Spec, standing: usize, owes: bool, since: i64) -> Line {
 /// so its output is byte-for-byte what it was before this existed: a person in
 /// front of a stream wants the heartbeat, and `core-014` d2 traded that away
 /// only for the reader that is asleep.
-struct Stream<'a, S: Sink = Stdout> {
+pub(crate) struct Stream<'a, S: Sink = Stdout> {
     spec: &'a Spec,
     p: Paint,
     /// Where a written line actually goes — see [`Sink`].
@@ -2699,7 +2731,7 @@ struct Stream<'a, S: Sink = Stdout> {
 }
 
 impl<'a, S: Sink> Stream<'a, S> {
-    fn new(spec: &'a Spec, sink: S) -> Stream<'a, S> {
+    pub(crate) fn new(spec: &'a Spec, sink: S) -> Stream<'a, S> {
         Stream { spec, p: Paint::new(), sink, hot: Vec::new(), cold: Vec::new() }
     }
 
@@ -2741,7 +2773,7 @@ impl<'a, S: Sink> Stream<'a, S> {
     /// is this row's whole claim — see
     /// [`the_measured_session_is_replayed_and_the_wake_count_is_counted`] —
     /// and a claim nothing can count is an estimate.
-    fn tick(&mut self, at: i64, spool: &mut Spool) -> Vec<Spooled> {
+    pub(crate) fn tick(&mut self, at: i64, spool: &mut Spool) -> Vec<Spooled> {
         spool.held.append(&mut self.cold);
         // Escalation. Without it a fleet that never earns a wake never delivers
         // its backlog, and the drop is back in through the door — so a spooled
@@ -2827,11 +2859,20 @@ impl<'a, S: Sink> Stream<'a, S> {
 /// version of [`Stream::tick`] shipped a drop with a test suite that could not
 /// see it. `core-021` is the second implementation, where the far end is a pane
 /// whose turn may be in flight and a refusal is an ordinary Tuesday.
-trait Sink {
+pub(crate) trait Sink {
     /// Write these, and say whether they **arrived** — never whether a send was
     /// attempted. Everything downstream of this answer depends on the
     /// difference: it is what an entry clears on.
     fn deliver(&mut self, said: &[String]) -> bool;
+}
+
+/// A borrowed sink is a sink, so a caller that needs to read something back off
+/// its own — whether the last delivery arrived, which is what the spool clears
+/// on — can keep it and lend it. See `crate::wake::Tell`.
+impl<S: Sink + ?Sized> Sink for &mut S {
+    fn deliver(&mut self, said: &[String]) -> bool {
+        (**self).deliver(said)
+    }
 }
 
 /// The one that ships.
@@ -2841,7 +2882,7 @@ trait Sink {
 /// long the fleet stays quiet, which on a quiet night is the whole night — so
 /// the flush is not housekeeping, it is the delivery, and its result is the
 /// answer this returns.
-struct Stdout;
+pub(crate) struct Stdout;
 
 impl Sink for Stdout {
     fn deliver(&mut self, said: &[String]) -> bool {
@@ -2945,7 +2986,7 @@ fn duration(s: &str) -> Option<i64> {
 }
 
 /// Everything a run of the verb was asked for.
-struct Spec {
+pub(crate) struct Spec {
     scope: Scope,
     want: BTreeSet<Kind>,
     about: Option<String>,
@@ -2965,6 +3006,36 @@ struct Spec {
     /// How old a spooled fact may get before it is a wake on its own. See
     /// [`DEFER_MAX`].
     defer_max: i64,
+}
+
+impl Spec {
+    /// The subscription a **told** wake is: that seat's scope, under `--wake`,
+    /// in prose.
+    ///
+    /// A `Spec` is the description of a subscription, and a wake delivered to a
+    /// governor is one — to exactly what `cmd_govern::seat_for` addresses there.
+    /// So the wake path builds one rather than growing a second vocabulary for
+    /// the same four questions [`Stream`] asks: which mode, which document, who
+    /// it is for, and how long a fact may wait.
+    ///
+    /// `json: false` because the far end is an agent reading prose, not a pipe;
+    /// the classes and the columns are what a person or a monitor reads off
+    /// stdout, and this path has no stdout.
+    pub(crate) fn for_wake(scope: &str) -> Spec {
+        Spec {
+            scope: Scope { name: scope.to_string(), seated: true, workspace: String::new(), pane: String::new(), all: false },
+            want: Kind::every().into_iter().collect(),
+            about: None,
+            every: EVERY,
+            settle: SETTLE,
+            heartbeat: i64::MAX,
+            stop_after: None,
+            until: None,
+            json: false,
+            wake: true,
+            defer_max: DEFER_MAX,
+        }
+    }
 }
 
 /// argv, split into the scope it names and the signals it subscribes to.
@@ -3593,7 +3664,8 @@ fn status(store: &Store, args: &Args) -> i32 {
             serde_json::to_string_pretty(&watches
                 .iter()
                 .map(|w| json!({ "key": w.key, "scope": w.scope, "pid": w.pid, "tick": w.tick, "stale": w.stale(), "watching": w.watching(),
-                                 "build": w.build, "stale_build": w.stale_build(), "spooled": w.spooled }))
+                                 "build": w.build, "stale_build": w.stale_build(), "spooled": w.spooled,
+                                 "wake": w.wake, "delivered": w.delivered, "holding": w.holding }))
                 .collect::<Vec<_>>())
             .unwrap_or_default()
         );
@@ -3606,6 +3678,23 @@ fn status(store: &Store, args: &Args) -> i32 {
     }
     let live = crate::place_super::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     for w in &watches {
+        // A seat's wake record answers a different question from a watcher's,
+        // so it gets a different sentence rather than a watcher's sentence with
+        // the interesting half missing. `core-021` check 5: a delivery path
+        // nobody can inspect is the seventh way silence lies.
+        if w.wake {
+            println!(
+                "{}  {}  {}  {}",
+                p.bold(&util::pad(&w.scope, 12)),
+                p.dim(&util::pad("wake", 10)),
+                p.dim(&util::pad(&format!("told {} ago", util::duration_human(util::since(&w.tick))), 22)),
+                match w.spooled {
+                    0 => p.dim(&format!("{} delivered · holding nothing", w.delivered)),
+                    n => p.dim(&format!("{} delivered · holding {n} — {}", w.delivered, w.holding)),
+                }
+            );
+            continue;
+        }
         let dead = w.watching() && !live.contains(&w.pid);
         let note = match (dead, w.stale(), w.watching()) {
             (true, _, _) => p.red("the process is gone"),
@@ -4238,6 +4327,9 @@ mod tests {
             daemon: false,
             build: crate::build_stamp(),
             spooled: 0,
+            wake: false,
+            delivered: 0,
+            holding: String::new(),
         };
         assert!(!pull.watching());
         assert!(!pull.stale(), "a day old and still not a fault: nobody promised to tick");
@@ -4256,6 +4348,9 @@ mod tests {
             daemon,
             build: build.into(),
             spooled: 0,
+            wake: false,
+            delivered: 0,
+            holding: String::new(),
         }
     }
 
@@ -4397,6 +4492,9 @@ mod tests {
                 daemon: false,
                 build: crate::build_stamp(),
                 spooled: 0,
+                wake: false,
+                delivered: 0,
+                holding: String::new(),
             };
             r.tick = util::iso_at(util::epoch_secs() - ago);
             r

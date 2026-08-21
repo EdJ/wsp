@@ -317,6 +317,31 @@ pub trait Kind {
     /// offers, and typing at a terminal is only the fallback.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery>;
 
+    /// Whether a sentence delivered to this kind lands in a queue that belongs
+    /// to the **agent** rather than to wsp.
+    ///
+    /// True by default, because the default delivery is [`crate::place::Place::tell`]
+    /// — herdr typing at a pane — and what receives it is whatever the agent
+    /// does with a prompt that arrives mid-turn. Driven against a real Claude
+    /// Code on 2026-08-21 (`core-021` d2): it *queues* it and answers it at the
+    /// turn boundary, and nothing is typed at a live composer. So this is not
+    /// about corruption.
+    ///
+    /// It is about **durability**. That queue lives in the agent, so a wake
+    /// handed to it and then `/clear`ed, restarted or killed is a wake wsp has
+    /// recorded as delivered and nobody ever read — a silent drop with wsp's
+    /// name on it, which is the one thing `core-017` forbids. `crate::wake`
+    /// holds a wake until the turn ends for that reason and no other, which
+    /// costs a wake ninety seconds.
+    ///
+    /// A kind whose transport carries a queue of its own — opencode's ACP
+    /// server, `core-020` — answers false and does not pay for a turn boundary
+    /// its transport does not have. Nothing overrides it yet, and the sentence
+    /// this is written in is what the first one to do so has to disagree with.
+    fn queue_is_the_agents(&self) -> bool {
+        true
+    }
+
     /// Whether the agent wsp started here is running, as its **own** runtime
     /// sees it — `None` where the kind has no runtime to ask.
     ///

@@ -28,6 +28,7 @@ mod cmd_spawn;
 mod cmd_task;
 mod cmd_verify;
 mod cmd_watch;
+mod wake;
 mod cmd_worklist;
 mod daemon;
 mod detail;
