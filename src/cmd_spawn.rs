@@ -143,11 +143,25 @@ pub fn work_order(subject: &str, how: Handover) -> String {
 ///
 /// A pure function of what `spawn` resolved, so what an agent is handed can be
 /// asserted without a backend to hand it to.
-fn order(work: &Work, cwd: Option<&str>, on: Option<&str>, show: bool) -> Order {
+fn order(
+    work: &Work,
+    cwd: Option<&str>,
+    on: Option<&str>,
+    show: bool,
+    extra: BTreeMap<String, String>,
+) -> Order {
+    let mut env = seat_env(work.project.as_deref(), work.task.as_deref());
+    // The kind's own, last, so a runtime that needs configuring gets it and
+    // every other seat is byte-for-byte what it was. It goes on the *seat*
+    // rather than on the agent's command line because that is where a runtime
+    // reads its configuration from, and it is passed in rather than looked up
+    // because this function must not learn what a kind is — the argument is on
+    // `agent_commands::Kind::env`.
+    env.extend(extra);
     Order {
         label: work.label.clone(),
         cwd: cwd.map(|c| c.to_string()),
-        env: seat_env(work.project.as_deref(), work.task.as_deref()),
+        env,
         on: on.map(|m| m.to_string()),
         show,
     }
@@ -971,7 +985,19 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // line's doing: herdr's `workspace.created` runs wsp's own plugin hook, the
     // hook installs the panel, and the `pane.swap` it needs focuses with no way
     // to decline. See `panel::install::install_one` and `fork-002`.
-    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"));
+    // Only where an agent is actually going to be started. `--kind` on a bare
+    // workspace names nothing that will run, and configuring a runtime nobody
+    // is launching would be a variable in a shell somebody else is using.
+    // `--govern` reads the same way it does where the slot is taken below: a
+    // custodial spawn starts an agent too, and it is the one case where there
+    // is no `--agent` flag to look at.
+    let will_start = args.has("agent")
+        || (args.has("govern") && (work.list.is_some() || work.project.is_some()));
+    let seat_extra = match will_start {
+        true => agent_commands::of(&kind).env(),
+        false => BTreeMap::new(),
+    };
+    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), seat_extra);
     let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
@@ -1065,6 +1091,51 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             .or_else(|| work.project.clone())
             .unwrap_or_default();
         let how = agent_commands::of(&kind);
+        // The work order, decided *before* the agent starts rather than after
+        // it is listening. It used to be computed below, next to the sentence
+        // that delivers it, which was right while every kind was told; a kind
+        // that takes its order in argv needs it in hand at `args` time. What
+        // decides it has not changed and is still nothing about the backend:
+        //
+        // A task gives an agent something to be told, and so — since
+        // robustness-048 — does a project it is being made custodian of. A bare
+        // project workspace is still what the line here used to say of all of
+        // them: a place to work rather than an instruction, with `f` in the
+        // panel the key that turns one into the other. What changed is that
+        // `--govern` is an instruction, and it is the custodial one.
+        let order = match (&work.task, &governing) {
+            // Spawned, but only a kind whose sessions arrive briefed is told
+            // its brief is above it. For every other kind that sentence is
+            // false and the agent has no way to find out what it is holding —
+            // `Handover::Running` is the wording for exactly that situation and
+            // it already exists. See `agent_commands::Kind::briefed`.
+            (Some(t), _) => Some(work_order(
+                t,
+                match how.briefed() {
+                    true => Handover::Spawned,
+                    false => Handover::Running,
+                },
+            )),
+            (None, Some(p)) => Some(match how.briefed() {
+                true => work_order(p, Handover::Custodian),
+                // The custodial order says what the seat is for and assumes the
+                // brief beneath it, so an unbriefed custodian needs the same
+                // fetch a claimant does. Prepended rather than woven in: the
+                // custodial sentence is a job description and this is one
+                // instruction before it, which is the fourth case
+                // `Handover`'s docs said would have to fetch.
+                false => format!(
+                    "Please run `wsp brief --session` first — your context is empty and \
+                     nothing has been read to you. {}",
+                    work_order(p, Handover::Custodian)
+                ),
+            }),
+            (None, None) => None,
+        };
+        // Only for a kind that takes it that way. Handing it to every kind's
+        // `args` would put the whole work order on Claude Code's command line,
+        // where nothing reads it and every byte of it is visible in `ps`.
+        let in_args = how.order_in_args();
         // The seat is passed in because the agent is named after it, and it can
         // be passed in because `open` has happened above: the port splits opening
         // a seat from starting an agent in it, so wsp holds the seat before
@@ -1076,6 +1147,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             seat: &seat,
             model: model.as_deref(),
             effort: effort.as_deref(),
+            order: match in_args {
+                true => order.as_deref(),
+                false => None,
+            },
             resume: None,
         };
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
@@ -1094,24 +1169,29 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 // instruction, with `f` in the panel the key that turns one
                 // into the other. What changed is that `--govern` is an
                 // instruction, and it is the custodial one.
-                let order = match (&work.task, &governing) {
-                    (Some(t), _) => Some(work_order(t, Handover::Spawned)),
-                    (None, Some(p)) => Some(work_order(p, Handover::Custodian)),
-                    (None, None) => None,
-                };
-                if let Some(text) = order {
+                if let Some(text) = &order {
                     ordered = true;
-                    // Through the kind rather than through the port. Readiness
-                    // is established above, and *how* a sentence reaches an
-                    // agent of this kind — its own channel, or the backend
-                    // typing at it — is the one decision this file must not
-                    // make; see `agent_commands`.
-                    match hand_over(place, how, &spawn, &text, &Patience::default()) {
-                        Ok(()) => told = true,
-                        Err(e) => {
-                            eprintln!("wsp: agent started but not working on it: {e}");
-                            unreached(how, place, &spawn);
-                        }
+                    match in_args {
+                        // Already delivered: it went out on the command line
+                        // with the agent, so there is nothing to send and a
+                        // send would say it twice. The turn it starts is the
+                        // agent's own doing and wsp has no submit to press, so
+                        // there is nothing here to confirm either — which is
+                        // the point of argv rather than a gap in it. See
+                        // `agent_commands::Kind::order_in_args`.
+                        true => told = true,
+                        // Through the kind rather than through the port.
+                        // Readiness is established above, and *how* a sentence
+                        // reaches an agent of this kind — its own channel, or
+                        // the backend typing at it — is the one decision this
+                        // file must not make; see `agent_commands`.
+                        false => match hand_over(place, how, &spawn, text, &Patience::default()) {
+                            Ok(()) => told = true,
+                            Err(e) => {
+                                eprintln!("wsp: agent started but not working on it: {e}");
+                                unreached(how, place, &spawn);
+                            }
+                        },
                     }
                 }
             }
@@ -1782,7 +1862,7 @@ mod tests {
             label: "robustness/004 · a title".into(),
             list: None,
         };
-        let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false);
+        let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false, BTreeMap::new());
         assert_eq!(o.label, "robustness/004 · a title");
         assert_eq!(o.cwd.as_deref(), Some("~/claude/wsp"), "expanded by the backend, not here");
         assert_eq!(o.on.as_deref(), Some("mb2"));
@@ -1797,7 +1877,7 @@ mod tests {
         // empty string somebody downstream has to test for.
         let proj =
             Work { task: None, project: Some("robustness".into()), label: "robustness".into(), list: None };
-        let o = order(&proj, None, None, true);
+        let o = order(&proj, None, None, true, BTreeMap::new());
         assert!(o.env.get("WSP_TASK").is_none());
         assert!(o.on.is_none());
         assert!(o.show);
@@ -1815,7 +1895,7 @@ mod tests {
     #[test]
     fn a_spawned_agent_is_not_handed_the_spawning_session() {
         let work = Work { task: None, project: None, label: "probe".into(), list: None };
-        let o = order(&work, None, None, false);
+        let o = order(&work, None, None, false, BTreeMap::new());
         assert_eq!(
             o.env.get(crate::place::CHILD_MARKER).map(String::as_str),
             Some(""),
@@ -2044,7 +2124,7 @@ mod tests {
         clock: &util::Dial,
     ) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, name: "t-260817-010", seat, model: None, effort: None, resume: None };
+            agent_commands::Spawn { full: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None };
         // The retry fields come from `retrying` because this test is about a
         // single attempt: a literal here would have to be updated every time the
         // retry's numbers move, for a wait that never reads them.
@@ -2123,7 +2203,7 @@ mod tests {
 
     fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, name: "robustness-080", seat, model: None, effort: None, resume: None };
+            agent_commands::Spawn { full: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None };
         let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
         start_agent(place, how, &spawn, &agent, "claude", wait)
     }
@@ -2410,6 +2490,7 @@ mod tests {
             seat: &seat,
             model: None,
             effort: None,
+            order: None,
             resume: None,
         };
         // The retry fields come from `retrying` because this test is about a

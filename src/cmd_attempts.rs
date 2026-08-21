@@ -150,7 +150,22 @@ impl Attempt {
 /// asked for, and the effort agrees exactly — `default` agreeing with anything,
 /// since it is the record of a half that was never stated.
 fn agrees(spawned: &str, ran: &str) -> bool {
-    let split = |s: &str| match s.split_once('/') {
+    // **From the last `/` and not the first**, which matters the moment a kind
+    // has model names with slashes in them. opencode spells a model
+    // `provider/model` — `opencode/x-preview-f-free` — so `spawned at` writes
+    // `opencode/x-preview-f-free/default` and splitting at the first separator
+    // reads the *provider* as the model and the rest as an effort. The effort
+    // is always the last segment, so this is the correct reading of the format
+    // rather than an accommodation of one kind, and it is identical to what
+    // splitting at the first did for every label already on record: `opus[1m]`
+    // and `opus-5/high` both parse the same either way.
+    //
+    // The one shape that would still be ambiguous is a [`crate::agent_commands::Ran`]
+    // whose model contains a slash and which states no effort — `label` omits
+    // the half when there is none. Nothing produces one today, and a kind that
+    // could must state `default` rather than omit it; see `core-029`, which is
+    // where opencode's `ran` is read.
+    let split = |s: &str| match s.rsplit_once('/') {
         Some((m, e)) => (m.to_string(), e.to_string()),
         None => (s.to_string(), String::new()),
     };
@@ -538,6 +553,29 @@ mod tests {
             Row(a[0].clone()).tier(),
             "opus-5/high · asked haiku/high",
             "a tier asked for and not delivered is the row worth seeing"
+        );
+    }
+
+    /// A model name with a separator in it is not a corner case: it is how the
+    /// second kind wsp knows spells every model it has.
+    #[test]
+    fn a_model_named_provider_slash_model_is_not_read_as_a_provider_at_default_effort() {
+        let t = task(&[
+            "- 2026-08-21T09:00:00Z claimed by pane w1:p1 · spawned at opencode/x-preview-f-free/default",
+            "- 2026-08-21T09:30:00Z released after 30m",
+        ]);
+        let a = attempts_of(&t);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(
+            Row(a[0].clone()).tier(),
+            "opencode/x-preview-f-free/default",
+            "the whole tier is printed back, whatever is inside the model half"
+        );
+        // The reason this test exists: the effort is the *last* segment, and
+        // reading it as the first made `x-preview-f-free/default` an effort.
+        assert!(
+            agrees("opencode/x-preview-f-free/default", "opencode/x-preview-f-free/default"),
+            "a tier agrees with itself, which splitting at the first separator broke"
         );
     }
 

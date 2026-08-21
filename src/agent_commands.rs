@@ -196,6 +196,7 @@
 //!
 //! `--session-id <uuid>`, the other lead, remains unrun and is now unneeded.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -317,6 +318,91 @@ pub trait Kind {
     /// offers, and typing at a terminal is only the fallback.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery>;
 
+    /// Whether a session of this kind arrives with its wsp brief already in
+    /// context.
+    ///
+    /// **`false` by default, because the brief is delivered by a hook only
+    /// Claude Code runs.** `claude-code/settings.snippet.json` wires
+    /// `wsp-session.sh` into Claude Code's own settings file under
+    /// `SessionStart`, and nothing else in wsp installs anything anywhere: a
+    /// `codex`, a `gemini` or an `opencode` starts with an empty context
+    /// whatever wsp has recorded.
+    ///
+    /// It exists because [`crate::cmd_spawn::work_order`] tells a spawned agent
+    /// *"Your brief is already above"*, and for those kinds that is simply
+    /// untrue. Driven on 2026-08-21: an opencode spawned with the order in argv
+    /// received it, went looking for context with `git status`, and answered
+    /// *"I do not want to invent a task for oc2-001, so could you paste the
+    /// brief directly"*. The order arrived perfectly and could not be acted on.
+    ///
+    /// `Handover::Running` is already the wording for an agent whose session
+    /// began before its claim, and that is exactly this agent's situation, so
+    /// what this selects is an existing sentence rather than a new one.
+    ///
+    /// The cost it does not pay for is the round trip: `wsp brief --session` is
+    /// ~3,300 tokens fetched at request 1 rather than sitting in the context
+    /// already. Handing the brief itself to a kind that takes its order in argv
+    /// would close that, and is not done here — the brief would have to be
+    /// composed for a seat that does not exist yet, which is a different piece
+    /// of work from choosing a sentence.
+    fn briefed(&self) -> bool {
+        false
+    }
+
+    /// Whether this kind is handed its work order in argv, rather than being
+    /// told it once it is listening.
+    ///
+    /// `false` for every kind but one, and the exception was measured rather
+    /// than designed. `core-026` drove `--kind opencode` end to end three
+    /// times and the work order failed to arrive all three: opencode's TUI
+    /// refuses typed input for **~2s after herdr's `agent.start` returns and
+    /// reports `interactive_ready`**, and text sent inside that window is
+    /// *discarded* — the composer is empty afterwards, not holding an unsent
+    /// sentence. Sweep of two runs × four delays, start→prompt: 0s and 1s
+    /// dropped, 2s and 4s landed.
+    ///
+    /// **That it is discarded rather than left sitting is what makes argv the
+    /// fix.** [`crate::cmd_spawn`]'s rescue for a work order that did not start
+    /// a turn is to press submit again, and there is nothing to submit; no
+    /// number of nudges recovers a sentence the composer never took. Waiting
+    /// longer would work and is the wrong shape — it makes every spawn pay for
+    /// one kind's startup, and it is a race wsp would be tuning against a
+    /// version number it does not control.
+    ///
+    /// A kind answering `true` promises that [`Kind::args`] puts
+    /// [`Spawn::order`] on the command line, so `cmd_spawn` must **not** also
+    /// tell it: the sentence is already delivered and telling would say it
+    /// twice. What that costs is the one thing argv cannot do — a work order
+    /// for an agent that is already running — and nothing wants that here,
+    /// because an agent already running is `Handover::Running`'s case and is
+    /// reached through [`Kind::tell`] like everything else.
+    fn order_in_args(&self) -> bool {
+        false
+    }
+
+    /// What this kind's seat needs in its environment, beyond what every seat
+    /// gets from [`crate::cmd_spawn::seat_env`].
+    ///
+    /// Empty for every kind that needs nothing, which is all of them but one.
+    /// It is here rather than in `cmd_spawn` for the reason [`TRIM`] is here:
+    /// the names and the JSON in it are one runtime's spelling, and a module
+    /// about placing work should not know them.
+    ///
+    /// **Why an environment variable and not a file**, since the obvious
+    /// reading of `core-020` d1 is a config file in the worktree. Measured:
+    /// `cmd_checkout::dirty` asks git with `--untracked-files=all`, so a file
+    /// wsp writes into a working tree makes that tree permanently dirty — every
+    /// opencode worktree would refuse `wsp checkout --rm`, be skipped by
+    /// `--sweep`, and be kept by `wsp despawn` with "uncommitted work in it".
+    /// It would also collide with a repository that ships an `opencode.json` of
+    /// its own, and overwriting one is not wsp's to do. The environment carries
+    /// exactly the same config — verified against `opencode debug config`, which
+    /// resolves the two routes identically — and leaves nothing behind to clean
+    /// up.
+    fn env(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
     /// Whether a sentence delivered to this kind lands in a queue that belongs
     /// to the **agent** rather than to wsp.
     ///
@@ -424,6 +510,16 @@ pub struct Spawn<'a> {
     /// How hard, of [`EFFORTS`] — the cheaper knob and the one to reach for
     /// first, being the same capability class for less spend.
     pub effort: Option<&'a str>,
+    /// The work order this agent is being started to act on, for a kind that
+    /// takes one **in argv** rather than by being told it afterwards.
+    ///
+    /// `None` everywhere else, and that is not a default so much as the whole
+    /// distinction: [`Claude`] is handed its order by [`Kind::tell`] once it is
+    /// listening, and reads this field never. It exists because measuring
+    /// `--kind opencode` end to end (`core-026`) found that being told is not
+    /// reliable for every kind — see [`Kind::order_in_args`] for what was
+    /// measured and why argv is the fix rather than a longer wait.
+    pub order: Option<&'a str>,
     /// A session to pick up where it left off, rather than a new one.
     ///
     /// render-061 above, arriving as `render-061`: the id is wsp's — read off
@@ -469,6 +565,7 @@ pub fn mint(name: &str, seat: &Seat) -> Option<String> {
 pub fn of(kind: &str) -> &'static dyn Kind {
     match kind.trim() {
         "claude" => &Claude,
+        "opencode" => &OpenCode,
         _ => &Plain,
     }
 }
@@ -519,6 +616,242 @@ impl Kind for Plain {
     /// whose sessions it has no business labelling with one — the record stays
     /// empty rather than being filled in with the default it would have
     /// guessed.
+    fn ran(&self, _session: &str, _cwd: &str) -> Option<Ran> {
+        None
+    }
+}
+
+/// opencode.
+///
+/// The second kind wsp knows by name, and the first that can be *chosen* — see
+/// `core-020`, whose point is balancing model usage and which cannot begin until
+/// wsp can say which model. Everything here was measured against opencode
+/// 1.18.20/1.18.21 in a sandbox herdr rather than read off `--help`; `core-026`
+/// holds the driving and `core-027` the decisions.
+///
+/// What it deliberately does **not** implement is [`Kind::ran`] and
+/// [`Kind::running`], which stay [`Plain`]'s answer of nothing. `opencode
+/// export <session>` is a rich record — per-message `providerID`, `modelID` and
+/// token counts — and reading it is `core-029`, whose whole job is making the
+/// cost comparable. Half a reader here would be a column that looks like
+/// `Claude`'s and is not.
+pub struct OpenCode;
+
+/// What a wsp-spawned opencode is configured with, as the JSON that
+/// [`Kind::env`] hands it.
+///
+/// **This is `core-020` d1 and it is a policy rather than a default.** opencode
+/// ships allowing `bash` and `edit` outright: driving one in `core-026`, it ran
+/// a shell command and wrote a file without asking anything. herdr's detection
+/// for the blocked state is correct and fires the moment something asks — but in
+/// the shipped configuration nothing ever asks, so `needs_a_person` is
+/// unreachable, and a kind whose only brake can never engage is a kind that
+/// cannot be given unattended work.
+///
+/// The price is accepted deliberately and is not small: more stalls, and each
+/// one wants a person. That is the trade Ed made, and the alternative — an agent
+/// that cannot be stopped and cannot ask — is the one thing `core-017` and the
+/// whole attention path exist to prevent.
+///
+/// Scoped to the seat and not to the machine. Ed's own opencode is untouched by
+/// this, which is the other half of the decision: wsp configures the agents it
+/// starts and nothing else.
+const PERMISSION: &str = r#"{"permission":{"bash":"ask","edit":"ask"}}"#;
+
+/// Where the model catalogue comes from, and the shape a model name has.
+///
+/// `provider/model` — `opencode models` prints one per line and there were
+/// **365 of them on this machine**, which is the whole argument against a list
+/// compiled into wsp. It is not a vocabulary of four words that a person learns
+/// once; it is a per-machine fact about which providers are configured and
+/// authenticated, and a copy kept here would be stale on the day it was written
+/// and wrong on any machine but one. `place.rs` refuses to keep a catalogue of
+/// kinds for exactly this reason and this is the same refusal one level down.
+fn opencode_models() -> std::result::Result<Vec<String>, String> {
+    let out = Command::new(opencode_bin())
+        .arg("models")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("opencode models: {e}"))?;
+    if !out.status.success() {
+        return Err("opencode models failed".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| l.contains('/'))
+        .collect())
+}
+
+/// opencode, wherever it is — the same reasoning as [`claude_bin`], and one
+/// extra reason of its own.
+///
+/// `~/.opencode/bin` reached `PATH` through `.zshrc`, which a **non-interactive**
+/// shell does not read, so `Command::new("opencode")` failed from a hook or a
+/// script on a machine that plainly had it. That was fixed at the source by
+/// moving the export to `~/.zshenv` on 2026-08-21, and this stays anyway: the
+/// lookup costs nothing and the failure it prevents reads as "opencode is not
+/// installed" on a machine where it is.
+fn opencode_bin() -> PathBuf {
+    if let Some(v) = std::env::var_os("OPENCODE_BIN") {
+        let p = PathBuf::from(v);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join("opencode");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    util::home().join(".opencode/bin/opencode")
+}
+
+impl Kind for OpenCode {
+    /// The model, the session, and the work order.
+    ///
+    /// No trim and no handle. There is nothing to trim — opencode has no
+    /// equivalent of Claude Code's tool and MCP preamble to shed — and nothing
+    /// to name it with: [`Kind::address`] is `None` here, so a handle would be a
+    /// string wsp mints and can never use.
+    ///
+    /// `--session` rather than `--resume`, which is the flag spelling that made
+    /// `core-026`'s finding D worth a row of its own: resuming an opencode
+    /// through `Claude::args` would hand it `--resume`, and opencode does not
+    /// have that flag. This is where knowing the kind pays for itself.
+    ///
+    /// `--prompt` last, and it is the reason [`Kind::order_in_args`] exists. See
+    /// there for the measurement; what matters here is that the order is a
+    /// **single argv element** and is therefore safe for the prose a work order
+    /// actually is. Verified rather than hoped: a prompt containing backticks
+    /// and `$(…)` was passed through herdr's `agent.start` and arrived intact,
+    /// with nothing executed — herdr does not put these through a shell.
+    fn args(&self, spawn: &Spawn) -> Vec<String> {
+        let mut argv: Vec<String> = Vec::new();
+        if let Some(model) = spawn.model {
+            argv.push("--model".into());
+            argv.push(model.to_string());
+        }
+        if let Some(session) = spawn.resume {
+            argv.push("--session".into());
+            argv.push(session.to_string());
+        }
+        if let Some(order) = spawn.order {
+            argv.push("--prompt".into());
+            argv.push(order.to_string());
+        }
+        argv
+    }
+
+    /// A `provider/model` this machine can actually serve, and no effort at all.
+    ///
+    /// **`--effort` is refused rather than dropped**, which is [`Plain::tier`]'s
+    /// rule kept rather than weakened: opencode has no effort concept, so a flag
+    /// accepted here would be a spawn that says it is running at `max` and is
+    /// not. The refusal names the one knob this kind does have, because a person
+    /// who typed `--effort` was reaching for a cheaper run and `--model` is how
+    /// they get one.
+    ///
+    /// **The model is checked in two stages, cheapest first.** The shape check
+    /// is free and catches the likeliest mistake by a distance — typing
+    /// `--model opus`, which is wsp's own vocabulary and means nothing here. Only
+    /// a name that is at least shaped like a model costs the catalogue lookup.
+    ///
+    /// **On not mapping `opus|sonnet|haiku` onto this kind.** It was a real
+    /// choice and this is the argument, because the next person will ask. wsp's
+    /// four words are Claude Code's aliases; the set they would have to map onto
+    /// is 365 entries that differ per machine with which providers are
+    /// configured and authenticated. A mapping compiled into wsp would claim
+    /// `opus` means `anthropic/claude-opus-5` on a machine where the `anthropic`
+    /// provider is not set up at all — a spawn stating a tier it is not running,
+    /// which is the exact defect [`Plain::tier`]'s refusal exists to prevent,
+    /// reintroduced with more steps. So: no mapping, `provider/model` only, and
+    /// the refusal says where the real names come from.
+    ///
+    /// **The lookup shells out and that costs ~2s**, measured over three runs.
+    /// It is paid only when `--model` is stated — a spawn that names no tier
+    /// makes no subprocess and is byte-for-byte the spawn wsp did before — and it
+    /// is paid *before* [`crate::place::Place::open`], which is the placement
+    /// `cmd_spawn::tier` already requires: two seconds against a workspace, a
+    /// claim and a worktree that would otherwise have to be despawned is not a
+    /// close call.
+    ///
+    /// **`--on <machine>` is the known gap.** The catalogue read here is this
+    /// machine's, and a far machine's providers are its own. That is the same
+    /// asymmetry `cmd_spawn::tier` already records for `--model` generally — the
+    /// flag states the tier and cannot guarantee it — and the refusal says so
+    /// rather than pretending the answer is authoritative.
+    fn tier(&self, model: Option<&str>, effort: Option<&str>) -> std::result::Result<(), String> {
+        if effort.is_some() {
+            return Err(
+                "opencode has no effort setting — say --model provider/model instead, \
+                 which is the knob this kind has"
+                    .into(),
+            );
+        }
+        let Some(m) = model else { return Ok(()) };
+        if !m.contains('/') {
+            return Err(format!(
+                "no model `{m}` — opencode names models `provider/model`, not by alias. \
+                 `opencode models` lists what this machine can serve"
+            ));
+        }
+        // A catalogue wsp could not read is not a licence to start anything: the
+        // failure this check exists to prevent is an unknown model refused by
+        // the agent in a pane nobody is looking at, and that is exactly as
+        // expensive whether or not the probe worked. Saying which of the two
+        // happened is the difference between a typo and a broken install.
+        let models = opencode_models()
+            .map_err(|e| format!("cannot check `{m}` — {e}. Is opencode installed?"))?;
+        if !models.iter().any(|k| k == m) {
+            return Err(format!(
+                "no model `{m}` on this machine — `opencode models` lists {} of them. \
+                 If this spawn is --on another machine, its providers are its own",
+                models.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`PERMISSION`], which is the whole of it. The argument is on the
+    /// constant and on [`Kind::env`].
+    fn env(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), PERMISSION.to_string())])
+    }
+
+    /// Yes — `--prompt`. The measurement is on [`Kind::order_in_args`].
+    fn order_in_args(&self) -> bool {
+        true
+    }
+
+    /// Nothing, and it is [`Plain`]'s answer for [`Plain`]'s reason: opencode
+    /// has a session id, but herdr is where wsp learns it and only once the
+    /// plugin has reported one. Minting a second name here would be a handle
+    /// wsp cannot address anything with.
+    fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<Address> {
+        None
+    }
+
+    /// Typed at, like [`Plain`]. opencode's ACP server is a real transport and
+    /// whether it is worth holding open is `core-028`, which also holds the one
+    /// thing that would change this: a mid-turn sentence reaches opencode's
+    /// durable session record immediately and is answered at the turn boundary,
+    /// so [`Kind::queue_is_the_agents`] stays true and is not overridden here.
+    fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
+        place.tell(seat, text)
+    }
+
+    /// Nothing to ask. The backend is the only witness, as for [`Plain`].
+    fn running(&self, _spawn: &Spawn) -> Option<bool> {
+        None
+    }
+
+    /// `core-029`'s, and empty until then — see the type docs for why half a
+    /// reader is worse than none.
     fn ran(&self, _session: &str, _cwd: &str) -> Option<Ran> {
         None
     }
@@ -637,6 +970,13 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const NO_AUTO_MODE: &[&str] = &["haiku"];
 
 impl Kind for Claude {
+    /// The one kind that is, and the only one wsp installs a hook for — see
+    /// `claude-code/settings.snippet.json`, which is Claude Code's settings
+    /// file and nobody else's.
+    fn briefed(&self) -> bool {
+        true
+    }
+
     /// The trim, the name, and the tier.
     ///
     /// `-n` is outside the `full` arm on purpose. [`TRIM`] is a capability
@@ -1539,12 +1879,113 @@ mod tests {
     /// ~28K, and a trim that pushes work into Bash costs more than it saves.
     /// A spawn description, so the tests below argue about one thing each.
     fn spawn<'a>(full: bool, name: &'a str, seat: &'a Seat) -> Spawn<'a> {
-        Spawn { full, name, seat, model: None, effort: None, resume: None }
+        Spawn { full, name, seat, model: None, effort: None, order: None, resume: None }
     }
 
     /// The same, at a stated tier.
     fn at<'a>(name: &'a str, seat: &'a Seat, model: Option<&'a str>, effort: Option<&'a str>) -> Spawn<'a> {
         Spawn { model, effort, ..spawn(false, name, seat) }
+    }
+
+    #[test]
+    fn an_opencode_is_started_with_the_model_and_the_work_order_it_was_given() {
+        let seat = Seat::new("w1:p1");
+        let sp = Spawn {
+            model: Some("opencode/x-preview-f-free"),
+            order: Some("You have been claimed onto core-027."),
+            ..spawn(false, "core-027", &seat)
+        };
+        let argv = of("opencode").args(&sp);
+        assert_eq!(
+            argv,
+            vec![
+                "--model",
+                "opencode/x-preview-f-free",
+                "--prompt",
+                "You have been claimed onto core-027."
+            ],
+            "the tier reaches the command line, and so does the order it was started to act on"
+        );
+    }
+
+    #[test]
+    fn an_opencode_work_order_is_one_argument_however_much_prose_is_in_it() {
+        let seat = Seat::new("w1:p1");
+        // The hazard is real and is why prose goes through a file everywhere
+        // else in wsp: a work order is long, and it quotes identifiers.
+        let prose = "read `wsp show core-027` and $(nothing) — then \"begin\"";
+        let sp = Spawn { order: Some(prose), ..spawn(false, "core-027", &seat) };
+        let argv = of("opencode").args(&sp);
+        assert_eq!(argv.len(), 2, "one flag and one value, never a split sentence: {argv:?}");
+        assert_eq!(argv[1], prose, "nothing quoted, escaped or eaten on the way");
+    }
+
+    #[test]
+    fn a_resumed_opencode_is_given_the_flag_opencode_actually_has() {
+        let seat = Seat::new("w1:p1");
+        let sp = Spawn { resume: Some("ses_fdaf7f65cffe"), ..spawn(false, "core-027", &seat) };
+        let argv = of("opencode").args(&sp);
+        assert_eq!(
+            argv,
+            vec!["--session", "ses_fdaf7f65cffe"],
+            "opencode has no --resume; handing it Claude Code's spelling is what core-031 is for"
+        );
+    }
+
+    #[test]
+    fn only_the_kind_wsp_installs_a_hook_for_is_told_its_brief_is_already_there() {
+        assert!(of("claude").briefed(), "claude-code/settings.snippet.json is Claude Code's");
+        assert!(
+            !of("opencode").briefed() && !of("codex").briefed(),
+            "no other kind runs wsp's SessionStart hook, so no other kind arrives briefed"
+        );
+    }
+
+    #[test]
+    fn only_a_kind_that_takes_its_order_in_argv_says_so() {
+        assert!(of("opencode").order_in_args(), "measured: typed input is discarded for ~2s");
+        assert!(!of("claude").order_in_args(), "Claude Code is told, and the trim is not an order");
+        assert!(!of("codex").order_in_args(), "an unmeasured kind claims nothing");
+    }
+
+    #[test]
+    fn a_spawned_opencode_is_configured_to_ask_before_it_acts() {
+        let env = of("opencode").env();
+        let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("the brake is armed on the seat");
+        assert!(cfg.contains("\"bash\":\"ask\""), "core-020 d1: bash asks — {cfg}");
+        assert!(cfg.contains("\"edit\":\"ask\""), "core-020 d1: edit asks — {cfg}");
+        assert!(
+            of("claude").env().is_empty() && of("codex").env().is_empty(),
+            "no other kind's seat changes, which is the compatibility rule everywhere here"
+        );
+    }
+
+    #[test]
+    fn wsps_own_tier_words_are_refused_by_a_kind_that_does_not_speak_them() {
+        // The likeliest mistake by a distance, and it must not cost a
+        // subprocess to catch: `opus` has no `/` and never reaches the lookup.
+        let why = of("opencode").tier(Some("opus"), None).expect_err("an alias is not a model here");
+        assert!(why.contains("provider/model"), "say the shape that would work — {why}");
+        assert!(why.contains("opencode models"), "and where the real names come from — {why}");
+    }
+
+    #[test]
+    fn an_effort_is_refused_for_a_kind_that_has_no_such_setting() {
+        let why = of("opencode").tier(None, Some("high")).expect_err("accepted and dropped is the defect");
+        assert!(
+            why.contains("--model"),
+            "somebody reaching for a cheaper run is told the knob that exists — {why}"
+        );
+    }
+
+    #[test]
+    fn an_opencode_that_states_no_tier_makes_no_subprocess_and_starts_plain() {
+        let seat = Seat::new("w1:p1");
+        assert!(of("opencode").tier(None, None).is_ok(), "no flags, no catalogue, no cost");
+        assert!(
+            of("opencode").args(&spawn(false, "core-027", &seat)).is_empty(),
+            "an unflagged spawn is byte-for-byte the one wsp did before this kind existed"
+        );
     }
 
     #[test]

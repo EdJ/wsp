@@ -681,6 +681,11 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
             seat: &seat,
             model: None,
             effort: None,
+            // A resumed agent is picking up a thread, not being handed a new
+            // piece of work: whatever it was told is already in the session it
+            // is resuming, and saying it again would restate an order it has
+            // already acted on.
+            order: None,
             resume: Some(&t.session),
         };
     let agent = Agent { kind: kind.clone(), name: name.clone(), args: how.args(&spawn) };
