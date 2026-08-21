@@ -418,6 +418,88 @@ impl Kind {
     }
 }
 
+/// What class of line this is — the closed vocabulary a consumer keys on
+/// instead of guessing from prose.
+///
+/// **`worklist-033` is why this is a field and not a shape you can recognise.**
+/// Five distinct kinds of line leave this verb and four of them were written by
+/// [`aside`], which marks all four with one `·`. So a monitor that had to drop
+/// the heartbeat could only key on the heartbeat's *wording*, and the `grep -v`
+/// it wrote ate [`REPLACED`] — a line of the same shape, carrying the one thing
+/// that watch could not afford to lose. The watch then ran eight hours and four
+/// installs on stale logic. The consumer was guessing a class from words, and
+/// the fix is not a better regex at the consumer: the emitter already knew the
+/// answer and never said it.
+///
+/// One word each, spelled the way [`Kind::word`] is and for the same reason —
+/// both readers are counting characters. One of them is a machine matching a
+/// field; the other is a person reading this stream down its second column.
+///
+/// **Closed, and in one place.** These five words exist here and nowhere else.
+/// A class spelled out at a call site would reproduce the defect one layer
+/// down: a sixth kind of line added next year would print a word no consumer's
+/// table has, and nothing here would fail until it mattered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Class {
+    /// The stream starting: scope, interval, standing count. Also what a
+    /// `--now` read and a `--once` prime are — both say where things stand
+    /// before any diff exists, which is what this word means. It is not a
+    /// sixth word for them, because a reader acts on the two identically:
+    /// this is the baseline, and what follows is change against it.
+    Open,
+    /// One edge of news. The only class whose line is a [`Signal`], and so the
+    /// only one whose JSON form is [`Signal::envelope`] rather than
+    /// [`Class::envelope`].
+    News,
+    /// The heartbeat: nothing changed, and this watch is still looking.
+    Beat,
+    /// A new build landed under this watch — see [`REPLACED`]. Its own word
+    /// rather than a loud [`Class::Beat`], because that collision *is*
+    /// `worklist-033`.
+    Replaced,
+    /// The stream ending, and why.
+    Over,
+}
+
+impl Class {
+    /// The word, in the JSON field and in the column a reader scans.
+    pub(crate) fn word(&self) -> &'static str {
+        match self {
+            Class::Open => "open",
+            Class::News => "news",
+            Class::Beat => "beat",
+            Class::Replaced => "replaced",
+            Class::Over => "over",
+        }
+    }
+
+    /// The whole vocabulary, so a reader can be handed it and a test can assert
+    /// it is closed.
+    pub(crate) fn every() -> [Class; 5] {
+        [Class::Open, Class::News, Class::Beat, Class::Replaced, Class::Over]
+    }
+
+    /// The JSON form of a line that is **not** news.
+    ///
+    /// Four fields, asked from here rather than written out at each of the four
+    /// call sites, for the reason [`Signal::envelope`] gives about hooks and
+    /// `--json` being one document: a shape written in four places is four
+    /// things to keep in step, and what this file has paid for repeatedly is a
+    /// word spelled out in a second place drifting from the first.
+    ///
+    /// **No `shape`.** [`crate::message::Shape`] names three things that exist
+    /// in the world — a level, a notification, a question. These four lines are
+    /// none of them; they are the stream talking about itself. The
+    /// `shape: "signal", signal: "watch-over"` the ending used to print was
+    /// this row's own defect wearing the `signal` field: a word that is not in
+    /// [`Kind::word`]'s vocabulary, sitting in the field a consumer reads that
+    /// vocabulary out of. `class` is where it belongs, and a consumer keying on
+    /// `signal == "watch-over"` was keying on prose with extra steps.
+    fn envelope(&self, at: i64, to: &str, text: &str) -> Value {
+        json!({ "class": self.word(), "at": util::iso_at(at), "to": to, "text": text })
+    }
+}
+
 /// One fact that is true now, and worth acting on.
 ///
 /// The *key* — kind plus subject — is what the ledger diffs on, and `detail` is
@@ -601,6 +683,12 @@ impl Signal {
     /// rather than a schema change.
     pub(crate) fn envelope(&self, edge: Edge, to: &str, at: &str) -> Value {
         let mut v = json!({
+            // The class field every line of this stream carries, and the one
+            // value of it that is a signal at all — see [`Class`]. It is here
+            // rather than added by the caller so that the document a hook
+            // receives and the document `--json` prints stay one document,
+            // which is the whole argument of this function.
+            "class": Class::News.word(),
             "shape": crate::message::Shape::Signal.as_str(),
             "signal": self.kind.word(),
             "kind": self.loudness().as_str(),
@@ -2102,13 +2190,92 @@ fn line(e: &Emit, at: i64, p: &Paint) -> String {
     format!("{} {head} {}  {}", p.dim(&clock(at)), p.bold(&e.signal.subject), p.dim(&detail))
 }
 
-/// A line that is not news: the opening, the heartbeat, the ending.
+/// A line that is not news: the opening, the heartbeat, [`REPLACED`], the end.
 ///
-/// Marked with a `·` in the column the signal name would occupy, so a stream
-/// can be read down its second column and the events picked out of it without
-/// reading the words.
-fn aside(at: i64, said: &str, p: &Paint) -> String {
-    format!("{} {} {}", p.dim(&clock(at)), p.dim(&util::pad("·", 14)), p.dim(said))
+/// **The `·` that used to sit here has become the class word.** The column the
+/// signal name occupies was already how this stream is read down its second
+/// column, and the `·` was already saying something there — *not news*. It was
+/// just saying it about four different lines at once, which is the whole of
+/// [`Class`]. The word keeps that reading and adds the distinction the `·` was
+/// hiding, and nothing else moves: same clock, same fourteen-wide column, same
+/// dim. Two seats read this stream by eye and one of them reads it down that
+/// column, so a shifted field costs more than the field is worth.
+fn aside(class: Class, at: i64, said: &str, p: &Paint) -> String {
+    format!("{} {} {}", p.dim(&clock(at)), p.dim(&util::pad(class.word(), 14)), p.dim(said))
+}
+
+/// One line that is not news, in whichever of the two documents is being
+/// written.
+///
+/// **Both of them, always, and that is the second half of this row.** The
+/// opening, the heartbeat and [`REPLACED`] used to be printed under
+/// `if !spec.json`, so a `--json` watcher emitted nothing at all until
+/// something moved — items 1 and 2 of the six ways silence lies, absent for
+/// exactly the reader most likely to be a machine and least able to ask a
+/// person whether its watch is still alive. The gate was never a decision; it
+/// was three call sites that each only knew how to write text.
+///
+/// So there is one emitter and it is unconditional. Leaving a class out of one
+/// of the two documents is now something you would have to do on purpose,
+/// rather than something you get by adding a `println!` next to the others.
+fn note(class: Class, at: i64, spec: &Spec, said: &str, p: &Paint) -> String {
+    match spec.json {
+        true => class.envelope(at, &spec.scope.name, said).to_string(),
+        false => aside(class, at, said, p),
+    }
+}
+
+/// The opening line: what is being watched, how often, and how much is already
+/// up.
+///
+/// Item 1 of the six. A watcher that says nothing at all from the first second
+/// is indistinguishable from one that never started, and the three facts here
+/// are what make the next hour of silence mean something.
+///
+/// A function rather than a `format!` in the loop because it is the line whose
+/// absence under `--json` was failure 1, and a line nothing can construct is a
+/// line nothing can assert on. See
+/// [`a_json_watcher_says_it_started_before_anything_has_happened`].
+fn opening(spec: &Spec, standing: usize, owes: bool, at: i64, p: &Paint) -> String {
+    note(
+        Class::Open,
+        at,
+        spec,
+        &format!(
+            "watching {} · every {} · {} standing · {}{}",
+            spec.scope.name,
+            util::duration_human(spec.every),
+            standing,
+            spec.want.iter().map(|k| k.word()).collect::<Vec<_>>().join(" "),
+            // Only when it is a seat and only at zero — see
+            // [`nothing_addressed`]. On every other line this is the empty
+            // string, so a watch on a project is byte-for-byte what it was.
+            nothing_addressed(&spec.scope, standing, owes).map(|note| format!(" · {note}")).unwrap_or_default()
+        ),
+        p,
+    )
+}
+
+/// The heartbeat.
+///
+/// Item 2 of the six. One line, and it carries the standing count rather than a
+/// pulse, so it is a level read in miniature: `0 standing` is a positive
+/// statement that nothing is wrong, where a bare tick would only be a statement
+/// that the process is alive.
+fn heartbeat(spec: &Spec, standing: usize, owes: bool, at: i64, since: i64, p: &Paint) -> String {
+    note(
+        Class::Beat,
+        at,
+        spec,
+        &format!(
+            "watching {} · {} · {} standing{}",
+            spec.scope.name,
+            util::duration_human(since),
+            standing,
+            nothing_addressed(&spec.scope, standing, owes).map(|note| format!(" · {note}")).unwrap_or_default()
+        ),
+        p,
+    )
 }
 
 /// What `0 standing` means when the scope being watched is a **seat**, said
@@ -2422,24 +2589,26 @@ pub fn watch(store: &Store, args: &Args) -> i32 {
 fn level_read(poll: &mut Poll, spec: &Spec) -> i32 {
     let now = poll.sample();
     let at = util::epoch_secs();
-    let stamp = util::now_iso();
-    if spec.json {
-        for s in &now {
-            println!("{}", s.envelope(Edge::Up, &spec.scope.name, &stamp));
-        }
-        return 0;
-    }
+    let stamp = util::iso_at(at);
     let p = Paint::new();
     if now.is_empty() {
+        // **Under `--json` too**, which it was not. The one call whose whole
+        // point is that it answers *nothing is up* positively answered it with
+        // zero bytes for the reader that cannot tell zero bytes from a binary
+        // that failed to start. [`Class::Open`] is the word because that is
+        // what this read is: the baseline, with no diff behind it.
         let said = match nothing_addressed(&spec.scope, 0, poll.owes_a_run()) {
             Some(note) => format!("nothing is up on {} — read just now · {note}", spec.scope.name),
             None => format!("nothing is up on {} — read just now", spec.scope.name),
         };
-        println!("{}", aside(at, &said, &p));
+        println!("{}", note(Class::Open, at, spec, &said, &p));
         return 0;
     }
     for s in &now {
-        println!("{}", line(&Emit { edge: Edge::Up, to: s.to.clone(), signal: s.clone(), held: 0 }, at, &p));
+        match spec.json {
+            true => println!("{}", s.envelope(Edge::Up, &spec.scope.name, &stamp)),
+            false => println!("{}", line(&Emit { edge: Edge::Up, to: s.to.clone(), signal: s.clone(), held: 0 }, at, &p)),
+        }
     }
     0
 }
@@ -2469,7 +2638,7 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         false => ledger.prime(&now, at),
     };
     say(&emits, at, spec);
-    if !known && !spec.json {
+    if !known {
         // Two reasons to have said nothing, and the reader wants to know which:
         // a first call is a subscription starting, and a re-prime is a tick
         // this caller has genuinely lost.
@@ -2485,7 +2654,7 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
                 ledger.standing()
             ),
         };
-        println!("{}", aside(at, &said, &Paint::new()));
+        println!("{}", note(Class::Open, at, spec, &said, &Paint::new()));
     }
     // pid 0, deliberately: this process is already over. A pull ledger is not a
     // reporter that can die, so it must never read as one — see
@@ -2534,36 +2703,10 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // `exec`s on it, and this cannot. See [`said_replaced`].
     let mut running = util::exe_stamp();
 
-    // The opening line, and it is item 1 of the six: a watcher that says
-    // nothing at all from the first second is indistinguishable from one that
-    // never started. It names the scope, the interval and the standing count,
-    // which between them make the next hour of silence mean something.
     let first = poll.sample();
-    let opening = ledger.prime(&first, started);
-    if !spec.json {
-        println!(
-            "{}",
-            aside(
-                started,
-                &format!(
-                    "watching {} · every {} · {} standing · {}{}",
-                    spec.scope.name,
-                    util::duration_human(spec.every),
-                    ledger.standing(),
-                    spec.want.iter().map(|k| k.word()).collect::<Vec<_>>().join(" "),
-                    // Only when it is a seat and only at zero — see
-                    // [`nothing_addressed`]. On every other line this is the
-                    // empty string, so a watch on a project is byte-for-byte
-                    // what it was.
-                    nothing_addressed(&spec.scope, ledger.standing(), poll.owes_a_run())
-                        .map(|note| format!(" · {note}"))
-                        .unwrap_or_default()
-                ),
-                &p
-            )
-        );
-    }
-    say(&opening, started, spec);
+    let primed = ledger.prime(&first, started);
+    println!("{}", opening(spec, ledger.standing(), poll.owes_a_run(), started, &p));
+    say(&primed, started, spec);
     register(store, &key, spec, &ledger, ticks);
 
     let over = loop {
@@ -2578,9 +2721,7 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         // the first line it should not trust.
         if let Some(now) = util::exe_stamp().filter(|now| running.is_some_and(|was| was != *now)) {
             running = Some(now);
-            if !spec.json {
-                println!("{}", aside(at, REPLACED, &p));
-            }
+            println!("{}", note(Class::Replaced, at, spec, REPLACED, &p));
         }
 
         // Sampled first and asked for the routing after, because the routing
@@ -2590,27 +2731,9 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         say(&emits, at, spec);
         register(store, &key, spec, &ledger, ticks);
 
-        // Item 2 of the six. One line, and it carries the standing count
-        // rather than a pulse, so it is a level read in miniature: `0 standing`
-        // is a positive statement that nothing is wrong.
-        if spec.heartbeat != i64::MAX && at - last_beat >= spec.heartbeat && !spec.json {
+        if spec.heartbeat != i64::MAX && at - last_beat >= spec.heartbeat {
             last_beat = at;
-            println!(
-                "{}",
-                aside(
-                    at,
-                    &format!(
-                        "watching {} · {} · {} standing{}",
-                        spec.scope.name,
-                        util::duration_human(at - started),
-                        ledger.standing(),
-                        nothing_addressed(&spec.scope, ledger.standing(), poll.owes_a_run())
-                            .map(|note| format!(" · {note}"))
-                            .unwrap_or_default()
-                    ),
-                    &p
-                )
-            );
+            println!("{}", heartbeat(spec, ledger.standing(), poll.owes_a_run(), at, at - started, &p));
         }
 
         if spec.stop_after.is_some_and(|s| at - started >= s) {
@@ -2636,11 +2759,15 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // Item 5. There is no silent return from this verb: an ending that is not
     // said reads exactly like the process that died without saying anything,
     // which is the fault the whole file is against.
-    if spec.json {
-        println!("{}", json!({ "shape": "signal", "signal": "watch-over", "to": spec.scope.name, "text": over.said(), "at": util::now_iso() }));
-    } else {
-        println!("{}", aside(at, &format!("stopped watching {} — {}", spec.scope.name, over.said()), &p));
-    }
+    // One sentence in both documents, where it used to be two. The JSON form
+    // said `signal: "watch-over"` — a word outside [`Kind::word`]'s vocabulary
+    // in the field that vocabulary is read from — and now says `class: "over"`,
+    // which is the same fact in the field every other line of this stream also
+    // carries. See [`Class::envelope`].
+    println!(
+        "{}",
+        note(Class::Over, at, spec, &format!("stopped watching {} — {}", spec.scope.name, over.said()), &p)
+    );
     over.code()
 }
 
@@ -4071,5 +4198,123 @@ mod tests {
     fn a_stalled_seat_is_the_one_derived_predicate_that_may_take_more_than_a_note() {
         assert_eq!(Kind::SeatStalled.loudness(), crate::message::Kind::Direction);
         assert_eq!(Kind::Review.loudness(), crate::message::Kind::Note);
+    }
+
+    // ---- the class of a line -----------------------------------------------
+
+    /// A watch on `wsp`, subscribed to everything, in whichever document.
+    fn watching(json: bool) -> Spec {
+        Spec {
+            scope: scope("wsp", false),
+            want: Kind::every().into_iter().collect(),
+            about: None,
+            every: EVERY,
+            settle: SETTLE,
+            heartbeat: HEARTBEAT,
+            stop_after: None,
+            until: None,
+            json,
+        }
+    }
+
+    /// The fourteen-wide column a reader scans, off a plain line.
+    fn column(l: &str) -> String {
+        l.chars().skip(6).take(14).collect::<String>().trim_end().to_string()
+    }
+
+    fn parsed(l: &str) -> Value {
+        serde_json::from_str(l).unwrap_or_else(|e| panic!("not one JSON document: {e} — {l}"))
+    }
+
+    /// **`worklist-033`, as an assertion, and the one test that would have
+    /// prevented it.** A monitor dropped the heartbeat by matching the shape of
+    /// its line; `REPLACED` prints on a line of the same shape, so it went too,
+    /// and the watch ran eight hours and four installs on stale logic. These
+    /// two lines are now distinguishable without reading a word of either, in
+    /// both documents — and before the class field they were not, because
+    /// `aside` put the same `·` in that column for both.
+    #[test]
+    fn a_build_replaced_notice_is_not_the_same_class_as_a_heartbeat() {
+        let p = util::Paint::plain();
+
+        let text = watching(false);
+        let beat = note(Class::Beat, 0, &text, "watching wsp · 1h · 0 standing", &p);
+        let repl = note(Class::Replaced, 0, &text, REPLACED, &p);
+        assert_eq!(column(&beat), "beat");
+        assert_eq!(column(&repl), "replaced");
+        assert_ne!(column(&beat), column(&repl), "the column a monitor reads separates them");
+
+        let json = watching(true);
+        let beat = parsed(&note(Class::Beat, 0, &json, "watching wsp · 1h · 0 standing", &p));
+        let repl = parsed(&note(Class::Replaced, 0, &json, REPLACED, &p));
+        assert_eq!(beat["class"], "beat");
+        assert_eq!(repl["class"], "replaced");
+    }
+
+    /// Every class, in the document a machine reads, carrying the word a
+    /// consumer keys on — including the four that are not signals, which under
+    /// `--json` were not printed at all.
+    #[test]
+    fn every_line_a_watch_emits_under_json_carries_its_class() {
+        let p = util::Paint::plain();
+        let spec = watching(true);
+        let mut seen: Vec<String> = Vec::new();
+        for class in Class::every() {
+            let v = match class {
+                // News is the one line that is a level, so it is the one line
+                // whose JSON form is the signal envelope rather than
+                // `Class::envelope`. It must still carry the field.
+                Class::News => sig(Kind::Review, "a-1").envelope(Edge::Up, "wsp", "2026-08-21T09:00:00Z"),
+                _ => parsed(&note(class, 0, &spec, "something happened", &p)),
+            };
+            assert_eq!(v["class"], class.word(), "{class:?} did not name itself");
+            seen.push(v["class"].as_str().expect("a class is a word").to_string());
+        }
+        assert_eq!(seen, vec!["open", "news", "beat", "replaced", "over"], "the vocabulary is these five");
+    }
+
+    /// **Failure 1, on the path that did not have it.** A `--json` watcher
+    /// printed nothing at all until something moved: the opening was written
+    /// under `if !spec.json`, so the reader least able to ask a person whether
+    /// its watch was alive was the one told nothing. A watcher that says
+    /// nothing from the first second is indistinguishable from one that never
+    /// started, and that is as true through a pipe as it is on a screen.
+    #[test]
+    fn a_json_watcher_says_it_started_before_anything_has_happened() {
+        let p = util::Paint::plain();
+        let v = parsed(&opening(&watching(true), 0, false, 0, &p));
+        assert_eq!(v["class"], "open");
+        assert_eq!(v["to"], "wsp", "addressed, like every other line");
+        let said = v["text"].as_str().expect("it says something");
+        assert!(said.contains("0 standing"), "and it says how much is up: {said}");
+        assert!(said.contains("watching wsp"), "and what it is watching: {said}");
+    }
+
+    /// The stream is read down its second column, by eye, by two seats. The
+    /// class word went where the `·` was and nothing else moved: five
+    /// characters of clock, a space, exactly fourteen for the class-or-signal
+    /// column, a space, then the subject. Asserted as geometry rather than as
+    /// words, because the words are the part that is allowed to change.
+    #[test]
+    fn the_columns_a_seat_reads_by_eye_do_not_move() {
+        let p = util::Paint::plain();
+        let at = 0;
+        let news =
+            line(&Emit { edge: Edge::Up, to: EVERYONE.into(), signal: sig(Kind::Review, "a-1"), held: 0 }, at, &p);
+        let beat = aside(Class::Beat, at, "watching wsp · 1h · 0 standing", &p);
+
+        assert_eq!(news.chars().take(5).collect::<String>(), clock(at), "the clock is where it was");
+        assert_eq!(beat.chars().take(5).collect::<String>(), clock(at));
+        for l in [&news, &beat] {
+            assert_eq!(l.chars().nth(5), Some(' '), "one space after the clock: {l}");
+            assert_eq!(l.chars().nth(20), Some(' '), "the second column is fourteen wide: {l}");
+        }
+        assert_eq!(column(&news), "review", "and a news line keeps the signal word it already printed");
+        // …and the third field starts at the same *column* in both, counted
+        // in characters rather than bytes, because what is being protected
+        // here is where a reader's eye lands.
+        let third = |l: &str| l.chars().skip(21).collect::<String>();
+        assert!(third(&news).starts_with("a-1"), "{news}");
+        assert!(third(&beat).starts_with("watching wsp"), "{beat}");
     }
 }

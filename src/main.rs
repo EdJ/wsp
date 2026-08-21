@@ -1308,6 +1308,13 @@ fn help_text() -> String {
                                     says what it is watching, one line per
                                     change, a heartbeat while nothing happens,
                                     and why it stopped
+  wsp watch --json                  …the same stream as one document per line.
+                                    Every line names its class in a `class`
+                                    field, and the text stream names it in the
+                                    second column. The whole vocabulary is
+                                    {classes}
+                                    — key a filter on one of those words and
+                                    never on the wording of a line
   wsp watch --now                   …or the level read on its own: everything
                                     up right now, correct after any restart —
                                     the one call that says "nothing is up"
@@ -1470,6 +1477,10 @@ the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
         machines = h("MACHINES"),
         worklists = h("WORKLISTS"),
         plumbing = h("PLUMBING"),
+        // Asked rather than typed out. A consumer that cannot discover the
+        // words is back to guessing from prose, and a list written here by
+        // hand is a sixth class away from telling them something false.
+        classes = cmd_watch::Class::every().map(|c| c.word()).join(", "),
     )
 }
 
