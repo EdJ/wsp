@@ -3909,6 +3909,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh, and the pass that looks when nobody asked |
 | `src/attention.rs` | that pass: the level set derived on a timer, the ledger that survives the process, who each level is addressed to, and the three edges that leave it — `hooks/on-attention-{raised,cleared,moved}` |
+| `src/wake.rs` | the pass's third audience: which levels are worth re-invoking a governor for, the spool that holds the rest, and the turn boundary a retyped delivery waits for |
 | `src/input.rs` | terminal bytes → keys: the escape-sequence parser |
 | `src/panel/rows.rs` | what is in the tree, and how each row draws |
 | `src/panel/render.rs` | `Line`/`Style`, the frame, and the ansi + html backends |
