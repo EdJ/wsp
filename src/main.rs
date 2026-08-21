@@ -1315,6 +1315,16 @@ fn help_text() -> String {
                                     {classes}
                                     — key a filter on one of those words and
                                     never on the wording of a line
+  wsp watch --wake [--defer-max 4h]  …or for a reader who is not there: a line
+                                    printed has been judged worth a context
+                                    read, and everything else is held and
+                                    rides the next one. Nothing is dropped.
+                                    A held fact older than --defer-max is a
+                                    wake by itself, so a quiet fleet still
+                                    delivers its backlog
+  wsp watch --drain                 print what a --wake watch is holding and
+                                    clear it — free, because you are already
+                                    awake to be reading it
   wsp watch --now                   …or the level read on its own: everything
                                     up right now, correct after any restart —
                                     the one call that says "nothing is up"

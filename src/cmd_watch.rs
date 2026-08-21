@@ -208,6 +208,33 @@ const SETTLE: i64 = 5 * 60;
 /// the standing count so it is a level read rather than a pulse.
 const HEARTBEAT: i64 = 30 * 60;
 
+/// How long a spooled fact may wait before it is a wake by itself.
+///
+/// **Four hours, and the number is measured rather than picked.** Replayed
+/// against the 134 wakes one seat actually took on 2026-08-19/20 — see
+/// [`the_measured_session_is_replayed_and_the_wake_count_is_counted`] — the
+/// table alone wakes 70 times. Adding escalation costs, over that same corpus:
+///
+/// | `--defer-max` | wakes | over no escalation at all |
+/// |---|---|---|
+/// | 1h | 78 | +8 |
+/// | 2h | 74 | +4 |
+/// | 4h | 71 | +1 |
+///
+/// So four hours buys the guarantee for one extra context read in two days,
+/// where an hour buys the same guarantee for eight. The other end of it is a
+/// fleet with nothing to say at all, where this is the *whole* wake budget: six
+/// a day, each carrying everything held.
+///
+/// **And four hours of latency is affordable precisely because of what is in
+/// here.** The spool holds what [`Line::disposition`] argued is not worth
+/// acting on now — a heartbeat, a level that went away, a level somebody else
+/// answers for, and a `flag`, which `hooks/on-attention-raised` has already
+/// delivered to a person for free. None of it is time-critical by construction.
+/// Escalation is not a delivery deadline; it is a bound on how long this can be
+/// silent, which is the one thing `core-014` will not allow to be unbounded.
+const DEFER_MAX: i64 = 4 * 60 * 60;
+
 /// How stale a register entry may be before `doctor` calls it dead: three ticks
 /// plus slack. Three rather than one because a tick that ran long is not a
 /// watcher that died, and a watch is a diagnostic — a diagnostic that cries
@@ -473,6 +500,11 @@ impl Class {
         }
     }
 
+    /// Back from the word, for a spool written by another build.
+    fn parse(word: &str) -> Option<Class> {
+        Class::every().into_iter().find(|c| c.word() == word)
+    }
+
     /// The whole vocabulary, so a reader can be handed it and a test can assert
     /// it is closed.
     pub(crate) fn every() -> [Class; 5] {
@@ -497,6 +529,286 @@ impl Class {
     /// `signal == "watch-over"` was keying on prose with extra steps.
     fn envelope(&self, at: i64, to: &str, text: &str) -> Value {
         json!({ "class": self.word(), "at": util::iso_at(at), "to": to, "text": text })
+    }
+}
+
+/// What is to be done with a line, under a mode whose reader is asleep.
+///
+/// **Two, and the absence of a third is the whole row.** `wsp watch`'s stdout
+/// *is* the wake: a line printed re-invokes an agent and its whole conversation
+/// is re-read, measured at 208k tokens on the seat that filed `core-014` —
+/// the same price for a heartbeat as for a question from Ed, because the
+/// context is the cost and not the payload. So printing is not free and the
+/// only lever wsp has is which lines it prints.
+///
+/// The tempting third is *drop*, and it is the one thing this must never have.
+/// A filter that drops has exactly one failure mode and it is silence, which is
+/// indistinguishable from health — the fault this whole file is written
+/// against, with six named guards against it already. Triage here decides
+/// **when**, never **whether**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Print it now, and carry the spool out under it. A claim that this line
+    /// was worth a context read.
+    Wake,
+    /// Hold it. It rides the next wake at no extra cost, because that wake was
+    /// already being paid for, and it is never lost — see [`Spool`].
+    Spool,
+}
+
+/// One line, before it is written and before it is known whether it will be
+/// written now.
+///
+/// **The type is what makes the table total.** A class and its payload cannot
+/// be separated, so there is no way to ask [`Line::disposition`] about a class
+/// without the thing it is a class *of*, and no way for a caller to reach
+/// stdout carrying something the table has never seen. See [`Stream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Line {
+    /// One edge of news — the only class that carries a level.
+    News(Emit),
+    /// Everything else: the class, and the sentence it says.
+    Note(Class, String),
+}
+
+impl Line {
+    pub(crate) fn class(&self) -> Class {
+        match self {
+            Line::News(_) => Class::News,
+            Line::Note(c, _) => *c,
+        }
+    }
+
+    /// **The table.** Keyed on the class and the level, never on words — which
+    /// is what `core-016` is for, and what `worklist-033` cost when a consumer
+    /// keyed a `grep -v` on the heartbeat's prose and ate the notice that the
+    /// binary underneath it had been replaced.
+    ///
+    /// A `match` with no wildcard on [`Kind`], deliberately: a signal kind
+    /// added later must state its disposition here or fail to compile. The
+    /// alternative — a chain of conditionals with a default — is how a new kind
+    /// silently inherits *spool* and is never delivered, which is the drop
+    /// arriving by the back door.
+    ///
+    /// Where a reading is genuinely unforeseeable the answer is [`Wake`].
+    /// A wake that was not needed costs one context read; a silence that was
+    /// wrong costs everything the row is trying to protect, and the two are not
+    /// symmetric.
+    ///
+    /// [`Wake`]: Disposition::Wake
+    pub(crate) fn disposition(&self) -> Disposition {
+        use Disposition::{Spool, Wake};
+        match self {
+            // The governor started this watch and is awake at the moment it
+            // says so. Item 1 of the six ways silence lies: a watcher that says
+            // nothing from its first second is indistinguishable from one that
+            // never started, and that is as true through a pipe as on a screen.
+            Line::Note(Class::Open, _) => Wake,
+            // `core-014` d2, and the one place the six-ways list is *traded*
+            // rather than extended. Absence of a heartbeat is only legible to a
+            // reader who is still reading, and the reader here is asleep by
+            // design; the register is written every tick and a dead process
+            // cannot fake it, which is strictly stronger.
+            Line::Note(Class::Beat, _) => Spool,
+            // `worklist-033` itself. The watch is now running logic that has
+            // been fixed, it cannot say so twice, and only the reader can
+            // repair it.
+            Line::Note(Class::Replaced, _) => Wake,
+            // Item 5. There is no silent ending, and under a mode built out of
+            // silence least of all — it is also the line the spool rides out
+            // on, so a watch that ends holding something still delivers it.
+            Line::Note(Class::Over, _) => Wake,
+            // Unconstructible: `News` is carried by the other variant, which is
+            // what the type is for. Answered rather than `unreachable!` because
+            // a panic in the disposition path would be the seventh way to be
+            // silent, and this is the safe half of an asymmetric choice.
+            Line::Note(Class::News, _) => Wake,
+            Line::News(e) => match e.edge {
+                // It went away, or somebody else answers for it now. There is
+                // nothing for this reader to do about either, and `worklist-039`
+                // is why the second is a line at all rather than a silence.
+                Edge::Down | Edge::Left => Spool,
+                Edge::Up => match e.signal.kind {
+                    // Somebody is sitting still.
+                    Kind::NeedsAPerson => Wake,
+                    // An agent wrote a question and is stopped behind it.
+                    Kind::Unanswered => Wake,
+                    // A modal holding the keyboard; one keypress fixes it.
+                    Kind::Blocked => Wake,
+                    // The reporter's own failure, and the only level here whose
+                    // subject is a governor rather than a piece of work.
+                    Kind::SeatStalled => Wake,
+                    // It died or it never started. Both want a first move now.
+                    Kind::AgentGone => Wake,
+                    // The agent's terminal verb, and the governor's own work.
+                    Kind::Review => Wake,
+                    // Liveness rather than news, and never filtered — the
+                    // existing rule, and the difference between a quiet fleet
+                    // and a watcher reporting on half a world.
+                    Kind::Blind => Wake,
+                    // `core-014` §4: a notification with nothing owed back, so
+                    // reading it *is* the whole disposition and it can be read
+                    // on the next wake. `hooks/on-attention-raised` already
+                    // reaches a person for free, and a governor should be woken
+                    // only for what a governor must **act** on.
+                    Kind::Flag => Spool,
+                },
+            },
+        }
+    }
+}
+
+/// One line being held, and what is needed to say it later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Spooled {
+    /// When it happened, not when it is delivered. A fact that waited four
+    /// hours says four hours ago, because a reader acting on the clock in the
+    /// line would otherwise go looking for something that moved long since.
+    pub(crate) at: i64,
+    /// What it was, when this build has the vocabulary to read it back.
+    line: Option<Line>,
+    /// What it said, always — the sentence for a note, and the whole rendered
+    /// line for news, which has no sentence of its own.
+    ///
+    /// **The reason nothing is ever dropped on the way back in.** A spool
+    /// survives an install, so it is routinely read by a *different* binary,
+    /// and a downgrade meets a class or a signal word it has no enum for. The
+    /// structured form is then `None` and this is what is printed: a reader can
+    /// read words that this build's code cannot parse, and the alternative —
+    /// `continue`, the way [`Ledger::of_json`] may safely skip a level it will
+    /// re-derive next tick — would be a drop with nothing behind it to notice.
+    ///
+    /// The asymmetry between the two is not arbitrary. A note's class is drawn
+    /// in the column from the stored *word*, so its sentence is all that is
+    /// needed; a signal's line is built from a subject, an edge and a duration
+    /// this build may no longer know how to read, so the only honest fallback
+    /// is the line as it looked when it was written.
+    text: String,
+    /// The class word as it was written, for the same reason.
+    class: String,
+}
+
+/// What is being held for the next wake.
+///
+/// **Beside the register rather than in a file of its own**, which is
+/// `core-017`'s "a file per watch key, beside the register" answered the
+/// cheaper way: it goes into the watch record under the same key, so it is one
+/// atomic write per tick instead of two records to keep in step, `--status` and
+/// `doctor` can read its depth for nothing, and it survives exactly what the
+/// ledger beside it survives. See [`register_as`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Spool {
+    held: Vec<Spooled>,
+}
+
+impl Spooled {
+    /// A line, ready to be held.
+    ///
+    /// The words are rendered here rather than at flush time and stored beside
+    /// the structured form — see [`Spooled::text`] for why the duplication is
+    /// the point rather than an oversight.
+    fn of(at: i64, line: Line) -> Spooled {
+        Spooled {
+            at,
+            text: match &line {
+                Line::Note(_, said) => said.clone(),
+                Line::News(_) => render(&line, at, &util::Paint::plain()),
+            },
+            class: line.class().word().to_string(),
+            line: Some(line),
+        }
+    }
+
+    /// The line, in whichever document is being written.
+    ///
+    /// The stored words are the fallback and not the normal path: a build that
+    /// can still read the structured form re-renders it, so the reader gets
+    /// this terminal's colour and this build's wording. See [`Spooled::text`].
+    fn say(&self, spec: &Spec, p: &Paint) -> String {
+        match &self.line {
+            Some(l) => render_for(l, self.at, spec, p),
+            None if spec.json => {
+                json!({ "class": self.class, "at": util::iso_at(self.at), "to": spec.scope.name, "text": self.text })
+                    .to_string()
+            }
+            // A class this build knows, carrying a signal it does not: the
+            // stored line is already whole, so it is printed as it was.
+            None if self.class == Class::News.word() => self.text.clone(),
+            None => column(&self.class, self.at, &self.text, &util::Paint::new()),
+        }
+    }
+}
+
+impl Spool {
+    pub(crate) fn depth(&self) -> usize {
+        self.held.len()
+    }
+
+    /// When the oldest thing here happened, which is what escalation reads.
+    pub(crate) fn oldest(&self) -> Option<i64> {
+        self.held.first().map(|h| h.at)
+    }
+
+    /// Everything held, in the order it happened — **taken, not copied**.
+    ///
+    /// The caller is expected to fail to deliver it and put it back. See
+    /// [`Stream::write`]: an entry clears when something arrived, never when a
+    /// send was attempted, which is the shape `core-021` needs when the thing
+    /// on the other end is a pane whose turn is in flight rather than a pipe.
+    fn take(&mut self) -> Vec<Spooled> {
+        std::mem::take(&mut self.held)
+    }
+
+    fn put_back(&mut self, mut held: Vec<Spooled>) {
+        held.extend(self.held.drain(..));
+        self.held = held;
+    }
+
+    pub(crate) fn json(&self) -> Value {
+        Value::Array(
+            self.held
+                .iter()
+                .map(|h| {
+                    let mut v = json!({ "at": h.at, "class": h.class, "text": h.text });
+                    if let (Some(Line::News(e)), Some(o)) = (&h.line, v.as_object_mut()) {
+                        o.insert("edge".into(), json!(e.edge.word()));
+                        o.insert("held".into(), json!(e.held));
+                        o.insert("to".into(), json!(e.to));
+                        o.insert("signal".into(), e.signal.json());
+                    }
+                    v
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn of_json(v: &Value) -> Spool {
+        let mut held = Vec::new();
+        for rec in v.as_array().into_iter().flatten() {
+            let at = rec.get("at").and_then(Value::as_i64).unwrap_or(0);
+            let class = rec.get("class").and_then(Value::as_str).unwrap_or_default().to_string();
+            let text = rec.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            // `None` here is not a drop. The entry keeps its words and is
+            // printed as them — see [`Spooled::text`].
+            let line = match Class::parse(&class) {
+                Some(Class::News) => rec
+                    .get("signal")
+                    .and_then(Signal::of_json)
+                    .zip(rec.get("edge").and_then(Value::as_str).and_then(Edge::parse))
+                    .map(|(signal, edge)| {
+                        Line::News(Emit {
+                            edge,
+                            to: rec.get("to").and_then(Value::as_str).unwrap_or(EVERYONE).to_string(),
+                            held: rec.get("held").and_then(Value::as_i64).unwrap_or(0),
+                            signal,
+                        })
+                    }),
+                Some(c) => Some(Line::Note(c, text.clone())),
+                None => None,
+            };
+            held.push(Spooled { at, line, text, class });
+        }
+        Spool { held }
     }
 }
 
@@ -681,6 +993,62 @@ impl Signal {
     /// subscribes only to what [`cmd_govern::seat_for`] addresses here, so the
     /// field is a constant, and it is present so the second value is a value
     /// rather than a schema change.
+    /// The signal as the two persisted records hold it.
+    ///
+    /// **Asked from both rather than written out in each.** There are now two
+    /// things on disk that carry a level — the ledger a watch resumes from, and
+    /// the spool a wake flushes — and this file has paid repeatedly for a field
+    /// spelled out in a second place drifting from the first. Distinct from
+    /// [`Signal::envelope`], which is the *wire* shape and answers to
+    /// `wsp-095` Part 4; this one answers only to itself and may change
+    /// whenever both readers do. See [`Ledger::json`] and [`Spool::json`].
+    pub(crate) fn json(&self) -> Value {
+        json!({
+            "signal": self.kind.word(),
+            "subject": self.subject,
+            "detail": self.detail,
+            "record": self.record,
+            "loud": self.loud.map(|k| k.as_str()),
+            "at_once": self.at_once,
+            // Who was answering for it when it was last read. The record is the
+            // only thing that remembers, and remembering is what makes a change
+            // of address a fact rather than a silence — see [`Signal::to`].
+            "to": self.to,
+        })
+    }
+
+    /// And back, or `None` for a record this build has no vocabulary for.
+    ///
+    /// The caller decides what `None` means, and the two callers mean different
+    /// things by it: a ledger entry that will not parse is a level that is
+    /// simply re-read on the next tick, and a **spool** entry that will not
+    /// parse is a fact somebody is owed — see [`Spooled::text`], which is why
+    /// nothing is dropped on this path.
+    pub(crate) fn of_json(rec: &Value) -> Option<Signal> {
+        let word = rec.get("signal").and_then(Value::as_str).unwrap_or_default();
+        Some(Signal {
+            kind: Kind::parse(word)?,
+            subject: rec.get("subject").and_then(Value::as_str).unwrap_or_default().to_string(),
+            detail: rec.get("detail").and_then(Value::as_str).unwrap_or_default().to_string(),
+            record: rec.get("record").and_then(Value::as_str).map(str::to_string),
+            // The word, and a `true` from a build that wrote a bool still reads
+            // as `direction`. These records survive an `exec` in the middle of
+            // an install, so the file this reads is routinely the previous
+            // binary's.
+            loud: rec.get("loud").and_then(|v| match v {
+                Value::Bool(b) => b.then_some(crate::message::Kind::Direction),
+                _ => v.as_str().and_then(crate::message::Kind::parse),
+            }),
+            at_once: rec.get("at_once").and_then(Value::as_bool).unwrap_or(true),
+            // A record written before the address was on the level reads as
+            // everybody's. It cannot produce a false `left` on the next tick,
+            // because a ledger this build did not key is primed rather than
+            // diffed and [`Ledger::prime`] takes the whole signal from the read
+            // — see [`resume`].
+            to: rec.get("to").and_then(Value::as_str).unwrap_or(EVERYONE).to_string(),
+        })
+    }
+
     pub(crate) fn envelope(&self, edge: Edge, to: &str, at: &str) -> Value {
         let mut v = json!({
             // The class field every line of this stream carries, and the one
@@ -766,6 +1134,11 @@ impl Edge {
             Edge::Down => "down",
             Edge::Left => "left",
         }
+    }
+
+    /// Back from the word, for a spool written by another build.
+    fn parse(word: &str) -> Option<Edge> {
+        [Edge::Up, Edge::Down, Edge::Left].into_iter().find(|e| e.word() == word)
     }
 }
 
@@ -1104,24 +1477,16 @@ impl Ledger {
             self.up
                 .iter()
                 .map(|(k, h)| {
-                    (
-                        k.clone(),
-                        json!({
-                            "signal": h.signal.kind.word(),
-                            "subject": h.signal.subject,
-                            "detail": h.signal.detail,
-                            "record": h.signal.record,
-                            "loud": h.signal.loud.map(|k| k.as_str()),
-                            "at_once": h.signal.at_once,
-                            // Who was answering for it when it was last read.
-                            // The ledger is the only thing that remembers, and
-                            // remembering is what makes a change of address a
-                            // fact rather than a silence — see [`Signal::to`].
-                            "to": h.signal.to,
-                            "since": h.since,
-                            "told": h.told,
-                        }),
-                    )
+                    let mut v = h.signal.json();
+                    if let Some(o) = v.as_object_mut() {
+                        // The two facts the *ledger* adds to a level: how long
+                        // it has been up, and whether it has been said out loud.
+                        // Neither belongs on the signal — a level does not know
+                        // its own age, only a diff does.
+                        o.insert("since".into(), json!(h.since));
+                        o.insert("told".into(), json!(h.told));
+                    }
+                    (k.clone(), v)
                 })
                 .collect(),
         )
@@ -1142,44 +1507,11 @@ impl Ledger {
     pub(crate) fn of_json(v: &Value) -> Ledger {
         let mut up = BTreeMap::new();
         for (key, rec) in v.as_object().into_iter().flatten() {
-            let word = rec.get("signal").and_then(Value::as_str).unwrap_or_default();
-            let Some(kind) = Kind::parse(word) else { continue };
+            let Some(signal) = Signal::of_json(rec) else { continue };
             up.insert(
                 key.clone(),
                 Held {
-                    signal: Signal {
-                        kind,
-                        subject: rec.get("subject").and_then(Value::as_str).unwrap_or_default().to_string(),
-                        detail: rec.get("detail").and_then(Value::as_str).unwrap_or_default().to_string(),
-                        record: rec
-                            .get("record")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        // The word, and a `true` from a build that wrote a bool
-                        // still reads as `direction`. The ledger survives an
-                        // `exec` in the middle of an install, so the file this
-                        // reads is routinely the previous binary's.
-                        loud: rec
-                            .get("loud")
-                            .and_then(|v| match v {
-                                Value::Bool(b) => {
-                                    b.then_some(crate::message::Kind::Direction)
-                                }
-                                _ => v.as_str().and_then(crate::message::Kind::parse),
-                            }),
-                        at_once: rec.get("at_once").and_then(Value::as_bool).unwrap_or(true),
-                        // A record written before the address was on the level
-                        // reads as everybody's. It cannot produce a false
-                        // `left` on the next tick, because a ledger this build
-                        // did not key is primed rather than diffed and
-                        // [`Ledger::prime`] takes the whole signal from the
-                        // read — see [`resume`].
-                        to: rec
-                            .get("to")
-                            .and_then(Value::as_str)
-                            .unwrap_or(EVERYONE)
-                            .to_string(),
-                    },
+                    signal,
                     since: rec.get("since").and_then(Value::as_i64).unwrap_or(0),
                     told: rec.get("told").and_then(Value::as_bool).unwrap_or(false),
                 },
@@ -2011,6 +2343,13 @@ pub(crate) struct Registered {
     /// from; this is cheaper, it travels to another machine's records, and it
     /// is the same field [`resume`] already needed.
     pub(crate) build: String,
+    /// How many facts this watch is holding for its reader — see [`Spool`].
+    ///
+    /// A watcher that has decided not to wake somebody is a watcher with
+    /// something to answer for, and a triage nobody can inspect would be the
+    /// seventh way silence lies in a file that already carries six. `--drain`
+    /// is how a reader collects it.
+    pub(crate) spooled: usize,
 }
 
 impl Registered {
@@ -2079,6 +2418,7 @@ pub(crate) fn registered(store: &Store) -> Vec<Registered> {
             standing: v.get("standing").and_then(Value::as_u64).unwrap_or(0) as usize,
             daemon: v.get("daemon").and_then(Value::as_bool).unwrap_or(false),
             build: v.get("build").and_then(Value::as_str).unwrap_or_default().to_string(),
+            spooled: v.get("spool").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
         })
         .collect()
 }
@@ -2201,7 +2541,41 @@ fn line(e: &Emit, at: i64, p: &Paint) -> String {
 /// dim. Two seats read this stream by eye and one of them reads it down that
 /// column, so a shifted field costs more than the field is worth.
 fn aside(class: Class, at: i64, said: &str, p: &Paint) -> String {
-    format!("{} {} {}", p.dim(&clock(at)), p.dim(&util::pad(class.word(), 14)), p.dim(said))
+    column(class.word(), at, said, p)
+}
+
+/// The same line, from a word rather than a [`Class`].
+///
+/// One caller and it is not a loosening of the vocabulary: [`Spooled`] may hold
+/// an entry written by a build that had a class this one does not, and printing
+/// its words in the column it was written for is the alternative to dropping it.
+/// Everything that *emits* still goes through [`aside`].
+fn column(word: &str, at: i64, said: &str, p: &Paint) -> String {
+    format!("{} {} {}", p.dim(&clock(at)), p.dim(&util::pad(word, 14)), p.dim(said))
+}
+
+/// One line, as a person reads it.
+fn render(l: &Line, at: i64, p: &Paint) -> String {
+    match l {
+        Line::News(e) => line(e, at, p),
+        Line::Note(c, said) => aside(*c, at, said, p),
+    }
+}
+
+/// …and as a machine does.
+fn render_json(l: &Line, at: i64, to: &str) -> Value {
+    match l {
+        Line::News(e) => e.signal.envelope(e.edge, to, &util::iso_at(at)),
+        Line::Note(c, said) => c.envelope(at, to, said),
+    }
+}
+
+/// One line in whichever of the two documents this watch is writing.
+fn render_for(l: &Line, at: i64, spec: &Spec, p: &Paint) -> String {
+    match spec.json {
+        true => render_json(l, at, &spec.scope.name).to_string(),
+        false => render(l, at, p),
+    }
 }
 
 /// One line that is not news, in whichever of the two documents is being
@@ -2219,10 +2593,7 @@ fn aside(class: Class, at: i64, said: &str, p: &Paint) -> String {
 /// of the two documents is now something you would have to do on purpose,
 /// rather than something you get by adding a `println!` next to the others.
 fn note(class: Class, at: i64, spec: &Spec, said: &str, p: &Paint) -> String {
-    match spec.json {
-        true => class.envelope(at, &spec.scope.name, said).to_string(),
-        false => aside(class, at, said, p),
-    }
+    render_for(&Line::Note(class, said.to_string()), at, spec, p)
 }
 
 /// The opening line: what is being watched, how often, and how much is already
@@ -2236,12 +2607,10 @@ fn note(class: Class, at: i64, spec: &Spec, said: &str, p: &Paint) -> String {
 /// absence under `--json` was failure 1, and a line nothing can construct is a
 /// line nothing can assert on. See
 /// [`a_json_watcher_says_it_started_before_anything_has_happened`].
-fn opening(spec: &Spec, standing: usize, owes: bool, at: i64, p: &Paint) -> String {
-    note(
+fn opening(spec: &Spec, standing: usize, owes: bool) -> Line {
+    Line::Note(
         Class::Open,
-        at,
-        spec,
-        &format!(
+        format!(
             "watching {} · every {} · {} standing · {}{}",
             spec.scope.name,
             util::duration_human(spec.every),
@@ -2252,7 +2621,6 @@ fn opening(spec: &Spec, standing: usize, owes: bool, at: i64, p: &Paint) -> Stri
             // string, so a watch on a project is byte-for-byte what it was.
             nothing_addressed(&spec.scope, standing, owes).map(|note| format!(" · {note}")).unwrap_or_default()
         ),
-        p,
     )
 }
 
@@ -2262,20 +2630,131 @@ fn opening(spec: &Spec, standing: usize, owes: bool, at: i64, p: &Paint) -> Stri
 /// pulse, so it is a level read in miniature: `0 standing` is a positive
 /// statement that nothing is wrong, where a bare tick would only be a statement
 /// that the process is alive.
-fn heartbeat(spec: &Spec, standing: usize, owes: bool, at: i64, since: i64, p: &Paint) -> String {
-    note(
+fn heartbeat(spec: &Spec, standing: usize, owes: bool, since: i64) -> Line {
+    Line::Note(
         Class::Beat,
-        at,
-        spec,
-        &format!(
+        format!(
             "watching {} · {} · {} standing{}",
             spec.scope.name,
             util::duration_human(since),
             standing,
             nothing_addressed(&spec.scope, standing, owes).map(|note| format!(" · {note}")).unwrap_or_default()
         ),
-        p,
     )
+}
+
+// ---------------------------------------------------------------------------
+// the one way out
+// ---------------------------------------------------------------------------
+
+/// **Everything this verb prints goes through here, and there is no other way
+/// to stdout from the loop.**
+///
+/// That is the guarantee, not a tidiness. `core-014`'s argument is that a
+/// filter which *drops* fails as silence and silence is indistinguishable from
+/// health; this file already carries six named ways that has happened. So the
+/// thing to be able to check by reading is that there is no early return, no
+/// `continue` and no second `println!` — one function takes a [`Line`], and
+/// the only two things it can do with one are print it now and hold it.
+///
+/// A **bare** `wsp watch` sets [`Spec::wake`] false and every line is a wake,
+/// so its output is byte-for-byte what it was before this existed: a person in
+/// front of a stream wants the heartbeat, and `core-014` d2 traded that away
+/// only for the reader that is asleep.
+struct Stream<'a> {
+    spec: &'a Spec,
+    p: Paint,
+    /// Judged worth a context read this tick, in the order it happened.
+    hot: Vec<Spooled>,
+    /// Judged not worth one *on its own*, this tick. Merged into the durable
+    /// spool by [`Stream::tick`].
+    cold: Vec<Spooled>,
+}
+
+impl<'a> Stream<'a> {
+    fn new(spec: &'a Spec) -> Stream<'a> {
+        Stream { spec, p: Paint::new(), hot: Vec::new(), cold: Vec::new() }
+    }
+
+    /// Offer a line. Print now, or hold — there is no third outcome, and no
+    /// argument you can pass that reaches neither.
+    fn put(&mut self, at: i64, l: Line) {
+        // A bare watch has one disposition. The table is only consulted for a
+        // reader who is not there to read.
+        let d = match self.spec.wake {
+            true => l.disposition(),
+            false => Disposition::Wake,
+        };
+        let held = Spooled::of(at, l);
+        match d {
+            Disposition::Wake => self.hot.push(held),
+            Disposition::Spool => self.cold.push(held),
+        }
+    }
+
+    /// End of tick: decide, write, and hand back what is still held.
+    ///
+    /// `spool` is passed in rather than owned because **the register is the
+    /// truth**, not this process's memory: `wsp watch --drain` may have emptied
+    /// it from another process since the last tick, and a spool kept only here
+    /// would deliver those entries a second time. See [`run`], which re-reads
+    /// it every tick.
+    /// Returns what was written, which is empty on a tick that earned no
+    /// wake. The count of non-empty ticks is this row's whole claim — see
+    /// [`the_measured_session_is_replayed_and_the_wake_count_is_counted`] —
+    /// and a claim nothing can count is an estimate.
+    fn tick(&mut self, at: i64, spool: &mut Spool) -> Vec<Spooled> {
+        spool.held.append(&mut self.cold);
+        // Escalation. Without it a fleet that never earns a wake never delivers
+        // its backlog, and the drop is back in through the door — so a spooled
+        // fact nobody has collected becomes justification by itself and carries
+        // everything else out with it. See [`DEFER_MAX`].
+        let overdue = spool.oldest().is_some_and(|o| at - o >= self.spec.defer_max);
+        if self.hot.is_empty() && !overdue {
+            return Vec::new();
+        }
+        // The wake first, then the backlog under it. The backlog costs nothing:
+        // the context read was already being paid for by the line above it.
+        //
+        // **Except `over`, which goes last, and that is not tidiness.** A
+        // consumer that reads until the stream says it is over is the obvious
+        // one to write, and with the ending sitting on top of its own backlog
+        // that consumer drops every line the wake was carrying — a drop this
+        // row would have created by ordering, in the flush most likely to be
+        // carrying something, since `over` wakes unconditionally. Found by
+        // running it: a watch ended holding five heartbeats and printed them
+        // underneath the line saying it had stopped.
+        let mut out = std::mem::take(&mut self.hot);
+        let (ending, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|h| h.class == Class::Over.word());
+        out = rest;
+        let carried = spool.take();
+        out.extend(carried.iter().cloned());
+        out.extend(ending);
+        if !self.write(&out) {
+            // Nothing arrived, so nothing clears. `core-021` is the case this
+            // is shaped for — a wake that cannot be typed at a pane whose turn
+            // is in flight — and the rule is the same either way: an entry
+            // clears when something arrived, never when a send was attempted.
+            spool.put_back(carried);
+            return Vec::new();
+        }
+        out
+    }
+
+    /// Write, and say whether it arrived.
+    ///
+    /// A watch is read by an agent whose stdout is a pipe, and a pipe buffers.
+    /// News held in a buffer until the next line arrives is news that is late
+    /// by however long the fleet stays quiet, which on a quiet night is the
+    /// whole night — so the flush is not housekeeping, it is the delivery, and
+    /// its result is what the spool clears on.
+    fn write(&self, out: &[Spooled]) -> bool {
+        for h in out {
+            println!("{}", h.say(self.spec, &self.p));
+        }
+        use std::io::Write;
+        std::io::stdout().flush().is_ok()
+    }
 }
 
 /// What `0 standing` means when the scope being watched is a **seat**, said
@@ -2367,6 +2846,14 @@ struct Spec {
     /// Stop when this task, project or worklist is out of open work.
     until: Option<String>,
     json: bool,
+    /// `--wake`: the reader is asleep, so a line printed has been judged worth
+    /// a context read. Opt-in, and a bare watch is byte-for-byte what it was —
+    /// a person in front of a stream wants the heartbeat, and `core-014` d2
+    /// traded that away only for the reader that is not there.
+    wake: bool,
+    /// How old a spooled fact may get before it is a wake on its own. See
+    /// [`DEFER_MAX`].
+    defer_max: i64,
 }
 
 /// argv, split into the scope it names and the signals it subscribes to.
@@ -2483,6 +2970,8 @@ fn spec(store: &Store, args: &Args) -> Result<Spec, String> {
         },
         until: args.get("until"),
         json: args.json(),
+        wake: args.has("wake"),
+        defer_max: dur("defer-max", DEFER_MAX)?,
     })
 }
 
@@ -2569,6 +3058,9 @@ pub fn watch(store: &Store, args: &Args) -> i32 {
             return 2;
         }
     };
+    if args.has("drain") {
+        return drain(store, &spec);
+    }
     let mut poll = Poll::new(store, spec.scope.clone(), spec.want.clone(), spec.about.clone());
     if args.has("now") {
         return level_read(&mut poll, &spec);
@@ -2659,7 +3151,7 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // pid 0, deliberately: this process is already over. A pull ledger is not a
     // reporter that can die, so it must never read as one — see
     // [`Registered::watching`].
-    register_as(store, &key, spec, &ledger, 1, 0);
+    register_as(store, &key, spec, &ledger, 1, 0, &Spool::default());
     0
 }
 
@@ -2691,7 +3183,6 @@ const REPLACED: &str = "wsp was replaced under this watch — it keeps the build
 
 /// The loop.
 fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
-    let p = Paint::new();
     let key = watch_key();
     let started = util::epoch_secs();
     let mut ledger = Ledger::default();
@@ -2703,11 +3194,20 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // `exec`s on it, and this cannot. See [`said_replaced`].
     let mut running = util::exe_stamp();
 
+    let mut stream = Stream::new(spec);
+    // What the last watch under this key was holding, which is routinely
+    // something: a spool that dies with the process that wrote it is a drop
+    // wearing the words *the process ended*. See [`spool_of`].
+    let mut spool = spool_of(store, &key);
+
     let first = poll.sample();
     let primed = ledger.prime(&first, started);
-    println!("{}", opening(spec, ledger.standing(), poll.owes_a_run(), started, &p));
-    say(&primed, started, spec);
-    register(store, &key, spec, &ledger, ticks);
+    stream.put(started, opening(spec, ledger.standing(), poll.owes_a_run()));
+    for e in primed {
+        stream.put(started, Line::News(e));
+    }
+    stream.tick(started, &mut spool);
+    register(store, &key, spec, &ledger, ticks, &spool);
 
     let over = loop {
         std::thread::sleep(std::time::Duration::from_secs(spec.every.max(1) as u64));
@@ -2717,24 +3217,33 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         if !store.exists() {
             break Over::StoreGone;
         }
+        // Re-read rather than carried, because `--drain` may have emptied it
+        // from another process since the last tick — see [`spool_of`].
+        spool = spool_of(store, &key);
         // Before the read, so a reader scrolling back finds the warning above
         // the first line it should not trust.
         if let Some(now) = util::exe_stamp().filter(|now| running.is_some_and(|was| was != *now)) {
             running = Some(now);
-            println!("{}", note(Class::Replaced, at, spec, REPLACED, &p));
+            stream.put(at, Line::Note(Class::Replaced, REPLACED.to_string()));
         }
 
         // Sampled first and asked for the routing after, because the routing
         // is a fact about the read that has just happened. See [`Routing`].
         let now = poll.sample();
-        let emits = ledger.advance(&now, &poll.routing(), at, spec.settle);
-        say(&emits, at, spec);
-        register(store, &key, spec, &ledger, ticks);
+        for e in ledger.advance(&now, &poll.routing(), at, spec.settle) {
+            stream.put(at, Line::News(e));
+        }
 
         if spec.heartbeat != i64::MAX && at - last_beat >= spec.heartbeat {
             last_beat = at;
-            println!("{}", heartbeat(spec, ledger.standing(), poll.owes_a_run(), at, at - started, &p));
+            stream.put(at, heartbeat(spec, ledger.standing(), poll.owes_a_run(), at - started));
         }
+
+        // One decision per tick, after everything this tick produced has been
+        // offered. A wake carries the backlog out with it, so the order the
+        // lines were put in is the order they are read in.
+        stream.tick(at, &mut spool);
+        register(store, &key, spec, &ledger, ticks, &spool);
 
         if spec.stop_after.is_some_and(|s| at - started >= s) {
             break Over::Elapsed;
@@ -2754,20 +3263,32 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         }
     };
 
-    store.clear_watch(&key);
     let at = util::epoch_secs();
     // Item 5. There is no silent return from this verb: an ending that is not
     // said reads exactly like the process that died without saying anything,
-    // which is the fault the whole file is against.
+    // which is the fault the whole file is against. It is also the line the
+    // spool rides out on — `over` is a wake, so a watch that ends holding
+    // something still delivers it, and a spool that died with its process
+    // would be a drop with a different word on it.
+    //
     // One sentence in both documents, where it used to be two. The JSON form
     // said `signal: "watch-over"` — a word outside [`Kind::word`]'s vocabulary
     // in the field that vocabulary is read from — and now says `class: "over"`,
     // which is the same fact in the field every other line of this stream also
     // carries. See [`Class::envelope`].
-    println!(
-        "{}",
-        note(Class::Over, at, spec, &format!("stopped watching {} — {}", spec.scope.name, over.said()), &p)
-    );
+    stream.put(at, Line::Note(Class::Over, format!("stopped watching {} — {}", spec.scope.name, over.said())));
+    stream.tick(at, &mut spool);
+    match spool.depth() {
+        // Nothing held, so the record goes and `doctor` stays quiet.
+        0 => {
+            store.clear_watch(&key);
+        }
+        // The ending could not be written — a closed pipe, most likely, which
+        // is the reader having gone away. The record stays, so the next watch
+        // in this pane resumes what this one was holding and `doctor` reports a
+        // watcher that stopped with a backlog rather than nothing at all.
+        _ => register(store, &key, spec, &ledger, ticks, &spool),
+    }
     over.code()
 }
 
@@ -2788,6 +3309,57 @@ fn say(emits: &[Emit], at: i64, spec: &Spec) {
     let _ = std::io::stdout().flush();
 }
 
+/// What the last watch under this key was holding.
+///
+/// **The register is the truth about the spool, not this process's memory.**
+/// `wsp watch --drain` empties it from another process, and a watch that kept
+/// its own copy would deliver those entries a second time; a watch that never
+/// read it at start-up would leave behind everything the previous process in
+/// this pane was holding when it died, which is a drop wearing the words *the
+/// process ended*.
+fn spool_of(store: &Store, key: &str) -> Spool {
+    Spool::of_json(store.watches().get(key).and_then(|v| v.get("spool")).unwrap_or(&Value::Null))
+}
+
+/// `wsp watch --drain` — print what is held and clear it, for a governor that
+/// is already awake and chooses to look.
+///
+/// Free by definition: the reader is running this, so the context read is
+/// already being paid for. It is also the escape hatch that makes the rest of
+/// this safe to trust — a design that decides when somebody is told is only
+/// tolerable if the somebody can always ask.
+fn drain(store: &Store, spec: &Spec) -> i32 {
+    let key = watch_key();
+    let at = util::epoch_secs();
+    let mut spool = spool_of(store, &key);
+    let stream = Stream::new(spec);
+    if spool.depth() == 0 {
+        // Said, and said positively. Nothing held and no watch at all are
+        // different facts and a reader draining a spool wants to know which.
+        let said = match store.watches().contains_key(&key) {
+            true => format!("nothing held on {} — the watch has told you everything it has", spec.scope.name),
+            false => format!("nothing held on {} — no watch is registered as {key}", spec.scope.name),
+        };
+        println!("{}", note(Class::Open, at, spec, &said, &Paint::new()));
+        return 0;
+    }
+    let held = spool.take();
+    if !stream.write(&held) {
+        spool.put_back(held);
+        return 1;
+    }
+    // Only now, and only this field: the record belongs to a watch that is
+    // probably still running, and rewriting the rest of it from here would
+    // stamp this process's pid over a live reporter's.
+    if let Some(mut rec) = store.watches().get(&key).cloned() {
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("spool".into(), spool.json());
+        }
+        store.set_watch(&key, rec);
+    }
+    0
+}
+
 /// How a watch is named in the register.
 ///
 /// The pane, because that is what a person reading `--status` would go and look
@@ -2800,11 +3372,11 @@ fn watch_key() -> String {
     }
 }
 
-fn register(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64) {
-    register_as(store, key, spec, ledger, ticks, std::process::id())
+fn register(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, spool: &Spool) {
+    register_as(store, key, spec, ledger, ticks, std::process::id(), spool)
 }
 
-fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, pid: u32) {
+fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, pid: u32, spool: &Spool) {
     store.set_watch(
         key,
         json!({
@@ -2825,11 +3397,27 @@ fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u6
             // it that has no `exec` behind it.
             "build": crate::build_stamp(),
             "ledger": ledger.json(),
+            // Beside the ledger, under the same key, written in the same atomic
+            // update — so it survives exactly what the ledger survives and
+            // `--status` and `doctor` can read its depth for nothing. See
+            // [`Spool`].
+            "spool": spool.json(),
         }),
     );
 }
 
 /// `wsp watch --status` — who is watching what, and whether they still are.
+/// What a watch is holding, said where the standing count already is.
+///
+/// Empty on everything that is holding nothing, so a watch without `--wake` —
+/// which can never hold anything — is byte-for-byte the line it always was.
+fn held(w: &Registered) -> String {
+    match w.spooled {
+        0 => String::new(),
+        n => format!(" · holding {n} · wsp watch --drain"),
+    }
+}
+
 fn status(store: &Store, args: &Args) -> i32 {
     let watches = registered(store);
     if args.json() {
@@ -2838,7 +3426,7 @@ fn status(store: &Store, args: &Args) -> i32 {
             serde_json::to_string_pretty(&watches
                 .iter()
                 .map(|w| json!({ "key": w.key, "scope": w.scope, "pid": w.pid, "tick": w.tick, "stale": w.stale(), "watching": w.watching(),
-                                 "build": w.build, "stale_build": w.stale_build() }))
+                                 "build": w.build, "stale_build": w.stale_build(), "spooled": w.spooled }))
                 .collect::<Vec<_>>())
             .unwrap_or_default()
         );
@@ -2865,7 +3453,7 @@ fn status(store: &Store, args: &Args) -> i32 {
             // running watch in this list, and the reader is here to find out
             // which of their watches is still going.
             (false, false, false) => p.dim(&format!("{} standing · read on demand", w.standing)),
-            (false, false, true) => p.dim(&format!("{} standing", w.standing)),
+            (false, false, true) => p.dim(&format!("{} standing{}", w.standing, held(w))),
         };
         println!(
             "{}  {}  {}  {}",
@@ -3482,6 +4070,7 @@ mod tests {
             standing: 0,
             daemon: false,
             build: crate::build_stamp(),
+            spooled: 0,
         };
         assert!(!pull.watching());
         assert!(!pull.stale(), "a day old and still not a fault: nobody promised to tick");
@@ -3499,6 +4088,7 @@ mod tests {
             standing: 0,
             daemon,
             build: build.into(),
+            spooled: 0,
         }
     }
 
@@ -3639,6 +4229,7 @@ mod tests {
                 standing: 0,
                 daemon: false,
                 build: crate::build_stamp(),
+                spooled: 0,
             };
             r.tick = util::iso_at(util::epoch_secs() - ago);
             r
@@ -4214,6 +4805,8 @@ mod tests {
             stop_after: None,
             until: None,
             json,
+            wake: false,
+            defer_max: DEFER_MAX,
         }
     }
 
@@ -4282,12 +4875,295 @@ mod tests {
     #[test]
     fn a_json_watcher_says_it_started_before_anything_has_happened() {
         let p = util::Paint::plain();
-        let v = parsed(&opening(&watching(true), 0, false, 0, &p));
+        let spec = watching(true);
+        let v = parsed(&render_for(&opening(&spec, 0, false), 0, &spec, &p));
         assert_eq!(v["class"], "open");
         assert_eq!(v["to"], "wsp", "addressed, like every other line");
         let said = v["text"].as_str().expect("it says something");
         assert!(said.contains("0 standing"), "and it says how much is up: {said}");
         assert!(said.contains("watching wsp"), "and what it is watching: {said}");
+    }
+
+    // ---- the wake -----------------------------------------------------------
+
+    fn waking(defer_max: i64) -> Spec {
+        Spec { wake: true, defer_max, ..watching(false) }
+    }
+
+    fn news(kind: Kind, edge: Edge, subject: &str) -> Line {
+        Line::News(Emit { edge, to: EVERYONE.into(), signal: sig(kind, subject), held: 0 })
+    }
+
+    fn beat() -> Line {
+        Line::Note(Class::Beat, "watching wsp · 1h · 0 standing".into())
+    }
+
+    /// **Nothing offered to the stream can vanish.** The one outcome that would
+    /// make this change worse than doing nothing is a seventh way to be silent,
+    /// and it would not look like a bug — it would look like a quiet fleet.
+    ///
+    /// So this is not a test of the table's cells; it is a test that the table
+    /// is *total*. Every line of every class goes in, in both modes, and the
+    /// count that comes out plus the count still held must be the count that
+    /// went in. An early return, a `continue`, or a filter running before the
+    /// table would all show up here as a number that does not add up.
+    #[test]
+    fn nothing_offered_to_the_stream_is_dropped() {
+        let mut every: Vec<Line> = vec![
+            Line::Note(Class::Open, "watching wsp".into()),
+            beat(),
+            Line::Note(Class::Replaced, REPLACED.into()),
+            Line::Note(Class::Over, "stopped watching wsp".into()),
+        ];
+        for kind in Kind::every().into_iter().chain(std::iter::once(Kind::Blind)) {
+            for edge in [Edge::Up, Edge::Down, Edge::Left] {
+                every.push(news(kind, edge, "a-1"));
+            }
+        }
+        for spec in [waking(DEFER_MAX), watching(false)] {
+            let mut stream = Stream::new(&spec);
+            let mut spool = Spool::default();
+            for l in &every {
+                stream.put(0, l.clone());
+            }
+            let written = stream.tick(0, &mut spool).len();
+            assert_eq!(
+                written + spool.depth(),
+                every.len(),
+                "wake={}: {written} written and {} held, out of {} offered",
+                spec.wake,
+                spool.depth(),
+                every.len()
+            );
+        }
+    }
+
+    /// `core-014` d2, and the measured half of the whole row: 45 of the 134
+    /// wakes one seat took in two days were a heartbeat saying nothing had
+    /// changed, and a heartbeat wake costs the same as a question from Ed
+    /// because the context is the price and not the payload.
+    ///
+    /// It is **held**, not dropped. Absence of a heartbeat only protects a
+    /// reader who is still reading; the reader here is asleep by design, and
+    /// the register is written every tick where a dead process cannot fake it.
+    #[test]
+    fn a_heartbeat_never_wakes_a_governor_and_is_never_lost() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec);
+        let mut spool = Spool::default();
+        for tick in 1..=5 {
+            stream.put(tick * 60, beat());
+            assert_eq!(stream.tick(tick * 60, &mut spool).len(), 0, "a heartbeat is not a wake");
+        }
+        assert_eq!(spool.depth(), 5, "and not one of them was lost");
+    }
+
+    /// A level that went away, and a level somebody else answers for now.
+    /// There is nothing for this reader to do about either — but *nothing to do
+    /// about* is not *not worth knowing*, so it waits for a line that was
+    /// already going to be printed and rides out under it at no extra cost.
+    #[test]
+    fn a_level_going_down_rides_the_next_thing_worth_waking_for() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec);
+        let mut spool = Spool::default();
+
+        stream.put(0, news(Kind::Flag, Edge::Down, "a-1"));
+        stream.put(0, news(Kind::Review, Edge::Left, "a-2"));
+        assert_eq!(stream.tick(0, &mut spool).len(), 0, "neither is worth a context read on its own");
+        assert_eq!(spool.depth(), 2);
+
+        stream.put(60, news(Kind::NeedsAPerson, Edge::Up, "a-3"));
+        assert_eq!(stream.tick(60, &mut spool).len(), 3, "the wake, and the two that were waiting");
+        assert_eq!(spool.depth(), 0);
+    }
+
+    /// Without this a fleet that never earns a wake never delivers its backlog,
+    /// and the drop is back in through the door. The number is [`DEFER_MAX`]
+    /// and its argument is measured there.
+    #[test]
+    fn a_spooled_fact_nobody_collected_becomes_a_wake_on_its_own() {
+        let spec = waking(4 * 60 * 60);
+        let mut stream = Stream::new(&spec);
+        let mut spool = Spool::default();
+
+        stream.put(0, news(Kind::Flag, Edge::Up, "a-1"));
+        assert_eq!(stream.tick(0, &mut spool).len(), 0);
+        // Three hours and fifty-nine minutes of nobody being told.
+        assert_eq!(stream.tick(4 * 60 * 60 - 60, &mut spool).len(), 0, "not yet");
+        assert_eq!(spool.depth(), 1);
+        // The age of the oldest, not of the newest: a steady trickle must not
+        // keep pushing the deadline out in front of the fact that is waiting.
+        stream.put(4 * 60 * 60, beat());
+        assert_eq!(stream.tick(4 * 60 * 60, &mut spool).len(), 2, "it is now justification by itself");
+        assert_eq!(spool.depth(), 0);
+    }
+
+    /// `over` is a wake, and it is the line the spool rides out on. A spool
+    /// that died with its process would be a drop with a different word on it.
+    #[test]
+    fn a_watch_that_ends_flushes_what_it_was_holding() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec);
+        let mut spool = Spool::default();
+
+        stream.put(0, beat());
+        stream.put(0, news(Kind::Flag, Edge::Up, "a-1"));
+        assert_eq!(stream.tick(0, &mut spool).len(), 0);
+
+        stream.put(60, Line::Note(Class::Over, "stopped watching wsp — the time asked for is up".into()));
+        let written = stream.tick(60, &mut spool);
+        assert_eq!(written.len(), 3, "the ending, and the two it carried out");
+        assert_eq!(spool.depth(), 0, "nothing is left behind for nobody to read");
+        // And the ending is the **last** line, not the first. A consumer that
+        // reads until the stream says it is over is the obvious one to write,
+        // and it must not lose the backlog that ending carried out with it.
+        assert_eq!(
+            written.iter().map(|h| h.class.as_str()).collect::<Vec<_>>(),
+            vec!["beat", "news", "over"],
+            "the backlog, then the ending",
+        );
+    }
+
+    /// `worklist-033` under `--wake`. The watch is running logic that has since
+    /// been fixed, it cannot say so twice, and only the reader can repair it —
+    /// so this is the one aside that must never wait for company.
+    #[test]
+    fn a_build_landing_under_the_watch_wakes_it_at_once() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec);
+        let mut spool = Spool::default();
+
+        stream.put(0, beat());
+        assert_eq!(stream.tick(0, &mut spool).len(), 0);
+        stream.put(60, Line::Note(Class::Replaced, REPLACED.into()));
+        assert_eq!(stream.tick(60, &mut spool).len(), 2, "at once, and it takes the backlog with it");
+        assert_eq!(
+            Line::Note(Class::Replaced, REPLACED.into()).disposition(),
+            Disposition::Wake,
+            "and it is a different class from the heartbeat it used to be confused with",
+        );
+        assert_eq!(beat().disposition(), Disposition::Spool);
+    }
+
+    /// The process ending, a restart, an install landing underneath. The spool
+    /// goes in the watch record beside the ledger, so it survives all three —
+    /// and an entry written by a build whose vocabulary this one does not have
+    /// is **kept as its words** rather than skipped, because skipping it would
+    /// be the drop this row exists to make unrepresentable.
+    #[test]
+    fn a_spool_survives_the_process_that_wrote_it() {
+        let spec = waking(DEFER_MAX);
+        let mut stream = Stream::new(&spec);
+        let mut spool = Spool::default();
+        stream.put(0, beat());
+        stream.put(0, news(Kind::Flag, Edge::Up, "a-1"));
+        stream.tick(0, &mut spool);
+        assert_eq!(spool.depth(), 2);
+
+        let back = Spool::of_json(&spool.json());
+        assert_eq!(back, spool, "byte for byte, through the record and out again");
+
+        // Now the same record as a build that has never heard of one of these.
+        let mut raw = spool.json();
+        raw.as_array_mut().unwrap()[0].as_object_mut().unwrap().insert("class".into(), json!("aurora"));
+        let odd = Spool::of_json(&raw);
+        assert_eq!(odd.depth(), 2, "the unreadable entry is kept, not skipped");
+        assert!(
+            odd.held[0].say(&spec, &util::Paint::plain()).contains("watching wsp"),
+            "and it still says what it said: {}",
+            odd.held[0].say(&spec, &util::Paint::plain())
+        );
+    }
+
+    /// `--wake` is opt-in and a bare `wsp watch` is what it always was. A
+    /// person in front of a stream wants the heartbeat; d2 traded it away only
+    /// for the reader that is asleep.
+    #[test]
+    fn a_bare_watch_prints_what_it_printed_before_this_change() {
+        let spec = watching(false);
+        let mut stream = Stream::new(&spec);
+        let mut spool = Spool::default();
+        stream.put(0, beat());
+        stream.put(0, news(Kind::Flag, Edge::Down, "a-1"));
+        assert_eq!(stream.tick(0, &mut spool).len(), 2, "both, now, in the order they happened");
+        assert_eq!(spool.depth(), 0, "a bare watch holds nothing back and so has nothing to hold");
+    }
+
+    /// **This row's whole claim, counted rather than estimated.**
+    ///
+    /// The corpus is real. `fixtures/wake-2026-08-19-seat.jsonl` is every line
+    /// `wsp watch` actually delivered to the seat that filed `core-014`,
+    /// recovered from that session's own transcript (`fb09b0f3`, 2026-08-19 and
+    /// -20) and classified once into the vocabulary `core-016` closed: 158
+    /// lines in 134 deliveries. A delivery is the unit that matters, because a
+    /// delivery is what re-invokes a governor and re-reads its whole
+    /// conversation — 208k tokens on that seat, the same for a heartbeat as for
+    /// a question from Ed.
+    ///
+    /// **134 deliveries become 71 — 47% of that session's watch wakes were not
+    /// worth a context read.** The numbers are asserted exactly, so if a cell
+    /// of [`Line::disposition`] moves this test says by how much rather than
+    /// merely that something changed.
+    #[test]
+    fn the_measured_session_is_replayed_and_the_wake_count_is_counted() {
+        let corpus: Vec<Value> = include_str!("../fixtures/wake-2026-08-19-seat.jsonl")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("the fixture is one JSON document per line"))
+            .collect();
+        assert_eq!(corpus.len(), 158, "every line the session delivered");
+
+        // Grouped by the second they were delivered in, which is the tick they
+        // would have shared.
+        let mut ticks: Vec<(i64, Vec<Line>)> = Vec::new();
+        for rec in &corpus {
+            let at = rec["at"].as_i64().expect("a stamp");
+            let class = Class::parse(rec["class"].as_str().expect("a class")).expect("a known class");
+            let l = match class {
+                Class::News => {
+                    let kind = Kind::parse(rec["kind"].as_str().expect("a signal")).expect("a known signal");
+                    let edge = Edge::parse(rec["edge"].as_str().expect("an edge")).expect("a known edge");
+                    news(kind, edge, "replayed")
+                }
+                c => Line::Note(c, rec["text"].as_str().unwrap_or_default().to_string()),
+            };
+            match ticks.last_mut() {
+                Some((t, batch)) if *t == at => batch.push(l),
+                _ => ticks.push((at, vec![l])),
+            }
+        }
+        assert_eq!(ticks.len(), 134, "deliveries, each one a context read");
+
+        let count = |defer_max: i64| {
+            let spec = waking(defer_max);
+            let mut spool = Spool::default();
+            let mut wakes = 0;
+            for (at, batch) in &ticks {
+                let mut stream = Stream::new(&spec);
+                for l in batch {
+                    stream.put(*at, l.clone());
+                }
+                if !stream.tick(*at, &mut spool).is_empty() {
+                    wakes += 1;
+                }
+            }
+            wakes
+        };
+
+        // The table alone, and then what bounding the silence costs on top of
+        // it. `DEFER_MAX` is argued from exactly these numbers.
+        // The table alone, and then what bounding the silence costs on top of
+        // it. `DEFER_MAX` is argued from exactly these four numbers.
+        assert_eq!(count(i64::MAX), 70, "the table alone");
+        assert_eq!(count(4 * 60 * 60), 71, "four hours costs one extra context read in two days");
+        assert_eq!(count(2 * 60 * 60), 74, "two hours costs four");
+        assert_eq!(count(60 * 60), 78, "an hour costs eight");
+        assert_eq!(count(DEFER_MAX), 71, "and the default is the four-hour one");
+
+        // **134 wakes to 71.** Said as an assertion so the claim cannot drift
+        // away from the prose that quotes it.
+        assert_eq!((ticks.len() - count(DEFER_MAX)) * 100 / ticks.len(), 47);
     }
 
     /// **The fourteen-wide column has one alphabet, and no word in it means

@@ -757,10 +757,13 @@ impl Paint {
         Paint { on: colour_enabled() }
     }
     /// No colour, whatever the terminal says — for text that is going to be
-    /// compared rather than looked at. A test that asserts on a line of output
-    /// should not be asserting on escape codes, and it should not be quietly
-    /// passing or failing on whether the harness happened to keep a tty.
-    #[cfg(test)]
+    /// compared or stored rather than looked at. A test that asserts on a line
+    /// of output should not be asserting on escape codes, and it should not be
+    /// quietly passing or failing on whether the harness happened to keep a
+    /// tty. The other caller is `cmd_watch`'s spool, which writes a rendering
+    /// of every line it holds into the watch record — read back by a person
+    /// looking at `watches.json`, and by a build that may no longer have the
+    /// vocabulary to re-render it.
     pub fn plain() -> Self {
         Paint { on: false }
     }
