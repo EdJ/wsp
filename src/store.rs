@@ -1835,6 +1835,34 @@ impl Store {
         }
     }
 
+    /// Change one watch record **with the file to ourselves**, and hand back
+    /// whatever the change decided.
+    ///
+    /// `set_watch` cannot promise this and never could: the caller computes the
+    /// new value outside the lock and hands over a snapshot of a record it read
+    /// some time ago, so the lock faithfully makes the wrong write indivisible.
+    /// That is `core-022` — a `wsp watch --drain` landing in the working part of
+    /// a tick was clobbered by the write-back at the end of it, and the entries
+    /// a governor had already read were delivered a second time.
+    ///
+    /// The comment above [`Store::locked`] describes the same failure one level
+    /// up and is the reason that lock exists. This is the same fix applied to a
+    /// field *inside* a record rather than to the map of records: read, change
+    /// and write without anybody else getting in between.
+    pub fn update_watch<T>(&self, key: &str, f: impl FnOnce(&mut Value) -> T) -> T {
+        self.locked(|| {
+            let mut m = match self.read_json("watches.json") {
+                Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            let mut rec = m.remove(key).unwrap_or(Value::Null);
+            let out = f(&mut rec);
+            m.insert(key.to_string(), rec);
+            self.write_json("watches.json", &Value::Object(m));
+            out
+        })
+    }
+
     pub fn set_watch(&self, key: &str, value: Value) {
         self.update_json("watches.json", |w| {
             w.insert(key.to_string(), value);

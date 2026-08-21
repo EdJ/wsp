@@ -661,6 +661,21 @@ impl Line {
 /// One line being held, and what is needed to say it later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Spooled {
+    /// Which entry this is, in this record, for ever.
+    ///
+    /// **`core-022`.** Two processes write a watch record — the watch itself
+    /// every tick, and `wsp watch --drain` whenever a governor looks — and the
+    /// fix is that neither writes a snapshot of the spool: one appends and the
+    /// other removes, both inside [`Store::update_watch`]'s lock. Removing by
+    /// seq is what makes those two operations commute. Without it the only way
+    /// to say *these are gone* is to write back the whole list, which is the
+    /// defect.
+    ///
+    /// Allocated inside the lock from a counter on the record, so it is unique
+    /// and never reused. Zero for an entry written before this field existed,
+    /// which is safe: a build that did not have seqs also did not remove by
+    /// them.
+    pub(crate) seq: u64,
     /// When it happened, not when it is delivered. A fact that waited four
     /// hours says four hours ago, because a reader acting on the clock in the
     /// line would otherwise go looking for something that moved long since.
@@ -698,7 +713,7 @@ pub(crate) struct Spooled {
 /// ledger beside it survives. See [`register_as`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Spool {
-    held: Vec<Spooled>,
+    pub(crate) held: Vec<Spooled>,
 }
 
 impl Spooled {
@@ -707,8 +722,12 @@ impl Spooled {
     /// The words are rendered here rather than at flush time and stored beside
     /// the structured form — see [`Spooled::text`] for why the duplication is
     /// the point rather than an oversight.
-    fn of(at: i64, line: Line) -> Spooled {
+    pub(crate) fn of(at: i64, line: Line) -> Spooled {
         Spooled {
+            // Assigned when it joins a record — see [`Spool::append`]. An entry
+            // in flight and never persisted has no place in a record's
+            // numbering and must not take one.
+            seq: 0,
             at,
             text: match &line {
                 Line::Note(_, said) => said.clone(),
@@ -774,14 +793,60 @@ impl Spool {
         self.held.first().map(|h| h.at)
     }
 
-    /// Hold this, whatever the table would have said about it.
+    /// Add these to a record, numbering them, and hand back everything the
+    /// record now holds.
     ///
-    /// For a caller that writes the record down **before** anything is
-    /// attempted rather than after — `crate::wake`, where the pass has already
-    /// saved its ledger and at-most-once is not affordable. The table still
-    /// decides when the spool leaves: that is [`Spool::owed`].
-    pub(crate) fn put(&mut self, at: i64, line: Line) {
-        self.held.push(Spooled::of(at, line));
+    /// **The append half of `core-022`.** It runs inside
+    /// [`Store::update_watch`], so what it reads and what it writes cannot be
+    /// split by a `--drain` in another process, and it never writes back
+    /// anything it did not put there.
+    pub(crate) fn append(rec: &mut Value, lines: Vec<Spooled>) -> Spool {
+        // A key nobody has written yet arrives as `Value::Null`, which has no
+        // object to insert into — so this used to hold nothing and say nothing
+        // about it, which is a drop by silence.
+        if !rec.is_object() {
+            *rec = json!({});
+        }
+        let mut spool = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        let mut next = rec.get("next_seq").and_then(Value::as_u64).unwrap_or(0).max(
+            // A record written before seqs existed numbers from above whatever
+            // is in it, so an old entry and a new one can never collide.
+            spool.held.iter().map(|h| h.seq).max().map(|m| m + 1).unwrap_or(0),
+        );
+        for mut h in lines {
+            h.seq = next;
+            next += 1;
+            spool.held.push(h);
+        }
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("next_seq".into(), json!(next));
+            o.insert("spool".into(), spool.json());
+        }
+        spool
+    }
+
+    /// Take these out of a record, by identity.
+    ///
+    /// **The removal half, and it is idempotent on purpose.** An entry a
+    /// `--drain` has already taken is simply not there, and one added since the
+    /// caller last looked has a higher seq and is untouched. That is what makes
+    /// the two writers commute, and it is why this takes a *watermark* rather
+    /// than a list: a flush always takes everything the record held at the
+    /// moment it looked, so everything at or below that number went with it.
+    pub(crate) fn settle(rec: &mut Value, through: u64) {
+        if !rec.is_object() {
+            *rec = json!({});
+        }
+        let mut spool = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        spool.held.retain(|h| h.seq > through);
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("spool".into(), spool.json());
+        }
+    }
+
+    /// The highest identity in a batch, which is what [`Spool::settle`] takes.
+    pub(crate) fn watermark(of: &[Spooled]) -> u64 {
+        of.iter().map(|h| h.seq).max().unwrap_or(0)
     }
 
     /// Everything held, in the order it happened — **taken, not copied**.
@@ -804,7 +869,7 @@ impl Spool {
             self.held
                 .iter()
                 .map(|h| {
-                    let mut v = json!({ "at": h.at, "class": h.class, "text": h.text });
+                    let mut v = json!({ "seq": h.seq, "at": h.at, "class": h.class, "text": h.text });
                     if let (Some(Line::News(e)), Some(o)) = (&h.line, v.as_object_mut()) {
                         o.insert("edge".into(), json!(e.edge.word()));
                         o.insert("held".into(), json!(e.held));
@@ -820,6 +885,7 @@ impl Spool {
     pub(crate) fn of_json(v: &Value) -> Spool {
         let mut held = Vec::new();
         for rec in v.as_array().into_iter().flatten() {
+            let seq = rec.get("seq").and_then(Value::as_u64).unwrap_or(0);
             let at = rec.get("at").and_then(Value::as_i64).unwrap_or(0);
             let class = rec.get("class").and_then(Value::as_str).unwrap_or_default().to_string();
             let text = rec.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -841,7 +907,7 @@ impl Spool {
                 Some(c) => Some(Line::Note(c, text.clone())),
                 None => None,
             };
-            held.push(Spooled { at, line, text, class });
+            held.push(Spooled { seq, at, line, text, class });
         }
         Spool { held }
     }
@@ -2773,6 +2839,18 @@ impl<'a, S: Sink> Stream<'a, S> {
     /// is this row's whole claim — see
     /// [`the_measured_session_is_replayed_and_the_wake_count_is_counted`] —
     /// and a claim nothing can count is an estimate.
+    /// What this tick decided to hold, taken out so the caller can write it
+    /// down before anything is attempted.
+    ///
+    /// `core-022`: the caller appends these to the record **inside the lock**
+    /// and gets back everything the record now holds, so a `--drain` from
+    /// another process is never written over. Before that, this was merged into
+    /// a `Spool` here and the whole thing was written back as a snapshot at the
+    /// end of the tick, which is the defect.
+    pub(crate) fn cold(&mut self) -> Vec<Spooled> {
+        std::mem::take(&mut self.cold)
+    }
+
     pub(crate) fn tick(&mut self, at: i64, spool: &mut Spool) -> Vec<Spooled> {
         spool.held.append(&mut self.cold);
         // Escalation. Without it a fleet that never earns a wake never delivers
@@ -3333,7 +3411,7 @@ fn once(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // pid 0, deliberately: this process is already over. A pull ledger is not a
     // reporter that can die, so it must never read as one — see
     // [`Registered::watching`].
-    register_as(store, &key, spec, &ledger, 1, 0, &Spool::default());
+    register_as(store, &key, spec, &ledger, 1, 0, &[]);
     0
 }
 
@@ -3425,10 +3503,6 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     let mut running = util::exe_stamp();
 
     let mut stream = Stream::new(spec, Stdout);
-    // What the last watch under this key was holding, which is routinely
-    // something: a spool that dies with the process that wrote it is a drop
-    // wearing the words *the process ended*. See [`spool_of`].
-    let mut spool = spool_of(store, &key);
 
     let first = poll.sample();
     let primed = ledger.prime(&first, started);
@@ -3436,8 +3510,14 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     for e in primed {
         stream.put(started, Line::News(e));
     }
-    stream.tick(started, &mut spool);
-    register(store, &key, spec, &ledger, ticks, &spool);
+    // What this tick decided to hold goes into the record *before* anything is
+    // written, and what comes back is everything the record holds — including
+    // whatever the last watch under this key was holding when its process ended,
+    // which is routinely something. A spool that dies with the process that
+    // wrote it is a drop wearing the words *the process ended*.
+    let mut spool = store.update_watch(&key, |rec| Spool::append(rec, stream.cold()));
+    let written = stream.tick(started, &mut spool);
+    register(store, &key, spec, &ledger, ticks, &written);
 
     let over = loop {
         std::thread::sleep(std::time::Duration::from_secs(spec.every.max(1) as u64));
@@ -3447,9 +3527,6 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         if !store.exists() {
             break Over::StoreGone;
         }
-        // Re-read rather than carried, because `--drain` may have emptied it
-        // from another process since the last tick — see [`spool_of`].
-        spool = spool_of(store, &key);
         // Before the read, so a reader scrolling back finds the warning above
         // the first line it should not trust.
         if let Some(now) = util::exe_stamp().filter(|now| running.is_some_and(|was| was != *now)) {
@@ -3472,8 +3549,14 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         // One decision per tick, after everything this tick produced has been
         // offered. A wake carries the backlog out with it, so the order the
         // lines were put in is the order they are read in.
-        stream.tick(at, &mut spool);
-        register(store, &key, spec, &ledger, ticks, &spool);
+        //
+        // Appended first and inside the lock, so what comes back is the record
+        // as it actually is — a `--drain` in another process between the last
+        // tick and this one has already taken what it took, and this never
+        // writes those entries back. `core-022`.
+        spool = store.update_watch(&key, |rec| Spool::append(rec, stream.cold()));
+        let written = stream.tick(at, &mut spool);
+        register(store, &key, spec, &ledger, ticks, &written);
 
         if spec.stop_after.is_some_and(|s| at - started >= s) {
             break Over::Elapsed;
@@ -3507,7 +3590,9 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
     // which is the same fact in the field every other line of this stream also
     // carries. See [`Class::envelope`].
     stream.put(at, Line::Note(Class::Over, format!("stopped watching {} — {}", spec.scope.name, over.said())));
-    stream.tick(at, &mut spool);
+    spool = store.update_watch(&key, |rec| Spool::append(rec, stream.cold()));
+    let written = stream.tick(at, &mut spool);
+    register(store, &key, spec, &ledger, ticks, &written);
     match ended(&spool) {
         // Nothing held, so the record goes and `doctor` stays quiet.
         Ending::Told => {
@@ -3522,7 +3607,6 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         // in front of the pane now; and the code reaches a wrapper that
         // captured neither stream. See [`Ending`] and [`untold`].
         Ending::Untold(held) => {
-            register(store, &key, spec, &ledger, ticks, &spool);
             eprintln!("{}", untold(spec, &key, held, &over));
             1
         }
@@ -3566,34 +3650,54 @@ fn spool_of(store: &Store, key: &str) -> Spool {
 /// this safe to trust — a design that decides when somebody is told is only
 /// tolerable if the somebody can always ask.
 fn drain(store: &Store, spec: &Spec) -> i32 {
-    let key = watch_key();
     let at = util::epoch_secs();
-    let mut spool = spool_of(store, &key);
     let mut stream = Stream::new(spec, Stdout);
-    if spool.depth() == 0 {
+    // **Two records, because there are two spools and a governor is owed by
+    // both.** This pane's own `wsp watch --wake`, if it is running one, and the
+    // wake the *daemon* is holding for the seat this pane governs — which after
+    // `core-021` d1 is the one that matters, and which nothing could reach
+    // until now. A verb that could only drain a spool almost nobody has is the
+    // escape hatch `core-017` promised and did not deliver.
+    // Kept per record rather than merged, because a seq numbers an entry
+    // *within* its own record — two records can hand out the same number for
+    // different lines, so each is settled against its own watermark.
+    let keys = [watch_key(), crate::wake::key_for(&spec.scope.name)];
+    let spools: Vec<(String, Spool)> = keys.iter().map(|k| (k.clone(), spool_of(store, k))).collect();
+    let held: Vec<Spooled> = spools.iter().flat_map(|(_, s)| s.held.clone()).collect();
+    if held.is_empty() {
         // Said, and said positively. Nothing held and no watch at all are
         // different facts and a reader draining a spool wants to know which.
-        let said = match store.watches().contains_key(&key) {
-            true => format!("nothing held on {} — the watch has told you everything it has", spec.scope.name),
-            false => format!("nothing held on {} — no watch is registered as {key}", spec.scope.name),
+        let known = store.watches();
+        let said = match keys.iter().any(|k| known.contains_key(k)) {
+            true => format!("nothing held on {} — you have been told everything there is", spec.scope.name),
+            false => format!("nothing held on {} — nothing is watching it", spec.scope.name),
         };
         println!("{}", note(Class::Open, at, spec, &said, &Paint::new()));
         return 0;
     }
-    let held = spool.take();
+    // Printed **before** anything is taken out of a record, so a drain that
+    // cannot write leaves both spools exactly as it found them. An entry clears
+    // when it arrived and never when a send was attempted, and that rule does
+    // not stop applying because the reader asked for it.
+    //
+    // In time order across both, because a person reading a backlog is reading
+    // a night, not two lists.
+    let mut held = held;
+    held.sort_by_key(|h| h.at);
     let said: Vec<String> = held.iter().map(|h| h.say(spec, &Paint::new())).collect();
     if !stream.sink.deliver(&said) {
-        spool.put_back(held);
         return 1;
     }
-    // Only now, and only this field: the record belongs to a watch that is
-    // probably still running, and rewriting the rest of it from here would
-    // stamp this process's pid over a live reporter's.
-    if let Some(mut rec) = store.watches().get(&key).cloned() {
-        if let Some(o) = rec.as_object_mut() {
-            o.insert("spool".into(), spool.json());
+    // And only these entries. Each record belongs to a writer that is probably
+    // still running — a watch, or the daemon — so rewriting the rest of it from
+    // here would stamp this process over theirs, and rewriting the *spool* from
+    // here is `core-022` itself: whatever they have appended since this printed
+    // has a higher seq and is left alone.
+    for (key, mine) in &spools {
+        if !mine.held.is_empty() {
+            let through = Spool::watermark(&mine.held);
+            store.update_watch(key, |rec| Spool::settle(rec, through));
         }
-        store.set_watch(&key, rec);
     }
     0
 }
@@ -3610,14 +3714,32 @@ fn watch_key() -> String {
     }
 }
 
-fn register(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, spool: &Spool) {
-    register_as(store, key, spec, ledger, ticks, std::process::id(), spool)
+fn register(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, written: &[Spooled]) {
+    register_as(store, key, spec, ledger, ticks, std::process::id(), written)
 }
 
-fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, pid: u32, spool: &Spool) {
-    store.set_watch(
-        key,
-        json!({
+/// Write down what this process owns, and take out what it has delivered.
+///
+/// **Two different kinds of field and they are written two different ways**,
+/// which is the whole of `core-022`. The pid, the tick, the count, the ledger
+/// and the build stamp have exactly one writer, so a snapshot of them is a true
+/// statement. The spool has two — this watch, and any `--drain` a governor
+/// runs — so it is never written as a snapshot: entries are appended by
+/// [`Spool::append`] before a delivery is attempted and removed by
+/// [`Spool::settle`] after one arrives, both inside [`Store::update_watch`],
+/// and nothing here writes back a list it read a whole tick ago.
+fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, pid: u32, written: &[Spooled]) {
+    store.update_watch(key, |rec| {
+        // Delivered, so gone — and gone in a way that cannot resurrect what a
+        // `--drain` took in the meantime, because it is by identity and not by
+        // rewriting the list.
+        if !written.is_empty() {
+            Spool::settle(rec, Spool::watermark(written));
+        }
+        if !rec.is_object() {
+            *rec = json!({});
+        }
+        let owned = json!({
             "scope": spec.scope.name,
             "seated": spec.scope.seated,
             "pid": pid,
@@ -3635,13 +3757,15 @@ fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u6
             // it that has no `exec` behind it.
             "build": crate::build_stamp(),
             "ledger": ledger.json(),
-            // Beside the ledger, under the same key, written in the same atomic
-            // update — so it survives exactly what the ledger survives and
-            // `--status` and `doctor` can read its depth for nothing. See
-            // [`Spool`].
-            "spool": spool.json(),
-        }),
-    );
+        });
+        // Merged rather than assigned, so `next_seq` and `spool` — the two
+        // fields this process does not own outright — survive the write.
+        if let (Some(dst), Some(src)) = (rec.as_object_mut(), owned.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+    });
 }
 
 /// `wsp watch --status` — who is watching what, and whether they still are.
@@ -5499,6 +5623,124 @@ mod tests {
         stream.put(0, Line::Note(Class::Over, "stopped watching wsp".into()));
         stream.tick(0, &mut spool);
         assert!(matches!(ended(&spool), Ending::Told));
+    }
+
+    // ---- two writers on one record -----------------------------------------
+
+    fn recorded(store: &Store, key: &str) -> Spool {
+        Spool::of_json(store.watches().get(key).and_then(|v| v.get("spool")).unwrap_or(&Value::Null))
+    }
+
+    /// **`core-022`, asserted as an interleaving rather than as a race.**
+    ///
+    /// Two processes write a watch record: the watch itself every tick, and a
+    /// `wsp watch --drain` whenever a governor looks. The failure is a lost
+    /// update — the watch reads the record at the top of its tick, does a poll
+    /// and a delivery, and writes back a whole spool that no longer reflects
+    /// what the drain took in between, so entries the governor has already read
+    /// are delivered a second time. Reproduced twice at `--every 1` against a
+    /// live store and absent at `--every 5`, which is exactly what makes it a
+    /// race.
+    ///
+    /// **A race is a bad thing to assert on**, so this asserts the property
+    /// underneath it, in the order the two writers actually interleave: the
+    /// write-back is a delta, so nothing this tick did not put there can be
+    /// written back by it. It shipped without this because the case was named
+    /// in a docstring and the only test drove `Stream::tick`, which is one
+    /// writer and cannot see it.
+    #[test]
+    fn an_entry_a_drain_took_is_not_written_back_by_the_tick_it_landed_in() {
+        let env = util::isolated("watch-drain-race");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let key = "w1:p1";
+        let spec = waking(DEFER_MAX);
+
+        // The watch's tick begins: what it is holding goes into the record.
+        let held = store.update_watch(key, |rec| {
+            Spool::append(rec, vec![Spooled::of(0, beat()), Spooled::of(0, beat())])
+        });
+        assert_eq!(held.depth(), 2);
+
+        // …and while that tick is still working — a poll, a herdr call, a
+        // delivery — a governor drains from another process.
+        let drained = recorded(&store, key);
+        store.update_watch(key, |rec| Spool::settle(rec, Spool::watermark(&drained.held)));
+        assert_eq!(recorded(&store, key).depth(), 0, "the drain took both");
+
+        // A new line arrives — the tick is still working, and the world does
+        // not stop for it.
+        store.update_watch(key, |rec| Spool::append(rec, vec![Spooled::of(60, news(Kind::Review, Edge::Up, "a-9"))]));
+
+        // The tick now finishes, having written out the two it was carrying.
+        // Both are already gone, so settling them is a no-op — and the write
+        // must not put them back, nor take the new one with them.
+        register_as(&store, key, &spec, &Ledger::default(), 1, 1, &held.held);
+        let left = recorded(&store, key);
+        assert_eq!(left.depth(), 1, "what the drain took stayed taken, and the late line survived");
+        assert_eq!(left.held[0].class, "news");
+        assert_eq!(
+            store.watches().get(key).and_then(|v| v.get("pid")).and_then(Value::as_u64),
+            Some(1),
+            "while the fields the watch does own were written",
+        );
+    }
+
+    /// The other direction, and the reason settling is by identity rather than
+    /// by emptying: a line spooled *after* a flush was decided must survive it.
+    ///
+    /// Without this the fix would trade one lost update for another — the tick
+    /// that delivers three lines would sweep away the fourth that arrived while
+    /// it was delivering, which is a drop rather than a duplicate and therefore
+    /// worse than what it replaced.
+    #[test]
+    fn a_line_spooled_while_a_flush_was_in_the_air_is_not_settled_away() {
+        let env = util::isolated("watch-settle-window");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let key = "w1:p1";
+        let spec = waking(DEFER_MAX);
+
+        let going = store.update_watch(key, |rec| {
+            Spool::append(rec, vec![Spooled::of(0, beat()), Spooled::of(0, beat())])
+        });
+        let watermark = Spool::watermark(&going.held);
+
+        // A fourth line arrives while the three above are being written out.
+        store.update_watch(key, |rec| Spool::append(rec, vec![Spooled::of(60, news(Kind::Review, Edge::Up, "a-9"))]));
+
+        // The flush lands, and takes out only what it carried.
+        register_as(&store, key, &spec, &Ledger::default(), 2, 1, &going.held);
+        let left = recorded(&store, key);
+        assert_eq!(left.depth(), 1, "the one that arrived late is still owed");
+        assert_eq!(left.held[0].class, "news");
+        assert!(left.held[0].seq > watermark, "because its identity is above the watermark");
+    }
+
+    /// Identities are never reused, including across a record written by a
+    /// build that had none — otherwise settling one entry would take an
+    /// unrelated one with it.
+    #[test]
+    fn an_identity_is_never_handed_out_twice() {
+        let env = util::isolated("watch-seq");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let key = "w1:p1";
+
+        let mut seen: Vec<u64> = Vec::new();
+        for tick in 0..5 {
+            let s = store.update_watch(key, |rec| Spool::append(rec, vec![Spooled::of(tick, beat())]));
+            seen.extend(s.held.iter().map(|h| h.seq));
+            // Take one out every other tick, so the list shrinks as well as grows.
+            if tick % 2 == 1 {
+                store.update_watch(key, |rec| Spool::settle(rec, Spool::watermark(&s.held)));
+            }
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.iter().collect::<std::collections::BTreeSet<_>>().len());
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "and they only go up: {seen:?}");
     }
 
     /// **This row's whole claim, counted rather than estimated.**

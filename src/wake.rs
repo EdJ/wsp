@@ -56,7 +56,7 @@
 
 use crate::agent_commands;
 use crate::cmd_govern;
-use crate::cmd_watch::{Emit, Line, Sink, Spec, Spool, Stream, EVERYONE};
+use crate::cmd_watch::{Emit, Line, Sink, Spec, Spool, Spooled, Stream, EVERYONE};
 use crate::place::Seat as Pane;
 use crate::store::Store;
 use crate::util;
@@ -116,31 +116,46 @@ pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
 fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) {
     let key = key_for(scope);
     let spec = Spec::for_wake(scope);
-    let mut spool = load(store, &key);
     let delivered = record(store, &key).0;
     // Nothing new and nothing held is nothing to do. Said here rather than at
-    // the caller because the caller now visits every seat with a record, and a
-    // seat at rest must not cost a store write every twenty seconds for ever.
-    if emits.is_empty() && spool.depth() == 0 {
+    // the caller because the caller visits every seat with a record, and a seat
+    // at rest must not cost a store write every twenty seconds for ever.
+    if emits.is_empty() && load(store, &key).depth() == 0 {
         return;
     }
 
-    for e in emits {
-        spool.put(at, Line::News((*e).clone()));
-    }
-    // Written down before anything is attempted — see the module docs. If this
-    // process dies in the next line, the fact is on disk and the next tick
-    // delivers it.
-    save(store, &key, &spool, delivered, NOT_YET);
+    // **Appended inside the lock, and what comes back is the record as it
+    // actually is.** Two things follow, and they are the whole of `core-022`
+    // on this path: the fact is durable before anything is attempted (see the
+    // module docs), and a `wsp watch --drain` from a governor's own pane
+    // between two ticks is not written over by this one.
+    let mut spool = store.update_watch(&key, |rec| {
+        let fresh: Vec<Spooled> =
+            emits.iter().map(|e| Spooled::of(at, Line::News((*e).clone()))).collect();
+        let s = Spool::append(rec, fresh);
+        stamp(rec, scope, delivered, NOT_YET, &s);
+        s
+    });
 
     // Nothing is offered as *hot*: everything this pass produced is already in
     // the spool by the line above, so the only question left is whether that
     // spool owes somebody a context read. `Stream::tick` answers it with the
     // same table `wsp watch --wake` uses, and returns what actually left —
-    // which is empty unless the sink took it, so it is also the count.
+    // which is empty unless the sink took it.
+    // Taken before the flush, because a flush empties the copy in hand and the
+    // number is what says *everything up to here has gone*.
+    let watermark = Spool::watermark(&spool.held);
     let mut tell = Tell::new(store, scope);
-    let sent = Stream::new(&spec, &mut tell).tick(at, &mut spool).len();
-    save(store, &key, &spool, delivered + sent, tell.why);
+    let written = Stream::new(&spec, &mut tell).tick(at, &mut spool).len();
+    store.update_watch(&key, |rec| {
+        // Delivered, so gone — by identity, so a drain that took them first is
+        // not undone and anything appended since is not swept away with them.
+        if written > 0 {
+            Spool::settle(rec, watermark);
+        }
+        let now = Spool::of_json(rec.get("spool").unwrap_or(&serde_json::Value::Null));
+        stamp(rec, scope, delivered + written, tell.why, &now);
+    });
 }
 
 /// A wake, told.
@@ -249,26 +264,27 @@ fn load(store: &Store, key: &str) -> Spool {
 ///
 /// A delivery path nobody can inspect is the seventh way silence lies, and this
 /// file's neighbour already carries six.
-fn save(store: &Store, key: &str, spool: &Spool, delivered: usize, why: &str) {
-    store.set_watch(
-        key,
-        json!({
-            "scope": key.strip_prefix("wake:").unwrap_or(key),
-            "host": util::hostname(),
-            // No process. This is a record of what the daemon owes a seat, not
-            // of a reporter that could die — see `cmd_watch::Registered::watching`.
-            "pid": 0,
-            "tick": util::now_iso(),
-            "wake": true,
-            "delivered": delivered,
-            // Why it is still holding whatever it is holding. Empty when it is
-            // holding nothing, because a reason for a thing that is not
-            // happening is noise — see [`Tell::why`].
-            "holding": match spool.depth() {
-                0 => String::new(),
-                _ => why.to_string(),
-            },
-            "spool": spool.json(),
+fn stamp(rec: &mut Value, scope: &str, delivered: usize, why: &str, spool: &Spool) {
+    if !rec.is_object() {
+        *rec = json!({});
+    }
+    let Some(o) = rec.as_object_mut() else { return };
+    o.insert("scope".into(), json!(scope));
+    o.insert("host".into(), json!(util::hostname()));
+    // No process. This is a record of what the daemon owes a seat, not of a
+    // reporter that could die — see `cmd_watch::Registered::watching`.
+    o.insert("pid".into(), json!(0));
+    o.insert("tick".into(), json!(util::now_iso()));
+    o.insert("wake".into(), json!(true));
+    o.insert("delivered".into(), json!(delivered));
+    // Why it is still holding whatever it is holding. Empty when it is holding
+    // nothing, because a reason for a thing that is not happening is noise —
+    // see [`Tell::why`].
+    o.insert(
+        "holding".into(),
+        json!(match spool.depth() {
+            0 => String::new(),
+            _ => why.to_string(),
         }),
     );
 }
