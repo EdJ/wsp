@@ -305,32 +305,62 @@ fn order(
     cwd: Option<&str>,
     on: Option<&str>,
     show: bool,
-    extra: BTreeMap<String, String>,
+    agent: Option<Occupant<'_>>,
 ) -> Order {
-    let mut env = seat_env(work.project.as_deref(), work.task.as_deref());
-    // The kind's own, last, so a runtime that needs configuring gets it and
-    // every other seat is byte-for-byte what it was. It goes on the *seat*
-    // rather than on the agent's command line because that is where a runtime
-    // reads its configuration from, and it is passed in rather than looked up
-    // because this function must not learn what a kind is — the argument is on
-    // `agent_commands::Kind::env`.
-    env.extend(extra);
     Order {
         label: work.label.clone(),
         cwd: cwd.map(|c| c.to_string()),
-        env,
+        env: seat_env(agent, work.project.as_deref(), work.task.as_deref()),
         on: on.map(|m| m.to_string()),
         show,
     }
 }
 
-/// What any seat wsp opens is given, whatever opened it.
+/// What is about to run in a seat, when what is about to run in it is an agent.
+///
+/// It is a parameter rather than something [`seat_env`] works out for itself
+/// because `spawn` opens seats with no agent in them at all — `wsp spawn` on a
+/// bare project is a terminal in the right tree — and configuring a runtime
+/// nobody is launching would be a variable in a shell somebody else is using.
+///
+/// `brief` is where this seat's brief will be written, for a kind that reads
+/// one out of a file: see [`crate::agent_commands::Kind::brief_file`] and
+/// [`brief_path`]. `None` for every other kind, for a seat with nothing to be
+/// briefed about, and for a resume — [`crate::cmd_resume`] carries the argument
+/// for the last of those, which was driven rather than assumed.
+pub(crate) struct Occupant<'a> {
+    pub kind: &'a str,
+    pub brief: Option<&'a std::path::Path>,
+}
+
+/// Everything the occupant of a seat wsp opens finds in its environment: what
+/// every seat gets, and what this kind's runtime needs on top.
 ///
 /// Here rather than inlined above because `wsp resume` opens seats too, and a
 /// resumed agent that inherited the caller's session identity — or missed the
 /// store it is supposed to be reading — would be a second, quieter copy of
 /// every failure [`crate::place::shed`] was written for.
-pub(crate) fn seat_env(project: Option<&str>, task: Option<&str>) -> BTreeMap<String, String> {
+///
+/// **The kind's half is inside this function and not composed onto it at the
+/// call site, and that is `core-038`.** It was composed at the call site for a
+/// month, in `spawn` and nowhere else, so `resume` opened seats with the
+/// `WSP_*` half and none of the runtime's — and for opencode the runtime's half
+/// is `core-020` d1's permission policy. Driven 2026-08-22 in a sandbox herdr: a
+/// spawned opencode stopped on `git status` and asked; the same agent, resumed
+/// into the same session, ran it without asking. The agent was doing the same
+/// work under a different policy and nothing said so. Two builders that have to
+/// agree is the defect; one builder that cannot be called without answering
+/// this question is the fix, which is why `agent` is a parameter a caller must
+/// say `None` to rather than a field it can leave off.
+///
+/// It goes on the **seat** rather than on the agent's command line, and why is
+/// on [`crate::agent_commands::Kind::env`], which is also where the names in it
+/// live: a module about placing work should not learn one runtime's spelling.
+pub(crate) fn seat_env(
+    agent: Option<Occupant<'_>>,
+    project: Option<&str>,
+    task: Option<&str>,
+) -> BTreeMap<String, String> {
     // Shed first: everything below is something this seat is *for*, and none of
     // it collides with a name the caller's Claude Code set.
     let mut env = crate::place::shed_env();
@@ -344,6 +374,11 @@ pub(crate) fn seat_env(project: Option<&str>, task: Option<&str>) -> BTreeMap<St
     }
     if let Some(t) = task {
         env.insert("WSP_TASK".into(), t.to_string());
+    }
+    // The kind's own, last, so a runtime that needs configuring gets it and
+    // every seat that does not is byte-for-byte what it was.
+    if let Some(a) = agent {
+        env.extend(crate::agent_commands::of(a.kind).env(a.brief));
     }
     env
 }
@@ -1197,11 +1232,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // which is the whole reason this works.
     let brief_at = (will_start && !subject.is_empty() && agent_commands::of(&kind).brief_file())
         .then(|| brief_path(store, &subject));
-    let seat_extra = match will_start {
-        true => agent_commands::of(&kind).env(brief_at.as_deref()),
-        false => BTreeMap::new(),
-    };
-    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), seat_extra);
+    let occupant = will_start.then(|| Occupant { kind: &kind, brief: brief_at.as_deref() });
+    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), occupant);
     let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
@@ -2068,7 +2100,7 @@ mod tests {
             label: "robustness/004 · a title".into(),
             list: None,
         };
-        let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false, BTreeMap::new());
+        let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false, None);
         assert_eq!(o.label, "robustness/004 · a title");
         assert_eq!(o.cwd.as_deref(), Some("~/claude/wsp"), "expanded by the backend, not here");
         assert_eq!(o.on.as_deref(), Some("mb2"));
@@ -2083,10 +2115,53 @@ mod tests {
         // empty string somebody downstream has to test for.
         let proj =
             Work { task: None, project: Some("robustness".into()), label: "robustness".into(), list: None };
-        let o = order(&proj, None, None, true, BTreeMap::new());
+        let o = order(&proj, None, None, true, None);
         assert!(o.env.get("WSP_TASK").is_none());
         assert!(o.on.is_none());
         assert!(o.show);
+    }
+
+    /// The kind's own configuration is part of the order, and it is composed
+    /// where the `WSP_*` set is composed rather than beside it.
+    ///
+    /// `core-038`: it was composed at the call site, in `spawn` and nowhere
+    /// else, and `resume` built the same order out of the same parts and took
+    /// only the first of them — so a resumed opencode ran with no permission
+    /// policy and `core-020` d1's brake could never fire. What this asserts is
+    /// the shape that makes that unwriteable: a caller says who is going to sit
+    /// in the seat, and one function answers what that means.
+    #[test]
+    fn a_seat_opened_for_an_agent_carries_the_kinds_own_configuration() {
+        let work = Work {
+            task: Some("oc-001".into()),
+            project: Some("core".into()),
+            label: "core/001 · a title".into(),
+            list: None,
+        };
+        let brief = std::path::PathBuf::from("/tmp/briefs/oc-001.md");
+        let o = order(
+            &work,
+            None,
+            None,
+            false,
+            Some(Occupant { kind: "opencode", brief: Some(&brief) }),
+        );
+        let cfg = o.env.get("OPENCODE_CONFIG_CONTENT").expect("opencode was given no config");
+        assert!(cfg.contains("permission"), "the brake is what the config is for: {cfg}");
+        assert!(cfg.contains("/tmp/briefs/oc-001.md"), "the brief is named in it: {cfg}");
+        assert_eq!(o.env.get("WSP_TASK").map(String::as_str), Some("oc-001"),
+            "the kind's half is added to what every seat gets, not instead of it");
+
+        // A seat with nothing starting in it is a terminal in the right tree,
+        // and configuring a runtime nobody is launching would be a variable in
+        // a shell somebody else is about to type in.
+        let bare = order(&work, None, None, false, None);
+        assert!(bare.env.get("OPENCODE_CONFIG_CONTENT").is_none());
+
+        // And every kind that needs nothing gets byte-for-byte what it got
+        // before the channel existed.
+        let claude = order(&work, None, None, false, Some(Occupant { kind: "claude", brief: Some(&brief) }));
+        assert_eq!(claude.env, bare.env, "a kind that needs no configuring is unchanged");
     }
 
     /// The other half of the same order: an agent spawned from inside an agent
@@ -2101,7 +2176,7 @@ mod tests {
     #[test]
     fn a_spawned_agent_is_not_handed_the_spawning_session() {
         let work = Work { task: None, project: None, label: "probe".into(), list: None };
-        let o = order(&work, None, None, false, BTreeMap::new());
+        let o = order(&work, None, None, false, None);
         assert_eq!(
             o.env.get(crate::place::CHILD_MARKER).map(String::as_str),
             Some(""),

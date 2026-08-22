@@ -384,12 +384,21 @@ pub trait Kind {
     }
 
     /// What this kind's seat needs in its environment, beyond what every seat
-    /// gets from [`crate::cmd_spawn::seat_env`].
+    /// gets.
     ///
     /// Empty for every kind that needs nothing, which is all of them but one.
     /// It is here rather than in `cmd_spawn` for the reason [`TRIM`] is here:
     /// the names and the JSON in it are one runtime's spelling, and a module
     /// about placing work should not know them.
+    ///
+    /// **Reached through [`crate::cmd_spawn::seat_env`] and nowhere else**, and
+    /// that is `core-038` rather than tidiness. It had one caller, in `spawn`,
+    /// which composed it onto the `WSP_*` set at the call site; `resume` built
+    /// the same order out of the same parts and took only the first of them, so
+    /// a resumed opencode ran under opencode's shipped policy instead of
+    /// `core-020` d1's. Two builders that have to agree is the defect. Anything
+    /// that opens a seat now names its occupant or says there is none, and the
+    /// composition happens once.
     ///
     /// **Why an environment variable and not a file**, since the obvious
     /// reading of `core-020` d1 is a config file in the worktree. Measured:
@@ -402,6 +411,16 @@ pub trait Kind {
     /// exactly the same config — verified against `opencode debug config`, which
     /// resolves the two routes identically — and leaves nothing behind to clean
     /// up.
+    ///
+    /// **And not argv, which is the third carrier and the one that would have
+    /// made `core-038` impossible.** An agent's command line reaches a seat wsp
+    /// did not open, since herdr's `agent.start` takes `args`; an environment
+    /// does not. It is unavailable rather than declined: opencode's TUI has no
+    /// config flag at all — `opencode --help` at 1.18.x offers `--model`,
+    /// `--session`, `--prompt` and `--agent`, and nothing that names a config —
+    /// so for the one kind that needs configuring there is no argv route to
+    /// prefer. That is why the rule in [`crate::cmd_resume`] has to be about
+    /// where a seat came from rather than about how it is told.
     ///
     /// `brief` is the file `spawn` will write this seat's brief into, when the
     /// kind is one that reads such a file — see [`Kind::brief_file`]. `None`

@@ -636,6 +636,19 @@ fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
 
 // ---- putting one back -----------------------------------------------------
 
+/// Whether this kind's seat has an environment in it, and so may only be one
+/// wsp opened itself.
+///
+/// The whole of the rule [`somewhere_to_stand`] applies about the kind, split
+/// out because it needs no socket to be true and a test should not need one to
+/// say so. `env(None)` rather than a property of the kind, because the question
+/// is *what would this resume have to deliver* — the same argument
+/// [`bring_back`] passes — so a kind that one day needs configuring only
+/// sometimes answers correctly without this line being revisited.
+fn needs_a_seat_wsp_opened(kind: &str) -> bool {
+    !agent_commands::of(kind).env(None).is_empty()
+}
+
 /// Where to start the agent: back in the room it was in, or a new one.
 ///
 /// **Back in the room wherever there is one.** herdr restores workspaces and
@@ -648,8 +661,39 @@ fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
 ///
 /// A pane with no agent, because starting one where an agent already is fails
 /// and would be the wrong thing if it did not.
+///
+/// **Except for a kind that needs an environment, and that is the half
+/// `core-038` found by driving.** A seat wsp did not open cannot be given one:
+/// `agent.start` takes `pane_id`, `kind`, `name`, `args` and a timeout and no
+/// environment at all (herdr protocol 19), and the only calls that carry `env`
+/// are the ones that make a new shell — `workspace.create` and `pane.split`.
+/// So whatever the restored pane's shell has is what the agent gets, and
+/// measured 2026-08-22 against a sandbox herdr stopped and started again, what
+/// it has is the *server's* environment: the pane came back with the same id
+/// and the same cwd and `OPENCODE_CONFIG_CONTENT` unset. That is precisely the
+/// case this function exists for, so for opencode the tidy answer and the
+/// correct one are opposites, and correct wins — a resumed agent under
+/// opencode's shipped policy instead of `core-020` d1's is an agent whose only
+/// brake can never fire, which is the one thing that kind may not be given
+/// unattended work without.
+///
+/// The cost is paid by one kind and is the cost the paragraph above declines:
+/// an empty room left standing beside the new one. It is not paid by `claude`,
+/// whose [`agent_commands::Kind::env`] is empty, so every resume that worked
+/// this way still does.
+///
+/// What is asked is *the environment this resume would have to deliver* —
+/// `env(None)`, the same argument [`bring_back`] passes — rather than a
+/// property of the kind, so a kind that one day needs configuring only
+/// sometimes gets the right answer without this line being revisited.
+///
+/// **`WSP_PROJECT` and `WSP_TASK` are lost here too and that is survivable.**
+/// They were already, before this row: the claim is the durable record of what
+/// a seat is for and `wsp brief` reads it, which is why `order`'s doc calls the
+/// environment exact for the life of a session rather than durable. A
+/// permission policy has no such second copy, which is the whole difference.
 fn somewhere_to_stand(t: &Thread) -> Option<Seat> {
-    if t.workspace.is_empty() {
+    if t.workspace.is_empty() || needs_a_seat_wsp_opened(&t.kind) {
         return None;
     }
     let panes = herdr::panes().ok()?;
@@ -694,7 +738,29 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
             let order = Order {
                 label,
                 cwd: (!t.cwd.is_empty()).then(|| t.cwd.clone()),
-                env: cmd_spawn::seat_env(t.seat_of.as_deref(), t.task.as_deref()),
+                // The kind's own configuration, through the one builder — a
+                // resumed agent is the same agent doing the same work and is
+                // owed the same policy. `core-038`; the argument is on
+                // `cmd_spawn::seat_env`.
+                //
+                // **No brief, and that was driven rather than inherited.** A
+                // resumed session already holds its brief, in the transcript
+                // rather than only in the system context it was loaded into:
+                // 2026-08-22, a sandbox opencode spawned with its brief in
+                // `instructions`, killed, and resumed with no `instructions`
+                // key at all, quoted a token that existed nowhere but that
+                // file. So laying a second copy would be ~3,300 tokens of
+                // duplicate at the top of every resume. It is also the only
+                // answer that is safe: `brief_path` is named for the subject
+                // and `despawn` deletes it, so a path named here without
+                // writing one would point at a file that is either absent —
+                // which opencode ignores in silence — or left over from an
+                // earlier spawn onto the same subject, which is worse.
+                env: cmd_spawn::seat_env(
+                    Some(cmd_spawn::Occupant { kind: &kind, brief: None }),
+                    t.seat_of.as_deref(),
+                    t.task.as_deref(),
+                ),
                 on: herdr::host_of(&t.workspace).map(|m| m.to_string()),
                 show: false,
             };
@@ -1276,7 +1342,10 @@ pub fn ask_on_startup(store: &Store) -> usize {
     let order = Order {
         label: format!("resume {}?", waiting.len()),
         cwd: None,
-        env: cmd_spawn::seat_env(None, None),
+        // No occupant: what this seat is for is `wsp resume` at a shell, and
+        // no agent is started in it. Configuring a runtime nobody is launching
+        // would be a variable in a shell a person is about to type in.
+        env: cmd_spawn::seat_env(None, None, None),
         on: None,
         show: false,
     };
@@ -1805,6 +1874,91 @@ mod tests {
         let mut t = crate::model::Task::new("a task", id);
         t.set_status(status);
         store.save_task(&t).unwrap();
+    }
+
+    /// A backend that remembers only what it was asked to open, and answers
+    /// ready to everything else.
+    struct Opens(std::cell::RefCell<Vec<crate::place::Order>>);
+
+    impl Place for Opens {
+        fn open(&self, order: &crate::place::Order) -> crate::place::Result<Seat> {
+            self.0.borrow_mut().push(order.clone());
+            Ok(Seat::new("w9:p1"))
+        }
+        fn start(&self, _: &Seat, _: &crate::place::Agent) -> crate::place::Result<()> {
+            Ok(())
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<crate::place::State> {
+            Ok(crate::place::State::Idle)
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            Ok(crate::place::Census::heard("", Vec::new()))
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("resume does not end seats")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<crate::place::Delivery> {
+            panic!("a resumed agent is told nothing — its order is in the session")
+        }
+        fn watch(
+            &self,
+            _: &mut dyn FnMut(crate::place::Event) -> bool,
+        ) -> crate::place::Result<()> {
+            panic!("resume does not wait for anything")
+        }
+        fn here(&self) -> Option<Seat> {
+            panic!("resume opens a seat rather than asking which one it is in")
+        }
+    }
+
+    /// `core-038`, as the check that would have caught it: the agent is the
+    /// same agent doing the same work, so the seat it is put back in is
+    /// configured the way the seat it was spawned into was.
+    ///
+    /// Driven before it was written — a sandbox opencode spawned with
+    /// `core-020` d1's policy stopped on `git status` and asked; resumed, it
+    /// ran the same command without asking. There is no second copy of a
+    /// permission policy anywhere, so a resume that drops it is an agent whose
+    /// only brake can never fire and nothing saying so.
+    ///
+    /// **No brief in it**, and that half was driven too: a resumed session
+    /// already holds its brief in the transcript, so naming a second copy would
+    /// be duplication at best and — since `despawn` deletes the file
+    /// `brief_path` names — a path at nothing at worst.
+    #[test]
+    fn a_resumed_agent_is_owed_the_policy_its_spawn_was_given() {
+        let (_env, store) = store("resume-config");
+        task_at(&store, "oc-001", Status::Doing);
+        let mut t = thread("oc-001", std::path::Path::new("/tmp/tree"));
+        t.kind = "opencode".into();
+        // Nowhere to stand: what this asserts is the order wsp opens with, and
+        // a room still standing is `somewhere_to_stand`'s question.
+        t.workspace = String::new();
+
+        let place = Opens(std::cell::RefCell::new(Vec::new()));
+        bring_back(&store, &place, &t).expect("the resume was refused");
+        let opened = place.0.borrow();
+        let env = &opened.first().expect("no seat was opened").env;
+        let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("resumed with no configuration at all");
+        assert!(cfg.contains("permission"), "the brake is what the config is for: {cfg}");
+        assert!(!cfg.contains("instructions"), "the session already holds its brief: {cfg}");
+        assert_eq!(env.get("WSP_TASK").map(String::as_str), Some("oc-001"));
+    }
+
+    /// The half no order can fix: a pane wsp did not open cannot be given an
+    /// environment, so a kind that needs one may not be stood back up in it.
+    ///
+    /// herdr's `agent.start` takes a pane, a kind, a name and args — no
+    /// environment — and the only calls that carry one make a new shell. Driven
+    /// 2026-08-22 against a sandbox herdr stopped and started again: the pane
+    /// came back with the same id and cwd, and `OPENCODE_CONFIG_CONTENT` unset.
+    /// That is the exact case `somewhere_to_stand` exists for, so for this one
+    /// kind the tidy answer and the correct one are opposites.
+    #[test]
+    fn a_kind_that_needs_configuring_may_not_be_stood_back_up_where_wsp_cannot_configure_it() {
+        assert!(needs_a_seat_wsp_opened("opencode"));
+        assert!(!needs_a_seat_wsp_opened("claude"), "every resume that worked this way still does");
+        assert!(!needs_a_seat_wsp_opened("codex"), "and a kind wsp knows nothing about is unchanged");
     }
 
     /// The `render-077` incident, as the check that would have caught it. The

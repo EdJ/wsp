@@ -1619,6 +1619,19 @@ it already reaches through `OPENCODE_CONFIG_CONTENT`. opencode loads it as syste
 context before the first message: nothing is fetched, and there is no `bash`
 call, so the brake is never met. `despawn` removes the file.
 
+**A resume carries the same configuration and no brief.** The session being
+picked up already holds its brief — in the transcript, not only in the system
+context it was loaded into, which was driven rather than assumed — so a second
+copy would be duplication, and `despawn` has usually taken the file away by
+then. The permission policy has no such second copy, which is why it has to be
+re-delivered: for a month it was not, and a resumed opencode ran under
+opencode's shipped defaults instead of wsp's, doing the same work under a
+different policy with nothing saying so. It is also why a resumed opencode gets
+a *new* room rather than the one it was in — herdr can put an environment into a
+shell it is creating and into nothing else, so a pane restored across a restart
+has none, and a kind whose brake lives there may only be stood back up in a seat
+wsp opened itself.
+
 That key *merges* with the machine's own config rather than replacing it, which
 is the property the whole scheme rests on: `plugin` still resolves to the herdr
 state plugin, so state reporting is untouched.
@@ -3963,7 +3976,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker |
 | `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, who each one is addressed to, and the six ways silence lies |
 | `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
-| `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on |
+| `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on — in a seat that can carry what their kind needs |
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
