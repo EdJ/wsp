@@ -800,7 +800,7 @@ const WSP_ALLOWED: &[&str] = &[
 /// ever reaching `blocked`.
 const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 
-/// The shell verbs a spawned opencode may read with without asking.
+/// The shell verbs a spawned opencode may read with, without asking.
 ///
 /// **`core-040`, and it is the half of `core-020` d2 that nothing implemented.**
 /// d2 draws the line at *read and record freely, stop before changing anything
