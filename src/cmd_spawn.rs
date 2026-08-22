@@ -347,7 +347,9 @@ pub(crate) struct Occupant<'a> {
 /// `WSP_*` half and none of the runtime's — and for opencode the runtime's half
 /// is `core-020` d1's permission policy. Driven 2026-08-22 in a sandbox herdr: a
 /// spawned opencode stopped on `git status` and asked; the same agent, resumed
-/// into the same session, ran it without asking. The agent was doing the same
+/// into the same session, ran it without asking. `core-040` has since put
+/// `git status` on the read list, so re-drive that with `cargo build` — the
+/// divergence is the finding, not the verb. The agent was doing the same
 /// work under a different policy and nothing said so. Two builders that have to
 /// agree is the defect; one builder that cannot be called without answering
 /// this question is the fix, which is why `agent` is a parameter a caller must

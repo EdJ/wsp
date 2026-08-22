@@ -800,6 +800,78 @@ const WSP_ALLOWED: &[&str] = &[
 /// ever reaching `blocked`.
 const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 
+/// The shell verbs a spawned opencode may read with without asking.
+///
+/// **`core-040`, and it is the half of `core-020` d2 that nothing implemented.**
+/// d2 draws the line at *read and record freely, stop before changing anything
+/// outside your own record*. [`WSP_ALLOWED`] is the record half; there was no
+/// read half, because `"*": "ask"` covers `grep`, `cat`, `ls` and `head` alike.
+/// A Claude Code in this project never noticed, because it reads with Read,
+/// Grep and Glob, which are not Bash and need no allowance — so the same policy
+/// mirrored verb for verb landed on a much narrower agent. Measured on
+/// `ui-007`: **28 permission prompts in 12 minutes**, the first of them
+/// `grep -n "## Source map" README.md`, the agent's second action, doing what
+/// the handbook tells every arriving agent to do.
+///
+/// **Ed settled it as scope rather than enumeration, and opencode has no such
+/// scope to set.** The decision named `external_directory` and said to read it
+/// before assuming it does the job. Read, in opencode 1.18.21, and it does not:
+/// `ShellTool.ask` raises it as a *second, separate* approval covering the path
+/// arguments of eight file-touching commands (`rm cp mv mkdir touch chmod chown
+/// cat`, plus the `cd` family), and the `bash` ask on the command text happens
+/// either way. It is also already doing the only thing it can: a path inside
+/// the agent's own location never asks and a path outside it always does, which
+/// is the scope the decision wanted and is on by default — four of `ui-007`'s
+/// prompts were exactly that, the agent reaching into `~/wsp` and a temp dir.
+/// Setting it would be a no-op or a tightening nobody asked for. So this is the
+/// fallback the decision named rather than one invented here.
+///
+/// **And the argument the decision preferred scope *for* turns out not to hold
+/// against opencode.** The row's case against pattern lists was
+/// `grep -n x $(rm -rf …)` — a read-only pattern with an argument that is not.
+/// opencode parses the command with tree-sitter and evaluates *every* command
+/// node in the tree, so the substitution is its own pattern and falls to
+/// `"*": "ask"` while the `grep` around it is allowed; the request asks, and
+/// nothing runs. Driven 2026-08-22 against a real opencode, `$( )` and
+/// backticks both, with a file that survived it.
+///
+/// What earns a place here is one checkable property: **no flag this command
+/// accepts can write a file or run another command.** It is not a claim that
+/// reading is safe, which is the thing `core-040` says a name cannot carry —
+/// it is the narrowest test that a reader can re-apply to a candidate. What it
+/// excludes is as much of the argument as what it admits: `find` (`-exec`,
+/// `-delete`), `sed` (`-i`), `awk` (`system()`, `print >`), `sort` (`-o`),
+/// `uniq` (its second operand is an output file), `file` (`-C` compiles a magic
+/// file), `tee` and `xargs` outright — and `rg`, which fails on `--pre` and
+/// `--hostname-bin` and is the one exclusion a reader will query. It is not
+/// that ripgrep reads worse; it is that opencode's own `grep` tool is ripgrep
+/// and is unasked, so the shell copy is the only one that has to pass this.
+///
+/// `git` is here by subcommand and not as a verb: `git log`, `show`, `status`,
+/// `diff` and `blame` and nothing else, so `push`, `checkout` and `reset` stay
+/// where the rest of the shell is.
+const READ_ONLY: &[&str] = &[
+    "cat", "grep", "head", "tail", "ls", "wc", "stat", "du", "pwd", "basename", "dirname", "which",
+    "nl", "cut", "tr", "git log", "git show", "git status", "git diff", "git blame",
+];
+
+/// The one rule that keeps [`READ_ONLY`] read-only: no redirection, ever.
+///
+/// `cat README.md > copy.txt` is a write, and an allowlist of heads that did
+/// not say so would have allowed it — the pattern opencode matches is the whole
+/// redirected statement, so `cat *` swallows the `>` and everything after it.
+/// Driven both ways on 2026-08-22: with this rule the command asks and the file
+/// is not there afterwards.
+///
+/// It is deliberately blunt. `2>/dev/null` is a redirect and asks like any
+/// other, which cost three of `ui-007`'s otherwise-allowed rows; the precise
+/// version needs one exception per allowed head, because a bare
+/// `"*>/dev/null": "allow"` sitting after this would hand `rm -rf x >/dev/null`
+/// straight through. Twenty extra patterns to save three prompts in twelve
+/// minutes is the wrong trade, and the blunt rule is the one that can be stated
+/// in a sentence: **nothing wsp allows a spawned opencode may redirect.**
+const NO_REDIRECT: &str = "*>*";
+
 /// What a wsp-spawned opencode is configured with, as the JSON that
 /// [`Kind::env`] hands it.
 ///
@@ -814,36 +886,52 @@ const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 /// The price is accepted deliberately and is not small: more stalls, and each
 /// one wants a person. That is the trade Ed made, and the alternative — an agent
 /// that cannot be stopped and cannot ask — is the one thing `core-017` and the
-/// whole attention path exist to prevent.
+/// whole attention path exist to prevent. `core-040` prices the other side of
+/// it: replayed against `ui-007`'s own 32 requests, this policy answers 14 of
+/// them without a person, and every one of the 18 left is a build, a write, a
+/// reach outside the tree, or a verb Ed's file does not allow either.
 ///
-/// Built from the two lists rather than written out, so the correspondence with
-/// `~/.claude/settings.json` is one line per verb and checkable by eye, and
-/// composed through `serde_json` rather than by concatenation so a verb with a
+/// Built from the three lists rather than written out, so the correspondence
+/// with `~/.claude/settings.json` is one line per verb and checkable by eye, and
+/// every pattern and action still goes through `serde_json` so a verb with a
 /// character in it that needs escaping cannot produce config that silently
 /// parses as something else.
 ///
-/// **Order does not carry the precedence and must not be relied on to.** The
-/// specific patterns and the `*` catch-all live in one map; opencode resolves
-/// the most specific match rather than the first, which is what makes
-/// `"*": "ask"` safe to sit beside twenty-three allows. Driven, because a map
-/// that resolved by insertion order would have made every allow dead and the
-/// only symptom would have been a stall that looked like the policy working.
+/// **Order carries the precedence, and the map is emitted in it.** opencode's
+/// `Permission.evaluate` is a `findLast` over the rules in config order — the
+/// *last* match wins, not the most specific — so broad goes first and narrow
+/// goes last: the catch-all, then the reads, then the wsp verbs, then
+/// [`NO_REDIRECT`] over all of them, then the four denies which nothing may
+/// overturn. This is why the map cannot be a `serde_json::Map`: that is a
+/// `BTreeMap`, and sorting the keys is what the old code was silently relying
+/// on — `*` sorts below every letter, so the catch-all landed first and the
+/// allows won by accident. The accident held; the sentence written next to it
+/// ("opencode resolves the most specific match") did not, and a rule like
+/// [`NO_REDIRECT`] that has to beat `cat *` would have been dead on arrival
+/// under it.
 ///
 /// Scoped to the seat and not to the machine. Ed's own opencode is untouched by
 /// this, which is the other half of the decision: wsp configures the agents it
 /// starts and nothing else.
 fn config(brief: Option<&Path>) -> String {
-    let mut bash = serde_json::Map::new();
-    // Denies first only for readability; see the note above on precedence.
-    for verb in WSP_DENIED {
-        bash.insert(format!("wsp {verb}*"), Value::from("deny"));
-    }
-    for verb in WSP_ALLOWED {
-        bash.insert(format!("wsp {verb}*"), Value::from("allow"));
-    }
-    // Everything else a shell can do, which is the brake itself.
-    bash.insert("*".to_string(), Value::from("ask"));
-    let mut cfg = serde_json::json!({ "permission": { "bash": bash, "edit": "ask" } });
+    let mut rules: Vec<(String, &str)> = Vec::new();
+    // Everything a shell can do, which is the brake itself. First, because
+    // everything below it is an exception to it.
+    rules.push(("*".to_string(), "ask"));
+    // `grep *` and not `grep*`: opencode rewrites a trailing ` *` to an
+    // optional argument list, so this matches `grep` and `grep -n x` and does
+    // not match a `grepfoo` that happens to be on the PATH.
+    rules.extend(READ_ONLY.iter().map(|c| (format!("{c} *"), "allow")));
+    rules.extend(WSP_ALLOWED.iter().map(|v| (format!("wsp {v}*"), "allow")));
+    rules.push((NO_REDIRECT.to_string(), "ask"));
+    rules.extend(WSP_DENIED.iter().map(|v| (format!("wsp {v}*"), "deny")));
+
+    let bash = rules
+        .iter()
+        .map(|(pattern, action)| format!("{}:{}", Value::from(pattern.as_str()), Value::from(*action)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut cfg = format!(r#"{{"permission":{{"bash":{{{bash}}},"edit":"ask"}}"#);
     // The brief, as a path opencode loads for itself. `core-032` d7, and the
     // reason it goes here rather than into the work order is on
     // [`Kind::brief_file`].
@@ -853,15 +941,17 @@ fn config(brief: Option<&Path>) -> String {
     // naming: `~/.config/opencode/plugins/herdr-agent-state.js` is what reports
     // an opencode's state to herdr, and a config that clobbered `plugin` would
     // have turned off state reporting for every agent wsp starts — silently,
-    // and with `needs_a_person` among the things it took with it. Driven twice
-    // on 2026-08-22: `opencode debug config` with this exact value resolves
-    // `instructions` to the file below and `plugin` still to the herdr plugin,
-    // and a spawned opencode in a sandbox herdr reported
-    // `screen_detection_skipped: true`, which is the plugin doing its job.
+    // and with `needs_a_person` among the things it took with it. Driven three
+    // times now: `opencode debug config` with this exact value resolves
+    // `instructions` to the file below, `plugin` still to the herdr plugin, and
+    // — the reason it was run again for `core-040` — the bash map in the order
+    // wsp wrote it rather than reordered by the merge.
     if let Some(path) = brief {
-        cfg["instructions"] = Value::from(vec![path.display().to_string()]);
+        let named = Value::from(vec![path.display().to_string()]);
+        cfg.push_str(&format!(r#","instructions":{named}"#));
     }
-    cfg.to_string()
+    cfg.push('}');
+    cfg
 }
 
 /// Where the model catalogue comes from, and the shape a model name has.
@@ -2545,6 +2635,60 @@ mod tests {
         // invitation for somebody to say yes on his behalf.
         assert_eq!(bash["wsp done*"], "deny", "the decision of 2026-08-19");
         assert_eq!(bash["wsp archive*"], "deny");
+        // The read half, which is `core-040`: the command that stopped `ui-007`
+        // on its second action, and the pipeline tail that would have stopped
+        // it anyway. opencode asks once per request and needs *every* segment
+        // allowed, so a `grep` without a `head` buys nothing.
+        assert_eq!(bash["grep *"], "allow", "the first of ui-007's 28 prompts — {cfg}");
+        assert_eq!(bash["head *"], "allow", "and the tail of the same pipeline");
+        assert_eq!(bash["git show *"], "allow", "`git show HEAD:<path>` is the handbook's own idiom");
+        // But not with a redirect on the end of it, which is a write.
+        assert_eq!(bash["*>*"], "ask", "core-040 — a head that can redirect is not read-only");
+    }
+
+    /// The order the map is written in, because opencode reads it as one.
+    ///
+    /// `Permission.evaluate` is a `findLast` over the rules in config order, so
+    /// a rule only means anything if it comes after everything it has to beat.
+    /// Asserted on the raw string rather than the parsed value, because parsing
+    /// it into a `serde_json::Value` puts it back in a `BTreeMap` and throws
+    /// away the one property under test. Driven the same day against opencode
+    /// 1.18.21: `opencode debug config` with this value resolves the bash map
+    /// in the order wsp wrote it, and a spawned agent evaluated
+    /// `grep -n "## Source map" README.md | head -5` as two allows and never
+    /// asked.
+    #[test]
+    fn the_broad_rules_are_written_before_the_narrow_ones_that_have_to_beat_them() {
+        let env = of("opencode").env(None);
+        let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("nothing on the seat");
+        let at = |needle: &str| cfg.find(needle).unwrap_or_else(|| panic!("no {needle} in {cfg}"));
+        assert!(at(r#""*":"ask""#) < at(r#""grep *""#), "the catch-all would bury the reads: {cfg}");
+        assert!(at(r#""grep *""#) < at(r#""*>*""#), "a redirect would be allowed: {cfg}");
+        assert!(at(r#""*>*""#) < at(r#""wsp done*""#), "the four denies answer to nothing: {cfg}");
+    }
+
+    /// What is not on the read list, and the test each entry had to pass.
+    ///
+    /// The property is checkable and the exclusions are where it does its work:
+    /// a command earns a place only if no flag it accepts can write a file or
+    /// run another command. These five are the ones a reader would expect to
+    /// find and would then have to un-fix.
+    #[test]
+    fn a_command_is_on_the_read_list_only_if_nothing_it_accepts_writes_or_runs() {
+        for (cmd, why) in [
+            ("find", "-exec and -delete"),
+            ("sed", "-i"),
+            ("awk", "system() and print >"),
+            ("sort", "-o"),
+            ("rg", "--pre runs a command of the caller's choosing"),
+        ] {
+            assert!(!READ_ONLY.contains(&cmd), "{cmd} is not read-only — {why}");
+        }
+        assert!(READ_ONLY.contains(&"grep"), "the one ui-007 stopped on");
+        assert!(
+            READ_ONLY.iter().all(|c| !c.starts_with("git ") || c.split(' ').count() == 2),
+            "git is allowed by subcommand, so `push` and `reset` stay where the rest of the shell is"
+        );
     }
 
     /// The brief rides in on the same variable as the brake, and does not
