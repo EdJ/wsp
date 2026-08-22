@@ -196,7 +196,7 @@
 //!
 //! `--session-id <uuid>`, the other lead, remains unrun and is now unneeded.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -475,7 +475,27 @@ pub trait Kind {
     /// the time this is asked — it is read when a claim ends — and the session
     /// is the one handle that outlives it. `cwd` is a hint and not a key: see
     /// [`transcript`], which falls back to a scan when the tree has moved.
-    fn ran(&self, session: &str, cwd: &str) -> Option<Ran>;
+    ///
+    /// # `since` is what makes this an attempt rather than a session
+    ///
+    /// Epoch seconds of the claim this is being read for, or `0` for the whole
+    /// session. **One session serves several attempts and always has**: an
+    /// agent finishes a task, is handed the next, and works both from the same
+    /// seat and the same session — which is the ordinary sequence `hand_off`
+    /// is written for. Read whole, every attempt after the first is labelled
+    /// with the session's running totals, so the second attempt on a seat
+    /// reports the first one's turns and tokens as its own and a sum over
+    /// attempts counts the early ones once per attempt that followed them.
+    ///
+    /// Found here rather than in the field, because `core-029` is the first
+    /// row to add a number that is *added up*: a turn count read twice looks
+    /// like a busy agent, and a token count read twice is a bill.
+    ///
+    /// Both runtimes stamp every message, so the window costs nothing to apply
+    /// and it fails open — a message wsp cannot date is counted, since dropping
+    /// evidence is the worse of the two errors and the tier label is right
+    /// either way.
+    fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran>;
 
     /// How this kind's own command line says *pick that session back up* —
     /// `None` for one that cannot be told to.
@@ -639,7 +659,7 @@ impl Kind for Plain {
     /// whose sessions it has no business labelling with one — the record stays
     /// empty rather than being filled in with the default it would have
     /// guessed.
-    fn ran(&self, _session: &str, _cwd: &str) -> Option<Ran> {
+    fn ran(&self, _session: &str, _cwd: &str, _since: i64) -> Option<Ran> {
         None
     }
 }
@@ -652,12 +672,11 @@ impl Kind for Plain {
 /// 1.18.20/1.18.21 in a sandbox herdr rather than read off `--help`; `core-026`
 /// holds the driving and `core-027` the decisions.
 ///
-/// What it deliberately does **not** implement is [`Kind::ran`] and
-/// [`Kind::running`], which stay [`Plain`]'s answer of nothing. `opencode
-/// export <session>` is a rich record — per-message `providerID`, `modelID` and
-/// token counts — and reading it is `core-029`, whose whole job is making the
-/// cost comparable. Half a reader here would be a column that looks like
-/// `Claude`'s and is not.
+/// [`Kind::running`] stays [`Plain`]'s answer of nothing: the backend is the
+/// only witness to whether an opencode is alive. [`Kind::ran`] is not — see
+/// there for what `opencode export` publishes, which is a better record than
+/// the one wsp derives for Claude Code and is read into the same shape so that
+/// neither kind gets a column the other cannot answer.
 pub struct OpenCode;
 
 /// The wsp verbs a spawned opencode may run without asking.
@@ -940,11 +959,133 @@ impl Kind for OpenCode {
         None
     }
 
-    /// `core-029`'s, and empty until then — see the type docs for why half a
-    /// reader is worse than none.
-    fn ran(&self, _session: &str, _cwd: &str) -> Option<Ran> {
-        None
+    /// `opencode export`, which is a *better* record than the one wsp derives
+    /// for Claude Code, and that is the uncomfortable half of `core-029`.
+    ///
+    /// Every assistant message carries `providerID`, `modelID`, `cost` in
+    /// dollars and `tokens {input, output, reasoning, cache{read, write}}` —
+    /// published rather than inferred, and in the units `core-014` prices in,
+    /// so setting the two kinds against each other is arithmetic. What wsp
+    /// does with it is exactly what it does with Claude's transcript, in the
+    /// same shape, so that neither kind gets a column the other cannot answer:
+    /// see [`Spend`].
+    ///
+    /// **`--sanitize`, and not only for size.** The flag redacts transcript and
+    /// file data, which takes this session's export from 172KB to 47KB with
+    /// every number in it unchanged (measured 2026-08-22 on
+    /// `ses_fdafaf5dd…`). wsp wants counts and never content, so asking for the
+    /// redacted copy means an agent's files do not pass through wsp at all —
+    /// the smaller parse is the second reason rather than the first.
+    ///
+    /// **The session id is the whole join and `cwd` is not used.** `export`
+    /// takes an id and finds the session wherever it ran, so unlike
+    /// [`transcript`] there is no path to derive and no scan to fall back to.
+    /// A cwd fallback was considered and refused: `opencode session list` can
+    /// name every session in a directory, but picking one of them by recency
+    /// would attribute a person's own opencode in that tree to an agent's
+    /// attempt, and the rule this record is built on is that a silently wrong
+    /// label is worse than a missing one.
+    ///
+    /// **What is in an export is one session and nothing else**: every message
+    /// in it carries the id that was asked for. So anything that ran under a
+    /// session of its own — which is where opencode puts a sub-agent, though
+    /// that half is read off its design rather than driven here — is outside
+    /// this reading, the same line [`read_ran`] draws at `isSidechain`. Both
+    /// columns are a floor for the same reason, and an attempt that delegated
+    /// heavily cost more than either record says.
+    ///
+    /// It shells out, ~1.5s measured over three runs, and that is affordable
+    /// exactly where it is paid — once when a claim ends, and on demand from
+    /// `wsp attempts`. Never in `brief`, `ls` or `show`.
+    fn ran(&self, session: &str, _cwd: &str, since: i64) -> Option<Ran> {
+        read_export(&export(session)?, since)
     }
+}
+
+/// One session as opencode publishes it, redacted of everything but the
+/// numbers.
+///
+/// The id is checked before it reaches a command line, for the reason
+/// [`transcript`] checks it before it reaches a path: it arrives from herdr,
+/// which got it from the agent, and `spawn` is a verb agents drive. opencode
+/// spells an id `ses_` and twenty-something alphanumerics; anything with a
+/// space, a slash or a dash in it is not one.
+fn export(session: &str) -> Option<Vec<u8>> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let out = Command::new(opencode_bin())
+        .args(["export", "--sanitize", session])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// That export, reduced to what served the attempt and what it cost.
+///
+/// Parsed whole rather than streamed, which is the one place this differs from
+/// [`read_ran`] and is not a choice: an export is a single JSON document, so
+/// there is no line to stop at. `--sanitize` is what keeps that affordable —
+/// the numbers are a fraction of a percent of an unredacted export.
+fn read_export(src: &[u8], since: i64) -> Option<Ran> {
+    let v: Value = serde_json::from_slice(src).ok()?;
+    let mut ran = Ran::default();
+    let mut micros: u64 = 0;
+    for m in v.get("messages")?.as_array()? {
+        let info = m.get("info")?;
+        if info.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        // Milliseconds here and seconds in the claim: opencode stamps in the
+        // unit JavaScript counts in, and the window arrives in the unit the
+        // store writes.
+        let at = info.pointer("/time/created").and_then(Value::as_i64).map(|ms| ms / 1_000);
+        if since > 0 && at.is_some_and(|t| t < since) {
+            continue;
+        }
+        let Some(model) = info.get("modelID").and_then(Value::as_str) else { continue };
+        ran.turns += 1;
+        // `provider/model`, which is opencode's own spelling of a model and the
+        // one `--model` is stated in — so what ran can be set against what was
+        // asked for without either being translated.
+        let model = match info.get("providerID").and_then(Value::as_str) {
+            Some(p) if !p.is_empty() => format!("{p}/{model}"),
+            _ => model.to_string(),
+        };
+        if !ran.models.contains(&model) {
+            ran.models.push(model);
+        }
+        let n = |p: &str| info.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+        ran.spend.cache += n("/tokens/cache/read");
+        ran.spend.input += n("/tokens/input") + n("/tokens/cache/write");
+        // Reasoning is counted *beside* output here and *inside* it by
+        // Anthropic, whose `output_tokens` includes thinking. Adding them is
+        // what makes the two kinds' out column the same unit — tokens the model
+        // produced — rather than two numbers that differ by whichever half the
+        // runtime happened to report separately.
+        ran.spend.output += n("/tokens/output") + n("/tokens/reasoning");
+        // Dollars as a float on the wire, kept as micro-dollars from here on:
+        // see `util::money_human` for why nothing downstream sees a float.
+        micros += (info.get("cost").and_then(Value::as_f64).unwrap_or(0.0) * 1e6).round() as u64;
+    }
+    if ran.models.is_empty() {
+        return None;
+    }
+    // Stated even when it is zero, because zero is a fact about this kind that
+    // Claude's record cannot state: a free model really did cost nothing, and
+    // `None` would say wsp does not know.
+    ran.spend.micros = Some(micros);
+    // opencode has no effort knob — [`OpenCode::tier`] refuses the flag — so
+    // the honest half is `default`, and it is written rather than omitted for a
+    // reason that is not cosmetic: `cmd_attempts::agrees` splits a tier at its
+    // *last* separator, and a model spelled `provider/model` with no effort
+    // after it reads as the provider at `model` effort. The empty half is the
+    // one shape that parse cannot survive, and this is the kind that produces
+    // it.
+    ran.efforts.push("default".to_string());
+    Some(ran)
 }
 
 /// Claude Code.
@@ -1244,8 +1385,9 @@ impl Kind for Claude {
     /// Recorded against Claude Code 2.1.234: one JSON object per line under
     /// `~/.claude/projects/<cwd>/<session>.jsonl`, an assistant turn carrying
     /// `message.model` (`claude-opus-5`) and a top-level `effort` (`high`).
-    fn ran(&self, session: &str, cwd: &str) -> Option<Ran> {
-        read_ran(&mut std::io::BufReader::new(std::fs::File::open(transcript(session, cwd)?).ok()?))
+    fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran> {
+        let file = std::fs::File::open(transcript(session, cwd)?).ok()?;
+        read_ran(&mut std::io::BufReader::new(file), since)
     }
 }
 
@@ -1268,13 +1410,123 @@ impl Kind for Claude {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Ran {
     /// Distinct model ids, in the order they first served a turn, with the
-    /// `claude-` prefix off: `opus-5`, `haiku-4-5`.
+    /// `claude-` prefix off: `opus-5`, `haiku-4-5`. opencode's are
+    /// `provider/model`, which is that kind's own spelling and the one a spawn
+    /// states.
     pub models: Vec<String>,
     /// Distinct effort levels, same ordering rule. Empty where the runtime
     /// recorded none, which is a real answer and not a missing one — an older
     /// Claude Code wrote no `effort` at all.
     pub efforts: Vec<String>,
+    /// Requests to the model, which is the same number as assistant turns:
+    /// one turn is one call and one line of the bill. See [`read_ran`] for
+    /// why counting the transcript's lines gave three times this.
     pub turns: usize,
+    pub spend: Spend,
+}
+
+/// What an attempt consumed, in the one vocabulary both kinds can answer in.
+///
+/// **The point of this type is that it is the same shape for every kind.**
+/// `core-029` exists because opencode publishes cost and Claude Code does not,
+/// and the failure it was written against is opencode arriving as a second,
+/// better-looking column that nobody can set against the first. So the fields
+/// are the ones *both* runtimes report, and a kind that knows more than this
+/// says it in [`Spend::micros`] or not at all.
+///
+/// # Why three numbers and not five
+///
+/// Both runtimes report input, output and two kinds of cache separately, and
+/// this keeps two of the four apart:
+///
+/// - **`cache` is cache read**, and it is an order of magnitude cheaper than
+///   everything else per token while being a hundred times more of them — 673M
+///   against 4k in one session measured here. Folding it into input would price
+///   an attempt about ten times too high, which is the one error a routing
+///   argument cannot survive.
+/// - **`input` is input plus cache write**, which are within 25% of each other
+///   per token: both are the model reading something it has not read before.
+///   The record loses that 25% and says so here.
+///
+/// Rounded to three significant figures on the way to disk, because the copy
+/// that survives is a clause in a task's log — see [`util::count_human`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Spend {
+    /// Tokens read from cache: the cheap half, and nearly all of the volume.
+    pub cache: u64,
+    /// Tokens the model read for the first time — input plus cache write.
+    pub input: u64,
+    /// Tokens the model produced, thinking included.
+    pub output: u64,
+    /// What the runtime says it cost, in millionths of a dollar — `None` where
+    /// the runtime says nothing, which is Claude Code, and `Some(0)` for a free
+    /// model, which is a different fact and has to read as one.
+    pub micros: Option<u64>,
+}
+
+impl Spend {
+    /// Nothing to say: no tokens and no price. A session that was started and
+    /// killed before it answered produces one of these, and writing a clause
+    /// of zeroes for it would be the record claiming a measurement it does not
+    /// have.
+    pub fn nothing(&self) -> bool {
+        self.cache == 0 && self.input == 0 && self.output == 0 && self.micros.is_none()
+    }
+
+    /// The clause that goes on a release line: `673M cache 21M in 3.5M out $1.20`.
+    ///
+    /// One clause rather than four, and every term self-describing. The task's
+    /// log is the only durable copy of this — a transcript is one machine's
+    /// disk, cleaned up on its own schedule and absent altogether for an agent
+    /// that ran on the other box — and it is also prose a person reads in
+    /// `wsp brief`, four entries of it on every request of every session. So
+    /// the cost of the record is four words on a line that was already being
+    /// written, and zero terms are left out rather than printed as `0`.
+    ///
+    /// [`Spend::of_clause`] reads it back, and the two are here together
+    /// because a format with its parser in another file drifts.
+    pub fn clause(&self) -> Option<String> {
+        if self.nothing() {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (n, what) in [(self.cache, "cache"), (self.input, "in"), (self.output, "out")] {
+            if n > 0 {
+                parts.push(format!("{} {what}", util::count_human(n)));
+            }
+        }
+        if let Some(m) = self.micros {
+            parts.push(util::money_human(m));
+        }
+        Some(parts.join(" "))
+    }
+
+    /// That clause back, and `None` for a clause that is not one.
+    ///
+    /// Strict on purpose: the log is prose people write in, so anything that is
+    /// not exactly pairs of `<count> <unit>` with an optional price is somebody's
+    /// sentence and must not be read as a measurement.
+    pub fn of_clause(text: &str) -> Option<Spend> {
+        let mut spend = Spend::default();
+        let mut words = text.split_whitespace().peekable();
+        let mut any = false;
+        while let Some(w) = words.next() {
+            if let Some(m) = util::money_of(w) {
+                spend.micros = Some(m);
+                any = true;
+                continue;
+            }
+            let n = util::count_of(w)?;
+            match words.next()? {
+                "cache" => spend.cache = n,
+                "in" => spend.input = n,
+                "out" => spend.output = n,
+                _ => return None,
+            }
+            any = true;
+        }
+        any.then_some(spend)
+    }
 }
 
 impl Ran {
@@ -1357,8 +1609,29 @@ fn mangle(cwd: &str) -> String {
 /// `None` when nothing served a turn at all, which is a transcript that exists
 /// and is not evidence of a tier — an agent that started and was killed before
 /// it answered. Empty is not zero here: it must not become "ran at nothing".
-fn read_ran(src: &mut impl std::io::BufRead) -> Option<Ran> {
+///
+/// # One request is several lines, and counting lines counted it three times
+///
+/// Measured 2026-08-22 against the largest transcript on this machine: **2,045
+/// assistant lines, 692 distinct requests.** Claude Code writes a line per
+/// content block — a thinking block and the tool call it decided on are two
+/// lines of the same response — and it repeats lines outright after a fork.
+/// Every one of those copies carries the *same* `usage`, so the totals this
+/// row was opened to record came out at 673M cache-read tokens for a session
+/// that read about 220M.
+///
+/// So the key is `message.id`, which is the id of the API response: one id is
+/// one request, one bill and one turn. It is read once per id and skipped
+/// after, which also puts the turn count right — the old count was three
+/// times the truth and had been printed on every attempt in the store since
+/// wsp-060.
+///
+/// A line with no id at all is counted as its own turn. That is the fail-open
+/// half of the same rule the gate above follows: an unrecognised shape must
+/// cost a duplicate at worst, never the whole record.
+fn read_ran(src: &mut impl std::io::BufRead, since: i64) -> Option<Ran> {
     let mut ran = Ran::default();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut line = String::new();
     while {
         line.clear();
@@ -1374,6 +1647,15 @@ fn read_ran(src: &mut impl std::io::BufRead) -> Option<Ran> {
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
+        // Before this attempt: the same session served the task this agent was
+        // handed before this one. See [`Kind::ran`] for why the window is the
+        // difference between an attempt and a session.
+        if since > 0 {
+            let at = v.get("timestamp").and_then(Value::as_str).map(util::epoch_of);
+            if at.is_some_and(|t| t > 0 && t < since) {
+                continue;
+            }
+        }
         let Some(model) = v.pointer("/message/model").and_then(Value::as_str) else { continue };
         // The runtime writes its own messages into the same stream and names
         // the model `<synthetic>` — a cancelled turn, a refusal it composed
@@ -1385,7 +1667,26 @@ fn read_ran(src: &mut impl std::io::BufRead) -> Option<Ran> {
         if model.starts_with('<') {
             continue;
         }
+        // The same response, written out again: a second content block, or a
+        // fork replaying what came before it. The tier it names is already
+        // recorded and its usage is already counted.
+        if let Some(id) = v.pointer("/message/id").and_then(Value::as_str) {
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+        }
         ran.turns += 1;
+        let n = |p: &str| v.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+        ran.spend.cache += n("/message/usage/cache_read_input_tokens");
+        ran.spend.input +=
+            n("/message/usage/input_tokens") + n("/message/usage/cache_creation_input_tokens");
+        // Thinking is inside `output_tokens` here and beside it in opencode's
+        // record; [`read_export`] adds the two so that this column means the
+        // same thing on both sides. Claude Code publishes no price at all, so
+        // `micros` stays `None` — the record says wsp does not know rather
+        // than pricing it from a table that would be wrong the week a rate
+        // changed.
+        ran.spend.output += n("/message/usage/output_tokens");
         let model = model.strip_prefix("claude-").unwrap_or(model).to_string();
         if !ran.models.contains(&model) {
             ran.models.push(model);
@@ -2400,16 +2701,32 @@ mod tests {
         assert!(doubt < hedged.find("wsp-f3").expect("the name"), "the hedge is last: {hedged}");
     }
 
-    /// One assistant turn, as Claude Code 2.1.234 writes it — the fields this
+    /// One assistant line, as Claude Code 2.1.234 writes it — the fields this
     /// reads and nothing else, so the test says what the coupling actually is.
-    fn turn(model: &str, effort: &str, sidechain: bool) -> String {
+    ///
+    /// A *line*, not a turn: the two are not the same thing and that is the
+    /// defect `core-029` found. `id` is `message.id`, the id of the API
+    /// response, and every line of one response carries the same one.
+    fn line(id: &str, model: &str, effort: &str, sidechain: bool, at: &str, usage: &str) -> String {
+        let stamp = match at.is_empty() {
+            true => String::new(),
+            false => format!(r#""timestamp":"{at}","#),
+        };
         format!(
-            r#"{{"type":"assistant","isSidechain":{sidechain},"effort":"{effort}","message":{{"model":"{model}","role":"assistant","content":[]}}}}"#
+            r#"{{"type":"assistant","isSidechain":{sidechain},"effort":"{effort}",{stamp}"message":{{"id":"{id}","model":"{model}","role":"assistant","usage":{usage},"content":[]}}}}"#
         )
     }
 
+    /// One turn, with an id of its own so that a test which says nothing about
+    /// requests gets one request per call.
+    fn turn(model: &str, effort: &str, sidechain: bool) -> String {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        line(&format!("msg_{n}"), model, effort, sidechain, "", "{}")
+    }
+
     fn ran_of(lines: &[String]) -> Option<Ran> {
-        read_ran(&mut std::io::Cursor::new(lines.join("\n")))
+        read_ran(&mut std::io::Cursor::new(lines.join("\n")), 0)
     }
 
     /// The ordinary session: one tier, and the turn count is what says how much
@@ -2479,9 +2796,12 @@ mod tests {
     /// is the model on its own — not the default effort it might have been.
     #[test]
     fn a_transcript_that_records_no_effort_is_labelled_by_its_model_alone() {
-        let ran = read_ran(&mut std::io::Cursor::new(
-            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","role":"assistant"}}"#,
-        ))
+        let ran = read_ran(
+            &mut std::io::Cursor::new(
+                r#"{"type":"assistant","message":{"model":"claude-sonnet-5","role":"assistant"}}"#,
+            ),
+            0,
+        )
         .expect("one turn");
         assert_eq!(ran.label(), "sonnet-5");
     }
@@ -2506,9 +2826,12 @@ mod tests {
     /// back with nothing, and looks exactly like a session that never ran.
     #[test]
     fn a_turn_written_with_spaces_in_it_is_still_a_turn() {
-        let ran = read_ran(&mut std::io::Cursor::new(
-            r#"{"type": "assistant", "effort": "max", "message": {"model": "claude-fable-5"}}"#,
-        ))
+        let ran = read_ran(
+            &mut std::io::Cursor::new(
+                r#"{"type": "assistant", "effort": "max", "message": {"model": "claude-fable-5"}}"#,
+            ),
+            0,
+        )
         .expect("whitespace is not a format change");
         assert_eq!(ran.label(), "fable-5/max");
     }
@@ -2528,5 +2851,217 @@ mod tests {
     fn a_session_id_that_is_not_one_never_reaches_the_filesystem() {
         assert!(transcript("../../etc/passwd", "/tmp").is_none());
         assert!(transcript("", "/tmp").is_none());
+    }
+
+    /// The same, one layer along: an opencode id reaches a command line rather
+    /// than a path, and the check is why a session that is really an argument
+    /// never gets there.
+    #[test]
+    fn a_session_id_that_is_not_one_never_reaches_a_command_line() {
+        assert!(export("--help").is_none());
+        assert!(export("ses_a b").is_none());
+        assert!(export("").is_none());
+    }
+
+    /// The defect this row found, and the reason every token total in wsp was
+    /// nearly three times the truth: Claude Code writes a line per content
+    /// block, each carrying the *same* `usage`, and a fork writes some of them
+    /// out twice. One `message.id` is one API response, one bill and one turn.
+    ///
+    /// Measured against the largest transcript on this machine, 2026-08-22:
+    /// 2,045 assistant lines, 692 distinct ids, and 673M cache-read tokens
+    /// counted where 242M were read.
+    #[test]
+    fn two_lines_of_one_response_are_one_request_and_one_bill() {
+        let usage = r#"{"input_tokens":10,"cache_read_input_tokens":900,"output_tokens":50}"#;
+        let ran = ran_of(&[
+            line("msg_a", "claude-opus-5", "high", false, "", usage),
+            line("msg_a", "claude-opus-5", "high", false, "", usage),
+            line("msg_b", "claude-opus-5", "high", false, "", usage),
+        ])
+        .expect("two responses over three lines");
+        assert_eq!(ran.turns, 2, "a thinking block and the tool call it decided on are one turn");
+        assert_eq!(ran.spend.cache, 1_800, "and one bill, not one per line");
+        assert_eq!(ran.spend.input, 20);
+        assert_eq!(ran.spend.output, 100);
+    }
+
+    /// Cache write is counted with input and cache read is kept apart, because
+    /// the first pair differ in price by a quarter and the second by an order
+    /// of magnitude. Folding all three would price an attempt about ten times
+    /// too high, which is the one error a routing argument cannot survive.
+    #[test]
+    fn what_the_model_read_for_the_first_time_is_not_what_it_read_from_cache() {
+        let ran = ran_of(&[line(
+            "msg_a",
+            "claude-opus-5",
+            "high",
+            false,
+            "",
+            r#"{"input_tokens":7,"cache_creation_input_tokens":2000,"cache_read_input_tokens":90000,"output_tokens":300}"#,
+        )])
+        .expect("one turn");
+        assert_eq!(ran.spend.input, 2_007, "cache write is input the model had not read before");
+        assert_eq!(ran.spend.cache, 90_000);
+        assert_eq!(ran.spend.micros, None, "Claude Code publishes no price and wsp invents none");
+    }
+
+    /// One session serves several attempts — an agent finishes a task and is
+    /// handed the next from the same seat — so a reading that starts at the
+    /// session start bills the second attempt for the first one's work.
+    #[test]
+    fn a_transcript_is_read_from_the_claim_and_not_from_the_start_of_the_session() {
+        let usage = r#"{"input_tokens":100,"output_tokens":10}"#;
+        let lines = [
+            line("msg_a", "claude-haiku-4-5", "low", false, "2026-08-22T09:00:00Z", usage),
+            line("msg_b", "claude-opus-5", "high", false, "2026-08-22T11:00:00Z", usage),
+        ];
+        let whole = read_ran(&mut std::io::Cursor::new(lines.join("\n")), 0).expect("both");
+        assert_eq!(whole.turns, 2);
+        let second = read_ran(
+            &mut std::io::Cursor::new(lines.join("\n")),
+            util::epoch_of("2026-08-22T10:00:00Z"),
+        )
+        .expect("the attempt that claimed at ten");
+        assert_eq!(second.turns, 1, "the earlier attempt's turns are not this one's");
+        assert_eq!(second.spend.input, 100);
+        assert_eq!(second.models, ["opus-5"], "nor is the tier it ran at");
+    }
+
+    /// A line wsp cannot date is counted rather than dropped. Losing evidence
+    /// is the worse of the two errors, and the tier is right either way.
+    #[test]
+    fn a_turn_with_no_stamp_on_it_is_counted_into_whatever_attempt_is_asking() {
+        let ran = read_ran(
+            &mut std::io::Cursor::new(turn("claude-opus-5", "high", false)),
+            util::epoch_of("2026-08-22T10:00:00Z"),
+        )
+        .expect("undated is not undone");
+        assert_eq!(ran.turns, 1);
+    }
+
+    /// opencode's export, as opencode 1.18.21 writes it — the fields this
+    /// reads, in the shape it reads them from.
+    fn export_of(messages: &str) -> Vec<u8> {
+        format!(r#"{{"info":{{"id":"ses_x"}},"messages":[{messages}]}}"#).into_bytes()
+    }
+
+    fn message(model: &str, cost: &str, at: i64, tokens: &str) -> String {
+        format!(
+            r#"{{"info":{{"role":"assistant","providerID":"opencode","modelID":"{model}","cost":{cost},"time":{{"created":{at}}},"tokens":{tokens}}},"parts":[]}}"#
+        )
+    }
+
+    /// What an opencode attempt cost, which is `core-029` itself: the numbers
+    /// are published per message rather than derived, and they arrive in the
+    /// units the Claude column is already in.
+    #[test]
+    fn an_opencode_attempt_reports_its_cost_in_the_units_the_other_kind_reports() {
+        let tokens = r#"{"input":300,"output":40,"reasoning":10,"cache":{"read":9000,"write":200}}"#;
+        let ran = read_export(
+            &export_of(&[
+                message("claude-sonnet-5", "0.012", 1_787_327_482_000, tokens),
+                message("claude-sonnet-5", "0.008", 1_787_327_500_000, tokens),
+            ]
+            .join(",")),
+            0,
+        )
+        .expect("two turns");
+        assert_eq!(ran.turns, 2);
+        assert_eq!(ran.spend.cache, 18_000);
+        assert_eq!(ran.spend.input, 1_000, "input and cache write, as on the other side");
+        assert_eq!(
+            ran.spend.output, 100,
+            "reasoning is beside output here and inside it there, so the column adds them"
+        );
+        assert_eq!(ran.spend.micros, Some(20_000), "$0.02, kept as an integer");
+        assert_eq!(
+            ran.spend.clause().as_deref(),
+            Some("18k cache 1.0k in 100 out $0.02"),
+            "and the clause that lands on the release line says all of it"
+        );
+    }
+
+    /// A model with a separator in it and no effort half is the one label
+    /// `cmd_attempts::agrees` cannot parse — it splits a tier at its last `/`,
+    /// and `opencode/x-preview-f-free` alone reads as the provider at
+    /// `x-preview-f-free` effort. This kind is the one that produces that
+    /// shape, so it states the half it does not have.
+    #[test]
+    fn an_opencode_tier_states_the_effort_it_has_not_got() {
+        let ran = read_export(
+            &export_of(&message("x-preview-f-free", "0", 1_787_327_482_000, "{}")),
+            0,
+        )
+        .expect("one turn");
+        assert_eq!(ran.label(), "opencode/x-preview-f-free/default");
+        assert_eq!(
+            ran.spend.micros,
+            Some(0),
+            "a free model cost nothing, which is a fact and not a missing reading"
+        );
+    }
+
+    /// The window again, on the kind whose sessions outlive an attempt just as
+    /// readily — opencode stamps in milliseconds and the claim is in seconds.
+    #[test]
+    fn an_opencode_session_is_read_from_the_claim_too() {
+        let tokens = r#"{"input":100,"output":10,"cache":{"read":0,"write":0}}"#;
+        let src = export_of(
+            &[
+                message("x-preview-f-free", "0", 1_787_327_000_000, tokens),
+                message("x-preview-f-free", "0", 1_787_328_000_000, tokens),
+            ]
+            .join(","),
+        );
+        let ran = read_export(&src, 1_787_327_500).expect("the second message only");
+        assert_eq!(ran.turns, 1);
+        assert_eq!(ran.spend.input, 100);
+    }
+
+    /// An export with nothing that served a turn is no answer rather than an
+    /// empty one, the same rule [`read_ran`] keeps: it must not become "ran at
+    /// nothing, for nothing".
+    #[test]
+    fn an_export_with_no_assistant_turn_in_it_is_no_answer() {
+        let user = r#"{"info":{"role":"user","time":{"created":1}},"parts":[]}"#;
+        assert!(read_export(&export_of(user), 0).is_none());
+        assert!(read_export(b"not json", 0).is_none());
+    }
+
+    /// The clause is the only durable copy of any of this — a transcript is one
+    /// machine's disk — so what is written has to read back. It round-trips to
+    /// the three significant figures it prints, which is the precision the
+    /// record claims and no more.
+    #[test]
+    fn what_an_attempt_cost_reads_back_off_the_line_it_was_written_on() {
+        let spend = Spend { cache: 242_000_000, input: 4_700_000, output: 875_000, micros: Some(1_234_567) };
+        let clause = spend.clause().expect("something to say");
+        assert_eq!(clause, "242M cache 4.7M in 875k out $1.23");
+        let back = Spend::of_clause(&clause).expect("its own inverse");
+        assert_eq!(back.cache, 242_000_000);
+        assert_eq!(back.input, 4_700_000);
+        assert_eq!(back.output, 875_000);
+        assert_eq!(back.micros, Some(1_230_000), "to the figures the clause printed");
+    }
+
+    /// A session that was started and killed before it answered has no spend,
+    /// and the record of that is no clause at all rather than a line of
+    /// zeroes claiming a measurement nobody took.
+    #[test]
+    fn nothing_measured_is_no_clause_and_not_a_row_of_zeroes() {
+        assert!(Spend::default().clause().is_none());
+        assert!(Spend { micros: Some(0), ..Spend::default() }.clause().is_some());
+    }
+
+    /// The log is prose people write in. A clause that is somebody's sentence
+    /// must not come back as a measurement, however many numbers are in it.
+    #[test]
+    fn a_sentence_in_the_log_is_not_a_measurement() {
+        assert!(Spend::of_clause("workspace closed").is_none());
+        assert!(Spend::of_clause("96 turns").is_none());
+        assert!(Spend::of_clause("ran opus-5/high").is_none());
+        assert!(Spend::of_clause("").is_none());
+        assert!(Spend::of_clause("12k cache and a note about it").is_none());
     }
 }

@@ -3921,7 +3921,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/render.rs` | a task or a project, in full, and the column menu |
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
-| `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, the outcome |
+| `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, what it consumed, the outcome |
 | `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, the three reasons one is finished with, and the branches a removed tree leaves behind |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! - 2026-08-18T12:50:09Z claimed by pane w58:p1 · spawned at opus[1m]/high
-//! - 2026-08-18T15:41:02Z released after 2h51m · ran opus-5/high · 96 turns
+//! - 2026-08-18T15:41:02Z released after 2h51m · ran opus-5/high · 96 turns · 242M cache 4.7M in 875k out
 //! ```
 //!
 //! **Nothing else is collected.** Every other column below — reached review,
@@ -16,6 +16,28 @@
 //! `review`, `done`, `block` and `release` whether anyone is calibrating or
 //! not. The whole of wsp-060 is one field joined to a workflow that was already
 //! recorded.
+//!
+//! # What it cost, which is `core-029` and the last clause on that line
+//!
+//! The tier says what served an attempt and the outcome says what came of it;
+//! neither says what it consumed, and a routing policy is an argument about
+//! spend. So a third clause was added to the same line, in
+//! [`crate::agent_commands::Spend`]'s units — read from the cache, read for the
+//! first time, produced — plus a price for the kind that publishes one.
+//!
+//! **Both kinds are read in the same units on purpose.** opencode publishes
+//! per-message `cost` and token counts; wsp derives Claude Code's from the
+//! transcript and there is no price in it. Left alone that would have made
+//! opencode a second, better-looking column that nothing could be set against,
+//! which is the failure this row was written to avoid — so what lands is the
+//! intersection: the numbers both runtimes report, with the price stated where
+//! it is known and absent rather than guessed where it is not.
+//!
+//! Two things this record is honest about being a floor. A sub-agent's spend
+//! belongs to the sub-agent — Claude's sidechains are skipped and an opencode
+//! export holds one session's own messages — and an attempt closed before this
+//! landed carries no clause at all, which the `unrecorded` line in the summary
+//! counts out loud beside a count of how many attempts a total is a total of.
 //!
 //! # Why the record is on the task and not in the state directory
 //!
@@ -52,6 +74,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
+use crate::agent_commands::Spend;
 use crate::model::Task;
 use crate::resolve::Index;
 use crate::store::Store;
@@ -116,7 +139,14 @@ pub struct Attempt {
     /// What the transcript says served it: `opus-5/high`, or
     /// `haiku-4-5→opus-5/high` for a session that moved mid-flight.
     pub ran: String,
+    /// Requests to the model, which is what a turn is and what a bill is
+    /// counted in.
     pub turns: usize,
+    /// What it consumed, as the release line recorded it — or read live for an
+    /// attempt still running. Zero everywhere for an attempt closed before
+    /// `core-029`, which is a record that was never written rather than an
+    /// attempt that cost nothing; the two are told apart by [`Spend::nothing`].
+    pub spend: Spend,
     /// When the agent let go, if it did.
     pub until: String,
     /// When it first reached review — the wall-clock the parent task asked for,
@@ -162,9 +192,10 @@ fn agrees(spawned: &str, ran: &str) -> bool {
     //
     // The one shape that would still be ambiguous is a [`crate::agent_commands::Ran`]
     // whose model contains a slash and which states no effort — `label` omits
-    // the half when there is none. Nothing produces one today, and a kind that
-    // could must state `default` rather than omit it; see `core-029`, which is
-    // where opencode's `ran` is read.
+    // the half when there is none. `core-029` is where the kind that would
+    // produce one arrived, and what it does instead is write `default`: an
+    // effort opencode has not got, stated rather than omitted, so that this
+    // split has something to take.
     let split = |s: &str| match s.rsplit_once('/') {
         Some((m, e)) => (m.to_string(), e.to_string()),
         None => (s.to_string(), String::new()),
@@ -246,6 +277,8 @@ pub fn attempts_of(t: &Task) -> Vec<Attempt> {
                     a.ran = tier.to_string();
                 } else if let Some(n) = clause.strip_suffix(" turns") {
                     a.turns = n.parse().unwrap_or(0);
+                } else if let Some(spend) = Spend::of_clause(clause) {
+                    a.spend = spend;
                 } else if clause == "workspace closed" {
                     // Not `dropped`. The agent did not put this down and may
                     // never have known it had stopped holding it, so counting
@@ -341,6 +374,28 @@ struct Tally {
     n: usize,
     by: BTreeMap<Outcome, usize>,
     clocks: Vec<i64>,
+    /// Everything this tier read and produced, added up.
+    ///
+    /// A **sum** where the clock is a median, and the two answer different
+    /// questions on purpose: the middle of the distribution is what says how
+    /// long a tier takes, and the total is what says what it cost — which is
+    /// the number `core-012` is accounting for and the one a capacity argument
+    /// is made of. A median bill would answer neither.
+    ///
+    /// Attempts closed before `core-029` contribute nothing, so a total is a
+    /// floor rather than a figure, and the `unrecorded` row beside it is how
+    /// far from the ceiling it might be.
+    spend: Spend,
+    /// Whether anything in this tier published a price at all. Without it a
+    /// tier of Claude attempts would total `$0` and read as free.
+    priced: bool,
+    /// How many of the attempts the spend was actually read for.
+    ///
+    /// Printed whenever it is fewer than all of them, because a total under a
+    /// count of 126 attempts reads as the whole of them and until `core-029`
+    /// none of them recorded anything. The number says how much of the tier
+    /// the total is a total of.
+    measured: usize,
 }
 
 impl Tally {
@@ -350,6 +405,16 @@ impl Tally {
         let secs = a.seconds();
         if secs > 0 && a.outcome != Outcome::Open {
             self.clocks.push(secs);
+        }
+        if !a.spend.nothing() {
+            self.measured += 1;
+        }
+        self.spend.cache += a.spend.cache;
+        self.spend.input += a.spend.input;
+        self.spend.output += a.spend.output;
+        if let Some(m) = a.spend.micros {
+            self.priced = true;
+            self.spend.micros = Some(self.spend.micros.unwrap_or(0) + m);
         }
     }
 
@@ -398,9 +463,15 @@ fn live(store: &Store, a: &mut Attempt) {
         return;
     }
     let Some(thread) = crate::cmd_resume::thread_for_task(store, &a.task) else { return };
-    if let Some(ran) = crate::agent_commands::of(&thread.kind).ran(&thread.session, &thread.cwd) {
+    let read = crate::agent_commands::of(&thread.kind).ran(
+        &thread.session,
+        &thread.cwd,
+        util::epoch_of(&a.at),
+    );
+    if let Some(ran) = read {
         a.turns = ran.turns;
         a.ran = ran.label();
+        a.spend = ran.spend;
     }
 }
 
@@ -436,6 +507,10 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
                     "spawned_at": a.spawned,
                     "ran_at": a.ran,
                     "turns": a.turns,
+                    "cache_tokens": a.spend.cache,
+                    "input_tokens": a.spend.input,
+                    "output_tokens": a.spend.output,
+                    "usd_micros": a.spend.micros,
                     "released_at": a.until,
                     "reviewed_at": a.reviewed,
                     "seconds": a.seconds(),
@@ -459,18 +534,66 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
         .max()
         .unwrap_or(4)
         .max(4);
+    // The price column is there only when something published a price. Claude
+    // Code publishes none, so on a store of Claude attempts an empty `cost`
+    // would be a column of blanks implying wsp failed to read something.
+    let priced = rows.iter().any(|a| a.spend.micros.is_some());
+    // A header, which this table did not have and now needs: `692  21M  3.5M`
+    // is three numbers a reader has to be told apart, and the alternative is
+    // spelling the unit into every cell of every row.
+    println!(
+        "{}",
+        p.dim(&format!(
+            "{}  {}  {}  {}  {}  {}{}  {}",
+            util::pad("date", 10),
+            util::pad("task", w_task),
+            util::pad("tier", w_tier),
+            // `turns` and not `reqs`: one word for one thing, the same one the
+            // log line and [`crate::agent_commands::Ran`] use. What it counts
+            // is API requests — see there — and a report with a second name
+            // for it would be two vocabularies for one number.
+            util::pad("turns", 5),
+            util::pad("read", 6),
+            util::pad("out", 6),
+            match priced {
+                true => format!("  {}", util::pad("cost", 8)),
+                false => String::new(),
+            },
+            util::pad("clock", 6),
+        ))
+    );
     for a in &rows {
         let tier = Row(a.clone()).tier();
         let turns = match a.turns {
             0 => String::new(),
-            n => format!("{n}t"),
+            n => n.to_string(),
+        };
+        // What the model read, cache and all, in one number: the split between
+        // the cheap half and the dear one is what the record keeps, and what a
+        // person scanning a report wants is how much context this attempt got
+        // through.
+        let read = match a.spend.cache + a.spend.input {
+            0 => String::new(),
+            n => util::count_human(n),
+        };
+        let out = match a.spend.output {
+            0 => String::new(),
+            n => util::count_human(n),
+        };
+        let cost = match (priced, a.spend.micros) {
+            (false, _) => String::new(),
+            (true, None) => format!("  {}", util::pad("", 8)),
+            (true, Some(m)) => format!("  {}", util::pad(&util::money_human(m), 8)),
         };
         println!(
-            "{}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}{}  {}  {}",
             p.dim(&util::local_ymd(&a.at)),
             p.bold(&util::pad(&a.task, w_task)),
             util::pad(&tier, w_tier),
             p.dim(&util::pad(&turns, 5)),
+            p.dim(&util::pad(&read, 6)),
+            p.dim(&util::pad(&out, 6)),
+            p.dim(&cost),
             p.dim(&util::pad(&util::duration_human(a.seconds()), 6)),
             outcome_colour(&p, a.outcome),
         );
@@ -496,6 +619,19 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
         }
         if let Some(m) = tally.median() {
             parts.push(format!("median {}", util::duration_human(m)));
+        }
+        if tally.measured > 0 && tally.measured < tally.n {
+            parts.push(format!("{} measured", tally.measured));
+        }
+        let read = tally.spend.cache + tally.spend.input;
+        if read > 0 {
+            parts.push(format!("{} read", util::count_human(read)));
+        }
+        if tally.spend.output > 0 {
+            parts.push(format!("{} out", util::count_human(tally.spend.output)));
+        }
+        if let Some(m) = tally.spend.micros.filter(|_| tally.priced) {
+            parts.push(util::money_human(m));
         }
         println!("{}  {}", p.bold(&util::pad(tier, w_key)), p.dim(&parts.join(" · ")));
     }
@@ -577,6 +713,57 @@ mod tests {
             agrees("opencode/x-preview-f-free/default", "opencode/x-preview-f-free/default"),
             "a tier agrees with itself, which splitting at the first separator broke"
         );
+    }
+
+    /// What the attempt cost, off the line that closed it. `core-029`: the
+    /// third clause on a line that was already being written, and the only
+    /// durable copy there is — the transcript it was read from is one
+    /// machine's disk and is cleaned up on its own schedule.
+    #[test]
+    fn an_attempt_carries_what_it_read_and_what_it_produced() {
+        let t = task(&[
+            "- 2026-08-22T09:00:00Z claimed by pane w1:p1 · spawned at opus[1m]/high",
+            "- 2026-08-22T11:00:00Z released after 2h · ran opus-5/high · 96 turns · 242M cache 4.7M in 875k out",
+        ]);
+        let a = attempts_of(&t);
+        assert_eq!(a[0].turns, 96, "requests, which is what a bill is counted in");
+        assert_eq!(a[0].spend.cache, 242_000_000);
+        assert_eq!(a[0].spend.input, 4_700_000);
+        assert_eq!(a[0].spend.output, 875_000);
+        assert_eq!(a[0].spend.micros, None, "Claude Code publishes no price");
+    }
+
+    /// The other kind, whose runtime publishes what it charged. Both columns
+    /// are read off the same clause in the same units, which is the whole
+    /// point of `core-029` — an opencode attempt that nobody can set against a
+    /// Claude one is a better-looking number and no more.
+    #[test]
+    fn an_opencode_attempt_is_read_in_the_same_units_and_carries_its_price() {
+        let t = task(&[
+            "- 2026-08-22T09:00:00Z claimed by pane w1:p1 · spawned at opencode/x-preview-f-free/default",
+            "- 2026-08-22T09:30:00Z released after 30m · ran opencode/x-preview-f-free/default · 16 turns · 295k cache 76k in 9.8k out $0",
+        ]);
+        let a = attempts_of(&t);
+        assert_eq!(a[0].spend.cache, 295_000);
+        assert_eq!(a[0].spend.micros, Some(0), "free is a reading, not a gap");
+        assert_eq!(
+            Row(a[0].clone()).tier(),
+            "opencode/x-preview-f-free/default",
+            "and the tier it was asked for is the tier it served"
+        );
+    }
+
+    /// An attempt closed before `core-029` has no such clause, and what that
+    /// records is a measurement nobody took rather than an attempt that cost
+    /// nothing.
+    #[test]
+    fn an_attempt_from_before_the_record_existed_reads_as_unmeasured() {
+        let t = task(&[
+            "- 2026-08-18T09:00:00Z claimed by pane w1:p1",
+            "- 2026-08-18T10:00:00Z released after 1h · ran opus-5/high · 96 turns",
+        ]);
+        let a = attempts_of(&t);
+        assert!(a[0].spend.nothing(), "no clause is no reading: {:?}", a[0].spend);
     }
 
     /// `wsp done` releases the claim *before* it marks the task done, so an

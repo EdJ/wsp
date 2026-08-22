@@ -2131,7 +2131,7 @@ mod tests {
         fn tell(&self, _: &dyn Place, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
             panic!("readiness does not deliver work orders")
         }
-        fn ran(&self, _: &str, _: &str) -> Option<agent_commands::Ran> {
+        fn ran(&self, _: &str, _: &str, _: i64) -> Option<agent_commands::Ran> {
             None
         }
     }
@@ -2507,7 +2507,7 @@ mod tests {
         fn running(&self, _: &agent_commands::Spawn) -> Option<bool> {
             None
         }
-        fn ran(&self, _: &str, _: &str) -> Option<agent_commands::Ran> {
+        fn ran(&self, _: &str, _: &str, _: i64) -> Option<agent_commands::Ran> {
             None
         }
     }

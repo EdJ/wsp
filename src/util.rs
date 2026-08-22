@@ -540,6 +540,75 @@ pub fn duration_human(secs: i64) -> String {
     }
 }
 
+/// A token count, short enough to sit in a log line: `412`, `9.8k`, `673M`.
+///
+/// **Three significant figures and no more, deliberately.** The number this
+/// renders goes into a task's log, which is read by people and injected into
+/// every spawn — see `cmd_brief`'s four-line budget — and `672929759` costs
+/// nine characters to say what `673M` says in four. The runtimes keep the exact
+/// figures; what the record needs is the order of magnitude and the first two
+/// digits, because the questions asked of it are *how much did this attempt
+/// read* and *is one tier ten times another*, and 0.5% of either is noise.
+///
+/// The inverse is [`count_of`], and the pair round-trips to the precision this
+/// prints rather than to the byte.
+pub fn count_human(n: u64) -> String {
+    let (scaled, unit) = match n {
+        0..=999 => return n.to_string(),
+        1_000..=999_999 => (n as f64 / 1e3, "k"),
+        1_000_000..=999_999_999 => (n as f64 / 1e6, "M"),
+        _ => (n as f64 / 1e9, "G"),
+    };
+    match scaled < 10.0 {
+        true => format!("{scaled:.1}{unit}"),
+        false => format!("{}{unit}", scaled.round() as u64),
+    }
+}
+
+/// `673M` back to a number, and `None` for anything that is not one.
+///
+/// Reading the record back is not an afterthought here: what [`count_human`]
+/// writes into a log line is the *only* durable copy of what an attempt cost —
+/// a transcript is one machine's disk and is cleaned up on its own schedule —
+/// so a formatter with no inverse would be a number that could be printed and
+/// never summed.
+pub fn count_of(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (digits, scale) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1e3),
+        'M' => (&s[..s.len() - 1], 1e6),
+        'G' => (&s[..s.len() - 1], 1e9),
+        _ => (s, 1.0),
+    };
+    let n: f64 = digits.parse().ok()?;
+    (n >= 0.0).then(|| (n * scale).round() as u64)
+}
+
+/// Money, as the millionths of a dollar the record keeps it in.
+///
+/// Integer micro-dollars rather than a float, because this is added up across
+/// attempts and compared between tiers, and a fraction that cannot be written
+/// down exactly is a total that disagrees with itself depending on the order
+/// the rows came in. Two decimal places above a cent and four below it: a
+/// cheap model's whole session can cost less than a cent, and `$0.00` would be
+/// the record saying it was free when it was not.
+pub fn money_human(micros: u64) -> String {
+    match micros {
+        // A free model really did cost nothing, and `$0.0000` reads as a
+        // rounding rather than as the fact it is.
+        0 => "$0".to_string(),
+        1..=9_999 => format!("${:.4}", micros as f64 / 1e6),
+        _ => format!("${:.2}", micros as f64 / 1e6),
+    }
+}
+
+/// `$1.23` back to micro-dollars, the inverse of [`money_human`] and there for
+/// the same reason [`count_of`] is.
+pub fn money_of(s: &str) -> Option<u64> {
+    let n: f64 = s.trim().strip_prefix('$')?.parse().ok()?;
+    (n >= 0.0).then(|| (n * 1e6).round() as u64)
+}
+
 /// This machine's name. Claims are machine-local — a workspace on the laptop
 /// means nothing on another host — and the store is shared, so anything
 /// crossing that line has to say where it came from.
@@ -1082,6 +1151,44 @@ mod tests {
     ///
     /// So this asks the platform the same question by a route that shares no
     /// code with ours. Shelling out is what the running binary must not do —
+    /// Three significant figures, whichever end of the scale it is at, and no
+    /// unit for a number small enough to read as itself.
+    #[test]
+    fn a_token_count_is_short_enough_to_sit_in_a_line_somebody_reads() {
+        assert_eq!(count_human(0), "0");
+        assert_eq!(count_human(412), "412");
+        assert_eq!(count_human(4_072), "4.1k");
+        assert_eq!(count_human(143_000), "143k");
+        assert_eq!(count_human(3_466_134), "3.5M");
+        assert_eq!(count_human(242_000_000), "242M");
+        assert_eq!(count_human(1_500_000_000), "1.5G");
+    }
+
+    /// The record on disk is what this printed, so a formatter without an
+    /// inverse would be a number that could never be added up again.
+    #[test]
+    fn a_token_count_reads_back_to_the_precision_it_was_printed_at() {
+        for n in [0_u64, 412, 4_100, 143_000, 3_500_000, 242_000_000] {
+            assert_eq!(count_of(&count_human(n)), Some(n), "{n} did not survive the round trip");
+        }
+        assert_eq!(count_of("nine"), None);
+        assert_eq!(count_of("12x"), None);
+        assert_eq!(count_of(""), None);
+    }
+
+    /// Below a cent and above it are both real answers, and `$0` is a third:
+    /// a free model cost nothing, which is not the same as `$0.00` rounding.
+    #[test]
+    fn money_says_which_side_of_a_cent_it_is_on() {
+        assert_eq!(money_human(0), "$0");
+        assert_eq!(money_human(3_400), "$0.0034");
+        assert_eq!(money_human(1_234_567), "$1.23");
+        assert_eq!(money_of("$1.23"), Some(1_230_000));
+        assert_eq!(money_of("$0"), Some(0));
+        assert_eq!(money_of("1.23"), None, "a price says so");
+        assert_eq!(money_of("$hat"), None);
+    }
+
     /// it is a fork on the path of every line the panel draws — and it is
     /// exactly right in a test, which runs once and can afford the truth.
     #[test]

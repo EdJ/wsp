@@ -1938,18 +1938,42 @@ fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
 /// reader that sees a release line with nothing after it knows exactly that
 /// much. There is no default to fall back on that would not be a guess.
 ///
-/// It must never cost a release. Nothing here is fatal, nothing waits on a
-/// socket, and the file read is a line-at-a-time scan of one file — see
-/// `agent_commands::read_ran` for why it is not read whole.
-fn ran_at(store: &Store, task_id: &str) -> String {
+/// It must never cost a release. Nothing here is fatal and nothing waits on a
+/// socket. For Claude Code it is a line-at-a-time scan of one file — see
+/// `agent_commands::read_ran` for why it is not read whole; for opencode it is
+/// a subprocess, ~1.5s, which is the price of a record that runtime publishes
+/// and wsp would otherwise have to derive. Paid once, when an attempt ends.
+///
+/// # And what it cost, which is the clause `core-029` added
+///
+/// Same line, same reading, one more clause: `242M cache 4.7M in 875k out`,
+/// and a price where the runtime states one. The argument for the units is on
+/// [`crate::agent_commands::Spend`] and the argument for writing it here
+/// rather than reading it at report time is the one above — evidence has to be
+/// durable and a transcript is not.
+///
+/// The window is the claim rather than the session, because one session serves
+/// several attempts in sequence and the second would otherwise be billed for
+/// the first. That is a token count read twice, which is a bill.
+fn ran_at(store: &Store, task_id: &str, since: &str) -> String {
     let Some(thread) = crate::cmd_resume::thread_for_task(store, task_id) else {
         return String::new();
     };
-    let Some(ran) = crate::agent_commands::of(&thread.kind).ran(&thread.session, &thread.cwd)
-    else {
-        return String::new();
+    // From the claim, not from the start of the session. One session serves
+    // several attempts whenever an agent is handed the next task from the same
+    // seat, and without the window the second attempt reports the first one's
+    // turns and its bill — see [`crate::agent_commands::Kind::ran`].
+    let ran = crate::agent_commands::of(&thread.kind).ran(
+        &thread.session,
+        &thread.cwd,
+        util::epoch_of(since),
+    );
+    let Some(ran) = ran else { return String::new() };
+    let spent = match ran.spend.clause() {
+        Some(c) => format!(" · {c}"),
+        None => String::new(),
     };
-    format!(" · ran {} · {} turns", ran.label(), ran.turns)
+    format!(" · ran {} · {} turns{spent}", ran.label(), ran.turns)
 }
 
 /// End a claim and leave the trace behind.
@@ -1976,7 +2000,7 @@ pub fn hand_off(store: &Store, task_id: &str, to: Option<&str>, reason: &str) {
     // and the event log after it, and `release_pane` clears the binding before
     // it gets here — so the log fallback is not a nicety, it is the path the
     // commonest release takes.
-    let ran = ran_at(store, task_id);
+    let ran = ran_at(store, task_id, &from);
 
     store.set_worked(
         task_id,
