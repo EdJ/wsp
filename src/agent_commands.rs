@@ -420,10 +420,27 @@ pub trait Kind {
     /// holds a wake until the turn ends for that reason and no other, which
     /// costs a wake ninety seconds.
     ///
-    /// A kind whose transport carries a queue of its own — opencode's ACP
-    /// server, `core-020` — answers false and does not pay for a turn boundary
-    /// its transport does not have. Nothing overrides it yet, and the sentence
-    /// this is written in is what the first one to do so has to disagree with.
+    /// The candidate for `false` was opencode's ACP server (`core-020`), and it
+    /// was driven against a real opencode rather than read — `core-026`,
+    /// 2026-08-21, sandbox herdr — and it answers **true** anyway, without ACP
+    /// being needed to find that out. What was seen: a mid-turn `wsp tell`
+    /// reaches opencode's *durable session record* immediately, as a `user`
+    /// message in `opencode export`, and is answered at the turn boundary. Then
+    /// the test this predicate actually asks for — killed mid-turn by pid with
+    /// a sentence pending, session resumed — and the sentence was still there,
+    /// unanswered, with the agent idle. Durable, and **stranded**: nothing
+    /// re-drives it.
+    ///
+    /// So the bar was never durability on its own. `false` says *the transport
+    /// will see this read*, and a record that survives with nobody running a
+    /// turn on it is `core-017`'s drop wearing a transcript — worse than the
+    /// lost shape, because the evidence sits there looking delivered. A kind
+    /// that overrides this owes that same drive and the second half of it: not
+    /// that the sentence is still in the record afterwards, but that something
+    /// on the far side picks it up with wsp saying nothing further.
+    ///
+    /// Holding for the turn boundary costs a wake ninety seconds, which is the
+    /// price of the answer being true, and it is cheap.
     fn queue_is_the_agents(&self) -> bool {
         true
     }
@@ -945,11 +962,15 @@ impl Kind for OpenCode {
         None
     }
 
-    /// Typed at, like [`Plain`]. opencode's ACP server is a real transport and
-    /// whether it is worth holding open is `core-028`, which also holds the one
-    /// thing that would change this: a mid-turn sentence reaches opencode's
-    /// durable session record immediately and is answered at the turn boundary,
-    /// so [`Kind::queue_is_the_agents`] stays true and is not overridden here.
+    /// Typed at, like [`Plain`], and `core-028` closed the question of whether
+    /// it should be something else. opencode's ACP server is a real transport,
+    /// but the fact it was wanted for — whether a sentence handed to a busy
+    /// opencode outlives the agent — was established by driving the pane
+    /// instead, and the answer does not want a second transport: the sentence
+    /// is durable and nothing re-drives it, so
+    /// [`Kind::queue_is_the_agents`] stays true and is not overridden here.
+    /// The argument is on that method, which is where a later kind will read
+    /// it.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
         place.tell(seat, text)
     }
@@ -2343,6 +2364,20 @@ mod tests {
         assert!(of("opencode").order_in_args(), "measured: typed input is discarded for ~2s");
         assert!(!of("claude").order_in_args(), "Claude Code is told, and the trim is not an order");
         assert!(!of("codex").order_in_args(), "an unmeasured kind claims nothing");
+    }
+
+    #[test]
+    fn no_kind_yet_has_a_queue_that_reads_what_is_put_in_it() {
+        // The tripwire on `core-028`: opencode was the candidate for `false`
+        // and was driven, and a sentence pending across a kill came back
+        // durable but with nothing to re-drive it. Flipping either of these
+        // stops holding a wake for the turn boundary and hands it over as
+        // delivered, which is `core-017`'s drop — so the argument on
+        // `Kind::queue_is_the_agents` has to be disagreed with before this
+        // line moves.
+        assert!(of("opencode").queue_is_the_agents(), "durable is not read — core-026 drove it");
+        assert!(of("claude").queue_is_the_agents(), "the queue dies with a /clear");
+        assert!(of("codex").queue_is_the_agents(), "an unmeasured kind claims nothing");
     }
 
     #[test]
