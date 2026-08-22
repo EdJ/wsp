@@ -476,6 +476,29 @@ pub trait Kind {
     /// is the one handle that outlives it. `cwd` is a hint and not a key: see
     /// [`transcript`], which falls back to a scan when the tree has moved.
     fn ran(&self, session: &str, cwd: &str) -> Option<Ran>;
+
+    /// How this kind's own command line says *pick that session back up* —
+    /// `None` for one that cannot be told to.
+    ///
+    /// The smallest possible fact and it is here for the reason the module docs
+    /// open with: `--resume` is Claude Code's spelling, opencode's is
+    /// `--session`, and until `core-031` the one word was written into
+    /// [`crate::cmd_resume::Thread::by_hand`] as though every agent shared it.
+    /// What that printed for a live opencode was `claude --resume ses_…` —
+    /// wrong binary and wrong flag in one line, offered to a person as the
+    /// recovery path for when herdr itself is broken.
+    ///
+    /// [`Kind::args`] reads it too, so a kind spells its resume in one place
+    /// and the argv wsp builds and the line it prints cannot drift apart.
+    ///
+    /// `None` is not a gap to be filled in with a guess. A kind wsp has no
+    /// resume spelling for is one whose thread it cannot pick up, and starting
+    /// a *fresh* session while saying "resumed" is the failure this returns
+    /// three answers to avoid — see [`crate::cmd_resume::bring_back`], which
+    /// refuses rather than starting one.
+    fn resume_flag(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// What is about to be started, as much of it as a kind is allowed to know.
@@ -780,10 +803,9 @@ impl Kind for OpenCode {
     /// to name it with: [`Kind::address`] is `None` here, so a handle would be a
     /// string wsp mints and can never use.
     ///
-    /// `--session` rather than `--resume`, which is the flag spelling that made
-    /// `core-026`'s finding D worth a row of its own: resuming an opencode
-    /// through `Claude::args` would hand it `--resume`, and opencode does not
-    /// have that flag. This is where knowing the kind pays for itself.
+    /// The session goes on through [`Kind::resume_flag`] rather than being
+    /// spelled here, so this kind's word for it is written once and the line
+    /// `wsp resume --print` offers cannot drift from the argv wsp builds.
     ///
     /// `--prompt` last, and it is the reason [`Kind::order_in_args`] exists. See
     /// there for the measurement; what matters here is that the order is a
@@ -797,8 +819,8 @@ impl Kind for OpenCode {
             argv.push("--model".into());
             argv.push(model.to_string());
         }
-        if let Some(session) = spawn.resume {
-            argv.push("--session".into());
+        if let (Some(flag), Some(session)) = (self.resume_flag(), spawn.resume) {
+            argv.push(flag.into());
             argv.push(session.to_string());
         }
         if let Some(order) = spawn.order {
@@ -806,6 +828,13 @@ impl Kind for OpenCode {
             argv.push(order.to_string());
         }
         argv
+    }
+
+    /// `--session`, which is `core-026`'s finding D: resuming an opencode
+    /// through [`Claude`]'s spelling hands it `--resume`, and opencode has no
+    /// such flag. This is where knowing the kind pays for itself.
+    fn resume_flag(&self) -> Option<&'static str> {
+        Some("--session")
     }
 
     /// A `provider/model` this machine can actually serve, and no effort at all.
@@ -1076,16 +1105,22 @@ impl Kind for Claude {
             argv.push("--effort".into());
             argv.push(effort.to_string());
         }
-        // Last, after the name, for the reason the name is last: `--resume`
-        // takes a value, so nothing may follow it that could be eaten as one.
-        // It is not conditional on `full` — a resumed session is a *thread*
-        // being picked up, and which tools it has is still this spawn's
-        // decision rather than the old one's.
-        if let Some(session) = spawn.resume {
-            argv.push("--resume".into());
+        // Last, after the name, for the reason the name is last: the resume
+        // flag takes a value, so nothing may follow it that could be eaten as
+        // one. It is not conditional on `full` — a resumed session is a
+        // *thread* being picked up, and which tools it has is still this
+        // spawn's decision rather than the old one's. The spelling is
+        // `Kind::resume_flag`'s and not this function's.
+        if let (Some(flag), Some(session)) = (self.resume_flag(), spawn.resume) {
+            argv.push(flag.into());
             argv.push(session.to_string());
         }
         argv
+    }
+
+    /// `--resume`.
+    fn resume_flag(&self) -> Option<&'static str> {
+        Some("--resume")
     }
 
     /// [`MODELS`], with an optional `[1m]`, and [`EFFORTS`].

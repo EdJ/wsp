@@ -2428,7 +2428,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// What a backend reading teaches about the sessions in seats already bound.
+/// What a backend reading teaches about the agents in seats already bound.
 ///
 /// **A session id cannot be recorded when the claim is made, and that is the
 /// whole reason this exists rather than one line in [`claim`].** `spawn`'s order
@@ -2455,12 +2455,36 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
 /// that is not the recorded one, and the backend is the party that knows. A
 /// recorded id that no longer names the agent in the seat is worse than none:
 /// it resumes the wrong conversation.
+///
+/// # And the kind, on the same rows and under the same two rules
+///
+/// `core-031`. `--kind` was read by `spawn` and never written down, so every
+/// reader that later asked what is in this seat was answered `claude` whatever
+/// had been started — `wsp resume` on a live opencode printed
+/// `claude --resume ses_…`, and [`crate::cmd_attempts::live`] would have asked
+/// `Claude::ran` to read an opencode's transcript.
+///
+/// **Observed rather than declared, which is the choice worth arguing.** The
+/// obvious fix is to carry `--kind` down into the claim beside `--model`, and
+/// it is worse in two ways: it cannot answer for an agent wsp did not start —
+/// a person's own claude claiming at its own shell — and it records what wsp
+/// *asked for* rather than what is there. herdr already reports the kind on
+/// every `pane.list` row, which `sync` reads on every tick anyway, so the fact
+/// is free and it is first-hand. That is also what makes
+/// [`crate::cmd_spawn::kind_or_default`]'s fallback safe: an absence lasts one
+/// tick on any record whose agent is still alive.
+///
+/// **Where it lands is both, for the session's reason.** A binding dies with
+/// the pane and the claim outlives it, and the one moment anybody asks what was
+/// running is the end of the attempt — after `release_pane` has dropped the
+/// binding. A kind on the binding alone would be gone exactly when `ran_at`
+/// reaches for it.
 fn sessions_learned<'a>(
     bindings: &BTreeMap<String, Value>,
-    seen: impl Iterator<Item = (&'a str, &'a str)>,
-) -> Vec<(String, String)> {
-    seen.filter(|(_, session)| !session.trim().is_empty())
-        .filter_map(|(seat, session)| {
+    seen: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+) -> Vec<(String, String, String)> {
+    seen.filter(|(_, session, _)| !session.trim().is_empty())
+        .filter_map(|(seat, session, kind)| {
             // An unbound pane is not this function's business — a session in a
             // seat nobody has claimed anything in is `reconcile`'s to notice, if
             // it is anybody's. A binding with no such key at all reads as empty
@@ -2469,12 +2493,20 @@ fn sessions_learned<'a>(
             // against an imagined store.
             let b = bindings.get(seat)?;
             let had = b.get("agent_session_id").and_then(|v| v.as_str()).unwrap_or("");
-            (had != session).then(|| (seat.to_string(), session.to_string()))
+            let was = b.get("agent_kind").and_then(|v| v.as_str()).unwrap_or("");
+            // Either field disagreeing is worth a write, and the `||` is what
+            // carries the records that already existed: their session was
+            // learned long ago and will never change again, so a check on the
+            // session alone would leave every one of them with no kind for as
+            // long as it lives.
+            let moved = had != session || (!kind.trim().is_empty() && was != kind);
+            moved.then(|| (seat.to_string(), session.to_string(), kind.to_string()))
         })
         .collect()
 }
 
-/// Record against each bound seat the session the backend says is sitting in it.
+/// Record against each bound seat what the backend says is sitting in it: the
+/// session it is running under, and what kind of agent it is.
 ///
 /// Called from wherever a backend reading is already in hand — `sync`, which has
 /// the pane list every tick, and `spawn`, which asks once the moment its agent
@@ -2485,7 +2517,10 @@ fn sessions_learned<'a>(
 /// against a task can come from: a binding holds one at a time, and an agent
 /// that is cleared and resumed twice leaves three. `render-061` wants exactly
 /// that list, and this is where it accrues without being built.
-pub fn learn_sessions<'a>(store: &Store, seen: impl Iterator<Item = (&'a str, &'a str)>) -> usize {
+pub fn learn_sessions<'a>(
+    store: &Store,
+    seen: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+) -> usize {
     // Read unlocked, because the expensive half is the caller's backend reading
     // and this is only deciding whether there is anything to write at all.
     let learned = sessions_learned(&store.bindings(), seen);
@@ -2498,11 +2533,18 @@ pub fn learn_sessions<'a>(store: &Store, seen: impl Iterator<Item = (&'a str, &'
         // agent in the seat either way — but the rest of the record is now
         // somebody else's and must not be written back from the stale copy.
         let bindings = store.bindings();
-        for (seat, session) in &learned {
+        for (seat, session, kind) in &learned {
             let Some(mut b) = bindings.get(seat).cloned() else { continue };
             let task = b.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string();
             let Some(o) = b.as_object_mut() else { continue };
             o.insert("agent_session_id".to_string(), json!(session));
+            // Silence is not a correction here either: a pane whose agent has
+            // died reports no kind and the recorded one is still the truth
+            // about what was in that seat — which is precisely when it is read,
+            // because `ran_at` asks at the end of an attempt.
+            if !kind.trim().is_empty() {
+                o.insert("agent_kind".to_string(), json!(kind));
+            }
             store.set_binding(seat, b);
             // And on the claim, which is the copy that is still there when the
             // attempt ends. Only where there is one: a session learned for a
@@ -2510,12 +2552,15 @@ pub fn learn_sessions<'a>(store: &Store, seen: impl Iterator<Item = (&'a str, &'
             if let Some(mut c) = store.claims().get(&task).cloned() {
                 if let Some(o) = c.as_object_mut() {
                     o.insert("agent_session_id".to_string(), json!(session));
+                    if !kind.trim().is_empty() {
+                        o.insert("agent_kind".to_string(), json!(kind));
+                    }
                     store.set_claim(&task, c);
                 }
             }
             store.log_event(
                 "session-learned",
-                json!({ "id": task, "pane": seat, "session": session }),
+                json!({ "id": task, "pane": seat, "session": session, "kind": kind }),
             );
         }
     });
@@ -6881,6 +6926,12 @@ mod tests {
                 let mut b = json!({ "task_id": task, "pane_id": pane });
                 if let Some(s) = session {
                     b["agent_session_id"] = json!(s);
+                    // A record that has a session has a kind: they are learned
+                    // from the same row on the same tick. The one that has
+                    // neither is the seat between the claim and the agent.
+                    if !s.is_empty() {
+                        b["agent_kind"] = json!("claude");
+                    }
                 }
                 (pane.to_string(), b)
             })
@@ -6897,17 +6948,23 @@ mod tests {
         let store = bound(&[("w1:p1", "robustness-060", Some(""))]);
 
         // Between claim and start: herdr has a pane and nothing in it.
-        let nothing = sessions_learned(&store, [("w1:p1", "")].into_iter());
+        let nothing = sessions_learned(&store, [("w1:p1", "", "")].into_iter());
         assert!(nothing.is_empty(), "no agent, no session, nothing to write");
 
         // The agent comes up and herdr says which session it is.
-        let learned = sessions_learned(&store, [("w1:p1", "309b2e2c")].into_iter());
-        assert_eq!(learned, vec![("w1:p1".to_string(), "309b2e2c".to_string())]);
+        let learned = sessions_learned(&store, [("w1:p1", "309b2e2c", "claude")].into_iter());
+        assert_eq!(
+            learned,
+            vec![("w1:p1".to_string(), "309b2e2c".to_string(), "claude".to_string())]
+        );
 
         // An `adopt`ed binding has no such key and is in exactly the same
         // position, so absence has to read as empty rather than as "skip".
         let adopted = bound(&[("w1:p1", "robustness-060", None)]);
-        assert_eq!(sessions_learned(&adopted, [("w1:p1", "309b2e2c")].into_iter()).len(), 1);
+        assert_eq!(
+            sessions_learned(&adopted, [("w1:p1", "309b2e2c", "claude")].into_iter()).len(),
+            1
+        );
     }
 
     /// **Silence is not a correction**, and this is the reading that would
@@ -6922,11 +6979,11 @@ mod tests {
         let store = bound(&[("w1:p1", "robustness-060", Some("309b2e2c"))]);
 
         assert!(
-            sessions_learned(&store, [("w1:p1", "")].into_iter()).is_empty(),
+            sessions_learned(&store, [("w1:p1", "", "claude")].into_iter()).is_empty(),
             "a dead agent's silence must not erase the id a resume is keyed on"
         );
         assert!(
-            sessions_learned(&store, [("w1:p1", "   ")].into_iter()).is_empty(),
+            sessions_learned(&store, [("w1:p1", "   ", "claude")].into_iter()).is_empty(),
             "and a blank one is silence too"
         );
     }
@@ -6940,12 +6997,15 @@ mod tests {
     fn a_seat_now_holding_another_session_is_corrected_to_it() {
         let store = bound(&[("w1:p1", "robustness-060", Some("309b2e2c"))]);
 
-        let learned = sessions_learned(&store, [("w1:p1", "f1487db7")].into_iter());
-        assert_eq!(learned, vec![("w1:p1".to_string(), "f1487db7".to_string())]);
+        let learned = sessions_learned(&store, [("w1:p1", "f1487db7", "claude")].into_iter());
+        assert_eq!(
+            learned,
+            vec![("w1:p1".to_string(), "f1487db7".to_string(), "claude".to_string())]
+        );
 
         // And the ordinary tick, where nothing has changed, writes nothing:
         // `sync` runs this every 20s against every pane on the machine.
-        let same = sessions_learned(&store, [("w1:p1", "309b2e2c")].into_iter());
+        let same = sessions_learned(&store, [("w1:p1", "309b2e2c", "claude")].into_iter());
         assert!(same.is_empty(), "a store write per tick per pane is not a projection");
     }
 
@@ -6955,10 +7015,56 @@ mod tests {
     #[test]
     fn a_session_in_a_seat_wsp_has_not_bound_teaches_it_nothing() {
         let store = bound(&[("w1:p1", "robustness-060", Some(""))]);
-        let seen = [("w1:p1", "309b2e2c"), ("w9:p1", "77fa398b")];
+        let seen = [("w1:p1", "309b2e2c", "claude"), ("w9:p1", "77fa398b", "claude")];
 
         let learned = sessions_learned(&store, seen.into_iter());
-        assert_eq!(learned, vec![("w1:p1".to_string(), "309b2e2c".to_string())]);
+        assert_eq!(
+            learned,
+            vec![("w1:p1".to_string(), "309b2e2c".to_string(), "claude".to_string())]
+        );
+    }
+
+    /// The kind obeys the same two rules as the session, and it has to be
+    /// asserted separately because it is judged separately: a pane whose agent
+    /// has died reports no kind either, and the moment it is worth the most is
+    /// the moment it stops being reported.
+    #[test]
+    fn a_seat_whose_agent_died_keeps_the_kind_it_was_last_seen_with() {
+        let store = bound(&[("w1:p1", "core-031", Some("309b2e2c"))]);
+        let mut b = store.get("w1:p1").unwrap().clone();
+        b["agent_kind"] = json!("opencode");
+        let store: BTreeMap<String, Value> =
+            [("w1:p1".to_string(), b)].into_iter().collect();
+
+        assert!(
+            sessions_learned(&store, [("w1:p1", "309b2e2c", "")].into_iter()).is_empty(),
+            "silence about the kind is not a correction any more than silence about the session"
+        );
+        assert_eq!(
+            sessions_learned(&store, [("w1:p1", "309b2e2c", "claude")].into_iter()).len(),
+            1,
+            "and a different kind is a correction, which is what a restarted pane looks like"
+        );
+    }
+
+    /// The `||` in the test, and the case it exists for: every record in the
+    /// store on the day `core-031` landed already had its session and will never
+    /// change it again. Judging the row on the session alone would leave each of
+    /// them with no kind for as long as it lived, and reading its default
+    /// forever.
+    #[test]
+    fn a_binding_that_already_knew_its_session_still_learns_its_kind() {
+        let store = bound(&[("w1:p1", "core-031", Some("309b2e2c"))]);
+        let mut b = store.get("w1:p1").unwrap().clone();
+        b.as_object_mut().unwrap().remove("agent_kind");
+        let store: BTreeMap<String, Value> =
+            [("w1:p1".to_string(), b)].into_iter().collect();
+
+        assert_eq!(
+            sessions_learned(&store, [("w1:p1", "309b2e2c", "opencode")].into_iter()),
+            vec![("w1:p1".to_string(), "309b2e2c".to_string(), "opencode".to_string())],
+            "an unchanged session with a kind nobody recorded is still news"
+        );
     }
 
     /// A store on disk with one pane holding one task.

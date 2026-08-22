@@ -196,10 +196,16 @@ pub struct Seat {
     /// with two governors up for a day — `bindings.json` was `{}`, and the two
     /// panes that had survived longest were the two that could not be resumed.
     pub session: String,
-    /// Where that session was running, which is what `claude --resume` has to
-    /// be standing in for the transcript to mean anything. Learned with the
+    /// Where that session was running, which is what a resume has to be
+    /// standing in for the transcript to mean anything. Learned with the
     /// session and from the same reading.
     pub cwd: String,
+    /// What kind of agent it is — `claude`, `opencode` — because what a resume
+    /// *is* differs by kind and only the kind knows how to say it. Learned with
+    /// the session, from the same reading and under the same rules; see
+    /// [`learn_seats`]. Empty until something has seen one, which
+    /// [`crate::cmd_spawn::kind_or_default`] reads as the default.
+    pub kind: String,
 }
 
 impl Seat {
@@ -307,6 +313,7 @@ fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
         since: rec.get("since").and_then(Value::as_str).unwrap_or_default().to_string(),
         session: str_at(rec, "session"),
         cwd: str_at(rec, "cwd"),
+        kind: str_at(rec, "kind"),
     })
 }
 
@@ -623,7 +630,7 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
         .governors()
         .get(project)
         .filter(|rec| str_at(rec, "workspace") == workspace)
-        .map(|rec| (str_at(rec, "session"), str_at(rec, "cwd")))
+        .map(|rec| (str_at(rec, "session"), str_at(rec, "cwd"), str_at(rec, "kind")))
         .unwrap_or_default();
     store.set_governor(
         project,
@@ -634,6 +641,10 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
             "since": util::now_iso(),
             "session": kept.0,
             "cwd": kept.1,
+            // The kind travels with the session because it is half of the same
+            // answer: an id nobody can say which binary to hand it to is not a
+            // thread anybody can pick up.
+            "kind": kept.2,
         }),
     );
     store.log_event("governor-set", json!({ "project": project, "workspace": workspace }));
@@ -762,6 +773,7 @@ fn stood_down(rec: &Value) -> Value {
         "host": str_at(rec, "host"),
         "session": str_at(rec, "session"),
         "cwd": str_at(rec, "cwd"),
+        "kind": str_at(rec, "kind"),
         "since": str_at(rec, "since"),
     })
 }
@@ -786,6 +798,7 @@ pub fn last_seat(governors: &BTreeMap<String, Value>, scope: &str) -> Option<Sea
             since: str_at(r, "since"),
             session: str_at(r, "session"),
             cwd: str_at(r, "cwd"),
+            kind: str_at(r, "kind"),
         })
     };
     of(rec).or_else(|| rec.get("last").and_then(of))
@@ -801,7 +814,8 @@ pub fn host_of(governors: &BTreeMap<String, Value>, project: &str) -> String {
     }
 }
 
-/// Record against each seat the session the backend says is sitting in it.
+/// Record against each seat what the backend says is sitting in it: the session
+/// it is running under, the tree it was started in, and its kind.
 ///
 /// The seat-shaped half of [`crate::cmd_agent::learn_sessions`], and separate
 /// from it for one reason that is not tidiness: a binding is keyed on a **pane**
@@ -810,7 +824,10 @@ pub fn host_of(governors: &BTreeMap<String, Value>, project: &str) -> String {
 /// both rules lives on that function: silence is not a correction, a different
 /// session is. The cwd travels with the session because a transcript resumed in
 /// the wrong tree is worse than one not resumed at all — `claude --resume`
-/// takes the id and inherits the directory from wherever it is run.
+/// takes the id and inherits the directory from wherever it is run. The kind
+/// travels with them for `core-031`'s reason and is judged the same way; the
+/// argument for observing it rather than declaring it is on
+/// [`crate::cmd_agent::learn_sessions`] and is not repeated here.
 ///
 /// Called from `sync`, which reads every pane on every tick and therefore pays
 /// no round-trip for this, and from `spawn`, which asks once the moment its
@@ -826,21 +843,31 @@ pub fn host_of(governors: &BTreeMap<String, Value>, project: &str) -> String {
 /// its neighbour. worklist-035; [`governs`] carries the argument.
 pub fn learn_seats<'a>(
     store: &Store,
-    seen: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+    seen: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str, &'a str)>,
 ) -> usize {
     let governors = store.governors();
     // Workspace -> project, computed once: `governs` is a scan, and a machine
     // running twenty panes would otherwise scan the whole file per pane.
-    let learned: Vec<(String, String, String)> = seen
-        .filter(|(_, _, session, _)| !session.trim().is_empty())
-        .filter_map(|(workspace, pane, session, cwd)| {
+    let learned: Vec<(String, String, String, String)> = seen
+        .filter(|(_, _, session, _, _)| !session.trim().is_empty())
+        .filter_map(|(workspace, pane, session, cwd, kind)| {
             let project = governs(&governors, workspace, Some(pane))?;
             let seat = seat_of(&project, governors.get(&project)?)?;
-            // The session is the only field a change is judged on. A cwd that
-            // has moved under a session wsp already knows is herdr answering
-            // about a pane whose shell has `cd`-ed, and the tree the agent was
-            // *started* in is the one to bring it back in.
-            (seat.session != session).then(|| (project, session.to_string(), cwd.to_string()))
+            // The session and the kind are the two fields a change is judged
+            // on, and the cwd is not: a cwd that has moved under a session wsp
+            // already knows is herdr answering about a pane whose shell has
+            // `cd`-ed, and the tree the agent was *started* in is the one to
+            // bring it back in.
+            //
+            // The kind joins the test rather than riding along with it because
+            // of the seats that already exist: their session was learned
+            // yesterday and will not change again, so a test on the session
+            // alone would leave every one of them kindless for life.
+            let moved =
+                seat.session != session || (!kind.trim().is_empty() && seat.kind != kind);
+            moved.then(|| {
+                (project, session.to_string(), cwd.to_string(), kind.to_string())
+            })
         })
         .collect();
     if learned.is_empty() {
@@ -848,7 +875,7 @@ pub fn learn_seats<'a>(
     }
     store.locked(|| {
         let governors = store.governors();
-        for (project, session, cwd) in &learned {
+        for (project, session, cwd, kind) in &learned {
             // Re-read inside the lock, for `learn_sessions`' reason: a
             // `wsp govern` landing between the two readings has moved the slot
             // to another workspace, and writing back from the stale copy would
@@ -859,10 +886,16 @@ pub fn learn_seats<'a>(
             if !cwd.is_empty() {
                 o.insert("cwd".to_string(), json!(cwd));
             }
+            // Silence is not a correction, the rule `learn_sessions` states: a
+            // pane whose agent has died reports no kind, and that is the moment
+            // the recorded one is worth the most.
+            if !kind.trim().is_empty() {
+                o.insert("kind".to_string(), json!(kind));
+            }
             store.set_governor(project, rec);
             store.log_event(
                 "session-learned",
-                json!({ "project": project, "session": session, "cwd": cwd }),
+                json!({ "project": project, "session": session, "cwd": cwd, "kind": kind }),
             );
         }
     });

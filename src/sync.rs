@@ -166,14 +166,16 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             let said = store.said();
             store.reap_said(&kept_bindings(&live, said.keys(), &answered));
             // The one reading of herdr that happens on every tick, and it
-            // already carries `agent_session` on the rows that have one. A
-            // binding cannot record the session at the moment it is written —
+            // already carries `agent_session` and `agent` on the rows that have
+            // one. A binding cannot record either at the moment it is written —
             // `spawn` claims before it starts the agent — so this is what makes
-            // the field true rather than merely present. After the reap, so a
+            // the fields true rather than merely present. After the reap, so a
             // binding about to be dropped is not written to first.
             crate::cmd_agent::learn_sessions(
                 store,
-                panes.iter().map(|p| (p.pane_id.as_str(), p.session_id.as_str())),
+                panes.iter().map(|p| {
+                    (p.pane_id.as_str(), p.session_id.as_str(), p.agent.as_str())
+                }),
             );
             // And the same reading again for the seats, off the same rows.
             // A custodian holds no claim, so nothing above this line records
@@ -193,7 +195,13 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
                             .unwrap_or_default(),
                         false => p.cwd.as_str(),
                     };
-                    (p.workspace_id.as_str(), p.pane_id.as_str(), p.session_id.as_str(), cwd)
+                    (
+                        p.workspace_id.as_str(),
+                        p.pane_id.as_str(),
+                        p.session_id.as_str(),
+                        cwd,
+                        p.agent.as_str(),
+                    )
                 }),
             );
             // And the census itself, kept so a restart can offer back what a

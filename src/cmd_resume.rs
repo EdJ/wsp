@@ -163,17 +163,24 @@ pub struct Thread {
     /// project is not what is being resumed.
     pub seat_of: Option<String>,
     pub session: String,
-    /// The directory the session was running in. `claude --resume` takes an id
-    /// and inherits the tree from wherever it is run, so this is half the
-    /// answer and not a detail.
+    /// The directory the session was running in. A resume takes an id and
+    /// inherits the tree from wherever it is run — for every kind wsp knows —
+    /// so this is half the answer and not a detail.
     pub cwd: String,
     /// The machine it was last seen on, as that machine calls itself.
     pub host: String,
     /// The room it was in, where that is still known. Empty is normal: a
     /// binding names a pane, and a pane's workspace is gone with it.
     pub workspace: String,
-    /// Which agent — `claude`, `codex` — because what a resume *is* differs by
-    /// kind and only the kind knows how to say it.
+    /// Which agent — `claude`, `opencode` — because what a resume *is* differs
+    /// by kind and only the kind knows how to say it: the binary to run, the
+    /// flag that spells "pick this session up", and whether there is a
+    /// transcript to read afterwards at all.
+    ///
+    /// Never empty. Every constructor puts a record's answer through
+    /// [`crate::cmd_spawn::kind_or_default`], so a reader here is asking about
+    /// an agent rather than about whether wsp wrote something down; the argument
+    /// for which default, and for why an absence does not last, is there.
     pub kind: String,
     pub from: Source,
 }
@@ -183,12 +190,30 @@ impl Thread {
     /// path when herdr itself is what is broken. Printed by `--print` and by
     /// every refusal below, because a verb that cannot do it should still say
     /// how.
-    pub fn by_hand(&self) -> String {
+    ///
+    /// `None` for a kind wsp has no resume spelling for. This read
+    /// `{kind} --resume {session}` until `core-031`, which is Claude Code's flag
+    /// on whatever binary the row happened to name: driven against a live
+    /// opencode it printed `claude --resume ses_fdaf7f65…`, wrong in both halves
+    /// and offered as the thing to type when nothing else works. The spelling is
+    /// [`crate::agent_commands::Kind::resume_flag`]'s, and a kind that has none
+    /// gets no line rather than a plausible one.
+    pub fn by_hand(&self) -> Option<String> {
+        let flag = agent_commands::of(&self.kind).resume_flag()?;
         let cd = match self.cwd.is_empty() {
             true => String::new(),
             false => format!("cd {} && ", self.cwd),
         };
-        format!("{cd}{} --resume {}", self.kind, self.session)
+        Some(format!("{cd}{} {flag} {}", self.kind, self.session))
+    }
+
+    /// [`Thread::by_hand`] for printing, with the reason standing in where there
+    /// is no line. A refusal that says nothing about what a person could do
+    /// instead is the failure `by_hand` exists to prevent, and an empty string
+    /// in the middle of a sentence is exactly that.
+    fn by_hand_says(&self) -> String {
+        self.by_hand()
+            .unwrap_or_else(|| format!("wsp has no way to resume a `{}` by hand", self.kind))
     }
 
     /// Ours to reach, or somebody else's machine.
@@ -242,10 +267,7 @@ fn of_row(row: &Value) -> Option<Thread> {
         cwd: text(row, "cwd"),
         host: herdr::host_of(&pane).unwrap_or(&util::hostname()).to_string(),
         workspace: text(row, "workspace"),
-        kind: match text(row, "kind").is_empty() {
-            true => cmd_spawn::DEFAULT_KIND.to_string(),
-            false => text(row, "kind"),
-        },
+        kind: cmd_spawn::kind_or_default(&text(row, "kind")),
         from: Source::Census,
     })
 }
@@ -495,9 +517,25 @@ pub fn thread_for_task(store: &Store, task: &str) -> Option<Thread> {
     .into_iter()
     .flatten()
     .find(|s| !s.is_empty());
-    let (session, from) = match recorded {
-        Some(s) => (s, Source::Record),
-        None => (text(&logged(store, "id", task)?, "session"), Source::Log),
+    // The kind comes off the same three rungs in the same order, because it is
+    // half of the same answer: an id with no binary to hand it to is not a
+    // thread anybody can pick up. Read separately rather than beside the session
+    // because the two are learned under separate rules — a binding written
+    // before `core-031` carries a session and no kind, and reading them as a
+    // pair would let the empty half throw away the good one.
+    let kind = [
+        bound.as_ref().map(|b| text(b, "agent_kind")),
+        claim.map(|c| text(c, "agent_kind")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|s| !s.is_empty());
+    let (session, kind, from) = match recorded {
+        Some(s) => (s, kind.unwrap_or_default(), Source::Record),
+        None => {
+            let d = logged(store, "id", task)?;
+            (text(&d, "session"), text(&d, "kind"), Source::Log)
+        }
     };
     if session.is_empty() {
         return None;
@@ -524,7 +562,7 @@ pub fn thread_for_task(store: &Store, task: &str) -> Option<Thread> {
         cwd,
         host: claim.map(|c| text(c, "host")).unwrap_or_default(),
         workspace: claim.map(|c| text(c, "workspace_id")).unwrap_or_default(),
-        kind: cmd_spawn::DEFAULT_KIND.to_string(),
+        kind: cmd_spawn::kind_or_default(&kind),
         from,
     })
 }
@@ -542,11 +580,16 @@ pub fn thread_for_seat(store: &Store, project: &str) -> Option<Thread> {
     let governors = store.governors();
     let seat = cmd_govern::last_seat(&governors, project);
     let recorded = seat.as_ref().map(|s| s.session.clone()).filter(|s| !s.is_empty());
-    let (session, from, cwd) = match recorded {
-        Some(s) => (s, Source::Record, seat.as_ref().map(|s| s.cwd.clone()).unwrap_or_default()),
+    let (session, from, cwd, kind) = match recorded {
+        Some(s) => (
+            s,
+            Source::Record,
+            seat.as_ref().map(|s| s.cwd.clone()).unwrap_or_default(),
+            seat.as_ref().map(|s| s.kind.clone()).unwrap_or_default(),
+        ),
         None => {
             let d = logged(store, "project", project)?;
-            (text(&d, "session"), Source::Log, text(&d, "cwd"))
+            (text(&d, "session"), Source::Log, text(&d, "cwd"), text(&d, "kind"))
         }
     };
     if session.is_empty() {
@@ -560,7 +603,7 @@ pub fn thread_for_seat(store: &Store, project: &str) -> Option<Thread> {
         cwd,
         host: cmd_govern::host_of(&governors, project),
         workspace: seat.map(|s| s.workspace).unwrap_or_default(),
-        kind: cmd_spawn::DEFAULT_KIND.to_string(),
+        kind: cmd_spawn::kind_or_default(&kind),
         from,
     })
 }
@@ -624,6 +667,20 @@ fn somewhere_to_stand(t: &Thread) -> Option<Seat> {
 /// has been told something false. A resumed agent runs that hook too.
 fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, String> {
     let kind = t.kind.clone();
+    // Refused before a workspace is opened, because the alternative is silent
+    // and worse. A kind with no resume spelling passes `Spawn::resume` to an
+    // `args` that ignores it — so the agent starts, the claim is re-taken, the
+    // line says "resumed", and what is actually in the seat is a fresh session
+    // with none of the transcript this whole verb exists to get back. A wrong
+    // answer that looks like the right one is the failure `core-031` is about;
+    // saying so costs a line.
+    if agent_commands::of(&kind).resume_flag().is_none() {
+        return Err(format!(
+            "{} was a `{kind}`, and wsp knows no way to resume one — \
+             starting it fresh would lose the session it is named after",
+            t.what
+        ));
+    }
     let label = match &t.seat_of {
         Some(project) => cmd_govern::governor_of(project),
         None => store
@@ -707,12 +764,20 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
         let ours: Vec<&crate::place::Seated> = rows.seats().filter(|r| r.seat == seat).collect();
         crate::cmd_agent::learn_sessions(
             store,
-            ours.iter().map(|r| (r.seat.as_str(), r.session.as_str())),
+            ours.iter().map(|r| (r.seat.as_str(), r.session.as_str(), r.agent.kind.as_str())),
         );
         if let (true, Some(ws)) = (t.seat_of.is_some(), cmd_spawn::workspace_of(&seat)) {
             cmd_govern::learn_seats(
                 store,
-                ours.iter().map(|r| (ws.as_str(), r.seat.as_str(), r.session.as_str(), r.cwd.as_str())),
+                ours.iter().map(|r| {
+                    (
+                        ws.as_str(),
+                        r.seat.as_str(),
+                        r.session.as_str(),
+                        r.cwd.as_str(),
+                        r.agent.kind.as_str(),
+                    )
+                }),
             );
         }
     }
@@ -902,7 +967,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
         for r in &rows {
             let from = format!("{}{}", r.thread.from.as_str(), r.note());
             println!("{}  {}", p.bold(&r.thread.row()), p.dim(&from));
-            println!("  {}", r.thread.by_hand());
+            println!("  {}", r.thread.by_hand_says());
         }
         return 0;
     }
@@ -963,7 +1028,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
             // Not a failure and not attempted. The id is another machine's, the
             // tunnel is for herdr rather than for the agent's own runtime, and
             // the honest answer is the line to run over there.
-            println!("{} is on {} — {}", p.bold(&t.what), t.host, t.by_hand());
+            println!("{} is on {} — {}", p.bold(&t.what), t.host, t.by_hand_says());
             continue;
         }
         // The second check, and the one that matters: the tick was given to a
@@ -1017,7 +1082,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
             }
             Err(e) => {
                 eprintln!("wsp: {e}");
-                eprintln!("wsp: by hand — {}", t.by_hand());
+                eprintln!("wsp: by hand — {}", t.by_hand_says());
                 failed += 1;
             }
         }
@@ -1289,7 +1354,10 @@ mod tests {
             "a seat nothing has been learned about has no thread to resume"
         );
 
-        cmd_govern::learn_seats(&store, [("w1", "w1:p6", "c109006f", "/Users/edjames/claude")].into_iter());
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p6", "c109006f", "/Users/edjames/claude", "claude")].into_iter(),
+        );
         let t = thread_for_seat(&store, "wsp").expect("the seat now has a session");
         assert_eq!((t.session.as_str(), t.cwd.as_str()), ("c109006f", "/Users/edjames/claude"));
         assert_eq!(t.from, Source::Record);
@@ -1306,7 +1374,10 @@ mod tests {
             "wsp",
             json!({ "workspace": "w1", "pane": "w1:p6", "host": util::hostname(), "since": util::now_iso() }),
         );
-        cmd_govern::learn_seats(&store, [("w1", "w1:p6", "c109006f", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p6", "c109006f", "/tmp/tree", "claude")].into_iter(),
+        );
         cmd_govern::vacate(&store, "wsp");
 
         assert!(
@@ -1315,7 +1386,39 @@ mod tests {
         );
         let t = thread_for_seat(&store, "wsp").expect("and still has a thread");
         assert_eq!(t.session, "c109006f");
-        assert_eq!(t.by_hand(), "cd /tmp/tree && claude --resume c109006f");
+        assert_eq!(t.by_hand().as_deref(), Some("cd /tmp/tree && claude --resume c109006f"));
+    }
+
+    /// A custodian's kind travels with its session — through the re-take that
+    /// `wsp resume` itself performs, and through standing the seat down.
+    ///
+    /// The two are asserted together because they are the two ways the record
+    /// is rewritten with the agent already gone, and either one dropping the
+    /// kind leaves a thread whose id nobody can say which binary to hand to.
+    #[test]
+    fn a_vacated_seat_remembers_which_binary_to_resume_it_with() {
+        let (_env, store) = store("resume-seat-kind");
+        store.set_governor(
+            "wsp",
+            json!({ "workspace": "w1", "pane": "w1:p6", "host": util::hostname() }),
+        );
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p6", "ses_fdaf7f65", "/tmp/tree", "opencode")].into_iter(),
+        );
+        cmd_govern::take(&store, "wsp", "w1", "w1:p9");
+        assert_eq!(
+            thread_for_seat(&store, "wsp").map(|t| t.kind),
+            Some("opencode".to_string()),
+            "re-taking the room an agent is already in keeps its kind with its session"
+        );
+
+        cmd_govern::vacate(&store, "wsp");
+        let t = thread_for_seat(&store, "wsp").expect("the thread outlives the occupancy");
+        assert_eq!(
+            t.by_hand().as_deref(),
+            Some("cd /tmp/tree && opencode --session ses_fdaf7f65")
+        );
     }
 
     /// Vacating twice must not bury the thread one level deeper each time —
@@ -1324,7 +1427,10 @@ mod tests {
     fn standing_an_empty_seat_down_again_keeps_the_same_thread() {
         let (_env, store) = store("resume-twice");
         store.set_governor("wsp", json!({ "workspace": "w1", "host": util::hostname() }));
-        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "sess", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p1", "sess", "/tmp/tree", "claude")].into_iter(),
+        );
         cmd_govern::vacate(&store, "wsp");
         store.set_governor(
             "wsp",
@@ -1371,11 +1477,20 @@ mod tests {
     fn silence_from_the_backend_leaves_a_seats_session_alone() {
         let (_env, store) = store("resume-silence");
         store.set_governor("wsp", json!({ "workspace": "w1", "host": util::hostname() }));
-        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "sess", "/tmp/tree")].into_iter());
-        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "", "")].into_iter());
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p1", "sess", "/tmp/tree", "claude")].into_iter(),
+        );
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p1", "", "", "")].into_iter(),
+        );
         assert_eq!(thread_for_seat(&store, "wsp").map(|t| t.session), Some("sess".to_string()));
 
-        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "another", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p1", "another", "/tmp/tree", "claude")].into_iter(),
+        );
         assert_eq!(
             thread_for_seat(&store, "wsp").map(|t| t.session),
             Some("another".to_string()),
@@ -1390,7 +1505,10 @@ mod tests {
     fn re_taking_the_same_seat_does_not_erase_its_session() {
         let (_env, store) = store("resume-retake");
         store.set_governor("wsp", json!({ "workspace": "w1", "host": util::hostname() }));
-        cmd_govern::learn_seats(&store, [("w1", "w1:p1", "sess", "/tmp/tree")].into_iter());
+        cmd_govern::learn_seats(
+            &store,
+            [("w1", "w1:p1", "sess", "/tmp/tree", "claude")].into_iter(),
+        );
         cmd_govern::take(&store, "wsp", "w1", "w1:p9");
         assert_eq!(thread_for_seat(&store, "wsp").map(|t| t.session), Some("sess".to_string()));
 
@@ -1425,7 +1543,7 @@ mod tests {
             (t.session.as_str(), t.cwd.as_str(), t.from),
             ("abc", "/tmp/work", Source::Record)
         );
-        assert_eq!(t.by_hand(), "cd /tmp/work && claude --resume abc");
+        assert_eq!(t.by_hand().as_deref(), Some("cd /tmp/work && claude --resume abc"));
     }
 
     /// And it comes off the *claim* when the binding is gone, which is the state
@@ -1454,6 +1572,113 @@ mod tests {
         );
         let t = thread_for_task(&store, "render-061").expect("the claim is a record too");
         assert_eq!((t.session.as_str(), t.from), ("abc", Source::Record));
+    }
+
+    /// The defect `core-031` was filed on, at the line that decides it.
+    ///
+    /// Driven against a live opencode in `core-026`, `wsp resume ocsand-001
+    /// --print` offered `claude --resume ses_fdaf7f65…` — wrong binary and
+    /// wrong flag, because `--kind` was read by `spawn` and written nowhere. The
+    /// record now carries what is in the seat, and both halves of the line come
+    /// off it.
+    #[test]
+    fn an_opencode_thread_is_resumed_as_an_opencode_and_not_as_a_claude() {
+        let (_env, store) = store("resume-kind");
+        store.set_binding(
+            "w1:p1",
+            json!({
+                "task_id": "ocsand-001",
+                "agent_session_id": "ses_fdaf7f65",
+                "agent_kind": "opencode",
+            }),
+        );
+        store.set_claim(
+            "ocsand-001",
+            json!({ "workspace_id": "w1", "cwd": "/tmp/work", "host": util::hostname() }),
+        );
+        let t = thread_for_task(&store, "ocsand-001").unwrap();
+        assert_eq!(t.kind, "opencode");
+        assert_eq!(
+            t.by_hand().as_deref(),
+            Some("cd /tmp/work && opencode --session ses_fdaf7f65"),
+            "the binary and the flag are both the kind's, and neither is claude's"
+        );
+    }
+
+    /// And it survives the binding, which is the one moment anybody asks. Both
+    /// `release_pane` and `done` drop the binding before they end the claim, so
+    /// `cmd_agent::ran_at` reads a claim and nothing else — and a kind that
+    /// lived only on the binding would have `Claude::ran` looking for an
+    /// opencode's transcript under `~/.claude/projects`.
+    #[test]
+    fn the_kind_outlives_the_binding_because_that_is_when_it_is_read() {
+        let (_env, store) = store("resume-kind-claim");
+        store.set_claim(
+            "ocsand-001",
+            json!({
+                "workspace_id": "w1",
+                "cwd": "/tmp/work",
+                "agent_session_id": "ses_fdaf7f65",
+                "agent_kind": "opencode",
+                "host": util::hostname(),
+            }),
+        );
+        let t = thread_for_task(&store, "ocsand-001").unwrap();
+        assert_eq!((t.kind.as_str(), t.from), ("opencode", Source::Record));
+    }
+
+    /// `core-031`'s second decision, asserted rather than described: a record
+    /// written before the kind was recorded reads as `claude`.
+    ///
+    /// The alternative — reading the absence as *unknown* — resolves to
+    /// `agent_commands::Plain`, which has no resume flag, and would take
+    /// `wsp resume` away from every thread in the store on the day it landed.
+    #[test]
+    fn a_record_written_before_the_kind_was_recorded_still_resumes() {
+        let (_env, store) = store("resume-kindless");
+        store.set_binding(
+            "w1:p1",
+            json!({ "task_id": "render-061", "agent_session_id": "abc" }),
+        );
+        store.set_claim(
+            "render-061",
+            json!({ "workspace_id": "w1", "cwd": "/tmp/work", "host": util::hostname() }),
+        );
+        let t = thread_for_task(&store, "render-061").unwrap();
+        assert_eq!(t.kind, cmd_spawn::DEFAULT_KIND);
+        assert_eq!(t.by_hand().as_deref(), Some("cd /tmp/work && claude --resume abc"));
+    }
+
+    /// A kind wsp has no resume spelling for gets no line rather than a
+    /// plausible one, and `bring_back` refuses rather than starting a fresh
+    /// session under the name of the old thread.
+    ///
+    /// This is the failure the whole row is about, one kind further out: a
+    /// `codex` row off the census used to print claude's flag, and answering
+    /// the picker on it would have started a new session and reported it
+    /// resumed.
+    #[test]
+    fn a_kind_wsp_cannot_resume_says_so_instead_of_guessing_claudes_flag() {
+        let (_env, store) = store("resume-unknown-kind");
+        let t = Thread {
+            what: "t-1".into(),
+            task: Some("t-1".into()),
+            seat_of: None,
+            session: "abc".into(),
+            cwd: "/tmp/work".into(),
+            host: util::hostname(),
+            workspace: String::new(),
+            kind: "codex".into(),
+            from: Source::Census,
+        };
+        assert_eq!(t.by_hand(), None);
+        assert!(t.by_hand_says().contains("codex"), "{}", t.by_hand_says());
+        let e = bring_back(&store, &crate::place_herdr::Herdr::new(), &t).unwrap_err();
+        assert!(e.contains("codex"), "{e}");
+        assert!(
+            store.claims().get("t-1").is_none(),
+            "and it refused before it took a claim or opened anything"
+        );
     }
 
     /// The boundary Ed drew: the offer is the last census, and an agent herdr
