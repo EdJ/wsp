@@ -1597,6 +1597,27 @@ it has. The panel's `f` hands work to an agent that has been running since
 before the claim existed, so that one is still asked to fetch, once, with
 `--session`. The duplicate is gone by construction rather than by remembering.
 
+**A kind with no session hook has none of that**, and its work order used to say
+*"your brief is already above"* to an agent whose context was empty. An opencode
+spawned that way read the sentence, went looking with `git status`, and asked
+for the brief to be pasted — a wrong order that reads exactly like a poor model.
+So `spawn` composes the brief itself and carries it in front of the sentence:
+the same `--session` text, built for the seat it has just opened rather than for
+the session running `spawn`. That is `cmd_brief::At` — the discovery is the
+argument and the composition is shared, so there is one brief and not two.
+
+Nothing is trimmed on the way. What the inlined brief replaces is the `wsp brief
+--session` the agent was being told to run, so it is a substitution rather than
+an addition: the same tokens, minus a round-trip at request 1, minus — under
+`core-020`'s permission policy — a stall on the agent's first `bash`, which was
+the command that would have told it what it was for.
+
+It goes only to a kind whose order is handed over in **argv**, which today is
+`opencode`. A kind that is *told* its order gets it through herdr putting text
+at a terminal, and that is the channel where one em-dash once left a work order
+sitting unsent in a composer; fourteen kilobytes of task prose through it is
+unmeasured, so `codex` and `gemini` still fetch. See `cmd_spawn::Route`.
+
 ### What it is *not* handed
 
 ```sh
@@ -3922,7 +3943,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/detail/editors.rs` | the columns, the editors, and the slot they read |
 | `src/detail/run.rs` | the detail pane itself |
 | `src/cmd_attempts.rs` | what ran a task and how it went: the tier asked for, the tier that served, what it consumed, the outcome |
-| `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else |
+| `src/cmd_brief.rs` | one call for a session-start hook: where, what, who else — and the same brief composed for a seat that does not exist yet |
 | `src/cmd_checkout.rs` | a working tree per task, landing it back on the trunk, the three reasons one is finished with, and the branches a removed tree leaves behind |
 | `src/cmd_mandate.rs` | standing direction: what a workspace is for |
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
