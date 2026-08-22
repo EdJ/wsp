@@ -13,7 +13,7 @@
      Unlisted where it is served: reachable by URL, linked from no nav, and
      out of the index too — the convention concept07.html set on joltsite. -->
 <meta name="robots" content="noindex,nofollow">
-<title>wsp, in five pictures</title>
+<title>wsp, in six pictures</title>
 <style>
   /* ---- palette -------------------------------------------------------
      One set of tokens, three grounds: screen-light, screen-dark, paper.
@@ -202,7 +202,7 @@
 <div class="wrap">
 
 <header>
-  <h1>wsp, in five pictures</h1>
+  <h1>wsp, in six pictures</h1>
   <p class="tagline">A control plane for work and for the agents doing it. <strong>wsp</strong> owns
   the durable half — projects, tasks, decisions, worklists, as markdown in a git repository.
   <strong>herdr</strong> owns the live half — workspaces, panes, and the agents running in them.
@@ -229,11 +229,11 @@
       subscription that names the seven things worth being interrupted for.</li>
   </ul>
 
-  <p>Five mechanisms carry nearly all of it: how work is filed, how an agent is put on a
-  piece of it, how you talk to that agent afterwards, how a queue of work is run in order,
-  and how any of that happens on a machine nobody is sitting at. Each picture below is one
-  of them. The vocabulary is exact — where two words look interchangeable on this page,
-  they are not.</p>
+  <p>Six mechanisms carry nearly all of it: how work is filed, how an agent is put on a piece
+  of it, how you talk to that agent afterwards, who answers when it asks for something, how a
+  queue of work is run in order, and how any of that happens on a machine nobody is sitting
+  at. Each picture below is one of them. The vocabulary is exact — where two words look
+  interchangeable on this page, they are not.</p>
   <p class="meta">Single file · nothing fetched · prints on paper · every fact checkable against the wsp README</p>
 </header>
 
@@ -474,13 +474,13 @@
 <!-- ══════════════ 03 · TALKING TO AN AGENT ══════════════ -->
 <section>
   <h2><span class="num">03</span>Talking to a running agent</h2>
-  <p class="lede">Three channels between the work and whoever is coordinating it, and one
-  subscription for whoever is watching several. A <em>governor</em> is a slot on a project — a
-  third kind of node beside projects and tasks — so a raised hand has somewhere to go. The
-  chain always terminates, because the person is the governor of last resort.</p>
+  <p class="lede">Three channels between the work and whoever is coordinating it, and they fail
+  in different ways, which is why there are three. A flag cannot time out but does not arrive on
+  its own; a tell arrives but can be talked over; a question can be left open, so it is the one
+  that refuses to close quietly. <em>Who</em> a raised hand reaches is the next picture.</p>
 
   <figure>
-    <svg viewBox="0 0 900 400" role="img" aria-label="An agent on the left and the governing seat on the right, joined by three lanes: a flag raised from agent to seat, a tell sent from seat to agent, and an ask-and-answer question travelling in both directions; beneath them a band listing the seven predicates wsp watch subscribes to.">
+    <svg viewBox="0 0 900 330" role="img" aria-label="An agent on the left and whoever is coordinating it on the right, joined by three lanes: a flag raised from the agent, a tell sent back to it, and an ask-and-answer question travelling in both directions.">
       <defs>
         <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path class="head" d="M0,0L10,5L0,10z"/>
@@ -500,17 +500,17 @@
       <text class="ts" x="44" y="270">  nobody interrupts to ask</text>
 
       <rect class="node-w" x="662" y="52" width="214" height="258" rx="12"/>
-      <text class="tb" x="682" y="80">the seat — or you</text>
-      <text class="ts" x="682" y="99">a slot on a project</text>
-      <text class="ts" x="682" y="130">· answers the hands raised</text>
-      <text class="ts" x="682" y="146">  beneath it</text>
-      <text class="ts" x="682" y="172">· sequences what runs next</text>
-      <text class="ts" x="682" y="198">· reviews against the code,</text>
-      <text class="ts" x="682" y="214">  not against the report</text>
-      <text class="ts" x="682" y="240">· consults nothing before</text>
-      <text class="ts" x="682" y="256">  a verb acts — it is a</text>
-      <text class="ts" x="682" y="272">  coordination point, not</text>
-      <text class="ts" x="682" y="288">  an approval gate</text>
+      <text class="tb" x="682" y="80">the other end</text>
+      <text class="ts" x="682" y="99">the seat above this task —</text>
+      <text class="ts" x="682" y="115">or you, where there is none</text>
+      <text class="ts" x="682" y="146">· answers what is raised</text>
+      <text class="ts" x="682" y="172">· says what to do next</text>
+      <text class="ts" x="682" y="188">  without ending the turn</text>
+      <text class="ts" x="682" y="214">· closes a question, or</text>
+      <text class="ts" x="682" y="230">  abandons it — it does</text>
+      <text class="ts" x="682" y="246">  not leave it open</text>
+      <text class="ts" x="682" y="278">which seat that is, and how</text>
+      <text class="ts" x="682" y="294">it is told, is picture 04</text>
 
       <!-- lane 1 · flag -->
       <text class="tb" x="450" y="92" text-anchor="middle">flag — a raised hand</text>
@@ -530,12 +530,8 @@
       <text class="ts" x="450" y="288" text-anchor="middle">the answer lands on the task’s log first, then reaches whoever asked</text>
       <text class="ts" x="450" y="304" text-anchor="middle">abandoning it is the other ending, and that goes home too</text>
 
-      <!-- watch band -->
-      <rect class="card" x="24" y="330" width="852" height="58" rx="12"/>
-      <text class="tb" x="44" y="354">watch — the few facts a coordinator acts on, as they become true</text>
-      <text class="tm" x="44" y="374">needs-a-person · review · blocked · flag · unanswered · agent-gone · seat-stalled</text>
     </svg>
-    <figcaption>Three channels that fail in different ways, and one subscription that names what it cares about instead of which field answers it.</figcaption>
+    <figcaption>Three channels, and the differences between them are the point: only one of them can be left open, and it is the one that refuses to be.</figcaption>
   </figure>
 
   <ul class="points">
@@ -552,24 +548,168 @@
       minutes is read as a retry and refused — <code>--again</code> is how you say you meant
       it — because a status probe’s timeout once stood in for the verdict on a message that had
       already arrived.</li>
-    <li><strong>Hands climb the project chain.</strong> One raised on a <code>checkout</code>
-      task asks <code>checkout</code>, then <code>shop</code>, then you.</li>
-    <li><strong>Seven predicates, and an eighth you cannot switch off.</strong>
-      <code>wsp watch</code> streams changes, not snapshots. <code>needs-a-person</code> is
-      stopped with no visible reason; <code>seat-stalled</code> exists because a governor is
-      idle between the agents it sequences and would otherwise raise nothing. The eighth word
-      is <code>blind</code> — wsp has lost sight of the fleet, which is the difference between
-      a quiet fleet and half a world. For a reader who is not at the screen, <code>--wake</code>
-      prints only what is worth a context read and holds the rest to ride the next one; nothing
-      is dropped.</li>
-    <li><strong>It says, and it does not act.</strong> Nothing vacates a seat, ends a pane or
-      advances a barrier on a computed level.</li>
+    <li><strong>A tell is the repair for a stopped turn, not a restart.</strong> The
+      conversation is intact; a respawn throws it away.</li>
   </ul>
 </section>
 
-<!-- ══════════════ 04 · WORKLISTS ══════════════ -->
+<!-- ══════════════ 04 · THE SEAT, AND THE WATCHER ══════════════ -->
 <section>
-  <h2><span class="num">04</span>Worklists</h2>
+  <h2><span class="num">04</span>The seat, and what it is told</h2>
+  <p class="lede">A <em>governor</em> is a slot on a project — a third kind of node beside
+  projects and tasks, and affordable precisely because it is a slot: no status, no prose,
+  nothing to finish. It adds the one edge a claim does not have. A claim is agent-to-task;
+  a seat is agent-to-project, which is what gives a raised hand somewhere to go and lets
+  <code>wsp wip</code> tell an agent sequencing work from one that has stalled.</p>
+
+  <figure>
+    <svg viewBox="0 0 900 545" role="img" aria-label="Above: a project chain — shop above checkout above a task — with a seat attached to each project, and a hand raised on the task asking the nearest seat above it, then the one above that, and the person last. Below: the daemon derives one level set once a minute and it reaches three audiences — a wsp watch subscription, a wake typed at the seat it names, and hooks with the sidebar token.">
+      <defs>
+        <marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path class="head" d="M0,0L10,5L0,10z"/>
+        </marker>
+      </defs>
+
+      <!-- ── band A · the chain ── -->
+      <text class="tw" x="20" y="26">A RAISED HAND ASKS THE NEAREST SEAT ABOVE IT</text>
+
+      <text class="ts" x="530" y="38">…and you, if neither of them does</text>
+
+      <rect class="node-a" x="56" y="48" width="190" height="48" rx="10"/>
+      <text class="tb" x="76" y="72">shop</text>
+      <text class="ts" x="76" y="88">project</text>
+
+      <line class="edge" x1="151" y1="96" x2="151" y2="120" marker-end="url(#ar4)"/>
+      <text class="ts" x="162" y="114">sub-project</text>
+
+      <rect class="node" x="56" y="126" width="190" height="48" rx="10"/>
+      <text class="tb" x="76" y="150">checkout</text>
+      <text class="ts" x="76" y="166">sub-project</text>
+
+      <line class="edge" x1="151" y1="174" x2="151" y2="198" marker-end="url(#ar4)"/>
+      <text class="ts" x="162" y="192">its task</text>
+
+      <rect class="node" x="56" y="204" width="190" height="48" rx="10"/>
+      <text class="tmb" x="76" y="228">checkout-119</text>
+      <text class="ts" x="76" y="244">an agent is on it</text>
+
+      <line class="rule" x1="246" y1="72" x2="282" y2="72"/>
+      <line class="rule" x1="246" y1="150" x2="282" y2="150"/>
+
+      <rect class="node-w" x="286" y="48" width="230" height="48" rx="10"/>
+      <text class="tb" x="304" y="70">the seat on shop</text>
+      <text class="ts" x="304" y="86">held by another custodian</text>
+
+      <rect class="node-w" x="286" y="126" width="230" height="48" rx="10"/>
+      <text class="tb" x="304" y="148">the seat on checkout</text>
+      <text class="ts" x="304" y="164">held by a custodian agent</text>
+
+      <line class="lane" x1="250" y1="224" x2="368" y2="180" marker-end="url(#ar4)"/>
+      <text class="ts" x="376" y="198">asks the nearest seat above it</text>
+
+      <line class="edge" x1="401" y1="122" x2="401" y2="102" marker-end="url(#ar4)"/>
+      <text class="ts" x="412" y="116">…this one only if checkout has none</text>
+
+      <line class="edge" x1="520" y1="72" x2="596" y2="72" marker-end="url(#ar4)"/>
+
+      <rect class="node-a" x="604" y="48" width="190" height="48" rx="10"/>
+      <text class="tb" x="622" y="70">you</text>
+      <text class="ts" x="622" y="86">the governor of last resort</text>
+
+      <text class="ts" x="560" y="214">a seat is addressable, too —</text>
+      <text class="ts" x="560" y="230">wsp govern checkout --tell "…"</text>
+      <text class="ts" x="560" y="246">puts words into that pane</text>
+
+      <text class="ti" x="20" y="268">The chain always terminates, because the person is the end of it — and with no seat anywhere above it, a hand goes to every panel.</text>
+
+      <line class="rule" x1="20" y1="292" x2="880" y2="292"/>
+
+      <!-- ── band B · the watcher ── -->
+      <text class="tw" x="20" y="318">ONE DERIVATION, THREE AUDIENCES</text>
+
+      <rect class="node" x="20" y="338" width="170" height="118" rx="11"/>
+      <text class="tb" x="38" y="362">wsp daemon</text>
+      <text class="ts" x="38" y="384">once a minute, for</text>
+      <text class="ts" x="38" y="400">the whole machine</text>
+      <text class="ts" x="38" y="422">keeps a ledger, so a</text>
+      <text class="ts" x="38" y="438">restart loses nothing</text>
+
+      <line class="lane" x1="194" y1="397" x2="216" y2="397" marker-end="url(#ar4)"/>
+
+      <rect class="node-a" x="222" y="338" width="290" height="118" rx="11"/>
+      <text class="tb" x="367" y="362" text-anchor="middle">the level set</text>
+      <text class="tm" x="367" y="388" text-anchor="middle">needs-a-person · review</text>
+      <text class="tm" x="367" y="404" text-anchor="middle">blocked · flag · unanswered</text>
+      <text class="tm" x="367" y="420" text-anchor="middle">agent-gone · seat-stalled</text>
+      <text class="ts" x="367" y="442" text-anchor="middle">…and blind, which nobody can switch off</text>
+
+      <line class="edge" x1="516" y1="372" x2="552" y2="348" marker-end="url(#ar4)"/>
+      <line class="edge" x1="516" y1="397" x2="552" y2="412" marker-end="url(#ar4)"/>
+      <line class="edge" x1="516" y1="424" x2="552" y2="482" marker-end="url(#ar4)"/>
+
+      <rect class="node" x="560" y="316" width="320" height="58" rx="10"/>
+      <text class="tb" x="578" y="338">wsp watch — a subscription</text>
+      <text class="ts" x="578" y="358">streams the edges; --now reads the whole level</text>
+
+      <rect class="node-w" x="560" y="386" width="320" height="58" rx="10"/>
+      <text class="tb" x="578" y="408">a wake — for the seat it names</text>
+      <text class="ts" x="578" y="428">typed at its pane, held when that would not land</text>
+
+      <rect class="node" x="560" y="456" width="320" height="58" rx="10"/>
+      <text class="tb" x="578" y="478">hooks, and the sidebar</text>
+      <text class="ts" x="578" y="498">on-attention-raised · needs=unanswered</text>
+
+      <text class="ti" x="20" y="534">It says, and it does not act: nothing vacates a seat, ends a pane or advances a barrier on a computed level.</text>
+    </svg>
+    <figcaption>A seat is where a hand goes; the level set is what reaches the seat. One pass a minute derives it, and three different audiences are served from that one derivation.</figcaption>
+  </figure>
+
+  <ul class="points">
+    <li><strong>One agent, one governorship.</strong> Taking a second slot hands the first back.
+      The seat has a place of its own — drawn under its project, its workspace and pane named
+      after the position, and neither a claim nor a release writes over that name.</li>
+    <li><strong>A coordination point, not an approval gate.</strong> No verb consults a seat
+      before acting. The one guard runs the other way: <code>wsp despawn</code> refuses to end a
+      governing pane without <code>--force</code>.</li>
+    <li><strong>A custodian is told a different job</strong>: sequence what runs next, write the
+      direction an arriving agent needs, review finished work against the code rather than
+      against the report, and hold the record — and <em>not</em> “go and claim something”, which
+      is the move that turns a governor back into an agent working somebody else’s task.</li>
+    <li><strong>A vacancy is not the same as no seat.</strong> <code>wsp govern --clear</code>
+      stands down and leaves the slot standing for the next occupant; <code>--remove</code> is
+      the separate decision that this project has no governor at all.</li>
+    <li><strong>You name what you care about, not which field answers it.</strong>
+      <code>needs-a-person</code> is an agent stopped with nothing said about why — one that
+      <em>did</em> say why draws <code>unanswered</code> instead. <code>seat-stalled</code>
+      exists because a seat is exempt from <code>needs-a-person</code>: a governor is idle
+      between the agents it sequences, so the one agent whose failure ends a whole run would
+      otherwise raise nothing. And <code>blind</code> cannot be subscribed to or switched off —
+      it says wsp has lost sight of the fleet, which is the difference between a quiet fleet and
+      half a world.</li>
+    <li><strong>A stall has to hold before it is worth a line</strong> — five minutes by default,
+      because an agent is “stopped” for a few seconds between every pair of turns. A modal
+      holding the keyboard is said at once.</li>
+    <li><strong>A wake is expensive, so it has to be earned.</strong> Every line that reaches a
+      governor re-invokes it and its whole conversation is re-read — 208K tokens on one measured
+      seat, the same for a heartbeat as for a real question. So the daemon judges what is worth a
+      context read, holds the rest, and drops none of it; a held fact older than
+      <code>--defer-max</code> becomes a wake by itself, so a quiet fleet still delivers its
+      backlog.</li>
+    <li><strong>Delivery asks where the keystrokes land.</strong> A wake is typed at a pane, and
+      three states are not deliveries: a pane stopped on a permission dialog takes the text into
+      the dialog, an agent still starting refuses it, and a pane that cannot be asked may hold no
+      agent at all. It is held in all three, because the queue lives inside the agent and a wake
+      handed to one that is then cleared or killed has been recorded as delivered and never
+      read.</li>
+    <li><strong>Nothing about it is opt-in, and the seat is the off switch.</strong>
+      <code>wsp govern --clear</code> vacates the slot, the wake answers <em>the seat is
+      empty</em>, and the spool holds everything until somebody sits down again.</li>
+  </ul>
+</section>
+
+<!-- ══════════════ 05 · WORKLISTS ══════════════ -->
+<section>
+  <h2><span class="num">05</span>Worklists</h2>
   <p class="lede">A worklist is an ordered queue of <em>groups</em> of task references, run group
   by group with a barrier between them. It references its members across projects and owns
   none of them. Running one is three words on repeat, and each answer names the command
@@ -664,9 +804,9 @@
   </ul>
 </section>
 
-<!-- ══════════════ 05 · AGENTS ON ANOTHER MACHINE ══════════════ -->
+<!-- ══════════════ 06 · AGENTS ON ANOTHER MACHINE ══════════════ -->
 <section>
-  <h2><span class="num">05</span>Agents on another machine</h2>
+  <h2><span class="num">06</span>Agents on another machine</h2>
   <p class="lede">A second machine, driven from the one you are sitting at. The far machine is
   an <em>executor</em> and never a seat: nobody sits at it, and it holds no store, no state and
   no wsp binary — which is why there is no sync of <code>~/wsp</code>, no merge story for two
