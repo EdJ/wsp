@@ -189,6 +189,13 @@
   .lane   { stroke:var(--ink-3); stroke-width:1.5; fill:none; }
   .bar    { stroke:var(--warn);  stroke-width:1.8; stroke-dasharray:7 5; }
   .head   { fill:var(--ink-3); }
+  .head-a { fill:var(--accent); }
+  .tree   { stroke:var(--ink-3); stroke-width:1.2; fill:none; }
+  .tie    { stroke:var(--ink-3); stroke-width:1;   fill:none; stroke-dasharray:2 3; }
+  .hand   { stroke:var(--accent); stroke-width:1.9; fill:none; }
+  .ring   { fill:var(--ok-soft); stroke:var(--ok-line); stroke-width:1.5; }
+  .core   { fill:var(--ok); }
+  .ta     { font-size:11px; fill:var(--accent); }
   .dot    { fill:var(--accent); }
   .dot-t  { font-size:11px; font-weight:700; fill:var(--bg); }
   .c-do, .c-td, .c-rv, .c-bl, .c-pk, .c-ok { fill:var(--bg); stroke-width:1; }
@@ -562,108 +569,143 @@
   projects and tasks, and affordable precisely because it is a slot: no status, no prose,
   nothing to finish. It adds the one edge a claim does not have. A claim is agent-to-task;
   a seat is agent-to-project, which is what gives a raised hand somewhere to go and lets
-  <code>wsp wip</code> tell an agent sequencing work from one that has stalled.</p>
+  <code>wsp wip</code> tell an agent sequencing work from one that has stalled. Seats nest the
+  way projects do: a governor’s own governor is the one on the project above it, and the person
+  is the end of the chain.</p>
 
   <figure>
-    <svg viewBox="0 0 900 545" role="img" aria-label="Above: a project chain — shop above checkout above a task — with a seat attached to each project, and a hand raised on the task asking the nearest seat above it, then the one above that, and the person last. Below: the daemon derives one level set once a minute and it reaches three audiences — a wsp watch subscription, a wake typed at the seat it names, and hooks with the sidebar token.">
+    <svg viewBox="0 0 900 665" role="img" aria-label="Above: a chain of governors. A person at the top, beneath them the seat on the shop project with a green agent marker showing it is occupied, beneath that the seat on the checkout sub-project with its own agent, and beneath that three tasks each with a green agent marker of their own. Projects sit to the left, tied to their seats by dotted lines. An accent-coloured path climbs from the tasks through each seat to the person. Below: the daemon derives one level set once a minute and it reaches three audiences — a wsp watch subscription, a wake typed at the seat it names, and hooks with the sidebar token.">
       <defs>
         <marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path class="head" d="M0,0L10,5L0,10z"/>
         </marker>
+        <marker id="ar6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+          <path class="head-a" d="M0,0L10,5L0,10z"/>
+        </marker>
       </defs>
 
-      <!-- ── band A · the chain ── -->
-      <text class="tw" x="20" y="26">A RAISED HAND ASKS THE NEAREST SEAT ABOVE IT</text>
+      <!-- ══ band A · governors over governors over agents ══ -->
+      <text class="tw" x="20" y="26">SEATS OVER SEATS, AGENTS UNDER BOTH</text>
 
-      <text class="ts" x="530" y="38">…and you, if neither of them does</text>
+      <!-- the person, at the top of the chain -->
+      <rect class="node-a" x="330" y="16" width="200" height="44" rx="10"/>
+      <text class="tb" x="430" y="38" text-anchor="middle">you</text>
+      <text class="ts" x="430" y="53" text-anchor="middle">the governor of last resort</text>
 
-      <rect class="node-a" x="56" y="48" width="190" height="48" rx="10"/>
-      <text class="tb" x="76" y="72">shop</text>
-      <text class="ts" x="76" y="88">project</text>
+      <line class="hand" x1="430" y1="92" x2="430" y2="64" marker-end="url(#ar6)"/>
+      <text class="ta" x="452" y="82">and the person is where it stops</text>
 
-      <line class="edge" x1="151" y1="96" x2="151" y2="120" marker-end="url(#ar4)"/>
-      <text class="ts" x="162" y="114">sub-project</text>
+      <!-- shop, and the seat on it -->
+      <rect class="node" x="40" y="100" width="200" height="40" rx="10"/>
+      <text class="tb" x="58" y="119">shop</text>
+      <text class="ts" x="58" y="133">project</text>
+      <line class="tie" x1="240" y1="120" x2="326" y2="120"/>
 
-      <rect class="node" x="56" y="126" width="190" height="48" rx="10"/>
-      <text class="tb" x="76" y="150">checkout</text>
-      <text class="ts" x="76" y="166">sub-project</text>
+      <rect class="node-w" x="330" y="96" width="200" height="48" rx="10"/>
+      <text class="tb" x="348" y="118">the seat on shop</text>
+      <text class="ts" x="348" y="134">a custodian agent holds it</text>
+      <circle class="ring" cx="556" cy="120" r="10"/>
+      <circle class="core" cx="556" cy="120" r="4.5"/>
 
-      <line class="edge" x1="151" y1="174" x2="151" y2="198" marker-end="url(#ar4)"/>
-      <text class="ts" x="162" y="192">its task</text>
+      <line class="tree" x1="58" y1="140" x2="58" y2="204"/>
+      <line class="tree" x1="58" y1="204" x2="76" y2="204"/>
 
-      <rect class="node" x="56" y="204" width="190" height="48" rx="10"/>
-      <text class="tmb" x="76" y="228">checkout-119</text>
-      <text class="ts" x="76" y="244">an agent is on it</text>
+      <line class="hand" x1="430" y1="176" x2="430" y2="148" marker-end="url(#ar6)"/>
+      <text class="ta" x="452" y="166">this seat’s own hands go up to that one</text>
 
-      <line class="rule" x1="246" y1="72" x2="282" y2="72"/>
-      <line class="rule" x1="246" y1="150" x2="282" y2="150"/>
+      <!-- checkout, and the seat on it -->
+      <rect class="node" x="80" y="184" width="200" height="40" rx="10"/>
+      <text class="tb" x="98" y="203">checkout</text>
+      <text class="ts" x="98" y="217">sub-project</text>
+      <line class="tie" x1="280" y1="204" x2="326" y2="204"/>
 
-      <rect class="node-w" x="286" y="48" width="230" height="48" rx="10"/>
-      <text class="tb" x="304" y="70">the seat on shop</text>
-      <text class="ts" x="304" y="86">held by another custodian</text>
+      <rect class="node-w" x="330" y="180" width="200" height="48" rx="10"/>
+      <text class="tb" x="348" y="202">the seat on checkout</text>
+      <text class="ts" x="348" y="218">another agent holds this one</text>
+      <circle class="ring" cx="556" cy="204" r="10"/>
+      <circle class="core" cx="556" cy="204" r="4.5"/>
 
-      <rect class="node-w" x="286" y="126" width="230" height="48" rx="10"/>
-      <text class="tb" x="304" y="148">the seat on checkout</text>
-      <text class="ts" x="304" y="164">held by a custodian agent</text>
+      <!-- the work beneath that seat -->
+      <text class="ts" x="196" y="252">the seat sequences the work beneath it</text>
+      <line class="hand" x1="430" y1="270" x2="430" y2="232" marker-end="url(#ar6)"/>
+      <text class="ta" x="446" y="262">any hand below asks this seat first</text>
 
-      <line class="lane" x1="250" y1="224" x2="368" y2="180" marker-end="url(#ar4)"/>
-      <text class="ts" x="376" y="198">asks the nearest seat above it</text>
+      <line class="tree" x1="265" y1="270" x2="705" y2="270"/>
+      <line class="tree" x1="265" y1="270" x2="265" y2="300"/>
+      <line class="tree" x1="485" y1="270" x2="485" y2="300"/>
+      <line class="tree" x1="705" y1="270" x2="705" y2="300"/>
 
-      <line class="edge" x1="401" y1="122" x2="401" y2="102" marker-end="url(#ar4)"/>
-      <text class="ts" x="412" y="116">…this one only if checkout has none</text>
+      <rect class="node" x="180" y="300" width="170" height="44" rx="10"/>
+      <text class="tmb" x="196" y="320">checkout-118</text>
+      <text class="ts" x="196" y="335">doing</text>
+      <circle class="ring" cx="370" cy="322" r="10"/>
+      <circle class="core" cx="370" cy="322" r="4.5"/>
 
-      <line class="edge" x1="520" y1="72" x2="596" y2="72" marker-end="url(#ar4)"/>
+      <rect class="node" x="400" y="300" width="170" height="44" rx="10"/>
+      <text class="tmb" x="416" y="320">checkout-119</text>
+      <text class="ts" x="416" y="335">blocked</text>
+      <circle class="ring" cx="590" cy="322" r="10"/>
+      <circle class="core" cx="590" cy="322" r="4.5"/>
+      <text class="tw" x="416" y="362">! this is the hand being raised</text>
 
-      <rect class="node-a" x="604" y="48" width="190" height="48" rx="10"/>
-      <text class="tb" x="622" y="70">you</text>
-      <text class="ts" x="622" y="86">the governor of last resort</text>
+      <rect class="node" x="620" y="300" width="170" height="44" rx="10"/>
+      <text class="tmb" x="636" y="320">checkout-120</text>
+      <text class="ts" x="636" y="335">review</text>
+      <circle class="ring" cx="810" cy="322" r="10"/>
+      <circle class="core" cx="810" cy="322" r="4.5"/>
 
-      <text class="ts" x="560" y="214">a seat is addressable, too —</text>
-      <text class="ts" x="560" y="230">wsp govern checkout --tell "…"</text>
-      <text class="ts" x="560" y="246">puts words into that pane</text>
+      <!-- legend -->
+      <circle class="ring" cx="34" cy="382" r="9"/>
+      <circle class="core" cx="34" cy="382" r="4"/>
+      <text class="ts" x="50" y="387">an agent — in a seat, or on a task</text>
+      <line class="tie" x1="268" y1="382" x2="300" y2="382"/>
+      <text class="ts" x="310" y="387">a seat is a slot on its project</text>
+      <line class="hand" x1="500" y1="382" x2="540" y2="382" marker-end="url(#ar6)"/>
+      <text class="ts" x="552" y="387">where a raised hand goes, and in what order</text>
 
-      <text class="ti" x="20" y="268">The chain always terminates, because the person is the end of it — and with no seat anywhere above it, a hand goes to every panel.</text>
+      <text class="ti" x="20" y="402">A seat is the slot; the agent is who is in it. Vacate one with <tspan class="tm">wsp govern --clear</tspan> and the slot stays.</text>
+      <text class="ti" x="20" y="420">With no seat above it at all, a hand goes to every panel instead.</text>
 
-      <line class="rule" x1="20" y1="292" x2="880" y2="292"/>
+      <line class="rule" x1="20" y1="438" x2="880" y2="438"/>
 
-      <!-- ── band B · the watcher ── -->
-      <text class="tw" x="20" y="318">ONE DERIVATION, THREE AUDIENCES</text>
+      <!-- ══ band B · the watcher ══ -->
+      <text class="tw" x="20" y="458">ONE DERIVATION, THREE AUDIENCES</text>
 
-      <rect class="node" x="20" y="338" width="170" height="118" rx="11"/>
-      <text class="tb" x="38" y="362">wsp daemon</text>
-      <text class="ts" x="38" y="384">once a minute, for</text>
-      <text class="ts" x="38" y="400">the whole machine</text>
-      <text class="ts" x="38" y="422">keeps a ledger, so a</text>
-      <text class="ts" x="38" y="438">restart loses nothing</text>
+      <rect class="node" x="20" y="478" width="170" height="118" rx="11"/>
+      <text class="tb" x="38" y="502">wsp daemon</text>
+      <text class="ts" x="38" y="524">once a minute, for</text>
+      <text class="ts" x="38" y="540">the whole machine</text>
+      <text class="ts" x="38" y="562">keeps a ledger, so a</text>
+      <text class="ts" x="38" y="578">restart loses nothing</text>
 
-      <line class="lane" x1="194" y1="397" x2="216" y2="397" marker-end="url(#ar4)"/>
+      <line class="lane" x1="194" y1="537" x2="216" y2="537" marker-end="url(#ar4)"/>
 
-      <rect class="node-a" x="222" y="338" width="290" height="118" rx="11"/>
-      <text class="tb" x="367" y="362" text-anchor="middle">the level set</text>
-      <text class="tm" x="367" y="388" text-anchor="middle">needs-a-person · review</text>
-      <text class="tm" x="367" y="404" text-anchor="middle">blocked · flag · unanswered</text>
-      <text class="tm" x="367" y="420" text-anchor="middle">agent-gone · seat-stalled</text>
-      <text class="ts" x="367" y="442" text-anchor="middle">…and blind, which nobody can switch off</text>
+      <rect class="node-a" x="222" y="478" width="290" height="118" rx="11"/>
+      <text class="tb" x="367" y="502" text-anchor="middle">the level set</text>
+      <text class="tm" x="367" y="528" text-anchor="middle">needs-a-person · review</text>
+      <text class="tm" x="367" y="544" text-anchor="middle">blocked · flag · unanswered</text>
+      <text class="tm" x="367" y="560" text-anchor="middle">agent-gone · seat-stalled</text>
+      <text class="ts" x="367" y="582" text-anchor="middle">…and blind, which nobody can switch off</text>
 
-      <line class="edge" x1="516" y1="372" x2="552" y2="348" marker-end="url(#ar4)"/>
-      <line class="edge" x1="516" y1="397" x2="552" y2="412" marker-end="url(#ar4)"/>
-      <line class="edge" x1="516" y1="424" x2="552" y2="482" marker-end="url(#ar4)"/>
-
-      <rect class="node" x="560" y="316" width="320" height="58" rx="10"/>
-      <text class="tb" x="578" y="338">wsp watch — a subscription</text>
-      <text class="ts" x="578" y="358">streams the edges; --now reads the whole level</text>
-
-      <rect class="node-w" x="560" y="386" width="320" height="58" rx="10"/>
-      <text class="tb" x="578" y="408">a wake — for the seat it names</text>
-      <text class="ts" x="578" y="428">typed at its pane, held when that would not land</text>
+      <line class="edge" x1="516" y1="512" x2="552" y2="488" marker-end="url(#ar4)"/>
+      <line class="edge" x1="516" y1="537" x2="552" y2="552" marker-end="url(#ar4)"/>
+      <line class="edge" x1="516" y1="564" x2="552" y2="622" marker-end="url(#ar4)"/>
 
       <rect class="node" x="560" y="456" width="320" height="58" rx="10"/>
-      <text class="tb" x="578" y="478">hooks, and the sidebar</text>
-      <text class="ts" x="578" y="498">on-attention-raised · needs=unanswered</text>
+      <text class="tb" x="578" y="478">wsp watch — a subscription</text>
+      <text class="ts" x="578" y="498">streams the edges; --now reads the whole level</text>
 
-      <text class="ti" x="20" y="534">It says, and it does not act: nothing vacates a seat, ends a pane or advances a barrier on a computed level.</text>
+      <rect class="node-w" x="560" y="526" width="320" height="58" rx="10"/>
+      <text class="tb" x="578" y="548">a wake — for the seat it names</text>
+      <text class="ts" x="578" y="568">typed at its pane, held when that would not land</text>
+
+      <rect class="node" x="560" y="596" width="320" height="58" rx="10"/>
+      <text class="tb" x="578" y="618">hooks, and the sidebar</text>
+      <text class="ts" x="578" y="638">on-attention-raised · needs=unanswered</text>
+
+      <text class="ti" x="20" y="660">It says, and it does not act: nothing vacates a seat, ends a pane or advances a barrier on a computed level.</text>
     </svg>
-    <figcaption>A seat is where a hand goes; the level set is what reaches the seat. One pass a minute derives it, and three different audiences are served from that one derivation.</figcaption>
+    <figcaption>Governors sit over governors and agents sit under both — the green marker is the occupant, the box is the slot. One pass a minute derives what any of them is told.</figcaption>
   </figure>
 
   <ul class="points">
