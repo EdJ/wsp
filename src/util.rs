@@ -1151,8 +1151,29 @@ mod tests {
     ///
     /// So this asks the platform the same question by a route that shares no
     /// code with ours. Shelling out is what the running binary must not do —
-    /// Three significant figures, whichever end of the scale it is at, and no
-    /// unit for a number small enough to read as itself.
+    /// it is a fork on the path of every line the panel draws — and it is
+    /// exactly right in a test, which runs once and can afford the truth.
+    #[test]
+    fn the_offset_we_read_out_of_libc_is_the_one_the_system_reports() {
+        let out = match std::process::Command::new("date").arg("+%z").output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            // No `date` on the box is not a claim about this code.
+            _ => return,
+        };
+        let (sign, hhmm) = out.split_at(1);
+        let hh: i64 = hhmm[..2].parse().expect("+HHMM");
+        let mm: i64 = hhmm[2..4].parse().expect("+HHMM");
+        let want = (hh * 3600 + mm * 60) * if sign == "-" { -1 } else { 1 };
+        assert_eq!(
+            local_offset(epoch_secs()),
+            want,
+            "libc says one thing and `date {out}` says another — the tm layout is being misread"
+        );
+    }
+
+    /// A token count, as it goes into a line somebody reads: three significant
+    /// figures, whichever end of the scale it is at, and no unit at all for a
+    /// number small enough to read as itself.
     #[test]
     fn a_token_count_is_short_enough_to_sit_in_a_line_somebody_reads() {
         assert_eq!(count_human(0), "0");
@@ -1187,25 +1208,5 @@ mod tests {
         assert_eq!(money_of("$0"), Some(0));
         assert_eq!(money_of("1.23"), None, "a price says so");
         assert_eq!(money_of("$hat"), None);
-    }
-
-    /// it is a fork on the path of every line the panel draws — and it is
-    /// exactly right in a test, which runs once and can afford the truth.
-    #[test]
-    fn the_offset_we_read_out_of_libc_is_the_one_the_system_reports() {
-        let out = match std::process::Command::new("date").arg("+%z").output() {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            // No `date` on the box is not a claim about this code.
-            _ => return,
-        };
-        let (sign, hhmm) = out.split_at(1);
-        let hh: i64 = hhmm[..2].parse().expect("+HHMM");
-        let mm: i64 = hhmm[2..4].parse().expect("+HHMM");
-        let want = (hh * 3600 + mm * 60) * if sign == "-" { -1 } else { 1 };
-        assert_eq!(
-            local_offset(epoch_secs()),
-            want,
-            "libc says one thing and `date {out}` says another — the tm layout is being misread"
-        );
     }
 }
