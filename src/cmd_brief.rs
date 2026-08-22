@@ -300,7 +300,65 @@ pub(crate) struct Briefing {
     pub cwd: Option<String>,
 }
 
+/// Where a brief is *for*, when that is not where the process is.
+///
+/// [`Briefing::live`] answers "where am I" out of the process environment:
+/// herdr's `WSP_*`, [`cmd_agent::my_pane`], the working directory. That is the
+/// right question for a session-start hook and the wrong one for `wsp spawn`,
+/// which composes a brief for a seat it has just opened and is about to start
+/// an agent in. Composed with `live`, that brief would carry the *spawning*
+/// session's pane, its tree, and therefore — through `task_in_hand` — its task.
+///
+/// So the discovery is the argument and the composition is shared. Everything
+/// from [`compose`] down was already pure over [`Briefing`]; this is the only
+/// thing that tied a brief to a session that exists.
+pub(crate) struct At<'a> {
+    /// The project the work resolved to. Passed rather than resolved, because
+    /// the caller has already done the resolution `-p` and the cwd chain would
+    /// redo differently from over here.
+    pub project: Option<&'a str>,
+    /// The seat, in herdr's spelling. It exists by the time this is asked —
+    /// `spawn` opens the seat before it starts anything in it — so this is a
+    /// real pane id and not a guess.
+    pub pane: Option<&'a str>,
+    pub workspace: Option<&'a str>,
+    /// The tree the agent will be standing in, which for a task spawn is its
+    /// own `wsp checkout` and not the trunk. This is what puts the `tree  your
+    /// own` line in front of an agent that would otherwise commit as if it
+    /// were on the trunk.
+    pub cwd: Option<&'a str>,
+}
+
 impl Briefing {
+    /// The read for a seat that is about to exist.
+    ///
+    /// The claim has already landed when `spawn` calls this — the order is
+    /// workspace, claim, agent — so `mine` resolves through the claim keyed on
+    /// this workspace, exactly as it will for the session once it opens.
+    pub(crate) fn at(store: &Store, seat: At<'_>) -> Briefing {
+        let world = overlap::World::live(store);
+        let governors = store.governors();
+        let seat_at = seat
+            .workspace
+            .and_then(|ws| cmd_govern::governs(&governors, ws, seat.pane))
+            .and_then(|scope| crate::worklist::running_position(store, &scope));
+        Briefing {
+            project: seat.project.map(str::to_string),
+            mandate: cmd_mandate::current(store, seat.workspace),
+            lists: crate::worklist::Running::read(store),
+            seat_at,
+            governors,
+            rules: rules(store),
+            pane: seat.pane.map(str::to_string),
+            workspace: seat.workspace.map(str::to_string),
+            // Normalised rather than taken as given: the caller's path may be
+            // absolute or already contracted, and `own_tree` expands whatever
+            // is here before asking whether it is a checkout.
+            cwd: seat.cwd.map(|c| util::contract(&util::expand(c))),
+            world,
+        }
+    }
+
     /// The live read. `current_project` can fail on a bad `-p`; a brief never
     /// does, so an unresolvable project is no project, which is a shorter
     /// brief.
@@ -1133,6 +1191,25 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     out
 }
 
+/// The session brief as one block of plain text, for a caller that is going to
+/// *hand* it to somebody rather than print it.
+///
+/// Same composition and same rendering as the hook's — deliberately, and it is
+/// the point of the split above. A second, shorter brief written for spawned
+/// agents would be a second contract: every cap, every ordering argument and
+/// every "before adding this, multiply" in this file would have to be re-made
+/// for it, and the two would drift on the first change that only remembered
+/// one. What `spawn` hands an unbriefed kind is therefore the same text a
+/// Claude Code reads out of `SessionStart`, composed for the seat instead of
+/// for this process.
+///
+/// Unpainted, because it is being embedded in a work order rather than written
+/// to a terminal: escape codes reaching an agent's prompt are noise it has to
+/// read past, and `Paint::new()` would decide by whether *`spawn`* had a tty.
+pub(crate) fn session_text(b: &Briefing) -> String {
+    brief_lines(&compose(b), &Paint::plain(), Depth::Session).join("\n")
+}
+
 pub fn brief(store: &Store, args: &Args) -> i32 {
     let b = Briefing::live(store, args);
     let r = compose(&b);
@@ -1697,6 +1774,34 @@ mod tests {
             assert!(normal.contains(needle), "{normal}");
             assert!(session.contains(needle), "{session}");
         }
+    }
+
+    /// What `wsp spawn` hands a kind with no session hook is this brief, whole,
+    /// and with nothing in it a terminal would have to interpret.
+    ///
+    /// Two things, and both are about it being *handed over* rather than
+    /// printed. It is the `--session` payload and not plain `wsp brief`,
+    /// because what it replaces is the `wsp brief --session` the agent used to
+    /// be told to run — a shorter one would be a saving the agent pays back at
+    /// request 2. And it is unpainted whatever `spawn`'s own stdout is: escape
+    /// codes reaching an agent's prompt are noise it reads past, and
+    /// `Paint::new()` would decide by whether the *spawning* terminal had a
+    /// tty, which is not a fact about the agent at all.
+    #[test]
+    fn what_spawn_hands_over_is_the_session_brief_with_nothing_to_interpret() {
+        let b = with_work();
+        let handed = session_text(&b);
+        let r = compose(&b);
+
+        assert!(handed.contains("the shape of it"), "not the payload: {handed}");
+        assert!(
+            handed.len() > brief_lines(&r, &plain(), Depth::Normal).join("\n").len(),
+            "handed less than --session: {handed}"
+        );
+        assert!(!handed.contains('\u{1b}'), "escape codes in a work order: {handed:?}");
+        // And it could have failed: the same brief drawn by a paint that writes
+        // escapes does.
+        assert!(brief_lines(&r, &Paint::painted(), Depth::Session).join("\n").contains('\u{1b}'));
     }
 
     /// A handbook is inherited the way tags and decisions are, and read root
