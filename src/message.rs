@@ -1575,6 +1575,68 @@ pub fn all(store: &Store) -> Vec<Message> {
     out
 }
 
+/// What `doctor` says about a hand still up on a subject that is gone.
+///
+/// **The second half of the fault the first half's fix exposed** (ui-006). A
+/// hand outlives its subject two ways: `wsp rm` clears the bindings and the
+/// claim on its way out and leaves standing hands alone (`cmd_task::rm`), and
+/// the legacy migration mints [`About::Task`] from whatever key an older
+/// binary wrote into `flags.json`, which could be an id typed wrong. Clearing
+/// such a hand works — [`hand`] resolves through this record and never asks
+/// the task table — so nothing is stuck any more. But nothing *said so* either:
+/// `doctor` walked bindings, worktrees, claims and watches and never looked
+/// here, while every panel went on drawing the interruption. That is `wsp-095`
+/// Part 1's shape — a fact wsp holds and never surfaces — and the panel was
+/// already drawing the words; the one tool somebody runs to tell a broken store
+/// from a healthy one was the surface that said nothing.
+///
+/// A problem rather than a note. A hand is by definition attention asked for
+/// *now*, and one whose subject cannot be worked is a request that can no
+/// longer be granted — the same family as a binding pointing at a missing task,
+/// only louder, because unlike a stale tree it is drawn at everybody until
+/// somebody acts.
+///
+/// Replies stay outside, as they are outside every hand surface — `list_flags`,
+/// the panel section and the watches all filter them — because an undelivered
+/// reply is a delivery question with its own record and not an orphaned hand.
+/// Subjects other than [`About::Task`] are skipped too: no raise path mints
+/// one, so a rule for resolving scope names would be tested against fixtures
+/// alone. When a scope-raising path lands, this is the check that grows the
+/// other arm.
+pub(crate) fn health(
+    store: &Store,
+    tasks: &[crate::model::Task],
+    archived: &[String],
+    problems: &mut Vec<String>,
+) {
+    for m in raised(store).into_iter().filter(|m| !m.is_reply()) {
+        let Some(subject) = m.about.task() else { continue };
+        if tasks.iter().any(|t| t.id == subject) {
+            continue;
+        }
+        // The archive is consulted before either word is said — `dangling` in
+        // `cmd_agent` is the argument: calling a retired task unknown is a
+        // false statement from the tool read as truth, and it sends somebody
+        // hunting for corruption that is not there.
+        let gone = match archived.iter().any(|a| a == subject) {
+            true => format!("{subject}, which is retired"),
+            false => format!("unknown task `{subject}`"),
+        };
+        // The advice follows the shape, because the obvious verb refuses a
+        // question — [`Shape::may`], `worklist-004` — and pointing a reader at
+        // a door that will not open is how a report gets ignored. The same
+        // split `dispose` prints when its own act is refused.
+        let act = match m.shape() {
+            Some(Shape::Question) => format!(
+                "a question is not cleared — `wsp answer {} \"…\"` or \
+                 `wsp answer {} --abandon \"…\"` closes it",
+                m.id, m.id
+            ),
+            _ => format!("`wsp flag --clear {}` lowers it", m.id),
+        };
+        problems.push(format!("a raised hand ({}) stands on {gone} — {act}", m.id));
+    }
+}
 
 #[cfg(test)]
 mod tests {

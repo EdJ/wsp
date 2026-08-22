@@ -4819,6 +4819,12 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    // The same question about the standing hands: a record that names a subject
+    // which is gone, drawn on every panel and named nowhere else. `archived`
+    // rides in from above so the check does not re-walk the archive to say
+    // retired rather than unknown.
+    crate::message::health(store, &tasks, &archived, &mut problems);
+
     section_damage(store, args, &tasks, &index.projects, &mut problems, &mut notes);
 
     let probe = Probe::live();
@@ -5443,6 +5449,88 @@ mod tests {
             "a hand about a retired task could not be lowered by the verb that exists to lower it",
         );
         assert!(crate::message::raised(&store).is_empty());
+    }
+
+    /// `doctor` says what the panel draws, which for a while nothing else did.
+    ///
+    /// ui-006's second half. Clearing an orphaned hand was fixed by resolving
+    /// through the record rather than the task table — the test above — and
+    /// the fault's quieter half stayed: `wsp rm` leaves standing hands alone,
+    /// so an orphan is *ordinary* state, while `doctor` walked bindings,
+    /// claims and trees and called the store healthy. Asserted on both words
+    /// the line must keep apart, because "unknown" about a retired task is a
+    /// lie from the one tool read as truth (`dangling`'s argument), and on the
+    /// repair clause naming this hand's own id — never ambiguous, where the
+    /// task id can name several.
+    #[test]
+    fn doctor_names_a_hand_standing_on_a_retired_task() {
+        let (_env, store) = scratch("doctor-flag-retired");
+        a_task(&store, "wsp-001");
+        assert_eq!(raise_one(&store, &["wsp-001", "the store will not parse"], &[]), 0);
+
+        // Up about live work: nothing to say, which is the common case and
+        // the reason this check may cost doctor nothing.
+        let mut problems = Vec::new();
+        crate::message::health(&store, &store.tasks(), &store.archived_ids(), &mut problems);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        store.archive_task(&store.task("wsp-001").unwrap()).unwrap();
+        assert!(store.task("wsp-001").is_none(), "the subject is gone");
+
+        crate::message::health(&store, &store.tasks(), &store.archived_ids(), &mut problems);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("retired"), "{problems:?}");
+        assert!(!problems[0].contains("unknown"), "retired is not missing: {problems:?}");
+        let id = crate::message::raised(&store)[0].id.clone();
+        assert!(
+            problems[0].contains(&format!("wsp flag --clear {id}")),
+            "the line names the verb and the unambiguous id: {problems:?}",
+        );
+    }
+
+    /// And a subject nothing ever answered to gets its honest word too.
+    ///
+    /// The raise path refuses such an id (`task_or_why`), but the legacy
+    /// migration cannot — it mints a hand out of whatever key an older binary
+    /// wrote into `flags.json`, and `inbox-001` was the one Ed's panel actually
+    /// carried. So the fixture goes through the migration, which is the one
+    /// thing that still produces this case.
+    #[test]
+    fn doctor_says_unknown_about_a_hand_on_an_id_that_never_resolved() {
+        let (_env, store) = scratch("doctor-flag-unknown");
+        store.set_legacy_flag("inbox-404", json!({ "said": "clearing me failed" }));
+        let adopted = crate::message::adopt_legacy_flags(&store);
+        assert_eq!(adopted.len(), 1, "the migration mints the hand: {adopted:?}");
+
+        let mut problems = Vec::new();
+        crate::message::health(&store, &store.tasks(), &store.archived_ids(), &mut problems);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("unknown task `inbox-404`"), "{problems:?}");
+    }
+
+    /// A question whose subject is gone is pointed at the verbs that close it,
+    /// not at the one that refuses.
+    ///
+    /// [`Shape::may`] refuses to let a question be cleared — `worklist-004`,
+    /// where clearing looked like answering — so a health line advising
+    /// `--clear` would send its reader straight at a refusal. The same split
+    /// `dispose` prints when its act is bounced.
+    #[test]
+    fn doctor_sends_an_orphaned_question_to_the_verbs_that_close_it() {
+        let (_env, store) = scratch("doctor-flag-question");
+        a_task(&store, "wsp-001");
+        assert_eq!(
+            raise_one(&store, &["wsp-001", "take this?"], &[("ask", "claim"), ("pane", "w4:p2")]),
+            0
+        );
+        store.archive_task(&store.task("wsp-001").unwrap()).unwrap();
+
+        let mut problems = Vec::new();
+        crate::message::health(&store, &store.tasks(), &store.archived_ids(), &mut problems);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("wsp answer"), "{problems:?}");
+        assert!(problems[0].contains("--abandon"), "{problems:?}");
+        assert!(!problems[0].contains("--clear"), "the clear door is shut here: {problems:?}");
     }
 
     /// `--ask` makes it a question, and a question may not simply be taken
