@@ -335,19 +335,16 @@ pub trait Kind {
     /// *"I do not want to invent a task for oc2-001, so could you paste the
     /// brief directly"*. The order arrived perfectly and could not be acted on.
     ///
-    /// **What answering `false` now buys is the brief itself, not a different
-    /// sentence.** It used to select `Handover::Running` — *"please run `wsp
-    /// brief --session`"* — and `core-032` replaced that with wsp composing the
-    /// brief for the seat and carrying it in front of the order, so the
-    /// sentence every spawn says is true for every kind. The round trip that
-    /// wording cost is the point: `wsp brief --session` is ~3,300 tokens
-    /// fetched at request 1 rather than sitting in the context already, and
-    /// under `core-020` d2's brake it is also the agent's first `bash`, so an
-    /// unwatched lane stalled on the agent finding out what it was for.
+    /// `Handover::Running` is already the wording for an agent whose session
+    /// began before its claim, and that is exactly this agent's situation, so
+    /// what this selects is an existing sentence rather than a new one.
     ///
-    /// The old wording is still reached, by a kind that is unbriefed *and* is
-    /// told its order rather than handed it in argv. That is
-    /// [`crate::cmd_spawn::Route`], and the reason is written there.
+    /// The cost it does not pay for is the round trip: `wsp brief --session` is
+    /// ~3,300 tokens fetched at request 1 rather than sitting in the context
+    /// already. Handing the brief itself to a kind that takes its order in argv
+    /// would close that, and is not done here — the brief would have to be
+    /// composed for a seat that does not exist yet, which is a different piece
+    /// of work from choosing a sentence.
     fn briefed(&self) -> bool {
         false
     }
@@ -712,18 +709,6 @@ pub struct OpenCode;
 ///
 /// So the line is *read and record freely, stop before changing anything
 /// outside your own record*, which is exactly where Ed's own file draws it.
-///
-/// **What `core-032` narrows, and by exactly how much.** `wsp brief` is still
-/// on this list and the list is unchanged — twenty-three allows and four
-/// denies, verb for verb what Ed's file has. What changed is that the brief
-/// entry is no longer *load-bearing*: the spawn that used to stop on it now
-/// arrives with the brief already in front of it, so nothing needs the
-/// allowance to get its first turn started. That removes the one reading of d2
-/// under which it was an exception for `wsp brief` — it never was, and d2 says
-/// so — and leaves the rest exactly where it was, because the reason for the
-/// other twenty-two is the one d2 gives: an agent runs `wsp show`, `wsp note`
-/// and `wsp review` all day, and every one of those is a person's attention
-/// spent on a verb that changes nothing outside the record.
 ///
 /// `say` is deliberately absent, because it is absent there. The handbook asks
 /// an agent to use it as its status line, so this is the one verb where a
