@@ -247,6 +247,34 @@ pub(super) fn share(store: &Store, view: &View, cursor: impl Into<Cursor>, agree
     }
 }
 
+/// Move the cursor for every panel, and nothing else.
+///
+/// For a writer holding no `View` of its own — a board is the store read
+/// another way, and its folds are nobody's — [`Shared::of`] would be exactly
+/// wrong: it would serialise defaults over whoever's folds and filters were on
+/// disk. So this takes the file as it stands, replaces the one field the
+/// gesture was about, and puts it back.
+///
+/// The window between the read and the write is a real lost-update risk — a key
+/// pressed in a panel in those microseconds writes a cursor this then clobbers —
+/// and it is taken deliberately, on the module's own terms: there is no lock
+/// because one keyboard means one writer, and the board *is* the keyboard here,
+/// speaking from another pane. The gesture is rare and the window is narrow;
+/// a lock would put a second synchronisation story beside the rename for a
+/// race a person cannot hit twice.
+///
+/// No file yet is no move: nobody has agreed a view, so there is nobody to
+/// point anywhere.
+pub(super) fn set_cursor(store: &Store, target: Target) {
+    let Some(text) = read(store) else { return };
+    let mut shared = parse(&text);
+    shared.cursor = Cursor::from(target);
+    let now = rendered(&shared);
+    if now != text {
+        write(store, &now);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +511,44 @@ mod tests {
         assert_eq!(empty.cursor, Cursor::default());
         assert!(empty.collapsed.is_empty());
         assert!(!empty.show_done);
+    }
+
+    /// The board's way in. It holds no `View` — it is the store read another
+    /// way — so [`Shared::of`] from it would write defaults over whoever's
+    /// folds were on disk. Replacing the one field and putting the rest back
+    /// is what keeps a card opened on a board from refolding every tree on
+    /// the machine.
+    #[test]
+    fn pointing_the_cursor_elsewhere_leaves_the_rest_of_the_view_alone() {
+        let dir = scratch("set-cursor");
+        let store = Store::at(dir.clone(), dir.clone());
+
+        // Nobody has agreed anything yet, so there is nobody to point anywhere.
+        set_cursor(&store, Target::Task("t-1".into()));
+        assert!(read(&store).is_none(), "a move with no view behind it wrote a file");
+
+        let mine = view_with(&["audio", "vst"], true);
+        let before = rendered(&Shared::of(&mine, Target::Project("wsp".into())));
+        write(&store, &before);
+
+        set_cursor(&store, Target::Task("t-2".into()));
+        let after = parse(&read(&store).unwrap());
+        assert_eq!(after.cursor.target, Target::Task("t-2".into()), "the cursor moved");
+        assert!(
+            after.collapsed.iter().any(|p| p == "audio")
+                && after.collapsed.iter().any(|p| p == "vst"),
+            "the folds survived the rewrite"
+        );        assert!(after.show_done, "as did everything else the file carried");
+
+        // And writing the cursor that is already there costs no write — the
+        // same economy every other path through this file keeps.
+        let stamped = std::fs::metadata(store.state.join(FILE)).unwrap().modified().unwrap();
+        set_cursor(&store, Target::Task("t-2".into()));
+        assert_eq!(
+            std::fs::metadata(store.state.join(FILE)).unwrap().modified().unwrap(),
+            stamped,
+            "an unchanged view is not written again",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

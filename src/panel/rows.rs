@@ -1320,22 +1320,7 @@ pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View) {
     // here: put the cursor on it. Done after the rebuild because until then the
     // row does not exist.
     if let Some(want) = view.land_on.take() {
-        // And when it still does not, the tree is holding it out of sight
-        // rather than not having it. A panel that answers "go to this task"
-        // by leaving the cursor where it was is one you stop pressing, so
-        // loosen whatever is covering the row and build again — see
-        // [`hiding`] for what the three are and why they are tried in this
-        // order. Each rebuild happens only in the case that would otherwise
-        // have failed, and the loop stops the moment the row is there.
-        for loosen in hiding() {
-            if row_for(&ui.rows, &want).is_some() {
-                break;
-            }
-            if loosen(view, snap, &want) {
-                rebuild(ui, snap, view, &was, sel);
-            }
-        }
-        if let Some(i) = row_for(&ui.rows, &want) {
+        if let Some(i) = make_room_for(ui, snap, view, &want) {
             ui.sel = i;
             // And the view owes it a look. The tree is allowed to sit with the
             // cursor off the pane — a wheel puts it there — but not when the
@@ -1344,6 +1329,35 @@ pub(crate) fn refetch_into(ui: &mut Ui, snap: &Snapshot, view: &mut View) {
             view.keyed = true;
         }
     }
+}
+
+/// Loosen whatever is keeping a row off the tree, and answer with the row once
+/// it exists.
+///
+/// The tree may be holding the row out of sight rather than not having it, and
+/// a panel that answers "go to this row" by leaving the cursor where it was is
+/// one you stop pressing. So walk [`hiding`] — what the three coverings are and
+/// why they are tried in that order — rebuilding only in the case that would
+/// otherwise have failed, and stopping the moment the row is there. A row that
+/// does not exist at all loosens nothing: every step looks the id up first and
+/// gives up on a miss.
+pub(super) fn make_room_for(
+    ui: &mut Ui,
+    snap: &Snapshot,
+    view: &mut View,
+    want: &str,
+) -> Option<usize> {
+    let sel = ui.sel;
+    let was = ui.cursor();
+    for loosen in hiding() {
+        if row_for(&ui.rows, want).is_some() {
+            break;
+        }
+        if loosen(view, snap, want) {
+            rebuild(ui, snap, view, &was, sel);
+        }
+    }
+    row_for(&ui.rows, want)
 }
 
 /// The rows again, with the cursor kept on the row it was on rather than the

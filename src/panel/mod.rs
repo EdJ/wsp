@@ -160,7 +160,7 @@ pub(crate) use rows::{agent_state, status_mark, word as agent_word, AgentState};
 pub(crate) use run::{stty, term_size};
 // And it runs the CLI the same way every key in the panel does — same capture,
 // same closed stdin, same one implementation of what a verb means.
-pub(crate) use verbs::{inspect, pop_out, run_wsp};
+pub(crate) use verbs::{follow, inspect, pop_out, run_wsp};
 pub use install::{install, install_if_adopted, uninstall};
 // The record of which pane holds the panel is keyed on a workspace, so it is
 // swept where the other workspace-keyed records are — see `install::reap_panels`

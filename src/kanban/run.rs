@@ -137,12 +137,20 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
                 // task off the screen instead of putting it on one.
                 Action::Open { id } => {
                     let ws = herdr::Env::read().workspace_id;
-                    let focus = crate::detail::Focus::Task(id);
+                    let focus = crate::detail::Focus::Task(id.clone());
                     // No pane of our own to split off: the board hands the
                     // task to the *sidebar's* detail pane and closes, so the
                     // detail is left where the panel that owns it can see it.
                     match panel::inspect(store, ws.as_deref(), &focus, None) {
-                        m if m.is_empty() => return 0,
+                        m if m.is_empty() => {
+                            // And take the tree's cursor along, so the sidebar
+                            // you land back on is standing on the row you were
+                            // reading rather than wherever it was before the
+                            // board opened. The detail is only half of "open":
+                            // the other half is which row the next verb lands on.
+                            panel::follow(store, &id);
+                            return 0;
+                        }
                         m => note = Some((m, Instant::now())),
                     }
                 }

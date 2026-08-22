@@ -786,7 +786,7 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
 ///
 /// `None` means herdr has no workspace at all — its start screen — and the
 /// callers say so rather than guessing at one.
-fn stage(self_ws: Option<&str>) -> Option<String> {
+pub(super) fn stage(self_ws: Option<&str>) -> Option<String> {
     self_ws.map(str::to_string).or_else(herdr::focused_workspace)
 }
 
@@ -1256,6 +1256,21 @@ pub(crate) fn inspect(
         json!({ "pane_id": pane, "text": format!("exec {} view\n", shell_quote(&exe)) }),
     );
     String::new()
+}
+
+/// Take every panel's cursor to a task, because the person is reading it now.
+///
+/// The board's half of opening a card. `↵` there hands the task to this
+/// workspace's detail pane and closes — and then the person comes back to a
+/// tree still pointing at whatever it pointed at before the board took over,
+/// where the next verb lands on the wrong row. The cursor is part of what the
+/// shared view carries, so this writes the wish and lets every panel take it
+/// on its next refetch, exactly as if a key had moved it in one of them.
+///
+/// Only the cursor goes through [`super::shared::set_cursor`] — the board has
+/// no `View` of its own, and the whole view would be somebody else's folds.
+pub(crate) fn follow(store: &Store, task: &str) {
+    super::shared::set_cursor(store, Target::Task(task.to_string()));
 }
 
 /// Run this binary against the store and report in a few words.

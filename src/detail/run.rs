@@ -279,6 +279,18 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     print!("\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
 
+    // And give the entry back. The file says what this workspace is reading,
+    // and the panel reads it to decide whether `↵` opens or closes — so an
+    // entry outliving its reader turns open into close on the wrong row, on
+    // every panel in the workspace, until something else wrote over it. A
+    // reload skips this: the process replaces itself and comes back pointed at
+    // the same thing, and clearing in between would be a blink of nothing-open
+    // that nobody asked for. A pinned view skips it too — it never wrote the
+    // workspace's entry and does not speak for it.
+    if !reload && pinned.is_none() {
+        super::set_focus(store, &ws, &Focus::Nothing);
+    }
+
     if reload {
         if let Ok(exe) = std::env::current_exe() {
             use std::os::unix::process::CommandExt;

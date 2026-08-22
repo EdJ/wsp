@@ -670,6 +670,43 @@ fn point_at(ui: &mut Ui, want: &Cursor) -> bool {
     }
 }
 
+/// Answer the held wish, loosening the view towards a row it cannot reach.
+///
+/// The wish is held until the row exists — but a task under a folded project
+/// has no row at all, and a held wish then waits for ever while its reader
+/// reads something else. So when pointing fails, walk the same three
+/// loosenings [`super::rows::make_room_for`] answers `land_on` with — fold,
+/// cap, filter, cheapest first, each only when it is actually the one in the
+/// way — and point again. What comes of it is what `land_on` already does:
+/// the tree rearranges itself just enough to draw the row it was asked for,
+/// and never at all for an id that is simply not in the store any more.
+///
+/// Landing sets `keyed`, so the frame pulls to the row rather than moving the
+/// cursor somewhere off-pane: a wish arrives from another surface, and the
+/// whole of what answering it means is *seeing* the thing you opened there.
+fn land_wish(ui: &mut Ui, snap: &Snapshot, view: &mut View, want: &mut Cursor) -> bool {
+    // No wish is not a landing — [`point_at`] says so and means nothing by it,
+    // but setting `keyed` on every quiet refetch would hand the view back to a
+    // cursor nobody has moved.
+    if want.target == Target::Nothing {
+        return false;
+    }
+    let landed = match point_at(ui, want) {
+        true => true,
+        false => match &want.target {
+            Target::Task(id) => {
+                super::rows::make_room_for(ui, snap, view, id).is_some() && point_at(ui, want)
+            }
+            _ => false,
+        },
+    };
+    if landed {
+        view.keyed = true;
+        *want = Cursor::default();
+    }
+    landed
+}
+
 /// What the panel is drawing in the room it asked for.
 ///
 /// The axis `fork-011` said the next page would pay for again, and this is it
@@ -1090,9 +1127,7 @@ pub(super) fn event_loop(
     let (mut keyboard, mut self_focused) = screen.focus(&live, me, self_ws);
     let snap = Snapshot::live(store, live.panes);
     let mut ui = collect(&snap, &view);
-    if point_at(&mut ui, &want) {
-        want = Cursor::default();
-    }
+    land_wish(&mut ui, &snap, &mut view, &mut want);
     if agreed.is_empty() {
         agreed = shared::rendered(&shared::Shared::of(&view, ui.cursor()));
     }
@@ -1186,11 +1221,22 @@ pub(super) fn event_loop(
         let is_key = matches!(msg, Msg::Key(_));
         // The person is driving. Whatever the file wanted, they want this.
         //
-        // The wheel is the exception, and it is the same exception it makes
-        // everywhere: it moves the view and deliberately leaves the cursor
-        // alone, so a wish about where the cursor belongs is not answered by a
-        // scroll and still stands after one.
-        if matches!(msg, Msg::Key(k) if !matches!(k, Key::Wheel { .. })) {
+        // Only while the tree has the keyboard, though. A page holds the keys
+        // for as long as it is up, and everything typed there moves the *page*
+        // — `j` walks prose, the arrows walk columns — and none of it is an
+        // opinion about which row the tree is on. A wish carried across a page
+        // outlives them, which is exactly what a card opened from a folded
+        // branch needs: the wish waits for the refetch that follows the page
+        // going away, and lands then.
+        //
+        // The wheel is the other exception, and it is the same exception it
+        // makes everywhere: it moves the view and deliberately leaves the
+        // cursor alone, so a wish about where the cursor belongs is not
+        // answered by a scroll and still stands after one.
+        if matches!(
+            msg,
+            Msg::Key(k) if !matches!(k, Key::Wheel { .. }) && page.is_none()
+        ) {
             want = Cursor::default();
         }
         // The pane's size is the loop's to read, and `render::row_at` is the
@@ -1225,8 +1271,31 @@ pub(super) fn event_loop(
                         let panes = screen.live().panes;
                         let next = Page::Task(TaskPage::open(store, focus.clone(), panes));
                         expand(screen, &mut view, Some(next.width()));
-                        view.showing = Some(focus);
+                        // The detail file says what this workspace is reading,
+                        // whoever opened it — a board included, which writes
+                        // the very same line from its own pane. The panel
+                        // reads this back on refetch to keep `↵` meaning
+                        // close on the row that is open.
+                        if let Some(ws) = super::verbs::stage(self_ws) {
+                            crate::detail::set_focus(store, &ws, &focus);
+                        }
+                        view.showing = Some(focus.clone());
                         page = Some(next);
+                        // Take the tree along. Reading about a task while the
+                        // tree points at another is how the next verb lands on
+                        // the wrong row, so the cursor comes off whatever it
+                        // was on and onto the card that was opened. When the
+                        // row is drawn this lands at once and the share below
+                        // hands it to every other panel; when it is folded
+                        // under a project the wish is held, and the refetch
+                        // that follows the page closing loosens towards it.
+                        if let crate::detail::Focus::Task(id) = &focus {
+                            want = Cursor::from(Target::Task(id.clone()));
+                            if point_at(&mut ui, &want) {
+                                view.keyed = true;
+                                want = Cursor::default();
+                            }
+                        }
                         // Deliberately no refetch. The page was built from the
                         // store a line ago and nothing about this keystroke
                         // changed it; the tree behind is not on screen and is
@@ -1246,6 +1315,12 @@ pub(super) fn event_loop(
                         // up unless something asked it to — which a command run
                         // on a board is exactly.
                         view.showing = None;
+                        // And the file says so too, for the same reason the
+                        // open did: this workspace reads what it was reading
+                        // out of one place, and a page closing is it closing.
+                        if let Some(ws) = super::verbs::stage(self_ws) {
+                            crate::detail::set_focus(store, &ws, &crate::detail::Focus::Nothing);
+                        }
                         refetch = true;
                     }
                 }
@@ -1289,6 +1364,12 @@ pub(super) fn event_loop(
                         Page::Task(TaskPage::open(store, focus.clone(), screen.live().panes));
                     if expand(screen, &mut view, Some(next.width())) {
                         page = Some(next);
+                        // The file, for the reason the board page says when it
+                        // opens: this workspace reads what it is reading from
+                        // one place, and the refetch below believes it.
+                        if let Some(ws) = super::verbs::stage(self_ws) {
+                            crate::detail::set_focus(store, &ws, &focus);
+                        }
                         view.showing = Some(focus);
                     } else {
                         let msg = inspect(store, self_ws, &focus, me);
@@ -1653,8 +1734,17 @@ pub(super) fn event_loop(
             drawn_status.clear();
             drawn_status.extend(snap.panes.iter().map(|p| (p.pane.clone(), p.state.clone())));
             refetch_into(&mut ui, &snap, &mut view);
-            if point_at(&mut ui, &want) {
-                want = Cursor::default();
+            land_wish(&mut ui, &snap, &mut view, &mut want);
+            // What this workspace's detail pane is pointed at, read rather
+            // than remembered. `view.showing` is the panel's own copy of that,
+            // and it goes stale in one direction only: a board hands a task to
+            // the detail pane from its own pane and writes the file directly,
+            // so a copy kept here still says nothing is open — and then `↵` on
+            // that row inspects it again instead of closing it. The page route
+            // below writes the same file on the way up and on the way down, so
+            // between them the two never disagree about who opened what.
+            if let Some(ws) = self_ws {
+                view.showing = Some(crate::detail::get_focus(store, ws));
             }
             // The board is the same store read a different way, so it is
             // rebuilt on exactly the news the tree is — including a card an
@@ -1682,6 +1772,85 @@ pub(super) fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `render` under `wsp`, with one task in the child — the shape a board
+    /// opens a card from when the card's project is folded in the tree.
+    fn wished_tree() -> Snapshot {
+        let mut child = crate::model::Project::new("render");
+        child.parent = Some("wsp".into());
+        let mut t = crate::model::Task::new("the sidebar follows", "render-001");
+        t.project = Some("render".into());
+        t.status_raw = "todo".into();
+        Snapshot {
+            projects: vec![crate::model::Project::new("wsp"), child],
+            tasks: vec![t],
+            ..Default::default()
+        }
+    }
+
+    /// The second half of opening a card. The wish is held until the row
+    /// exists — but a task under a folded project has no row at all, and a
+    /// wish that waits for ever is a cursor that never follows. So pointing
+    /// at it takes the fold out of the way, lands, spends the wish, and asks
+    /// the frame to pull to the row: coming back to the tree means seeing
+    /// what you opened, not sitting next to it.
+    #[test]
+    fn a_wish_for_a_folded_row_unfolds_towards_it_instead_of_waiting() {
+        let snap = wished_tree();
+        let mut view = View::default();
+        view.collapsed.insert("wsp".into());
+        let mut ui = collect(&snap, &view);
+        assert!(
+            ui.rows_for_target(&Target::Task("render-001".into())).is_empty(),
+            "the fixture folds the row away to begin with",
+        );
+
+        let mut want = Cursor::from(Target::Task("render-001".into()));
+        assert!(land_wish(&mut ui, &snap, &mut view, &mut want));
+        assert_eq!(want.target, Target::Nothing, "a landed wish is spent");
+        assert!(view.keyed, "the frame pulls to the row that just landed");
+        assert!(!view.collapsed.contains("wsp"), "the fold came out of the way");
+        assert_eq!(
+            ui.rows.get(ui.sel).map(|r| crate::panel::rows::target_of(r)),
+            Some(Target::Task("render-001".into())),
+            "the cursor stands on the row the wish named",
+        );
+    }
+
+    /// An id that is simply gone loosens nothing. Every hiding step looks the
+    /// task up first and gives up on a miss, so a stale wish — a card retired
+    /// between being opened and being adopted — cannot spend the reader's
+    /// filters or folds on a row that will never arrive.
+    #[test]
+    fn a_wish_for_work_that_is_not_in_the_store_loosens_nothing_and_still_waits() {
+        let snap = wished_tree();
+        let mut view = View::default();
+        view.collapsed.insert("wsp".into());
+        let mut ui = collect(&snap, &view);
+
+        let mut want = Cursor::from(Target::Task("gone-999".into()));
+        assert!(!land_wish(&mut ui, &snap, &mut view, &mut want));
+        assert!(
+            view.collapsed.contains("wsp"),
+            "nothing was undone for an id that has no row coming",
+        );
+        assert_eq!(want.target, Target::Task("gone-999".into()), "the wish goes on being held");
+    }
+
+    /// No wish is not a landing. `point_at` says so for `Nothing` and means
+    /// nothing by it; taking that as one would set `keyed` on every quiet
+    /// refetch and hand the scroll back to a cursor nobody has moved.
+    #[test]
+    fn a_quiet_refetch_sets_nothing_in_motion() {
+        let snap = Snapshot::default();
+        let mut view = View::default();
+        let mut ui = collect(&snap, &view);
+        let keyed_was = view.keyed;
+        let mut want = Cursor::default();
+
+        assert!(!land_wish(&mut ui, &snap, &mut view, &mut want));
+        assert_eq!(view.keyed, keyed_was, "no wish, no pull");
+    }
 
     /// The source of this file, for the one test below that is about *where* a
     /// line sits rather than what it computes. Read the way the help test in
