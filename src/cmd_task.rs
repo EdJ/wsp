@@ -211,10 +211,33 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     }
 
     if let Some(s) = &scope {
-        println!("{}", p.dim(&format!("{}  ({} open)", s, tasks.len())));
+        println!("{}", p.dim(&scope_line(s, &tasks)));
     }
     print_tasks(&tasks, &store.tasks(), &p, scope.is_none());
     0
+}
+
+/// The dim scope line above a listing.
+///
+/// The word over the number follows what the filter admitted, not what the
+/// verb usually shows. With `--all` the list holds finished work too, and
+/// `fork  (27 open)` over twenty-seven done rows is how this line came to tell
+/// a governor the fork project still had rows outstanding minutes after Ed had
+/// closed the lot — his panel was right and the CLI lied (ui-001). The
+/// arithmetic was never wrong; a total was printed as the answer to *how much
+/// is left*, the pattern of robustness-079 and wsp-093: a count computed for
+/// one question and read as the answer to another.
+///
+/// So both halves are stated whenever any of it is finished — `0 open · 27
+/// done` keeps the half that answers *is anything left* without dropping the
+/// half that explains why the row is long. All open, the one word is enough,
+/// because then it is the truth.
+fn scope_line(scope: &str, shown: &[Task]) -> String {
+    let open = shown.iter().filter(|t| t.status().is_open()).count();
+    match shown.len() - open {
+        0 => format!("{scope}  ({open} open)"),
+        done => format!("{scope}  ({open} open · {done} done)"),
+    }
 }
 
 /// `wsp find <text>` — the store's finding aid.
@@ -2613,6 +2636,35 @@ mod tests {
         // And the rows themselves are still the filter's: the count is the
         // whole of what the parent borrows from outside the list.
         assert_eq!(lines.len(), 2, "the filter still decides which rows there are: {lines:?}");
+    }
+
+    /// ui-001. `--all` widens the list past open work; the header kept the
+    /// word `open` over what had become a total, so `wsp ls -p fork --all`
+    /// read `(27 open)` over twenty-seven done rows and the number was read
+    /// aloud as work still outstanding. The label follows the list.
+    #[test]
+    fn a_widened_listing_says_what_its_count_counts() {
+        let store = scratch("ls-all-header");
+        store.save_project(&crate::model::Project::new("fork")).unwrap();
+        for (id, status) in [("fork-001", "doing"), ("fork-002", "done"), ("fork-003", "done")] {
+            let mut t = Task::new("a piece of the fork", id);
+            t.project = Some("fork".into());
+            t.status_raw = status.into();
+            store.save_task(&t).unwrap();
+        }
+
+        let index = Index::new(store.projects());
+        let args = Args::synth("ls", &[], &[("all", ""), ("project", "fork")]);
+        let said = scope_line("fork", &filtered(&store, &args, &index, Some("fork".into())));
+        assert!(said.contains("1 open"), "{said}");
+        assert!(said.contains("2 done"), "the total is not an open count: {said}");
+
+        // And the default keeps its word: everything it shows is open, so the
+        // short form is still the truth there.
+        let args = Args::synth("ls", &[], &[("project", "fork")]);
+        let said = scope_line("fork", &filtered(&store, &args, &index, Some("fork".into())));
+        assert!(said.contains("(1 open)"), "{said}");
+        assert!(!said.contains("done"), "nothing finished is on the list to count: {said}");
     }
 
     /// A scope nobody typed has to be able to say what it hid.
