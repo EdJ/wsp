@@ -1608,8 +1608,8 @@ the argument and the composition is shared, so there is one brief and not two.
 Nothing is trimmed on the way. What it replaces is the `wsp brief --session` the
 agent was being told to run, so it is a substitution rather than an addition: the
 same tokens, minus a round-trip at request 1, minus — under `core-020`'s
-permission policy — a stall on the agent's first `bash`, which was the command
-that would have told it what it was for.
+permission policy, which `core-041` has since replaced — a stall on the agent's
+first `bash`, which was the command that would have told it what it was for.
 
 **Where it goes is the kind's own configuration, not the work order.** wsp writes
 the brief beside the machine state — `~/.local/state/wsp/briefs/<subject>.md`,

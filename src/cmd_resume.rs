@@ -673,9 +673,11 @@ fn needs_a_seat_wsp_opened(kind: &str) -> bool {
 /// and the same cwd and `OPENCODE_CONFIG_CONTENT` unset. That is precisely the
 /// case this function exists for, so for opencode the tidy answer and the
 /// correct one are opposites, and correct wins — a resumed agent under
-/// opencode's shipped policy instead of `core-020` d1's is an agent whose only
-/// brake can never fire, which is the one thing that kind may not be given
-/// unattended work without.
+/// opencode's shipped policy instead of wsp's is an agent that can run `wsp
+/// done`, which is Ed's by the decision of 2026-08-19. `core-041` narrowed the
+/// distance between those two policies to exactly the four denied verbs and did
+/// not close it, so the reason to carry the environment is smaller than it was
+/// and is the same reason.
 ///
 /// The cost is paid by one kind and is the cost the paragraph above declines:
 /// an empty room left standing beside the new one. It is not paid by `claude`,
@@ -1917,9 +1919,11 @@ mod tests {
     ///
     /// Driven before it was written — a sandbox opencode spawned with
     /// `core-020` d1's policy stopped on `git status` and asked; resumed, it
-    /// ran the same command without asking. There is no second copy of a
-    /// permission policy anywhere, so a resume that drops it is an agent whose
-    /// only brake can never fire and nothing saying so.
+    /// ran the same command without asking. `core-041` allowed `git status`
+    /// and the driving no longer reproduces on that command, but the property
+    /// it established is the one under test and has not changed: there is no
+    /// second copy of a permission policy anywhere, so a resume that drops it
+    /// is an agent running under a policy nobody chose, with nothing saying so.
     ///
     /// **No brief in it**, and that half was driven too: a resumed session
     /// already holds its brief in the transcript, so naming a second copy would
