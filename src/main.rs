@@ -211,6 +211,47 @@ const LITERAL_AFTER: &[(&str, usize)] =
 /// `--supersedes` — and `--` still ends flag parsing everywhere.
 const OWNED_AFTER: &[(&str, &str)] = &[("decide", "supersedes")];
 
+/// Verbs on which a [`BOOL_FLAGS`] name takes a value instead.
+///
+/// One name collides today: `status`. On `watch` it is a mode — `wsp watch
+/// --status` lists the watches and reads nothing after it — so there it stands
+/// alone. Everywhere else the word is read as a filter somebody typed a value
+/// for: `wsp ls -s done`, `wsp find -s review`, `wsp add "…" --status review`,
+/// `wsp project add x --status done`. With the name in [`BOOL_FLAGS`] only,
+/// every one of those parsed as a bare flag — the filter silently ignored,
+/// `project add` writing the word `true` into the project's status — while the
+/// value went on through as a positional nothing refused, because `status` is
+/// a word the tally knows. `--status=done` worked throughout, which is how
+/// this stayed hidden so long: nobody bitten once goes back to check the form
+/// that bit them.
+///
+/// Listed per verb rather than struck from [`BOOL_FLAGS`] because that list
+/// protects positionals which follow a verb's own flags (`spawn --headless
+/// <id>`, `verify --check <path>`), and un-listing a name globally would hand
+/// that hazard back the day `watch` grows a positional beside its modes. Keyed
+/// on the top-level verb only, which is all [`Args::parse`] has read when this
+/// table is consulted — `wsp project add` and its siblings share one entry,
+/// and none of them reads `--status` as a mode.
+const VALUED_ON: &[(&str, &str)] = &[
+    ("ls", "status"),
+    ("list", "status"),
+    ("find", "status"),
+    ("add", "status"),
+    ("project", "status"),
+];
+
+/// Whether this flag stands alone on this verb.
+///
+/// [`BOOL_FLAGS`] says which names never take a value and [`VALUED_ON`] names
+/// the verbs on which one of them does. One helper rather than the condition
+/// spelled twice, because [`Args::scan`]'s two branches already differ in how
+/// they read a token that follows — the long form refuses any `-`-led word,
+/// the short form only `--` — and the two agreeing *here* is what keeps
+/// `-s done` and `--status done` meaning the same thing.
+fn bool_flag(name: &str, valued_on: &[&str]) -> bool {
+    BOOL_FLAGS.contains(&name) && !valued_on.contains(&name)
+}
+
 /// Flags a verb still accepts and no longer reads.
 ///
 /// [`unknown_flags`] refuses a flag nothing read and the help does not list,
@@ -250,16 +291,18 @@ impl Args {
         // pass hands back as a positional, but neither pass can turn a
         // different token into the verb — the verb is the first bare word
         // either way.
-        let cmd = Args::scan(&argv, None, &[]).cmd;
+        let cmd = Args::scan(&argv, None, &[], &[]).cmd;
         let literal_after = LITERAL_AFTER.iter().find(|(c, _)| *c == cmd).map(|(_, n)| *n);
         let owned: Vec<&str> =
             OWNED_AFTER.iter().filter(|(c, _)| *c == cmd).map(|(_, f)| *f).collect();
-        Args::scan(&argv, literal_after, &owned)
+        let valued_on: Vec<&str> =
+            VALUED_ON.iter().filter(|(c, _)| *c == cmd).map(|(_, f)| *f).collect();
+        Args::scan(&argv, literal_after, &owned, &valued_on)
     }
 
     /// One pass over argv. `literal_after`, when set, is how many positionals
     /// this command parses normally before the rest of the line is its payload.
-    fn scan(argv: &[String], literal_after: Option<usize>, owned: &[&str]) -> Args {
+    fn scan(argv: &[String], literal_after: Option<usize>, owned: &[&str], valued_on: &[&str]) -> Args {
         let mut positional: Vec<String> = Vec::new();
         let mut flags: HashMap<String, Vec<String>> = HashMap::new();
         // Which of them ate a word. See [`Args::dropped`]: a flag that stands
@@ -305,7 +348,7 @@ impl Args {
                 if let Some(v) = inline {
                     entry.push(v);
                     valued.insert(name.clone());
-                } else if BOOL_FLAGS.contains(&name.as_str()) {
+                } else if bool_flag(&name, valued_on) {
                     entry.push("true".into());
                 } else if i + 1 < argv.len() && !argv[i + 1].starts_with('-') {
                     entry.push(argv[i + 1].clone());
@@ -322,7 +365,7 @@ impl Args {
                     continue;
                 }
                 let entry = flags.entry(name.clone()).or_default();
-                if BOOL_FLAGS.contains(&name.as_str()) {
+                if bool_flag(&name, valued_on) {
                     entry.push("true".into());
                 } else if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
                     entry.push(argv[i + 1].clone());
@@ -1508,6 +1551,40 @@ the rules in `brief`, the blocked list in `wip`. Each halves; each says so."#,
 
 #[cfg(test)]
 mod tests {
+    /// `status` is a mode word on `watch` and a filter value everywhere else
+    /// it is read, and [`BOOL_FLAGS`] could only say the first half. So
+    /// `wsp ls -p fork -s done` parsed as a bare flag plus a stray positional:
+    /// the documented filter silently ignored, and — on `project add`, which
+    /// stores what it is given — the literal word `true` written into a
+    /// project's status. The inline form kept working throughout, which is why
+    /// nobody retested the space form that bit them.
+    #[test]
+    fn a_status_filter_takes_its_value_on_the_verbs_that_read_one() {
+        use crate::Args;
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+
+        // The verbs that filter by it get the value they were typed.
+        let args = parse(&["ls", "-p", "fork", "-s", "done"]);
+        assert_eq!(args.get("status").as_deref(), Some("done"));
+        assert_eq!(args.get("project").as_deref(), Some("fork"), "and nothing around it was eaten");
+        let long = parse(&["find", "--status", "review"]);
+        assert_eq!(long.get("status").as_deref(), Some("review"));
+        assert!(long.rest.is_empty(), "the value went to the flag, not to the positionals");
+        let add = parse(&["add", "a title", "--status", "review"]);
+        assert_eq!(add.get("status").as_deref(), Some("review"));
+        assert_eq!(add.rest.first().map(String::as_str), Some("a title"), "the subject stays the subject");
+        let proj = parse(&["project", "add", "x", "--status", "done"]);
+        assert_eq!(proj.get("status").as_deref(), Some("done"));
+
+        // And watch keeps its mode: bare, or followed by other flags, it still
+        // stands alone and takes nothing.
+        let bare = parse(&["watch", "--status"]);
+        assert_eq!(bare.get("status").as_deref(), Some("true"));
+        let guarded = parse(&["watch", "--once", "--status"]);
+        assert_eq!(guarded.get("status").as_deref(), Some("true"));
+        assert!(!guarded.has("once-value"), "no flag grew a second name");
+    }
+
     /// The help is the map, and a verb that is not on it does not exist as far
     /// as anyone reading is concerned. `wsp rename` had been there for weeks —
     /// the panel's `e` key runs it — and a task was filed saying renaming was
