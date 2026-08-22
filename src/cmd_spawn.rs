@@ -92,31 +92,38 @@ pub enum Handover {
 }
 
 /// How an agent comes to know what it is holding — which is a fact about the
-/// kind, not about the work, and is the third thing `work_order` needs.
+/// kind, not about the work, and is what decides whether the sentence below is
+/// true when it is said.
 ///
 /// [`Route::Hook`] is Claude Code. `spawn`'s order is workspace, claim, agent,
 /// sentence, so the `SessionStart` hook has already run `wsp brief --session`
 /// with the claim in place and the brief is at the top of the agent's context
-/// before it reads a word of the order. Nothing to add and nothing to ask.
+/// before it reads a word of the order. Nothing to write and nothing to ask.
 ///
 /// [`Route::Inline`] is `core-032`, and it is what a kind with no session hook
-/// gets instead: wsp composes the brief for the seat it has just opened and
-/// carries it in front of the sentence. Nothing is fetched and nothing is
-/// asked, which is the point — see [`brief_for`] for what it costs and
-/// [`crate::cmd_brief::At`] for why it cannot simply be the live brief.
+/// gets instead: wsp writes the brief to a file and the kind's own
+/// configuration names it, so the runtime loads it as system context before the
+/// first message. Nothing is fetched, because the agent never goes and gets it;
+/// nothing is asked, because there is no `bash` call and so `core-020` d2's
+/// brake is never met. See [`crate::agent_commands::Kind::brief_file`] for the
+/// driving, and [`crate::cmd_brief::At`] for why the brief cannot simply be the
+/// live one.
 ///
-/// [`Route::Fetch`] is what is left, and it is the old behaviour kept
-/// deliberately rather than by omission. **The brief is only inlined where the
-/// order goes in argv.** A kind that is *told* its order gets it through
-/// `Place::tell`, which for a kind wsp knows nothing about is herdr putting
-/// text into a terminal — the channel robustness-035 showed will silently
-/// swallow a work order over one character. Fourteen kilobytes of task prose
-/// through it is unmeasured, and this file's standing answer to an unmeasured
-/// runtime is [`crate::agent_commands::Plain`]'s: do the thing that is known to
-/// work rather than the thing that would be better if it did. So `codex` and
-/// `gemini` still fetch, and still stall on a brake if they are under one; the
-/// day either is driven end to end the way `core-026` drove opencode, this is
-/// the arm that moves.
+/// **It is not [`crate::agent_commands::Kind::order_in_args`], and the day
+/// those two were the same predicate cost a revert.** The brief went into a
+/// `--prompt` argv element; herdr refuses `agent.start` args holding any
+/// control character, a brief is multi-line, and three spawns of three were
+/// refused with `invalid_agent_argument` and no agent started. Env is not argv.
+///
+/// [`Route::Fetch`] is what is left: a kind with neither a hook nor a config
+/// file wsp can write into. `codex` and `gemini` are told to run `wsp brief
+/// --session`, which is a round-trip and — under a brake — a stall, and it is
+/// the honest answer until one of them is driven the way `core-026` drove
+/// opencode. It is also where a brief that could not be *written* lands, which
+/// is the one failure this must not paper over: opencode ignores an
+/// `instructions` file that is not there, in silence, so an unwritten brief
+/// with the confident sentence on top of it would be exactly the `core-027`
+/// failure this row exists to remove, arriving by a new door.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
     Hook,
@@ -124,12 +131,81 @@ enum Route {
     Fetch,
 }
 
-/// The kind's two answers, read as one question.
-fn route(how: &dyn agent_commands::Kind) -> Route {
-    match (how.briefed(), how.order_in_args()) {
-        (true, _) => Route::Hook,
-        (false, true) => Route::Inline,
-        (false, false) => Route::Fetch,
+/// Whether the brief this seat needed is where the agent will find it.
+///
+/// [`Laid::Elsewhere`] is not a failure: it is every kind that does not read a
+/// brief from a file, and every spawn with nothing to be briefed about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Laid {
+    Written,
+    Failed,
+    Elsewhere,
+}
+
+/// The kind's answer and the brief's, read as one question.
+fn route(how: &dyn agent_commands::Kind, laid: Laid) -> Route {
+    match (how.briefed(), how.brief_file(), laid) {
+        (true, _, _) => Route::Hook,
+        // Written, so the sentence is true.
+        (false, true, Laid::Written) => Route::Inline,
+        // A kind that reads a brief from a file, and no file. Say the true
+        // thing, which is the old thing.
+        (false, true, _) => Route::Fetch,
+        (false, false, _) => Route::Fetch,
+    }
+}
+
+/// Where a seat's brief is written.
+///
+/// Beside the machine state rather than in the working tree, which is
+/// `core-020` d2's correction applied to a second kind of file: `cmd_checkout::dirty`
+/// asks git with `--untracked-files=all`, so anything wsp leaves in a checkout
+/// makes that tree permanently dirty — refused by `wsp checkout --rm`, skipped
+/// by `--sweep`, kept by `despawn` as holding uncommitted work. It is also why
+/// this is not simply `AGENTS.md`, which is the other way opencode would read
+/// it.
+///
+/// Named for the subject, so a spawn onto the same task twice overwrites its
+/// own file rather than accumulating, and so [`despawn`] can find it again with
+/// nothing recorded anywhere.
+fn brief_path(store: &Store, subject: &str) -> std::path::PathBuf {
+    store.state.join("briefs").join(format!("{subject}.md"))
+}
+
+/// Compose this seat's brief and write it where the agent will read it.
+///
+/// The claim has landed by the time this is called, which is the whole reason
+/// it is called here and not before the seat opened: a brief composed a moment
+/// earlier is a brief about an empty seat.
+///
+/// A write that fails is reported and answered with [`Laid::Failed`], never
+/// swallowed. The agent would start perfectly well — opencode ignores a missing
+/// `instructions` file without a word — and would be told its brief was above
+/// it when nothing was, which is the failure `core-027` found by driving and
+/// this row was filed to remove.
+fn lay_brief(store: &Store, work: &Work, seat: &Seat, cwd: Option<&str>, path: &std::path::Path) -> Laid {
+    let ws = workspace_of(seat);
+    let text = crate::cmd_brief::session_text(&crate::cmd_brief::Briefing::at(
+        store,
+        crate::cmd_brief::At {
+            project: work.project.as_deref(),
+            pane: Some(seat.as_str()),
+            workspace: ws.as_deref(),
+            cwd,
+        },
+    ));
+    let wrote = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .unwrap_or(Ok(()))
+        .and_then(|()| std::fs::write(path, format!("{text}\n")));
+    match wrote {
+        Ok(()) => Laid::Written,
+        Err(e) => {
+            eprintln!("wsp: could not write the brief to {}: {e}", util::contract(path));
+            eprintln!("wsp: the work order will ask for it instead");
+            Laid::Failed
+        }
     }
 }
 
@@ -173,23 +249,20 @@ pub fn work_order(subject: &str, how: Handover) -> String {
     }
 }
 
-/// The whole of what an agent is handed: the sentence, and whatever has to come
-/// in front of it for the sentence to be true.
+/// The sentence an agent is handed, and it is one sentence per job rather than
+/// one per kind.
 ///
-/// Pure, and it takes the brief as a closure rather than the store, for the
-/// reason [`order`] is pure about backends: what an agent is handed is the
-/// thing worth asserting, and asserting it should not need a store to compose a
-/// brief out of. The closure is also the laziness — [`brief_for`] is the one
-/// expensive call in `spawn` and two of the three routes never make it.
-fn handover(
-    subject: &str,
-    how: Handover,
-    route: Route,
-    brief: impl FnOnce() -> String,
-) -> String {
+/// Pure, and it takes the [`Route`] rather than the kind, for the reason
+/// [`order`] is pure about backends: what an agent is told is the thing worth
+/// asserting, and asserting it should not need a store, a seat or a file on
+/// disk.
+///
+/// [`Route::Hook`] and [`Route::Inline`] say the same thing, which is the point
+/// of the carrier rather than a coincidence: both mean *the brief is already in
+/// your context*, and the only difference is who put it there.
+fn handover(subject: &str, how: Handover, route: Route) -> String {
     match (route, how) {
-        (Route::Hook, _) => work_order(subject, how),
-        (Route::Inline, _) => format!("{}\n\n{}", brief(), work_order(subject, how)),
+        (Route::Hook | Route::Inline, _) => work_order(subject, how),
         // The custodial order says what the seat is for and assumes the brief
         // beneath it, so a custodian that has to fetch needs the same
         // instruction a claimant does. Prepended rather than woven in: the
@@ -201,9 +274,9 @@ fn handover(
              nothing has been read to you. {}",
             work_order(subject, Handover::Custodian)
         ),
-        // A claimant that has to fetch is an agent whose context does not have
-        // its brief in it, which is exactly what `Handover::Running` is the
-        // wording for. An existing sentence rather than a new one.
+        // A claimant with no brief in its context is exactly what
+        // `Handover::Running` is the wording for. An existing sentence rather
+        // than a new one.
         (Route::Fetch, _) => work_order(subject, Handover::Running),
     }
 }
@@ -249,35 +322,6 @@ fn order(
         on: on.map(|m| m.to_string()),
         show,
     }
-}
-
-/// The brief an unbriefed kind is handed, composed for the seat rather than for
-/// this process.
-///
-/// The three facts `cmd_brief` normally reads out of the environment, supplied
-/// from what `spawn` has just decided: the project the work resolved to, the
-/// seat that was opened for it, and the tree the agent will stand in — which
-/// for a task spawn is its own `wsp checkout` and is the fact an agent gets
-/// wrong in both directions without. Read `cmd_brief::At` for why this cannot
-/// simply be the live one: composed here, `Briefing::live` would describe the
-/// *spawning* session, and hand the new agent its parent's pane and its
-/// parent's task.
-///
-/// It reads the store a second time in the same command, a few milliseconds
-/// after the claim wrote to it. That is deliberate and it is the point of doing
-/// it here rather than earlier: the brief has to see the claim, and the claim
-/// is what makes it a brief about this task rather than about an empty seat.
-fn brief_for(store: &Store, work: &Work, seat: &Seat, cwd: Option<&str>) -> String {
-    let ws = workspace_of(seat);
-    crate::cmd_brief::session_text(&crate::cmd_brief::Briefing::at(
-        store,
-        crate::cmd_brief::At {
-            project: work.project.as_deref(),
-            pane: Some(seat.as_str()),
-            workspace: ws.as_deref(),
-            cwd,
-        },
-    ))
 }
 
 /// What any seat wsp opens is given, whatever opened it.
@@ -1136,8 +1180,25 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // is no `--agent` flag to look at.
     let will_start = args.has("agent")
         || (args.has("govern") && (work.list.is_some() || work.project.is_some()));
+    // What this seat is about, in one word: the task, or — under `--govern` —
+    // the scope it answers for. Worked out here rather than where the agent is
+    // named below, because the seat's environment is fixed when the seat opens
+    // and the brief's path is part of it.
+    let subject = work
+        .task
+        .clone()
+        .or_else(|| work.list.clone())
+        .or_else(|| work.project.clone())
+        .unwrap_or_default();
+    // Where this seat's brief will be written, when the kind is one that reads
+    // a brief out of a file. Named now and written later: the environment has
+    // to be settled before `open`, and the brief cannot be composed until the
+    // claim has landed a moment after it. The path is knowable in advance,
+    // which is the whole reason this works.
+    let brief_at = (will_start && !subject.is_empty() && agent_commands::of(&kind).brief_file())
+        .then(|| brief_path(store, &subject));
     let seat_extra = match will_start {
-        true => agent_commands::of(&kind).env(),
+        true => agent_commands::of(&kind).env(brief_at.as_deref()),
         false => BTreeMap::new(),
     };
     let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), seat_extra);
@@ -1227,12 +1288,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let mut told = false;
     let mut ordered = false;
     if args.has("agent") || governing.is_some() {
-        let name = work
-            .task
-            .clone()
-            .or_else(|| work.list.clone())
-            .or_else(|| work.project.clone())
-            .unwrap_or_default();
+        let name = subject.clone();
         let how = agent_commands::of(&kind);
         // The work order, decided *before* the agent starts rather than after
         // it is listening. It used to be computed below, next to the sentence
@@ -1247,15 +1303,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // panel the key that turns one into the other. What changed is that
         // `--govern` is an instruction, and it is the custodial one.
         //
-        // What changed with `core-032` is only what comes in front of it: a kind
-        // that arrives with nothing is handed the brief rather than told to go
-        // and get one. Composed lazily, because it reads the store a second
-        // time and walks the pane roster, and two of the three routes never
-        // look at it.
-        let brief = || brief_for(store, &work, &seat, cwd.as_deref());
+        // What `core-032` changes is not the sentence but whether it is true: a
+        // kind that would otherwise arrive with an empty context has its brief
+        // written where its own runtime will load it, and then the same
+        // sentence every other spawn says is true for it too.
+        //
+        // Written here rather than before the seat opened, because this is the
+        // first moment there is anything to say: the claim has landed, so the
+        // brief is about this task rather than about an empty seat.
+        let laid = match (&brief_at, work.task.is_some() || governing.is_some()) {
+            (Some(path), true) => lay_brief(store, &work, &seat, cwd.as_deref(), path),
+            _ => Laid::Elsewhere,
+        };
         let order = match (&work.task, &governing) {
-            (Some(t), _) => Some(handover(t, Handover::Spawned, route(how), brief)),
-            (None, Some(p)) => Some(handover(p, Handover::Custodian, route(how), brief)),
+            (Some(t), _) => Some(handover(t, Handover::Spawned, route(how, laid))),
+            (None, Some(p)) => Some(handover(p, Handover::Custodian, route(how, laid))),
             (None, None) => None,
         };
         // Only for a kind that takes it that way. Handing it to every kind's
@@ -1676,13 +1738,16 @@ fn end_work(
     // despawn at the seat. Fail-open by construction — the record names the
     // pane the seat started in, so a seat whose agent has already been replaced
     // stops matching and this says nothing.
+    // What this seat is the custodian of, if anything. Read once and used
+    // twice: the refusal below, and the brief this seat was started with, which
+    // for a custodial spawn is named for the scope rather than for a task.
+    let held: Vec<String> = store
+        .governors()
+        .iter()
+        .filter(|(_, rec)| rec.get("pane").and_then(|x| x.as_str()) == Some(seat.as_str()))
+        .map(|(proj, _)| proj.clone())
+        .collect();
     if !args.has("force") {
-        let governors = store.governors();
-        let held: Vec<String> = governors
-            .iter()
-            .filter(|(_, rec)| rec.get("pane").and_then(|x| x.as_str()) == Some(seat.as_str()))
-            .map(|(proj, _)| proj.clone())
-            .collect();
         if !held.is_empty() {
             eprintln!("{} {seat} is the seat for {}", p.yellow("✗"), held.join(" "));
             eprintln!("  {}", p.dim("the thread it is holding does not come back — `wsp govern --clear` there first"));
@@ -1713,6 +1778,21 @@ fn end_work(
     // What the binding said, unless the release found something else there —
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);
+
+    // The brief this seat was started with, if it had one. Removed here because
+    // this is the verb that ends a seat, and a brief left behind is a stale
+    // answer sitting on disk waiting to be handed to whoever is spawned onto
+    // the task next — the file is named for the subject, so the next spawn
+    // would read it before writing its own only if the write failed, which is
+    // exactly the case where a stale one is worst.
+    //
+    // Best effort and silent. There is nothing a person does about it, an
+    // absent file is the ordinary answer for every kind that never had one, and
+    // a line here would be printed on every despawn in the fleet for the
+    // benefit of none.
+    for subject in task.iter().map(String::as_str).chain(held.iter().map(String::as_str)) {
+        let _ = std::fs::remove_file(brief_path(store, subject));
+    }
 
     // Last, and only now: the tree is the one step a person can still do by
     // hand afterwards, so it must not be the step that stops the claim being
@@ -2115,86 +2195,84 @@ mod tests {
         assert!(!text.contains("wsp brief"), "the hook has already injected it: {text}");
     }
 
-    /// A kind with no session hook is handed its brief rather than sent to
-    /// fetch one, and the sentence it is handed is the same one every other
-    /// spawn says.
+    /// A kind with no session hook says the same sentence every other spawn
+    /// says, because by the time it is said the brief is already in its
+    /// context.
     ///
     /// This is `core-032`. Before it, an unbriefed kind got `Handover::Running`
     /// — *"please run `wsp brief --session`"* — which is a round-trip at
     /// request 1, and under `core-020` d2's brake it is also the agent's first
     /// `bash`: driving d1 showed every opencode spawn stopping there, on the
-    /// one command that tells it what it is for. Asserted on the pair, because
-    /// what makes the fix a fix is that both halves moved: the fetch is gone
-    /// *and* the brief is present.
+    /// one command that tells it what it is for.
+    ///
+    /// The brief is not *in* this string, which is d7's correction and the
+    /// whole of what changed after the revert: it is in a file the kind's own
+    /// runtime loads. So what is asserted here is that the sentence stops
+    /// asking, and the sentence is the one Claude Code already gets.
     #[test]
-    fn an_unbriefed_kind_is_handed_its_brief_instead_of_being_sent_for_it() {
-        let text = handover("t-260815-033", Handover::Spawned, Route::Inline, || {
-            "where  meta/tooling/wsp/core".into()
-        });
-        assert!(text.contains("where  meta/tooling/wsp/core"), "the brief is not in it: {text}");
-        assert!(!text.contains("wsp brief"), "still sent to fetch what it was just given: {text}");
+    fn a_kind_that_arrives_holding_its_brief_is_not_sent_for_it() {
+        let text = handover("t-260815-033", Handover::Spawned, Route::Inline);
+        assert!(!text.contains("wsp brief"), "sent to fetch what it already holds: {text}");
         assert!(text.contains("Your brief is already above"), "{text}");
-        // In front of the sentence, not after it. The order is what the agent
-        // acts on and it reads *"your brief is already above"*; below it, that
-        // is false in the one direction that matters.
-        assert!(
-            text.find("where  meta").unwrap() < text.find("You have been claimed").unwrap(),
-            "the brief is not above the order: {text}"
+        assert_eq!(
+            text,
+            handover("t-260815-033", Handover::Spawned, Route::Hook),
+            "two ways of arriving briefed, one sentence"
         );
     }
 
-    /// And a custodian is handed the same thing, because its sentence makes the
-    /// same claim.
+    /// And a custodian says the same, because its sentence makes the same
+    /// claim about what is above it.
     #[test]
-    fn an_unbriefed_custodian_is_handed_the_project_brief_too() {
-        let text = handover("robustness", Handover::Custodian, Route::Inline, || "open   x".into());
-        assert!(text.contains("open   x"), "{text}");
+    fn a_custodian_that_arrives_holding_its_brief_is_not_sent_for_it_either() {
+        let text = handover("robustness", Handover::Custodian, Route::Inline);
         assert!(text.contains("custodian of the robustness project"), "{text}");
         assert!(!text.contains("wsp brief"), "{text}");
     }
 
-    /// A kind whose hook already ran is not handed it a second time.
+    /// Which route each kind is on, and it is a fact about where a brief can be
+    /// put rather than about how the order travels.
     ///
-    /// The measurement `cmd_brief::Depth` carries runs both ways: the reason to
-    /// inject the payload at request 0 is that every later request pays for it
-    /// anyway, and that is exactly the reason not to inject it twice. Claude
-    /// Code reads its brief out of `SessionStart` before it sees the order, so
-    /// inlining here would put ~3,300 tokens into the context that are already
-    /// a few hundred tokens above.
+    /// `claude` arrives briefed from its `SessionStart` hook and must not be
+    /// given it twice — `core-032` d2. `opencode` has an `instructions` key
+    /// that loads a file wsp names, driven in d7. Every other kind has neither,
+    /// so it is told to fetch.
+    ///
+    /// **`Route::Inline` is not `order_in_args`, and asserting that is the
+    /// point of this test.** They were the same predicate for one commit: the
+    /// brief went into a `--prompt` argv element, herdr refuses `agent.start`
+    /// args holding any control character, and three spawns of three were
+    /// refused with `invalid_agent_argument`.
     #[test]
-    fn a_briefed_kind_is_not_handed_the_brief_it_already_read() {
-        let text = handover("t-260815-033", Handover::Spawned, Route::Hook, || {
-            panic!("a briefed kind must not compose a brief")
-        });
-        assert_eq!(text, work_order("t-260815-033", Handover::Spawned));
+    fn a_kind_is_given_a_brief_where_its_own_runtime_will_read_one() {
+        let laid = Laid::Written;
+        assert!(route(agent_commands::of("claude"), laid) == Route::Hook);
+        assert!(route(agent_commands::of("opencode"), laid) == Route::Inline);
+        assert!(route(agent_commands::of("codex"), laid) == Route::Fetch);
     }
 
-    /// The brief is inlined only where the order goes in argv, and that is a
-    /// statement about the delivery channel rather than about the kind.
+    /// A brief that could not be written is a brief that is not there, and the
+    /// order must say so.
     ///
-    /// `claude` arrives briefed and needs nothing. `opencode` takes its order
-    /// as a single argv element — proven in `core-026` to arrive intact with
-    /// backticks and `$(...)` in it, because herdr does not put `agent.start`
-    /// args through a shell — so a brief can ride in on it. Every other kind is
-    /// *told*, which is herdr putting text at a terminal, and that is the
-    /// channel robustness-035 showed will swallow a work order over a single
-    /// character. Fourteen kilobytes of task prose through it is unmeasured, so
-    /// it still fetches.
+    /// The failure this guards is silent in every layer beneath it: opencode
+    /// ignores an `instructions` path that does not exist without a word, so an
+    /// agent whose file failed to write starts perfectly well and is told its
+    /// brief is above it when nothing is. That is `core-027`'s failure exactly
+    /// — an order that reads as a poor model rather than a wrong order —
+    /// arriving through the new carrier.
     #[test]
-    fn only_a_kind_whose_order_goes_in_argv_can_be_handed_a_brief() {
-        assert!(route(agent_commands::of("claude")) == Route::Hook);
-        assert!(route(agent_commands::of("opencode")) == Route::Inline);
-        assert!(route(agent_commands::of("codex")) == Route::Fetch);
+    fn a_brief_that_was_not_written_is_not_claimed_to_be_there() {
+        let text = handover("t-260815-033", Handover::Spawned, route(agent_commands::of("opencode"), Laid::Failed));
+        assert_eq!(text, work_order("t-260815-033", Handover::Running));
+        assert!(text.contains("wsp brief --session"), "{text}");
     }
 
-    /// A kind that still has to fetch gets the wording that already existed for
-    /// an agent whose context does not hold its brief, rather than a fourth
+    /// A kind that has to fetch gets the wording that already existed for an
+    /// agent whose context does not hold its brief, rather than a fourth
     /// sentence.
     #[test]
     fn a_kind_that_cannot_be_handed_a_brief_is_told_to_fetch_one() {
-        let text = handover("t-260815-033", Handover::Spawned, Route::Fetch, || {
-            panic!("nothing to compose when nothing can carry it")
-        });
+        let text = handover("t-260815-033", Handover::Spawned, Route::Fetch);
         assert_eq!(text, work_order("t-260815-033", Handover::Running));
         assert!(text.contains("wsp brief --session"), "{text}");
     }
@@ -2867,11 +2945,13 @@ mod tests {
         }
     }
 
-    /// A backend that remembers what it was asked to start, and answers ready.
-    struct Started(std::cell::RefCell<Vec<Agent>>);
+    /// A backend that remembers what it was asked to open and what it was asked
+    /// to start, and answers ready.
+    struct Started(std::cell::RefCell<Vec<Agent>>, std::cell::RefCell<Vec<Order>>);
 
     impl Place for Started {
-        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+        fn open(&self, order: &Order) -> crate::place::Result<Seat> {
+            self.1.borrow_mut().push(order.clone());
             Ok(Seat::new("w9:p1"))
         }
         fn start(&self, _: &Seat, agent: &Agent) -> crate::place::Result<()> {
@@ -2881,8 +2961,10 @@ mod tests {
         fn state(&self, _: &Seat) -> crate::place::Result<State> {
             Ok(State::Idle)
         }
+        // The other end of the same test: `despawn` is what takes the brief
+        // away again.
         fn stop(&self, _: &Seat) -> crate::place::Result<()> {
-            panic!("spawn does not end seats")
+            Ok(())
         }
         fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
             panic!("a kind that takes its order in argv is not told it as well")
@@ -2936,29 +3018,52 @@ mod tests {
             store.save_task(&t).unwrap();
         }
 
-        let place = Started(std::cell::RefCell::new(Vec::new()));
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
         let flags = [("agent", "true"), ("kind", "opencode"), ("no-tree", "true")];
         assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags)), 0);
 
-        let agent = place.0.borrow().first().cloned().expect("nothing was started");
-        let order = agent
+        // The seat's environment names the file, and the file is where the
+        // brief went. Read out of the order the backend was asked to open,
+        // because that is the value herdr actually receives.
+        let opened = place.1.borrow().first().cloned().expect("no seat was opened");
+        let cfg: serde_json::Value =
+            serde_json::from_str(opened.env.get("OPENCODE_CONFIG_CONTENT").expect("no config on the seat"))
+                .expect("valid config");
+        let named = cfg["instructions"][0].as_str().expect("no brief named").to_string();
+        let brief = std::fs::read_to_string(&named).expect("named a file that is not there");
+
+        // The brief, and the task it is about.
+        assert!(brief.contains("compose the brief into the order"), "no overview: {brief}");
+        assert!(brief.contains("read the source map first"), "no handbook: {brief}");
+        assert!(brief.contains("t-1"), "{brief}");
+        // And not the other one. A brief composed for this process rather than
+        // for the seat would have named whatever the caller was holding.
+        assert!(!brief.contains("not this agent's business"), "the spawner's task: {brief}");
+
+        // Outside every working tree, which is `core-020` d2's correction: a
+        // file wsp leaves in a checkout makes it permanently dirty.
+        assert!(named.starts_with(store.state.to_str().unwrap()), "not beside the state: {named}");
+
+        // The order itself, no longer asking for what the agent already has.
+        let order = place.0.borrow().first().cloned().expect("nothing was started")
             .args
             .windows(2)
             .find(|w| w[0] == "--prompt")
             .map(|w| w[1].clone())
             .expect("no work order in the argv");
-
-        // The brief, and the task it is about.
-        assert!(order.contains("compose the brief into the order"), "no overview: {order}");
-        assert!(order.contains("read the source map first"), "no handbook: {order}");
-        assert!(order.contains("t-1"), "{order}");
-        // And not the other one. A brief composed for this process rather than
-        // for the seat would have named whatever the caller was holding.
-        assert!(!order.contains("not this agent's business"), "the spawner's task: {order}");
-
-        // The order itself, after the brief and no longer asking for one.
         assert!(order.contains("You have been claimed onto t-1"), "{order}");
         assert!(!order.contains("wsp brief --session"), "sent to fetch what it was given: {order}");
+        // One argv element, and nothing in it herdr will refuse: the encoder
+        // rejects any control character, which is what put the brief in a file
+        // rather than in this string.
+        assert!(!order.contains('\n'), "a multi-line work order is refused by herdr: {order:?}");
+
+        // And the ending takes it away. A brief left behind is a stale answer
+        // waiting to be handed to whoever is spawned onto the task next.
+        assert_eq!(end_work(&place, &store, &Args::synth("despawn", &["t-1"], &[]), None, &|_, _, _| {
+            Leftovers { tree: Tree::Absent, builds: Vec::new() }
+        }), 0);
+        assert!(!std::path::Path::new(&named).exists(), "the brief outlived the seat: {named}");
     }
 
     /// The whole of robustness-010, at the one line where it happens.

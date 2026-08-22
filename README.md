@@ -1601,22 +1601,35 @@ before the claim existed, so that one is still asked to fetch, once, with
 *"your brief is already above"* to an agent whose context was empty. An opencode
 spawned that way read the sentence, went looking with `git status`, and asked
 for the brief to be pasted — a wrong order that reads exactly like a poor model.
-So `spawn` composes the brief itself and carries it in front of the sentence:
-the same `--session` text, built for the seat it has just opened rather than for
-the session running `spawn`. That is `cmd_brief::At` — the discovery is the
-argument and the composition is shared, so there is one brief and not two.
+So `spawn` composes the brief itself, for the seat it has just opened rather
+than for the session running `spawn`. That is `cmd_brief::At` — the discovery is
+the argument and the composition is shared, so there is one brief and not two.
 
-Nothing is trimmed on the way. What the inlined brief replaces is the `wsp brief
---session` the agent was being told to run, so it is a substitution rather than
-an addition: the same tokens, minus a round-trip at request 1, minus — under
-`core-020`'s permission policy — a stall on the agent's first `bash`, which was
-the command that would have told it what it was for.
+Nothing is trimmed on the way. What it replaces is the `wsp brief --session` the
+agent was being told to run, so it is a substitution rather than an addition: the
+same tokens, minus a round-trip at request 1, minus — under `core-020`'s
+permission policy — a stall on the agent's first `bash`, which was the command
+that would have told it what it was for.
 
-It goes only to a kind whose order is handed over in **argv**, which today is
-`opencode`. A kind that is *told* its order gets it through herdr putting text
-at a terminal, and that is the channel where one em-dash once left a work order
-sitting unsent in a composer; fourteen kilobytes of task prose through it is
-unmeasured, so `codex` and `gemini` still fetch. See `cmd_spawn::Route`.
+**Where it goes is the kind's own configuration, not the work order.** wsp writes
+the brief beside the machine state — `~/.local/state/wsp/briefs/<subject>.md`,
+outside every working tree, because a file wsp leaves in a checkout makes it
+permanently dirty — and names that path in opencode's `instructions` key, which
+it already reaches through `OPENCODE_CONFIG_CONTENT`. opencode loads it as system
+context before the first message: nothing is fetched, and there is no `bash`
+call, so the brake is never met. `despawn` removes the file.
+
+That key *merges* with the machine's own config rather than replacing it, which
+is the property the whole scheme rests on: `plugin` still resolves to the herdr
+state plugin, so state reporting is untouched.
+
+It is deliberately **not** the same predicate as "the order goes in argv", and
+the day those two were one predicate cost a revert. The brief went into a
+`--prompt` element; herdr refuses `agent.start` args holding any control
+character, a brief is multi-line, and three spawns of three were refused with
+`invalid_agent_argument` and no agent started. Env is not argv. `codex` and
+`gemini` have no config channel wsp knows, so they still fetch — see
+`cmd_spawn::Route`.
 
 ### What it is *not* handed
 

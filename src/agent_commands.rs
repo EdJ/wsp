@@ -197,7 +197,7 @@
 //! `--session-id <uuid>`, the other lead, remains unrun and is now unneeded.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -402,8 +402,40 @@ pub trait Kind {
     /// exactly the same config — verified against `opencode debug config`, which
     /// resolves the two routes identically — and leaves nothing behind to clean
     /// up.
-    fn env(&self) -> BTreeMap<String, String> {
+    ///
+    /// `brief` is the file `spawn` will write this seat's brief into, when the
+    /// kind is one that reads such a file — see [`Kind::brief_file`]. `None`
+    /// for every kind that is not, and for a spawn with nothing to brief about.
+    /// It is a path rather than the text because the seat's environment is
+    /// fixed when the seat opens, and the brief cannot be composed until the
+    /// claim has landed a moment later; the path is knowable in advance and the
+    /// content is not.
+    fn env(&self, _brief: Option<&Path>) -> BTreeMap<String, String> {
         BTreeMap::new()
+    }
+
+    /// Whether this kind will read a brief out of a file wsp names in its
+    /// configuration, rather than having to be handed one or sent for one.
+    ///
+    /// **`false` by default, and true for exactly one kind, because it is a
+    /// fact about a runtime's config format rather than a thing wsp can arrange.**
+    /// opencode has an `instructions` key taking a list of paths, which it loads
+    /// as system context before the session's first message. `core-032` d7 drove
+    /// it: a brief written to a file outside any working tree, its absolute path
+    /// in `instructions`, and an opencode with `bash` and `edit` both **denied**
+    /// answered what task it was holding and quoted a token that existed nowhere
+    /// but that file. No tool call, so no `bash`, so `core-020` d2's brake is
+    /// never met — which is the whole of what this row is for.
+    ///
+    /// It is what [`crate::cmd_spawn::Route::Inline`] selects on, and it
+    /// deliberately is **not** [`Kind::order_in_args`]. Those were the same
+    /// predicate for one commit and it was wrong: the brief went into a
+    /// `--prompt` argv element, and herdr refuses `agent.start` args holding any
+    /// control character — a brief is multi-line, so three spawns of three were
+    /// refused with `invalid_agent_argument` and no agent started. Env is not
+    /// argv and that guard does not reach it.
+    fn brief_file(&self) -> bool {
+        false
     }
 
     /// Whether a sentence delivered to this kind lands in a queue that belongs
@@ -779,7 +811,7 @@ const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 /// Scoped to the seat and not to the machine. Ed's own opencode is untouched by
 /// this, which is the other half of the decision: wsp configures the agents it
 /// starts and nothing else.
-fn permission() -> String {
+fn config(brief: Option<&Path>) -> String {
     let mut bash = serde_json::Map::new();
     // Denies first only for readability; see the note above on precedence.
     for verb in WSP_DENIED {
@@ -790,7 +822,25 @@ fn permission() -> String {
     }
     // Everything else a shell can do, which is the brake itself.
     bash.insert("*".to_string(), Value::from("ask"));
-    serde_json::json!({ "permission": { "bash": bash, "edit": "ask" } }).to_string()
+    let mut cfg = serde_json::json!({ "permission": { "bash": bash, "edit": "ask" } });
+    // The brief, as a path opencode loads for itself. `core-032` d7, and the
+    // reason it goes here rather than into the work order is on
+    // [`Kind::brief_file`].
+    //
+    // **This key merges with the machine's own config rather than replacing
+    // it**, which is the property the whole scheme rests on and the one worth
+    // naming: `~/.config/opencode/plugins/herdr-agent-state.js` is what reports
+    // an opencode's state to herdr, and a config that clobbered `plugin` would
+    // have turned off state reporting for every agent wsp starts — silently,
+    // and with `needs_a_person` among the things it took with it. Driven twice
+    // on 2026-08-22: `opencode debug config` with this exact value resolves
+    // `instructions` to the file below and `plugin` still to the herdr plugin,
+    // and a spawned opencode in a sandbox herdr reported
+    // `screen_detection_skipped: true`, which is the plugin doing its job.
+    if let Some(path) = brief {
+        cfg["instructions"] = Value::from(vec![path.display().to_string()]);
+    }
+    cfg.to_string()
 }
 
 /// Where the model catalogue comes from, and the shape a model name has.
@@ -960,8 +1010,13 @@ impl Kind for OpenCode {
 
     /// [`permission`], which is the whole of it. The argument is on that
     /// function, on [`WSP_ALLOWED`] and on [`Kind::env`].
-    fn env(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), permission())])
+    fn env(&self, brief: Option<&Path>) -> BTreeMap<String, String> {
+        BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), config(brief))])
+    }
+
+    /// Yes — `instructions`. The measurement is on [`Kind::brief_file`].
+    fn brief_file(&self) -> bool {
+        true
     }
 
     /// Yes — `--prompt`. The measurement is on [`Kind::order_in_args`].
@@ -2397,7 +2452,7 @@ mod tests {
 
     #[test]
     fn a_spawned_opencode_can_read_and_record_freely_and_asks_before_anything_else() {
-        let env = of("opencode").env();
+        let env = of("opencode").env(None);
         let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("the brake is armed on the seat");
         let v: Value = serde_json::from_str(cfg).expect("valid config, composed not concatenated");
         let bash = &v["permission"]["bash"];
@@ -2413,6 +2468,49 @@ mod tests {
         // invitation for somebody to say yes on his behalf.
         assert_eq!(bash["wsp done*"], "deny", "the decision of 2026-08-19");
         assert_eq!(bash["wsp archive*"], "deny");
+    }
+
+    /// The brief rides in on the same variable as the brake, and does not
+    /// disturb it or the machine's own config.
+    ///
+    /// `core-032` d7. Two things are asserted because two things could break:
+    /// the key has to be there and absolute, and the config has to still be the
+    /// policy it was — a spawned opencode that got a brief and lost its brake
+    /// would be the worst trade in this file. What cannot be asserted from here
+    /// is the third and most important one, because it is opencode's behaviour
+    /// and not wsp's: that this **merges** with the machine config rather than
+    /// replacing it, so `~/.config/opencode/plugins/herdr-agent-state.js`
+    /// survives. Driven instead — see the note in [`config`].
+    #[test]
+    fn the_brief_arrives_on_the_same_variable_as_the_brake_and_does_not_disturb_it() {
+        let cfg = |brief| {
+            let env = of("opencode").env(brief);
+            let raw = env.get("OPENCODE_CONFIG_CONTENT").expect("nothing on the seat").clone();
+            serde_json::from_str::<Value>(&raw).expect("valid config")
+        };
+
+        let with = cfg(Some(Path::new("/some/where/t-260815-033.md")));
+        assert_eq!(with["instructions"][0], "/some/where/t-260815-033.md");
+        // The brake, unchanged beside it.
+        assert_eq!(with["permission"]["bash"]["*"], "ask");
+        assert_eq!(with["permission"]["edit"], "ask");
+        assert_eq!(with["permission"]["bash"]["wsp done*"], "deny");
+
+        // And a spawn with nothing to brief about says nothing rather than
+        // naming a file that is not there: opencode ignores a missing
+        // `instructions` path in silence, so a wrong one is invisible.
+        let without = cfg(None);
+        assert!(without.get("instructions").is_none(), "a path to nothing: {without}");
+        assert_eq!(without["permission"], with["permission"], "the brake is not a function of the brief");
+    }
+
+    /// Which kinds can be handed a brief this way, and it is a fact about a
+    /// runtime's config format rather than about the work.
+    #[test]
+    fn only_a_kind_with_somewhere_to_read_a_brief_from_is_given_one() {
+        assert!(of("opencode").brief_file(), "core-032 d7 drove it");
+        assert!(!of("claude").brief_file(), "it has a session hook and must not get it twice");
+        assert!(!of("codex").brief_file(), "wsp knows no config channel for it");
     }
 
     /// The two lists are a copy of somebody else's file, and the only thing
@@ -2434,8 +2532,10 @@ mod tests {
     #[test]
     fn no_other_kinds_seat_is_touched() {
         assert!(
-            of("claude").env().is_empty() && of("codex").env().is_empty(),
-            "the compatibility rule everywhere here: an unmeasured kind is left exactly as it was"
+            of("claude").env(Some(Path::new("/tmp/b.md"))).is_empty()
+                && of("codex").env(Some(Path::new("/tmp/b.md"))).is_empty(),
+            "the compatibility rule everywhere here: an unmeasured kind is left exactly as it was, \
+             and a brief it has no way to read does not change that"
         );
     }
 
