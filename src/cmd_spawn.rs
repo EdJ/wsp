@@ -2161,9 +2161,24 @@ mod tests {
         assert!(bare.env.get("OPENCODE_CONFIG_CONTENT").is_none());
 
         // And every kind that needs nothing gets byte-for-byte what it got
-        // before the channel existed.
+        // before the channel existed — asserted as the kind's own contribution.
+        //
+        // `claude.env == bare.env` stood here and is not the claim it reads as:
+        // `seat_env` opens with `place::shed_env`, and comparing two of those
+        // is comparing two readings of the live process environment taken at
+        // different instants. `place::shed_keys` carries why, and what it cost
+        // (`robustness-099`). Not fixed by taking `util::env_lock` instead: the
+        // neighbours are right to set what they read, and a claim about one
+        // kind should not need the whole suite to hold still.
+        assert!(
+            agent_commands::of("claude").env(Some(&brief)).is_empty(),
+            "a kind that needs no configuring is unchanged"
+        );
+        // …and the seat it is composed into is an ordinary one, which is the
+        // other half of `unchanged` and the half `seat_env` could break.
         let claude = order(&work, None, None, false, Some(Occupant { kind: "claude", brief: Some(&brief) }));
-        assert_eq!(claude.env, bare.env, "a kind that needs no configuring is unchanged");
+        assert_eq!(claude.env.get("WSP_TASK").map(String::as_str), Some("oc-001"));
+        assert!(claude.env.get("OPENCODE_CONFIG_CONTENT").is_none(), "one kind's spelling reached another's seat");
     }
 
     /// The other half of the same order: an agent spawned from inside an agent

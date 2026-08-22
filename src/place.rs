@@ -393,6 +393,18 @@ pub fn shed(key: &str) -> bool {
 ///
 /// [`CHILD_MARKER`] is always in the list and the rest is only what is actually
 /// here, so a spawn from a shell with none of this in it is one name long.
+///
+/// **It enumerates the live process environment, so no two of its results may
+/// be compared to each other** — nor two of anything built on it, which is
+/// every [`shed_env`] and every [`crate::cmd_spawn::seat_env`]. cargo runs
+/// tests as threads in one process and several of them set `CLAUDE_CODE_*`
+/// names (`place_super`, `cmd_sandbox`); one landing between two calls puts a
+/// key in one result and not the other. `robustness-099` was such an assertion
+/// in `cmd_spawn`, and what it cost was not itself: it was green in four debug
+/// runs, red under `--release`, and passed alone — this project's signature for
+/// a real ordering bug, spent on a test that had none, on the run an install is
+/// gated on. Assert a property of one result, or the contribution of the thing
+/// actually under test; never one snapshot against another.
 pub fn shed_keys() -> Vec<String> {
     let mut keys: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
