@@ -197,8 +197,10 @@
 //! `--session-id <uuid>`, the other lead, remains unrun and is now unneeded.
 
 use std::collections::{BTreeMap, HashSet};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -872,16 +874,8 @@ fn config(brief: Option<&Path>) -> String {
 /// and wrong on any machine but one. `place.rs` refuses to keep a catalogue of
 /// kinds for exactly this reason and this is the same refusal one level down.
 fn opencode_models() -> std::result::Result<Vec<String>, String> {
-    let out = Command::new(opencode_bin())
-        .arg("models")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("opencode models: {e}"))?;
-    if !out.status.success() {
-        return Err("opencode models failed".into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    let out = captured(opencode_bin(), &["models"])?;
+    Ok(String::from_utf8_lossy(&out)
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| l.contains('/'))
@@ -913,6 +907,79 @@ fn opencode_bin() -> PathBuf {
         }
     }
     util::home().join(".opencode/bin/opencode")
+}
+
+/// Everything one of these runtimes wrote to stdout, through a file rather
+/// than a pipe.
+///
+/// **The pipe was losing most of it, and saying nothing.** `opencode export
+/// --sanitize` on a 53-turn session writes 165,230 bytes. Asked for down a
+/// pipe, wsp received 65,536 of them — one pipe buffer — and an exit status of
+/// *zero*, so [`read_export`] was handed a JSON document cut off mid-string,
+/// returned nothing, and `ui-007` closed with no cost clause at all. That is
+/// `core-039`. It was read at first as `despawn` ending the agent before its
+/// runtime could be asked. Driven in a sandbox, both endings wrote the clause —
+/// `wsp release` on a live opencode and `wsp despawn` on another — and then the
+/// row that had lost one lost it again on a replay through `release`, with no
+/// agent left to kill. Nothing about the ending is the variable. The size of
+/// the export is.
+///
+/// The cause belongs to the runtime rather than to the subcommand: these are
+/// Bun-compiled binaries, their stdout writes are asynchronous, and the process
+/// exits without waiting for a pipe it has filled to drain. A file has no
+/// buffer to overrun and its writes complete before exit — the same export
+/// redirected to one came back 165,230 bytes three times out of three.
+///
+/// So every capture in this file goes through here, including the two that are
+/// small today: `opencode models` is 13KB and `claude agents --json` is 1.4KB,
+/// both grow with what is on the machine, and both fail plausibly rather than
+/// loudly when cut — a valid model refused, an agent that cannot be addressed.
+/// The defence is one temp file, and waiting to be the second row this costs is
+/// not a saving.
+///
+/// The file is this process's own, is opened `0600` because a sanitized export
+/// still carries the shape of one attempt and a temp directory is shared, and
+/// is removed however this ends.
+fn captured(bin: PathBuf, args: &[&str]) -> std::result::Result<Vec<u8>, String> {
+    // Named as the reader would type it — `opencode models`, not the resolved
+    // path — because these strings reach a person inside a refusal that is
+    // about their `--model`, not about where wsp found the binary.
+    let said = format!(
+        "{} {}",
+        bin.file_name().unwrap_or(bin.as_os_str()).to_string_lossy(),
+        args.join(" ")
+    );
+    // Unique per call and not merely per process. Nothing here runs two at
+    // once today, and a name that would silently collide the day something
+    // does is a trap laid for a reader with no reason to look here.
+    static NTH: AtomicU64 = AtomicU64::new(0);
+    let at = std::env::temp_dir().join(format!(
+        "wsp-captured-{}-{}",
+        std::process::id(),
+        NTH.fetch_add(1, Ordering::Relaxed)
+    ));
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&at)
+        .map_err(|e| format!("{said}: {e}"))?;
+    let ran = Command::new(&bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(sink))
+        .stderr(Stdio::null())
+        .status();
+    let out = match ran {
+        Err(e) => Err(format!("{said}: {e}")),
+        Ok(s) if !s.success() => Err(format!("{said} failed")),
+        Ok(_) => std::fs::read(&at).map_err(|e| format!("{said}: {e}")),
+    };
+    // Whatever happened, including the failures: a capture that could not be
+    // read is exactly the one whose leftovers nobody comes back for.
+    let _ = std::fs::remove_file(&at);
+    out
 }
 
 impl Kind for OpenCode {
@@ -1120,17 +1187,16 @@ impl Kind for OpenCode {
 /// which got it from the agent, and `spawn` is a verb agents drive. opencode
 /// spells an id `ses_` and twenty-something alphanumerics; anything with a
 /// space, a slash or a dash in it is not one.
+///
+/// Taken through [`captured`] and not through a pipe, which is the whole of
+/// `core-039`: this is the longest thing wsp asks any runtime for, so it is the
+/// one that overran a pipe buffer and came back a truncated document under a
+/// successful exit status. The argument is there.
 fn export(session: &str) -> Option<Vec<u8>> {
     if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
-    let out = Command::new(opencode_bin())
-        .args(["export", "--sanitize", session])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    out.status.success().then_some(out.stdout)
+    captured(opencode_bin(), &["export", "--sanitize", session]).ok()
 }
 
 /// That export, reduced to what served the attempt and what it cost.
@@ -2033,16 +2099,8 @@ fn claude_bin() -> PathBuf {
 /// here — [`pick`] gets an empty listing and says nothing, which is the right
 /// answer rather than a wrong one.
 fn listing() -> std::result::Result<Vec<Live>, String> {
-    let out = Command::new(claude_bin())
-        .args(["agents", "--json"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("claude agents --json: {e}"))?;
-    if !out.status.success() {
-        return Err("claude agents --json failed".into());
-    }
-    Ok(parse_listing(&String::from_utf8_lossy(&out.stdout)))
+    let out = captured(claude_bin(), &["agents", "--json"])?;
+    Ok(parse_listing(&String::from_utf8_lossy(&out)))
 }
 
 /// The sentence a caller says when it could not deliver a work order.
@@ -3186,6 +3244,66 @@ mod tests {
         let ran = read_export(&src, 1_787_327_500).expect("the second message only");
         assert_eq!(ran.turns, 1);
         assert_eq!(ran.spend.input, 100);
+    }
+
+    /// The property `core-039` cost a row to learn: what these runtimes write
+    /// must not land in a pipe. They are Bun binaries, they exit without
+    /// draining one they have filled, and the reader is left with 64KiB of a
+    /// 165KB export under a successful exit status — a truncated document is a
+    /// missing clause and nothing says so. Asserted on the *child's* end of the
+    /// handle rather than on the size of what came back, because a capture that
+    /// happens to fit tells nothing apart.
+    #[test]
+    fn what_a_runtime_writes_never_goes_into_a_pipe() {
+        let out = captured(
+            PathBuf::from("/bin/sh"),
+            &["-c", "if [ -p /dev/stdout ]; then echo pipe; else echo file; fi"],
+        )
+        .expect("/bin/sh");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "file");
+    }
+
+    /// Everything the child wrote, and only that. The whole reason for the file
+    /// is that the last byte arrives, so the test that matters is the tail.
+    #[test]
+    fn a_capture_is_every_byte_the_child_wrote() {
+        let out = captured(
+            PathBuf::from("/bin/sh"),
+            &["-c", "i=0; while [ $i -lt 4000 ]; do echo 0123456789012345678901234567890123456789; i=$((i+1)); done; echo tail"],
+        )
+        .expect("/bin/sh");
+        assert_eq!(out.len(), 4000 * 41 + 5, "a capture that stopped at a buffer boundary");
+        assert!(String::from_utf8_lossy(&out).ends_with("tail\n"), "the last line never arrived");
+    }
+
+    /// A child that failed is an error naming the command the way a person
+    /// would type it — these strings reach somebody inside a refusal about
+    /// their `--model`, not about where wsp found the binary — and it leaves
+    /// nothing behind, because the capture nobody could read is exactly the one
+    /// whose leftovers nobody comes back for.
+    ///
+    /// Looked for by what this child wrote rather than by counting the
+    /// directory: temp is shared with every other test in the run and with
+    /// every other wsp on the machine, and a count is a test that fails for
+    /// somebody else's reasons.
+    #[test]
+    fn a_failed_capture_says_what_was_run_and_keeps_no_file() {
+        let mark = format!("half-{}-{:?}", std::process::id(), std::thread::current().id());
+        let e = captured(PathBuf::from("/bin/sh"), &["-c", &format!("echo {mark}; exit 3")])
+            .expect_err("exit 3");
+        assert!(e.contains("sh -c"), "it named a path instead of the command — {e}");
+        assert!(e.ends_with("failed"), "{e}");
+        let left: Vec<PathBuf> = std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("wsp-captured-"))
+                    && std::fs::read_to_string(p).is_ok_and(|s| s.contains(&mark))
+            })
+            .collect();
+        assert!(left.is_empty(), "a temp file outlived the capture: {left:?}");
     }
 
     /// An export with nothing that served a turn is no answer rather than an

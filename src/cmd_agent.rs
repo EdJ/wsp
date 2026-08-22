@@ -1944,6 +1944,18 @@ fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
 /// a subprocess, ~1.5s, which is the price of a record that runtime publishes
 /// and wsp would otherwise have to derive. Paid once, when an attempt ends.
 ///
+/// **And it does not have to be taken before the seat is ended.** `core-039`
+/// began as that suspicion — `wsp despawn` stops the agent and only then
+/// reaches the claim through [`release_pane`], and the first real opencode row
+/// closed with no clause. Both endings were then driven against a live opencode
+/// in a sandbox and **both wrote the clause**, while the row that had lost one
+/// lost it again on a replay through `wsp release`, with no agent left to kill.
+/// The reading is of a record on disk in both kinds, the agent is not asked
+/// anything, and the order this is called in is not the hazard. What was
+/// actually wrong is one file down, on `agent_commands::captured` — which is
+/// where a missing clause should be read about next, before this is suspected
+/// again.
+///
 /// # And what it cost, which is the clause `core-029` added
 ///
 /// Same line, same reading, one more clause: `242M cache 4.7M in 875k out`,
