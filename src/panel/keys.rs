@@ -803,6 +803,11 @@ enum Scope {
     TaskOrProject,
     /// A task, or the agent's own pane — the two ends of a claim.
     TaskOrPane,
+    /// An agent's own row, wherever it is drawn, and deliberately not a seat:
+    /// the slot answers with its occupant for looking and jumping, but a verb
+    /// that empties that occupant's window is acting on whoever happens to
+    /// hold the post, which is not the post's business to offer.
+    Pane,
     /// A board is a project's; a task or the inbox hand one over instead of
     /// refusing.
     Board,
@@ -821,6 +826,7 @@ impl Scope {
             Scope::Task => matches!(target, Target::Task(_)),
             Scope::TaskOrProject => matches!(target, Target::Task(_) | Target::Project(_)),
             Scope::TaskOrPane => matches!(target, Target::Task(_) | Target::Pane(_)),
+            Scope::Pane => matches!(target, Target::Pane(_)),
             Scope::Board => matches!(target, Target::Task(_) | Target::Project(_) | Target::Inbox),
             Scope::Seat => matches!(target, Target::Seat(_)),
             Scope::Agent => matches!(target, Target::Pane(_) | Target::Seat(_)),
@@ -857,6 +863,7 @@ pub(crate) fn keymap(target: &Target, flagged: bool) -> Vec<(&'static str, Vec<(
                 ("c f", "claim, find work · y/n", Scope::TaskOrPane),
                 ("C", "hand to a spare · y/n", Scope::Task),
                 ("u", "take the work back · y/n", Scope::TaskOrPane),
+                ("U", "empty its window, keep the work · y/n", Scope::Pane),
                 ("O", "a terminal here", Scope::TaskOrProject),
                 ("S", "an agent on it · y/n", Scope::TaskOrProject),
                 ("T", "say it to a project's governor", Scope::Seat),

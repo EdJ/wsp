@@ -592,6 +592,43 @@ pub trait Kind {
     fn resume_flag(&self) -> Option<&'static str> {
         None
     }
+
+    /// What typed into this kind's pane empties its context — `None` for every
+    /// kind nobody has measured, and for kinds that have no such word.
+    ///
+    /// The third spelling to live here, and core-031 named this exact function
+    /// as one of them while it was still `clear_command(kind)` in the panel,
+    /// matching on the kind string: `/clear` is Claude Code's word, and the
+    /// match was right only while Claude Code was the only kind with an answer.
+    /// render-062 made that false by offering the gesture as a verb of its own,
+    /// so the fact moved beside [`Kind::resume_flag`], which carries the full
+    /// argument — a kind spells its words once, and every caller reads the
+    /// same answer.
+    ///
+    /// `None` is the honest answer and not a gap. A kind with no measured
+    /// spelling gets no clear rather than one guessed at: typed into a pane, a
+    /// wrong word is not a failed command but the first half of whatever the
+    /// agent reads next.
+    fn clear_command(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether a clear of this kind leaves a **new session** where herdr can
+    /// see one — which is the only completion signal a clear has.
+    ///
+    /// `true` by default, because waiting is the shape a clear was first built
+    /// around: Claude Code's `SessionStart` hook teaches herdr the replacement
+    /// session's id within a few hundred milliseconds, and the wait is what
+    /// keeps a work order from landing mid-reset. A kind answering `false`
+    /// says the signal never comes, so waiting would be a stall with nothing
+    /// at the end of it — and owes, in its own override's doc, the drive that
+    /// proves text typed straight after lands safely anyway.
+    ///
+    /// Never asked where [`Kind::clear_command`] answers `None`; there is
+    /// nothing to wait for.
+    fn clear_replaces_session(&self) -> bool {
+        true
+    }
 }
 
 /// What is about to be started, as much of it as a kind is allowed to know.
@@ -684,6 +721,29 @@ pub fn of(kind: &str) -> &'static dyn Kind {
         "opencode" => &OpenCode,
         _ => &Plain,
     }
+}
+
+/// What a clear of one pane is: the word to type, and whether to wait for the
+/// session that replaces the one it ends.
+///
+/// One value rather than two fields on whatever carries it, because the pair
+/// is one fact read from one kind — [`Kind::clear_command`] and
+/// [`Kind::clear_replaces_session`] — and a caller holding only half of it
+/// would either stall or send blind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clear {
+    /// Typed into the pane as its own line.
+    pub cmd: &'static str,
+    /// Whether to hold the next sentence until herdr reports a new session in
+    /// that pane. See [`Kind::clear_replaces_session`].
+    pub waits: bool,
+}
+
+/// The clear for a kind, whole. `None` where the kind has none, which is the
+/// answer every caller passes through: no spelling, nothing typed.
+pub fn clear_of(kind: &str) -> Option<Clear> {
+    let k = of(kind);
+    k.clear_command().map(|cmd| Clear { cmd, waits: k.clear_replaces_session() })
 }
 
 /// An agent wsp knows nothing about beyond its name.
@@ -1051,6 +1111,34 @@ impl Kind for OpenCode {
     /// such flag. This is where knowing the kind pays for itself.
     fn resume_flag(&self) -> Option<&'static str> {
         Some("--session")
+    }
+
+    /// `/clear`, which this runtime spells only as an alias of `/new` — start
+    /// a new session. Driven 2026-08-23 against 1.18.21 in a sandbox herdr,
+    /// the same rig `core-026` used: typed at an idle composer it resets the
+    /// transcript view at once; the next turn opened a session of its own;
+    /// `opencode export` on the old id still showed every message it had, so
+    /// nothing of the old context reached the new turn — and the old session
+    /// stays listed, which is [`Kind::resume_flag`]'s business, not this one's.
+    ///
+    /// [`clear_replaces_session`] answers false on the same drive, and that is
+    /// why both facts are recorded here rather than inferred from the docs:
+    /// herdr's `agent_session` keeps the **old** id through the clear — the
+    /// plugin learns the replacement only when the next message creates it —
+    /// so the wait that completes a Claude Code clear can never fire for this
+    /// kind, and every sentence would pay its full timeout for nothing. What
+    /// makes skipping that wait safe rather than lucky: text sent straight
+    /// afterwards, across the same 150 ms gap every sentence here uses, was
+    /// taken by the fresh composer and became the new session's first turn.
+    /// That is unlike the startup window ([`Kind::order_in_args`]), where input
+    /// inside two seconds is discarded outright — a clear is not a restart,
+    /// and the drive says so.
+    fn clear_command(&self) -> Option<&'static str> {
+        Some("/clear")
+    }
+
+    fn clear_replaces_session(&self) -> bool {
+        false
     }
 
     /// A `provider/model` this machine can actually serve, and no effort at all.
@@ -1467,6 +1555,12 @@ impl Kind for Claude {
     /// `--resume`.
     fn resume_flag(&self) -> Option<&'static str> {
         Some("--resume")
+    }
+
+    /// `/clear`. The spelling the panel carried for a kind before there was a
+    /// trait to carry it in, unchanged.
+    fn clear_command(&self) -> Option<&'static str> {
+        Some("/clear")
     }
 
     /// [`MODELS`], with an optional `[1m]`, and [`EFFORTS`].
@@ -3423,5 +3517,28 @@ mod tests {
         assert!(Spend::of_clause("ran opus-5/high").is_none());
         assert!(Spend::of_clause("").is_none());
         assert!(Spend::of_clause("12k cache and a note about it").is_none());
+    }
+
+    /// A kind spells its clear once, and every caller reads the same answer —
+    /// which is the whole of why the fact lives here rather than in the panel.
+    /// Claude Code's `/clear` is unchanged from the day it was written; the
+    /// opencode spelling is the one render-062 drove, and it carries its own
+    /// wait semantics with it: herdr sees no replacement session until the
+    /// next prompt, so waiting for one would be a stall with nothing at the
+    /// end. A kind nobody has measured answers `None`, and a caller that
+    /// respects that offers nothing rather than typing a guess at somebody's
+    /// composer.
+    #[test]
+    fn a_kind_spells_its_clear_once_and_unmeasured_kinds_get_none() {
+        let claude = clear_of("claude").expect("claude has always had one");
+        assert_eq!(claude.cmd, "/clear", "the spelling the panel has carried all along");
+        assert!(claude.waits, "claude announces the replacement session");
+
+        let opencode = clear_of("opencode").expect("driven 2026-08-23 against 1.18.21");
+        assert_eq!(opencode.cmd, "/clear", "an alias of /new — start a new session");
+        assert!(!opencode.waits, "the new session id appears only at the next prompt");
+
+        assert!(clear_of("codex").is_none(), "never measured");
+        assert!(clear_of("").is_none(), "a shell is not a kind");
     }
 }

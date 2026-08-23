@@ -5080,7 +5080,9 @@ mod tests {
             press(&mut ui, &mut view, 'c');
             on_pane(&mut ui, "w4:p2");
             match confirmed_enter(&mut ui, &mut view) {
-                panel::Effect::Run { then, .. } => then.expect("an idle agent is told").clear,
+                panel::Effect::Run { then, .. } => {
+                    then.expect("an idle agent is told").clear.map(|c| c.cmd)
+                }
                 _ => panic!("the pick should run a claim"),
             }
         };
@@ -5253,7 +5255,11 @@ mod tests {
                 );
                 let t = then.expect("an agent handed a task is told about it");
                 assert_eq!(t.pane, "w4:p2");
-                assert_eq!(t.clear, Some("/clear"), "on an empty context, like every other");
+                assert_eq!(
+                    t.clear.map(|c| c.cmd),
+                    Some("/clear"),
+                    "on an empty context, like every other"
+                );
                 let said = t.text.clone().expect("a sentence, not just a clear");
                 assert!(said.contains("t-001"), "said: {said}");
             }
@@ -5382,7 +5388,7 @@ mod tests {
                 assert!(escalate.is_none(), "release has nothing to refuse on");
                 let t = then.expect("an idle agent handed its work back is cleared");
                 assert_eq!(t.pane, "w2:p1");
-                assert_eq!(t.clear, Some("/clear"));
+                assert_eq!(t.clear.map(|c| c.cmd), Some("/clear"));
                 assert!(t.text.is_none(), "nothing is typed after the clear");
             }
             _ => panic!("u should run a release"),

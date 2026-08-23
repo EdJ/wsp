@@ -656,6 +656,8 @@ disturbing a layout you will come back to.
 | `C` | task | the same claim, onto whoever is spare — no picking |
 | `f` | idle agent | send it to find its own work |
 | | | asks which project, and remembers, if it stands nowhere |
+| `u` | task or agent | take the work back · y/n — either end of the join |
+| `U` | agent | empty its window, keep the work · y/n |
 | `O` | task, project | open a herdr workspace for it, and claim it |
 | `S` | task, project | the same, with an agent started in it and told |
 | `x` | flagged task | lower a hand an agent raised — either row |
@@ -792,6 +794,26 @@ the panel can never send a pane to work somewhere it would disagree it is.
 Note that this is *not* the branch of the tree the row is drawn under: a pane
 mandated to `data` while standing in the `wsp` checkout is drawn where it
 stands and told what it is for.
+
+`u` takes the work back, and it undoes all three things a claim did: the
+binding and the durable claim go — that is `wsp release` — and the context goes
+with them, because an agent whose window still reasons about work it no longer
+holds would read as free and not be. Either end of the join answers: `u` on an
+agent says *you are off this*; `u` on its task says *nobody is on this*. Both
+ask `y`/`n`.
+
+`U` is the half of that which keeps the work. It types whatever empties the
+agent's context and nothing else — no command runs, no event, no commit, so a
+task in hand stays in hand and the row keeps reading as held. This is for work
+that wants a fresh window without wanting to be taken away: a context burned on
+a wrong first reading, an agent told to begin again, a task you would re-claim
+onto the same pane if you took it back first. The spellings are per-kind facts
+beside `--resume`'s, and the verb refuses by name where nothing can be emptied:
+a shell has no window; a kind with no measured clear gets nothing typed rather
+than a guess at somebody's composer (`claude` and `opencode` are the two known
+today); mid-turn the composer is not a composer yet; `blocked` means a dialog
+holds the keyboard, so the clear would go *to the dialog*; and a governor's
+window is refused because it is the thread the position exists to hold.
 
 Most panes resolve to nothing, and that is not the odd case — herdr reports
 where a pane's *shell* started, which for every agent launched from `~/claude`

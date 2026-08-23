@@ -13,11 +13,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::agent_commands::{clear_of, Clear};
 use crate::herdr;
 use crate::input::Key;
 use crate::kanban::Scope;
 use crate::live::AgentRef;
 use crate::model::Priority;
+use crate::place::State;
+use crate::place_herdr::of_word;
 use crate::store::Store;
 
 use super::install::{list_panes, widest, PaneInfo};
@@ -353,23 +356,10 @@ pub(crate) struct Tell {
     /// for the person who pressed the key.
     pub(crate) note: String,
     /// What to type first to empty the context this sentence would otherwise
-    /// land on top of — see [`clear_command`]. `None` where nothing here knows
-    /// how to ask, and the sentence goes in on its own as it always did.
-    pub(crate) clear: Option<&'static str>,
-}
-
-/// What empties this kind of agent's context, for the kinds we know how to ask.
-///
-/// Claude Code and nothing else. `/clear` is Claude Code's spelling, herdr
-/// starts twenty other kinds, and the cost of guessing is a work order with a
-/// line in front of it that the agent reads as the first half of its
-/// instructions. `spawn` starts `claude` unless told otherwise, so the case
-/// this covers is very nearly all of them, and the rest lose nothing they had.
-fn clear_command(kind: &str) -> Option<&'static str> {
-    match kind {
-        "claude" => Some("/clear"),
-        _ => None,
-    }
+    /// land on top of — see [`crate::agent_commands::clear_of`]. `None` where
+    /// nothing here knows how to ask, and the sentence goes in on its own as
+    /// it always did.
+    pub(crate) clear: Option<Clear>,
 }
 
 /// Send an agent looking for its own work.
@@ -381,7 +371,7 @@ pub(super) fn tell_find_work(a: &AgentRef, project: &str) -> Tell {
              names, then do it. If nothing is actionable, say so and stop."
         )),
         note: format!("{} → looking in {project}", a.where_()),
-        clear: clear_command(&a.kind),
+        clear: clear_of(&a.kind),
     }
 }
 
@@ -405,7 +395,7 @@ pub(super) fn tell_released(a: &AgentRef, task: &str) -> Option<Tell> {
         // takes it off the pane, so by the time this is drawn it is already
         // what the agent *was* called.
         note: format!("{} ← {task}", a.where_()),
-        clear: Some(clear_command(&a.kind)?),
+        clear: Some(clear_of(&a.kind)?),
     })
 }
 
@@ -422,7 +412,7 @@ pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
         pane: a.pane.clone(),
         text: Some(crate::cmd_spawn::work_order(task, crate::cmd_spawn::Handover::Running)),
         note: format!("{} → {task}", a.where_()),
-        clear: clear_command(&a.kind),
+        clear: clear_of(&a.kind),
     }
 }
 
@@ -501,8 +491,8 @@ const CLEAR_POLL_MS: u64 = 100;
 /// sentence to an agent that has just booted, and this is what makes the two
 /// hand-overs the same hand-over.
 pub(super) fn send_tell(t: &Tell) -> Result<(), String> {
-    if let Some(cmd) = t.clear {
-        clear_agent(&t.pane, cmd)?;
+    if let Some(clear) = &t.clear {
+        clear_agent(&t.pane, clear)?;
     }
     match &t.text {
         Some(text) => type_line(&t.pane, text),
@@ -525,7 +515,8 @@ fn type_line(pane: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Empty an agent's context, and wait for the session that replaces it.
+/// Empty an agent's context, and wait for the session that replaces it where
+/// the kind says one will be visible.
 ///
 /// The waiting is on the session id, not on the status. A clear is not a turn:
 /// `agent.prompt --wait` spent five seconds on one and answered
@@ -536,13 +527,23 @@ fn type_line(pane: &str, text: &str) -> Result<(), String> {
 /// *and* the session that replaced it has started its hooks, which is the same
 /// moment `wsp brief` is being read into it.
 ///
+/// A kind whose replacement session stays invisible until its next prompt
+/// ([`Clear::waits`] false) skips the poll entirely rather than paying the
+/// ceiling every time: for that shape, waiting cannot distinguish "not yet"
+/// from "never", and the drive behind [`Kind::clear_replaces_session`] is what
+/// says typing on is safe. See the opencode override, which is the case this
+/// branch exists for.
+///
 /// Not an error when the wait runs out. The sentence goes in either way,
 /// because a work order that never arrives is worse than one arriving on a
 /// context that was not emptied, and an agent still busy at that point queues
 /// what is typed at it rather than dropping it.
-fn clear_agent(pane: &str, cmd: &str) -> Result<(), String> {
+fn clear_agent(pane: &str, clear: &Clear) -> Result<(), String> {
     let before = session_of(pane);
-    type_line(pane, cmd)?;
+    type_line(pane, clear.cmd)?;
+    if !clear.waits {
+        return Ok(());
+    }
     let deadline = Instant::now() + Duration::from_millis(CLEAR_MS);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(CLEAR_POLL_MS));
@@ -726,8 +727,82 @@ fn unassign(target: &Target, ui: &mut Ui, view: &mut View) -> Effect {
     )
 }
 
-/// `W`: leave the agents view standing on the work.
+/// `U`: empty an agent's window, leaving its work exactly where it is.
 ///
+/// The other half of `u`. That key takes the claim apart *and* empties the
+/// context, because an agent whose window is still full of a task it no longer
+/// holds is not free. This one empties the context and leaves the claim
+/// standing, because there is work that wants a fresh window without wanting
+/// to be taken away — a context burned on a wrong first reading, an agent told
+/// to begin again, a task that would be re-claimed onto the same pane if it
+/// were taken back first. One key where that was two and a sentence, and
+/// nothing in the store moves: no command runs, no event, no commit, so the
+/// claim survives because nothing touched it and the row keeps reading as
+/// held.
+///
+/// It refuses everywhere nothing can be emptied, each by name. A shell has no
+/// window; a kind with no measured spelling gets nothing typed rather than a
+/// guess ([`clear_of`], which passes `None` through as the honest answer); an
+/// agent mid-turn has a prompt that is not a prompt; and a blocked one is
+/// stopped behind a dialog that holds the keyboard, so the clear would go *to
+/// the dialog* (robustness-083) — the same refusal [`pick_tell`]'s gate makes,
+/// said instead of swallowed.
+///
+/// The y/n is not negotiable here, whatever [`ask`] forgives elsewhere:
+/// nothing undoes an emptied context window.
+fn clear_window(a: &AgentRef, ui: &mut Ui, view: &mut View) -> Effect {
+    if !a.agent {
+        say(ui, "a shell has nothing to empty");
+        return Effect::None;
+    }
+    // Before the state, on purpose: the spelling is permanent and the state is
+    // a moment. Telling a busy codex "it is mid-turn" would have it trying
+    // again when the turn ends, where what is true is that this key never
+    // works there.
+    let Some(clear) = clear_of(&a.kind) else {
+        say(ui, format!("no clear spelling for {} — nothing was sent", a.kind));
+        return Effect::None;
+    };
+    match of_word(&a.state) {
+        State::Working => {
+            say(ui, "it is mid-turn — its prompt is not a prompt");
+            return Effect::None;
+        }
+        State::Blocked => {
+            say(ui, "a dialog holds its keyboard — the clear would go to the dialog");
+            return Effect::None;
+        }
+        State::Starting => {
+            say(ui, "it is still coming up");
+            return Effect::None;
+        }
+        State::Idle => {}
+        _ => {
+            say(ui, "it is not at its prompt");
+            return Effect::None;
+        }
+    }
+    // The one fact a slip costs most on, put in the question rather than left
+    // to be discovered after: this empties nothing but the window, and work
+    // in hand stays in hand.
+    let holding = a.task.as_ref().filter(|t| t.in_hand()).map(|t| t.id.clone());
+    let question = match &holding {
+        Some(task) => format!("empty {}'s window · {task} stays claimed?", a.where_()),
+        None => format!("empty {}'s window?", a.where_()),
+    };
+    ask(
+        view,
+        question,
+        Effect::Tell(Tell {
+            pane: a.pane.clone(),
+            text: None,
+            note: format!("{} · emptying its window", a.where_()),
+            clear: Some(clear),
+        }),
+    )
+}
+
+/// `W`: leave the agents view standing on the work.
 /// Aimed at an agent wherever one is drawn — the list under `w`, the section at
 /// the foot, the row beneath a claimed task — so the gesture is the same one
 /// everywhere: point at somebody, ask what they are on, and be put there.
@@ -1809,6 +1884,20 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // The other direction. `c` joins a task to an agent; this takes the
         // join apart from whichever end you are looking at it from.
         Key::Char('u') => unassign(&target, ui, view),
+        // And the half of `u` that keeps the work: the window goes, the claim
+        // stays. Refused on a seat for what a governor's window *is* rather
+        // than for what it is doing — see [`clear_window`].
+        Key::Char('U') if matches!(target, Target::Seat(_)) => {
+            say(ui, "a governor's window is the thread the position holds");
+            Effect::None
+        }
+        Key::Char('U') => match ui.rows.get(ui.sel).and_then(|r| r.agent()).cloned() {
+            Some(a) => clear_window(&a, ui, view),
+            None => {
+                say(ui, "U empties an agent's window — aim at one");
+                Effect::None
+            }
+        },
         // The dock's own verb. `c` needs you to have decided what the work is;
         // this needs only that there is some.
         //
@@ -2039,6 +2128,223 @@ pub(super) fn task_verb(target: &Target, ui: &mut Ui, verb: &str) -> Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::keys::{apply_key, keymap};
+    use super::super::rows::{collect, target_of, Snapshot};
+    use crate::model::Task;
+
+    /// A pane standing in nothing, drawn where every unattached pane goes.
+    fn pane_of(kind: &str, state: &str, agent: bool) -> AgentRef {
+        AgentRef {
+            pane: "w1:p1".into(),
+            state: state.into(),
+            kind: kind.into(),
+            agent,
+            ..Default::default()
+        }
+    }
+
+    /// Select the row that answers as this pane, wherever it was drawn.
+    fn aim_at(ui: &mut Ui, pane: &str) {
+        let at = ui
+            .rows_for_target(&Target::Pane(pane.into()))
+            .first()
+            .copied()
+            .expect("the pane has a row");
+        ui.select_for_test(at);
+    }
+
+    /// What the key did, read out of the confirm it put up.
+    fn asked(view: &View) -> (&str, &Tell) {
+        match &view.mode {
+            Mode::Confirm { question, deed } => match **deed {
+                Effect::Tell(ref t) => (question, t),
+                _ => panic!("the deed is not a sentence: {deed:?}"),
+            },
+            other => panic!("no question went up: {other:?}"),
+        }
+    }
+
+    fn said(ui: &Ui) -> String {
+        ui.message.clone().expect("the footer says why").0
+    }
+
+    // ---- U ----
+
+    /// The whole verb in one assertion: an idle agent holding work asks first,
+    /// the question says the claim survives, and the deed types nothing but
+    /// the kind's own clear.
+    #[test]
+    fn u_on_an_idle_agent_asks_and_the_claim_survives_the_answer() {
+        let mut snap = Snapshot::default();
+        snap.projects.push(crate::model::Project::new("render"));
+        snap.tasks.push(Task::new("the sidebar follows", "render-001"));
+        snap.bindings.insert("w1:p1".into(), serde_json::json!({"task_id": "render-001"}));
+        snap.panes.push(pane_of("claude", "idle", true));
+        let mut ui = collect(&snap, &View::default());
+        aim_at(&mut ui, "w1:p1");
+        let mut view = View::default();
+
+        assert_eq!(apply_key(Key::Char('U'), &mut ui, &mut view), Effect::None);
+        let (question, tell) = asked(&view);
+        assert!(question.contains("render-001"), "the work is named: {question}");
+        assert!(question.contains("stays claimed"), "and so is the fact it survives: {question}");
+        assert_eq!(tell.text, None, "a clear carries no sentence after it");
+        assert_eq!(
+            tell.clear,
+            Some(Clear { cmd: "/clear", waits: true }),
+            "the spelling is the kind's, and claude announces its new session",
+        );
+    }
+
+    /// A kind nobody has measured gets nothing typed, whatever state it is in:
+    /// the refusal must not read as "try again later" about a key that will
+    /// never work here.
+    #[test]
+    fn a_kind_with_no_clear_spelling_is_refused_before_its_state_is_even_asked() {
+        for state in ["idle", "working"] {
+            let mut snap = Snapshot::default();
+            snap.panes.push(pane_of("codex", state, true));
+            let mut ui = collect(&snap, &View::default());
+            aim_at(&mut ui, "w1:p1");
+            let mut view = View::default();
+
+            assert_eq!(apply_key(Key::Char('U'), &mut ui, &mut view), Effect::None);
+            assert!(
+                said(&ui).contains("codex"),
+                "`{state}` says why the kind cannot be cleared, not why this second failed: {}",
+                said(&ui),
+            );
+            assert_eq!(view.mode, Mode::Browse, "nothing went up");
+        }
+    }
+
+    /// Mid-turn the composer is not a composer, and `/clear` typed there would
+    /// land on top of whatever the turn is doing.
+    #[test]
+    fn a_mid_turn_pane_is_not_cleared() {
+        let mut snap = Snapshot::default();
+        snap.panes.push(pane_of("claude", "working", true));
+        let mut ui = collect(&snap, &View::default());
+        aim_at(&mut ui, "w1:p1");
+        let mut view = View::default();
+
+        assert_eq!(apply_key(Key::Char('U'), &mut ui, &mut view), Effect::None);
+        assert!(said(&ui).contains("mid-turn"), "{}", said(&ui));
+        assert_eq!(view.mode, Mode::Browse);
+    }
+
+    /// robustness-083's shape: herdr's `blocked` means a dialog holds the
+    /// keyboard, so text typed at the pane goes *to the dialog*. A clear sent
+    /// there could select an answer nobody chose.
+    #[test]
+    fn a_blocked_pane_refuses_the_clear_because_a_dialog_holds_its_keyboard() {
+        let mut snap = Snapshot::default();
+        snap.panes.push(pane_of("claude", "blocked", true));
+        let mut ui = collect(&snap, &View::default());
+        aim_at(&mut ui, "w1:p1");
+        let mut view = View::default();
+
+        assert_eq!(apply_key(Key::Char('U'), &mut ui, &mut view), Effect::None);
+        assert!(said(&ui).contains("dialog"), "{}", said(&ui));
+        assert_eq!(view.mode, Mode::Browse);
+    }
+
+    /// And a shell has nothing to empty, however idle it is.
+    #[test]
+    fn a_shell_has_no_window_to_empty() {
+        let mut snap = Snapshot::default();
+        snap.panes.push(pane_of("", "idle", false));
+        let mut ui = collect(&snap, &View::default());
+        aim_at(&mut ui, "w1:p1");
+        let mut view = View::default();
+
+        assert_eq!(apply_key(Key::Char('U'), &mut ui, &mut view), Effect::None);
+        assert!(said(&ui).contains("shell"), "{}", said(&ui));
+        assert_eq!(view.mode, Mode::Browse);
+    }
+
+    /// A seat is refused for what its window *is*: the position exists as a
+    /// thread, and emptying whoever stands in it deletes that thread while the
+    /// row goes on reading as the position.
+    #[test]
+    fn a_governors_window_is_not_emptied_from_here() {
+        let mut snap = Snapshot::default();
+        snap.projects.push(crate::model::Project::new("fork"));
+        snap.governors.insert("fork".into(), serde_json::json!({"workspace": "w9"}));
+        snap.panes.push(AgentRef {
+            workspace: "w9".into(),
+            ..pane_of("claude", "idle", true)
+        });
+        let mut ui = collect(&snap, &View::default());
+        let at = ui
+            .rows
+            .iter()
+            .position(|r| target_of(r) == Target::Seat("fork".into()))
+            .expect("the slot drew");
+        ui.select_for_test(at);
+        let mut view = View::default();
+
+        assert_eq!(apply_key(Key::Char('U'), &mut ui, &mut view), Effect::None);
+        assert!(said(&ui).contains("thread"), "{}", said(&ui));
+        assert_eq!(view.mode, Mode::Browse);
+    }
+
+    /// Off an agent, `U` is a key aimed at nothing, and the map hides it on
+    /// rows where it would be exactly that.
+    #[test]
+    fn the_map_offers_u_only_where_an_agent_row_answers_for_it() {
+        for target in [
+            Target::Task("render-001".into()),
+            Target::Project("render".into()),
+            Target::Inbox,
+            Target::Nothing,
+        ] {
+            let lines = keymap(&target, false)
+                .into_iter()
+                .flat_map(|(_, keys)| keys)
+                .filter(|(k, _)| *k == "U");
+            assert!(
+                lines.count() == 0,
+                "U is advertised on {target:?}, where pressing it aims at nothing",
+            );
+        }
+        // Where an agent row answers, once. A seat answers *as a seat* — the
+        // verb refuses on one, and advertising a key that can only say no
+        // would be the map promising something the row cannot do.
+        let lines = keymap(&Target::Pane("w1:p1".into()), false)
+            .into_iter()
+            .flat_map(|(_, keys)| keys)
+            .filter(|(k, _)| *k == "U")
+            .count();
+        assert_eq!(lines, 1, "U is documented where an agent row answers");
+    }
+
+    /// An agent handed back its work mid-clear keeps reading as held: the verb
+    /// runs no command, so nothing in the store can have moved. Asserted the
+    /// only place it can be — the deed carries no argv at all.
+    #[test]
+    fn the_clear_runs_no_command_and_therefore_releases_nothing() {
+        let mut snap = Snapshot::default();
+        snap.projects.push(crate::model::Project::new("render"));
+        snap.tasks.push(Task::new("the sidebar follows", "render-001"));
+        snap.bindings.insert("w1:p1".into(), serde_json::json!({"task_id": "render-001"}));
+        snap.panes.push(pane_of("opencode", "idle", true));
+        let mut ui = collect(&snap, &View::default());
+        aim_at(&mut ui, "w1:p1");
+        let mut view = View::default();
+
+        apply_key(Key::Char('U'), &mut ui, &mut view);
+        let (_, tell) = asked(&view);
+        assert!(
+            matches!(&tell.text, None),
+            "nothing follows the clear that could act on the claim",
+        );
+        assert_eq!(
+            tell.clear.as_ref().map(|c| c.cmd),
+            Some("/clear"),
+            "opencode's spelling, driven 2026-08-23 — not assumed off claude's",
+        );
+    }
 
     fn pane(id: &str, label: &str) -> PaneInfo {
         PaneInfo {
