@@ -1261,7 +1261,7 @@ two lines that were already there rather than lines of its own:
 
 ```
 - 2026-08-18T12:50:09Z claimed by pane w58:p1 · spawned at opus[1m]/high
-- 2026-08-18T15:41:02Z released after 2h51m · ran opus-5/high · 96 turns
+- 2026-08-18T15:41:02Z released after 2h51m · ran opus-5/high · 96 turns · 242M cache 4.7M in 875k out
 ```
 
 `spawned at` is what somebody typed — absent, and therefore silent, when they
@@ -1271,6 +1271,14 @@ types `/model` halfway through shows up as `haiku-4-5→opus-5`, and a spawn tha
 stated nothing still gets a true label. Neither is filled in by guess, because a
 wrong tier on an attempt is worse than no tier — a router calibrated on it
 learns the opposite of what happened.
+
+The last clause is what the attempt consumed, in tokens rather than money:
+`cache` is what the model re-read, `in` is everything it read for the first
+time, `out` is what it produced. A price follows only where the runtime states
+one itself — wsp invents no rate, because a stored price goes stale the day the
+rate moves, while counts stay true for ever and can be priced at read time.
+Like the tier it is silent when there was nothing to measure, and it rounds to
+three figures because the durable copy is this sentence, not the transcript.
 
 Clauses rather than lines because `wsp brief` hands an arriving agent the last
 four log entries: a line of its own would push the direction written on the task
