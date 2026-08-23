@@ -45,6 +45,9 @@ pub(super) const AGENTS_KEY: &str = "(agents)";
 /// And above them, what an agent has raised a hand about.
 pub(super) const FLAGS_KEY: &str = "(flagged)";
 
+/// And above those, the queue that drove the tree into motion at all.
+pub(super) const WORKLISTS_KEY: &str = "(worklists)";
+
 /// How many raised hands the foot draws before the rest need `→` on the tail.
 ///
 /// Three, where the agents get five, and for the opposite reason: the agents
@@ -67,6 +70,34 @@ pub(super) const MAX_FLAGS_DOCKED: usize = 3;
 /// at what it cost before there were headings, and [`Row::More`] says how many
 /// the headings displaced, exactly as it says how many the cap did.
 pub(super) const MAX_AGENTS_DOCKED: usize = 5;
+
+/// How much slug a compact worklist line spends before its marks begin.
+///
+/// Fixed rather than fitted, and that is the whole trick: the second line —
+/// the agents aligned under the members they stand on — has to know where the
+/// first line's marks began, and a start column derived from anything variable
+/// would have to be spelled twice to agree with itself. Ten covers every slug
+/// in the store today with room to spare; longer ones cut, which is honest,
+/// because the shape of the marks is what this line is for.
+pub(super) const WORKLIST_NAME_W: usize = 10;
+
+/// Where those marks begin: the margin, the section indent, the padded slug
+/// and the space before the first mark. One number, read by both lines — see
+/// [`WORKLIST_NAME_W`] for why it is not arithmetic.
+pub(super) const WL_MARKS_AT: usize = 3 + WORKLIST_NAME_W;
+
+/// Page-width zone geometry, measured off [`super::render::PAGE_MIN`]: the
+/// lead (slug and ordinal), then four zones left to right — tasks, agents,
+/// cost, barrier. Fixed columns rather than a fit-to-width, because a group
+/// line is read down its zones and a zone that moves with its neighbours is
+/// four zones in name only. The tasks zone wraps rather than truncates, so
+/// its budget is the one number here a membership depends on.
+pub(super) const WL_TASKS_AT: usize = 17;
+pub(super) const WL_TASKS_W: usize = 42;
+pub(super) const WL_AGENTS_AT: usize = 60;
+pub(super) const WL_AGENTS_W: usize = 14;
+pub(super) const WL_COST_AT: usize = 75;
+pub(super) const WL_BARRIER_AT: usize = 86;
 
 /// What an agent is waiting for, as far as anything here can tell.
 ///
@@ -377,6 +408,83 @@ pub(super) enum Row {
     /// beyond the id is what the tree cannot say: the sentence, and which pane
     /// said it.
     Flag { card: Card },
+    /// One worklist, at a sidebar's width: the slug, then one mark per member
+    /// with a space between groups — so the shape is the run's signature, and
+    /// `4·1·2·1` names its list to anybody who has watched it once. On the
+    /// right, where the run is up to and how many rows still want somebody.
+    ///
+    /// It never takes the cursor. The section answers *which list wants you*;
+    /// what you do about one is `wsp worklist`'s business until the page that
+    /// draws it as a flow chart exists (`worklist-ui-008`), and a row you can
+    /// reach but no verb can act on is the thing [`Row::Group`] was introduced
+    /// to stop being.
+    ///
+    /// **A sidebar drawing, not a second record.** Everything here came off
+    /// [`crate::worklist::listing`], which is what `wsp worklist ls` reads too;
+    /// nothing on this row is worked out again from the file.
+    Worklist {
+        id: String,
+        segment: crate::worklist::Segment,
+        at: crate::worklist::AtMark,
+        open: usize,
+        /// Member marks in group order: the task's own status glyph, exactly
+        /// what the tree draws in its first column. A member the store has
+        /// lost draws the quiet dot rather than vanishing — a membership
+        /// display must not edit the membership. The agents standing on these
+        /// are not here but on [`Detail::OnMembers`], one line down, which is
+        /// where "never displaces" puts them.
+        marks: Vec<Vec<(Style, &'static str)>>,
+    },
+    /// One group of a worklist, at page width: four zones left to right — the
+    /// tasks, the agents standing on them, what they recorded spending, and
+    /// the state of the barrier after them.
+    ///
+    /// The zones are fixed columns measured off [`super::render::PAGE_MIN`],
+    /// and the tasks zone has a budget rather than a truncation: full ids
+    /// always, wrapped to a continuation line when they do not fit, because
+    /// the prefix is the only part of an id that says which project a member
+    /// is from and `⋯` would be this surface editing the membership.
+    ListGroup {
+        list: String,
+        segment: crate::worklist::Segment,
+        ordinal: usize,
+        of: usize,
+        barrier: Barrier,
+        /// The tasks zone's own line of member ids — whole and prefixed, with
+        /// any that did not fit carried on [`Detail::WrappedIds`] lines.
+        members: String,
+        agents: Vec<(AgentState, String)>,
+        cost: Option<(u64, Option<u64>)>,
+    },
+}
+
+/// The state of the barrier after one group, in words the CLI already chose.
+///
+/// Every arm is a store fact — the verdict on the group, the ordinals the walk
+/// flagged, the members it carried back — read under
+/// [`crate::worklist::Reading::Settled`]. Nothing here says whether a barrier
+/// will *open*; under the settled reading only the store has been asked, and
+/// `settled` is deliberately not `landed`: the commit is git's answer, and no
+/// panel row may claim it without paying for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Barrier {
+    /// Members of this group are still somebody's. The count of them.
+    Holding(usize),
+    /// Nothing outstanding in the store and no verdict written: the run is
+    /// standing in front of the barrier, and the sentence owed to it is still
+    /// owed.
+    Settled,
+    /// A verdict is written; the barrier was passed — and, when the group
+    /// records what its members put on the trunk, how many of them do. Read
+    /// off [`crate::model::Group::landed`], which `go` wrote at the moment it
+    /// passed: a store field, and so free to draw four times a second where
+    /// asking git is not.
+    Passed(Option<(usize, usize)>),
+    /// Something wrong that `show` names: a member behind the position, or a
+    /// barrier crossed with nothing written at it.
+    Flagged,
+    /// Ahead of the run, or ahead of any work at all.
+    Ahead,
 }
 
 /// A raised hand, in full: what the row draws and what the card over the panel
@@ -577,6 +685,23 @@ pub(super) enum Detail {
     ///
     /// [`root_of`]: crate::resolve::Index::root_of
     Root { path: String, depth: usize },
+    /// The agents standing on a worklist's members, aligned under the member
+    /// each one stands on. The second line of a compact worklist row, and a
+    /// line only while somebody is actually there — an empty run draws its
+    /// marks alone, which is the truth about it.
+    ///
+    /// The column the first mark sits at is carried rather than derived again:
+    /// both lines are built from the same constants, and a constant spelled in
+    /// two places is one edit away from an agent pointing between members.
+    OnMembers { at: usize, marks: Vec<(usize, AgentState)> },
+    /// Member ids that did not fit the tasks zone of a page-width group line,
+    /// whole and prefixed. A wrap and not a truncation: see [`Row::ListGroup`].
+    WrappedIds(String),
+    /// The closed lists the section is not drawing — `wsp worklist ls --all`
+    /// holds the roster. Never hidden quietly, for the reason `ls`'s own tail
+    /// line gives: a section with the closed segment taken out reads exactly
+    /// like a world with none.
+    ClosedLists(usize),
 }
 
 impl Row {
@@ -584,9 +709,14 @@ impl Row {
     /// heading you cannot fold or add to, and both are things the groups need.
     /// The two exceptions are the agents view's, where a row that is not an
     /// agent is a row three verbs have nothing to say about — an agent's own
-    /// lines, and the project heading over a run of them.
+    /// lines, and the project heading over a run of them — and the worklists
+    /// section, which is read rather than aimed at until a page exists to act
+    /// on.
     pub(super) fn selectable(&self) -> bool {
-        !matches!(self, Row::Detail(_) | Row::Group { .. })
+        !matches!(
+            self,
+            Row::Detail(_) | Row::Group { .. } | Row::Worklist { .. } | Row::ListGroup { .. }
+        )
     }
     /// The pane this row *is*. A task that has one is not it — the pane sits
     /// on its own row directly beneath, and letting both answer meant two
@@ -626,6 +756,9 @@ pub(crate) enum RowKind {
     /// driver that wants the flag rather than the task it points at has to ask
     /// for the row.
     Flag,
+    /// A worklist row or one of its group lines. Never selected — see
+    /// [`Row::Worklist`] for why the section does not take the cursor yet.
+    Worklist,
     Nothing,
 }
 
@@ -789,6 +922,11 @@ pub(super) fn target_of(row: &Row) -> Target {
         // one: `S`, `a` and `↵` on it would be verbs pressed on a row the
         // cursor cannot reach.
         Row::Group { .. } | Row::Detail(_) => Target::Nothing,
+        // The worklists section, like the agents view's headings: read, not
+        // aimed at. There is no verb to dispatch against a list yet — that
+        // arrives with the page — and an invented target would make every key
+        // ask a question nothing can answer.
+        Row::Worklist { .. } | Row::ListGroup { .. } => Target::Nothing,
     }
 }
 
@@ -804,6 +942,14 @@ impl Ui {
     /// rather than for the one under the cursor.
     #[cfg(test)]
     pub(crate) fn rows_for_test(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The same count at runtime, for a driver that hunts a row by walking —
+    /// the storyboard's section-heading hunt bounds itself by it rather than
+    /// by a number somebody chose, which is the same reason every hunt here
+    /// terminates on the cursor going nowhere.
+    pub(crate) fn row_count(&self) -> usize {
         self.rows.len()
     }
 
@@ -884,6 +1030,7 @@ impl Ui {
             Some(Row::Group { .. }) => RowKind::Group,
             Some(Row::Detail(_)) => RowKind::Detail,
             Some(Row::Flag { .. }) => RowKind::Flag,
+            Some(Row::Worklist { .. } | Row::ListGroup { .. }) => RowKind::Worklist,
             None => RowKind::Nothing,
         }
     }
@@ -1061,6 +1208,12 @@ pub struct Snapshot {
     /// coordinating seat between agents rather than a worker that has stopped —
     /// which the panel would otherwise draw as the loudest row on the screen.
     pub governors: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Every worklist there has ever been, segmented and read —
+    /// [`crate::worklist::listing`]'s answer, which `wsp worklist ls` and this
+    /// panel draw from one computation. Under [`crate::worklist::Reading::Settled`]
+    /// and nothing else: the section redraws with the rest of the tree, and the
+    /// landed reading is one git process per member.
+    pub worklists: Vec<crate::worklist::Listed>,
     /// Every pane that exists, ours included — the furniture is dropped in
     /// [`collect`], where the rule about what counts as ours lives.
     ///
@@ -1095,6 +1248,7 @@ impl Snapshot {
                 .collect(),
             said: store.said(),
             governors: store.governors(),
+            worklists: crate::worklist::listing(store, store.worklists()),
             panes,
         }
     }
@@ -2164,6 +2318,23 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
     // Whichever branch above ran, `dock` says where that slice begins.
     let (rows, dock) = flag_rows(snap, view, rows, dock);
 
+    // The worklists, last of the pinned sections. Flags are news and the
+    // census is who is free; this is the plan that put both in motion — worth
+    // a standing place and the first thing a short pane gives up, which is
+    // what being furniture means here.
+    //
+    // Who stands on which member comes off the census rather than a second
+    // walk over the bindings: the state is already joined with what the store
+    // holds, sorted most-urgent-first, and the same pane twice on one line is
+    // one pane too many to count.
+    let mut on_member: std::collections::BTreeMap<String, (AgentState, String)> = Default::default();
+    for (state, _, a) in &census {
+        if let Some(t) = &a.task {
+            on_member.entry(t.id.clone()).or_insert((*state, a.pane.clone()));
+        }
+    }
+    let (rows, dock) = worklist_rows(snap, view, rows, dock, &on_member);
+
     // The mark on the work itself, wherever the tree happens to draw it. The
     // section says which task and why; this is what makes it findable in place
     // once you have read that and want to see what it sits beside.
@@ -2378,6 +2549,260 @@ fn flag_rows(snap: &Snapshot, view: &View, rows: Vec<Row>, dock: usize) -> (Vec<
     let at = rows.len() - dock;
     rows.splice(at..at, out);
     (rows, dock + n)
+}
+
+/// The worklists, as a section of its own beside the agents — never inside the
+/// tree, where a list would sit under a parent it has not got. There is no
+/// parent: a worklist references tasks across projects and answers to nothing
+/// above it, which is the whole of what one is.
+///
+/// **One section, two drawings, and the ask decides.** `Z` walks the panel
+/// through sidebar, half the screen and all of it, and [`View::asked_width`]
+/// records which was asked for. At a sidebar the question is *which list wants
+/// you*: one line per worklist, the run's signature in member marks, and the
+/// agents standing on them on a line of their own beneath. At a page there is
+/// room to read a group: one line per group, four zones — the tasks with full
+/// ids, who stands on them, what they recorded spending, and the barrier.
+/// Both are sections; neither takes the panel over, and the tree and the
+/// census keep their places at either width.
+///
+/// The branch reads the *ask*, never the columns granted. A split dragged by a
+/// column rewrites the pane under the reader if the rows follow it — the
+/// scroll-jump bug that cost this file its last width predicate — and an ask
+/// is a keypress, which is a decision rather than a resize. It follows that
+/// the loop refetches when `Z` moves the ask: see `super::run`, where the two
+/// arms say so.
+///
+/// What is drawn: every list that wants somebody — running, or finished with
+/// rows still standing. Closed lists are counted on the tail line and named by
+/// `wsp worklist ls --all`, which is the roster; a panel line per finished run
+/// forever would be the board growing back over the wall. Under the review
+/// filter, under a search and in the agents view the section stands down,
+/// exactly as the seats and the shells do: those views are questions about
+/// something else, and the header strip still carries everything.
+fn worklist_rows(
+    snap: &Snapshot,
+    view: &View,
+    mut rows: Vec<Row>,
+    dock: usize,
+    on_member: &std::collections::BTreeMap<String, (AgentState, String)>,
+) -> (Vec<Row>, usize) {
+    if snap.worklists.is_empty() || view.agents || view.review_only || !view.filter.is_empty() {
+        return (rows, dock);
+    }
+    let page = view.asked_width.is_some();
+    // Closed lists are behind the tail line, whatever the width. At page width
+    // a list with no groups has no lines to draw and no place to be counted
+    // from, so it stands down too — `ls` still names it.
+    let wanted: Vec<&crate::worklist::Listed> =
+        snap.worklists.iter().filter(|l| l.segment != crate::worklist::Segment::Closed).collect();
+    let drawn: Vec<&&crate::worklist::Listed> =
+        wanted.iter().filter(|l| !page || l.at.of > 0).collect();
+    if drawn.is_empty() {
+        return (rows, dock);
+    }
+
+    let folded = view.collapsed.contains(WORKLISTS_KEY);
+    let before = rows.len();
+    rows.push(Row::Section {
+        key: WORKLISTS_KEY.to_string(),
+        label: "worklists".into(),
+        count: drawn.len(),
+        collapsed: folded,
+    });
+    if !folded {
+        for l in drawn {
+            if page {
+                push_group_rows(snap, l, on_member, &mut rows);
+            } else {
+                let (marks, standing) = compact_marks(snap, l.list.groups(), on_member);
+                rows.push(Row::Worklist {
+                    id: l.list.id.clone(),
+                    segment: l.segment,
+                    at: crate::worklist::at_mark(l),
+                    open: l.open,
+                    marks,
+                });
+                if !standing.is_empty() {
+                    rows.push(Row::Detail(Detail::OnMembers { at: WL_MARKS_AT, marks: standing }));
+                }
+            }
+        }
+        let closed = snap.worklists.len() - wanted.len();
+        if closed > 0 {
+            rows.push(Row::Detail(Detail::ClosedLists(closed)));
+        }
+    }
+    let added = rows.len() - before;
+    (rows, dock + added)
+}
+
+/// One list at page width: a line per group, and a continuation line wherever
+/// the full ids outran the tasks zone.
+///
+/// The barrier word comes off facts this reading already holds — the verdict
+/// on the group, [`crate::worklist::flagged_groups`]'s ordinals, the members
+/// the position carried back — and off nothing else. In particular it does not
+/// ask git, which is what makes the whole section affordable four times a
+/// second; `settled` says what the *store* says and stops there.
+fn push_group_rows(
+    snap: &Snapshot,
+    l: &crate::worklist::Listed,
+    on_member: &std::collections::BTreeMap<String, (AgentState, String)>,
+    rows: &mut Vec<Row>,
+) {
+    let draft = l.list.status() == crate::model::WorklistStatus::Draft;
+    let flagged = crate::worklist::flagged_groups(&l.at);
+    let holding = l.at.holding().len();
+    let groups = l.list.groups();
+    for (i, g) in groups.iter().enumerate() {
+        let ordinal = i + 1;
+        // The one group the run stands in front of is the only one whose
+        // members were read back on the position, so it is the only one that
+        // can name a holding count. Every other arm below is a fact about the
+        // record itself.
+        let barrier = if !draft && flagged.contains(&ordinal) {
+            Barrier::Flagged
+        } else if l.at.at == Some(ordinal) {
+            match holding {
+                0 => Barrier::Settled,
+                n => Barrier::Holding(n),
+            }
+        } else if !draft
+            && !g.verdict.trim().is_empty()
+            && l.at.at.is_none_or(|at| ordinal < at)
+        {
+            // What `go` recorded at the barrier, in member counts — the same
+            // numbers `wsp worklist show` draws as a line, read off the group
+            // instead of out of git.
+            let placed = g.landed.iter().filter(|e| e.commit.is_some()).count();
+            Barrier::Passed((!g.landed.is_empty()).then_some((placed, g.landed.len())))
+        } else {
+            Barrier::Ahead
+        };
+
+        // What every member of this group has recorded, summed. A member with
+        // no clauses contributes nothing rather than a zero — see
+        // [`crate::cmd_attempts::recorded`] for why a zero here would be a
+        // claim about turns nobody measured.
+        let mut tokens = 0u64;
+        let mut micros = 0u64;
+        let mut any = false;
+        let mut all_priced = true;
+        for m in &g.members {
+            let Some(t) = snap.tasks.iter().find(|t| &t.id == m) else { continue };
+            if let Some((tok, price)) = crate::cmd_attempts::recorded(t) {
+                any = true;
+                tokens += tok;
+                match price {
+                    Some(m) => micros += m,
+                    None => all_priced = false,
+                }
+            }
+        }
+
+        // Who stands on this group's members, in census order — most urgent
+        // first, which is where the eye starts.
+        let agents: Vec<(AgentState, String)> = g
+            .members
+            .iter()
+            .filter_map(|m| on_member.get(m))
+            .map(|(state, pane)| (*state, pane.clone()))
+            .collect();
+
+        for (line, ids) in wrap_ids(&g.members, WL_TASKS_W).into_iter().enumerate() {
+            if line == 0 {
+                rows.push(Row::ListGroup {
+                    list: l.list.id.clone(),
+                    segment: l.segment,
+                    ordinal,
+                    of: groups.len(),
+                    barrier,
+                    members: ids,
+                    agents: agents.clone(),
+                    cost: any.then_some((tokens, all_priced.then_some(micros))),
+                });
+            } else {
+                rows.push(Row::Detail(Detail::WrappedIds(ids)));
+            }
+        }
+    }
+}
+
+/// Member ids wrapped to `w`, whole and prefixed, longest-first-fill greedy.
+///
+/// An id wider than the budget gets a line of its own and keeps its length:
+/// the alternative is cutting the prefix or hiding the member behind `⋯`, and
+/// a membership display must do neither. The prefix is the only part of an id
+/// that says which project a member came from.
+fn wrap_ids(ids: &[String], w: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for id in ids {
+        if cur.is_empty() {
+            cur.push_str(id);
+        } else if cur.chars().count() + 1 + id.chars().count() <= w {
+            cur.push(' ');
+            cur.push_str(id);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(id);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Member marks for the sidebar drawing, grouped as the plan groups them, plus
+/// the agents standing on members with their column offsets inside the mark
+/// region.
+///
+/// The offsets are the same walk as the marks themselves, taken while the same
+/// grouping is in hand — deriving them again from the rendered line is how the
+/// second line ends up pointing between members the first time anything about
+/// the layout changes.
+/// One list's member marks at a sidebar: per group, per member, the task's own
+/// status mark.
+type MemberMarks = Vec<Vec<(Style, &'static str)>>;
+
+/// And the agents standing on them: the column inside the mark region, and
+/// what that agent is waiting for.
+type StandingLine = Vec<(usize, AgentState)>;
+
+fn compact_marks(
+    snap: &Snapshot,
+    groups: Vec<crate::model::Group>,
+    on_member: &std::collections::BTreeMap<String, (AgentState, String)>,
+) -> (MemberMarks, StandingLine) {
+    let mut marks: Vec<Vec<(Style, &'static str)>> = Vec::new();
+    let mut standing: Vec<(usize, AgentState)> = Vec::new();
+    let mut offset = 0usize;
+    for g in groups {
+        if !marks.is_empty() {
+            // The space between groups is part of the shape: `4·1·2·1` is
+            // phase four and nothing else.
+            offset += 1;
+        }
+        marks.push(Vec::new());
+        let run = marks.last_mut().expect("the group was just pushed");
+        for m in &g.members {
+            // The task's own status glyph, or the quiet dot for a member the
+            // store has lost — named by `dangling`, never dropped here. A
+            // membership display must not edit the membership.
+            let (st, gl) = match snap.tasks.iter().find(|t| &t.id == m) {
+                Some(t) => status_mark(t.status()),
+                None => (Style::Dim, glyph::QUIET),
+            };
+            run.push((st, gl));
+            if let Some((state, _)) = on_member.get(m) {
+                standing.push((offset, *state));
+            }
+            offset += 1;
+        }
+    }
+    (marks, standing)
 }
 
 /// Every tag in use, commonest first and alphabetical inside that.
@@ -2769,6 +3194,187 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
                 l.spans.extend(right.spans);
             }
         }
+        // The slug first and padded to its full allowance, so the marks begin
+        // on every line at the same column and the agent line beneath can be
+        // read straight down onto its member. The run's signature is the point
+        // of the drawing: one mark per member, one space between groups.
+        //
+        // On the right, where the run is up to and what still wants somebody —
+        // the same two numbers `ls` draws, off the same reading. Clipped marks
+        // say so with the strip's own ellipsis; the count beside them never
+        // moves, which is what keeps a clipped signature honest about being
+        // clipped rather than short.
+        Row::Worklist { id, segment, at, open, marks, .. } => {
+            l.push(Style::Plain, " ");
+            l.pad(1);
+            let ink = match segment {
+                crate::worklist::Segment::Running => Style::Accent,
+                crate::worklist::Segment::Unjudged => Style::Warn,
+                crate::worklist::Segment::Closed => Style::Dim,
+            };
+            let mut slug = util::truncate(id, WORKLIST_NAME_W);
+            for _ in slug.chars().count()..WORKLIST_NAME_W {
+                slug.push(' ');
+            }
+            l.push(ink, slug);
+            l.push(Style::Plain, " ");
+            debug_assert_eq!(l.width(), WL_MARKS_AT);
+
+            let mut right = Line::default();
+            right.push(
+                match at {
+                    crate::worklist::AtMark::Group(_) => Style::Accent,
+                    crate::worklist::AtMark::Flagged => Style::Warn,
+                    crate::worklist::AtMark::Passed | crate::worklist::AtMark::Empty => Style::Dim,
+                },
+                at.text(),
+            );
+            right.push(Style::Plain, " ");
+            right.push(
+                match *open > 0 {
+                    true => Style::Warn,
+                    false => Style::Dim,
+                },
+                match *open {
+                    0 => glyph::QUIET.to_string(),
+                    n => n.to_string(),
+                },
+            );
+            let avail = w.saturating_sub(WL_MARKS_AT + right.width() + 1);
+            let mut used = 0usize;
+            let mut clipped = false;
+            for (gi, group) in marks.iter().enumerate() {
+                let need = group.len() + usize::from(gi > 0);
+                if used + need > avail && used > 0 {
+                    clipped = true;
+                    break;
+                }
+                if gi > 0 {
+                    l.push(Style::Plain, " ");
+                    used += 1;
+                }
+                for (st, gl) in group {
+                    l.push(*st, *gl);
+                    used += 1;
+                }
+            }
+            if clipped && l.width() + 2 <= w.saturating_sub(right.width()) {
+                l.push(Style::Dim, format!(" {}", glyph::MORE));
+            }
+            l.pad(w.saturating_sub(l.width() + right.width()).max(1));
+            l.spans.extend(right.spans);
+        }
+        // The agents standing on members, aligned under the work they are on:
+        // an agent on a task never displaces it, and here that means its own
+        // line rather than a column of somebody else's. The offsets are the
+        // members' columns inside the mark region, made absolute by the same
+        // `at` that padded this line — the two numbers come from one constant,
+        // and mixing their frames is how an agent ends up pointing between
+        // members.
+        Row::Detail(Detail::OnMembers { at, marks }) => {
+            l.pad(*at);
+            let mut cur = *at;
+            for (off, state) in marks {
+                let want = *at + *off;
+                if want < cur {
+                    continue;
+                }
+                l.pad(want - cur);
+                cur = want;
+                let (st, g) = (*state).mark();
+                l.push(st, g);
+                cur += g.chars().count();
+            }
+        }
+        // Four zones, left to right: identity, tasks, agents, cost, barrier.
+        // Each zone starts where it starts whatever its neighbours drew, so a
+        // group reads down its zones instead of along its accidents.
+        Row::ListGroup { list, segment, ordinal, of, barrier, members, agents, cost } => {
+            l.push(Style::Plain, " ");
+            l.pad(1);
+            let ink = match segment {
+                crate::worklist::Segment::Running => Style::Accent,
+                crate::worklist::Segment::Unjudged => Style::Warn,
+                crate::worklist::Segment::Closed => Style::Dim,
+            };
+            let mut slug = util::truncate(list, WL_TASKS_AT - 8);
+            for _ in slug.chars().count()..(WL_TASKS_AT - 8) {
+                slug.push(' ');
+            }
+            l.push(ink, slug);
+            l.push(Style::Plain, " ");
+            l.push(Style::Dim, format!("{ordinal:>2}/{of:<2}"));
+            l.pad(WL_TASKS_AT.saturating_sub(l.width()));
+            l.push(Style::Muted, members.clone());
+            // The mark and the pane: which agent, and which terminal to find
+            // it in. Cut at the zone's edge without ceremony — the sidebar
+            // line carries the same census, and the count beside it never
+            // moves.
+            l.pad(WL_AGENTS_AT.saturating_sub(l.width()));
+            let mut used = 0usize;
+            for (i, (state, pane)) in agents.iter().enumerate() {
+                let cell = format!("{}{}", state.mark().1, util::truncate(pane, 6));
+                let need = cell.chars().count() + usize::from(i > 0);
+                if used + need > WL_AGENTS_W && used > 0 {
+                    break;
+                }
+                if i > 0 {
+                    l.push(Style::Plain, " ");
+                }
+                let (st, g) = state.mark();
+                l.push(st, g);
+                l.push(Style::Muted, util::truncate(pane, 6));
+                used += need;
+            }
+            l.pad(WL_COST_AT.saturating_sub(l.width()));
+            match cost {
+                Some((tokens, price)) => {
+                    l.push(Style::Dim, util::count_human(*tokens));
+                    if let Some(m) = price {
+                        l.push(Style::Plain, " ");
+                        // Stated by the runtime or not drawn: see
+                        // [`crate::cmd_attempts::recorded`] for why no price
+                        // here may be computed from tokens.
+                        l.push(Style::Accent, util::money_human(*m));
+                    }
+                }
+                None => l.push(Style::Dim, glyph::QUIET),
+            }
+            l.pad(WL_BARRIER_AT.saturating_sub(l.width()));
+            match barrier {
+                Barrier::Holding(n) => l.push(Style::Warn, format!("holding {n}")),
+                Barrier::Settled => l.push(Style::Warn, "settled"),
+                Barrier::Flagged => l.push(Style::Warn, "!"),
+                Barrier::Passed(None) => l.push(Style::Dim, glyph::DONE),
+                // The tick, and what landed behind it: `✓ 3/4` is three of
+                // the four members on the record `go` wrote. A member that
+                // landed without the reflog placing it draws in the total and
+                // not the count — said rather than smoothed over.
+                Barrier::Passed(Some((placed, of))) => {
+                    l.push(Style::Dim, glyph::DONE);
+                    l.push(
+                        if placed == of { Style::Dim } else { Style::Muted },
+                        format!(" {placed}/{of}"),
+                    );
+                }
+                Barrier::Ahead => {}
+            }
+        }
+        // Where the tasks zone wrapped. Indented into the zone it belongs to,
+        // dim like any other line that belongs to the row above it.
+        Row::Detail(Detail::WrappedIds(ids)) => {
+            l.pad(WL_TASKS_AT);
+            l.push(Style::Muted, ids.clone());
+        }
+        // The closed lists, named rather than vanished — `ls --all` holds the
+        // roster, and this line is the difference between that and a section
+        // that pretends there was never anything finished.
+        Row::Detail(Detail::ClosedLists(n)) => {
+            l.pad(1);
+            l.push(Style::Dim, glyph::MORE);
+            l.push(Style::Plain, " ");
+            l.push(Style::Muted, format!("{n} closed"));
+        }
     }
     l
 }
@@ -2829,6 +3435,30 @@ pub(super) fn full_text(row: &Row) -> String {
         // In full, which is the point of asking: the row is where the path is
         // cut to a sidebar's width.
         Row::Detail(Detail::Root { path, .. }) => path.clone(),
+        // None of the worklists section takes the cursor, so none of these is
+        // ever asked for — answered in their own words for the same reason a
+        // detail line is, in case that changes.
+        Row::Worklist { id, open, at, .. } => {
+            format!("{id} · {} · {} standing", at.text(), open)
+        }
+        Row::ListGroup { list, ordinal, of, members, barrier, .. } => format!(
+            "{list} {ordinal}/{of} · {} · {}",
+            match barrier {
+                Barrier::Holding(n) => format!("holding {n}"),
+                Barrier::Settled => "settled".into(),
+                Barrier::Flagged => "!".into(),
+                Barrier::Passed(_) => "✓".into(),
+                Barrier::Ahead => "ahead of the run".into(),
+            },
+            members
+        ),
+        Row::Detail(Detail::OnMembers { marks, .. }) => marks
+            .iter()
+            .map(|(_, s)| word(*s))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Row::Detail(Detail::WrappedIds(ids)) => ids.clone(),
+        Row::Detail(Detail::ClosedLists(n)) => format!("{n} closed"),
     }
 }
 
@@ -3058,6 +3688,7 @@ mod tests {
             flags: Vec::new(),
             said: Default::default(),
             governors: Default::default(),
+            worklists: Vec::new(),
             panes: vec![],
         }
     }

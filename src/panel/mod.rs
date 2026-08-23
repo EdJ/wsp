@@ -83,6 +83,18 @@ pub(crate) use keys::{click, wheel, Hit};
 pub(crate) use render::{
     frame, glyph, legend, line, place, to_ansi, to_html, to_html_spans, Line, Style,
 };
+// The measure a page-width panel asks its host for, and the width the
+// worklists section's second drawing is laid out against. Out here because
+// the storyboard builds wide frames against it rather than against a number
+// spelled twice.
+pub(crate) use render::PAGE_MIN;
+// A row's own words, unabridged, at runtime: the storyboard hunts section
+// headings by the label they draw, which is the same text the focus dock
+// reads this function for. The `*_for_test` spelling beside it predates a
+// caller outside tests.
+pub(crate) fn row_text(ui: &Ui, i: usize) -> String {
+    rows::full_text(&ui.rows[i])
+}
 // The style tables, out to the renderer. `crate::draw` paints a cell to a
 // terminal through exactly these, so there is one answer to what `Accent` looks
 // like rather than one per surface.

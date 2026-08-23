@@ -1013,32 +1013,12 @@ fn heading(s: Segment) -> &'static str {
 
 /// Where the run is up to, in one column.
 ///
-/// Four answers and the fourth is the one this column did not have. A finished
-/// list reading `5` beside `5` groups would say it is on the last one, which
-/// is the one thing it is not — so a run with no position left to have draws a
-/// mark. **But `✓` on a run that walked past a barrier nobody wrote at is a
-/// tick this surface has not got**: `phase-two` drew one, and the design read
-/// it off `wsp worklist ls` as one of the five and said so.
-///
-/// `!` is `group_mark`'s existing glyph for a group with something wrong with
-/// it, and it stands for both of the things that keep a finished run out of
-/// `Closed` while its `OPEN` count reads `·` — a barrier nobody wrote at, and
-/// a member that has gone. Which one, and which group or member, is
-/// `wsp worklist show <slug>` and the `--json` row; a table with a column for
-/// each would be two columns empty in every ordinary run.
-///
-/// **A run still in motion keeps its group number**, so a dangling member on
-/// one is not marked here. That is the honest trade rather than an oversight:
-/// where the run is up to is what a running row is read for, and `next` and
-/// `go` both name a dangling member at the barrier — loudly, and into the
-/// list's own log — which is while there is still time to put something back.
+/// The four answers and their argument live on [`worklist::at_mark`], which is
+/// where they moved when the panel's section became the second caller: two
+/// surfaces drawing the same mark from two spellings of the question is how
+/// `ls` and a panel come to disagree about one run.
 fn at_mark(l: &worklist::Listed) -> String {
-    match (l.at.at, l.at.of) {
-        (Some(n), _) => n.to_string(),
-        (None, 0) => "·".to_string(),
-        (None, _) if !l.at.unwritten.is_empty() || !l.gone.is_empty() => "!".to_string(),
-        (None, _) => "✓".to_string(),
-    }
+    worklist::at_mark(l).text()
 }
 
 /// A count, or the mark for none.
@@ -1166,19 +1146,10 @@ fn group_mark(p: &Paint, at: Option<usize>, ordinal: usize, slipped_in: &BTreeSe
     }
 }
 
-/// Which groups the plan marks `!`: where a member slipped behind, and where
-/// a barrier was crossed with nothing written at it.
-///
-/// Both halves come off one `Position` read — the ordinals are carried on
-/// `passed` and on `unwritten`, filled by the same walk — so the mark needs no
-/// second reading of anything. The blocks beside the plan still name their
-/// specifics off `slipped` and `unwritten`, so a group that is marked for one
-/// reason and not the other is named rather than guessed at.
+/// Which groups the plan marks `!`, off the shared reading — see
+/// [`crate::worklist::flagged_groups`].
 fn flagged_in(pos: &Position) -> BTreeSet<usize> {
-    let mut out: BTreeSet<usize> =
-        pos.passed.iter().filter(|b| !b.member.finished()).map(|b| b.group).collect();
-    out.extend(pos.unwritten.iter().copied());
-    out
+    worklist::flagged_groups(pos)
 }
 
 // ---- show -------------------------------------------------------------

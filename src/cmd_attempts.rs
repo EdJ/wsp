@@ -235,6 +235,42 @@ impl Row {
     }
 }
 
+/// What a task's attempts recorded, in total: tokens read and produced, and
+/// the price **only where every recording attempt's runtime stated one**.
+///
+/// `None` when nothing was recorded — no attempt ever wrote a spend clause —
+/// which is the ordinary case for a member nobody has spawned yet. The price is
+/// the part that cannot be filled in: `core-045` says a turn that died
+/// upstream records as one that ran without a clause at all, so a sum over the
+/// clauses is a floor on what was spent and never the bill. A stated zero
+/// survives — [`crate::agent_commands::Spend::micros`] holds `Some(0)` for a
+/// free model, and that is a fact the runtime stated rather than one computed
+/// here — but a mix of priced and unpriced attempts answers `None` rather than
+/// a number that quietly means *the priced ones only*.
+///
+/// This is the reading the worklists section draws at page width, which is why
+/// it lives here beside the parser and not at the call site: a format with its
+/// summariser in another file drifts.
+pub fn recorded(t: &Task) -> Option<(u64, Option<u64>)> {
+    let mut tokens = 0u64;
+    let mut micros = 0u64;
+    let mut any = false;
+    let mut all_priced = true;
+    for a in attempts_of(t) {
+        let s = a.spend;
+        if s.nothing() {
+            continue;
+        }
+        any = true;
+        tokens += s.cache + s.input + s.output;
+        match s.micros {
+            Some(m) => micros += m,
+            None => all_priced = false,
+        }
+    }
+    any.then_some((tokens, all_priced.then_some(micros)))
+}
+
 /// Every attempt in one task's log, oldest first.
 ///
 /// Reads the two clauses this task added and the five lines the store was
@@ -777,6 +813,39 @@ mod tests {
             "- 2026-08-18T10:00:01Z → done",
         ]);
         assert_eq!(attempts_of(&t)[0].outcome, Outcome::Done);
+    }
+
+    /// The reading the worklists section draws its cost zone from. The three
+    /// arms between them are the whole honesty of that zone: a stated zero is
+    /// a fact and survives; a mix of priced and unpriced attempts refuses to
+    /// be priced, because a sum of the priced ones only is a number that
+    /// quietly means something else; and no clauses at all is nothing.
+    #[test]
+    fn recorded_totals_are_what_the_runtimes_stated_and_nothing_computed() {
+        // Stated zero survives — the free runtime said $0 and that is news.
+        let free = task(&[
+            "- 2026-08-22T09:00:00Z claimed by pane w1:p1",
+            "- 2026-08-22T09:30:00Z released after 30m · ran opus-5/high · 16 turns · 295k cache 76k in 9.8k out $0",
+        ]);
+        assert_eq!(recorded(&free), Some((295_000 + 76_000 + 9_800, Some(0))));
+
+        // Unpriced beside priced: tokens still total, the price does not.
+        let mixed = task(&[
+            "- 2026-08-22T09:00:00Z claimed by pane w1:p1",
+            "- 2026-08-22T09:10:00Z released after 10m · ran opus-5/high · 4 turns · 5M cache 100k in 2k out $0.50",
+            "- 2026-08-22T09:20:00Z claimed by pane w1:p2",
+            "- 2026-08-22T09:40:00Z released after 20m · ran opus-5/high · 8 turns · 242M cache 4.7M in 875k out",
+        ]);
+        assert_eq!(
+            recorded(&mixed),
+            Some((5_000_000 + 100_000 + 2_000 + 242_000_000 + 4_700_000 + 875_000, None)),
+            "a turn nobody measured must not read as one that was free"
+        );
+
+        // Nothing recorded at all — the ordinary state of a member not yet
+        // spawned, and of every turn that died upstream (`core-045`).
+        let silent = task(&["- 2026-08-22T09:00:00Z claimed by pane w1:p1"]);
+        assert_eq!(recorded(&silent), None);
     }
 
     /// Rework is invisible from inside the attempt that was reworked: its own

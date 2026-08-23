@@ -1456,12 +1456,16 @@ pub(super) fn event_loop(
                 Effect::Full => {
                     let want = cycle(view.asked_width, screen.widest());
                     if expand(screen, &mut view, want) {
-                        // Nothing is refetched and nothing is redrawn here,
-                        // and nothing needs to be: the rows do not depend on
-                        // the width. The host answers by resizing us and the
-                        // next frame is drawn into whatever columns came back —
-                        // the same rows, with more room. That is the whole of
-                        // what this key does.
+                        // The host answers by resizing us and the next frame is
+                        // drawn into whatever columns came back — the same
+                        // tree, with more room. Nothing else needed a refetch,
+                        // and this comment used to end there: **the worklists
+                        // section does read the ask**, because its two
+                        // drawings are two questions (which list wants you,
+                        // against what each group did) rather than one drawing
+                        // given more columns. So `Z` refetches, once, on an
+                        // explicit keypress — the cost the sidebar form exists
+                        // to keep off every redraw.
                         //
                         // Said, rather than left to be read off the frame: two
                         // of the three states can be granted the same columns on
@@ -1475,6 +1479,7 @@ pub(super) fn event_loop(
                                 None => "the sidebar",
                             },
                         );
+                        refetch = true;
                     } else {
                         let m = open_full(self_ws);
                         say(&mut ui, m);
@@ -1486,6 +1491,9 @@ pub(super) fn event_loop(
                 Effect::Sidebar => {
                     if expand(screen, &mut view, None) {
                         say(&mut ui, "the sidebar");
+                        // Back through the same branch the way out came in:
+                        // the ask moved, so the section follows it.
+                        refetch = true;
                     }
                 }
                 // Off the loop, deliberately. `wsp spawn --agent` creates a
@@ -1649,8 +1657,9 @@ pub(super) fn event_loop(
                 // by itself, because it is built for whatever the screen says
                 // it measures. There used to be a refetch on this line, because
                 // a page and a sidebar did not have the same rows in them; that
-                // was the `ZZ` scroll jump, and `super::rows` no longer reads
-                // the width when it decides which rows exist.
+                // was the `ZZ` scroll jump, and `super::rows` reads no *width*
+                // when it decides which rows exist — only `Z`'s own ask, which
+                // refetches for itself on the keypress that moves it.
                 //
                 // A hand raised outranks the cadence.
                 //

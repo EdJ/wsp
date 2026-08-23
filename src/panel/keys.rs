@@ -37,11 +37,11 @@ impl View {
         self.full = full;
     }
 
-    /// Stand the panel at a width it has already commanded, so a scene can
-    /// press a key from somewhere other than the sidebar. Test-only: the live
-    /// path gets here through [`super::verbs::expand`], which also has a host to
-    /// tell.
-    #[cfg(test)]
+    /// Stand the panel at a width it has already commanded, so a scene or a
+    /// test can press a key from somewhere other than the sidebar. The live
+    /// path gets here through [`super::verbs::expand`], which also has a host
+    /// to tell; everything else — the storyboard's wide frames, the tests that
+    /// drive them — arrives at the same view state through this.
     pub(crate) fn asked_for_width(&mut self, cols: Option<usize>) {
         self.asked_width = cols;
     }

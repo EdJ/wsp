@@ -310,6 +310,10 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         // [`crate::cmd_govern`] — and a world that had one would be showing
         // the exception in every frame.
         governors: BTreeMap::new(),
+        // No worklists. Every frame above is the panel on an ordinary
+        // afternoon; [`planned_world`] is the one that shows the section, so
+        // nothing here pays for it or has it moving under it.
+        worklists: Vec::new(),
         panes: agents,
     }
 }
@@ -351,6 +355,254 @@ fn quiet_world() -> Snapshot {
     let mut s = world();
     s.panes.clear();
     s.bindings.clear();
+    s
+}
+
+/// A member task, with a log that says what its attempts recorded.
+///
+/// The clause is [`crate::agent_commands::Spend::clause`]'s own format, written
+/// the way a release line writes it — the fixture must not be able to draw a
+/// cost the reader could not also find by reading `wsp show`.
+fn member(id: &str, project: &str, status: &str, spend: &str) -> Task {
+    let mut t = task(id, &format!("Queue work item {id}"), Some(project), status);
+    if !spend.is_empty() {
+        // Two lines, the way the record actually writes them: the release
+        // clause attaches to the attempt above it, and an attempt begins at a
+        // claim. A log with only the release line is prose, not a measurement
+        // — which is exactly what `attempts_of` should do with it.
+        t.body = format!(
+            "## Log\n- 2026-08-19T09:00:00Z claimed by pane w9:p1\n\
+             - 2026-08-20T10:00:00Z released · ran opus-5/high · 96 turns · {spend}\n"
+        );
+    }
+    t
+}
+
+/// One member as the position carries it back — settled exactly as the store
+/// word beside it says, so the fixture cannot disagree with itself about who
+/// is finished.
+fn standing(id: &str, status: &str) -> crate::worklist::Standing {
+    let settlement = match status {
+        "review" => crate::worklist::Settlement::Review,
+        "done" => crate::worklist::Settlement::Closed,
+        other => crate::worklist::Settlement::Open(
+            crate::model::Status::parse(other).expect("a status the fixture spelled right"),
+        ),
+    };
+    crate::worklist::Standing { id: id.to_string(), settlement, landing: None }
+}
+
+/// A hand-built reading of one list: what [`crate::worklist::listing`] would
+/// have answered for the record this describes.
+///
+/// The position is *derived here the way the walk derives it* — the floor is
+/// the last verdict, the run stops one past it, and whatever it walked past in
+/// silence or left unfinished is named — rather than taken on trust, so the
+/// fixture cannot disagree with itself about which barriers were crossed. The
+/// storyboard has no store to ask; building the answer once, honestly, is the
+/// whole price of drawing offline.
+/// One fixture group: its members with the store word each holds, the verdict
+/// written at its barrier if any, and what `go` recorded landing behind it —
+/// how many of its members the reflog placed, of how many ran.
+type FixtureGroup<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>, Option<(usize, usize)>);
+
+fn listed(
+    id: &str,
+    title: &str,
+    status: &str,
+    groups: &[FixtureGroup<'_>],
+) -> crate::worklist::Listed {
+    use crate::model::WorklistStatus;
+    use crate::worklist::{self, Reading, Settlement};
+
+    let mut w = crate::model::Worklist::new(id, title);
+    w.set_status(WorklistStatus::parse(status).unwrap_or(WorklistStatus::Draft));
+    let mut body = String::from("## Groups\n");
+    let mut standings: Vec<Vec<crate::worklist::Standing>> = Vec::new();
+    for (i, (members, verdict, landed)) in groups.iter().enumerate() {
+        body.push_str(&format!(
+            "- {}\n",
+            members.iter().map(|(id, _)| *id).collect::<Vec<_>>().join(" ")
+        ));
+        body.push_str("  stop: every member settled, and nothing fighting\n");
+        if let Some(said) = verdict {
+            body.push_str(&format!("  verdict: 2026-08-2{i}T12:00:00Z {said}\n"));
+        }
+        // The record `go` writes at the moment it passes the barrier, one
+        // entry per member in the file's own token grammar (`<member>@<hash>`,
+        // `@?` where the reflog could not place it) — written here rather than
+        // left empty so the section draws exactly what a real record carries.
+        if let Some((placed, _)) = landed {
+            let entries = members
+                .iter()
+                .enumerate()
+                .map(|(j, (id, _))| {
+                    let commit = if j < *placed { format!("9{i}2{j}4f11") } else { "?".into() };
+                    format!("{id}@{commit} {id}.rs")
+                })
+                .collect::<Vec<_>>();
+            body.push_str(&format!("  landed: {}\n", entries.join(" · ")));
+        }
+        standings.push(members.iter().map(|(id, st)| standing(id, st)).collect());
+    }
+    w.body = body;
+
+    // The walk, in miniature: the floor is the last verdict written, the run
+    // stands one past it, and everything behind is carried back — finished or,
+    // when it is not, named as slipped.
+    let len = groups.len();
+    let floor = groups
+        .iter()
+        .rposition(|(_, v, _)| v.is_some())
+        .map_or(0, |i| i + 1);
+    let at = (floor < len).then(|| floor + 1);
+    let mut passed: Vec<crate::worklist::Behind> = Vec::new();
+    let mut slipped: Vec<crate::worklist::Standing> = Vec::new();
+    let mut unwritten: Vec<usize> = Vec::new();
+    let mut members: Vec<crate::worklist::Standing> = Vec::new();
+    let mut open = 0usize;
+    for all in standings.iter().flatten() {
+        if !matches!(all.settlement, Settlement::Closed) {
+            open += 1;
+        }
+    }
+    for (i, g) in standings.iter().enumerate() {
+        if Some(i + 1) == at {
+            members = g.clone();
+            continue;
+        }
+        if i + 1 >= at.unwrap_or(len + 1) {
+            continue;
+        }
+        for s in g {
+            if !s.finished() {
+                slipped.push(s.clone());
+            }
+            passed.push(crate::worklist::Behind { group: i + 1, member: s.clone() });
+        }
+        if groups[i].1.is_none() {
+            unwritten.push(i + 1);
+        }
+    }
+
+    let segment = match w.status() {
+        WorklistStatus::Done if open == 0 && unwritten.is_empty() && slipped.is_empty() => {
+            worklist::Segment::Closed
+        }
+        WorklistStatus::Draft | WorklistStatus::Running | WorklistStatus::Held => {
+            worklist::Segment::Running
+        }
+        _ => worklist::Segment::Unjudged,
+    };
+    crate::worklist::Listed {
+        list: w,
+        segment,
+        at: crate::worklist::Position {
+            at,
+            of: len,
+            members,
+            passed,
+            slipped,
+            unwritten,
+            reading: Reading::Settled,
+        },
+        open,
+        gone: Vec::new(),
+        // Fixed, like every other clock in these fixtures: an age drawn off
+        // the wall clock would be a frame that changes under the reader.
+        activity: util_epoch(),
+    }
+}
+
+/// 2026-08-21T09:00:00Z, as epoch seconds — when the last of these queues was
+/// touched, for as long as this fixture exists.
+fn util_epoch() -> i64 {
+    crate::util::epoch_of("2026-08-21T09:00:00Z")
+}
+
+/// The world with worklists in it: one mid-run with an agent working a member
+/// and a spare standing on a finished one, and one finished run nobody has
+/// fully judged — the pair between them being every reason the section exists.
+///
+/// The members are tasks of their own rather than borrowed ones, so the marks,
+/// the costs and the tree all read off records the reader can name. Costs come
+/// from log clauses in the release format, and they deliberately cover all
+/// four cases at once: priced, stated-zero, unpriced, and never recorded.
+fn planned_world() -> Snapshot {
+    let mut s = world();
+
+    s.tasks.extend([
+        // Group 1 of phase-two: landed and judged. Priced, stated-zero, and
+        // recorded-but-unpriced — so the group's cost zone draws tokens and
+        // no dollar sign, which is the honest answer for a mixed group.
+        member("p-901", "trance", "review", "673M cache 21M in 3.5M out $1.20"),
+        member("p-902", "verb", "done", "12M cache 900k in 40k out $0"),
+        member("p-903", "tooling", "done", "5M cache 300k in 9k out"),
+        // Group 2, where the run stands: one member still doing, priced.
+        member("p-904", "trance", "doing", "88M cache 4M in 600k out $2.40"),
+        // Group 3, ahead of the run: not started, so nothing recorded at all.
+        member("p-905", "verb", "todo", ""),
+        member("p-906", "wsp", "todo", ""),
+        // phase-one, finished and mostly judged — except one barrier nobody
+        // wrote anything at, and one row still sitting at review under a
+        // verdict that was written anyway.
+        member("p-907", "trance", "done", "201M cache 11M in 1.1M out $0.84"),
+        member("p-908", "meta", "done", "44M cache 2M in 200k out $0.31"),
+        member("p-909", "tooling", "review", "67M cache 3M in 350k out $0.52"),
+    ]);
+
+    // The agent working the current group's member moves off t-001 onto
+    // p-904; the spare stands on a settled one, which is what spares do at a
+    // barrier between groups.
+    s.bindings.insert("w1:p1".to_string(), json!({ "task_id": "p-904" }));
+    s.bindings.insert("w4:p2".to_string(), json!({ "task_id": "p-901" }));
+
+    let running = listed(
+        "phase-two",
+        "the second phase, in flight",
+        "running",
+        &[
+            (
+                &[("p-901", "review"), ("p-902", "done"), ("p-903", "done")],
+                Some("three landed clean and nothing fought"),
+                // All three placed by the reflog: the tick draws `✓ 3/3`.
+                Some((3, 3)),
+            ),
+            (&[("p-904", "doing")], None, None),
+            (&[("p-905", "todo"), ("p-906", "todo")], None, None),
+        ],
+    );
+    let unjudged = listed(
+        "phase-one",
+        "the first phase, over and half-judged",
+        "done",
+        &[
+            (&[("p-907", "done")], Some("landed overnight, quiet"), Some((1, 1))),
+            // Long on purpose, and not unusually so: three members of a
+            // project whose ids carry its whole ancestry outrun the tasks
+            // zone at page width, which is exactly the case the wrap exists
+            // for. The panel has no tree rows for them — a finished list's
+            // membership outlives the tree's interest in it — so their marks
+            // at a sidebar draw the quiet dot rather than vanishing.
+            (
+                &[
+                    ("render-strata-001", "done"),
+                    ("render-strata-002", "done"),
+                    ("render-strata-003", "done"),
+                ],
+                None,
+                None,
+            ),
+            (
+                &[("p-909", "review")],
+                Some("read it, worth keeping"),
+                // A verdict over a member the reflog could not place: the
+                // count says so rather than smoothing over into a full tick.
+                Some((0, 1)),
+            ),
+        ],
+    );
+    s.worklists = vec![running, unjudged];
     s
 }
 
@@ -655,6 +907,33 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// The same panel after `Z` asked its host for the page: the state the
+    /// second press of the cycle leaves behind, held rather than scripted.
+    ///
+    /// A state and not a flow for now because the live answer to `Z` is half
+    /// the loop's — it asks the host, the host resizes the pane, the refetch
+    /// follows — and a driver with no host would have to pretend to both. What
+    /// is honest here is what the reducer owns: the ask itself, which is the
+    /// field the rows read. When the worklists section grows verbs (`ui-008`)
+    /// the keypress gets scripted through [`Driver::input`], and this
+    /// constructor becomes its first frame.
+    fn at_page(snap: &'a Snapshot, w: usize, h: usize) -> Driver<'a> {
+        let mut view = panel::View::default();
+        view.asked_for_width(Some(panel::PAGE_MIN));
+        let ui = panel::collect(snap, &view);
+        panel::place(&ui, &mut view, w, h);
+        Driver {
+            snap,
+            view,
+            ui,
+            log: Vec::new(),
+            size: (w, h),
+            keyboard: true,
+            effect: panel::Effect::None,
+            claims: Vec::new(),
+        }
+    }
+
     /// Draw this one as the sidebar rather than as the tab.
     ///
     /// Every other scene is the tab, because that is the panel with room to
@@ -837,6 +1116,27 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// Walk to the section heading that draws `want` — "agents", "flagged",
+    /// "worklists" — wherever it sits in whatever this world has pinned to the
+    /// foot. By the words and not by counting, for the reason every other hunt
+    /// here is: the sections above this one are exactly what a fixture gains
+    /// when the panel learns to draw something new.
+    fn to_heading(&mut self, want: &str) -> &mut Self {
+        for _ in 0..self.ui.row_count() {
+            if self.ui.selected_kind() == panel::RowKind::Section
+                && panel::row_text(&self.ui, self.ui.selected_index()) == want
+            {
+                return self;
+            }
+            let before = self.ui.selected_index();
+            self.key(Key::Down);
+            if self.ui.selected_index() == before {
+                break;
+            }
+        }
+        panic!("no section heading reading {want:?} on this panel");
+    }
+
     /// Press `Down` until the cursor is on a particular pane's row. A scene
     /// that means a *specific* agent — the spare one, the one standing nowhere
     /// — has to say which: what a count of presses lands on changes the moment
@@ -949,6 +1249,21 @@ impl<'a> Driver<'a> {
         let frame = panel::frame(&self.ui, &mut self.view, w, h);
         let said = frame.iter().any(|l| l.text().contains(want));
         self.claim(format!("the panel says \u{201c}{want}\u{201d}"), said, "it does not".into())
+    }
+
+    /// And the words it does not — the other half of a fold, which `says`
+    /// cannot make: a claim that something went away is about absence, and an
+    /// assertion that only ever looks for presence would pass a fold that
+    /// drew its rows anyway.
+    fn never_says(&mut self, want: &str) -> &mut Self {
+        let (w, h) = self.size;
+        let frame = panel::frame(&self.ui, &mut self.view, w, h);
+        let gone = !frame.iter().any(|l| l.text().contains(want));
+        self.claim(
+            format!("the panel does not say \u{201c}{want}\u{201d}"),
+            gone,
+            "it still does".into(),
+        )
     }
 
     /// Whether this is the pane being worked in. The one fact a click both
@@ -1264,6 +1579,52 @@ fn scenes() -> Vec<Scene> {
             .key(Key::Char('?'))
             .keys(&[Key::Down; 14])
             .scene("Moving with it up", "The tree carries on underneath. It has fewer rows to work with, so the cursor runs out of pane sooner and the tree starts moving sooner — but the map is never allowed to push the cursor off the bottom, and the two rows of lookahead beyond it survive whatever the pane is down to."),
+    );
+
+    // ---- the worklists ---------------------------------------------------
+    //
+    // The queue that drove everything above it. Two widths, one section, and
+    // the fixture carries both of the states a person is actually asked to
+    // judge: a run standing at its barrier, and a finished run nobody has
+    // fully judged.
+
+    let p = planned_world();
+
+    out.push(
+        Driver::new(&p)
+            .now_on("the inbox")
+            .says("worklists")
+            .says("phase-two")
+            .says("\u{25c6}\u{2713}\u{2713} \u{25b8} \u{b7}\u{b7}")
+            .scene(
+                "The worklists, at a sidebar",
+                "A section of its own beside the agents, never inside the tree — a worklist references tasks across projects and has no parent to sit under. One line per list: the run's signature in member marks, one space between groups, so 4·1·2·1 names its list to anybody who has watched the run once. The glyphs are the tasks' own statuses, learned once; the agents working members hang on their own line beneath, aligned under the member each stands on. phase-one reads ! on the right: a barrier somebody crossed without writing anything at it — the tick this surface refuses to draw for them is the whole point of worklist-ui-006.",
+            ),
+    );
+
+    out.push(
+        Driver::new(&p)
+            .to_heading("worklists")
+            .key(Key::Left)
+            .never_says("\u{25c6}\u{2713}\u{2713}")
+            .says("worklists")
+            .scene(
+                "Folded",
+                "← folds the section exactly as it folds a project, and the heading keeps the count, so closing it loses nothing. What folds is the drawing and not the fact: a barrier crossed without a verdict does not stop existing because the panel got shorter — the footer's counts and `wsp worklist ls` still say so.",
+            ),
+    );
+
+    out.push(
+        Driver::at_page(&p, 120, 30)
+            .says("phase-two")
+            .says("p-901")
+            .says("holding 1")
+            .says("$2.40")
+            .says("\u{2713} 3/3")
+            .scene(
+                "The groups, at page width",
+                "`Z` asks for the room and each group gets a line in four zones: the tasks with full ids, the agents on them, what they recorded spending, and the barrier. Ids keep their project prefix — it is the only part that says where a member came from — and render-strata-001's group wrapped rather than lose it or hide anybody behind ⋯. $2.40 is what the runtime stated for p-904; group one drew tokens and no price, because one of its members recorded tokens without one and no surface here may compute a dollar from tokens. settled marks the place the run stands with nothing left outstanding in the store and no verdict written; ✓ 3/3 is a passed barrier with go's own count of what landed behind it — a store field, so it costs nothing to draw and claims nothing git has not said. The store alone answers here, never git.",
+            ),
     );
 
     // ---- management ----
@@ -7120,6 +7481,125 @@ mod tests {
         // otherwise the key that brings it back is drawn nowhere.
         let done: Vec<&Scene> = scenes.iter().filter(|s| text(&s.html).contains("done 1")).collect();
         assert_eq!(done.len(), 1, "exactly one scene shows finished work");
+    }
+
+    /// Every row's own words, top to bottom.
+    fn words(ui: &panel::Ui) -> Vec<String> {
+        (0..ui.row_count()).map(|i| panel::row_text(ui, i)).collect()
+    }
+
+    /// The wrap is a membership promise, so it is held where it can be
+    /// checked: full ids on the continuation line, nothing cut, and no `⋯`
+    /// standing in the tasks zone of any group. A display that edited the
+    /// membership would be exactly the surface this section must not be.
+    #[test]
+    fn a_group_that_outruns_the_tasks_zone_wraps_whole_and_hides_no_member() {
+        let world = planned_world();
+        let d = Driver::at_page(&world, 120, 30);
+        let said = words(&d.ui);
+        assert!(
+            said.iter().any(|t| t.contains("render-strata-001 render-strata-002")),
+            "the first zone line: {said:?}"
+        );
+        assert!(
+            said.iter().any(|t| t == "render-strata-003"),
+            "the continuation line carries what wrapped: {said:?}"
+        );
+        assert!(
+            said.iter().all(|t| !t.contains('…')),
+            "an ellipsis never stands for a member: {said:?}"
+        );
+
+        // And at page width the ids are the point — which is also how this
+        // test tells the two drawings apart without scraping glyphs.
+        let sidebar = planned_world();
+        let d = Driver::new(&sidebar);
+        assert!(
+            words(&d.ui).iter().all(|t| !t.contains("render-strata-001")),
+            "the sidebar drawing reads shapes, not ids"
+        );
+    }
+
+    /// The second line is aligned under the member each agent stands on, and
+    /// that is checkable as columns rather than eyeballed: the working mark
+    /// sits in the same column as its member's status glyph above it.
+    #[test]
+    fn an_agent_line_draws_under_the_member_its_agent_stands_on() {
+        let world = planned_world();
+        let mut d = Driver::new(&world);
+        let frame = panel::frame(&d.ui, &mut d.view, W, H);
+        let cols = |l: &panel::Line, glyph: char| -> Vec<usize> {
+            let mut col = 0;
+            let mut out = Vec::new();
+            for s in &l.spans {
+                for c in s.text.chars() {
+                    if c == glyph {
+                        out.push(col);
+                    }
+                    col += 1;
+                }
+            }
+            out
+        };
+        let list_at =
+            frame.iter().position(|l| l.text().contains("phase-two")).expect("the list drew");
+        let marks = cols(&frame[list_at], '▸');
+        let agents = cols(&frame[list_at + 1], '●');
+        assert_eq!(
+            marks,
+            agents,
+            "the working member and the agent standing on it share a column"
+        );
+    }
+
+    /// Where the view asks about something else, the section stands down —
+    /// the same rule the seats and the shells keep under a search and under
+    /// `R`. What it does not do is vanish behind an ordinary redraw: only a
+    /// question about work moves it.
+    #[test]
+    fn the_worklists_stand_down_where_the_view_asks_other_questions() {
+        let p = planned_world();
+        // Driven through the reducer, because which rows exist is the
+        // reducer's decision and this is exactly the assertion about it that
+        // a hand-built view could get wrong.
+        let has_section = |keys: &[Key]| -> bool {
+            words(&showing(&p, keys).0).iter().any(|t| t == "worklists")
+        };
+        assert!(has_section(&[]), "the ordinary tree draws it");
+        assert!(
+            !has_section(&[Key::Char('R')]),
+            "the review filter is a question about work alone"
+        );
+        assert!(!has_section(&[Key::Char('w')]), "and so is the census");
+        assert!(
+            !has_section(&[Key::Char('/'), Key::Char('x'), Key::Char('q'), Key::Char('z')]),
+            "a search with no hits still answers its own question"
+        );
+    }
+
+    /// Closed lists are counted, not hidden. A section with the finished runs
+    /// taken out reads exactly like a world with none — the same lie `ls`
+    /// refused to tell, told smaller.
+    #[test]
+    fn a_closed_list_is_counted_on_the_tail_line_rather_than_vanished() {
+        let mut p = planned_world();
+        // Everything judged: every member closed, every barrier answered,
+        // nothing dangling or silent — the walk's own test for it.
+        p.worklists.push(listed(
+            "phase-zero",
+            "the run before these, fully judged",
+            "done",
+            &[(&[("p-907", "done")], Some("quiet"), None)],
+        ));
+        let d = Driver::new(&p);
+        assert!(
+            words(&d.ui).iter().any(|t| t == "1 closed"),
+            "the tail names what it is not drawing"
+        );
+        assert!(
+            words(&d.ui).iter().all(|t| !t.contains("phase-zero")),
+            "and the closed list itself stays off the panel"
+        );
     }
 
 }

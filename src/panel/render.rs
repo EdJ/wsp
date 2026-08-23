@@ -341,6 +341,27 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
             ],
         ),
         (
+            "In the worklists section",
+            "The queue of groups that drove the tree into motion, pinned beside \
+             the agents and never inside the tree — a worklist references tasks \
+             across projects and answers to no parent above it. At a sidebar \
+             width it is one line per list: the run's signature in member \
+             marks, read as a shape before it is read as statuses. At page \
+             width (`Z`) each group gets a line in four zones — tasks, agents, \
+             cost, barrier. Nothing here takes the cursor yet; the verbs arrive \
+             with the flow-chart page.",
+            vec![
+                mark(&[(Style::Dim, g::OPEN), (Style::Plain, " "), (Style::Muted, "worklists"), (Style::Plain, " "), (Style::Dim, "2")], "the section", "every list that wants somebody — running, or finished with rows still standing; closed ones are counted on the tail line and named by wsp worklist ls --all"),
+                mark(&[(Style::Accent, "phase-four "), (Style::Warn, g::BLOCKED), (Style::Accent, g::DOING), (Style::Plain, "  "), (Style::Dim, g::QUIET), (Style::Muted, g::REVIEW)], "member marks", "one per member, one space between groups — 4·1·2·1 is phase four and nothing else. The glyphs are the task's own statuses from the first table above, so nothing here is learned twice"),
+                mark(&[(Style::Plain, "         "), (Style::Warn, g::NEEDS_YOU), (Style::Muted, g::IDLE)], "who stands on them", "agents on their own line beneath, aligned under the member each stands on — an agent on a task never displaces it, drawn only while somebody is actually there"),
+                mark(&[(Style::Dim, "!"), (Style::Plain, " "), (Style::Warn, "3")], "where the run is", "the same AT mark and OPEN count wsp worklist ls draws: the group the run stands at, or ! for a barrier crossed with nothing written at it — the tick is earned, not assumed"),
+                mark(&[(Style::Accent, "phase-two"), (Style::Plain, " "), (Style::Dim, " 2/7"), (Style::Plain, "  "), (Style::Muted, "core-001 core-045")], "a group, at page width", "full ids, project prefix included — too wide for the zone they wrap to a second line whole rather than lose the prefix or hide a member behind ⋯"),
+                mark(&[(Style::Warn, g::NEEDS_YOU), (Style::Muted, "w2:p1 "), (Style::Accent, g::WORKING), (Style::Muted, "w5:p2")], "the agents zone", "the same census marks as everywhere else, beside the pane each one lives in — never sharing a column with the tasks"),
+                mark(&[(Style::Dim, "697M"), (Style::Plain, " "), (Style::Accent, "$1.20")], "what was recorded", "tokens summed over the group's attempts, priced only where every recording runtime stated a price — $0 is stated by a free runtime, never computed. A turn that died upstream records nothing, so this is a floor on spend, not a bill"),
+                mark(&[(Style::Warn, "holding 2"), (Style::Plain, "  "), (Style::Warn, "settled"), (Style::Plain, "  "), (Style::Dim, g::DONE), (Style::Plain, " 3/4"), (Style::Plain, " "), (Style::Warn, "!")], "the barrier zone", "holding n — members still somebody's · settled — all done in the store, verdict still owed · ✓ n/m — passed, and m of its members are on go's own record of what landed · ! something wrong that show names. The store alone: landed is git's answer, and no panel row claims it without paying for it"),
+            ],
+        ),
+        (
             "Colour on its own",
             "Seven roles, used consistently regardless of glyph.",
             vec![
@@ -882,7 +903,7 @@ pub(super) fn scroll_for(sel: usize, n: usize, body: usize) -> usize {
 /// split moves, and that was a real bug: crossing this number un-collapsed
 /// folded projects and jumped the scroll. Wider is the same panel with more
 /// room.
-pub(super) const PAGE_MIN: usize = 96;
+pub(crate) const PAGE_MIN: usize = 96;
 
 /// What a page asks for when there is no width that would be enough.
 ///

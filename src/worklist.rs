@@ -772,6 +772,75 @@ pub struct Listed {
     pub activity: i64,
 }
 
+/// Where the run is up to, in one mark — the answer `wsp worklist ls` draws in
+/// its AT column and the panel's worklists section draws on its line.
+///
+/// Four answers, and the fourth is the one this mark did not have. A finished
+/// list reading `5` beside `5` groups would say it is on the last one, which is
+/// the one thing it is not — so a run with no position left to have draws a
+/// mark. **But a tick on a run that walked past a barrier nobody wrote at is a
+/// tick this surface has not got**: `phase-two` drew one, and the design read
+/// it off `ls` as one of the five and said so.
+///
+/// It lives here rather than in either caller for the reason [`listing`] does:
+/// two surfaces draw it, and a second spelling of the question is how they come
+/// to disagree about the same run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtMark {
+    /// A run still in motion: which group it stands at. A dangling member on
+    /// one is not flagged here — where the run is up to is what a running row
+    /// is read for, and `next` and `go` both name a dangling member at the
+    /// barrier loudly enough.
+    Group(usize),
+    /// No groups yet.
+    Empty,
+    /// Nothing left to stand at, and something wrong with that: a barrier
+    /// somebody crossed without writing at it, or a member that has gone.
+    /// Which one, and which group or member, is `show`'s job — this says only
+    /// that there is something to go and look at.
+    Flagged,
+    /// Every barrier answered and nothing gone. The tick, earned.
+    Passed,
+}
+
+impl AtMark {
+    /// The mark itself, for callers that paint their own colours. A group
+    /// number is drawn as its digits and nothing else: `ls` has always printed
+    /// `12`, and a panel that drew one glyph for it would be a second answer.
+    pub fn text(self) -> String {
+        match self {
+            AtMark::Group(n) => n.to_string(),
+            AtMark::Empty => "·".into(),
+            AtMark::Flagged => "!".into(),
+            AtMark::Passed => "✓".into(),
+        }
+    }
+}
+
+/// That mark, off a reading.
+pub fn at_mark(l: &Listed) -> AtMark {
+    match (l.at.at, l.at.of) {
+        (Some(n), _) => AtMark::Group(n),
+        (None, 0) => AtMark::Empty,
+        (None, _) if !l.at.unwritten.is_empty() || !l.gone.is_empty() => AtMark::Flagged,
+        (None, _) => AtMark::Passed,
+    }
+}
+
+/// Which groups carry something a person has to see: a member of a group the
+/// run already passed that does not read as finished, or a barrier crossed
+/// with nothing written at it.
+///
+/// Both halves come off one [`Position`] read — the ordinals are carried on
+/// `passed` and on `unwritten`, filled by the same walk — so the mark needs no
+/// second reading of anything.
+pub fn flagged_groups(pos: &Position) -> BTreeSet<usize> {
+    let mut out: BTreeSet<usize> =
+        pos.passed.iter().filter(|b| !b.member.finished()).map(|b| b.group).collect();
+    out.extend(pos.unwritten.iter().copied());
+    out
+}
+
 /// Every worklist, segmented and ordered: the answer both surfaces draw.
 ///
 /// Sorted by segment and then by last activity, newest first, with the slug as
