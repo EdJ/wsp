@@ -1405,13 +1405,15 @@ mod tests {
         // `Settled` because that is what a *reading* verb asks — see
         // `worklist::running_position`, which is where this comes from live.
         // The two members lists are the barrier's and the sweep's business and
-        // the seat line reads neither.
+        // the seat line reads neither — nor the barriers crossed without a
+        // verdict, which is the run's own history and not this agent's state.
         let at = |at| crate::worklist::Position {
             at,
             of: 5,
             members: Vec::new(),
             passed: Vec::new(),
             slipped: Vec::new(),
+            unwritten: Vec::new(),
             reading: crate::worklist::Reading::Settled,
         };
         r.seat_at = Some(at(Some(2)));

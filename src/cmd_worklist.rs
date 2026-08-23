@@ -1036,7 +1036,7 @@ fn at_mark(l: &worklist::Listed) -> String {
     match (l.at.at, l.at.of) {
         (Some(n), _) => n.to_string(),
         (None, 0) => "·".to_string(),
-        (None, _) if !l.no_verdict.is_empty() || !l.gone.is_empty() => "!".to_string(),
+        (None, _) if !l.at.unwritten.is_empty() || !l.gone.is_empty() => "!".to_string(),
         (None, _) => "✓".to_string(),
     }
 }
@@ -1056,16 +1056,17 @@ fn count(n: usize) -> String {
 /// One row for a parser: the worklist object every other verb emits, and the
 /// five facts this reading adds to it.
 ///
-/// `gone` and `no_verdict` have no column in the table — the `AT` mark says
-/// only that one of them is not empty — so this is where a caller that wants
-/// to know *which* group, or *which* member, reads it without running `show`.
+/// `gone` and the position's `unwritten` have no column in the table — the
+/// `AT` mark says only that one of them is not empty — so this is where a
+/// caller that wants to know *which* group, or *which* member, reads it
+/// without running `show`.
 fn listed_json(l: &worklist::Listed) -> serde_json::Value {
     let mut out = worklist_json_at(&l.list, &l.at);
     if let Some(o) = out.as_object_mut() {
         o.insert("segment".into(), json!(l.segment.word()));
         o.insert("open".into(), json!(l.open));
         o.insert("gone".into(), json!(l.gone));
-        o.insert("no_verdict".into(), json!(l.no_verdict));
+        o.insert("unwritten".into(), json!(l.at.unwritten));
         o.insert("activity".into(), json!(util::iso_at(l.activity)));
     }
     out
@@ -1082,9 +1083,20 @@ fn listed_json(l: &worklist::Listed) -> serde_json::Value {
 // the mark live here instead of at one call site: a block one caller in four
 // prints is how this happened, and a block nothing can assert on is why it went
 // unnoticed.
+//
+// [`Position::unwritten`] is the same receipt one level up, and it gets the
+// same treatment for the same reason: it was born because `ls` drew `!` on
+// `phase-two` while `show` drew the group as an ordinary passed tick.
 
 /// What being behind means, in the words a reader can act on.
 const BEHIND: &str = "in a group already passed, and not finished — the run does not go back for them";
+
+/// What an unwritten barrier means, likewise. There is no verb that fills one
+/// after the fact — `go` passes only the barrier the position stands at, and
+/// the floor has walked past this one — so the sentence stops at what is true:
+/// nothing was asked, and nothing records what was decided.
+const UNWRITTEN: &str =
+    "a barrier somebody crossed without writing at it — no stop condition was read, and nothing records what was decided";
 
 /// The `behind` block, in the caller's own label column.
 ///
@@ -1103,6 +1115,25 @@ fn behind_lines(p: &Paint, slipped: &[Standing], head: &str, indent: usize) -> V
     let mut out = vec![format!("{head}  {}", ids.join("  "))];
     out.extend(
         util::wrap(BEHIND, 78usize.saturating_sub(indent))
+            .iter()
+            .map(|line| format!("{}{}", " ".repeat(indent), p.dim(line))),
+    );
+    out
+}
+
+/// The same shape for the barriers crossed without a verdict, off
+/// [`Position::unwritten`].
+fn unwritten_lines(p: &Paint, ordinals: &[usize], head: &str, indent: usize) -> Vec<String> {
+    if ordinals.is_empty() {
+        return Vec::new();
+    }
+    let named = match ordinals {
+        [one] => format!("group {one}"),
+        many => format!("groups {}", many.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")),
+    };
+    let mut out = vec![format!("{head}  {named}")];
+    out.extend(
+        util::wrap(UNWRITTEN, 78usize.saturating_sub(indent))
             .iter()
             .map(|line| format!("{}{}", " ".repeat(indent), p.dim(line))),
     );
@@ -1135,15 +1166,19 @@ fn group_mark(p: &Paint, at: Option<usize>, ordinal: usize, slipped_in: &BTreeSe
     }
 }
 
-/// Which groups a member slipped in, for the mark above.
+/// Which groups the plan marks `!`: where a member slipped behind, and where
+/// a barrier was crossed with nothing written at it.
 ///
-/// The ordinal is carried on `passed` and not on `slipped`, and the two are the
-/// same walk: `position` puts every member of a group it walks past on `passed`
-/// and the unfinished ones on `slipped`. Read from `passed` here so the mark
-/// needs no second reading — and the block still prints off `slipped`, so a
-/// member the two ever disagree about is named without a mark rather than lost.
-fn slipped_in(pos: &Position) -> BTreeSet<usize> {
-    pos.passed.iter().filter(|b| !b.member.finished()).map(|b| b.group).collect()
+/// Both halves come off one `Position` read — the ordinals are carried on
+/// `passed` and on `unwritten`, filled by the same walk — so the mark needs no
+/// second reading of anything. The blocks beside the plan still name their
+/// specifics off `slipped` and `unwritten`, so a group that is marked for one
+/// reason and not the other is named rather than guessed at.
+fn flagged_in(pos: &Position) -> BTreeSet<usize> {
+    let mut out: BTreeSet<usize> =
+        pos.passed.iter().filter(|b| !b.member.finished()).map(|b| b.group).collect();
+    out.extend(pos.unwritten.iter().copied());
+    out
 }
 
 // ---- show -------------------------------------------------------------
@@ -1200,6 +1235,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 // `dangling`, `groups`, `waiting_on` and `worklist`, and a
                 // member the floor stepped over is in none of those.
                 "behind": behind_json(&pos.slipped),
+                "unwritten": pos.unwritten,
                 "dangling": dangling,
             }))
             .unwrap_or_default()
@@ -1258,7 +1294,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
     if !groups.is_empty() {
         println!();
-        let behind_at = slipped_in(&pos);
+        let behind_at = flagged_in(&pos);
         let w_ord = groups.len().to_string().chars().count();
         // Where the ids begin: the mark, the ordinal and the cap column, each
         // with its two spaces. Everything written under a group hangs off this,
@@ -1325,6 +1361,17 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     if !pos.slipped.is_empty() {
         println!();
         for line in behind_lines(&p, &pos.slipped, &p.dim(&util::pad("behind", 8)), 10) {
+            println!("{line}");
+        }
+    }
+
+    // And the barrier half of the same receipt, off `Position::unwritten`: a
+    // group below the floor carrying no verdict drew an ordinary passed tick
+    // here while `ls` drew `!` on the row — the two surfaces disagreeing about
+    // one group. The mark on it now has its legend.
+    if !pos.unwritten.is_empty() {
+        println!();
+        for line in unwritten_lines(&p, &pos.unwritten, &p.dim(&util::pad("unwritten", 8)), 10) {
             println!("{line}");
         }
     }
@@ -1893,12 +1940,16 @@ pub fn next(store: &Store, args: &Args) -> i32 {
                     "at": pos.at,
                     "of": pos.of,
                     "behind": behind_json(&pos.slipped),
+                    "unwritten": pos.unwritten,
                 }))
                 .unwrap_or_default()
             );
             return 0;
         }
         for line in behind_lines(&p, &pos.slipped, &p.bold("behind"), 8) {
+            println!("{line}");
+        }
+        for line in unwritten_lines(&p, &pos.unwritten, &p.bold("unwritten"), 8) {
             println!("{line}");
         }
         println!("{} {}", w.id, p.dim("is done — nothing left to want from it"));
@@ -1986,6 +2037,12 @@ fn report(
     // The other line that cannot be missed, and it is rarer and stranger. The
     // argument is above `behind_lines`; this is the caller that always had it.
     for line in behind_lines(&p, &pos.slipped, &p.bold("behind"), 8) {
+        println!("{line}");
+    }
+    // Its counterpart: a barrier crossed with nothing written at it is a
+    // reading nobody ever made, and this is where somebody standing at the
+    // next barrier learns it.
+    for line in unwritten_lines(&p, &pos.unwritten, &p.bold("unwritten"), 8) {
         println!("{line}");
     }
 
@@ -2155,6 +2212,7 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
         // half of the same verb the quieter one — and a governor polling
         // `--json` is the reader least likely to go and look.
         "behind": behind_json(&pos.slipped),
+        "unwritten": pos.unwritten,
         "dangling": gone,
     });
     match st {
@@ -2795,10 +2853,17 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     // waiting on it and no barrier will ever mention it again — which is
     // exactly why the decision is the last moment it can be written down.
     let behind: Vec<String> = pos.slipped.iter().map(|s| s.id.clone()).collect();
-    let tail = match behind.is_empty() {
-        true => String::new(),
-        false => format!(" · behind {}", behind.join(" ")),
-    };
+    // And the third thing being closed over: a barrier somebody crossed
+    // without writing at it. Nothing below this line will ever ask about it
+    // again, so the decision is its last chance to be on the record.
+    let unwritten: Vec<String> = pos.unwritten.iter().map(|n| n.to_string()).collect();
+    let mut tail = String::new();
+    if !behind.is_empty() {
+        tail.push_str(&format!(" · behind {}", behind.join(" ")));
+    }
+    if !unwritten.is_empty() {
+        tail.push_str(&format!(" · unwritten {}", unwritten.join(" ")));
+    }
 
     w.set_status(WorklistStatus::Done);
     w.log(&match pos.at {
@@ -2820,13 +2885,13 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     }
     store.log_event(
         "worklist-done",
-        json!({ "id": w.id, "at": pos.at, "open": left, "behind": behind }),
+        json!({ "id": w.id, "at": pos.at, "open": left, "behind": behind, "unwritten": pos.unwritten }),
     );
 
     if args.json() {
         println!(
             "{}",
-            json!({ "worklist": w.id, "status": "done", "at": pos.at, "open": left, "behind": behind })
+            json!({ "worklist": w.id, "status": "done", "at": pos.at, "open": left, "behind": behind, "unwritten": pos.unwritten })
         );
         return 0;
     }
@@ -2851,6 +2916,9 @@ pub fn done(store: &Store, args: &Args) -> i32 {
         );
     }
     for line in behind_lines(&p, &pos.slipped, &p.bold("behind"), 8) {
+        println!("{line}");
+    }
+    for line in unwritten_lines(&p, &pos.unwritten, &p.bold("unwritten"), 8) {
         println!("{line}");
     }
     0
@@ -4083,7 +4151,7 @@ mod tests {
         let (_, p) = at(&store, "batch");
         let paint = Paint::plain();
         let marks: Vec<String> =
-            (1..=p.of).map(|n| group_mark(&paint, p.at, n, &slipped_in(&p))).collect();
+            (1..=p.of).map(|n| group_mark(&paint, p.at, n, &flagged_in(&p))).collect();
         assert_eq!(marks, ["!", "→"], "the group it slipped in is not a group that landed");
 
         let block = behind_lines(&paint, &p.slipped, "behind", 8).join("\n");
@@ -4100,6 +4168,57 @@ mod tests {
             "and the machine half carries the disagreement, not only the id"
         );
         assert!(behind_lines(&paint, &[], "behind", 8).is_empty(), "silent in an ordinary run");
+    }
+
+    /// The barrier half of the same receipt. `phase-two` group 2 was passed in
+    /// silence and every surface drew it as an ordinary passed group until
+    /// `ls` learned to draw `!` on the row — at which point the two surfaces
+    /// disagreed, and none of them said *which* group or what was wrong with
+    /// it. The plan's mark and this block come off one `Position` read, so
+    /// they cannot part again.
+    #[test]
+    fn a_barrier_passed_without_a_verdict_is_marked_and_named_where_behind_is_named() {
+        let (_env, store) = running("unwritten");
+        for id in ["wl-001", "wl-002", "wl-003"] {
+            task(&store, id, "review");
+        }
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["add", "batch", "wl-003"]);
+        started(&store, "batch");
+        crossed(&store, "batch", 1);
+        // Group 3 answered over group 2's silence: `phase-two`'s shape.
+        crossed(&store, "batch", 3);
+
+        let (_, p) = at(&store, "batch");
+        assert_eq!(p.unwritten, [2], "the walk names the group nobody wrote at");
+
+        let paint = Paint::plain();
+        let marks: Vec<String> =
+            (1..=p.of).map(|n| group_mark(&paint, p.at, n, &flagged_in(&p))).collect();
+        assert_eq!(marks, ["✓", "!", "✓"], "group 2 is not a group that landed cleanly: {marks:?}");
+
+        let block = unwritten_lines(&paint, &p.unwritten, "unwritten", 8).join("\n");
+        assert!(block.starts_with("unwritten  group 2"), "which group: {block}");
+        assert!(block.contains("crossed"), "and what is wrong with it: {block}");
+        assert!(
+            block.lines().all(|l| l.chars().count() <= 80),
+            "inside eighty however deep the column is: {block}"
+        );
+        assert!(
+            unwritten_lines(&paint, &[2, 5], "unwritten", 8)[0].contains("groups 2, 5"),
+            "and more than one is said as a list: {:?}",
+            unwritten_lines(&paint, &[2, 5], "unwritten", 8)[0]
+        );
+
+        // Closing over it says so, once, where the decision is written down.
+        assert_eq!(run(&store, &["done", "batch"]), 0);
+        let log = store.worklist("batch").unwrap().section("Log").unwrap_or_default();
+        assert!(
+            log.contains("every barrier passed · unwritten 2"),
+            "\"every barrier passed\" without this line is how phase-two got its tick: {log}"
+        );
     }
 
     /// `done` is a decision and it says what it is closing over. A member of a

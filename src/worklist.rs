@@ -380,6 +380,40 @@ pub struct Position {
     /// surface rather than resolve, and a caller that prints nothing about it
     /// is the floor quietly covering the thing it was put in to survive.
     pub slipped: Vec<Standing>,
+    /// The ordinals of groups the run walked past carrying **no verdict** —
+    /// barriers crossed in silence. Empty in every ordinary run.
+    ///
+    /// This is [`Position::slipped`] one level up: slipped names members below
+    /// the floor that do not read as finished; this names groups below the
+    /// floor that nobody wrote anything at. `at` cannot see either of them —
+    /// the floor is the group after the *last* verdict, so a hole below it is
+    /// stepped straight over — and monotonicity is right that it should not:
+    /// pointing `at` back would reopen a barrier on a finished run and offer
+    /// to spawn members whose work landed yesterday. What was missing was the
+    /// report, and this is it, filled on the walk this answer already is and
+    /// printed by every caller that prints `slipped`.
+    ///
+    /// The founding case is real: `phase-two` group 2 — three members, one of
+    /// them from another project, 63.6M tokens between them — has no stop
+    /// condition, no verdict and no log line recording its barrier being
+    /// passed. Of the 26 groups across the six worklists whose runs are over,
+    /// 25 carry a verdict; counted on the store, 2026-08-21.
+    ///
+    /// Four places read whether a verdict is empty, each meaning something
+    /// different, and they are enumerated because a fifth spelling of the
+    /// question is how two surfaces come to disagree about the same group:
+    /// the floor in [`position`], for which silence is the wall the walk
+    /// stands on; `go`'s already-finished stamp, which fills only what a
+    /// start inherited; `verdict_lines`, which renders nothing where nothing
+    /// is stored; and this list, which names the silence. This field replaced
+    /// `passed_unwritten`, which recomputed the walk's own answer from `at`
+    /// and let `ls` and `show` disagree about `phase-two` until it went.
+    ///
+    /// A draft has crossed no barriers whatever its members read as, so the
+    /// draft arm of [`position`] never fills this: a plan composed out of work
+    /// already at `review` would otherwise report every group in front of the
+    /// first unfinished one as crossed in silence.
+    pub unwritten: Vec<usize>,
     /// Which of the two questions was asked.
     ///
     /// Carried so that [`sweep`] can refuse the free answer. `Settled` is a
@@ -510,6 +544,7 @@ pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
     let mut repos = Repos::new(store);
     let mut passed: Vec<Behind> = Vec::new();
     let mut slipped: Vec<Standing> = Vec::new();
+    let mut unwritten: Vec<usize> = Vec::new();
     for (i, g) in groups.iter().enumerate() {
         let members = group(store, &mut repos, g, reading);
         // The first group nobody has written a verdict on — or, on a plan with
@@ -521,7 +556,15 @@ pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
             false => i + 1 > floor,
         };
         if stop {
-            return Position { at: Some(i + 1), of: groups.len(), members, passed, slipped, reading };
+            return Position {
+                at: Some(i + 1),
+                of: groups.len(),
+                members,
+                passed,
+                slipped,
+                unwritten,
+                reading,
+            };
         }
         // Below the floor and not finished: walked past, and named. A group
         // whose barrier was passed goes on the `passed` list whatever its
@@ -530,8 +573,16 @@ pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
         // is kept there and named rather than taken on this list's word.
         slipped.extend(members.iter().filter(|s| !s.finished()).cloned());
         passed.extend(members.into_iter().map(|member| Behind { group: i + 1, member }));
+        // Below the floor and carrying nothing: walked past in silence, and
+        // named. The stop above is what makes this sound — it fires before
+        // this line, so only groups behind the last verdict are ever collected
+        // here, and the group standing at the barrier reads as exactly that
+        // rather than as an answer to a question nobody has reached yet.
+        if !draft && g.verdict.trim().is_empty() {
+            unwritten.push(i + 1);
+        }
     }
-    Position { at: None, of: groups.len(), members: Vec::new(), passed, slipped, reading }
+    Position { at: None, of: groups.len(), members: Vec::new(), passed, slipped, unwritten, reading }
 }
 
 /// Every member of one group, in the order the group names them.
@@ -702,9 +753,6 @@ pub struct Listed {
     /// to put something back, and hiding the list behind a count is how that
     /// chance is lost.
     pub gone: Vec<String>,
-    /// The ordinals of groups the run walked past with nothing written at
-    /// their barrier. See [`passed_unwritten`].
-    pub no_verdict: Vec<usize>,
     /// When anything last happened on this run, in epoch seconds — the sort
     /// key, and the only ordering the list has ever had that carries
     /// information.
@@ -751,7 +799,6 @@ pub fn listing(store: &Store, lists: Vec<Worklist>) -> Vec<Listed> {
 fn listed(store: &Store, w: Worklist) -> Listed {
     let at = position(store, &w, Reading::Settled);
     let gone = dangling(store, &w);
-    let no_verdict = passed_unwritten(&w, at.at);
 
     let renamed = store.renamed_ids();
     let mut open = 0usize;
@@ -773,11 +820,11 @@ fn listed(store: &Store, w: Worklist) -> Listed {
     let segment = match w.status() {
         WorklistStatus::Draft | WorklistStatus::Running | WorklistStatus::Held => Segment::Running,
         // Every member done, every barrier answered, nothing dangling — and
-        // `at.is_none()` is the second half of "every barrier answered": it
-        // says the walk found no barrier still shut, where `no_verdict` says
+        // `at.finished()` is the second half of "every barrier answered": it
+        // says the walk found no barrier still shut, where `at.unwritten` says
         // none of the ones behind it was crossed in silence.
         WorklistStatus::Done
-            if open == 0 && gone.is_empty() && at.finished() && no_verdict.is_empty() =>
+            if open == 0 && gone.is_empty() && at.finished() && at.unwritten.is_empty() =>
         {
             Segment::Closed
         }
@@ -793,50 +840,7 @@ fn listed(store: &Store, w: Worklist) -> Listed {
         0 => util::epoch_of(&w.created),
         last => last,
     };
-    Listed { list: w, segment, at, open, gone, no_verdict, activity }
-}
-
-/// The barriers the run walked past with nothing written at them.
-///
-/// **This is the fact that stops the list drawing a tick it has not got.**
-/// `phase-two` group 2 — three members, one of them from another project,
-/// 63.6M tokens — has no stop condition, no verdict and no log line recording
-/// it being passed, and `at` cannot see it: the floor is the group after the
-/// *last* one carrying a verdict, so a hole below the last verdict is stepped
-/// straight over. Counted on the store on 2026-08-21: of the 26 groups on the
-/// six worklists whose runs are over, 25 carry a verdict and that one does
-/// not.
-///
-/// Monotonicity is right and is not touched here — pointing `at` back at group
-/// 2 would reopen a barrier on a finished worklist and offer to spawn members
-/// whose work landed yesterday. What was missing is the report.
-///
-/// # One spelling, and where the rest of it goes
-///
-/// `worklist-ui-006` is the other half: the same ordinals carried on
-/// [`Position`], filled on the walk that already visits every one of those
-/// groups, and printed by `report` the way [`Position::slipped`] is. **It
-/// should move this function's body onto that walk rather than write the
-/// predicate a second time** — a second copy is how the list and the plan
-/// reading come to disagree about the same group.
-///
-/// A draft has crossed no barriers at all, whatever its members read as, so
-/// there is nothing here to have been silent about. Without that guard a plan
-/// composed out of work already at `review` would report every group in front
-/// of the first unfinished one as a barrier nobody wrote at.
-pub fn passed_unwritten(w: &Worklist, at: Option<usize>) -> Vec<usize> {
-    if w.status() == WorklistStatus::Draft {
-        return Vec::new();
-    }
-    let groups = w.groups();
-    let passed = at.map_or(groups.len(), |n| n.saturating_sub(1));
-    groups
-        .iter()
-        .take(passed)
-        .enumerate()
-        .filter(|(_, g)| g.verdict.trim().is_empty())
-        .map(|(i, _)| i + 1)
-        .collect()
+    Listed { list: w, segment, at, open, gone, activity }
 }
 
 /// The last thing the run wrote about itself, in epoch seconds, or 0.
@@ -2564,13 +2568,14 @@ mod tests {
     /// it being passed. **`at` cannot see it** — the floor is the group after
     /// the *last* one carrying a verdict, so a hole below that is stepped
     /// straight over and the list drew the same `✓` as a run somebody read
-    /// every barrier of.
+    /// every barrier of — but the answer that carries `at` now carries the
+    /// receipt too, filled on the walk that stepped over it.
     ///
     /// Monotonicity is not touched: `at` still says the run is finished, which
     /// is the answer that stops `next` offering to spawn work that landed
-    /// yesterday. What is added is the receipt.
+    /// yesterday. What is added is the report.
     #[test]
-    fn a_barrier_the_run_walked_past_in_silence_is_named_where_the_position_cannot_see_it() {
+    fn a_barrier_the_run_walked_past_in_silence_is_named_on_the_answer_that_stepped_over_it() {
         let (_env, store, _repo) = scratch("silent");
         for id in ["wsp-1", "wsp-2", "wsp-3"] {
             task(&store, id, "done");
@@ -2580,14 +2585,55 @@ mod tests {
         passed(&mut w, 3, "clean");
         store.save_worklist(&w).unwrap();
 
+        assert!(position(&store, &w, Reading::Settled).unwritten.eq(&[2]), "the walk names it");
         let read = listing(&store, vec![w]).remove(0);
         assert!(read.at.finished(), "the walk still says the run is over");
-        assert_eq!(read.no_verdict, [2], "and this is the group nobody wrote at");
+        assert_eq!(read.at.unwritten, [2], "and this is the group nobody wrote at");
         assert_eq!(
             read.segment,
             Segment::Unjudged,
             "so the run is not closed, however done its rows are",
         );
+    }
+
+    /// The line the collection must not cross: **the barrier the run is
+    /// standing at is an open question, and a barrier it went past carrying
+    /// nothing is a skipped one.** The stop fires before anything is
+    /// collected, so only groups behind the last verdict are ever named —
+    /// and a verdict written late closes the silence, because the field reads
+    /// off the record rather than off an event that happened once.
+    #[test]
+    fn the_walk_names_the_barriers_it_went_past_and_not_the_one_it_stands_at() {
+        let (_env, store, _repo) = scratch("unwritten");
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            task(&store, id, "done");
+        }
+        let mut w = list("- 1  wsp-1\n- 2  wsp-2\n- 3  wsp-3\n");
+
+        // Nobody has answered anywhere: the run stands at the front, and there
+        // is nothing behind it to have been silent about.
+        let p = position(&store, &w, Reading::Settled);
+        assert_eq!(p.at, Some(1));
+        assert!(p.unwritten.is_empty());
+
+        // Group 1 answered, group 2 not: the run stands at group 2's barrier.
+        // It has not been passed, so its silence is the ordinary kind.
+        passed(&mut w, 1, "clean");
+        let p = position(&store, &w, Reading::Settled);
+        assert_eq!(p.at, Some(2));
+        assert!(p.unwritten.is_empty(), "the barrier in front of the run is not one it walked past");
+
+        // `phase-two`'s shape: group 3 answered over group 2's silence. The
+        // floor steps over the hole, and the walk names what it stepped over.
+        passed(&mut w, 3, "clean");
+        let p = position(&store, &w, Reading::Settled);
+        assert!(p.finished());
+        assert_eq!(p.unwritten, [2]);
+
+        // Written late, the way phase four's G2 verdict was: the silence
+        // closes, because this is a reading and not a memory.
+        passed(&mut w, 2, "late, but written");
+        assert!(position(&store, &w, Reading::Settled).unwritten.is_empty());
     }
 
     /// A plan has crossed no barriers at all, whatever its members read as. The
@@ -2604,7 +2650,7 @@ mod tests {
 
         let read = listing(&store, vec![w]).remove(0);
         assert_eq!(read.at.at, Some(2), "the plan is where the run would begin");
-        assert!(read.no_verdict.is_empty(), "and nothing behind it was passed in silence");
+        assert!(read.at.unwritten.is_empty(), "and nothing behind it was passed in silence");
         assert_eq!(read.segment, Segment::Running, "a plan is the run's own segment");
     }
 
