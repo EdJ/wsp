@@ -1355,6 +1355,20 @@ silent loss in a smaller hat. Two verbs read it only after the field has asked
 --from FILE` — because both own another argument a bare `--from` would read as,
 and obeying the wrong reading is worse than answering with the shape.
 
+`--from` is also the only spelling. `--body` is the second half of a card on
+`wsp flag`, and nowhere else — but the project handbook offered the two as a
+pair, so agents typed `wsp note <id> --body -` at verbs that have no such flag.
+Those verbs stop parsing flags at their subject (`LITERAL_AFTER` in `main.rs`),
+which is the rule that keeps `wsp note <id> "--parent is add-only"` a sentence,
+so the words went into the record *as* the prose — `- 2026-08-23 --body -` — and
+exited 0 with the ordinary receipt while the paragraph on stdin was read by
+nobody. A payload that is nothing but a flag-shaped word is now refused before
+the store is opened, naming what it was about to be written down as and saying
+that stdin was not read; `--` first is how a caller who meant those words as the
+text says so. Making `--body` an alias was the other way out and is worse: it
+would give one word two meanings, the prose on four verbs and half a card on a
+fifth, which is the ambiguity that caused this rather than a repair for it.
+
 The reason is not convenience. Prose written here is prose *about this CLI* —
 file names, verb names, code identifiers — which is exactly the text that wants
 backticks, and inside the double quotes a shell needs for a multi-paragraph

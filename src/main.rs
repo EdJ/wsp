@@ -184,18 +184,54 @@ const GLOBAL_FLAGS: &[&str] = &["json", "help", "version", "no-commit", "terse",
 /// removal syntax the help documents, and `-ui` was read as a flag named `ui`,
 /// added `dsp` and exited 0 having silently dropped the removal.
 ///
-/// Five commands are listed and no more. Each takes an id and then a payload
+/// Six commands are listed and no more. Each takes an id and then a payload
 /// that is the user's own vocabulary — free prose, or `+tag`/`-tag` — and none
 /// of them owns a flag of its own beyond the global ones above, so nothing is
 /// lost by stopping. `add`, `find`, `flag` and `say` take prose too but carry
 /// real flags after it (`wsp add "…" -p wsp`, `wsp flag <id> --seen`), so they
 /// keep ordinary parsing and lean on the whitespace rule in [`Args::scan`].
 ///
-/// `--` still ends flag parsing everywhere, and is still the answer for the
-/// case no rule can reach: a payload that is a single flag-shaped word on a
-/// command that owns that flag.
-const LITERAL_AFTER: &[(&str, usize)] =
-    &[("note", 1), ("block", 1), ("park", 1), ("decide", 1), ("rename", 1), ("tag", 1)];
+/// A payload that is *nothing but* a flag-shaped word is refused rather than
+/// recorded — see [`swallowed_flag`] — and `--` is how a caller who meant
+/// those words as the text says so.
+const LITERAL_AFTER: &[Literal] = &[
+    Literal { cmd: "note", subject: 1, payload: "log entry", stream: true },
+    Literal { cmd: "block", subject: 1, payload: "question", stream: true },
+    Literal { cmd: "park", subject: 1, payload: "reason", stream: true },
+    Literal { cmd: "decide", subject: 1, payload: "decision", stream: true },
+    Literal { cmd: "rename", subject: 1, payload: "title", stream: false },
+    Literal { cmd: "tag", subject: 1, payload: "tag edits", stream: false },
+];
+
+/// One row of [`LITERAL_AFTER`]: a verb, and what it does with the words past
+/// its subject.
+///
+/// One table rather than three keyed alike, because the refusal below needs
+/// two more facts about exactly these six verbs and a second list of them
+/// would drift the first time a seventh is added.
+struct Literal {
+    cmd: &'static str,
+    /// How many positionals the subject takes before the payload begins.
+    subject: usize,
+    /// What the payload becomes, named the way the verb's own output names it.
+    /// The refusal says what was about to be written, and "recorded as the log
+    /// entry" is a sentence the caller can check against what they meant.
+    payload: &'static str,
+    /// Whether `--from` inside the payload is read rather than recorded.
+    ///
+    /// It is not in [`OWNED_AFTER`] because it is deliberately *not* parsed as
+    /// a flag: `cmd_task::payload_source` matches it out of the positionals so
+    /// that `wsp note <id> "--from is add-only"` stays a sentence. That makes
+    /// it invisible to [`swallowed_flag`], which would otherwise refuse the one
+    /// spelling the handbook teaches. `rename` and `tag` have no stream form,
+    /// so on them `--from` is the mistake it looks like.
+    stream: bool,
+}
+
+/// The [`LITERAL_AFTER`] row for a verb, if it has one.
+fn literal(cmd: &str) -> Option<&'static Literal> {
+    LITERAL_AFTER.iter().find(|l| l.cmd == cmd)
+}
 
 /// Flags a [`LITERAL_AFTER`] command owns, which therefore go on being read
 /// inside its payload.
@@ -281,6 +317,15 @@ pub struct Args {
     /// every command takes `&Args` and a read is a read whether or not the
     /// caller holds it mutably; nothing here crosses a thread.
     read: RefCell<HashSet<String>>,
+    /// Whether a bare `--` ended flag parsing.
+    ///
+    /// The only thing that tells `wsp note <id> -- --body -`, which means
+    /// *record those words*, from `wsp note <id> --body -`, which means the
+    /// caller believed `--body` was a flag. Both reach the payload as the same
+    /// two tokens, so [`swallowed_flag`] cannot tell them apart from the
+    /// payload alone — and refusing the first would take away the escape hatch
+    /// the help sends people to.
+    escaped: bool,
 }
 
 impl Args {
@@ -292,7 +337,7 @@ impl Args {
         // different token into the verb — the verb is the first bare word
         // either way.
         let cmd = Args::scan(&argv, None, &[], &[]).cmd;
-        let literal_after = LITERAL_AFTER.iter().find(|(c, _)| *c == cmd).map(|(_, n)| *n);
+        let literal_after = literal(&cmd).map(|l| l.subject);
         let owned: Vec<&str> =
             OWNED_AFTER.iter().filter(|(c, _)| *c == cmd).map(|(_, f)| *f).collect();
         let valued_on: Vec<&str> =
@@ -309,6 +354,7 @@ impl Args {
         // for itself costs nothing when nobody reads it, and one that took the
         // token after it has taken something that was going somewhere.
         let mut valued: HashSet<String> = HashSet::new();
+        let mut escaped = false;
         let mut i = 0;
         while i < argv.len() {
             let a = argv[i].clone();
@@ -332,6 +378,7 @@ impl Args {
             if let Some(body) = a.strip_prefix("--") {
                 if body.is_empty() {
                     // `--` ends flag parsing
+                    escaped = true;
                     positional.extend(argv[i + 1..].iter().cloned());
                     break;
                 }
@@ -381,7 +428,7 @@ impl Args {
         }
 
         let cmd = if positional.is_empty() { String::new() } else { positional.remove(0) };
-        Args { cmd, rest: positional, flags, valued, read: RefCell::default() }
+        Args { cmd, rest: positional, flags, valued, read: RefCell::default(), escaped }
     }
 
     /// A command line one command builds for another, instead of shelling out
@@ -407,6 +454,9 @@ impl Args {
             // [`Args::dropped`] is asked about the invocation, once, in `main`.
             valued: HashSet::new(),
             read: RefCell::default(),
+            // …and no `--` either: the payload is passed as the positional it
+            // already is, so nothing had to be escaped to get here.
+            escaped: false,
         }
     }
 
@@ -653,6 +703,117 @@ fn dry_run(args: &Args) -> (bool, String) {
     }
 }
 
+/// A flag typed into the payload of a [`LITERAL_AFTER`] verb, which is about
+/// to be written down as the payload.
+///
+/// # The defect
+///
+/// `wsp note <id> --body -` exited 0, printed the ordinary receipt, and left
+/// `- 2026-08-23 --body -` in the log. Same across `decide`, `park`, `block`,
+/// `rename` and very nearly `tag`. The paragraph on stdin was read by nobody
+/// and the caller was told it had worked, which is how `robustness-099`'s
+/// review note stopped existing. It is not a slip the caller could have
+/// caught: the project handbook told every agent that `--body -` was a way to
+/// give a verb its prose.
+///
+/// # Why here, and why it is not [`unknown_flags`]
+///
+/// [`unknown_flags`] is the general answer and it never sees this one. Past
+/// the subject of a listed verb, [`Args::scan`] has already decided a
+/// `--`-led token is prose, so it is a positional and never enters the flag
+/// map at all — there is nothing for a read tally to be missing. The two
+/// rules meet exactly here: the rule that keeps `wsp note 028 "--parent is
+/// add-only"` a sentence is the rule that swallows a mistyped flag whole.
+///
+/// That also makes the claim this check needs airtight, which the general one
+/// could not manage without reading the help. Past the subject only
+/// [`GLOBAL_FLAGS`] and [`OWNED_AFTER`] are parsed, so a `--`-led word in the
+/// payload is unreachable to every line of code in the binary. No verb can be
+/// reading it, documented or not, and there is no vocabulary to consult.
+///
+/// And it runs before the store is opened, where [`unknown_flags`] cannot: a
+/// tally is only complete once the verb has finished asking, so its refusal
+/// arrives after the record has been written. `wsp add "t" --body -` shows
+/// what that is worth — exit 2, the flag named, and a task already created
+/// with `-` on the end of its title.
+///
+/// # What counts
+///
+/// The payload *entire*, and nothing less: one `--`-led word, optionally with
+/// one word after it or an `=value` inside it. That is the same line
+/// `cmd_task::payload_source` draws for `--from`, and for the same reason —
+/// prose here is mostly about the CLI, so a payload that merely *begins* with
+/// a flag is a sentence somebody meant. A token holding a space is prose
+/// whatever it starts with, which is the whitespace rule in [`Args::scan`]
+/// read once more.
+///
+/// Three things are therefore still text and still work: a sentence
+/// (`wsp note 028 "--parent is add-only"`), the tag removal syntax
+/// (`wsp tag <id> -ui`, one dash), and anything at all after `--`.
+fn swallowed_flag(args: &Args) -> Option<(&'static Literal, String, Option<String>)> {
+    // The caller said these words are the text. That is the whole meaning of
+    // `--` and it is what the help sends people to.
+    if args.escaped {
+        return None;
+    }
+    let l = literal(&args.cmd)?;
+    let (head, value) = match args.rest.get(l.subject..)? {
+        [one] => (one.as_str(), None),
+        [one, two] => (one.as_str(), Some(two.clone())),
+        _ => return None,
+    };
+    let body = head.strip_prefix("--")?;
+    if body.is_empty() || body.contains(char::is_whitespace) {
+        return None;
+    }
+    let name = body.split_once('=').map_or(body, |(n, _)| n);
+    if l.stream && name == "from" {
+        return None;
+    }
+    Some((l, name.to_string(), value))
+}
+
+/// Say what the word would have become, before it becomes it.
+///
+/// Two sentences the caller cannot get anywhere else. **What it was about to
+/// write**, because the failure this replaces was a success — the receipt
+/// looked right and the log had to be re-read to find the damage. And
+/// **nothing was read from stdin**, because the caller with a paragraph in a
+/// pipe needs to know whether they still have it; the refusal happens before
+/// the store is open, so the pipe is untouched and the file behind it is
+/// exactly where it was.
+///
+/// Only said when there is a pipe to reassure about. On a terminal it would be
+/// a line about a hazard the caller was never in.
+fn refuse_swallowed(l: &Literal, name: &str, value: Option<&str>) -> i32 {
+    let p = util::Paint::new();
+    let typed = match value {
+        Some(v) => format!("--{name} {v}"),
+        None => format!("--{name}"),
+    };
+    eprintln!(
+        "wsp: `wsp {}` has no {}, so `{typed}` was about to be recorded as the",
+        l.cmd,
+        p.bold(&format!("--{name}")),
+    );
+    eprint!("     {}. Nothing was written", l.payload);
+    if util::stdin_is_tty() {
+        eprintln!(".");
+    } else {
+        eprintln!(", and nothing was read from stdin.");
+    }
+    if l.stream {
+        eprintln!(
+            "     A paragraph goes in by `wsp {} <id> --from -` or a bare `-`; `--` first",
+            l.cmd
+        );
+        eprintln!("     records a flag-shaped word as the text.");
+    } else {
+        eprintln!("     `--` first records a flag-shaped word as the text.");
+    }
+    2
+}
+
 /// Say that `-n` is not read here, before anything has happened.
 ///
 /// The one line that matters is *nothing has been done*, because the reader
@@ -714,6 +875,13 @@ fn main() {
         if !reads {
             std::process::exit(refuse_dry_run(&verb));
         }
+    }
+
+    // Beside the check above and for its reason: a word that is about to be
+    // written into the record has to be refused before the record is opened.
+    // See [`swallowed_flag`].
+    if let Some((l, name, value)) = swallowed_flag(&args) {
+        std::process::exit(refuse_swallowed(l, &name, value.as_deref()));
     }
 
     if args.has("no-commit") {
@@ -1525,8 +1693,9 @@ place an id changes, and it is recorded so the old one still resolves.
 Ids accept a bare suffix (003) or a unique title substring; a suffix that names
 more than one task now lists them rather than answering "no such task".
 Text that starts with a flag is text: `wsp note <id> "--parent is add-only"` and
-`wsp tag <id> +dsp -ui` both mean what they say. `--` still ends flag parsing,
-for the one case that needs it — a payload that is a single flag-shaped word.
+`wsp tag <id> +dsp -ui` both mean what they say. A payload that is nothing but a
+flag-shaped word reads the other way — a flag the verb has not got — and is
+refused before anything is written; `--` first says you meant the words.
 A flag wsp does not know still takes the word after it, so a command that ends
 with a value nothing read says so and exits 2 — the word went nowhere. A flag
 this page does not give the verb, and that the verb never asked about, is
@@ -1776,6 +1945,62 @@ mod tests {
         assert_eq!(parse(&["tag", "wsp-055", "--", "-tmp"]).rest, vec!["wsp-055", "-tmp"]);
     }
 
+    /// The other end of that rule: a payload that is *only* a flag is refused.
+    ///
+    /// `wsp note <id> --body -` exited 0 and left `- 2026-08-23 --body -` in
+    /// the log while the paragraph on stdin went unread — the same across
+    /// `decide`, `park`, `block` and `rename`, because the rule above had
+    /// already decided the token was prose. Asserted on
+    /// [`super::swallowed_flag`] rather than through the verbs because the
+    /// point of the check is that it answers before any of them is reached.
+    #[test]
+    fn a_payload_that_is_only_a_flag_is_refused_rather_than_recorded() {
+        use super::Args;
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+        let caught = |line: &[&str]| super::swallowed_flag(&parse(line)).map(|(l, n, v)| (l.cmd, n, v));
+
+        // Every verb on the list, in the spelling the handbook taught.
+        for l in super::LITERAL_AFTER {
+            assert_eq!(
+                caught(&[l.cmd, "028", "--body", "-"]),
+                Some((l.cmd, "body".to_string(), Some("-".to_string()))),
+                "{} recorded the flag as its {}",
+                l.cmd,
+                l.payload,
+            );
+        }
+        // Both other shapes of a flag standing alone.
+        assert_eq!(caught(&["note", "028", "--body"]), Some(("note", "body".into(), None)));
+        assert_eq!(caught(&["note", "028", "--body=x"]), Some(("note", "body".into(), None)));
+
+        // What must go on being text. A sentence that merely begins with a
+        // flag is the case `LITERAL_AFTER` exists for, and the whitespace rule
+        // is what tells it from a flag however many words follow.
+        assert_eq!(caught(&["note", "028", "--parent is add-only"]), None);
+        assert_eq!(caught(&["note", "028", "--parent", "is", "add-only"]), None);
+        // One dash is the tag removal syntax, and a bare `-` is the stream.
+        assert_eq!(caught(&["tag", "028", "-ui"]), None);
+        assert_eq!(caught(&["note", "028", "-"]), None);
+        // `--` is the escape hatch, and it has to survive reaching the payload
+        // as the very tokens the check refuses without it.
+        assert_eq!(caught(&["note", "028", "--", "--body", "-"]), None);
+        // A verb not on the list parses `--body` as a flag, where the read
+        // tally in `unknown_flags` is what answers for it.
+        assert_eq!(caught(&["add", "a title", "--body", "-"]), None);
+
+        // `--from` is read out of the payload by the four prose verbs, so it
+        // is the one name they must not refuse — and the two with no stream
+        // form still do.
+        for l in super::LITERAL_AFTER {
+            let got = caught(&[l.cmd, "028", "--from", "-"]);
+            assert_eq!(got.is_none(), l.stream, "{} answered wrongly for --from", l.cmd);
+        }
+        assert_eq!(caught(&["note", "028", "--from"]), None);
+        assert_eq!(caught(&["note", "028", "--from=/tmp/x.md"]), None);
+        // …and nothing else is exempted by being near it.
+        assert!(caught(&["note", "028", "--form", "-"]).is_some());
+    }
+
     /// The other half of the same change: nothing that used to parse may stop.
     ///
     /// Stopping flag parsing at a command's payload is only safe because the
@@ -1878,7 +2103,8 @@ mod tests {
     #[test]
     fn every_command_whose_payload_is_literal_is_a_command() {
         let arms = dispatch();
-        for (cmd, _) in super::LITERAL_AFTER {
+        for l in super::LITERAL_AFTER {
+            let cmd = l.cmd;
             assert!(
                 arms.iter().any(|names| names.iter().any(|n| n == cmd)),
                 "`{cmd}` is in LITERAL_AFTER but nothing dispatches it"
