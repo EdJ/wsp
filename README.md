@@ -109,6 +109,7 @@ wsp worklist next           # …or `next <slug>` where the workspace holds no s
                             #   group 2 of 4 — 4 may start now      → wsp spawn each
                             #   group 2 of 4 — waiting on 2         → wait
                             #   group 1 of 4 finished — read this…  → go, or hold
+                            #     (and what that group's lands touched, before you judge)
                             #   nothing left — 4 groups, all …      → done
 wsp worklist go "…"         # pass the barrier: the verdict, the sweep behind it,
                             #   and which members of that group touched one file

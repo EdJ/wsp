@@ -1625,9 +1625,11 @@ fn help_text() -> String {
   Editing is write-ahead-only: a group at or behind where the list is up to has
   either run or is running, and is refused with what may be edited instead.
 
-  wsp worklist next [<slug>]        what may start now, what is holding it, the
-                                    prose to read at a barrier, or nothing left.
-                                    No slug when the workspace holds the seat
+  wsp worklist next [<slug>]        what may start now, what is holding it, or
+                                    the prose to read at a barrier — with what
+                                    the group behind it landed and which of its
+                                    members touched one file. No slug when the
+                                    workspace holds the seat
   wsp worklist go [<slug>] ["…"|-|--from FILE]   start the list, or pass a
                                     barrier: records the verdict, sweeps the
                                     trees of the groups behind it, and says

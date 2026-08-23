@@ -1258,9 +1258,16 @@ pub struct Overlap {
 /// **One walk, two answers.** The barrier wants the per-member record — what
 /// each member's newest land put on the trunk, written into the group before
 /// the sweep deletes the branch that was the only other place it lived — and
-/// it wants the same-file report. Both are read off the same reflog walk, so
-/// [`overlaps`] is this function seen from one side rather than a second
-/// computation that could disagree with the first.
+/// it wants the same-file report. Both are read off the one reflog walk this
+/// function runs, so no caller re-derives either half, and nothing can
+/// disagree with the other half of what the same call returned.
+///
+/// There was a thin `overlaps` wrapper here returning only [`Touched::overlap`]
+/// (`worklist-ui-003`). It is gone rather than given a caller: once `next`
+/// printed the barrier's evidence it printed the whole of [`Touched`] — the
+/// receipt beside the report, exactly as `go` does — so no caller wanted the
+/// overlap half alone, and a second name for one walk with no caller outside
+/// the tests warned in every release build.
 ///
 /// **Feedback on how the group was composed, not a check on it.** Mutual
 /// exclusion is deliberately not machinery in this design — it is the rule
@@ -1351,17 +1358,13 @@ pub fn touched(store: &Store, members: &[String]) -> Touched {
 
 /// What the members of a group that has just landed put on the trunk: one
 /// [`Landed`] entry per member, and the overlap report beside it. See
-/// [`touched`], which is the one walk both come from.
+/// [`touched`], which is the one walk both come from, and
+/// `cmd_worklist::touched_lines`, which is the one shape both barrier verbs —
+/// `go` after passing it, `next` while it stands shut — print.
 #[derive(Debug, Default)]
 pub struct Touched {
     pub landed: Vec<Landed>,
     pub overlap: Overlap,
-}
-
-/// Which members of a group put their hands on the same file — the overlap
-/// half of [`Touched`], which is the shape the barrier has always printed.
-pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
-    touched(store, members).overlap
 }
 
 #[cfg(test)]
@@ -1528,7 +1531,7 @@ mod tests {
         // ran for it, and what it changed is unknown rather than nothing.
         task(&store, "wsp-4", "review");
 
-        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into(), "wsp-3".into(), "wsp-4".into()]);
+        let o = touched(&store, &["wsp-1".into(), "wsp-2".into(), "wsp-3".into(), "wsp-4".into()]).overlap;
         assert_eq!(
             o.shared,
             vec![("shared.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
@@ -1649,7 +1652,7 @@ mod tests {
             spawned(&repo, id);
         }
 
-        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        let o = touched(&store, &["wsp-1".into(), "wsp-2".into()]).overlap;
         assert!(o.shared.is_empty(), "neither of them touched a file, let alone the same one");
         assert_eq!(o.unread, ["wsp-1", "wsp-2"], "and not knowing is said, not smoothed over");
     }
@@ -1688,7 +1691,7 @@ mod tests {
         git_run(&repo, &["worktree", "remove", "--force", &dir.display().to_string()]);
         git_run(&repo, &["branch", "-d", "wsp-1"]);
 
-        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        let o = touched(&store, &["wsp-1".into(), "wsp-2".into()]).overlap;
         assert_eq!(
             o.shared,
             vec![("shared.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
@@ -1726,7 +1729,7 @@ mod tests {
         git_run(&second, &["commit", "--quiet", "--all", "--message", "early too"]);
         land(&repo, "wsp-2");
 
-        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        let o = touched(&store, &["wsp-1".into(), "wsp-2".into()]).overlap;
         assert_eq!(
             o.shared,
             vec![("early.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],
@@ -1764,7 +1767,7 @@ mod tests {
         land(&repo, "wsp-2");
         assert!(new.is_dir(), "both trees stood the whole time");
 
-        let o = overlaps(&store, &["wsp-1".into(), "wsp-2".into()]);
+        let o = touched(&store, &["wsp-1".into(), "wsp-2".into()]).overlap;
         assert_eq!(
             o.shared,
             vec![("early.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])],

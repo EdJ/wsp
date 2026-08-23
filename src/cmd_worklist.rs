@@ -1848,6 +1848,12 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing]) -> Front {
 /// which prints the title itself, and seven titles here is seven lines on every
 /// barrier check instead of one. `--json` carries the rest.
 ///
+/// The one exception to two lines is a shut barrier, which carries the evidence
+/// block [`barrier_evidence`] reads — the report of what the group behind it
+/// put on the trunk, printed here while the verdict is being composed rather
+/// than only by [`go`] after it has been given. The argument for that, and for
+/// nowhere else, is on that function.
+///
 /// [`Reading::Landed`], and this is the one caller that has to pay for it. A
 /// group is finished when every member's branch is on the trunk, because both
 /// cheap signals are wrong: `done` never arrives, and `review` arrives before
@@ -1900,12 +1906,19 @@ pub fn next(store: &Store, args: &Args) -> i32 {
     }
     let st = state(store, &w, &pos);
     let gone = worklist::dangling(store, &w);
+    // Read once, here, for both halves of the verb: the lines `report` draws
+    // and the keys `next_json` sets are the same walk's two answers.
+    let touched = barrier_evidence(store, &w, &pos, &st);
 
     if args.json() {
-        println!("{}", serde_json::to_string_pretty(&next_json(&w, &pos, &st, &gone)).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&next_json(&w, &pos, &st, &gone, touched.as_ref()))
+                .unwrap_or_default()
+        );
         return 0;
     }
-    report(&w, &pos, &st, &gone, seat);
+    report(&w, &pos, &st, &gone, seat, touched.as_ref());
     0
 }
 
@@ -1945,7 +1958,19 @@ fn how(verb: &str, w: &Worklist, seat: bool) -> String {
 }
 
 /// Four states, and the line each of them ends on is the command to run next.
-fn report(w: &Worklist, pos: &Position, st: &State, gone: &[String], seat: bool) {
+///
+/// The shut-barrier state carries the evidence block when one was read — see
+/// [`barrier_evidence`] for when that is — drawn between the prose being judged
+/// and the verbs, because it is part of what the verdict rests on and not a
+/// hint about what to run.
+fn report(
+    w: &Worklist,
+    pos: &Position,
+    st: &State,
+    gone: &[String],
+    seat: bool,
+    touched: Option<&worklist::Touched>,
+) {
     let p = Paint::new();
     let of = pos.of;
 
@@ -2049,6 +2074,13 @@ fn report(w: &Worklist, pos: &Position, st: &State, gone: &[String], seat: bool)
                 }
                 println!();
             }
+            // The same block `go` prints once the barrier is behind it, read
+            // while it stands shut — one walk, [`touched_lines`], both verbs.
+            if let Some(t) = touched {
+                for line in touched_lines(&p, t) {
+                    println!("{line}");
+                }
+            }
             if !verbs.is_empty() {
                 println!("{}", p.dim(&verbs));
             }
@@ -2063,7 +2095,53 @@ fn report(w: &Worklist, pos: &Position, st: &State, gone: &[String], seat: bool)
     }
 }
 
-fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String]) -> serde_json::Value {
+/// The evidence at a shut barrier: the group behind it, read off the trunk.
+///
+/// Phase five's stop conditions tell the reader to consult this report — *"`go`
+/// reports which members of a landed group touched one file; read that report
+/// rather than assuming they stayed apart"* — and until now only `go` printed
+/// it, after the verdict was written and the sweep had run. **Reading the
+/// evidence required passing the barrier first.** A governor composes the
+/// verdict standing in front of it, polling this verb; the report belongs
+/// there, beside the prose being read, where the next group is being composed.
+/// `--json` carries it to the reader least likely to go and open a second verb
+/// for it.
+///
+/// Only there. `next` runs on repeat, and the walk under the report is real
+/// git — one reflog per repository and one diff per land, see
+/// [`worklist::touched`] — so a barrier whose group has not finished, or a hold
+/// taken in the middle of one, reads nothing at all. And where nothing was
+/// read, [`next_json`] omits the keys outright instead of carrying empty
+/// arrays: an absent walk must not be machine-readable as a clean one, which is
+/// the absence-as-evidence this report exists to refuse, one indirection over.
+///
+/// Not on a draft either, whatever its members look like: a plan's finished
+/// groups were finished before the list existed, `go` stamps them *already
+/// finished when the list started* and reports nothing when it starts. This is
+/// that same decision read from the other side of barrier zero.
+///
+/// The position walk above is `Reading::Landed` work too, and it stays its own
+/// walk: it asks whether anything is outstanding, the reflog asks what each
+/// land added, and no git question answers both. Within the report itself the
+/// reflog is read once per repository however many members share it — the cost
+/// `worklist::touched` was priced at, and the reason polling it at a barrier is
+/// affordable.
+fn barrier_evidence(store: &Store, w: &Worklist, pos: &Position, st: &State) -> Option<worklist::Touched> {
+    match st {
+        State::Shut { .. } => {}
+        _ => return None,
+    }
+    // Held mid-group shuts no barrier over finished work; a draft has none
+    // behind any group. What is left is a gate standing in front of a group
+    // whose work is over — the one state the walk has an answer for.
+    if w.status() == WorklistStatus::Draft || !pos.at_barrier() {
+        return None;
+    }
+    let members = w.groups().get(pos.at? - 1)?.members.clone();
+    Some(worklist::touched(store, &members))
+}
+
+fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched: Option<&worklist::Touched>) -> serde_json::Value {
     let mut v = json!({
         "worklist": w.id,
         "status": w.status().as_str(),
@@ -2100,6 +2178,22 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String]) -> serde
             });
             v["prose"] = json!(prose);
             v["in_flight"] = json!(flight);
+            // The evidence, where a group stands behind the gate to have
+            // produced any — [`barrier_evidence`] names the states those are.
+            // Key names are `go --json`'s, so one parser reads either verb.
+            // Omitted rather than emptied elsewhere: present-but-empty on
+            // every poll would read as "checked and clean" about walks that
+            // never ran.
+            if let Some(t) = touched {
+                v["same_file"] = json!(t
+                    .overlap
+                    .shared
+                    .iter()
+                    .map(|(f, who)| json!({ "file": f, "members": who }))
+                    .collect::<Vec<_>>());
+                v["unread"] = json!(t.overlap.unread);
+                v["landed"] = landed_json(&t.landed);
+            }
         }
         State::Nothing => v["state"] = json!("finished"),
     }
@@ -2172,9 +2266,11 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     };
     if !starting && shut.is_none() {
         // Not an error: a governor that types `go` twice has done nothing
-        // wrong and wants to know where it is, which is what `next` says.
+        // wrong and wants to know where it is, which is what `next` says. No
+        // evidence block here: no barrier is shut, so no group stands behind
+        // one to have touched anything — `next` is where that is read.
         println!("{}", Paint::new().dim("no barrier is shut — nothing to pass"));
-        report(&w, &pos, &st, &worklist::dangling(store, &w), seat);
+        report(&w, &pos, &st, &worklist::dangling(store, &w), seat, None);
         return 0;
     }
     let prose = shut.as_ref().map(|(_, prose)| prose.clone()).unwrap_or_default();
@@ -2375,8 +2471,9 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     // to have touched anything, and "none" there would be an answer to a
     // question nobody asked.
     if let Some(t) = &touched {
-        say_overlap(&p, &t.overlap);
-        say_landed(&p, &t.landed);
+        for line in touched_lines(&p, t) {
+            println!("{line}");
+        }
     }
     say_swept(&p, swept.as_ref(), crossed.is_some() && args.has("keep"), dry);
     // Beside the line naming what may start, because it is about those same
@@ -2484,38 +2581,45 @@ fn seat_on(store: &Store, w: &Worklist) -> SeatOn {
     }
 }
 
-/// What the group that just landed touched, where two of them touched one file.
+/// What the group behind the barrier put on the trunk: the same-file report,
+/// then one line naming what each member landed.
+///
+/// **One shape, two verbs.** [`go`] prints it once the barrier is behind it;
+/// `next` prints it while the barrier stands shut — see
+/// [`barrier_evidence`] for why both moments read it and why nowhere else
+/// does. The lines are built rather than printed so a test can assert on
+/// exactly what either verb says, which is the same split [`verdict_lines`]
+/// and [`behind_lines`] make.
 ///
 /// Silence is the answer nearly every time and it is the answer worth having:
 /// the composition rule held. It says so in one line rather than printing
 /// nothing, because "no output" is exactly the absence the `batch` could not
 /// act on.
-fn say_overlap(p: &Paint, o: &worklist::Overlap) {
+fn touched_lines(p: &Paint, t: &worklist::Touched) -> Vec<String> {
+    let mut out = Vec::new();
+    let o = &t.overlap;
     if o.shared.is_empty() && o.unread.is_empty() {
-        println!("{}", p.dim("same file  none — no two members touched one file"));
-        return;
-    }
-    for (file, who) in &o.shared {
-        println!("{}  {}  {}", p.bold("same file"), file, p.dim(&who.join(" ")));
-    }
-    if !o.unread.is_empty() {
+        out.push(p.dim("same file  none — no two members touched one file"));
+    } else {
+        for (file, who) in &o.shared {
+            out.push(format!("{}  {}  {}", p.bold("same file"), file, p.dim(&who.join(" "))));
+        }
         // The honest half. A member nobody could place contributes no overlaps,
         // so leaving it out would turn "we could not look" into "we looked and
         // it was clean" — the absence-as-evidence this report exists to replace.
-        println!(
-            "{}  {}",
-            p.dim(&util::pad("", 9)),
-            p.dim(&format!("{} could not be read back off the trunk", o.unread.join(" ")))
-        );
+        if !o.unread.is_empty() {
+            out.push(format!(
+                "{}  {}",
+                p.dim(&util::pad("", 9)),
+                p.dim(&format!("{} could not be read back off the trunk", o.unread.join(" ")))
+            ));
+        }
     }
-}
-
-/// What each member of the group that just landed put on the trunk — one
-/// line, the commit shortened for reading, because this is a receipt and not
-/// the record: the full hashes are on the group, where they are kept. `@?` is
-/// a member nobody could place, said in kind rather than left out.
-fn say_landed(p: &Paint, landed: &[Landed]) {
-    let said: Vec<String> = landed
+    // One line, the commit shortened for reading, because this is a receipt and
+    // not the record: the full hashes are on the group, where they are kept.
+    // `@?` is a member nobody could place, said in kind rather than left out.
+    let said: Vec<String> = t
+        .landed
         .iter()
         .map(|e| {
             let at: String =
@@ -2523,7 +2627,8 @@ fn say_landed(p: &Paint, landed: &[Landed]) {
             format!("{}@{} {}", e.member, at, e.files.len())
         })
         .collect();
-    println!("{}  {}", p.bold("landed"), p.dim(&said.join(" · ")));
+    out.push(format!("{}  {}", p.bold("landed"), p.dim(&said.join(" · "))));
+    out
 }
 
 /// The record itself, whole, for a parser.
@@ -3274,6 +3379,74 @@ mod tests {
         (w, p)
     }
 
+    /// A store of its own **and** a repository beside it, the project rooted
+    /// there — the shape `worklist.rs`'s `scratch` builds, because the evidence
+    /// block is the first thing in this file asked to read what a member put on
+    /// a trunk. Members made against it carry `project: wsp`; [`task`] does not
+    /// set one.
+    ///
+    /// Like `running`, this isolates the environment too: landing reads real
+    /// worktrees under the repository, and the verbs around them ask herdr who
+    /// is standing where.
+    fn grounded(tag: &str) -> (util::Isolated, Store, std::path::PathBuf) {
+        let env = util::isolated(&format!("wlground-{tag}"));
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_run(&repo, &["init", "--quiet", "-b", "master"]);
+        std::fs::write(repo.join("kept.txt"), "one\n").unwrap();
+        git_run(&repo, &["add", "kept.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "first"]);
+
+        let mut p = crate::model::Project::new("wsp");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+
+        (env, store, repo)
+    }
+
+    fn member(store: &Store, id: &str, status: &str) {
+        let mut t = Task::new(id, id);
+        t.project = Some("wsp".into());
+        t.status_raw = status.into();
+        store.save_task(&t).unwrap();
+    }
+
+    fn git_run(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A tree on a branch of the task's name with one commit in it, which is
+    /// what an agent that has committed and not landed leaves behind.
+    fn committed(repo: &std::path::Path, id: &str) -> std::path::PathBuf {
+        let dir = repo.join(crate::cmd_checkout::WORKTREES).join(id);
+        let from = crate::cmd_checkout::trunk_branch(repo).expect("the repository is on a branch");
+        git_run(repo, &["worktree", "add", "--quiet", "-b", id, &dir.display().to_string(), &from]);
+        std::fs::write(dir.join(format!("{id}.txt")), "mine\n").unwrap();
+        git_run(&dir, &["add", "."]);
+        git_run(&dir, &["commit", "--quiet", "-m", id]);
+        dir
+    }
+
+    /// What `land` is underneath: rebase onto the trunk, fast-forward it. The
+    /// reflog entry that names the branch is what the evidence walk reads.
+    fn land(repo: &std::path::Path, id: &str) {
+        git_run(repo, &["merge", "--ff-only", "--quiet", id]);
+    }
+
     fn gate_of(store: &Store, id: &str) -> String {
         let (w, p) = at(store, id);
         match state(store, &w, &p) {
@@ -3717,6 +3890,137 @@ mod tests {
             "no repository to look in here, and unknown is said rather than dropped"
         );
         assert!(gs[1].landed.is_empty(), "the group ahead of the barrier is untouched");
+    }
+
+    /// The report phase five's stop conditions tell the reader to consult, on
+    /// the verb a governor polls **while composing the verdict** — not only on
+    /// `go`, which printed it after the verdict was written and the sweep had
+    /// run, so reading the evidence required passing the barrier first.
+    ///
+    /// Two members share a file (room left in it, so they rebase clean), an
+    /// unrelated land sits between theirs, and the next group has not started:
+    /// the arrangement the reflog walk exists for.
+    #[test]
+    fn a_shut_barrier_names_which_members_touched_one_file_while_it_stands_shut() {
+        let (_env, store, repo) = grounded("evidence");
+        std::fs::write(repo.join("shared.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git_run(&repo, &["add", "shared.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "shared"]);
+
+        for (id, line) in [("wl-001", 0usize), ("wl-002", 9)] {
+            member(&store, id, "review");
+            let dir = committed(&repo, id);
+            let mut lines: Vec<String> =
+                std::fs::read_to_string(dir.join("shared.txt")).unwrap().lines().map(String::from).collect();
+            lines[line] = id.to_string();
+            std::fs::write(dir.join("shared.txt"), lines.join("\n") + "\n").unwrap();
+            git_run(&dir, &["commit", "--quiet", "--all", "--message", "shared"]);
+            git_run(&dir, &["rebase", "--quiet", "master"]);
+            land(&repo, id);
+        }
+        // The group ahead: never started, which is what makes this a barrier
+        // somebody is standing in front of rather than a finished run.
+        member(&store, "wl-003", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001", "wl-002"]);
+        run(&store, &["add", "batch", "wl-003"]);
+        started(&store, "batch");
+        assert_eq!(gate_of(&store, "batch"), "after 1 ", "the work is over and nobody has passed it");
+
+        let w = store.worklist("batch").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let st = state(&store, &w, &pos);
+        let t = barrier_evidence(&store, &w, &pos, &st)
+            .expect("the gate is shut over a finished group, so the evidence is read");
+        let lines = touched_lines(&Paint::plain(), &t);
+        assert!(
+            lines.iter().any(|l| l.contains("same file") && l.contains("shared.txt")
+                && l.contains("wl-001") && l.contains("wl-002")),
+            "the file two of them shared, named before anybody judges the group: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("landed") && l.contains("wl-001") && l.contains("wl-002")),
+            "and the receipts beside it — the whole block `go` prints, from one walk: {lines:?}"
+        );
+
+        // The verb itself runs to completion with all of it in view.
+        assert_eq!(run(&store, &["next", "batch"]), 0);
+
+        // And nowhere else. Once the barrier is passed there is no shut gate,
+        // so a second poll reads nothing rather than reporting on a group
+        // whose trees are already gone.
+        run(&store, &["go", "batch", "clean"]);
+        let w = store.worklist("batch").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let st = state(&store, &w, &pos);
+        assert!(barrier_evidence(&store, &w, &pos, &st).is_none(), "no shut barrier, no walk");
+    }
+
+    /// The honest half of the report, on the surface the verdict is composed
+    /// at. A member whose change cannot be read back contributes no overlaps,
+    /// so a report that skipped it would turn *we could not look* into *we
+    /// looked and it was clean* — here, in front of the person about to judge
+    /// the group, not only afterwards in `go`'s receipt.
+    #[test]
+    fn a_member_nobody_can_read_back_is_named_at_the_barrier_rather_than_counted_clean() {
+        let (_env, store, _repo) = grounded("unread");
+        // At `review`, so both members are settled and the barrier stands
+        // open-able; but nothing ever ran for either, so no reflog places
+        // what either of them changed.
+        member(&store, "wl-001", "review");
+        member(&store, "wl-002", "review");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001", "wl-002"]);
+        started(&store, "batch");
+
+        let w = store.worklist("batch").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let st = state(&store, &w, &pos);
+        let t =
+            barrier_evidence(&store, &w, &pos, &st).expect("both settled, and the gate still shut");
+        let lines = touched_lines(&Paint::plain(), &t);
+        assert!(
+            lines.iter().any(|l| l.contains("could not be read back") && l.contains("wl-001") && l.contains("wl-002")),
+            "named where silence would read as a clean bill: {lines:?}"
+        );
+    }
+
+    /// The machine half of the same evidence, under the key names `go --json`
+    /// already established — present exactly where a walk ran, absent
+    /// otherwise. A governor parsing this must not be able to read an empty
+    /// array as *checked and clean* on a poll where nothing was checked.
+    #[test]
+    fn the_json_carries_the_evidence_at_the_barrier_and_omits_it_where_no_walk_ran() {
+        let (_env, store) = running("json-evidence");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+
+        let w = store.worklist("batch").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let st = state(&store, &w, &pos);
+        let t = barrier_evidence(&store, &w, &pos, &st).expect("shut over a settled group");
+        let v = next_json(&w, &pos, &st, &[], Some(&t));
+        assert_eq!(v["gate"], json!("after 1"));
+        assert_eq!(v["same_file"], json!([]), "the walk ran and found nothing shared");
+        assert_eq!(
+            v["landed"][0],
+            json!({ "member": "wl-001", "commit": null, "files": [] }),
+            "design-only work is a plain entry, not an unreadable one"
+        );
+        assert_eq!(v["unread"], json!([]), "and unreadable means something narrower than no repository");
+
+        task(&store, "wl-001", "doing");
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let st = state(&store, &w, &pos);
+        let t = barrier_evidence(&store, &w, &pos, &st);
+        assert!(t.is_none(), "the group is held again: nothing is read");
+        let v = next_json(&w, &pos, &st, &[], t.as_ref());
+        assert!(v.get("same_file").is_none(), "absent, not empty: {v}");
+        assert!(v.get("unread").is_none() && v.get("landed").is_none(), "{v}");
     }
 
     /// The plan drawing draws a count and never the mapping — there is no lead
