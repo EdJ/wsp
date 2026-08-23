@@ -74,8 +74,6 @@ pub(crate) use keys::Mode;
 // drive it through the reducer the way a reader would.
 #[cfg(test)]
 pub(crate) use keys::{Chore, Menu};
-#[cfg(test)]
-pub(crate) use rows::Card;
 // The live path reaches these through `super::keys`; only the storyboard's
 // tests need them from outside.
 #[cfg(test)]

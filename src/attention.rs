@@ -160,10 +160,6 @@ const SETTLE: i64 = 5 * 60;
 /// a person wants the machine's own reading.
 pub(crate) const KEY: &str = "daemon";
 
-/// The address of a signal nobody in particular answers for, where the level
-/// that carries it is defined. See [`crate::cmd_watch::EVERYONE`].
-pub(crate) use crate::cmd_watch::EVERYONE;
-
 /// The event kind an edge is logged and hooked under.
 ///
 /// Three words for three edges. `attention-moved` is deliberately not a
@@ -517,6 +513,9 @@ pub(crate) fn stand_down(store: &Store) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The level addressed to nobody in particular, under its own name rather
+    // than a re-export out here that nothing outside these tests reads.
+    use crate::cmd_watch::EVERYONE;
     use crate::model::{Group, Task, Worklist, WorklistStatus};
 
     /// A source that answers with whatever the test is holding.
