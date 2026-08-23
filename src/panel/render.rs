@@ -310,7 +310,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Query, g::QUESTION)], "a question", "an agent stopped on a task with a question written on it — drawn wherever that agent is, tree or strip"),
                 mark(&[(Style::Dim, g::MORE), (Style::Muted, " 2 more")], "overflow", "past the six-task cap; ↵ opens the tail in place"),
                 mark(&[(Style::Accent, g::WORKING), (Style::Plain, " "), (Style::Accent, "Trance Video")], "a pane", "nested under the task it claimed, or under the project it stands in — the same mark and the same colour the agents view gives it, so one pane does not read two ways in one glance"),
-                mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Muted, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped"),
+                mark(&[(Style::Dim, g::SHELL), (Style::Plain, " "), (Style::Dim, "Trance Lite")], "a shell", "a pane with no agent — never started, as against an idle one that stopped. The whole row is dim: a terminal somebody left open is furniture, not work waiting to be taken, and drawing it at unclaimed weight read it as a task until you stopped and read the glyph"),
                 mark(&[(Style::Accent, g::SEAT), (Style::Plain, " "), (Style::Accent, "governor · wsp")], "a governor", "the custodial slot on the project above it: one agent, answerable for everything beneath, drawn where it is answerable rather than under whatever task it borrowed. It names the project rather than the work, because it holds no work. T says something to it, ↵ goes there"),
                 mark(&[(Style::Dim, g::SEAT), (Style::Plain, " "), (Style::Muted, "governor · verb"), (Style::Plain, "  "), (Style::Muted, "empty")], "a vacancy", "the position outlives whoever was in it — wsp spawn -p <project> --govern fills it again. Drawn only where no slot above it is filled: a vacancy is an invitation, and one per level would bury the governors that exist"),
                 mark(&[(Style::Dim, g::NOTES)], "written on", "something is in this row's Overview or Details — E opens it"),
@@ -346,7 +346,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
             vec![
                 mark(&[(Style::Plain, "plain")], "claimed", "a task with an agent on it"),
                 mark(&[(Style::Muted, "muted")], "unclaimed", "a task nobody is on; agent names"),
-                mark(&[(Style::Dim, "dim")], "structure", "carets, counts, punctuation, finished work"),
+                mark(&[(Style::Dim, "dim")], "structure", "carets, counts, punctuation, finished work — and a whole row that is a bare command line: a pane with no agent in it is furniture, and dim is how the panel says nothing here is work"),
                 mark(&[(Style::Bold, "bold")], "project", "project names only"),
                 mark(&[(Style::Accent, "accent")], "live", "running agents and work in flight"),
                 mark(&[(Style::Warn, "warn")], "waiting on you", "an agent stopped in front of you, and work blocked without a question"),

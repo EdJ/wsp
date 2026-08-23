@@ -2659,7 +2659,21 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             // difference legible on its own.
             let (st, dot) =
                 if agent.agent { state.mark() } else { (Style::Dim, glyph::SHELL) };
-            let ink = if agent.agent { state.ink() } else { Style::Muted };
+            // And the whole row goes with it — render-014. The mark alone did
+            // not carry it: `▫` drew dim beside a title drawn [`Style::Muted`],
+            // which is the colour of unclaimed work, so a command line read as
+            // a task worth taking until you stopped and read the glyph. Dim is
+            // the one role left that says the true thing — structure, a place,
+            // nothing in flight — and it makes the distinction a property of
+            // the row rather than of one column: every pane carrying an agent
+            // keeps a mark and an ink at [`Style::Muted`] or brighter, so down
+            // a rail a few columns wide the eye sorts work from empty terminal
+            // without reading either. No eighth style for it: seven roles is
+            // what a reader holds, and a hue would spend one on the only thing
+            // here that is not work at all. The shape still says it alone — see
+            // [`glyph::SHELL`] — which is what keeps this honest on a terminal
+            // without colour.
+            let ink = if agent.agent { state.ink() } else { Style::Dim };
             l.push(st, dot);
             l.push(Style::Plain, " ");
             // Standing on its own, in the agents view: the project it belongs
@@ -2931,6 +2945,86 @@ mod tests {
         // And the task-blocked reading is untouched: same attention, different
         // action, so they may not be folded into one another.
         assert_eq!(agent_state("idle", Some(Status::Blocked), false), AgentState::Blocked);
+    }
+
+    /// A workspace with no agent in it is a command line, and render-014 is
+    /// the row that stopped drawing it as unclaimed work. `▫` was already its
+    /// own mark, but the title sat at [`Style::Muted`] beside it — the colour
+    /// of a task worth taking — so a rail a few columns wide read a bare
+    /// terminal as claimable until somebody stopped and read the glyph. The
+    /// whole row dims instead, which makes the split scannable rather than
+    /// per-row reading: **every pane carrying an agent keeps something on its
+    /// row at [`Style::Muted`] or brighter, and a command line is dim end to
+    /// end.** No eighth role was minted for it — seven is the palette the
+    /// reader holds — and the shape still carries the fact on its own, which
+    /// is what keeps this true on a terminal without colour.
+    #[test]
+    fn a_command_line_draws_dimmer_than_any_pane_carrying_an_agent() {
+        let ink = |row: &Row| {
+            match render_row(row, 34, None) {
+                l => l
+                    .spans
+                    .iter()
+                    .filter(|s| !s.text.trim().is_empty())
+                    .map(|s| (s.style, s.text.clone()))
+                    .collect::<Vec<_>>(),
+            }
+        };
+
+        // The shell: nothing on the row outranks dim.
+        let shell = Row::Agent {
+            agent: AgentRef { pane: "w9:p1".into(), agent: false, ..Default::default() },
+            title: "zsh".into(),
+            depth: 1,
+            state: AgentState::Quiet,
+            census: None,
+        };
+        let drawn = ink(&shell);
+        assert!(
+            drawn.iter().all(|(st, _)| *st == Style::Dim),
+            "a command line is furniture, drawn at structure weight: {drawn:?}"
+        );
+        assert!(drawn.iter().any(|(_, t)| t == glyph::SHELL), "and the glyph still says it alone");
+
+        // An idle agent on the same rail keeps its mark above dim — here
+        // muted, the quietest any agent row gets — which is the contrast the
+        // eye sorts by.
+        let spare = Row::Agent {
+            agent: AgentRef {
+                pane: "w9:p2".into(),
+                agent: true,
+                state: "idle".into(),
+                ..Default::default()
+            },
+            title: "unassigned".into(),
+            depth: 1,
+            state: AgentState::Spare,
+            census: None,
+        };
+        let drawn = ink(&spare);
+        assert!(
+            drawn.iter().any(|(st, _)| *st != Style::Dim),
+            "an agent row always carries something brighter than structure: {drawn:?}"
+        );
+
+        // Pinned, as the On-a-task marks are: whatever the row now draws, the
+        // glossary draws too.
+        let legend = crate::panel::render::legend()
+            .iter()
+            .flat_map(|(_, _, ms)| ms.iter())
+            .find(|m| m.name == "a shell")
+            .expect("the legend still has an entry for a shell")
+            .sample
+            .spans
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| s.style)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            legend,
+            vec![Style::Dim, Style::Dim],
+            "the legend draws a shell exactly as the row does"
+        );
     }
 
     fn task(id: &str, project: Option<&str>, status: &str) -> Task {
