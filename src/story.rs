@@ -1622,7 +1622,13 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
         panes: kanban::seated(w.panes.clone(), &w.governors),
     };
 
-    let shot = |title: &str, caption: &str, scope: Scope, cur: Cursor, done: bool, note: &str| {
+    let shot = |title: &str,
+                caption: &str,
+                scope: Scope,
+                cur: Cursor,
+                mode: &kanban::Mode,
+                done: bool,
+                note: &str| {
         let board = kanban::collect(&ctx, &scope, done);
         let target = match board.card_at(&cur) {
             Some(c) => format!("task {}", c.id),
@@ -1634,20 +1640,33 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
             gesture: "K".into(),
             target,
             claims: Vec::new(),
-            html: panel::to_html(&kanban::frame(&board, &cur, BW, BH, note), BW),
+            html: panel::to_html(&kanban::frame(&board, &cur, mode, BW, BH, note), BW),
         }
     };
 
     // Where a key would land, pushed through the same reducer the live board
-    // runs — so a scene can only show a state you could arrive at.
-    let after = |scope: Scope, done: bool, keys: &[Key]| -> Cursor {
-        let board = kanban::collect(&ctx, &scope, done);
-        let mut cur = Cursor::default();
-        for k in keys {
-            kanban::apply_key(*k, &board, &mut cur);
-        }
-        cur
-    };
+    // runs — so a scene can only show a state you could arrive at. The mode
+    // comes back beside the cursor for the same reason it lives beside it in
+    // the loops: a lit rail is a state the reader can be standing in.
+    let after =
+        |scope: Scope, done: bool, keys: &[Key]| -> (Cursor, kanban::Mode) {
+            let board = kanban::collect(&ctx, &scope, done);
+            let mut cur = Cursor::default();
+            let mut mode = kanban::Mode::default();
+            for k in keys {
+                kanban::apply_key(*k, &board, &mut cur, &mut mode);
+            }
+            (cur, mode)
+        };
+
+    let (scoped_cur, scoped_mode) =
+        after(Scope::Project("vst".into()), false, &[Key::Char('l'), Key::Char('j')]);
+    let (done_cur, done_mode) =
+        after(Scope::Project("tooling".into()), true, &[Key::Char('l'), Key::Char('l'), Key::Char('l')]);
+    let (empty_cur, empty_mode) = after(Scope::Inbox, false, &[Key::Char('l')]);
+    // `c`, one card over: the rail lit on its second agent, the way a reader
+    // arrives there when the first spare is not the one they had in mind.
+    let (hand_cur, hand_mode) = after(Scope::Everything, false, &[Key::Char('c'), Key::Char('l')]);
 
     vec![
         shot(
@@ -1655,6 +1674,16 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
             "K opens the work by state rather than by tree: one column per lane, cards in each. The same join the panel makes — what herdr says about a pane, against what the store holds — drawn as a mark on the card an agent is on. The column the cursor is in is named in the live ink, because a board with three empty columns otherwise gives no clue where a verb would land.",
             Scope::Everything,
             Cursor::default(),
+            &kanban::Mode::default(),
+            false,
+            "",
+        ),
+        shot(
+            "A card, handed over",
+            "c on a card lights the rail at the foot, and the rail is already the answer to who could take it — only agents holding nothing are offered, since an idle agent parked on a blocked task is stopped, not free. ←→ moves the light, ↵ runs `claim --pane` and types the work order into the pane behind an empty context, esc walks away. A mode rather than a widget, so the columns stay up while you choose: you are picking an agent for this card, and the card has to still be visible.",
+            Scope::Everything,
+            hand_cur,
+            &hand_mode,
             false,
             "",
         ),
@@ -1662,7 +1691,8 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
             "Scoped to a project",
             "A board of one project and everything filed beneath it — sub-projects included, since a parent whose work all lives in its children would otherwise open as four empty columns. Scoped, the cards stop naming their project: it is the heading.",
             Scope::Project("vst".into()),
-            after(Scope::Project("vst".into()), false, &[Key::Char('l'), Key::Char('j')]),
+            scoped_cur,
+            &scoped_mode,
             false,
             "",
         ),
@@ -1670,7 +1700,8 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
             "Finished work, brought back",
             "A shows the done column. Off by default because a board is what is in flight, and a year of completions would be the widest column on it — but the question \"what did we finish\" is asked often enough to be one key away.",
             Scope::Project("tooling".into()),
-            after(Scope::Project("tooling".into()), true, &[Key::Char('l'), Key::Char('l'), Key::Char('l')]),
+            done_cur,
+            &done_mode,
             true,
             "",
         ),
@@ -1678,7 +1709,8 @@ fn board_scenes(w: &Snapshot) -> Vec<Scene> {
             "A verb with nothing under it",
             "The cursor in an empty column. A key aimed at nothing has to say so in the footer — silence reads as a board that has stopped answering, which is the one thing a live surface must never look like.",
             Scope::Inbox,
-            after(Scope::Inbox, false, &[Key::Char('l')]),
+            empty_cur,
+            &empty_mode,
             false,
             "nothing here to send to review",
         ),

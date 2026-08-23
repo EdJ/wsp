@@ -810,6 +810,9 @@ struct BoardPage {
     /// questions, and `A` on the board is a column appearing rather than rows.
     show_done: bool,
     cur: kanban::Cursor,
+    /// The board's own half-answered questions, held here for the same reason
+    /// the cursor is: the page owns them, and a rebuild must not drop one.
+    mode: kanban::Mode,
     board: kanban::Board,
 }
 
@@ -821,7 +824,7 @@ impl BoardPage {
         panes: Vec<AgentRef>,
     ) -> BoardPage {
         let board = kanban::collect(&kanban::Ctx::of(store, panes), &scope, show_done);
-        BoardPage { scope, show_done, cur: kanban::Cursor::default(), board }
+        BoardPage { scope, show_done, cur: kanban::Cursor::default(), mode: kanban::Mode::default(), board }
     }
 
     /// Rebuild from the store, and put the cursor back on the card it was on.
@@ -859,7 +862,7 @@ impl Page {
     /// `super::render::frame` takes a `&mut View`.
     fn frame(&mut self, note: &str, w: usize, h: usize) -> Vec<super::render::Line> {
         match self {
-            Page::Board(p) => kanban::frame(&p.board, &p.cur, w, h, note),
+            Page::Board(p) => kanban::frame(&p.board, &p.cur, &p.mode, w, h, note),
             Page::Task(p) => {
                 let mut out = crate::detail::frame(
                     &p.ctx,
@@ -945,8 +948,9 @@ fn board_key(
     p: &mut BoardPage,
     ui: &mut Ui,
     self_ws: Option<&str>,
+    tx: &Sender<Msg>,
 ) -> FromPage {
-    match kanban::apply_key(k, &p.board, &mut p.cur) {
+    match kanban::apply_key(k, &p.board, &mut p.cur, &mut p.mode) {
         kanban::Action::None => FromPage::Nothing,
         kanban::Action::Say(m) => {
             say(ui, m);
@@ -962,10 +966,32 @@ fn board_key(
         // and the commit all happen because it is the same path a person at a
         // shell would take. The card is about to be in another column and the
         // cursor goes with it, so its id is named while it is still in hand.
-        kanban::Action::Run { argv, task } => {
+        //
+        // A claim that landed says so through the sentence that went with it —
+        // what you want to know about a hand-over is whether the agent was
+        // told — and the typing runs off this loop, where the clear behind the
+        // sentence can wait seconds without the page freezing. A refusal with a
+        // stronger form on offer becomes the y/n the form exists for, held in
+        // the page's mode rather than in a note that would expire.
+        kanban::Action::Run { argv, escalate, then, task } => {
             match run_wsp(&argv) {
-                Ok(m) => say(ui, m.label),
-                Err(e) => say(ui, e),
+                Ok(m) => {
+                    say(ui, then.as_ref().map(|t| t.note.clone()).unwrap_or(m.label));
+                    if let Some(t) = then {
+                        tell(t, ui, tx);
+                    }
+                }
+                Err(e) => match escalate {
+                    Some(forced) => {
+                        p.mode = kanban::Mode::Confirm {
+                            question: e,
+                            argv: forced,
+                            then,
+                            task: task.clone(),
+                        };
+                    }
+                    None => say(ui, e),
+                },
             }
             FromPage::Refetch(Some(task))
         }
@@ -1255,7 +1281,7 @@ pub(super) fn event_loop(
             // would be the seam showing. See [`board_key`] and [`task_key`].
             Msg::Key(k) if page.is_some() => {
                 let acted = page.as_mut().map(|p| match p {
-                    Page::Board(b) => board_key(k, b, &mut ui, self_ws),
+                    Page::Board(b) => board_key(k, b, &mut ui, self_ws, &tx),
                     Page::Task(t) => task_key(k, t, &mut ui, self_ws, h),
                 });
                 match acted {

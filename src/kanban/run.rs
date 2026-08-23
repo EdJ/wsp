@@ -6,6 +6,7 @@
 //! herdr's fan-out for a pane that can wait a tenth of a second.
 
 use std::io::{Read, Write};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::herdr;
@@ -14,7 +15,7 @@ use crate::panel::{self, to_ansi};
 use crate::resolve::Index;
 use crate::store::Store;
 
-use super::{apply_key, collect, frame, Action, Ctx, Cursor, Scope};
+use super::{apply_key, collect, frame, Action, Ctx, Cursor, Mode, Scope};
 
 /// How long the footer keeps what it was told.
 const NOTE: Duration = Duration::from_secs(4);
@@ -34,9 +35,10 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
         let (w, _) = panel::term_size();
         // Tall enough for the longest column: a pipe has no bottom edge, and a
         // board that scrolled would be hiding cards from a reader who cannot
-        // press a key.
+        // press a key. A pipe is never mid-way through anything, so the frame
+        // draws browse.
         let tallest = board.columns.iter().map(|c| c.cards.len()).max().unwrap_or(0);
-        for l in frame(&board, &Cursor::default(), w.max(80), tallest + 9, "") {
+        for l in frame(&board, &Cursor::default(), &Mode::default(), w.max(80), tallest + 9, "") {
             println!("{}", l.text().trim_end());
         }
         return 0;
@@ -76,23 +78,36 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
     let started_as = crate::util::exe_stamp();
     let mut board = collect(&Ctx::live(store), scope, show_done);
     let mut cur = Cursor::default();
+    let mut mode = Mode::default();
     let mut note: Option<(String, Instant)> = None;
     let mut painted = String::new();
     let mut fingerprint = store.fingerprint();
     let mut last_poll = Instant::now();
+
+    // What the off-loop work has to say back. The only off-loop work is
+    // sending the sentence that follows a claim — [`panel::send_tell`] — and
+    // that can take seconds, because a clear waits for the session that
+    // replaces the one it ended. The same bargain the panel makes: the footer
+    // speaks at once, and a failure to type catches up when it happens.
+    let (tx, rx) = mpsc::channel::<String>();
 
     let Ok(mut tty) = std::fs::File::open("/dev/tty") else { return 1 };
     let mut keys = input::Keys::new();
     let mut pressed: Vec<Key> = Vec::new();
 
     loop {
+        // Late news from the typing thread. Drained before the frame is built,
+        // so a failed hand-over is on the next screenful rather than never.
+        while let Ok(line) = rx.try_recv() {
+            note = Some((line, Instant::now()));
+        }
         let text = note
             .as_ref()
             .filter(|(_, at)| at.elapsed() < NOTE)
             .map(|(m, _)| m.clone())
             .unwrap_or_default();
         let (w, h) = panel::term_size();
-        let now = to_ansi(&frame(&board, &cur, w, h, &text), w, h);
+        let now = to_ansi(&frame(&board, &cur, &mode, w, h, &text), w, h);
         if now != painted {
             print!("{now}");
             let _ = std::io::stdout().flush();
@@ -118,7 +133,7 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
         // command just run has moved it to.
         let mut follow: Option<String> = None;
         for k in pressed.drain(..) {
-            match apply_key(k, &board, &mut cur) {
+            match apply_key(k, &board, &mut cur, &mut mode) {
                 Action::None => {}
                 Action::Quit => return 0,
                 Action::Refetch => rebuild = true,
@@ -165,11 +180,40 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
                 }
                 // The CLI does the work, exactly as the panel's keys do: the
                 // event log, the hooks and the commit all happen because it is
-                // the same code path a person at a shell would take.
-                Action::Run { argv, task } => {
+                // the same code path a person at a shell would take. A refusal
+                // with a stronger form on offer goes back as the y/n the form
+                // exists for — what the CLI said is the question, because the
+                // code that knows the rule worded it.
+                //
+                // On success the sentence goes in behind a clear, off this
+                // loop: waiting for the session that replaces the one the clear
+                // ends is seconds, and a board frozen right after ↵ reads as
+                // one that has died. The footer takes the sentence's own line —
+                // what you want to know about a claim is whether the agent was
+                // told — and the thread reports only a failure to type.
+                Action::Run { argv, escalate, then, task } => {
                     match panel::run_wsp(&argv) {
-                        Ok(m) => note = Some((m.label, Instant::now())),
-                        Err(e) => note = Some((e, Instant::now())),
+                        Ok(m) => {
+                            note = Some((
+                                then.as_ref().map(|t| t.note.clone()).unwrap_or(m.label),
+                                Instant::now(),
+                            ));
+                            if let Some(t) = then {
+                                let tx = tx.clone();
+                                std::thread::spawn(move || {
+                                    if let Err(e) = panel::send_tell(&t) {
+                                        let _ = tx.send(e);
+                                    }
+                                });
+                            }
+                        }
+                        Err(e) => match escalate {
+                            Some(forced) => {
+                                mode =
+                                    Mode::Confirm { question: e, argv: forced, then, task: task.clone() };
+                            }
+                            None => note = Some((e, Instant::now())),
+                        },
                     }
                     // The card is about to be in another column, and the cursor
                     // goes with it. Named here, while the id is still in hand:

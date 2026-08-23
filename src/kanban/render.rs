@@ -9,7 +9,7 @@ use crate::model::{Priority, Status};
 use crate::panel::{self, glyph, line, Line, Style};
 use crate::util;
 
-use super::{Board, Card, Cursor};
+use super::{Board, Card, Cursor, Mode};
 
 /// Rows above the columns: the title and its rule.
 const HEAD: usize = 2;
@@ -257,26 +257,52 @@ fn header(board: &Board, w: usize) -> Line {
 /// One line, and it earns its row only when there is somebody on it. The height
 /// changes when an agent goes free, which is rare and is news; it does not
 /// change as the cursor moves, which is what would make the cards jump.
-fn spare_rail(board: &Board, w: usize) -> Option<Line> {
+///
+/// `c` is what the line is *for*. In [`Mode::Hand`] it is lit rather than
+/// listed: the chosen agent moves into the ink the board uses for "this is
+/// live", the rest stand exactly as they were, and the count gives way to
+/// naming the card — the rail is no longer reporting who is free, it is asking
+/// where the work goes.
+fn spare_rail(board: &Board, w: usize, mode: &Mode) -> Option<Line> {
     let spare = board.spare();
     if spare.is_empty() {
         return None;
     }
+    let lit = match mode {
+        Mode::Hand { task, sel } => Some((task.as_str(), *sel)),
+        _ => None,
+    };
     let mut l = Line::default();
     let (st, mark) = crate::panel::AgentState::Spare.mark();
     l.push(st, mark);
-    l.push(Style::Muted, format!(" spare {}", spare.len()));
-    l.push(Style::Dim, "  ·  ");
+    match &lit {
+        Some((task, _)) => {
+            l.push(Style::Accent, format!(" hand {task}"));
+            l.push(Style::Dim, " ▸ ");
+        }
+        None => {
+            l.push(Style::Muted, format!(" spare {}", spare.len()));
+            l.push(Style::Dim, "  ·  ");
+        }
+    }
     let mut left = 0;
     for (i, a) in spare.iter().enumerate() {
         // Everything after the first has to fit whole, or the line ends in half
         // a name — which reads as a name rather than as a truncation.
+        //
+        // Selection is ink here, as it is everywhere else on this board: the
+        // chosen agent's name and pane move into the live ink and nothing else
+        // about the line moves, so the light travels without the rail jumping.
+        let chosen = lit.as_ref().is_some_and(|(_, sel)| i == *sel);
         let mut want = Line::default();
         if i > 0 {
             want.push(Style::Dim, "   ");
         }
-        want.push(Style::Muted, util::truncate(&a.name, 32));
-        want.push(Style::Dim, format!(" · {}", a.pane));
+        want.push(
+            if chosen { Style::Accent } else { Style::Muted },
+            util::truncate(&a.name, 32),
+        );
+        want.push(if chosen { Style::Accent } else { Style::Dim }, format!(" · {}", a.pane));
         if l.width() + want.width() > w.saturating_sub(10) && i > 0 {
             left = spare.len() - i;
             break;
@@ -340,10 +366,17 @@ fn dock(board: &Board, cur: &Cursor, w: usize) -> Vec<Line> {
     vec![line(Style::Plain, util::truncate(&card.title, w)), facts]
 }
 
-pub(crate) fn frame(board: &Board, cur: &Cursor, w: usize, h: usize, note: &str) -> Vec<Line> {
+pub(crate) fn frame(
+    board: &Board,
+    cur: &Cursor,
+    mode: &Mode,
+    w: usize,
+    h: usize,
+    note: &str,
+) -> Vec<Line> {
     let n = board.columns.len();
     let ws = widths(n, w);
-    let rail = spare_rail(board, w);
+    let rail = spare_rail(board, w, mode);
     let body = h.saturating_sub(HEAD + COLHEAD + DOCK + usize::from(rail.is_some())).max(1);
 
     let mut out: Vec<Line> = vec![header(board, w), line(Style::Dim, "─".repeat(w))];
@@ -411,13 +444,38 @@ pub(crate) fn frame(board: &Board, cur: &Cursor, w: usize, h: usize, note: &str)
     // you are looking at" — the order you would ask them in.
     out.extend(rail);
     out.extend(dock(board, cur, w));
-    out.push(if note.is_empty() {
-        line(
+    // The last line belongs to whichever question is open. A confirm outranks
+    // even a fresh note — a y/n that a four-second note could displace would be
+    // a question that stops being asked while it waits — and the pick's hint
+    // yields only to a note, because the rail already says most of it.
+    out.push(match mode {
+        Mode::Confirm { question, .. } => {
+            let mut l = Line::default();
+            l.push(Style::Warn, util::truncate(question, w.saturating_sub(6)));
+            l.push(Style::Dim, "  y/n");
+            l
+        }
+        _ if !note.is_empty() => line(Style::Accent, util::truncate(note, w)),
+        Mode::Hand { task, sel } => {
+            let spares = board.spare();
+            let mut l = Line::default();
+            match spares.get(*sel).or_else(|| spares.last()) {
+                Some(a) => {
+                    l.push(
+                        Style::Accent,
+                        format!("hand {task} ▸ {}", util::truncate(&a.name, w.saturating_sub(40))),
+                    );
+                    l.push(Style::Dim, "   ←→ choose · ↵ give · esc walk away");
+                }
+                None => l.push(Style::Warn, "nobody is spare any more"),
+            }
+            l.fit(w);
+            l
+        }
+        _ => line(
             Style::Dim,
-            "hjkl move · s v d o set · < > shift · ! priority · ↵ open it · E edit · A done · q close",
-        )
-    } else {
-        line(Style::Accent, util::truncate(note, w))
+            "hjkl move · s v d o set · < > shift · c hand · ! priority · ↵ open it · E edit · A done · q close",
+        ),
     });
     out.truncate(h);
     out
@@ -512,6 +570,11 @@ mod tests {
             pane: pane.into(),
             task: None,
             held: None,
+            who: crate::live::AgentRef {
+                pane: pane.into(),
+                kind: "claude".into(),
+                ..Default::default()
+            },
         }
     }
 
@@ -523,14 +586,14 @@ mod tests {
     fn the_spare_rail_costs_a_row_only_when_there_is_somebody_on_it() {
         use crate::panel::AgentState;
         let busy = board_with(vec![agent(AgentState::Working, "Trance Video", "w1:p1")]);
-        assert!(spare_rail(&busy, 120).is_none());
-        let cards_when_busy = frame(&busy, &Cursor::default(), 120, 30, "").len();
+        assert!(spare_rail(&busy, 120, &Mode::Browse).is_none());
+        let cards_when_busy = frame(&busy, &Cursor::default(), &Mode::Browse, 120, 30, "").len();
 
         let free = board_with(vec![
             agent(AgentState::Working, "Trance Video", "w1:p1"),
             agent(AgentState::Spare, "Verb UI", "w2:p1"),
         ]);
-        let rail = spare_rail(&free, 120).expect("somebody is free and the board should say so");
+        let rail = spare_rail(&free, 120, &Mode::Browse).expect("somebody is free and the board should say so");
         let text = rail.text();
         assert!(text.contains("spare 1"), "{text}");
         assert!(text.contains("Verb UI"), "{text}");
@@ -539,9 +602,50 @@ mod tests {
 
         // The frame is the same height either way — the rail comes out of the
         // columns, not out of the pane.
-        let with_rail = frame(&free, &Cursor::default(), 120, 30, "");
+        let with_rail = frame(&free, &Cursor::default(), &Mode::Browse, 120, 30, "");
         assert_eq!(with_rail.len(), cards_when_busy);
         assert_eq!(with_rail.len(), 30);
+    }
+
+    /// Picking lights the rail instead of listing it: the chosen agent in the
+    /// live ink, the card named where the count was, and the footer saying what
+    /// ↵ will do. The columns are untouched — that is why this is a mode and
+    /// not a widget.
+    #[test]
+    fn picking_lights_the_rail_and_says_what_enter_will_do() {
+        use crate::panel::AgentState;
+        let b = board_with(vec![
+            agent(AgentState::Spare, "Verb UI", "w2:p1"),
+            agent(AgentState::Spare, "Jolt", "w5P:p2"),
+        ]);
+        let hand = |sel| Mode::Hand { task: "t-034".into(), sel };
+
+        // The first spare lit, the second still dim. Both names stay on the
+        // line — choosing among agents you cannot see is not choosing.
+        let rail = spare_rail(&b, 140, &hand(0)).expect("somebody is on the rail");
+        let ink_of = |rail: &Line, name: &str| {
+            rail.spans
+                .iter()
+                .find(|s| s.text.contains(name))
+                .unwrap_or_else(|| panic!("{name} is not on the rail: {}", rail.text()))
+                .style
+        };
+        assert_eq!(ink_of(&rail, "Verb UI"), Style::Accent);
+        assert_eq!(ink_of(&rail, "Jolt"), Style::Muted);
+        assert!(rail.text().contains("hand t-034"), "{}", rail.text());
+        assert!(!rail.text().contains("spare"), "the count gave way to the card: {}", rail.text());
+
+        // The arrows move the light, not a cursor.
+        let rail = spare_rail(&b, 140, &hand(1)).expect("still on the rail");
+        assert_eq!(ink_of(&rail, "Verb UI"), Style::Muted);
+        assert_eq!(ink_of(&rail, "Jolt"), Style::Accent);
+
+        // And the footer names the deed by id, so what ↵ says is what ↵ does
+        // even if a rebuild has slid another card under the cursor.
+        let f = frame(&b, &Cursor::default(), &hand(0), 140, 30, "");
+        let hint = f.last().expect("a footer").text();
+        assert!(hint.contains("hand t-034 ▸ Verb UI"), "{hint}");
+        assert!(hint.contains("↵ give"), "{hint}");
     }
 
     /// Every agent is a mark, and the count is never what gets cut. A strip too

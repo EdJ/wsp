@@ -400,14 +400,18 @@ pub(super) fn tell_released(a: &AgentRef, task: &str) -> Option<Tell> {
 }
 
 /// Tell an agent about a task it has just been handed. The sentence itself is
-/// [`crate::cmd_spawn::claimed_text`], which is also what an agent `spawn` has
+/// [`crate::cmd_spawn::work_order`], which is also what an agent `spawn` has
 /// just started hears — one work order, however it was handed over.
 ///
 /// `Running` because this agent has been sitting in that pane since before the
 /// claim existed: its session-start brief was a brief about holding nothing, so
 /// unlike a spawned agent it does have to go and fetch. `spawn`'s case is the
 /// other arm, and the difference is the whole reason the case is named.
-pub(super) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
+///
+/// Out here rather than `pub(super)` because the board's `c` reaches the same
+/// sentence: a hand-over is one hand-over however it was started, and two
+/// wordings would be two contracts — see [`crate::kanban::keys::Mode::Hand`].
+pub(crate) fn tell_claimed(a: &AgentRef, task: &str) -> Tell {
     Tell {
         pane: a.pane.clone(),
         text: Some(crate::cmd_spawn::work_order(task, crate::cmd_spawn::Handover::Running)),
@@ -490,7 +494,7 @@ const CLEAR_POLL_MS: u64 = 100;
 /// through whatever it was thinking about before. `spawn` hands over the same
 /// sentence to an agent that has just booted, and this is what makes the two
 /// hand-overs the same hand-over.
-pub(super) fn send_tell(t: &Tell) -> Result<(), String> {
+pub(crate) fn send_tell(t: &Tell) -> Result<(), String> {
     if let Some(clear) = &t.clear {
         clear_agent(&t.pane, clear)?;
     }
@@ -1385,12 +1389,33 @@ pub(crate) fn run_wsp(argv: &[String]) -> Result<Made, String> {
                 });
             Ok(Made { label: argv.join(" "), id: made })
         }
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr);
-            let first = err.lines().next().unwrap_or("failed").trim();
-            Err(first.strip_prefix("wsp: ").unwrap_or(first).to_string())
-        }
+        Ok(o) => Err(refusal_reason(
+            &String::from_utf8_lossy(&o.stdout),
+            &String::from_utf8_lossy(&o.stderr),
+        )),
         Err(e) => Err(format!("cannot run wsp: {e}")),
+    }
+}
+
+/// What a refused command said, in the words worth showing.
+///
+/// A command that refused in JSON said *why* as data — `claim` is the one
+/// today, and its reasons are what a y/n over the stronger form has to show,
+/// because "`✗` id title" does not tell anyone what answering yes would do.
+/// Quoted in preference to stderr, whose first line is that banner; commands
+/// that refuse in prose fall back to it exactly as they always did.
+fn refusal_reason(stdout: &str, stderr: &str) -> String {
+    let said = stdout
+        .lines()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .filter(|v| v.get("error").is_some())
+        .and_then(|v| v.get("reason").and_then(|x| x.as_str()).map(str::to_string));
+    match said {
+        Some(why) => why,
+        None => {
+            let first = stderr.lines().next().unwrap_or("failed").trim();
+            first.strip_prefix("wsp: ").unwrap_or(first).to_string()
+        }
     }
 }
 
@@ -2166,6 +2191,34 @@ mod tests {
 
     fn said(ui: &Ui) -> String {
         ui.message.clone().expect("the footer says why").0
+    }
+
+    // ---- refusals, as the question they become ----
+
+    /// A refusal that spoke JSON is quoted for its reason, not its banner. The
+    /// y/n over a forced claim has to tell someone what answering yes does —
+    /// "already done — claiming it would reopen it" does that; "`✗` id title"
+    /// does not.
+    #[test]
+    fn a_refusal_that_said_why_is_quoted_for_the_why() {
+        let stdout = "{\"error\":\"done\",\"task\":\"t-01\",\
+                      \"reason\":\"already done — claiming it would reopen it\"}\n";
+        assert_eq!(
+            refusal_reason(stdout, "✗ t-01  a title\n"),
+            "already done — claiming it would reopen it",
+        );
+    }
+
+    /// And prose falls back to exactly what it always said — first line of
+    /// stderr, `wsp:` prefix off. Every command that refuses without JSON keeps
+    /// its old words on the footer and in the questions.
+    #[test]
+    fn a_prose_refusal_still_says_what_stderr_said() {
+        assert_eq!(refusal_reason("", "wsp: no such project `x`\n"), "no such project `x`");
+        assert_eq!(refusal_reason("", ""), "failed");
+        // Success-shaped JSON (an `id`, no `error`) is not a reason and never
+        // masquerades as one.
+        assert_eq!(refusal_reason("{\"id\":\"t-02\"}\n", "wsp: boom\n"), "boom");
     }
 
     // ---- U ----

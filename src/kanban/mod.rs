@@ -19,7 +19,7 @@ mod keys;
 mod render;
 mod run;
 
-pub(crate) use keys::{apply_key, Action, Cursor};
+pub(crate) use keys::{apply_key, Action, Cursor, Mode};
 pub(crate) use render::frame;
 pub use run::run;
 
@@ -152,6 +152,13 @@ pub(crate) struct Agent {
     pub(crate) task: Option<String>,
     /// How long it has held it.
     pub(crate) held: Option<String>,
+    /// The pane row this was built from — the acting record beside the drawing
+    /// one. The fields above are what a board *says* about an agent; handing
+    /// work over needs two things saying will not give you: which kind it is
+    /// (`clear_of` spells an empty context per kind) and the uncut name for the
+    /// sentence that goes into the pane. Kept whole rather than picked apart so
+    /// the next verb that acts on an agent gets both for free.
+    pub(crate) who: AgentRef,
 }
 
 pub(crate) struct Board {
@@ -419,6 +426,7 @@ pub(crate) fn collect(ctx: &Ctx, scope: &Scope, show_done: bool) -> Board {
                     .and_then(|c| c.as_str())
                     .filter(|c| !c.is_empty())
                     .map(|c| util::duration_human(util::since(c))),
+                who: p.clone(),
             }
         })
         .collect();

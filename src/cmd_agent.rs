@@ -2108,6 +2108,18 @@ fn blocked_question(t: &Task) -> Option<String> {
     })
 }
 
+/// Why claiming finished work is refused, in one sentence.
+///
+/// Said twice over — the pretty block for a person at a shell, and as
+/// `"reason"` beside `"error"` under `--json` — and they must not drift. The
+/// surfaces that run this command with `--force` in their pocket (`c`, on the
+/// tree or the board) quote the reason as the question the force is the answer
+/// to, and a banner naming only id and title would make that question
+/// unanswerable.
+fn done_reason(t: &Task) -> String {
+    format!("already {} — claiming it would reopen it", t.status_raw)
+}
+
 pub fn claim(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp claim <id>   (inside a herdr pane)");
@@ -2175,9 +2187,14 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // pointed at a completed task while testing the refusal below, and quietly
     // undid somebody else's finished work.
     if !t.status().is_open() && !args.has("force") {
+        let why = done_reason(&t);
+        if args.json() {
+            println!("{}", json!({ "error": "done", "task": t.id, "reason": why }));
+            return 1;
+        }
         let p = Paint::new();
         eprintln!("{} {}  {}", p.yellow("✗"), p.bold(&t.id), t.title);
-        eprintln!("  {}", p.dim(&format!("already {} — claiming it would reopen it", t.status_raw)));
+        eprintln!("  {}", p.dim(&why));
         eprintln!("  {}", p.dim(&format!("wsp claim {} --force   to pick it back up", t.id)));
         return 1;
     }
@@ -2195,12 +2212,17 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // Refused rather than warned about, for the same reason as the two guards
     // around it: a line above the work still leaves the block gone.
     if t.status() == Status::Blocked && !args.has("force") {
+        let why = match blocked_question(&t) {
+            Some(q) => format!("blocked, waiting on an answer: {q}"),
+            None => "blocked — a decision is owed before it is worked".into(),
+        };
+        if args.json() {
+            println!("{}", json!({ "error": "blocked", "task": t.id, "reason": why }));
+            return 1;
+        }
         let p = Paint::new();
         eprintln!("{} {}  {}", p.yellow("✗"), p.bold(&t.id), t.title);
-        match blocked_question(&t) {
-            Some(q) => eprintln!("  {}", p.dim(&format!("blocked, waiting on an answer: {q}"))),
-            None => eprintln!("  {}", p.dim("blocked — a decision is owed before it is worked")),
-        }
+        eprintln!("  {}", p.dim(&why));
         eprintln!("  {}", p.dim(&format!("wsp claim {} --force   to work it anyway", t.id)));
         return 1;
     }
@@ -2223,11 +2245,27 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
             .map(|c| util::duration_human(util::since(c)))
             .unwrap_or_default();
         if args.json() {
+            // The reason in one line, for the same reader as the two above:
+            // whoever is holding this task, said where the question can quote
+            // it.
+            let who: Vec<String> = held_by
+                .iter()
+                .map(|h| {
+                    format!(
+                        "{} in {} · {}{}",
+                        if h.agent.is_empty() { "a shell".into() } else { h.agent.clone() },
+                        h.pane_id,
+                        h.agent_status,
+                        if held.is_empty() { String::new() } else { format!(" · {held}") },
+                    )
+                })
+                .collect();
             println!(
                 "{}",
                 json!({
                     "error": "held",
                     "task": t.id,
+                    "reason": format!("held — {}", who.join("; ")),
                     "held_by": held_by.iter().map(|p| json!({
                         "pane": p.pane_id, "agent": p.agent, "state": p.agent_status,
                     })).collect::<Vec<_>>(),

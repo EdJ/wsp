@@ -161,6 +161,11 @@ pub(crate) use run::{stty, term_size};
 // And it runs the CLI the same way every key in the panel does — same capture,
 // same closed stdin, same one implementation of what a verb means.
 pub(crate) use verbs::{follow, inspect, pop_out, run_wsp};
+// The sentence that goes with a claim, and the sending of it. The board's `c`
+// hands work over through the same three pieces this module's keys do — one
+// wording for a work order, however it was handed over — see
+// [`verbs::tell_claimed`].
+pub(crate) use verbs::{send_tell, tell_claimed, Tell};
 pub use install::{install, install_if_adopted, uninstall};
 // The record of which pane holds the panel is keyed on a workspace, so it is
 // swept where the other workspace-keyed records are — see `install::reap_panels`

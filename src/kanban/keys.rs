@@ -7,6 +7,7 @@
 
 use crate::input::Key;
 use crate::model::Status;
+use crate::panel::Tell;
 
 use super::{Board, Lane};
 
@@ -36,6 +37,44 @@ impl Cursor {
     }
 }
 
+/// What the board is mid-way through, when it is anything.
+///
+/// The panel keeps its modes on `View`; a board has no view of its own — it is
+/// a pure function of the store and the census — so its modes sit beside the
+/// cursor, held by whichever loop is drawing it. Both loops hold one: the board
+/// in its own tab and the board drawn in place of the tree run the same keys,
+/// and two mode types would be one more thing for them to keep agreeing on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Reading and steering. The resting state.
+    #[default]
+    Browse,
+    /// `c` on a card: choosing which spare agent takes it.
+    ///
+    /// A mode rather than a widget so the columns stay up while you choose —
+    /// you are picking an agent *for* a card, and the card has to still be
+    /// visible. The rail at the foot is already the list of who is free; this
+    /// lights it and hands it the arrows.
+    ///
+    /// The task is named rather than pointed at. The cursor cannot move while
+    /// picking, but a rebuild can still slide a different card under it — an
+    /// agent elsewhere claiming work is ordinary — and the deed must not follow
+    /// it. Whatever ↵ does is said in the footer by id, so what it names is
+    /// always what it does.
+    Hand { task: String, sel: usize },
+    /// The CLI refused the hand-over and said why; `y` runs the stronger form.
+    ///
+    /// Held here rather than re-asked through [`Action::Run`]'s `escalate`
+    /// because the question has to survive keystrokes — a footer note expires,
+    /// and a y/n that vanishes after four seconds is not a question.
+    Confirm {
+        question: String,
+        argv: Vec<String>,
+        then: Option<Tell>,
+        task: String,
+    },
+}
+
 /// What a key asked for beyond moving the cursor.
 pub(crate) enum Action {
     None,
@@ -46,7 +85,24 @@ pub(crate) enum Action {
     /// A `wsp` subcommand for the card under the cursor. Argv rather than the
     /// pieces, for the reason the panel gives: the CLI is the one
     /// implementation and this is a caller of it.
-    Run { argv: Vec<String>, task: String },
+    ///
+    /// `escalate` is the stronger form of the same command, offered when the
+    /// CLI refuses — `claim` refuses on work that is done, on work somebody
+    /// live is holding and on a blocked task, three rules the board would
+    /// otherwise keep a second copy of. Carrying `--force` here turns each
+    /// refusal into the next question instead, exactly as the panel's picks do.
+    ///
+    /// `then` is what to say to the agent once it has worked — a claim nobody
+    /// tells the agent about leaves it sitting idle on work it now holds.
+    /// Withheld when the command was refused, because the sentence would be a
+    /// lie; it rides here rather than in [`Mode::Confirm`] so that a claim
+    /// confirmed under force still has somebody told about it.
+    Run {
+        argv: Vec<String>,
+        escalate: Option<Vec<String>>,
+        then: Option<Tell>,
+        task: String,
+    },
     /// Open the task full-size in an editor tab.
     Edit { id: String },
     /// Show this task in the panel's detail pane, and close the board.
@@ -104,7 +160,10 @@ fn shift(from: Status, forward: bool) -> Option<Lane> {
     Lane::ALL.get(to).copied()
 }
 
-pub(crate) fn apply_key(k: Key, board: &Board, cur: &mut Cursor) -> Action {
+/// The key, while the board is only being read. The verbs below are all about
+/// the card under the cursor, which is why they live behind [`Mode::Browse`]:
+/// in a mode, the keys mean what the mode says and nothing else.
+fn browse_key(k: Key, board: &Board, cur: &mut Cursor, mode: &mut Mode) -> Action {
     // Every verb below is about the card under the cursor, and an empty column
     // has none. Worked out once here so each of them can say what it wanted
     // rather than each of them checking.
@@ -121,6 +180,8 @@ pub(crate) fn apply_key(k: Key, board: &Board, cur: &mut Cursor) -> Action {
         }
         Action::Run {
             argv: vec![lane.verb().to_string(), c.id.clone()],
+            escalate: None,
+            then: None,
             task: c.id.clone(),
         }
     };
@@ -189,6 +250,33 @@ pub(crate) fn apply_key(k: Key, board: &Board, cur: &mut Cursor) -> Action {
             }),
         },
 
+        // ---- hand it over ----
+        //
+        // `c`, the panel's pick with the picking done here instead. There the
+        // second act lands on a row of a full tree; here it lands on a lit rail
+        // that holds nothing but the agents who could take the work, so the
+        // arrows and ↵ are the whole question.
+        //
+        // Only spares are offered, and [`Board::spare`] has already made the
+        // judgement — an idle agent parked on a blocked task is stopped, not
+        // free, and an agent already holding work is `claim`'s refusal to make,
+        // not this board's.
+        //
+        // One spare still walks through the rail rather than handing over on
+        // the spot: `c` is one key, and starting an agent on the wrong task
+        // costs a context window. The ↵ is where you look before you commit,
+        // and looking is cheap exactly once.
+        Key::Char('c') => match card {
+            None => Action::Say("nothing here to hand over".into()),
+            Some(c) if board.spare().is_empty() => {
+                Action::Say(format!("nobody is spare · wsp spawn {} starts one", c.id))
+            }
+            Some(c) => {
+                *mode = Mode::Hand { task: c.id.clone(), sel: 0 };
+                Action::None
+            }
+        },
+
         // ---- what comes first in this column ----
         //
         // The board is the one place the answer is visible: priority orders a
@@ -197,6 +285,8 @@ pub(crate) fn apply_key(k: Key, board: &Board, cur: &mut Cursor) -> Action {
         Key::Char('!') => match card {
             Some(c) => Action::Run {
                 argv: vec!["prio".into(), c.id.clone(), c.priority.cycled().as_str().into()],
+                escalate: None,
+                then: None,
                 task: c.id.clone(),
             },
             None => Action::Say("priority is a card's place in its column".into()),
@@ -224,10 +314,104 @@ pub(crate) fn apply_key(k: Key, board: &Board, cur: &mut Cursor) -> Action {
     }
 }
 
+/// The key, while the spare rail is lit.
+///
+/// Everything else stands down: the cursor may not move while picking (the
+/// footer names the deed by id, and moving it would be two questions under one
+/// pair of arrows), and every other verb waits until this one is answered.
+/// `esc` walking away has to be reachable, and it is — along with the two keys
+/// (`q`, `K`) that close the board itself, which here stand down the mode
+/// first, because a mode you opened by accident should not cost the board.
+fn hand_key(k: Key, board: &Board, mode: &mut Mode) -> Action {
+    // Small values copied out, so the arms can reset the mode without fighting
+    // a borrow that is still reading it.
+    let Mode::Hand { task, sel } = mode else { return Action::None };
+    let (task, sel) = (task.clone(), *sel);
+    // Read per keypress, not once at `c`: a rebuild between the two keys can
+    // have changed who is free, and the deed must answer for the rail as it is
+    // now, not as it was lit.
+    let spares = board.spare();
+    match k {
+        Key::Left | Key::Char('h') => {
+            if let Mode::Hand { sel, .. } = mode {
+                *sel = sel.saturating_sub(1);
+            }
+            Action::None
+        }
+        Key::Right | Key::Char('l') => {
+            if sel + 1 < spares.len() {
+                if let Mode::Hand { sel, .. } = mode {
+                    *sel += 1;
+                }
+            }
+            Action::None
+        }
+        // The confirm step, whatever the size of the rail — see the `c` above.
+        // The sentence is worked out here, while both ends of the pick are
+        // still in hand: past this return, the agent is just a pane id in an
+        // argv.
+        //
+        // [`crate::panel::pick_tell`] guards its sentence on `agent && idle`;
+        // this rail needs no second copy of that test, because [`Board::spare`]
+        // has already applied it — spare *is* stopped-with-nothing-in-hand —
+        // and a stale census between the two keystrokes is the same race the
+        // panel accepts between its own read and the typing.
+        Key::Enter => {
+            let Some(a) = spares.get(sel).or_else(|| spares.last()) else {
+                *mode = Mode::Browse;
+                return Action::Say("nobody is spare any more".into());
+            };
+            let argv = vec!["claim".to_string(), task.clone(), "--pane".into(), a.pane.clone()];
+            let mut forced = argv.clone();
+            forced.push("--force".into());
+            let then = crate::panel::tell_claimed(&a.who, &task);
+            *mode = Mode::Browse;
+            Action::Run { argv, escalate: Some(forced), then: Some(then), task }
+        }
+        Key::Esc | Key::Interrupt | Key::Char('q') | Key::Char('K') => {
+            *mode = Mode::Browse;
+            Action::Say("walked away".into())
+        }
+        _ => Action::None,
+    }
+}
+
+/// The key, while a refusal is being offered its stronger form.
+///
+/// The panel's own y/n, aimed at the same command: `y` runs it, everything else
+/// that means no leaves the work exactly as it was. `↵` counts as no, not yes —
+/// it is the busiest key on either surface, and the one slip most likely to
+/// answer a question nobody had finished reading.
+fn confirm_key(k: Key, mode: &mut Mode) -> Action {
+    match k {
+        Key::Char('y') | Key::Char('Y') => {
+            let Mode::Confirm { argv, then, task, .. } = std::mem::take(mode) else {
+                return Action::None;
+            };
+            Action::Run { argv, escalate: None, then, task }
+        }
+        Key::Char('n') | Key::Char('N') | Key::Esc | Key::Interrupt | Key::Enter => {
+            *mode = Mode::Browse;
+            Action::Say("left alone".into())
+        }
+        _ => Action::None,
+    }
+}
+
+pub(crate) fn apply_key(k: Key, board: &Board, cur: &mut Cursor, mode: &mut Mode) -> Action {
+    match mode {
+        Mode::Hand { .. } => return hand_key(k, board, mode),
+        Mode::Confirm { .. } => return confirm_key(k, mode),
+        Mode::Browse => {}
+    }
+    browse_key(k, board, cur, mode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kanban::{collect, Ctx, Scope};
+    use crate::live::AgentRef;
     use crate::model::Task;
     use crate::resolve::Index;
     use std::collections::BTreeMap;
@@ -251,6 +435,77 @@ mod tests {
             panes: Vec::new(),
         };
         collect(&ctx, &Scope::Project("wsp".into()), show_done)
+    }
+
+    /// A census small enough to reason about: one agent working, one idle on a
+    /// blocked task, and whoever else the test asks for. Only the last group
+    /// ever reaches [`Board::spare`], which is the point.
+    fn board_with_census(spec: &[(&str, &str, &str)], spares: &[(&str, &str)]) -> Board {
+        let mut tasks: Vec<Task> = spec
+            .iter()
+            .map(|(id, status, prio)| {
+                let mut t = Task::new("a title", id);
+                t.project = Some("wsp".into());
+                t.status_raw = (*status).into();
+                t.priority_raw = (*prio).into();
+                t
+            })
+            .collect();
+        // What the standing pair are holding: work moving under the busy one,
+        // a blocked question under the idle one. Both must exist for the join
+        // to read them as anything but spare.
+        let mut held = Task::new("held", "t-hold");
+        held.project = Some("wsp".into());
+        held.status_raw = "doing".into();
+        let mut stuck = Task::new("stopped", "t-stuck");
+        stuck.project = Some("wsp".into());
+        stuck.status_raw = "blocked".into();
+        tasks.push(held);
+        tasks.push(stuck);
+
+        let pane = |id: &str, state: &str, name: &str| AgentRef {
+            pane: id.into(),
+            workspace: "w9".into(),
+            agent: true,
+            kind: "claude".into(),
+            state: state.into(),
+            title: name.into(),
+            ..Default::default()
+        };
+        let mut panes = vec![pane("w9:p1", "working", "busy"), pane("w9:p2", "idle", "stopped")];
+        for (id, name) in spares {
+            panes.push(pane(id, "idle", name));
+        }
+        let mut bindings = BTreeMap::new();
+        bindings.insert("w9:p1".to_string(), serde_json::json!({ "task_id": "t-hold" }));
+        bindings.insert("w9:p2".to_string(), serde_json::json!({ "task_id": "t-stuck" }));
+
+        let ctx = Ctx {
+            tasks,
+            index: Index::new(vec![crate::model::Project::new("wsp")]),
+            bindings,
+            claims: BTreeMap::new(),
+            panes,
+        };
+        collect(&ctx, &Scope::Project("wsp".into()), true)
+    }
+
+    /// The loop's shape in miniature: cursor and mode beside each other, keys
+    /// through the same door the live boards use.
+    struct Drive<'a> {
+        board: &'a Board,
+        cur: Cursor,
+        mode: Mode,
+    }
+
+    impl<'a> Drive<'a> {
+        fn new(board: &'a Board) -> Drive<'a> {
+            Drive { board, cur: Cursor::default(), mode: Mode::default() }
+        }
+
+        fn press(&mut self, k: Key) -> Action {
+            apply_key(k, self.board, &mut self.cur, &mut self.mode)
+        }
     }
 
     fn argv_of(a: Action) -> Vec<String> {
@@ -277,9 +532,9 @@ mod tests {
     fn the_key_that_opens_a_board_is_also_the_key_that_closes_it() {
         let b = board(&[("t-01", "todo", "normal")], true);
         for k in [Key::Char('K'), Key::Char('q'), Key::Esc] {
-            let mut cur = Cursor::default();
+            let mut d = Drive::new(&b);
             assert!(
-                matches!(apply_key(k, &b, &mut cur), Action::Quit),
+                matches!(d.press(k), Action::Quit),
                 "{k:?} should stand the board down",
             );
         }
@@ -299,13 +554,13 @@ mod tests {
             &[("t-01", "todo", "normal"), ("t-02", "todo", "normal"), ("t-03", "doing", "normal")],
             true,
         );
-        let mut cur = Cursor::default();
-        apply_key(Key::Char('j'), &full, &mut cur);
-        assert_eq!(cur, Cursor { col: 0, row: 1 });
+        let mut d = Drive::new(&full);
+        d.press(Key::Char('j'));
+        assert_eq!(d.cur, Cursor { col: 0, row: 1 });
 
         // The card it was on has been finished, and `todo` is one shorter.
         let after = board(&[("t-01", "todo", "normal"), ("t-03", "doing", "normal")], true);
-        assert_eq!(cur.clamped(&after), Cursor { col: 0, row: 0 });
+        assert_eq!(d.cur.clamped(&after), Cursor { col: 0, row: 0 });
 
         // And the column that goes when `done` is put away takes the cursor
         // back with it rather than leaving it off the right-hand edge, where
@@ -329,22 +584,22 @@ mod tests {
             ],
             true,
         );
-        let mut cur = Cursor::default();
-        apply_key(Key::Char('j'), &b, &mut cur);
-        apply_key(Key::Char('j'), &b, &mut cur);
-        assert_eq!(cur, Cursor { col: 0, row: 2 });
+        let mut d = Drive::new(&b);
+        d.press(Key::Char('j'));
+        d.press(Key::Char('j'));
+        assert_eq!(d.cur, Cursor { col: 0, row: 2 });
 
         // One card in `doing`, so the row has to come back to it.
-        apply_key(Key::Char('l'), &b, &mut cur);
-        assert_eq!(cur, Cursor { col: 1, row: 0 });
+        d.press(Key::Char('l'));
+        assert_eq!(d.cur, Cursor { col: 1, row: 0 });
         // And an empty column takes the cursor rather than refusing it: you
         // have to be able to see you are there.
-        apply_key(Key::Char('l'), &b, &mut cur);
-        assert_eq!(cur, Cursor { col: 2, row: 0 });
+        d.press(Key::Char('l'));
+        assert_eq!(d.cur, Cursor { col: 2, row: 0 });
         // The far edge holds.
-        apply_key(Key::Char('l'), &b, &mut cur);
-        apply_key(Key::Char('l'), &b, &mut cur);
-        assert_eq!(cur.col, 3);
+        d.press(Key::Char('l'));
+        d.press(Key::Char('l'));
+        assert_eq!(d.cur.col, 3);
     }
 
     /// The whole of what a board is for: a card, pushed along. `>` and the
@@ -353,16 +608,16 @@ mod tests {
     #[test]
     fn a_card_is_pushed_along_by_the_same_verbs_that_name_the_lanes() {
         let b = board(&[("t-01", "todo", "normal")], true);
-        let mut cur = Cursor::default();
-        assert_eq!(argv_of(apply_key(Key::Char('>'), &b, &mut cur)), ["start", "t-01"]);
-        assert_eq!(argv_of(apply_key(Key::Char('s'), &b, &mut cur)), ["start", "t-01"]);
-        assert_eq!(argv_of(apply_key(Key::Char('d'), &b, &mut cur)), ["done", "t-01"]);
-        assert_eq!(argv_of(apply_key(Key::Char('v'), &b, &mut cur)), ["review", "t-01"]);
+        let mut d = Drive::new(&b);
+        assert_eq!(argv_of(d.press(Key::Char('>'))), ["start", "t-01"]);
+        assert_eq!(argv_of(d.press(Key::Char('s'))), ["start", "t-01"]);
+        assert_eq!(argv_of(d.press(Key::Char('d'))), ["done", "t-01"]);
+        assert_eq!(argv_of(d.press(Key::Char('v'))), ["review", "t-01"]);
         // Already there is not a command. It would be a log line, an event and
         // a commit recording a keypress.
-        assert_eq!(said(apply_key(Key::Char('o'), &b, &mut cur)), "already in todo");
+        assert_eq!(said(d.press(Key::Char('o'))), "already in todo");
         // And the near end has nowhere to go back to.
-        assert_eq!(said(apply_key(Key::Char('<'), &b, &mut cur)), "todo is the near end");
+        assert_eq!(said(d.press(Key::Char('<'))), "todo is the near end");
     }
 
     /// A blocked card is in the doing column, so pushing it on means `review` —
@@ -370,9 +625,10 @@ mod tests {
     #[test]
     fn a_blocked_card_moves_from_the_column_it_is_drawn_in() {
         let b = board(&[("t-01", "blocked", "normal")], true);
-        let mut cur = Cursor { col: 1, row: 0 };
-        assert_eq!(argv_of(apply_key(Key::Char('>'), &b, &mut cur)), ["review", "t-01"]);
-        assert_eq!(argv_of(apply_key(Key::Char('<'), &b, &mut cur)), ["reopen", "t-01"]);
+        let mut d = Drive::new(&b);
+        d.cur = Cursor { col: 1, row: 0 };
+        assert_eq!(argv_of(d.press(Key::Char('>'))), ["review", "t-01"]);
+        assert_eq!(argv_of(d.press(Key::Char('<'))), ["reopen", "t-01"]);
     }
 
     /// Every verb has to survive being aimed at nothing. An empty column is the
@@ -381,14 +637,15 @@ mod tests {
     #[test]
     fn a_verb_aimed_at_an_empty_column_says_so_and_does_nothing() {
         let b = board(&[("t-01", "todo", "normal")], true);
-        let mut cur = Cursor { col: 2, row: 0 };
-        for k in ['s', 'v', 'd', 'o', '!', 'E', '>', '<'] {
+        let mut d = Drive::new(&b);
+        d.cur = Cursor { col: 2, row: 0 };
+        for k in ['s', 'v', 'd', 'o', '!', 'E', '>', '<', 'c'] {
             assert!(
-                matches!(apply_key(Key::Char(k), &b, &mut cur), Action::Say(_)),
+                matches!(d.press(Key::Char(k)), Action::Say(_)),
                 "{k} should refuse rather than act",
             );
         }
-        assert!(matches!(apply_key(Key::Enter, &b, &mut cur), Action::Say(_)));
+        assert!(matches!(d.press(Key::Enter), Action::Say(_)));
     }
 
     /// The board is a view and holds nothing of its own, so `↵` is a way out of
@@ -397,8 +654,8 @@ mod tests {
     #[test]
     fn opening_a_card_is_the_board_handing_over_and_going() {
         let b = board(&[("t-01", "todo", "normal")], true);
-        let mut cur = Cursor::default();
-        match apply_key(Key::Enter, &b, &mut cur) {
+        let mut d = Drive::new(&b);
+        match d.press(Key::Enter) {
             Action::Open { id } => assert_eq!(id, "t-01"),
             _ => panic!("↵ on a card should open it"),
         }
@@ -410,12 +667,14 @@ mod tests {
     #[test]
     fn priority_cycles_through_the_same_order_as_everywhere_else() {
         let b = board(&[("t-01", "todo", "normal")], true);
-        let mut cur = Cursor::default();
-        assert_eq!(argv_of(apply_key(Key::Char('!'), &b, &mut cur)), ["prio", "t-01", "high"]);
+        let mut d = Drive::new(&b);
+        assert_eq!(argv_of(d.press(Key::Char('!'))), ["prio", "t-01", "high"]);
         let b = board(&[("t-01", "todo", "high")], true);
-        assert_eq!(argv_of(apply_key(Key::Char('!'), &b, &mut cur)), ["prio", "t-01", "low"]);
+        let mut d = Drive::new(&b);
+        assert_eq!(argv_of(d.press(Key::Char('!'))), ["prio", "t-01", "low"]);
         let b = board(&[("t-01", "todo", "low")], true);
-        assert_eq!(argv_of(apply_key(Key::Char('!'), &b, &mut cur)), ["prio", "t-01", "normal"]);
+        let mut d = Drive::new(&b);
+        assert_eq!(argv_of(d.press(Key::Char('!'))), ["prio", "t-01", "normal"]);
     }
 
     /// With `done` put away there are three columns, and the digit that named
@@ -423,8 +682,199 @@ mod tests {
     #[test]
     fn a_digit_cannot_reach_a_column_that_is_not_showing() {
         let b = board(&[("t-01", "done", "normal")], false);
-        let mut cur = Cursor::default();
-        assert_eq!(said(apply_key(Key::Char('4'), &b, &mut cur)), "that column is not showing");
-        assert_eq!(cur, Cursor::default());
+        let mut d = Drive::new(&b);
+        assert_eq!(said(d.press(Key::Char('4'))), "that column is not showing");
+        assert_eq!(d.cur, Cursor::default());
+    }
+
+    /// The whole of `c`, end to end at the keys: the rail offers only who is
+    /// free, ↵ turns the choice into `claim --pane`, and the sentence rides
+    /// behind it — because a claim nobody tells the agent about leaves an idle
+    /// agent sitting on work it now holds.
+    #[test]
+    fn handing_a_card_over_claims_it_on_the_chosen_pane_and_tells_them() {
+        // Two spares named so their rail order is known: Jolt sorts first.
+        let b = board_with_census(
+            &[("t-01", "todo", "normal")],
+            &[("w2:p1", "Jolt"), ("w3:p1", "Verb UI")],
+        );
+        let mut d = Drive::new(&b);
+
+        // `c` itself runs nothing — even with a rail under it, the deed waits
+        // for ↵, because starting an agent on the wrong task costs a context
+        // window and looking is cheap exactly once.
+        assert!(matches!(d.press(Key::Char('c')), Action::None));
+        assert_eq!(
+            d.mode,
+            Mode::Hand { task: "t-01".into(), sel: 0 },
+            "the card being handed is named, not pointed at",
+        );
+        assert!(matches!(d.press(Key::Right), Action::None));
+        assert!(matches!(d.mode, Mode::Hand { sel: 1, .. }), "the arrows move the light");
+
+        match d.press(Key::Enter) {
+            Action::Run { argv, escalate, then, task } => {
+                assert_eq!(argv, ["claim", "t-01", "--pane", "w3:p1"]);
+                // The stronger form travels with the first attempt: a refusal
+                // from `claim` becomes the next question rather than a rule the
+                // board keeps a second copy of.
+                assert_eq!(
+                    escalate,
+                    Some(vec![
+                        "claim".into(),
+                        "t-01".into(),
+                        "--pane".into(),
+                        "w3:p1".into(),
+                        "--force".into()
+                    ])
+                );
+                // …and the sentence is already composed, so a claim that works
+                // is never one nobody was told about.
+                let tell = then.expect("a claim goes with a sentence");
+                assert!(tell.text.expect("the work order").contains("claimed onto t-01"));
+                assert!(tell.note.contains("→ t-01"), "{}", tell.note);
+                assert_eq!(tell.pane, "w3:p1");
+                assert_eq!(task, "t-01", "the cursor follows the card the command moved");
+            }
+            _ => panic!("↵ on a lit rail hands the card over"),
+        }
+        // And the mode stood down behind the deed: the next key is an ordinary
+        // one again.
+        assert_eq!(d.mode, Mode::Browse);
+    }
+
+    /// One spare still walks through the rail. `c` is one key; starting an
+    /// agent on the wrong card costs a context window, and the ↵ is the one
+    /// place you look before it happens.
+    #[test]
+    fn a_lone_spare_still_waits_for_enter() {
+        let b = board_with_census(&[("t-01", "todo", "normal")], &[("w2:p1", "Jolt")]);
+        let mut d = Drive::new(&b);
+        assert!(matches!(d.press(Key::Char('c')), Action::None));
+        assert!(matches!(d.mode, Mode::Hand { sel: 0, .. }));
+
+        // The arrows hold at the ends of a one-agent rail.
+        d.press(Key::Left);
+        assert!(matches!(d.mode, Mode::Hand { sel: 0, .. }));
+    }
+
+    /// Nobody free is a sentence, not a mode. Both reasons have their own word
+    /// downstream — everyone busy, or nobody there at all — but on the board
+    /// they end the same way: no rail, no pick, and a pointer at the verb that
+    /// would make some.
+    #[test]
+    fn c_with_nobody_free_says_so_instead_of_opening_an_empty_rail() {
+        // Everyone accounted for: working, or idle *on* something.
+        let b = board_with_census(&[("t-01", "todo", "normal")], &[]);
+        let mut d = Drive::new(&b);
+        let m = said(d.press(Key::Char('c')));
+        assert!(m.contains("nobody is spare"), "{m}");
+        assert!(m.contains("spawn"), "{m} should say how to make an agent");
+        assert_eq!(d.mode, Mode::Browse);
+    }
+
+    /// Picking owns the keyboard, except for the ways out. Movement would put
+    /// a different card under the dock while the footer names the one being
+    /// handed, and `q` standing the whole board down over a mode entered by
+    /// accident would be a steep price for a stray keystroke — so it stands
+    /// the mode down instead, exactly as `esc` does.
+    #[test]
+    fn while_picking_everything_waits_except_the_way_out() {
+        let b = board_with_census(
+            &[("t-01", "todo", "normal"), ("t-02", "todo", "normal")],
+            &[("w2:p1", "Jolt")],
+        );
+        let mut d = Drive::new(&b);
+        d.press(Key::Char('c'));
+
+        // No movement, no verbs, no digits: the deed is named in the footer and
+        // the cursor staying still is part of that bargain.
+        for k in [Key::Down, Key::Up, Key::Char('j'), Key::Char('k'), Key::Char('1'), Key::Char('s')] {
+            assert!(matches!(d.press(k), Action::None), "{k:?} should wait");
+        }
+        assert_eq!(d.cur, Cursor::default());
+        assert!(matches!(d.press(Key::Char('q')), Action::Say(_)));
+        assert_eq!(d.mode, Mode::Browse, "q stands the pick down before it stands the board down");
+    }
+
+    /// And `esc` walks away without handing anything over.
+    #[test]
+    fn esc_walks_away_from_the_rail_and_leaves_the_work_alone() {
+        let b = board_with_census(&[("t-01", "todo", "normal")], &[("w2:p1", "Jolt")]);
+        let mut d = Drive::new(&b);
+        d.press(Key::Char('c'));
+        assert_eq!(said(d.press(Key::Esc)), "walked away");
+        assert_eq!(d.mode, Mode::Browse);
+    }
+
+    /// The refusal half. The board never decides whether a claim should be
+    /// forced — `claim` says why it said no, and that sentence comes back as
+    /// the question `y` answers by running the stronger form. `n` leaves
+    /// everything as it was, and so does `↵`, which is the busiest key on
+    /// either surface and the likeliest slip.
+    #[test]
+    fn a_refused_claim_comes_back_as_the_question_that_force_answers() {
+        let b = board(&[("t-01", "todo", "normal")], true);
+        let mut d = Drive::new(&b);
+        // What the loop puts up when the CLI refuses: its words, and the same
+        // command carrying --force.
+        d.mode = Mode::Confirm {
+            question: "already done — claiming it would reopen it".into(),
+            argv: vec!["claim".into(), "t-01".into(), "--pane".into(), "w2:p1".into(), "--force".into()],
+            then: Some(crate::panel::tell_claimed(
+                &AgentRef {
+                    pane: "w2:p1".into(),
+                    agent: true,
+                    kind: "claude".into(),
+                    state: "idle".into(),
+                    ..Default::default()
+                },
+                "t-01",
+            )),
+            task: "t-01".into(),
+        };
+
+        // Anything that is not yes is no.
+        for k in [Key::Char('n'), Key::Char('N'), Key::Esc, Key::Enter] {
+            let mut probe = Drive::new(&b);
+            probe.mode = d.mode.clone();
+            assert_eq!(said(probe.press(k)), "left alone");
+            assert_eq!(probe.mode, Mode::Browse);
+        }
+
+        let mut d = Drive::new(&b);
+        d.mode = Mode::Confirm {
+            question: "refused".into(),
+            argv: vec!["claim".into(), "t-01".into(), "--force".into()],
+            then: None,
+            task: "t-01".into(),
+        };
+        match d.press(Key::Char('y')) {
+            Action::Run { argv, escalate, task, .. } => {
+                assert_eq!(argv, ["claim", "t-01", "--force"]);
+                // Nothing stronger above the force: the question was the last
+                // stop.
+                assert_eq!(escalate, None);
+                assert_eq!(task, "t-01", "the cursor follows the card the command moved");
+            }
+            _ => panic!("y runs it"),
+        }
+        assert_eq!(d.mode, Mode::Browse);
+    }
+
+    /// A rebuild between `c` and `↵` can empty the rail — every spare picked
+    /// work up elsewhere. The pick stands down rather than aiming at a name
+    /// that is no longer drawn.
+    #[test]
+    fn enter_on_a_rail_that_has_gone_empty_stands_down_instead() {
+        let b = board_with_census(&[("t-01", "todo", "normal")], &[("w2:p1", "Jolt")]);
+        let mut d = Drive::new(&b);
+        d.press(Key::Char('c'));
+        // The world moved: the census the mode was lit against is not the one
+        // answering now.
+        let empty = board_with_census(&[("t-01", "todo", "normal")], &[]);
+        d.board = &empty;
+        assert_eq!(said(d.press(Key::Enter)), "nobody is spare any more");
+        assert_eq!(d.mode, Mode::Browse);
     }
 }
