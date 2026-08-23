@@ -964,11 +964,27 @@ fn config(brief: Option<&Path>, reach: &[PathBuf]) -> String {
     // on the store covers `tasks/`, `projects/` and `worklists/` beneath it.
     // Written only when there is something to write, so a seat with nothing to
     // reach for is byte-for-byte the config it had before this existed.
-    let outside = match reach.is_empty() {
+    //
+    // The brief's own directory is in here too, and it is this function's to
+    // add rather than [`crate::cmd_spawn::reach`]'s: **a config may not name a
+    // file it forbids reaching.** Found by driving a real spawn on 2026-08-23 —
+    // the agent went to re-read the brief `instructions` had pointed it at, and
+    // stopped on `external_directory` for `<state>/briefs/*`. That is
+    // `core-027` d2's finding in a new place: the brake fired on the one thing
+    // wsp had told the agent to look at. Stated as an invariant so it cannot
+    // drift, the brief's path being the only path this config hands out.
+    let named: Vec<PathBuf> = brief
+        .and_then(|b| b.parent())
+        .map(|d| d.to_path_buf())
+        .into_iter()
+        .filter(|d| !reach.iter().any(|r| d.starts_with(r)))
+        .collect();
+    let outside = match reach.is_empty() && named.is_empty() {
         true => String::new(),
         false => {
             let allows = reach
                 .iter()
+                .chain(named.iter())
                 .map(|dir| {
                     format!(
                         "{}:{}",
@@ -2769,6 +2785,32 @@ mod tests {
         assert_eq!(v["permission"]["bash"]["wsp done*"], "deny");
     }
 
+    /// A config may not name a file it forbids reaching.
+    ///
+    /// Found by driving a real spawn rather than by reading this file: the
+    /// agent went to re-read the brief `instructions` had pointed it at and
+    /// stopped on `external_directory` for the directory it sits in. `core-027`
+    /// d2 is the same finding one layer up — the brake fired on the agent
+    /// finding out what it was for — and the invariant is stated here because
+    /// the brief's path is the only path this config hands out.
+    #[test]
+    fn the_brief_this_config_names_is_a_brief_the_agent_may_go_back_and_read() {
+        let env = of("opencode").env(Some(Path::new("/var/state/wsp/briefs/ui-007.md")), &[]);
+        let v: Value = serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("valid config");
+        assert_eq!(v["instructions"][0], "/var/state/wsp/briefs/ui-007.md");
+        assert_eq!(
+            v["permission"]["external_directory"]["/var/state/wsp/briefs/*"], "allow",
+            "wsp pointed the agent at this file; refusing it is the brake stopping the brief"
+        );
+
+        // And it is not said twice when something already reaches it.
+        let store = PathBuf::from("/var/state/wsp");
+        let env = of("opencode").env(Some(Path::new("/var/state/wsp/briefs/ui-007.md")), &[store]);
+        let v: Value = serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("valid config");
+        let out = v["permission"]["external_directory"].as_object().expect("some allows");
+        assert_eq!(out.len(), 1, "the parent already answers for it — {out:?}");
+    }
+
     /// The order the map is written in, because opencode reads it as one.
     ///
     /// `Permission.evaluate` is a `findLast` over the rules in config order, so
@@ -2821,7 +2863,16 @@ mod tests {
         // `instructions` path in silence, so a wrong one is invisible.
         let without = cfg(None);
         assert!(without.get("instructions").is_none(), "a path to nothing: {without}");
-        assert_eq!(without["permission"], with["permission"], "the policy is not a function of the brief");
+        // The posture is not a function of the brief. Where the agent may
+        // *reach* is, by exactly one directory, and that is
+        // [`the_brief_this_config_names_is_a_brief_the_agent_may_go_back_and_read`]
+        // rather than a leak from here: a config may not name a file it forbids.
+        assert_eq!(without["permission"]["bash"], with["permission"]["bash"]);
+        assert_eq!(without["permission"]["edit"], with["permission"]["edit"]);
+        assert!(
+            without["permission"].get("external_directory").is_none(),
+            "nothing named, nothing reachable: {without}"
+        );
     }
 
     /// Which kinds can be handed a brief this way, and it is a fact about a
