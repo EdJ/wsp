@@ -1571,6 +1571,68 @@ fn label(project: &Option<String>) -> String {
     project.clone().unwrap_or_else(|| "the inbox".into())
 }
 
+/// `wsp ref <id> +PATH -PATH` — the files this row names outside its own tree.
+///
+/// **Add-only was the whole of it until `core-042`, and that is the same defect
+/// [`prio`] was written for one field over.** `wsp add --ref PATH` set this at
+/// the one moment you know least about the work, and nothing could move it
+/// afterwards. That mattered little while `refs` was a note to a reader; it
+/// stopped being little the moment [`crate::cmd_spawn::reach`] made it the
+/// thing that decides where a spawned agent may reach. `worklist-surface` is
+/// the case: five rows all needing one spec outside every worktree, the path
+/// written in a parent's prose, every row already created — and no way to say
+/// so on any of them. A mechanism that only works on rows nobody has filed yet
+/// is not a mechanism.
+///
+/// `+`/`-` rather than a replacing list, because that is [`tag`]'s spelling for
+/// the same shape and a caller should not have to learn a second one. The path
+/// is stored the way `add` stores it — [`crate::util::contract`], so `~` comes
+/// back — and removal matches on the contracted form, which is what `wsp show`
+/// prints and therefore what a caller has in front of them.
+///
+/// A removal naming a path the row does not carry says so and exits 1, for
+/// [`tag`]'s reason: a ref that stays on a task after a command reported
+/// success is a reach nobody can see the reason for.
+pub fn reference(store: &Store, args: &Args) -> i32 {
+    let changes: Vec<String> = args.rest.iter().skip(1).cloned().collect();
+    if changes.is_empty() {
+        eprintln!("usage: wsp ref <id> +PATH -PATH");
+        return 2;
+    }
+    let tidy = |p: &str| util::contract(&util::expand(p));
+    let mut absent: Vec<String> = Vec::new();
+    let code = mutate(store, args, "refs", |t| {
+        for c in &changes {
+            // A leading `-` is the removal syntax, and a path may not begin
+            // with one — `-` is not a path component anywhere this store
+            // points — so there is nothing to disambiguate against.
+            if let Some(rm) = c.strip_prefix('-') {
+                let at = tidy(rm);
+                if !t.refs.iter().any(|x| *x == at) {
+                    absent.push(rm.to_string());
+                }
+                t.refs.retain(|x| *x != at);
+                continue;
+            }
+            let at = tidy(c.strip_prefix('+').unwrap_or(c));
+            if !at.is_empty() && !t.refs.iter().any(|x| *x == at) {
+                t.refs.push(at);
+            }
+        }
+    });
+    if code != 0 {
+        return code;
+    }
+    if !absent.is_empty() {
+        eprintln!(
+            "wsp: nothing to remove — no {} on this task",
+            absent.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(" or ")
+        );
+        return 1;
+    }
+    0
+}
+
 /// `wsp tag <id> +dsp -ui` — adjust tags, in the vocabulary the help documents.
 ///
 /// The `-ui` half of that line used to be eaten by the flag parser: it reached
@@ -2808,6 +2870,36 @@ mod tests {
         // Written down, because a backlog whose order changes with no record
         // is one nobody can read a week later.
         assert!(t.body.contains("priority normal → high"), "the log should carry it: {}", t.body);
+    }
+
+    /// A row can be told where its work is after it exists, which is the only
+    /// time anybody knows.
+    ///
+    /// `--ref` on `add` was the whole of it, and `core-042` turned `refs` into
+    /// the thing that decides where a spawned agent may reach — so an add-only
+    /// field meant the mechanism worked on no row that had already been filed.
+    /// `worklist-surface` was five such rows and one spec outside every
+    /// worktree.
+    #[test]
+    fn a_row_can_be_told_which_file_outside_its_tree_it_needs() {
+        let store = scratch("ref-edit");
+        let t = task_with(&store, "verb-021", "normal");
+        store.save_task(&t).unwrap();
+
+        let at = format!("{}/claude/.scratch/spec.html", util::home().display());
+        assert_eq!(reference(&store, &Args::synth("ref", &["021", &at], &[])), 0);
+        // Stored the way `add` stores it, which is the way `wsp show` prints
+        // it, which is what a caller has in front of them to remove by.
+        assert_eq!(
+            store.find_task("021").expect("the task").refs,
+            vec!["~/claude/.scratch/spec.html".to_string()]
+        );
+
+        // And it comes off again, named either way round.
+        assert_eq!(reference(&store, &Args::synth("ref", &["021", "-~/claude/.scratch/spec.html"], &[])), 0);
+        assert!(store.find_task("021").expect("the task").refs.is_empty());
+        // A removal that removed nothing is [`tag`]'s rule, for its reason.
+        assert_eq!(reference(&store, &Args::synth("ref", &["021", "-~/nowhere.md"], &[])), 1);
     }
 
     /// A tag that was asked to go and did not, on a command that exited 0, is

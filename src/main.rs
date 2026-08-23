@@ -201,6 +201,10 @@ const LITERAL_AFTER: &[Literal] = &[
     Literal { cmd: "decide", subject: 1, payload: "decision", stream: true },
     Literal { cmd: "rename", subject: 1, payload: "title", stream: false },
     Literal { cmd: "tag", subject: 1, payload: "tag edits", stream: false },
+    // `wsp ref <id> -~/claude/spec.md` is the same `+`/`-` payload as `tag`,
+    // and a path that begins with `-` here would be read as a flag for exactly
+    // the reason `-ui` was.
+    Literal { cmd: "ref", subject: 1, payload: "ref edits", stream: false },
 ];
 
 /// One row of [`LITERAL_AFTER`]: a verb, and what it does with the words past
@@ -919,6 +923,7 @@ fn main() {
         "reopen" | "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
         "tag" => cmd_task::tag(&store, &args),
+        "ref" => cmd_task::reference(&store, &args),
         "prio" | "priority" => cmd_task::prio(&store, &args),
         "next" => cmd_task::next(&store, &args),
         "edit" => cmd_task::edit(&store, &args),
@@ -1396,6 +1401,10 @@ fn help_text() -> String {
   wsp mv <id> -p proj               reassign, sub-tree and all
   wsp mv <id> --parent <id>|none    re-parent it, or detach it
   wsp tag <id> +dsp -ui             adjust tags
+  wsp ref <id> +PATH -PATH          the files this row names outside its own
+                                    tree. A spawned agent may reach them
+                                    without asking, and nothing above its tree
+                                    is reachable however it is written
   wsp prio <id> high|normal|low     what comes first inside its project
   wsp next [-p proj]                highest-priority actionable task
   wsp rm <id>                       retire it to the archive
