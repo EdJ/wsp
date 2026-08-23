@@ -7602,5 +7602,46 @@ mod tests {
         );
     }
 
+    /// The zone geometry is measured at [`panel::PAGE_MIN`], and this is the
+    /// claim that says so at that width rather than at the generous one the
+    /// scenes are photographed at. A hundred and twenty columns proves the
+    /// drawing reads; only ninety-six proves it fits — that the barrier text
+    /// clears the edge, that the agent zone leaves the cost zone alone, that
+    /// no constant drifting upward quietly pushes `holding 12` off a pane
+    /// somebody actually has. Every group line is bounded by the measure and
+    /// every zone is still present within it.
+    #[test]
+    fn a_group_line_fits_its_zones_at_the_measure_they_are_cut_to() {
+        let world = planned_world();
+        let mut d = Driver::at_page(&world, panel::PAGE_MIN, 30);
+        let frame = panel::frame(&d.ui, &mut d.view, panel::PAGE_MIN, 30);
+
+        // Group lines carry their ordinal against the group count; everything
+        // else that might match is a count on a heading or a footer.
+        let groups: Vec<&panel::Line> =
+            frame.iter().filter(|l| l.text().contains("/3 ")).collect();
+        assert_eq!(groups.len(), 6, "three groups per list, both lists drawn");
+
+        for l in &groups {
+            assert!(
+                l.width() <= panel::PAGE_MIN,
+                "a group line overran the measure it is cut to: {:?}",
+                l.text()
+            );
+        }
+        // Each zone, still itself at ninety-six: the working agent beside its
+        // pane, the stated price beside it, and the barrier named in full
+        // rather than clipped by a constant that moved.
+        let current = groups.iter().find(|l| l.text().contains("p-904")).expect("group 2 drew");
+        let t = current.text();
+        assert!(t.contains("\u{25cf}w1:p1"), "agents zone: {t}");
+        assert!(t.contains("$2.40"), "cost zone: {t}");
+        assert!(t.contains("holding 1"), "barrier zone: {t}");
+        // And the passed tick with go's own count behind it, which is the
+        // widest thing the zone carries besides a two-digit holding.
+        let passed = groups.iter().find(|l| l.text().contains("p-901")).expect("group 1 drew");
+        assert!(passed.text().contains("\u{2713} 3/3"), "{}", passed.text());
+    }
+
 }
 
