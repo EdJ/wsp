@@ -1057,6 +1057,22 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                     ),
                 );
             }
+            // The files this row names outside its own tree, which is a
+            // different `refs` from the `names` block below: those are tasks
+            // the prose mentions, these are paths on the task itself.
+            //
+            // **`core-042`, and it is the half that makes the mechanism work.**
+            // `cmd_spawn::reach` turns this list into the one place a spawned
+            // agent may reach outside its worktree without a prompt — and a
+            // path it may reach but is never told about is no use at all.
+            // Driven: `worklist-surface`'s five members all need one spec whose
+            // path lives in a *parent's* prose, so both agents of group 1 read
+            // their whole brief and never learned the file existed. It is paid
+            // for by every request of the session, so it is one line per path
+            // and nothing at all on the rows — most of them — that name none.
+            for (i, at) in r.mine.iter().flat_map(|t| t.refs.iter()).enumerate() {
+                row(if i == 0 { "files" } else { "" }, p.dim(at).to_string());
+            }
         }
         // A custodian holding nothing is not an agent that has failed to claim
         // anything: it is an agent doing its job. The default line below tells
@@ -1500,6 +1516,32 @@ mod tests {
         assert!(line("decided") < line("open"), "a decision constrains what may be taken");
         assert!(text.contains("the task in hand"), "{text}");
         assert!(text.contains("take work here without asking"), "{text}");
+    }
+
+    /// A row that names a file outside the tree says so in the brief, because
+    /// a path the agent may reach and is never told about is no mechanism.
+    ///
+    /// `core-042`. `cmd_spawn::reach` turns `Task::refs` into the one place a
+    /// spawned agent may go outside its worktree without a prompt, and both
+    /// agents of `worklist-surface`'s group 1 read their whole brief without
+    /// learning the spec every member of that list needs even existed — its
+    /// path lives in a parent's prose. Nothing at all on the rows that name no
+    /// file, which is most of them, because this is paid on every request.
+    #[test]
+    fn the_files_a_row_names_outside_its_tree_are_in_the_brief_that_may_reach_them() {
+        let mut b = briefing();
+        let quiet = brief_lines(&compose(&b), &plain(), Depth::Terse).join("\n");
+        assert!(!quiet.contains("files"), "a row naming none says nothing: {quiet}");
+
+        if let Some(t) = b.world.tasks.iter_mut().find(|t| t.id == "t-001") {
+            t.refs = vec!["~/claude/.scratch/worklist-ui-001.html".into()];
+        }
+        let text = brief_lines(&compose(&b), &plain(), Depth::Terse).join("\n");
+        assert!(text.contains("~/claude/.scratch/worklist-ui-001.html"), "{text}");
+        let line = |needle: &str| {
+            text.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle} in:\n{text}"))
+        };
+        assert!(line("you") < line("files"), "it is a fact about the row in hand: {text}");
     }
 
     /// The backlog is the subtree, not the exact project. Scoped exactly, a
