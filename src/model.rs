@@ -1429,6 +1429,41 @@ pub struct Group {
     /// decision to pass it is the list's `status` moving off `draft`. One
     /// written fact per barrier, and no barrier with two.
     pub verdict: String,
+    /// What each member put on the trunk, recorded by `wsp worklist go` at the
+    /// moment it passed the barrier — one entry per member, in member order:
+    /// the merge commit, the files that land touched, and [`Landed::commit`]
+    /// of `None` where the reflog could not place it at all.
+    ///
+    /// **Written state on a derived record, and it passes the same test
+    /// `verdict` does, for a different reason.** A verdict is written because
+    /// a judgement is not a computation. This is a *fact*, but its evidence is
+    /// destroyed by the act that makes it due: the association between a
+    /// member and its commits is the branch name, and `go` deletes the branch
+    /// — through the sweep — in the same call that writes this. What survives
+    /// is the trunk's local reflog: machine-local, carried by no clone, gone
+    /// at gc. After the barrier there is nothing durable left to compute it
+    /// from, so it is recorded at the one moment it is in hand. The commits
+    /// themselves are permanent; *which member wrote which* was not, until
+    /// this field.
+    ///
+    /// Beside the verdict rather than in the log, for the same reason the
+    /// verdict is: the two are one exchange with the barrier, they travel with
+    /// the group across renumbering, and a fact filed away from the group it
+    /// belongs to is one a reader has to reassemble.
+    pub landed: Vec<Landed>,
+}
+
+/// One member's landing, as [`Group::landed`] holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    pub member: String,
+    /// The trunk value this member's newest land put there, full hash — the
+    /// durable copy is read months later, and a short hash is a guess about
+    /// what else the repository will grow. `None` where the reflog does not
+    /// place the member: nobody knows what it put on the trunk, which is said
+    /// rather than smoothed over into an empty file list.
+    pub commit: Option<String>,
+    pub files: Vec<String>,
 }
 
 impl Group {
@@ -1499,14 +1534,16 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         n.parse().ok()
     };
 
-    // What an indented line under a group continues. Two prose blocks now
+    // What an indented line under a group continues. Three prose blocks now
     // hang off a group, so "am I inside the stop condition" is no longer a
     // bool: a wrapped `verdict:` would otherwise land in the middle of the
-    // `stop:` it answers.
+    // `stop:` it answers, and a wrapped file list the same distance from its
+    // own member.
     enum Cont {
         Members,
         Stop,
         Verdict,
+        Landed,
     }
 
     let mut out: Vec<Group> = Vec::new();
@@ -1540,14 +1577,66 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         } else if let Some(rest) = trimmed.strip_prefix("verdict:") {
             last.verdict = rest.trim().to_string();
             cont = Cont::Verdict;
+        } else if let Some(rest) = trimmed.strip_prefix("landed:") {
+            last.landed.clear();
+            landed_push(&mut last.landed, rest);
+            cont = Cont::Landed;
         } else {
             match cont {
                 Cont::Stop => join(&mut last.stop, trimmed),
                 Cont::Verdict => join(&mut last.verdict, trimmed),
+                Cont::Landed => landed_push(&mut last.landed, trimmed),
                 Cont::Members => {
                     last.members.extend(trimmed.split_whitespace().map(|t| t.to_string()))
                 }
             }
+        }
+    }
+    out
+}
+
+/// One token stream of a `landed:` block, folded into entries already read.
+///
+/// The grammar is tokens, because the payload is ids, hashes and paths and all
+/// three are whitespace-free: `<member>@<hash>` starts an entry — `@?` for the
+/// member the reflog could not place — every token after it until the next
+/// entry is one of that member's files, and `·` separates entries for the
+/// human reading the file. A continuation line is the same walker run again,
+/// which is what makes wrapping free.
+fn landed_push(acc: &mut Vec<Landed>, text: &str) {
+    for tok in text.split_whitespace() {
+        if tok == "·" {
+            continue;
+        }
+        match tok.split_once('@') {
+            Some((member, commit)) => acc.push(Landed {
+                member: member.to_string(),
+                commit: (commit != "?").then(|| commit.to_string()),
+                files: Vec::new(),
+            }),
+            None => {
+                if let Some(last) = acc.last_mut() {
+                    last.files.push(tok.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// A [`Group::landed`] block as the file holds it: the inverse of
+/// [`landed_push`]. Empty writes nothing, like any other block.
+fn landed_text(landed: &[Landed]) -> String {
+    let mut out = String::new();
+    for e in landed {
+        if !out.is_empty() {
+            out.push_str(" · ");
+        }
+        out.push_str(&e.member);
+        out.push('@');
+        out.push_str(e.commit.as_deref().unwrap_or("?"));
+        for f in &e.files {
+            out.push(' ');
+            out.push_str(f);
         }
     }
     out
@@ -1579,6 +1668,7 @@ pub fn render_groups(groups: &[Group]) -> String {
         out.push('\n');
         block(&mut out, "stop", &g.stop);
         block(&mut out, "verdict", &g.verdict);
+        block(&mut out, "landed", &landed_text(&g.landed));
     }
     out
 }
@@ -2281,6 +2371,7 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
                 cap: None,
                 stop: stop.into(),
                 verdict: verdict.into(),
+                ..Group::default()
             },
             Group { members: vec!["render-041".into()], ..Group::default() },
         ]);
@@ -2290,6 +2381,44 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!(got[0].verdict, verdict, "and the answer did not land inside the question");
         assert_eq!(got[0].members, ["robustness-069"], "nor either of them among the members");
         assert_eq!(got[1].verdict, "", "a barrier nobody has passed writes nothing at all");
+    }
+
+    /// What each member landed survives the disk, wrapped like any other block
+    /// and read back as the same entries — including the member nobody could
+    /// place, which is said as `?` rather than dropped. A file list wrapping
+    /// across lines must not become files of the wrong member, which is what
+    /// `## Groups` being parsed line by line puts at stake here.
+    #[test]
+    fn what_a_group_landed_round_trips_through_the_record() {
+        let mut w = Worklist::new("batch", "Overnight batch");
+        w.set_groups(&[Group {
+            members: vec!["wl-001".into(), "wl-002".into(), "wl-003".into()],
+            verdict: "2026-08-23T09:00:00Z clean".into(),
+            landed: vec![
+                Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: vec!["src/x.rs".into(), "src/y.rs".into()] },
+                Landed { member: "wl-002".into(), commit: Some("9b02dde".into()), files: Vec::new() },
+                Landed { member: "wl-003".into(), commit: None, files: Vec::new() },
+            ],
+            ..Group::default()
+        }]);
+
+        let written = render_groups(w.groups().as_slice());
+        assert!(written.contains("landed:"), "{written}");
+        let got = Worklist::from_doc(&fm::parse(&w.render()), "batch").groups();
+        assert_eq!(got[0].landed, w.groups()[0].landed, "the whole mapping comes back");
+        assert_eq!(got[0].landed[2].commit, None, "unplaced is a state, not an absence");
+        assert_eq!(got[0].landed[1].files.len(), 0, "placed and empty is different from unplaced");
+
+        // A long file list wraps on write; the continuation belongs to the
+        // member it was written under, not to whichever one reads first.
+        let many: Vec<String> = (0..12).map(|i| format!("src/dir{i}/file{i}.rs")).collect();
+        w.set_groups(&[Group {
+            members: vec!["wl-001".into()],
+            landed: vec![Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: many }],
+            ..Group::default()
+        }]);
+        let got = Worklist::from_doc(&fm::parse(&w.render()), "batch").groups();
+        assert_eq!(got[0].landed[0].files.len(), 12, "all twelve survive the wrap: {}", render_groups(w.groups().as_slice()));
     }
 
     /// `## Groups` is the file's structure and belongs second, above the

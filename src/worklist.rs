@@ -115,7 +115,7 @@ use std::path::PathBuf;
 
 use crate::cmd_checkout;
 use crate::cmd_verify::{git, toplevel};
-use crate::model::{Group, Status, Task, Worklist, WorklistStatus};
+use crate::model::{Group, Landed, Status, Task, Worklist, WorklistStatus};
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util;
@@ -1252,8 +1252,15 @@ pub struct Overlap {
     pub unread: Vec<String>,
 }
 
-/// What the members of a group that has just landed touched, and where two of
-/// them touched the same file.
+/// What the members of a group that has just landed put on the trunk, and
+/// where two of them touched the same file.
+///
+/// **One walk, two answers.** The barrier wants the per-member record — what
+/// each member's newest land put on the trunk, written into the group before
+/// the sweep deletes the branch that was the only other place it lived — and
+/// it wants the same-file report. Both are read off the same reflog walk, so
+/// [`overlaps`] is this function seen from one side rather than a second
+/// computation that could disagree with the first.
 ///
 /// **Feedback on how the group was composed, not a check on it.** Mutual
 /// exclusion is deliberately not machinery in this design — it is the rule
@@ -1273,25 +1280,33 @@ pub struct Overlap {
 /// three — and one `git diff --name-only` per *land*, which is one per member
 /// for all but the member that landed twice. That is the cost the design
 /// priced, and it did not move much when the arity did.
-pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
+pub fn touched(store: &Store, members: &[String]) -> Touched {
     let mut repos = Repos::new(store);
     let mut logs: HashMap<PathBuf, cmd_checkout::Landings> = HashMap::new();
     let mut touched: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut out = Overlap::default();
+    let mut out = Touched::default();
 
     for id in members {
         // Through `Store::task_now`, because these are the raw member ids out
         // of the worklist's own text and a renumbered one is not at the path
-        // it names. It is also what makes the `branches` call below work: that
+        // it names. It is also what makes the branch search below work: that
         // expands the *current* id backwards into the names a tree may have
         // been cut under, so asking it with the worklist's older name gives it
         // nothing to expand and misses the branch under the newer one.
         //
         // No project, no root, or no repository is not a member that could not
         // be read: it is design-only work with nothing to look in, and it is
-        // passed over exactly as the sweep passes over it.
-        let Some(task) = store.task_now(&repos.renamed, id) else { continue };
-        let Some(trunk) = task.project.as_deref().and_then(|p| repos.of(p)) else { continue };
+        // passed over exactly as the sweep passes over it. It still gets an
+        // entry in `landed` — the record is one entry per member, and an
+        // absent entry would make the count drawn from it overstate coverage.
+        let Some(task) = store.task_now(&repos.renamed, id) else {
+            out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
+            continue;
+        };
+        let Some(trunk) = task.project.as_deref().and_then(|p| repos.of(p)) else {
+            out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
+            continue;
+        };
         let log = logs
             .entry(trunk.dir.clone())
             .or_insert_with(|| cmd_checkout::Landings::read(&trunk.dir, &trunk.branch));
@@ -1302,28 +1317,51 @@ pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
         // **Every name, not the first one that answers.** A task renumbered
         // between two lands has one land under each name, and stopping at the
         // first reads the newer and drops the older — the same "one is all
-        // there is" mistake `Landings::files` had within a single name, one
-        // level up. A name that never landed answers `None` here legitimately,
-        // because it is a name and not a claim, so it is *no* name answering
-        // that means nobody could place the member.
+        // there is" mistake `placed` had within a single name, one level up.
+        // A name that never landed answers `None` here legitimately, because
+        // it is a name and not a claim, so it is *no* name answering that
+        // means nobody could place the member.
         let mut files: BTreeSet<String> = BTreeSet::new();
-        let mut placed = false;
+        let mut placed: Option<String> = None;
         for b in repos.branches(&task.id) {
-            if let Some(f) = log.files(&trunk.dir, &b) {
-                placed = true;
-                files.extend(f);
+            if let Some(p) = log.placed(&trunk.dir, &b) {
+                placed = placed.or(Some(p.commit));
+                files.extend(p.files);
             }
         }
-        if !placed {
-            out.unread.push(id.clone());
+        match &placed {
+            Some(commit) => out.landed.push(Landed { member: id.clone(), commit: Some(commit.clone()), files: files.iter().cloned().collect() }),
+            // The honest half, in both records: `unread` says it in words where
+            // the report is printed, and `commit: None` says it in kind where
+            // the record is kept — neither turns "we could not look" into "we
+            // looked and it was clean".
+            None => {
+                out.overlap.unread.push(id.clone());
+                out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
+            }
         }
         for f in files {
             touched.entry(f).or_default().push(id.clone());
         }
     }
 
-    out.shared = touched.into_iter().filter(|(_, who)| who.len() > 1).collect();
+    out.overlap.shared = touched.into_iter().filter(|(_, who)| who.len() > 1).collect();
     out
+}
+
+/// What the members of a group that has just landed put on the trunk: one
+/// [`Landed`] entry per member, and the overlap report beside it. See
+/// [`touched`], which is the one walk both come from.
+#[derive(Debug, Default)]
+pub struct Touched {
+    pub landed: Vec<Landed>,
+    pub overlap: Overlap,
+}
+
+/// Which members of a group put their hands on the same file — the overlap
+/// half of [`Touched`], which is the shape the barrier has always printed.
+pub fn overlaps(store: &Store, members: &[String]) -> Overlap {
+    touched(store, members).overlap
 }
 
 #[cfg(test)]
@@ -1370,6 +1408,24 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The same run, where the answer matters: the trunk value a step left
+    /// behind, for an assertion that wants to name it.
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
     fn task(store: &Store, id: &str, status: &str) {
@@ -1479,6 +1535,96 @@ mod tests {
             "the file two of them shared, and only that file"
         );
         assert_eq!(o.unread, ["wsp-4"], "and the one nobody could place is named, not dropped");
+    }
+
+    /// The other half of the same walk: per member, the merge commit and every
+    /// file its lands put on the trunk. This is what `go` writes into the group
+    /// before the sweep deletes the branch that was the only other place the
+    /// association lived, so it is proved against real branches that have
+    /// already landed — with an unrelated commit between two members, and a
+    /// member whose tree was swept underneath it.
+    #[test]
+    fn the_record_names_the_commit_and_files_each_member_put_on_the_trunk() {
+        let (_env, store, repo) = scratch("record");
+        std::fs::write(repo.join("shared.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git_run(&repo, &["add", "shared.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "shared"]);
+
+        for (id, line) in [("wsp-1", 0usize), ("wsp-2", 9)] {
+            task(&store, id, "review");
+            let dir = committed(&repo, id);
+            let mut lines: Vec<String> =
+                std::fs::read_to_string(dir.join("shared.txt")).unwrap().lines().map(String::from).collect();
+            lines[line] = id.to_string();
+            std::fs::write(dir.join("shared.txt"), lines.join("\n") + "\n").unwrap();
+            git_run(&dir, &["commit", "--quiet", "--all", "--message", "shared"]);
+        }
+        task(&store, "wsp-3", "review");
+        committed(&repo, "wsp-3");
+        // Somebody else's work landing in between — the trunk tip moves under
+        // the group, and each member's record must still be its own.
+        std::fs::write(repo.join("theirs.txt"), "not ours\n").unwrap();
+        git_run(&repo, &["add", "theirs.txt"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "theirs"]);
+
+        let mut tips = HashMap::new();
+        for id in ["wsp-1", "wsp-3", "wsp-2"] {
+            git_run(&repo.join(cmd_checkout::WORKTREES).join(id), &["rebase", "--quiet", "master"]);
+            land(&repo, id);
+            tips.insert(id, git_out(&repo, &["rev-parse", "master"]));
+        }
+        task(&store, "wsp-4", "review"); // no branch: nothing ever ran for it
+
+        let t = touched(&store, &["wsp-1".into(), "wsp-2".into(), "wsp-3".into(), "wsp-4".into()]);
+        assert_eq!(
+            t.landed.iter().map(|e| e.member.as_str()).collect::<Vec<_>>(),
+            ["wsp-1", "wsp-2", "wsp-3", "wsp-4"],
+            "one entry per member, in member order"
+        );
+        assert_eq!(
+            t.landed[0].commit.as_deref(),
+            Some(tips["wsp-1"].as_str()),
+            "the commit is the trunk value this member's land put there"
+        );
+        assert_eq!(
+            t.landed[1].commit.as_deref(),
+            Some(tips["wsp-2"].as_str()),
+            "and the newest tip, not whichever landed first"
+        );
+        assert!(t.landed[0].files.contains(&"shared.txt".to_string()), "{:?}", t.landed[0].files);
+        assert_eq!(t.landed[2].files, ["wsp-3.txt"], "a member's own files and nobody else's");
+        assert_eq!(
+            t.landed[3].commit, None,
+            "nothing ran for it, and unknown is said rather than smoothed over"
+        );
+
+        // The report beside it is unchanged by sharing one walk.
+        assert_eq!(t.overlap.unread, ["wsp-4"]);
+        assert_eq!(
+            t.overlap.shared,
+            vec![("shared.txt".to_string(), vec!["wsp-1".to_string(), "wsp-2".to_string()])]
+        );
+    }
+
+    /// The sweep has already taken the tree and the branch by the time anybody
+    /// judges the run, so the record has to be readable from exactly that
+    /// state — which is the whole reason it is written when it is.
+    #[test]
+    fn a_member_whose_branch_the_sweep_deleted_is_still_in_the_record() {
+        let (_env, store, repo) = scratch("record-swept");
+        task(&store, "wsp-1", "review");
+        committed(&repo, "wsp-1");
+        land(&repo, "wsp-1");
+        let tip = git_out(&repo, &["rev-parse", "master"]);
+        git_run(
+            &repo,
+            &["worktree", "remove", "--force", &repo.join(cmd_checkout::WORKTREES).join("wsp-1").display().to_string()],
+        );
+        git_run(&repo, &["branch", "-d", "wsp-1"]);
+
+        let t = touched(&store, &["wsp-1".into()]);
+        assert_eq!(t.landed[0].commit.as_deref(), Some(tip.as_str()), "the reflog outlives both");
+        assert_eq!(t.landed[0].files, ["wsp-1.txt"]);
     }
 
     /// The same root, in the report rather than in the predicate. A branch that

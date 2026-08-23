@@ -1247,7 +1247,7 @@ impl Landings {
         Landings { values }
     }
 
-    /// The files `branch` put on the trunk, or `None` where the reflog does not
+    /// What `branch` put on the trunk, or `None` where the reflog does not
     /// place it. See the type's docs for why those are two different answers.
     ///
     /// **The name is the whole lookup, and every entry carrying it counts.**
@@ -1285,20 +1285,36 @@ impl Landings {
     /// whole answer to `None` rather than reporting the lands above it — a
     /// partial account of what a member touched is a partial `none`, which is
     /// the one confusion this type is here to keep out.
-    pub(crate) fn files(&self, repo: &Path, branch: &str) -> Option<Vec<String>> {
+    ///
+    /// The commit is the **newest** entry's trunk value — the tip this branch
+    /// last left the trunk at, full hash because the durable copy is read
+    /// months later and a short one is a guess about what else the repository
+    /// will grow. It was added for [`crate::model::Group::landed`], which
+    /// writes the association between member and commits down before the sweep
+    /// deletes the only other place it lived.
+    pub(crate) fn placed(&self, repo: &Path, branch: &str) -> Option<Placed> {
         let named = format!("merge {branch}:");
         let mut out: BTreeSet<String> = BTreeSet::new();
-        let mut landed = false;
+        let mut commit = String::new();
         for (at, (tip, _)) in
             self.values.iter().enumerate().filter(|(_, (_, why))| why.starts_with(&named))
         {
-            landed = true;
+            if commit.is_empty() {
+                commit = tip.clone();
+            }
             let (base, _) = self.values.get(at + 1)?;
             let diff = git(repo, &["diff", "--name-only", base, tip])?;
             out.extend(diff.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
         }
-        landed.then(|| out.into_iter().collect())
+        (!commit.is_empty()).then(|| Placed { commit, files: out.into_iter().collect() })
     }
+}
+
+/// What one branch put on the trunk, as [`Landings::placed`] answers it: the
+/// merge commit of its newest land, and every file across all of its lands.
+pub(crate) struct Placed {
+    pub commit: String,
+    pub files: Vec<String>,
 }
 
 /// Serialise the moment two worktrees meet.

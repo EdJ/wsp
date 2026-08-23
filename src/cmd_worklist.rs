@@ -73,7 +73,7 @@ use serde_json::json;
 // be a divergence in what each section can hold. `worklist-045` made it
 // `pub(crate)` for its second caller; this is the third.
 use crate::cmd_task::fold;
-use crate::model::{Group, Worklist, WorklistStatus};
+use crate::model::{Group, Landed, Worklist, WorklistStatus};
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::worklist::{self, Landing, Position, Reading, Segment, Standing};
@@ -1180,6 +1180,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                     "stop": g.stop,
                     "verdict": g.verdict,
                     "members": g.members,
+                    // Whole, where the plan drawing draws a count: an
+                    // abridgement is a thing done for a reader, and a parser
+                    // is not one.
+                    "landed": landed_json(&g.landed),
                 })).collect::<Vec<_>>(),
                 "at": pos.at,
                 // The third state, for the reader that cannot see the `at`
@@ -1297,6 +1301,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             // been passed, which is a thing worth being able to see in the plan
             // rather than only at `next`.
             for line in verdict_lines(&p, g, &w.id, width, args.has("verdicts")) {
+                println!("{indent}{line}");
+            }
+            for line in landed_lines(&p, g) {
                 println!("{indent}{line}");
             }
         }
@@ -1522,6 +1529,31 @@ fn verdict_parts(v: &str) -> (String, &str) {
         }
         _ => (String::new(), v.trim()),
     }
+}
+
+/// What [`show`] draws of what a passed group's members landed: **a count,
+/// never the mapping.** The rule is `worklist-046`'s taken one step further —
+/// no lead of this record can stand in for it, so the only things drawn are
+/// the two numbers that cannot mislead: how many members were placed, of how
+/// many, and how many files between them. A member recorded as unplaced keeps
+/// the placed count below the membership, which is the honest shape of "we
+/// could not look". The mapping itself is on the group in the file and in
+/// `--json` — not an abridgement of prose drawn elsewhere, but a record that
+/// is drawn only as its size.
+fn landed_lines(p: &Paint, g: &Group) -> Vec<String> {
+    if g.landed.is_empty() {
+        return Vec::new();
+    }
+    let placed = g.landed.iter().filter(|e| e.commit.is_some()).count();
+    let files: usize = g.landed.iter().map(|e| e.files.len()).sum();
+    vec![p.dim(&format!(
+        "landed: {} of {} member{} · {} file{}",
+        placed,
+        g.landed.len(),
+        if g.landed.len() == 1 { "" } else { "s" },
+        files,
+        if files == 1 { "" } else { "s" },
+    ))]
 }
 
 /// What `go` tells the writer about the verdict it has just recorded, when
@@ -2191,11 +2223,12 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     };
 
     // Read before anything is removed, though nothing now depends on that
-    // order: the report is off the trunk's reflog, which outlives both the
-    // trees and the branches the sweep takes. See `cmd_checkout::Landings`.
-    let overlap = match crossed {
-        Some(n) => worklist::overlaps(store, &groups[n - 1].members),
-        None => worklist::Overlap::default(),
+    // order: the report and the per-member record are both off the trunk's
+    // reflog, which outlives the trees and the branches the sweep takes. See
+    // `cmd_checkout::Landings`.
+    let touched = match crossed {
+        Some(n) => Some(worklist::touched(store, &groups[n - 1].members)),
+        None => None,
     };
 
     // `-n` is a dry run of the **whole verb**, not of the sweep alone. Half a
@@ -2235,6 +2268,13 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         false => {
             if let Some(n) = crossed {
                 groups[n - 1].verdict = verdict_of(&said);
+                // The association between member and commits, written while it
+                // is still in hand: the sweep this call just ran deletes the
+                // branch that was the only other place it lived, and what
+                // outlives that is a machine-local reflog expiring at gc.
+                if let Some(t) = &touched {
+                    groups[n - 1].landed = t.landed.clone();
+                }
             }
         }
     }
@@ -2292,8 +2332,11 @@ pub fn go(store: &Store, args: &Args) -> i32 {
                 "started": starting,
                 "passed": crossed,
                 "verdict": said,
-                "same_file": overlap.shared.iter().map(|(f, who)| json!({ "file": f, "members": who })).collect::<Vec<_>>(),
-                "unread": overlap.unread,
+                "same_file": touched.as_ref().map(|t| t.overlap.shared.iter().map(|(f, who)| json!({ "file": f, "members": who })).collect::<Vec<_>>()).unwrap_or_default(),
+                "unread": touched.as_ref().map(|t| t.overlap.unread.clone()).unwrap_or_default(),
+                // The record itself, whole: a parser is not the reader the
+                // count-only plan drawing is for.
+                "landed": touched.as_ref().map(|t| landed_json(&t.landed)).unwrap_or_default(),
                 "swept": swept.as_ref().map(|s| json!({
                     "removed": s.swept.removed,
                     "branches": s.swept.branches,
@@ -2331,8 +2374,9 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     // Only where a barrier was crossed. Starting a list has no group behind it
     // to have touched anything, and "none" there would be an answer to a
     // question nobody asked.
-    if crossed.is_some() {
-        say_overlap(&p, &overlap);
+    if let Some(t) = &touched {
+        say_overlap(&p, &t.overlap);
+        say_landed(&p, &t.landed);
     }
     say_swept(&p, swept.as_ref(), crossed.is_some() && args.has("keep"), dry);
     // Beside the line naming what may start, because it is about those same
@@ -2464,6 +2508,30 @@ fn say_overlap(p: &Paint, o: &worklist::Overlap) {
             p.dim(&format!("{} could not be read back off the trunk", o.unread.join(" ")))
         );
     }
+}
+
+/// What each member of the group that just landed put on the trunk — one
+/// line, the commit shortened for reading, because this is a receipt and not
+/// the record: the full hashes are on the group, where they are kept. `@?` is
+/// a member nobody could place, said in kind rather than left out.
+fn say_landed(p: &Paint, landed: &[Landed]) {
+    let said: Vec<String> = landed
+        .iter()
+        .map(|e| {
+            let at: String =
+                e.commit.as_deref().map(|c| c.chars().take(7).collect()).unwrap_or_else(|| "?".into());
+            format!("{}@{} {}", e.member, at, e.files.len())
+        })
+        .collect();
+    println!("{}  {}", p.bold("landed"), p.dim(&said.join(" · ")));
+}
+
+/// The record itself, whole, for a parser.
+fn landed_json(landed: &[Landed]) -> serde_json::Value {
+    json!(landed
+        .iter()
+        .map(|e| json!({ "member": e.member, "commit": e.commit, "files": e.files }))
+        .collect::<Vec<_>>())
 }
 
 /// What the sweep did, and the one line of it that is an obligation.
@@ -3611,6 +3679,83 @@ mod tests {
             "and the member that would have dragged it back is named"
         );
     }
+
+    /// The record is as much the point of passing a barrier as the verdict is:
+    /// `go` writes what each member put on the trunk onto the group it crossed
+    /// — one entry per member, surviving the write back to the file — and a
+    /// dry run writes nothing at all. Starting a list records nothing either:
+    /// it crosses no barrier, so there is no group behind it to have landed.
+    #[test]
+    fn passing_a_barrier_records_what_its_members_landed_and_a_dry_run_writes_nothing() {
+        let (_env, store) = running("record");
+        task(&store, "wl-001", "todo");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+
+        // Starting: no barrier behind anything, so no record anywhere.
+        assert_eq!(run(&store, &["go", "batch"]), 0);
+        assert!(groups_of(&store, "batch")[0].landed.is_empty(), "starting crossed nothing");
+
+        // Group 1 finishes on the store — no repository here to land in, which
+        // is the design-only shape — and its barrier shuts.
+        task(&store, "wl-001", "review");
+
+        assert_eq!(flagged(&store, &["go", "batch"], &[("dry-run", "true")]), 0);
+        assert!(groups_of(&store, "batch")[0].landed.is_empty(), "-n wrote nothing");
+
+        assert_eq!(run(&store, &["go", "batch"]), 0);
+        let gs = groups_of(&store, "batch");
+        assert_eq!(
+            gs[0].landed.iter().map(|e| e.member.as_str()).collect::<Vec<_>>(),
+            ["wl-001"],
+            "one entry per member of the group whose barrier was crossed"
+        );
+        assert_eq!(
+            gs[0].landed[0].commit, None,
+            "no repository to look in here, and unknown is said rather than dropped"
+        );
+        assert!(gs[1].landed.is_empty(), "the group ahead of the barrier is untouched");
+    }
+
+    /// The plan drawing draws a count and never the mapping — there is no lead
+    /// of this record that can stand in for it, so the two numbers that cannot
+    /// mislead are all that is drawn, and an unplaced member keeps the placed
+    /// count below the membership instead of vanishing from it.
+    #[test]
+    fn the_plan_draws_a_count_of_what_landed_and_never_the_mapping() {
+        let p = Paint::plain();
+        let mut g = Group { members: vec!["wl-001".into(), "wl-002".into()], ..Group::default() };
+        assert!(landed_lines(&p, &g).is_empty(), "nothing recorded, nothing drawn");
+
+        g.landed = vec![
+            Landed {
+                member: "wl-001".into(),
+                commit: Some("e3f1c2ade4b5960f8d21c7ba44f0e6d9a1b2c3d4".into()),
+                files: (0..11).map(|i| format!("src/dir{i}/file{i}.rs")).collect(),
+            },
+            Landed { member: "wl-002".into(), commit: None, files: Vec::new() },
+        ];
+
+        let drawn = landed_lines(&p, &g);
+        assert_eq!(drawn.len(), 1, "one line whatever the mapping holds: {drawn:?}");
+        let line = &drawn[0];
+        assert!(line.contains("1 of 2"), "placed, of members — the gap is visible: {line}");
+        assert!(line.contains("11 files"), "and the weight of what landed: {line}");
+        assert!(
+            !line.contains("src/"),
+            "never the mapping itself: {line}",
+        );
+
+        let solo = Group {
+            landed: vec![Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: vec!["one.rs".into()] }],
+            ..Group::default()
+        };
+        let line = &landed_lines(&p, &solo)[0];
+        assert!(line.contains("1 of 1 member") && line.contains("1 file"), "singular reads as one: {line}");
+    }
+
 
     /// The receipt for the floor, and who is told about it.
     ///
