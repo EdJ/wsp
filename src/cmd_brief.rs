@@ -945,8 +945,22 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     }
     // Said before the work rather than after it: what it changes is how you
     // commit, and an agent reads a brief once and commits hours later.
+    //
+    // **"and it is the whole project" is `core-042`, and it is there to stop a
+    // reach rather than to be informative.** A tree sits at
+    // `<checkout>/.worktrees/<task>`, so an agent that reads *the root* as the
+    // project's recorded root walks up out of its own tree — and three opencodes
+    // did, one of them editing `src/cmd_task.rs` in the shared checkout before
+    // anyone noticed. Every tracked file is already here, including the
+    // `README.md` the handbook sends them to, and the alternative to this
+    // clause is a standing `external_directory` allow on the parent, which
+    // would cover every sibling agent's tree as well. Six words against that.
     if r.own_tree.is_some() {
-        row("tree", p.dim("your own — commit freely; `wsp land` puts it on the trunk").to_string());
+        row(
+            "tree",
+            p.dim("your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk")
+                .to_string(),
+        );
     }
 
     // Standing direction, before anything about the work itself. An agent

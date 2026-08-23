@@ -431,7 +431,14 @@ pub trait Kind {
     /// fixed when the seat opens, and the brief cannot be composed until the
     /// claim has landed a moment later; the path is knowable in advance and the
     /// content is not.
-    fn env(&self, _brief: Option<&Path>) -> BTreeMap<String, String> {
+    ///
+    /// `reach` is the directories outside this agent's own tree that it may
+    /// use without asking — [`crate::cmd_spawn::reach`] decides them, from what
+    /// wsp already holds, and a kind that has no way to say so ignores them.
+    /// Empty is not a failure and not a default: it is a seat wsp knows of
+    /// nothing outside the tree for, and it must produce the configuration the
+    /// seat had before this parameter existed.
+    fn env(&self, _brief: Option<&Path>, _reach: &[PathBuf]) -> BTreeMap<String, String> {
         BTreeMap::new()
     }
 
@@ -866,31 +873,47 @@ const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 /// flipping it changes is what the agent may do inside the tree wsp made for
 /// it, and nothing about where it may do it.
 ///
-/// **`external_directory` is deliberately not written here, and `core-041`'s
-/// decision says to write it.** This is the one place the build departs from
-/// it, on a fact driven after it was made. The key was to be set explicitly
-/// "so it is a decision rather than an inheritance" while keeping its asking
-/// default — and setting it cannot do both. `Permission.merge` is a
-/// concatenation and `Permission.evaluate` is a `findLast`, so every rule wsp
-/// writes lands *after* opencode's own, and `{"*":"ask"}` does not restate the
-/// default: it overturns the narrow allows underneath it. Driven with `opencode
-/// debug agent build` on 2026-08-23 — 11 rules resolved for
-/// `external_directory` without the key and 12 with it, wsp's `ask *`
-/// second-to-last, burying eight of them: opencode's own tmp directory, which
+/// **`external_directory` carries narrow allows and never a catch-all, which
+/// is `core-042`.** `core-041`'s decision said to set the key explicitly "so it
+/// is a decision rather than an inheritance" while keeping its asking default,
+/// and the build refused because setting it *cannot do both*: `Permission.merge`
+/// is a concatenation and `Permission.evaluate` is a `findLast`, so every rule
+/// wsp writes lands after opencode's own, and `{"*":"ask"}` does not restate the
+/// default — it overturns the narrow allows underneath it. Driven with `opencode
+/// debug agent build`: 11 rules resolved without the key and 12 with it, wsp's
+/// `ask *` second-to-last, burying eight — opencode's own tmp directory, which
 /// its system prompt tells the agent to write scratch files in, and the seven
-/// skill directories on this machine. Only the tool-output directory survives,
-/// because opencode re-appends that one after every merge. On `ui-007`'s replay
-/// the tmp rule alone is three of the four prompts that would remain, spent on
-/// opencode's plumbing rather than on the agent reaching anywhere. So the
-/// asking default is kept by leaving it alone, and the decision is recorded
-/// here, where the next reader of this function is.
+/// skill directories on this machine. That argument is about a **catch-all**,
+/// and it still holds: nothing here may write one.
+///
+/// A **narrow allow** is the opposite case and lands correctly, which is what
+/// makes this row possible. Driven the same way on 2026-08-23: wsp's rules
+/// arrive after `ask *` at index 0, `findLast` gives each of them its own
+/// paths, and every path nobody named still falls through to the ask. So the
+/// key is written, with allows only, and the question stops being *may we set
+/// it* and becomes **what does wsp already know**.
+///
+/// [`crate::cmd_spawn::reach`] answers that and is where the paths come from —
+/// the store it was built with and the row's own `refs`, never a constant in
+/// this file. What is *not* here is the project root. Three agents asked for
+/// `~/claude/wsp/*` and the transcripts say none of them needed it: two were
+/// reaching for the handbook's *"`README.md` at the root"* in the main checkout
+/// while holding a copy of it in their own tree, and the third wanted `git
+/// worktree add`, which a linked worktree can run perfectly well from where it
+/// stands. Against that, `edit` is `allow` and an `external_directory` rule is
+/// a path rule and not an operation rule — so the grant would hand a spawned
+/// agent write access to the shared checkout somebody else is standing in.
+/// `ui-001`'s agent, which was allowed it by hand, edited `src/cmd_task.rs`
+/// **in the main checkout** and had to `git apply -R` its way back out. The
+/// allow is refused and the reach is closed at the other end, in the sentence
+/// [`crate::cmd_brief`] writes about the tree.
 ///
 /// **What the replay says, which is the acceptance test the decision named.**
 /// Against `ui-007`'s own 32 requests — 28 `bash`, 3 `edit`, 1
-/// `external_directory` — this policy answers 31 without a person. The one left
-/// is `cat ~/wsp/tasks/ui-007.md`: a reach outside the tree, asked by
-/// `external_directory` and not by anything wsp wrote. Single digits was the
-/// target.
+/// `external_directory` — `core-041`'s policy answered 31 without a person, and
+/// the one left was `cat ~/wsp/tasks/ui-007.md`. That is the store, so this
+/// answers all 32. Replayed the same way across every opencode row wsp has run,
+/// the residue is what `reach` cannot know in advance and nothing else.
 ///
 /// **What is left of `core-020` d1's requirement, stated thinly because it is
 /// thin.** d1's argument was that a kind whose only brake can never engage
@@ -917,7 +940,7 @@ const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 /// Scoped to the seat and not to the machine. Ed's own opencode is untouched by
 /// this, which is the other half of the decision: wsp configures the agents it
 /// starts and nothing else.
-fn config(brief: Option<&Path>) -> String {
+fn config(brief: Option<&Path>, reach: &[PathBuf]) -> String {
     let mut rules: Vec<(String, &str)> = Vec::new();
     // The posture. Everything a shell can do, in a tree wsp made and nobody
     // has landed.
@@ -930,7 +953,36 @@ fn config(brief: Option<&Path>) -> String {
         .map(|(pattern, action)| format!("{}:{}", Value::from(pattern.as_str()), Value::from(*action)))
         .collect::<Vec<_>>()
         .join(",");
-    let mut cfg = format!(r#"{{"permission":{{"bash":{{{bash}}},"edit":"allow"}}"#);
+    // Where this agent may reach outside its own tree, as allows and nothing
+    // else. The paragraph above carries the argument; what it comes to here is
+    // that a key holding only allows adds rules and takes none away, so the
+    // asking default survives underneath it for every path nobody named.
+    //
+    // `<dir>/*` is opencode's own spelling for a directory, and its `*` spans
+    // separators: a rule on `.../T/opencode/*` answered a request for
+    // `.../T/opencode/render-014-before/*` in `render-014`'s log, so one rule
+    // on the store covers `tasks/`, `projects/` and `worklists/` beneath it.
+    // Written only when there is something to write, so a seat with nothing to
+    // reach for is byte-for-byte the config it had before this existed.
+    let outside = match reach.is_empty() {
+        true => String::new(),
+        false => {
+            let allows = reach
+                .iter()
+                .map(|dir| {
+                    format!(
+                        "{}:{}",
+                        Value::from(format!("{}/*", dir.display())),
+                        Value::from("allow")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#","external_directory":{{{allows}}}"#)
+        }
+    };
+    let mut cfg =
+        format!(r#"{{"permission":{{"bash":{{{bash}}},"edit":"allow"{outside}}}"#);
     // The brief, as a path opencode loads for itself. `core-032` d7, and the
     // reason it goes here rather than into the work order is on
     // [`Kind::brief_file`].
@@ -1213,8 +1265,8 @@ impl Kind for OpenCode {
 
     /// [`config`], which is the whole of it. The argument is on that function,
     /// on [`WSP_DENIED`] and on [`Kind::env`].
-    fn env(&self, brief: Option<&Path>) -> BTreeMap<String, String> {
-        BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), config(brief))])
+    fn env(&self, brief: Option<&Path>, reach: &[PathBuf]) -> BTreeMap<String, String> {
+        BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), config(brief, reach))])
     }
 
     /// Yes — `instructions`. The measurement is on [`Kind::brief_file`].
@@ -2652,7 +2704,7 @@ mod tests {
 
     #[test]
     fn a_spawned_opencode_works_in_its_own_tree_freely_and_still_cannot_end_a_task() {
-        let env = of("opencode").env(None);
+        let env = of("opencode").env(None, &[]);
         let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("the policy is on the seat");
         let v: Value = serde_json::from_str(cfg).expect("valid config, composed not concatenated");
         let bash = &v["permission"]["bash"];
@@ -2674,28 +2726,47 @@ mod tests {
         );
     }
 
-    /// The key wsp does *not* write, which is the one place the build departs
-    /// from `core-041`'s decision.
+    /// What may be written under `external_directory`, and what may never be.
     ///
-    /// Setting `external_directory` explicitly cannot both state the boundary
-    /// and keep it where it was. Rules merge by concatenation and evaluate by
-    /// `findLast`, so anything wsp writes lands after opencode's own and a
-    /// `{"*":"ask"}` overturns the narrow allows beneath it rather than
-    /// restating the default above them. Driven with `opencode debug agent
-    /// build` on 2026-08-23: 11 external_directory rules resolved without the
-    /// key, 12 with it, and the eight allows it buries include opencode's own
-    /// tmp directory and every skill directory on the machine. The argument is
-    /// on [`config`]; this is the tripwire, because the next reader will have
-    /// the decision in front of them and this file will look like a mistake.
+    /// `core-041` d2 forbade the key because setting it cannot both state the
+    /// boundary and keep it where it was: rules merge by concatenation and
+    /// evaluate by `findLast`, so a `{"*":"ask"}` wsp writes lands after
+    /// opencode's own narrow allows and overturns them — 11 rules resolved
+    /// without the key and 12 with it at `opencode debug agent build`, burying
+    /// eight, opencode's own tmp directory among them. That argument is about a
+    /// **catch-all** and it is the thing this asserts is still absent.
+    ///
+    /// An **allow** is the opposite case: it adds a rule and takes none away,
+    /// so every path nobody named still falls to the `ask *` opencode ships at
+    /// index 0. Driven the same way on 2026-08-23 before this landed. The
+    /// tripwire is worth keeping in one test with the refusal, because the two
+    /// halves are one rule and a reader who sees only the allow will reach for
+    /// the catch-all next.
     #[test]
-    fn wsp_says_nothing_about_where_an_opencode_may_reach_because_saying_it_narrows_it() {
-        let env = of("opencode").env(None);
-        let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("the policy is on the seat");
+    fn where_an_opencode_may_reach_is_named_path_by_path_and_never_as_a_catch_all() {
+        let plain = of("opencode").env(None, &[]);
         assert!(
-            !cfg.contains("external_directory"),
-            "opencode's default asks for every path outside the agent's own directory, \
-             and a rule here would sit after the allows it ships with — {cfg}"
+            !plain["OPENCODE_CONFIG_CONTENT"].contains("external_directory"),
+            "a seat with nothing outside its tree is the config it was before this existed"
         );
+
+        let store = PathBuf::from("/Users/somebody/wsp");
+        let spec = PathBuf::from("/Users/somebody/specs");
+        let env = of("opencode").env(None, &[store, spec]);
+        let cfg = &env["OPENCODE_CONFIG_CONTENT"];
+        let v: Value = serde_json::from_str(cfg).expect("valid config, composed not concatenated");
+        let out = &v["permission"]["external_directory"];
+        assert_eq!(out["/Users/somebody/wsp/*"], "allow", "the store — {cfg}");
+        assert_eq!(out["/Users/somebody/specs/*"], "allow", "the row's own refs — {cfg}");
+        // The whole of `core-041` d2 in one line. Anything matching everything
+        // lands after opencode's own allows and buries them, and no path this
+        // file can be handed makes that a good trade.
+        assert!(
+            out.as_object().is_some_and(|m| m.keys().all(|k| k != "*" && k.len() > 2)),
+            "an allow names a place; a catch-all overturns the eight rules under it — {cfg}"
+        );
+        // And the posture beside it is untouched: a reach is not a licence.
+        assert_eq!(v["permission"]["bash"]["wsp done*"], "deny");
     }
 
     /// The order the map is written in, because opencode reads it as one.
@@ -2709,7 +2780,7 @@ mod tests {
     /// keeping the denies from being decoration.
     #[test]
     fn the_catch_all_is_written_before_the_denies_that_have_to_beat_it() {
-        let env = of("opencode").env(None);
+        let env = of("opencode").env(None, &[]);
         let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("nothing on the seat");
         let at = |needle: &str| cfg.find(needle).unwrap_or_else(|| panic!("no {needle} in {cfg}"));
         assert!(
@@ -2733,7 +2804,7 @@ mod tests {
     #[test]
     fn the_brief_arrives_on_the_same_variable_as_the_policy_and_does_not_disturb_it() {
         let cfg = |brief| {
-            let env = of("opencode").env(brief);
+            let env = of("opencode").env(brief, &[]);
             let raw = env.get("OPENCODE_CONFIG_CONTENT").expect("nothing on the seat").clone();
             serde_json::from_str::<Value>(&raw).expect("valid config")
         };
@@ -2776,8 +2847,8 @@ mod tests {
     #[test]
     fn no_other_kinds_seat_is_touched() {
         assert!(
-            of("claude").env(Some(Path::new("/tmp/b.md"))).is_empty()
-                && of("codex").env(Some(Path::new("/tmp/b.md"))).is_empty(),
+            of("claude").env(Some(Path::new("/tmp/b.md")), &[]).is_empty()
+                && of("codex").env(Some(Path::new("/tmp/b.md")), &[]).is_empty(),
             "the compatibility rule everywhere here: an unmeasured kind is left exactly as it was, \
              and a brief it has no way to read does not change that"
         );
@@ -3542,3 +3613,4 @@ mod tests {
         assert!(clear_of("").is_none(), "a shell is not a kind");
     }
 }
+

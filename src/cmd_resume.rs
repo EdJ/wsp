@@ -641,12 +641,15 @@ fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
 ///
 /// The whole of the rule [`somewhere_to_stand`] applies about the kind, split
 /// out because it needs no socket to be true and a test should not need one to
-/// say so. `env(None)` rather than a property of the kind, because the question
-/// is *what would this resume have to deliver* — the same argument
-/// [`bring_back`] passes — so a kind that one day needs configuring only
-/// sometimes answers correctly without this line being revisited.
+/// say so. `env` rather than a property of the kind, because the question is
+/// *what would this resume have to deliver* — the same argument [`bring_back`]
+/// passes — so a kind that one day needs configuring only sometimes answers
+/// correctly without this line being revisited.
+///
+/// Asked with the emptiest seat there is — no brief, nothing outside the tree —
+/// so the answer is about the kind and not about which row is being resumed.
 fn needs_a_seat_wsp_opened(kind: &str) -> bool {
-    !agent_commands::of(kind).env(None).is_empty()
+    !agent_commands::of(kind).env(None, &[]).is_empty()
 }
 
 /// Where to start the agent: back in the room it was in, or a new one.
@@ -759,7 +762,17 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
                 // which opencode ignores in silence — or left over from an
                 // earlier spawn onto the same subject, which is worse.
                 env: cmd_spawn::seat_env(
-                    Some(cmd_spawn::Occupant { kind: &kind, brief: None }),
+                    Some(cmd_spawn::Occupant {
+                        kind: &kind,
+                        brief: None,
+                        // The same world the spawn had. `core-042` is a
+                        // permission policy like the rest of this env, and
+                        // `core-038`'s finding was that resume took the `WSP_*`
+                        // half and none of the runtime's — a resumed agent
+                        // doing the same work under a narrower policy would be
+                        // that defect written again.
+                        reach: &cmd_spawn::reach(store, t.task.as_deref(), Some(&t.cwd)),
+                    }),
                     t.seat_of.as_deref(),
                     t.task.as_deref(),
                 ),
