@@ -1989,10 +1989,14 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 ///
 /// **One sentence, two readers**, which is the discipline this file keeps: a
 /// seat's obligation is asked from the stall side by [`stalled_seats`] and from
-/// the stand-down side by [`Poll::owes_a_run`], and those are one predicate read
-/// from its two ends — `worklist-037` said so before either existed. Written out
+/// the stand-down side by [`Poll::owes_a_run`], and those agree on this
+/// predicate — `worklist-037` said so before either existed. Written out
 /// twice, they would be one install away from disagreeing about whether a
-/// governor may go home.
+/// governor may go home. **They agree here and diverge one step past it, on
+/// purpose**: settlement ends a *member's* obligation, and the stand-down side
+/// goes on to ask about the barrier the settled members leave standing, which
+/// is `worklist-052` — see [`Poll::owes_a_run`] for why that step belongs on
+/// one side only.
 ///
 /// `Settlement::of` and not a status test spelled out here, for the same reason
 /// one level up: `review` being the end of the line is `worklist.rs`'s sentence.
@@ -2121,6 +2125,32 @@ impl<'a> Poll<'a> {
     /// has spawned raise no level at all, so the count is zero and the sentence
     /// underneath it said *stand down*.
     ///
+    /// **And past settlement, to the barrier settlement leaves standing —
+    /// `worklist-052`, which is `worklist-041`'s case at the other end.**
+    /// [`outstanding`] stops a member's obligation at `review`, and that is
+    /// right for the stall side; but a run whose every member has got there is
+    /// not over, it is waiting on its verdict. The levels that announced the
+    /// members are gone by then — answered with Ed's `done`, or simply taken
+    /// down as each agent stopped — so the count is honestly zero again, and
+    /// the sentence under it offered the stand-down to a seat owing a verdict,
+    /// a `go`, the sweep behind it, and `wsp worklist done`. So the question
+    /// walks each running list a second way:
+    /// [`position`](worklist::position) under
+    /// [`Reading::Settled`](worklist::Reading::Settled), and
+    /// [`at_barrier`](worklist::Position::at_barrier) for the barrier nobody
+    /// has read. The free reading on purpose — `Settled` starts no git
+    /// process, and this line is asked at the opening and on heartbeats, never
+    /// per tick — and conservative in the only direction that costs anything:
+    /// settled arrives before landed, so the worst this half can do is withhold
+    /// a stand-down from a seat that was not going anywhere anyway.
+    ///
+    /// Addressed the way everything in a run is addressed, through its members
+    /// and [`addressed_to`]: a seat sitting on the list answers because the
+    /// list step fronts [`cmd_govern::seat_for`]'s chain, and a project seat
+    /// answers because its members' work is what the verdict judges. One
+    /// definition of *mine* across both halves, or the two halves would learn
+    /// to disagree about whose run it is.
+    ///
     /// Asked of the store and not of the level read, for exactly that reason: a
     /// `todo` member with no agent on it is invisible to every predicate in
     /// this file and is the whole of what makes the zero misleading.
@@ -2136,9 +2166,24 @@ impl<'a> Poll<'a> {
         let index = Index::new(self.store.projects());
         let governors = self.store.governors();
         let lists = worklist::Running::read(self.store);
-        self.store.tasks().iter().any(|t| {
+        if self.store.tasks().iter().any(|t| {
             outstanding(t, &lists).is_some()
                 && addressed_to(&index, &governors, &lists, t) == self.scope.name
+        }) {
+            return true;
+        }
+        // No unsettled work addressed here — but a barrier may stand over the
+        // settled kind. See the doc above for why this half is here and not on
+        // [`stalled_seats`].
+        let renamed = self.store.renamed_ids();
+        self.store.worklists().iter().filter(|w| w.status().is_running()).any(|w| {
+            let p = worklist::position(self.store, w, worklist::Reading::Settled);
+            p.at_barrier()
+                && p.members.iter().any(|m| {
+                    self.store.task_now(&renamed, &m.id).is_some_and(|t| {
+                        addressed_to(&index, &governors, &lists, &t) == self.scope.name
+                    })
+                })
         })
     }
 }
@@ -4088,18 +4133,27 @@ mod tests {
         assert_eq!(nothing_addressed(&scope("phase-two", true), 0, true), None);
     }
 
-    /// And the fact itself, read off the store rather than off the level set,
-    /// because the members that make the zero misleading are exactly the ones
-    /// no level is derived from.
+    /// The life of one run, asked from the stand-down end. `worklist-041`
+    /// taught this question about work nobody has begun; `worklist-052` is its
+    /// other end — **work that is over and unread**. A member's obligation
+    /// stops at settlement, but the run's runs to the barrier the settled
+    /// members leave standing: by then every level that announced them is gone,
+    /// so the count is honestly zero, and the old answer handed a seat owing a
+    /// verdict, a `go` and `wsp worklist done` the advice to vacate. Composed
+    /// with [`nothing_addressed`], that zero-and-owed reading is exactly what
+    /// suppresses the stand-down line.
+    ///
+    /// Seated on the list, which is how a run's governor normally sits; the
+    /// next test holds the project-seat shape.
     #[test]
-    fn a_seat_owes_a_run_until_every_member_of_it_is_settled() {
+    fn a_seat_owes_its_run_past_the_members_settlement_while_its_barrier_stands_unread() {
         let night = Night::new("owes")
             .projects(&[("nightly", None)])
             .task("nightly-1", "nightly", Status::Todo)
             .running("tonight", &["nightly-1"])
-            .seat("nightly", "w1:p1", false);
+            .seat("tonight", "w1:p1", false);
         let seated = Scope {
-            name: "nightly".into(),
+            name: "tonight".into(),
             seated: true,
             workspace: "w1".into(),
             pane: "w1:p1".into(),
@@ -4111,7 +4165,53 @@ mod tests {
         let mut t = night.store.task("nightly-1").unwrap();
         t.set_status(Status::Review);
         night.store.save_task(&t).unwrap();
-        assert!(!poll(&night.store).owes_a_run(), "and review is where a run's work stops");
+        assert!(
+            poll(&night.store).owes_a_run(),
+            "review settles the member and leaves the barrier standing — this is worklist-052"
+        );
+
+        let mut t = night.store.task("nightly-1").unwrap();
+        t.set_status(Status::Done);
+        night.store.save_task(&t).unwrap();
+        assert!(
+            poll(&night.store).owes_a_run(),
+            "Ed's done on the row does not answer the barrier nobody has read"
+        );
+
+        let mut w = night.store.worklist("tonight").unwrap();
+        let mut groups = w.groups();
+        groups[0].verdict = "green across the board — landing it".into();
+        w.set_groups(&groups);
+        night.store.save_worklist(&w).unwrap();
+        assert!(
+            !poll(&night.store).owes_a_run(),
+            "a passed barrier is a run nobody is waiting on"
+        );
+    }
+
+    /// And the standing barrier is addressed the way everything in a run is —
+    /// through its members — so it belongs to the seat the work answers to and
+    /// to no other. Here no seat sits on the list, both projects have seats,
+    /// and the settled member lives in `nightly`: `nightly` owes tonight's
+    /// verdict because its member's work is what the verdict judges, and
+    /// `other`, whose seat could just as easily have been read as the owner of
+    /// any list it can see, owes nothing.
+    #[test]
+    fn a_barrier_standing_is_owed_by_the_seat_its_members_address_and_by_no_other() {
+        let night = Night::new("whose")
+            .projects(&[("nightly", None), ("other", None)])
+            .task("nightly-1", "nightly", Status::Done)
+            .running("tonight", &["nightly-1"])
+            .seat("nightly", "w1:p1", false)
+            .seat("other", "w2:p2", false);
+        assert!(
+            Poll::new(&night.store, scope("nightly", true), BTreeSet::new(), None).owes_a_run(),
+            "the seat its members address owes the unread barrier"
+        );
+        assert!(
+            !Poll::new(&night.store, scope("other", true), BTreeSet::new(), None).owes_a_run(),
+            "a neighbouring seat does not inherit somebody else's verdict"
+        );
     }
 
     // ---- the questions somebody wrote down ---------------------------------

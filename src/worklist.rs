@@ -23,7 +23,7 @@
 //!
 //! | | reads | costs | asked by |
 //! |---|---|---|---|
-//! | [`Reading::Settled`] | the task's status is `review` or closed | the store | the panel, `worklist show` |
+//! | [`Reading::Settled`] | the task's status is `review` or closed | the store | the panel, `worklist show`, the watch deciding whether a seat may stand down |
 //! | [`Reading::Landed`] | the branch is on the trunk | git, per member | the barrier |
 //!
 //! Both of the cheap signals a barrier could have rested on are wrong, and the
