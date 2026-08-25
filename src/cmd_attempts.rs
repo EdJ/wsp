@@ -732,6 +732,23 @@ mod tests {
         );
     }
 
+    /// `review` grew an account and logs `review: …` for it. Every attempt in
+    /// the store's history was logged with `→ review`, and a record that read
+    /// only the new spelling would report those as having reached nothing —
+    /// the outcome column is what `wsp attempts` is for.
+    #[test]
+    fn an_attempt_reaches_review_by_either_spelling_the_verb_has_had() {
+        for line in ["→ review", "review: the gate is on the account, not on what landed"] {
+            let t = task(&[
+                "- 2026-08-25T09:00:00Z claimed by pane w1:p1 · spawned at opus/high",
+                &format!("- 2026-08-25T10:00:00Z {line}"),
+            ]);
+            let a = attempts_of(&t);
+            assert_eq!(a[0].outcome, Outcome::Review, "{line}");
+            assert_eq!(a[0].reviewed, "2026-08-25T10:00:00Z", "{line}");
+        }
+    }
+
     /// A model name with a separator in it is not a corner case: it is how the
     /// second kind wsp knows spells every model it has.
     #[test]

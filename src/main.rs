@@ -1928,7 +1928,9 @@ mod tests {
         assert_eq!(a.text(1), "--parent exists only on wsp add");
         assert!(!a.has("parent"), "the prose was read as a flag");
 
-        for verb in ["block", "park", "decide", "rename"] {
+        // `review` most of all: an account of work on this CLI is a paragraph
+        // whose first word is a flag name about as often as any note here is.
+        for verb in ["block", "park", "decide", "rename", "review"] {
             let a = parse(&[verb, "028", "-p is not a thing on this command"]);
             assert_eq!(a.text(1), "-p is not a thing on this command", "{verb}");
             assert!(!a.has("project"), "{verb} lost its payload to a flag");

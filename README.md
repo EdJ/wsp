@@ -1933,7 +1933,7 @@ wsp commit-help      # ~/wsp/committing.md, when you are about to stage
 ### Where an agent stops
 
 ```sh
-wsp review <id>      # an agent's last word on a piece of work
+wsp review <id> "…"  # an agent's last word on a piece of work — and it takes one
 wsp done <id>        # yours
 ```
 
@@ -1942,6 +1942,27 @@ it means *I have finished and it is yours now*, which is a different claim from
 `done` and the only one an agent is in a position to make. An agent that closes
 its own work has graded its own homework, and the one thing it cannot know is
 whether the thing you asked for is the thing it built.
+
+**It takes the account, and refuses without one** — the same payload `block` and
+`park` take, `-` and `--from` included. Thirteen of fourteen opencode rows
+reached `review` and stopped there with the work uncommitted, unlanded or
+unwritten, and every one of them cost a person a turn to notice and say so. The
+obvious gate is the wrong one: refusing when nothing is ahead of the trunk
+*passes* a row that landed itself and wrote nothing, and *fails* a row that was
+genuinely finished with no diff to land. What is missing in all of them is the
+row's own prose, so that is what is refused over — and taking it as the payload
+is also what settles where an account lives, which a governor and an agent
+disagreed about in good faith.
+
+Writing it is a review step and not bookkeeping. Asked for an account of work
+already sitting at `review`, one agent wrote: *"CLOEXEC on the master — writing
+this note found it missing and 6495b78 adds it."* It is the only step in the
+flow that is not a machine check.
+
+What `review` will *not* do is refuse over the commit. It says what it can see —
+files still uncommitted in the tree, commits the trunk has not got — and leaves
+the judgement, because a row with nothing to land is often exactly right. It
+says nothing at all when the tree is clean and the branch is level.
 
 Nothing enforces this and nothing should: `wsp done` works from anywhere, and a
 rule that has to be policed by a permission is a rule nobody believes in. What

@@ -2272,6 +2272,30 @@ mod tests {
         );
     }
 
+    /// `v` was one keystroke and is now a sentence, because `wsp review` takes
+    /// the account. Both halves matter: the prompt has to go up (a key that
+    /// ran the CLI and let its refusal bubble up would put the panel one
+    /// keystroke from an error every time), and what it becomes has to be the
+    /// argv the CLI expects.
+    #[test]
+    fn v_asks_for_the_account_review_now_takes() {
+        let mut snap = Snapshot::default();
+        snap.projects.push(crate::model::Project::new("render"));
+        snap.tasks.push(Task::new("the sidebar follows", "render-001"));
+        let mut ui = collect(&snap, &View::default());
+        let at = ui.rows_for_target(&Target::Task("render-001".into()))[0];
+        ui.select_for_test(at);
+        let mut view = View::default();
+
+        assert_eq!(apply_key(Key::Char('v'), &mut ui, &mut view), Effect::None, "nothing ran yet");
+        let Mode::Prompt { verb, .. } = &view.mode else { panic!("no prompt: {:?}", view.mode) };
+        assert_eq!(verb.label(), "account");
+        assert_eq!(
+            verb.argv("the zones already fitted; nothing to change"),
+            vec!["review", "render-001", "the zones already fitted; nothing to change"],
+        );
+    }
+
     /// A kind nobody has measured gets nothing typed, whatever state it is in:
     /// the refusal must not read as "try again later" about a key that will
     /// never work here.

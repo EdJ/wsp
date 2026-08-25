@@ -1904,21 +1904,29 @@ pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Who
 /// be teaching its readers to stop reading it.
 pub(crate) fn outstanding(store: &Store, task: &str) -> Vec<String> {
     let Ok(cwd) = std::env::current_dir() else { return Vec::new() };
-    let Ok(w) = pick(candidates(store, &cwd, task), task) else { return Vec::new() };
+    match pick(candidates(store, &cwd, task), task) {
+        Ok(w) => holding(&w),
+        // Nothing to say and nothing wrong: a task whose project has no root
+        // and whose caller is standing outside a repository is most of what
+        // `wsp` is run against.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The half of [`outstanding`] that is only git, so it can be asked of a real
+/// repository without a store or a working directory in the way.
+fn holding(w: &Where) -> Vec<String> {
     if !w.dir.join(".git").exists() {
         return Vec::new();
     }
     let mut out = Vec::new();
     if dirty(&w.dir) {
-        out.push(format!(
-            "uncommitted work in {} — `wsp commit-help` first",
-            util::contract(&w.dir)
-        ));
+        out.push(format!("uncommitted work in {} — `wsp commit-help` first", util::contract(&w.dir)));
     }
     if let Some(branch) = w.on() {
         match ahead(&w.trunk, &w.branch, &branch).len() {
             0 => {}
-            n => out.push(format!("{} not on {} — `wsp land {task}`?", n_commits(n), w.branch)),
+            n => out.push(format!("{} not on {} — `wsp land {}`?", n_commits(n), w.branch, w.task)),
         }
     }
     out
@@ -2133,6 +2141,44 @@ mod tests {
             git(&dir, &["log", "--format=%s", "-1"]).unwrap().contains("mine"),
             "the trunk is not at the landed commit"
         );
+    }
+
+    /// The three occurrences `wsp review` now reports, in the one repository,
+    /// and the two it must stay quiet about.
+    ///
+    /// This is the half of `robustness-101` that is a **warning and not a
+    /// refusal**, and the silences are why. A branch level with the trunk is
+    /// `worklist-ui-003`, which landed itself and was right to; it is also
+    /// `ui-007`, which had no diff to land and was right to. Both are correct
+    /// at review, so a verb that spoke here would be teaching the reader that
+    /// this line means nothing — and the two that are worth reading, the tree
+    /// still holding files and the branch still holding commits, are the exact
+    /// states `render-014` and `render-033` were in when they stopped.
+    #[test]
+    fn review_names_work_still_in_a_tree_or_still_off_the_trunk_and_is_quiet_otherwise() {
+        let (_env, dir) = scratch("outstanding");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-1");
+        ensure(&dir, &wt, "t-1", "master").unwrap();
+        let asked = || holding(&pick(vec![dir.clone()], "t-1").unwrap());
+
+        assert!(asked().is_empty(), "a tree just made holds nothing: {:?}", asked());
+
+        // `render-014`: two modified files, nothing on the branch.
+        std::fs::write(wt.join("mine.txt"), "mine\n").unwrap();
+        let said = asked();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("uncommitted work in"), "{}", said[0]);
+
+        // `render-033`: committed, and never landed.
+        run(&wt, &["add", "mine.txt"]);
+        run(&wt, &["commit", "--quiet", "-m", "mine"]);
+        assert_eq!(asked(), vec!["1 commit not on master — `wsp land t-1`?".to_string()]);
+
+        // `worklist-ui-003`: it landed itself, and there is nothing to say.
+        git_ok(&wt, &["rebase", "master"]).unwrap();
+        git_ok(&dir, &["merge", "--ff-only", "--quiet", "t-1"]).unwrap();
+        assert!(asked().is_empty(), "landed work was reported as outstanding: {:?}", asked());
     }
 
     /// A tree is a checkout, so the trunk's uncommitted work is not in it. This

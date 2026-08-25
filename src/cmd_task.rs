@@ -1070,23 +1070,24 @@ pub fn block(store: &Store, args: &Args) -> i32 {
 /// The account, and the gate that is the whole of `robustness-101`.
 ///
 /// `review` was [`set_status`] with no argument. That is the shape of a verb
-/// you type at the end, and thirteen of fourteen opencode rows typed it and
-/// stopped: `render-033` committed and never landed, `render-014` left two
-/// modified files in its tree with nothing on its branch, `worklist-ui-003`
-/// landed itself and wrote not a word, `ui-007` had nothing to land — which
-/// was correct — and still wrote its account only when the governor asked.
-/// Every one of them needed a person to notice and say so, and that person's
-/// turn is a cost `wsp attempts` cannot see.
+/// you type at the end, and twelve of the thirteen opencode rows wsp had run
+/// by 2026-08-25 typed it and needed a governor to ask for the rest:
+/// `render-033` committed and never landed, `render-014` left two modified
+/// files in its tree with nothing on its branch, `worklist-ui-003` landed
+/// itself and wrote not a word, `ui-007` had nothing to land — which was
+/// correct — and still wrote its account only when it was asked. That asking
+/// is a cost `wsp attempts` cannot see, because it is spent by the seat and
+/// not by the agent.
 ///
 /// # Why the account is the thing refused, and not the commit
 ///
 /// The obvious gate is the title's: refuse when nothing is ahead of the trunk.
-/// It is wrong twice. It **passes** `ui-003` and `ui-006`, which committed and
-/// landed and wrote nothing, and it **fails** `ui-007`, which was genuinely
-/// finished with no diff — a row with nothing to land is correct to sit at
-/// review, and a verb that refuses it is a verb people learn to force. What is
-/// missing in all four is the same thing, and it is not a commit: it is the
-/// row's own prose.
+/// It is wrong twice. It **passes** `worklist-ui-003` and `-006`, which
+/// committed and landed and wrote nothing, and it **fails** `ui-007`, which was
+/// genuinely finished with no diff — a row with nothing to land is correct to
+/// sit at review, and a verb that refuses it is a verb people learn to force.
+/// What is missing in all four is the same thing, and it is not a commit: it
+/// is the row's own prose.
 ///
 /// And prose is worth refusing over on its own evidence. `compound-002`, asked
 /// for an account of work already at review, wrote: *"CLOEXEC on the master —
@@ -1116,11 +1117,20 @@ pub fn block(store: &Store, args: &Args) -> i32 {
 pub fn review(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
         "wsp review <id> \"what you did, and what you left\"   (or `-` to read it from stdin)";
-    // Before `prose_payload`, which would print `usage:` and stop. This is the
-    // refusal the whole task is about and it is the one moment an agent is
-    // certainly reading, so it says what an account is, where it goes, and how
-    // to get prose past a shell — and then names what it can see of the work,
-    // which is where `render-014` would have learnt about its two files.
+    // No id at all is a different mistake and gets the plain usage. The
+    // handbook's line is `Finished? wsp review`, *without* one, so this is a
+    // sentence agents type — and answering it with a lecture about accounts
+    // buries the word it is actually missing.
+    if args.rest.is_empty() {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    }
+    // An id and nothing after it. Handled before `prose_payload`, which would
+    // print `usage:` and stop: this is the refusal the whole task is about and
+    // the one moment an agent is certainly reading, so it says what an account
+    // is, where it goes, and how to get prose past a shell — and then names
+    // what it can see of the work, which is where `render-014` would have
+    // learnt about the two files it had left in its tree.
     if args.rest.len() < 2 {
         let p = Paint::new();
         eprintln!("wsp: review takes the account — what you did, what you left undone, and what the next reader needs");
@@ -2587,6 +2597,73 @@ mod tests {
         let store = Store::at(root.clone(), root.join("state"));
         store.ensure_dirs().unwrap();
         store
+    }
+
+    /// The occurrence, and it is `render-014`'s exactly: `wsp review render-014`
+    /// with two modified files in the tree and nothing on the branch, exit 0, a
+    /// row reading `review` on every surface the governor looks at, and a
+    /// person's turn spent noticing.
+    ///
+    /// The status is asserted beside the exit code because a refusal that has
+    /// already moved the row is the failure being fixed and reads identically
+    /// from the code alone.
+    #[test]
+    fn review_refuses_a_row_with_no_account_and_leaves_it_where_it_was() {
+        let store = scratch("review-no-account");
+        let mut t = Task::new("wsp review looks like the last step", "wsp-101");
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+
+        assert_eq!(review(&store, &parse(&["review", "wsp-101"])), 2);
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing", "and it did not move");
+    }
+
+    /// Where the account goes, which on 2026-08-24 a governor and an agent
+    /// disagreed about in good faith — one had written it onto the row's
+    /// overview, the other was reading the log. `review` takes it and puts it
+    /// in the log, so there is nothing left to disagree about.
+    #[test]
+    fn the_account_it_takes_is_written_into_the_log_a_barrier_reads() {
+        let store = scratch("review-account");
+        let mut t = Task::new("wsp review looks like the last step", "wsp-101");
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+
+        let said = "the gate is on the account, not on what landed — ui-007 had nothing to land";
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", said])), 0);
+
+        let back = store.task("wsp-101").unwrap();
+        assert_eq!(back.status_raw, "review");
+        let log = back.section("Log").expect("the log is where it went");
+        assert!(log.contains(&format!("review: {said}")), "{log}");
+        assert!(
+            !back.section("Overview").unwrap_or_default().contains("ui-007"),
+            "and not onto the prose the row was written with"
+        );
+    }
+
+    /// A row that is genuinely finished with nothing to land is still owed one.
+    ///
+    /// This is `ui-007`, and it is the case that decides the whole shape: it
+    /// reached review having produced no diff, which was *correct*, so a gate
+    /// keyed on "nothing is ahead of the trunk" would refuse the one row that
+    /// had done the right thing. What it did not do was say so unprompted. So
+    /// the account is what is refused over, and it is refused over identically
+    /// whether or not there is a commit anywhere.
+    #[test]
+    fn a_row_that_correctly_produced_no_diff_owes_the_same_account() {
+        let store = scratch("review-no-diff");
+        let mut t = Task::new("the worklists zones prove their fit", "ui-007");
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+
+        assert_eq!(review(&store, &parse(&["review", "ui-007"])), 2, "no diff is not no account");
+        assert_eq!(
+            review(&store, &parse(&["review", "ui-007", "the zones already fitted; nothing to change"])),
+            0,
+            "and having said so, it goes to review with nothing landed and no argument"
+        );
+        assert_eq!(store.task("ui-007").unwrap().status_raw, "review");
     }
 
     /// The `under` line did not go wrong when its parent was swept — it went
