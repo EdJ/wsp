@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::agent_commands;
 use crate::cmd_agent;
@@ -535,10 +535,20 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
 
 /// Which tier the agent is to be started at, checked before anything is opened.
 ///
-/// Asked and never inferred, like [`placement`] — and here that is a park
-/// rather than a principle: the decision of 2026-08-17 stood a routing
-/// heuristic down on the evidence of its own dry runs and left this flag as the
-/// whole mechanism, so whoever spawns states the tier when they already know it.
+/// **Stated when somebody states it, and otherwise inferred from where the work
+/// sits — out loud.** `--model` and `--effort` are the whole vocabulary, and one
+/// word of it means the spawner is stating the tier; a spawn that says neither,
+/// onto work with a filled seat above it, starts at [`GOVERNED_MODEL`] and
+/// [`GOVERNED_EFFORT`] and prints that it did. Ed, 2026-08-25, `wsp-058` d6.
+///
+/// That is inside d1's line rather than across it, and the line is not
+/// [`placement`]'s: **placement stays asked-never-inferred, tier is
+/// inferred-but-printed-and-overridable**, which is what that decision put on
+/// each of them. Nor does it unpark the router d4 stood down — nothing per-task
+/// is estimated here, no field was added and the task's prose is not read. The
+/// one thing inferred is a structural fact the store already holds, and
+/// [`governed`] carries the rest of the argument for it.
+///
 /// [`agent_commands::Kind::tier`] holds why the words are checked at all, and
 /// [`agent_commands::EFFORTS`] why `--effort` is the one to reach for first.
 ///
@@ -560,11 +570,19 @@ fn placement(store: &Store, args: &Args) -> Result<Option<String>, String> {
 ///
 /// `--on <machine>` is orthogonal and stays that way: the flag states the tier,
 /// and that machine's `claude` has its own version and its own settings.
-fn tier(args: &Args, kind: &str, agent: bool) -> Result<(Option<String>, Option<String>), String> {
+fn tier(
+    args: &Args,
+    kind: &str,
+    agent: bool,
+    scope: &Scope,
+) -> Result<(Option<String>, Option<String>), String> {
     let model = args.get("model");
     let effort = args.get("effort");
+    // The trigger for the default is this same expression and not a second one
+    // beside it: neither word stated is exactly the case that had nothing to
+    // check, and it is now the case that has something to decide.
     if model.is_none() && effort.is_none() {
-        return Ok((None, None));
+        return Ok(governed(args, kind, agent, scope));
     }
     if !agent {
         return Err("--model and --effort say how to start an agent — add --agent".into());
@@ -577,6 +595,113 @@ fn tier(args: &Args, kind: &str, agent: bool) -> Result<(Option<String>, Option<
         }
     }
     Ok((model, effort))
+}
+
+/// The tier a spawn onto governed work starts at, when nobody said otherwise.
+///
+/// Sonnet because d5 *measured* it: `wsp-061` ran an unattended sonnet agent
+/// through the whole harness on render-076 — claimed, stayed in its own tree,
+/// read commit-help and took the right branch of it, verified, installed, swept
+/// nothing of anybody else's — so the capability question was answered before
+/// this default was written. It is also the tier
+/// [`agent_commands::Kind::unattended`] has nothing to say about, which is the
+/// same measurement from the other end: haiku panes open in manual mode and a
+/// default that opened one would be a fleet of agents stopped at their first
+/// permission prompt.
+const GOVERNED_MODEL: &str = "sonnet";
+
+/// Medium because effort is the cheaper knob — the same capability class for
+/// less spend, and no failure mode a model change would not add worse. d1's
+/// second consequence, applied to the flat default rather than to a router.
+const GOVERNED_EFFORT: &str = "medium";
+
+/// Where a piece of work sits, for the one question [`governed`] asks of it.
+///
+/// The four arguments [`cmd_govern::seat_for`] takes, carried in rather than
+/// looked up. `place_work` has a store and has read all of this by the time it
+/// calls [`tier`]; reaching for one *here* would cost the property that makes
+/// every refusal above checkable — a function you can put four literals into
+/// and read an answer out of, with no store, no seat and no herdr.
+struct Scope<'a> {
+    /// `governors/`, as [`crate::store::Store::governors`] reads it.
+    governors: &'a BTreeMap<String, Value>,
+    /// The project tree, for the ancestor half of the walk.
+    index: &'a Index,
+    /// The **running** worklist this work is a member of, which is the front of
+    /// the walk and `None` in the ordinary state where nothing is running. See
+    /// [`cmd_govern::seat_for`], which is where that ordering is argued.
+    list: Option<&'a str>,
+    /// The work's project, or `None` for work that has none.
+    project: Option<&'a str>,
+}
+
+/// The default: work with a seat above it starts cheap, and is told so.
+///
+/// **A flat default at the spawn, not the per-task router `wsp-058` d4
+/// parked.** No complexity estimate, no new field on a task, no reading of the
+/// prose. The sole inference is whether the work has a filled seat above it,
+/// which is [`cmd_govern::seat_for`]'s existing walk over the running list, the
+/// project and its ancestors — the same walk a raised hand takes, so a spawn
+/// routes down exactly where a hand would route up.
+///
+/// **The printing is the load-bearing half.** A default that swapped the tier
+/// in silence would be the `--effort` warning failure that
+/// [`agent_commands::Kind::tier`] was written against — a session that ran at
+/// one tier and was recorded at another — and the whole licence d1 gave was for
+/// a tier that is *inferred, printed and overridable*. So the sentence is
+/// printed from inside this function rather than by the caller: there is no way
+/// to take the inference without it.
+///
+/// Four things it does not fire on, and each is a decision rather than a guard.
+///
+/// - **Nothing to start.** A bare `wsp spawn <task>` opens a terminal and
+///   claims the work; no agent runs, so there is no tier, and a tier recorded
+///   against a claim nobody started would be a record of something that did not
+///   happen.
+/// - **`--govern`.** A seat sequences, reviews and writes the notes, and d5's
+///   measured residue of a cheap tier was precisely that work — no review note,
+///   and the change description left in an overview that is then injected into
+///   every later spawn on the task. The seat is the worst place in the fleet to
+///   route down: workers cheap, seats on the settings tier.
+/// - **A kind with no vocabulary for these words.** `sonnet` is Claude Code's
+///   spelling and [`agent_commands::Plain`] passes no tier on at all, so a
+///   default sent to one of those kinds would be wsp saying it started `codex`
+///   on sonnet and starting it on whatever codex defaults to. It declines
+///   rather than refuses — a tier nobody typed may never be the reason a spawn
+///   fails, and the way to say sonnet to a kind that spells it differently is
+///   still to type it.
+/// - **Ungoverned work.** No seat anywhere above it is the ordinary state and
+///   reads as today's behaviour exactly: nothing added to the command line,
+///   nothing written to the claim, nothing printed.
+///
+/// The trigger is **where the work sits and not who typed the spawn**, which is
+/// the wider of the two readings and was chosen knowing what it widens: a spawn
+/// Ed types at the panel onto `wsp` or `compound` defaults to sonnet too,
+/// because governed territory is fleet work whoever opened it and `--model` is
+/// there for the exception.
+fn governed(args: &Args, kind: &str, agent: bool, scope: &Scope) -> (Option<String>, Option<String>) {
+    let unstated = (None, None);
+    if !agent || args.has("govern") {
+        return unstated;
+    }
+    if agent_commands::of(kind).tier(Some(GOVERNED_MODEL), Some(GOVERNED_EFFORT)).is_err() {
+        return unstated;
+    }
+    let Some(seat) = cmd_govern::seat_for(scope.governors, scope.index, scope.list, scope.project)
+    else {
+        return unstated;
+    };
+    // On stderr, and not through `Paint`: the `--json` form of this command
+    // prints an object on stdout that a caller parses, and a dim line in front
+    // of it would break the one reader that cannot skip it. This is the same
+    // channel `spawn` already says "no tree of its own for …" on, and for the
+    // same reason — it is news about what was done, not a failure.
+    eprintln!(
+        "wsp: starting at {GOVERNED_MODEL}, {GOVERNED_EFFORT} effort — \
+         {} has a seat above this work. --model or --effort states your own",
+        seat.scope
+    );
+    (Some(GOVERNED_MODEL.to_string()), Some(GOVERNED_EFFORT.to_string()))
 }
 
 /// herdr's default when nobody says which agent. Every other kind it knows is
@@ -1267,10 +1392,33 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
     };
 
+    // Where this work sits, which is the one thing the tier default below reads
+    // — and it is read here, off the store this function already holds, so that
+    // `tier` itself stays a function four literals can check. `Running::read`
+    // is the same directory read `wsp message` and `wsp task` do to answer the
+    // same question, and it is paid on every spawn rather than behind the
+    // trigger, because the trigger is one expression inside `tier` and copying
+    // it out here to save a directory listing would be two places to change it.
+    let governors = store.governors();
+    let running = crate::worklist::Running::read(store);
+    let scope = Scope {
+        governors: &governors,
+        index: &index,
+        // A `--govern` spawn names its own list; a task spawn is a member of
+        // whatever is running over it. Either way this is the front of the
+        // walk — see `cmd_govern::seat_for`.
+        list: work
+            .list
+            .as_deref()
+            .or_else(|| work.task.as_deref().and_then(|t| running.list_of(t))),
+        project: work.project.as_deref(),
+    };
+
     // Both read before anything is opened, so a mistyped alias costs a line of
-    // output instead of a workspace to tear down again.
+    // output instead of a workspace to tear down again — and so a tier this
+    // infers is printed before the workspace it applies to exists.
     let kind = args.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
-    let (model, effort) = match tier(args, &kind, args.has("agent") || args.has("govern")) {
+    let (model, effort) = match tier(args, &kind, args.has("agent") || args.has("govern"), &scope) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("wsp: {e}");
@@ -2057,7 +2205,7 @@ pub(crate) fn cmd_agent_claim(store: &Store, task: &str, flags: &[(&str, &str)])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Task;
+    use crate::model::{Project, Task};
     use crate::place::Delivery;
 
     fn seat(tag: &str) -> Store {
@@ -2188,7 +2336,10 @@ mod tests {
     /// and starting it on whatever codex defaults to.
     #[test]
     fn a_mistyped_tier_is_refused_before_anything_is_opened() {
-        let none = |flags: &[(&str, &str)]| tier(&Args::synth("spawn", &["t-1"], flags), "claude", true);
+        let (g, i) = (BTreeMap::new(), Index::new(vec![]));
+        let nowhere = Scope { governors: &g, index: &i, list: None, project: None };
+        let none =
+            |flags: &[(&str, &str)]| tier(&Args::synth("spawn", &["t-1"], flags), "claude", true, &nowhere);
 
         assert_eq!(none(&[]).unwrap(), (None, None), "no flag must send no argument at all");
         assert_eq!(
@@ -2204,10 +2355,12 @@ mod tests {
         let err = none(&[("effort", "hi")]).unwrap_err();
         assert!(err.contains("xhigh"), "an ignored effort is a session that lied: {err}");
 
-        let err = tier(&Args::synth("spawn", &["t-1"], &[("model", "opus")]), "claude", false).unwrap_err();
+        let err = tier(&Args::synth("spawn", &["t-1"], &[("model", "opus")]), "claude", false, &nowhere)
+            .unwrap_err();
         assert!(err.contains("--agent"), "a tier with nothing to start it: {err}");
 
-        let err = tier(&Args::synth("spawn", &["t-1"], &[("model", "opus")]), "codex", true).unwrap_err();
+        let err = tier(&Args::synth("spawn", &["t-1"], &[("model", "opus")]), "codex", true, &nowhere)
+            .unwrap_err();
         assert!(err.contains("claude"), "wsp does not know how codex spells a model: {err}");
     }
 
@@ -2221,8 +2374,10 @@ mod tests {
     /// names the tier they typed rather than the rule that caught it.
     #[test]
     fn a_tier_that_cannot_be_left_alone_is_refused_unless_somebody_is_going_to_the_pane() {
+        let (g, i) = (BTreeMap::new(), Index::new(vec![]));
+        let nowhere = Scope { governors: &g, index: &i, list: None, project: None };
         let background = |m: &str| {
-            tier(&Args::synth("spawn", &["t-1"], &[("model", m)]), "claude", true)
+            tier(&Args::synth("spawn", &["t-1"], &[("model", m)]), "claude", true, &nowhere)
         };
 
         let err = background("haiku").unwrap_err();
@@ -2235,8 +2390,130 @@ mod tests {
         assert!(background("opus[1m]").is_ok(), "including with the suffix on");
 
         let flags = [("model", "haiku"), ("focus", "true")];
-        let focused = tier(&Args::synth("spawn", &["t-1"], &flags), "claude", true);
+        let focused = tier(&Args::synth("spawn", &["t-1"], &flags), "claude", true, &nowhere);
         assert!(focused.is_ok(), "somebody is going to the pane: {focused:?}");
+    }
+
+    /// A tree with a seat in the middle of it: `wsp` is governed, `robustness`
+    /// and `data` are under it and empty, `tooling` is above it.
+    fn governed_tree() -> (BTreeMap<String, Value>, Index) {
+        let mut wsp = Project::new("wsp");
+        wsp.parent = Some("tooling".into());
+        let mut rob = Project::new("robustness");
+        rob.parent = Some("wsp".into());
+        let seated = [(
+            "wsp".to_string(),
+            json!({ "workspace": "w9", "host": util::hostname() }),
+        )]
+        .into_iter()
+        .collect();
+        (seated, Index::new(vec![Project::new("tooling"), wsp, rob]))
+    }
+
+    /// The default, and the sentence it exists for: a spawn onto work with a
+    /// seat above it starts at sonnet and medium effort with nothing typed.
+    ///
+    /// Both shapes of "above", because the trigger is `seat_for`'s walk and not
+    /// a lookup: `wsp` has the seat, so work in `wsp` finds it at its own level
+    /// and work in `robustness` finds it one step up — the same walk a hand
+    /// raised in `robustness` takes to reach the same agent.
+    #[test]
+    fn governed_work_with_no_tier_stated_starts_at_sonnet_and_medium() {
+        let (g, i) = governed_tree();
+        let at = |project| {
+            let scope = Scope { governors: &g, index: &i, list: None, project: Some(project) };
+            tier(&Args::synth("spawn", &["t-1"], &[("agent", "true")]), "claude", true, &scope)
+        };
+
+        let both = (Some("sonnet".to_string()), Some("medium".to_string()));
+        assert_eq!(at("wsp").unwrap(), both, "the seat is on this very project");
+        assert_eq!(at("robustness").unwrap(), both, "and one step up is still above it");
+        assert_eq!(
+            at("tooling").unwrap(),
+            (None, None),
+            "a seat answers for what is under it and not for what is over it"
+        );
+    }
+
+    /// And the seat itself is exempt: `--govern` onto the same scope keeps
+    /// whatever the settings file says.
+    ///
+    /// d5 measured the residue of a cheap tier and it was precisely the seat's
+    /// own work — no review note, and the change description left in an
+    /// overview that is then injected into every later spawn on the task. The
+    /// role that sequences, reviews and writes the notes is the worst place in
+    /// the fleet to route down, so the flag that takes it is the one flag that
+    /// turns this off. Workers cheap, seats on the settings tier.
+    #[test]
+    fn a_govern_spawn_onto_the_same_scope_keeps_the_settings_tier() {
+        let (g, i) = governed_tree();
+        let scope = Scope { governors: &g, index: &i, list: None, project: Some("robustness") };
+        let flags = [("govern", "true")];
+        let out = tier(&Args::synth("spawn", &["robustness"], &flags), "claude", true, &scope);
+        assert_eq!(
+            out.unwrap(),
+            (None, None),
+            "a seat spawned under a seat is still a seat"
+        );
+    }
+
+    /// One word about the tier suppresses the whole default rather than filling
+    /// in the other half of it.
+    ///
+    /// `--effort high` on governed work is a person saying *this one is hard*,
+    /// and answering it with `sonnet at high effort` would be wsp finishing a
+    /// sentence somebody else started — a spawn that ran at a tier its spawner
+    /// never chose, which is the failure the printing is here to prevent and
+    /// not one to reintroduce from the other end.
+    #[test]
+    fn one_word_about_the_tier_suppresses_the_default_rather_than_completing_it() {
+        let (g, i) = governed_tree();
+        let scope = Scope { governors: &g, index: &i, list: None, project: Some("robustness") };
+        let stated = |flags: &[(&str, &str)]| {
+            tier(&Args::synth("spawn", &["t-1"], flags), "claude", true, &scope).unwrap()
+        };
+
+        assert_eq!(
+            stated(&[("effort", "high")]),
+            (None, Some("high".into())),
+            "the model is left to the settings file, not defaulted to sonnet"
+        );
+        assert_eq!(
+            stated(&[("model", "opus[1m]")]),
+            (Some("opus[1m]".into()), None),
+            "and the effort is left alone, not defaulted to medium"
+        );
+    }
+
+    /// Ungoverned work spawns exactly as it did before this existed: no tier on
+    /// the command line, nothing on the claim, nothing printed.
+    ///
+    /// Three ways to be ungoverned and all of them are the ordinary state — no
+    /// seat anywhere, no agent to start one for, and a kind that has no
+    /// vocabulary for these words. The last is a decline and not a refusal: a
+    /// tier nobody typed may never be the reason a spawn fails.
+    #[test]
+    fn work_with_no_seat_above_it_spawns_exactly_as_it_did_before() {
+        let (g, i) = governed_tree();
+        let none = BTreeMap::new();
+        let flags = [("agent", "true")];
+        let out = |governors, kind, agent, project| {
+            let scope = Scope { governors, index: &i, list: None, project };
+            tier(&Args::synth("spawn", &["t-1"], &flags), kind, agent, &scope).unwrap()
+        };
+
+        assert_eq!(out(&none, "claude", true, Some("wsp")), (None, None), "nobody is governing");
+        assert_eq!(out(&g, "claude", true, None), (None, None), "work in no project at all");
+        assert_eq!(
+            out(&g, "claude", false, Some("wsp")),
+            (None, None),
+            "a terminal with no agent in it has no tier to run at"
+        );
+        assert_eq!(
+            out(&g, "codex", true, Some("wsp")),
+            (None, None),
+            "and a kind wsp cannot say `sonnet` to is left alone rather than refused"
+        );
     }
 
     /// And the refusal happens before `place.open`, which is the whole reason
@@ -2351,7 +2628,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
-    use crate::model::Project;
 
     /// What a seat is opened with, which is the whole of what `spawn` says to a
     /// backend before anything is running in it.
