@@ -362,11 +362,43 @@ pub(crate) fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
 /// by [`ensure_tree`] or by `checkout` the next time either touches the
 /// repository, and pruning it here would mean guessing which repository each
 /// tree came from.
+///
+/// # Two functions, because `-n` has to ask the same question
+///
+/// The judgement is [`stale_build_dirs`] and this is the removal of what it
+/// picked. Split for `worklist-051`: a preview computed *beside* the act is a
+/// second opinion about a directory listing crossed with a live workspace list,
+/// and the one run where the two would disagree is the run where herdr changed
+/// its answer between them. Asking once and removing that answer is the only
+/// arrangement where the preview cannot be wrong about the act.
 fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<String> {
+    let mut gone = Vec::new();
+    for path in stale_build_dirs(store, live, mine) {
+        if std::fs::remove_dir_all(&path).is_ok() {
+            gone.push(util::contract(&path));
+        }
+    }
+    gone.sort();
+    gone
+}
+
+/// The build trees under the state directory no live workspace owns.
+///
+/// The judgement half of [`clear_build_dirs`], and the whole of what
+/// `wsp verify --rm --all -n` has to say about the residue. Sorted, because the
+/// preview and the act both print it and a directory listing arrives in
+/// whatever order the filesystem felt like.
+///
+/// `None` for `live` is herdr not answering, and it is the guard rather than an
+/// error path: see [`clear_build_dirs`] above. It matters twice as much to the
+/// preview, because "herdr is silent, so nothing here would go" and "there is
+/// no residue" are the same empty list and very much not the same fact — which
+/// is why the caller says which one it got rather than printing a bare zero.
+fn stale_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<PathBuf> {
     let Some(live) = live else { return Vec::new() };
     let root = store.state.join("build");
     let Ok(entries) = std::fs::read_dir(&root) else { return Vec::new() };
-    let mut gone = Vec::new();
+    let mut stale = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
         if !path.is_dir() || path == mine {
@@ -376,12 +408,10 @@ fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<
         if live.iter().any(|ws| keyed_on(name, ws)) {
             continue;
         }
-        if std::fs::remove_dir_all(&path).is_ok() {
-            gone.push(util::contract(&path));
-        }
+        stale.push(path);
     }
-    gone.sort();
-    gone
+    stale.sort();
+    stale
 }
 
 /// Whether a build tree under `build/` belongs to this workspace.
@@ -526,22 +556,8 @@ pub(crate) fn last_build(store: &Store, repo: &Path, key: &str) -> Scratch {
 /// the next `worktree add` refuse, with a message that reads like a bug in this
 /// command rather than a stale registration.
 fn clear_warm(store: &Store, repo: &Path, named_for: &Path, dir: &Path, all: bool) -> usize {
-    let mine = std::fs::read_to_string(dir.join(BUILT_AT))
-        .ok()
-        .map(|s| PathBuf::from(s.trim()))
-        .and_then(|target| target.parent().map(Path::to_path_buf))
-        .filter(|d| d.starts_with(store.state.join("warm")))
-        .and_then(|d| crate::sharing::warm_named(&d));
-    let claimed = if all {
-        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES)
-    } else {
-        mine.into_iter().collect()
-    };
     let mut gone = 0;
-    for w in claimed {
-        if !w.dir.exists() {
-            continue;
-        }
+    for w in free_warm(store, named_for, dir, all) {
         let _ = git(repo, &["worktree", "remove", "--force", &w.tree().display().to_string()]);
         if std::fs::remove_dir_all(&w.dir).is_ok() {
             gone += 1;
@@ -549,6 +565,45 @@ fn clear_warm(store: &Store, repo: &Path, named_for: &Path, dir: &Path, all: boo
         let _ = git(repo, &["worktree", "prune"]);
     }
     gone
+}
+
+/// The warm trees this call would take: exactly the ones [`clear_warm`] then
+/// removes, held while the caller looks at them.
+///
+/// # Why the preview takes the locks
+///
+/// A dry run that answered "which trees are free" by *reading* the lock files
+/// would be a second implementation of [`crate::sharing::claim_at`], and it
+/// would differ from it on the case that arrangement was built for: a lock left
+/// by a build that was killed reads as held and is in fact free, because the
+/// claim reclaims it. So the preview asks the same question the same way, and
+/// what it gets back is the answer, not an estimate of it.
+///
+/// The cost is that a dry run writes — a lock file per free slot, dropped when
+/// the returned `Warm`s do. That is the same write every build makes on its way
+/// in, held for as long as it takes to print a line instead of as long as a
+/// build; and there is no way to be truthful here without it. `-n` promises not
+/// to remove anything, which this keeps.
+///
+/// The `dir.exists()` filter belongs here rather than in the removal: a claim
+/// on a slot nothing has built in yet succeeds and hands back a directory that
+/// is not there ([`crate::sharing::claim_at`] makes the lock, not the tree), so
+/// a preview without it would name three trees on a machine that has one.
+fn free_warm(store: &Store, named_for: &Path, dir: &Path, all: bool) -> Vec<crate::sharing::Warm> {
+    let claimed = if all {
+        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES)
+    } else {
+        // Which one it was is not a guess: the build wrote it down.
+        std::fs::read_to_string(dir.join(BUILT_AT))
+            .ok()
+            .map(|s| PathBuf::from(s.trim()))
+            .and_then(|target| target.parent().map(Path::to_path_buf))
+            .filter(|d| d.starts_with(store.state.join("warm")))
+            .and_then(|d| crate::sharing::warm_named(&d))
+            .into_iter()
+            .collect()
+    };
+    claimed.into_iter().filter(|w| w.dir.exists()).collect()
 }
 
 /// The paths whose change is under test, as `git add` pathspecs.
@@ -1256,26 +1311,51 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // it has gone wrong, and needing a working repository to drop it would be
     // exactly backwards.
     if args.has("rm") {
+        let all = args.has("all");
+        // `worklist-051`. Everything above this line is a read, and everything
+        // below is the same read acted on — which is what lets the two branches
+        // share their words instead of describing each other.
+        let dry = args.has("dry-run");
         let existed = tree.exists();
         // The warm tree first, because which one it was is written down *in*
-        // the directory the next line removes.
-        let warm = clear_warm(store, &repo, &named_for, &dir, args.has("all"));
-        let _ = git(&repo, &["worktree", "remove", "--force", &tree.display().to_string()]);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = git(&repo, &["worktree", "prune"]);
+        // the directory the next line removes — and, in the preview, because
+        // holding the claim is what makes the answer true while it is printed.
+        let warm_paths: Vec<String> = match dry {
+            true => free_warm(store, &named_for, &dir, all).iter().map(|w| util::contract(&w.dir)).collect(),
+            false => Vec::new(),
+        };
+        let warm = match dry {
+            true => warm_paths.len(),
+            false => clear_warm(store, &repo, &named_for, &dir, all),
+        };
+        if !dry {
+            let _ = git(&repo, &["worktree", "remove", "--force", &tree.display().to_string()]);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = git(&repo, &["worktree", "prune"]);
+        }
         // `--all` is for the residue rather than for this run: the trees the
         // per-workspace keying left behind, 9.6G on this machine and reachable
         // by no other command, since the workspaces that owned them are gone.
         // Only under the state directory, and never a checkout's — a checkout's
         // belongs to a tree somebody may be standing in, and goes when that
         // does.
-        let residue = if args.has("all") {
-            let live: Option<Vec<String>> =
-                crate::herdr::workspaces().ok().map(|w| w.into_iter().map(|x| x.id).collect());
-            clear_build_dirs(store, live.as_deref(), &dir)
-        } else {
+        //
+        // `live` is kept rather than folded into the call because `None` and
+        // `Some([])` produce the same empty residue and are not the same fact:
+        // one is "herdr did not answer, so this half was skipped" and the other
+        // is "there is nothing here". Said out loud in both branches — a
+        // preview more candid than the act would be the wrong way round.
+        let live: Option<Vec<String>> = all
+            .then(|| crate::herdr::workspaces().ok().map(|w| w.into_iter().map(|x| x.id).collect()))
+            .flatten();
+        let residue: Vec<String> = if !all {
             Vec::new()
+        } else if dry {
+            stale_build_dirs(store, live.as_deref(), &dir).iter().map(|d| util::contract(d)).collect()
+        } else {
+            clear_build_dirs(store, live.as_deref(), &dir)
         };
+        let herdr_silent = all && live.is_none();
         if json_out {
             println!(
                 "{}",
@@ -1283,12 +1363,20 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     "removed": existed,
                     "path": util::contract(&dir),
                     "also": residue.len(),
+                    "also_paths": residue,
                     "warm": warm,
+                    "warm_paths": warm_paths,
+                    "herdr_silent": herdr_silent,
+                    "dry_run": dry,
                 })
             );
         } else {
+            // `checkout --rm -n`'s words, deliberately: a reader who has learned
+            // what "would remove" means on one removing verb has learned it on
+            // all of them.
+            let did = if dry { "would remove" } else { "removed" };
             if existed {
-                println!("removed {}", util::contract(&dir));
+                println!("{did} {}", util::contract(&dir));
             } else {
                 // Named by what owns it, which is the checkout inside one and
                 // the agent outside — otherwise "no build tree for w20" reads
@@ -1300,10 +1388,31 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 }
             }
             if !residue.is_empty() {
-                println!("removed {} left by earlier workspaces", residue.len());
+                println!("{did} {} left by earlier workspaces", residue.len());
             }
             if warm > 0 {
-                println!("removed {warm} warm build tree(s) — the next build here is cold");
+                let cold = if dry { "would be cold" } else { "is cold" };
+                println!("{did} {warm} warm build tree(s) — the next build here {cold}");
+            }
+            // The paths, and only in the preview. The act prints counts because
+            // by then the decision has been made and thirty lines is a wall;
+            // the preview *is* the decision, and a count is not something
+            // anybody can check. These are also the only place the residue is
+            // ever named — nothing else in wsp lists it, which is most of why
+            // this verb has a dry run at all.
+            if dry {
+                for path in warm_paths.iter().chain(residue.iter()) {
+                    println!("  {}", p.dim(path));
+                }
+            }
+            if herdr_silent {
+                println!(
+                    "{}",
+                    p.yellow(&format!(
+                        "herdr did not answer, so nothing left by earlier workspaces {}",
+                        if dry { "is listed" } else { "was removed" }
+                    ))
+                );
             }
         }
         return 0;
@@ -2078,6 +2187,164 @@ bench::b: benchmark
         // Said, and meant: an empty answer from a herdr that answered is a
         // machine with no agents on it, and its trees are residue.
         assert_eq!(clear_build_dirs(&store, Some(&[]), Path::new("/nowhere")).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `worklist-051`, the residue half. `-n` on `--rm --all` is only worth
+    /// having if it is a promise, so the promise is what is asserted:
+    /// [`stale_build_dirs`] is asked which trees would go, and then
+    /// [`clear_build_dirs`] is asked to go and remove them, and the two lists
+    /// have to be the same one.
+    ///
+    /// This is the strongest case for a dry run in the whole of `worklist-051`
+    /// and the fixture says why in three directories. What `--all` matches is a
+    /// listing of a directory nobody types crossed with herdr's live workspace
+    /// list — a wildcard over two things the caller cannot see from where they
+    /// are standing. And the removal *does not name what it took*: it prints a
+    /// count. So the preview is not a convenience here, it is the only place
+    /// these paths are ever said out loud.
+    #[test]
+    fn what_a_dry_run_of_rm_all_names_is_what_the_removal_then_takes() {
+        let dir = scratch_dir("foresee-residue");
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let build = store.state.join("build");
+        for t in ["wsp-w2x", "wsp-w2y", "wsp-w2z", "my-wsp-w2q"] {
+            std::fs::create_dir_all(build.join(t).join("tree")).unwrap();
+        }
+        // `w2y` is alive and `wsp-w2z` is the caller's own, which is the second
+        // exclusion and the one a preview computed beside the act would be free
+        // to disagree about.
+        let live = vec!["w2y".to_string()];
+        let mine = build.join("wsp-w2z");
+
+        let said = stale_build_dirs(&store, Some(&live), &mine);
+        let said_names: Vec<String> = said.iter().map(|d| util::contract(d)).collect();
+        assert_eq!(said.len(), 2, "the preview named the wrong trees: {said_names:?}");
+        assert!(said.iter().all(|d| d.exists()), "a dry run removed a tree");
+        assert!(build.join("wsp-w2x").exists() && build.join("my-wsp-w2q").exists());
+
+        let did = clear_build_dirs(&store, Some(&live), &mine);
+        assert_eq!(did, said_names, "the removal disagreed with the preview");
+        assert!(build.join("wsp-w2y").exists(), "a live agent lost the tree it was building in");
+        assert!(mine.exists(), "the caller's own tree went with the residue");
+
+        // Sorted, and the same order both times: the preview and the act print
+        // the same list, so a stable order is part of them agreeing rather than
+        // a nicety. A directory listing has whatever order the filesystem felt
+        // like on the day.
+        let mut expected = said_names.clone();
+        expected.sort();
+        assert_eq!(said_names, expected, "the preview printed a directory listing in filesystem order");
+
+        // And herdr's silence reaches the preview as it reaches the act:
+        // nothing named, because nothing would go. The caller is told which of
+        // the two it got by `verify` rather than by this, which is why the
+        // empty list is not enough on its own.
+        assert!(
+            stale_build_dirs(&store, None, &mine).is_empty(),
+            "silence from herdr was previewed as a machine with no agents on it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The warm half of the same promise, and the half where the preview has to
+    /// *take* something to be truthful.
+    ///
+    /// [`free_warm`] answers "which trees would go" by claiming them, because
+    /// that is the question [`clear_warm`] keys on: a tree somebody is building
+    /// in cannot be claimed and is therefore not removed. A preview that read
+    /// the lock files instead would be a second implementation of the claim and
+    /// would differ from it on a lock left behind by a build that was killed —
+    /// held to a reader, free to the act.
+    ///
+    /// Two slots have trees and the third has only a lock, which is the state
+    /// `claim_at` documents and the one a preview gets wrong by naming three.
+    #[test]
+    fn a_dry_run_of_rm_all_names_the_warm_trees_the_removal_then_takes() {
+        let dir = scratch_dir("foresee-warm");
+        repo(&dir);
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let warm = store.state.join("warm");
+        let named = util::slugify(dir.file_name().unwrap().to_str().unwrap());
+        std::fs::create_dir_all(&warm).unwrap();
+        for slot in [0, 1] {
+            std::fs::create_dir_all(warm.join(format!("{named}-{slot}")).join("tree")).unwrap();
+        }
+        // Slot 2 is a claim with no tree behind it: `claim_at` makes the lock
+        // and whoever builds there makes the directory.
+        assert!(!warm.join(format!("{named}-2")).exists());
+
+        let said: Vec<String> =
+            free_warm(&store, &dir, Path::new("/nowhere"), true).iter().map(|w| util::contract(&w.dir)).collect();
+        assert_eq!(said.len(), 2, "a slot nothing has built in was named as a tree: {said:?}");
+        assert!(warm.join(format!("{named}-0")).exists(), "a dry run removed a warm tree");
+        assert!(warm.join(format!("{named}-1")).exists(), "a dry run removed a warm tree");
+
+        // The claims are dropped with the `Warm`s above, so the removal can
+        // take them: a preview that held its locks past the line it printed
+        // would make the next real `--rm` a no-op.
+        let did = clear_warm(&store, &dir, &dir, Path::new("/nowhere"), true);
+        assert_eq!(did, said.len(), "the removal disagreed with the preview");
+        assert!(!warm.join(format!("{named}-0")).exists(), "the tree the preview named was left standing");
+        assert!(!warm.join(format!("{named}-1")).exists(), "the tree the preview named was left standing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A defect the split above uncovered rather than one it introduced, and
+    /// the exact thing a dry run is for: **`--rm --all` was skipping the
+    /// caller's own warm tree** — the one `--rm` alone removes.
+    ///
+    /// The old shape computed the narrow answer first, unconditionally: it
+    /// claimed the tree the last build wrote down, *held that claim*, and then
+    /// under `--all` asked [`crate::sharing::warm_each`] for every free tree.
+    /// The lock it was still holding is a lock, and the pid inside it is this
+    /// process, which `ps` reports as alive — so the claim it had just taken
+    /// made its own tree read as busy, and the widest removal in wsp left
+    /// standing the one tree the caller most certainly meant.
+    ///
+    /// Silent both ways: `--all` printed a count that was right about the trees
+    /// it did take, and nobody had a list to hold it against. It is asserted
+    /// here on the preview because the preview is now where such a list exists.
+    #[test]
+    fn rm_all_takes_the_tree_the_caller_last_built_in_and_not_only_the_others() {
+        let dir = scratch_dir("foresee-mine");
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let warm = store.state.join("warm");
+        let named = util::slugify(dir.file_name().unwrap().to_str().unwrap());
+        for slot in [0, 1, 2] {
+            std::fs::create_dir_all(warm.join(format!("{named}-{slot}")).join("tree")).unwrap();
+        }
+        // The pointer a build leaves behind, naming slot 1 as the tree this
+        // caller last built in — which is what `--rm` on its own would take.
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(
+            scratch.join(BUILT_AT),
+            format!("{}\n", warm.join(format!("{named}-1")).join("target").display()),
+        )
+        .unwrap();
+
+        let narrow: Vec<String> =
+            free_warm(&store, &dir, &scratch, false).iter().map(|w| util::contract(&w.dir)).collect();
+        assert_eq!(narrow.len(), 1, "the pointer did not name one tree: {narrow:?}");
+
+        // The mechanism, reproduced rather than argued: hold the narrow claim
+        // across the wide question, which is exactly what the old shape did to
+        // itself, and the wide answer comes back short of the tree being held.
+        let held = free_warm(&store, &dir, &scratch, false);
+        let while_held: Vec<String> =
+            free_warm(&store, &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
+        assert_eq!(while_held.len(), 2, "a held claim did not take its slot out of the wide answer");
+        assert!(!while_held.contains(&narrow[0]), "the held tree was claimed twice at once");
+        drop(held);
+
+        let wide: Vec<String> =
+            free_warm(&store, &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
+        assert_eq!(wide.len(), 3, "--all did not reach every free tree: {wide:?}");
+        assert!(
+            wide.contains(&narrow[0]),
+            "--all left standing the one tree --rm on its own removes: {wide:?} against {narrow:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     /// Everything this command was failing to say, said. A run that goes red on

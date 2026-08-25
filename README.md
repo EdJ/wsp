@@ -3985,6 +3985,50 @@ what it *did* rather than what it attempted. A preview would be a report of what
 it intended, wrong on exactly the runs that matter. `wsp checkout <id> --rm -n`
 answers the half people are actually asking about.
 
+#### Which of the rest earn a dry run, and why it is not about damage
+
+The check made all eight removing verbs safe at once, which left the question of
+what the four still refusing *should* do. They do not get the same answer, and
+the line between them is not how much a verb destroys. The two that grew a
+preview are among the least destructive in wsp; one of the two that stayed
+refused is the only verb here that deletes a record outright. What decides it is
+**whether the caller can enumerate what goes**.
+
+- **A wildcard or a cascade earns a preview**, because the set it removes is one
+  nobody typed and no other verb prints. `wsp verify --rm --all` is the strongest
+  case in the whole enumeration: it matches every warm tree nobody is building in,
+  crossed with every build directory under the state directory that no live herdr
+  workspace owns — 9.6G in thirty of them once — and the removal itself reports a
+  *count*, so `-n` is the only place those paths are ever said out loud. `wsp
+  worklist rm` is the cascade: taking the last member of a group drops the group,
+  which renumbers every group after it, and a group number is what you type next.
+- **One named thing that comes back is refused — and signposted.** `wsp rm <id>`
+  files the task in the archive and clears its claim and pane bindings; `wsp
+  machine rm --force` deletes a record into a commit the store's git still holds.
+  Their entire preview is a `show`, which exists. Building a second one inside
+  the verb that removes, kept in step with the removal by nothing, is worse than
+  the refusal — so the refusal names the read instead: `wsp show <id>` and `wsp
+  machine show <name>`.
+- **A set that is not knowable ahead of the act is refused with the reason on the
+  verb.** `despawn`, above, alone.
+
+`wsp verify --rm --all -n` takes the warm-tree claims to answer, because that is
+the same question the removal keys on — a lock left by a killed build reads as
+held to anything that merely looks at it, and is free to the claim that reclaims
+it. It holds them for as long as it takes to print a line, and removes nothing.
+It also says when herdr did not answer, which the act now does too: silence and
+"there is no residue" are the same empty list and very much not the same fact.
+
+`-n` stays refused on the ordinary reading verbs, `wsp ls` included. Not because
+the word would be dangerous there — it would be *true*, since a read is its own
+dry run — but because accepting it needs a second list, of verbs where the word
+is harmless, and that list's mistakes are not symmetrical. A reader left off it
+is refused, which costs a retype. A remover wrongly on it does the thing on the
+word that means do not do the thing. One list whose errors are all benign beats
+two lists where the second one can take a tree. And `wsp ls -n` exited 2 before
+any of this, on the tally afterwards; what changed is that the refusal now
+arrives first.
+
 ### What none of it fixes
 
 A tree each closes the sweeps and does not close everything. Two agents editing

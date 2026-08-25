@@ -651,7 +651,8 @@ fn die_on_broken_pipe() {
 /// `checkout` for the arm that also covers `--rm`, which is the sentence they
 /// need. It is short because the property it describes is rare, and it going
 /// stale is the one failure here that costs nothing but a wrong signpost.
-const LOOKS_FIRST: &str = "archive, checkout, install, migrate, project rm, sandbox rm, worklist go";
+const LOOKS_FIRST: &str =
+    "archive, checkout, install, migrate, project rm, sandbox rm, verify --rm, worklist go, worklist rm";
 
 /// Whether this invocation reads `-n`, and what to call it if it does not.
 ///
@@ -693,6 +694,42 @@ const LOOKS_FIRST: &str = "archive, checkout, install, migrate, project rm, sand
 /// the arms that dispatch on a subcommand are the arms whose refusal has to say
 /// `worklist rm` rather than `worklist`, and that is one fact about a verb, not
 /// two.
+///
+/// # Which removing verbs are on this list, and why the rest are not
+///
+/// `worklist-050` made every removing verb *safe* with one check and then gave
+/// four of them a real dry run; `worklist-051` settled the remaining four, and
+/// split them two and two. The line it drew is not about how much damage a verb
+/// does — the two that stayed refused include the only verb in wsp that deletes
+/// a record outright, and the two that got a preview are among the least
+/// destructive there are. It is about **whether the caller can enumerate what
+/// goes**:
+///
+/// - **A wildcard or a cascade earns a preview.** `sandbox rm --all` and
+///   `verify --rm --all` match a set nobody typed; `project rm --force` and
+///   `worklist rm` take things *with* the one you named — orphaned tasks, a
+///   group emptied and dropped. In every one of these the removal computes a
+///   set the caller did not write down and no other verb prints, so `-n` is the
+///   only place that set is ever said out loud. `checkout --rm` is the same
+///   shape one step in: the named thing is the tree, and the *branch* is the
+///   consequence it computes.
+/// - **One named thing that comes back is refused, and signposted.** `wsp rm`
+///   and `wsp machine rm` remove exactly the record you typed, into an archive
+///   or into a commit that git still has. Their whole preview is a `show`,
+///   which exists — so what the refusal owes is the name of it, and
+///   [`refuse_dry_run`] pays that. A dry run here would be a second `show`
+///   living inside the verb that removes, kept in step with it by nothing.
+/// - **A set that is not knowable ahead of the act is refused with the reason
+///   on the verb.** `despawn` alone, and its argument is in
+///   [`crate::cmd_spawn::despawn`]: every step is conditioned on herdr's answer
+///   to the last one, so a preview is a report of what would be *attempted* —
+///   which is a different sentence from what would happen, on exactly the runs
+///   that matter.
+///
+/// The first bullet is why the arms below are not a list of dangerous verbs.
+/// `wsp worklist rm` is on it and cannot lose a byte; `wsp machine rm --force`
+/// is off it and deletes a file. What the flag is worth is a function of what
+/// the caller cannot otherwise see.
 fn dry_run(args: &Args) -> (bool, String) {
     let sub = args.rest.first().map(String::as_str).unwrap_or_default();
     let named = |reads: bool| (reads, format!("{} {sub}", args.cmd).trim_end().to_string());
@@ -705,7 +742,15 @@ fn dry_run(args: &Args) -> (bool, String) {
         "migrate" | "install" | "archive" | "checkout" => (true, args.cmd.clone()),
         "project" | "proj" | "p" => named(matches!(sub, "rm" | "remove" | "delete")),
         "sandbox" => named(matches!(sub, "rm" | "remove" | "stop")),
-        "worklist" | "wl" => named(matches!(sub, "go" | "start")),
+        "worklist" | "wl" => named(matches!(sub, "go" | "start" | "rm" | "remove")),
+        // The one arm that turns on a flag rather than a word, because that is
+        // where `verify` keeps the difference: `wsp verify` is a build and has
+        // nothing to look at first, `wsp verify --rm` removes trees nothing
+        // else in wsp can list. Asked through `given` like the check itself —
+        // reading `--rm` here would tell the tally somebody had looked at it,
+        // and on `wsp add --rm` (which is not a verify) that is a word going
+        // silently nowhere.
+        "verify" => (args.given("rm"), args.cmd.clone()),
         "machine" | "machines" => named(false),
         _ => (false, args.cmd.clone()),
     }
@@ -827,19 +872,66 @@ fn refuse_swallowed(l: &Literal, name: &str, value: Option<&str>) -> i32 {
 /// The one line that matters is *nothing has been done*, because the reader
 /// typed `-n` precisely to find out what would be, and every previous version
 /// of this sentence arrived after the answer had been acted on.
+///
+/// # Why three verbs get a paragraph and the rest get a list
+///
+/// A refusal on a verb that removes something is read by somebody who wanted an
+/// answer, and the list at the bottom does not give them one — it names the
+/// nearest verbs that look first, which for `wsp rm` is none of them. So the
+/// three removing verbs that stay refused after `worklist-051` each carry **the
+/// read that does answer the question they were asked**, and for two of the
+/// three that read is a plain `show`. That is the argument for refusing them
+/// rather than the apology for it: a preview here would be a second and worse
+/// `wsp show`, built inside the verb that removes, and kept in step with it by
+/// nothing.
+///
+/// `despawn` is the exception in kind rather than in shape. Its preview would
+/// not be redundant, it would be *wrong* — see [`crate::cmd_spawn::despawn`] —
+/// so what it names is the read for the half of the question that is a
+/// directory, and it says why the other half has no answer.
 fn refuse_dry_run(verb: &str) -> i32 {
     let p = util::Paint::new();
     eprintln!("wsp: `wsp {verb}` does not look first, so {} is refused. Nothing has been done.", p.bold("-n"));
-    // The verbs that removed things on this word are the reason the refusal
-    // exists, so the one with a real dry run for the thing people are usually
-    // asking about gets named rather than left to be looked up.
-    if verb == "despawn" {
-        eprintln!("     Ending an agent is a run of steps across herdr, each one decided by");
-        eprintln!("     the last one's answer, so what it would do is not knowable until it");
-        eprintln!("     does it. For the half that is a directory: `wsp checkout <id> --rm -n`.");
+    for line in signpost(verb) {
+        eprintln!("     {line}");
     }
     eprintln!("     Verbs that do look first: {}", p.dim(LOOKS_FIRST));
     2
+}
+
+/// What a refused removing verb is told instead of a preview.
+///
+/// Held apart from [`refuse_dry_run`] so it can be read as data. The claim
+/// these lines make is not about wording — it is that every verb still refusing
+/// `-n` after `worklist-051` names a read that *does* answer it, and that claim
+/// is checkable only if the sentences are values rather than `eprintln!`s
+/// halfway down a function. The test asks two things of each: that there is an
+/// entry at all, and that the verb it points at is one that exists.
+///
+/// Empty for the rest, which is the honest answer for `wsp ls -n`: there is no
+/// preview to send anybody to, because there is nothing to preview.
+fn signpost(verb: &str) -> &'static [&'static str] {
+    // The verbs that removed things on this word are the reason the refusal
+    // exists, so each of the ones still refused names the read that answers
+    // what they were asked, rather than leaving it to be looked up.
+    match verb {
+        "despawn" => &[
+            "Ending an agent is a run of steps across herdr, each one decided by",
+            "the last one's answer, so what it would do is not knowable until it",
+            "does it. For the half that is a directory: `wsp checkout <id> --rm -n`.",
+        ],
+        "rm" => &[
+            "The task goes to the archive and comes back; what goes quietly is the",
+            "claim on it and every pane bound to it. `wsp show <id>` names both,",
+            "which is the whole of what a dry run here could have told you.",
+        ],
+        "machine rm" => &[
+            "Without --force this retires the machine and is reversible. With it the",
+            "record is deleted — and committed, so the store's git has it. There is",
+            "one record and no cascade: `wsp machine show <name>` is all of it.",
+        ],
+        _ => &[],
+    }
 }
 
 /// Whether this invocation has to have a store to mean anything.
@@ -1440,12 +1532,14 @@ fn help_text() -> String {
   wsp land [<id>]                   rebase it onto the trunk and fast-forward the
                                     trunk onto it; prints what actually moved.
                                     The tree stays — landing is not finishing
-  wsp verify [<path>…] [--check] [--release] [--rm [--all]]
+  wsp verify [<path>…] [--check] [--release] [--rm [--all] [-n]]
                                     build and test your change at HEAD, in one
                                     of a few warm trees this machine shares —
                                     yours alone while it builds, and cold only
                                     when they are all busy; --rm drops the one
-                                    you built in, --all every free one
+                                    you built in, --all every free one and the
+                                    build residue no other verb can reach. -n
+                                    names all of it and removes none
   wsp verify --alone                …or every test in a process of its own,
                                     ~90s, naming the failures and nothing
                                     else — what to reach for when a test goes
@@ -1606,7 +1700,9 @@ fn help_text() -> String {
                                     that exists instead of making one
   wsp worklist add <slug> <parent> --sub   …or that parent's open sub-tasks as
                                     one group, resolved now and not live
-  wsp worklist rm <slug> <task>…    take members out; a group left empty goes
+  wsp worklist rm <slug> <task>… [-n]
+                                    take members out; a group left empty goes,
+                                    and -n says which before anything moves
   wsp worklist mv <slug> <task> --group N   between groups, or --after N for a
                                     new one between two that exist
   wsp worklist group <slug> N [--parallel N|none] [--stop "…"|-]
@@ -2302,16 +2398,17 @@ mod tests {
     /// ordering — in `main` it is two lines above the dispatch, and a test that
     /// ran the dispatch to find out would be a test of the removal.
     ///
-    /// Five verbs are named because five is the enumeration this row was filed
-    /// on: four in it, and `wsp rm` found by driving the rest.
+    /// Three verbs now, not five. `worklist-051` gave `verify --rm` and
+    /// `worklist rm` real dry runs and left these three refusing on arguments
+    /// of their own — see [`super::dry_run`] for the line between them. What is
+    /// asserted here is the same property either way: `-n` on a verb that does
+    /// not look first is refused, and refused *before* the verb runs.
     #[test]
     fn a_verb_that_cannot_look_first_refuses_n_rather_than_ignoring_it() {
         for argv in [
             &["despawn", "t-1"][..],
-            &["verify", "--rm", "--all"][..],
             &["rm", "t-1"][..],
             &["machine", "rm", "seat"][..],
-            &["worklist", "rm", "night", "t-1"][..],
         ] {
             let mut with_n: Vec<&str> = argv.to_vec();
             with_n.push("-n");
@@ -2321,9 +2418,11 @@ mod tests {
         }
     }
 
-    /// The five that do, including the two subcommands whose siblings do not:
-    /// `wsp worklist go` looks first and `wsp worklist rm` does not, so the
-    /// answer cannot be a property of the verb alone.
+    /// The ones that do, with their aliases — and with the two invocations that
+    /// prove the answer is not a property of the verb alone. `wsp verify --rm`
+    /// looks first and plain `wsp verify` has nothing to look at, which is one
+    /// verb split by a *flag*; `wsp sandbox rm` looks first and `wsp sandbox
+    /// ls` does not, which is one verb split by a subcommand.
     #[test]
     fn a_verb_that_does_look_first_is_let_through_with_its_aliases() {
         for argv in [
@@ -2334,11 +2433,40 @@ mod tests {
             &["project", "rm", "batch"][..],
             &["p", "delete", "batch"][..],
             &["sandbox", "rm", "--all"][..],
+            &["verify", "--rm"][..],
+            &["verify", "--rm", "--all"][..],
             &["wl", "start", "night"][..],
+            &["worklist", "rm", "night", "t-1"][..],
+            &["wl", "remove", "night", "t-1"][..],
         ] {
             let a = args(argv);
             assert!(super::dry_run(&a).0, "`wsp {}` reads -n and was refused it", argv.join(" "));
         }
+    }
+
+    /// `verify` is the one arm that turns on a flag, and the flag is the whole
+    /// difference: `wsp verify` builds and has nothing to preview, `wsp verify
+    /// --rm` removes trees no other verb in wsp can list. Asserted apart from
+    /// the loops above because a table of invocations that all answer the same
+    /// way cannot show a verb answering both.
+    ///
+    /// The second half is the one that would go wrong quietly. The check asks
+    /// through `given`, so looking at `--rm` here must not tell the tally that
+    /// somebody read it — otherwise `wsp add "t" --rm` would parse a word
+    /// nothing acts on and lose the only warning there is about it.
+    #[test]
+    fn verify_looks_first_only_when_it_is_removing_and_asking_does_not_read_the_flag() {
+        assert!(!super::dry_run(&args(&["verify"])).0, "a build has a dry run to offer");
+        assert!(!super::dry_run(&args(&["verify", "src/main.rs"])).0, "a build has a dry run to offer");
+        assert!(super::dry_run(&args(&["verify", "--rm"])).0, "the removing branch was refused -n");
+
+        let a = args(&["verify", "--rm"]);
+        assert!(super::dry_run(&a).0);
+        assert!(
+            !a.read.borrow().contains("rm"),
+            "the check marked --rm read before dispatch, so a verb that then ignored it \
+             would have the one tally that catches that silenced"
+        );
     }
 
     /// A refusal has to say which verb, and a verb that dispatches on a
@@ -2349,7 +2477,78 @@ mod tests {
         assert_eq!(super::dry_run(&args(&["worklist", "rm", "night"])).1, "worklist rm");
         assert_eq!(super::dry_run(&args(&["sandbox", "ls"])).1, "sandbox ls");
         assert_eq!(super::dry_run(&args(&["despawn", "t-1"])).1, "despawn");
+        assert_eq!(super::dry_run(&args(&["machine", "rm", "seat"])).1, "machine rm");
         assert_eq!(super::dry_run(&args(&["verify"])).1, "verify");
+    }
+
+    /// A refusal that only says no is the thing `worklist-051` decided against
+    /// twice: `wsp rm` and `wsp machine rm` stay refused *because* the read that
+    /// answers them already exists, so the refusal has to name it or the
+    /// argument for refusing is not being made to the person it is made about.
+    ///
+    /// The signpost is checked for the verb it points at rather than word for
+    /// word, so the sentence can be rewritten without the test being about
+    /// prose.
+    #[test]
+    fn a_removing_verb_that_stays_refused_names_the_read_that_answers_it() {
+        for (verb, points_at) in
+            [("rm", "wsp show"), ("machine rm", "wsp machine show"), ("despawn", "wsp checkout")]
+        {
+            let said = super::signpost(verb).join(" ");
+            assert!(!said.is_empty(), "`wsp {verb}` is refused -n with nothing to go on");
+            assert!(
+                said.contains(points_at),
+                "the refusal on `wsp {verb}` does not send anybody to `{points_at}`: {said}"
+            );
+            // And the verb it sends them to has to be one wsp has. `dry_run`
+            // answers for every string, so the question is not "is this a verb"
+            // but "does the help describe it" — a signpost to a name the help
+            // has never heard of is the same wrong turn as a stale
+            // `LOOKS_FIRST`, one indirection along.
+            let named = points_at.strip_prefix("wsp ").unwrap();
+            assert!(
+                super::help_text().contains(&format!("wsp {named}")),
+                "the refusal on `wsp {verb}` sends people to `{points_at}`, which the help does not list"
+            );
+            assert!(
+                super::LOOKS_FIRST.split(", ").all(|n| n != verb),
+                "`wsp {verb}` is signposted as looking first and also refuses -n"
+            );
+        }
+    }
+
+    /// The other half of `worklist-051`, and the one that is about the verb an
+    /// agent types most rather than about the ones that delete. `-n` on a
+    /// reading verb is refused, with nothing to send anybody to — and that is
+    /// the answer, not an omission.
+    ///
+    /// It could have been made a silent no-op: `wsp ls -n` is `wsp ls`, so the
+    /// word is *true* there. What that would cost is the property this whole
+    /// check is built on. Today the list below has one meaning — these verbs
+    /// look first — and both ways of being wrong about it are safe. Accepting
+    /// `-n` on readers needs a second list, of verbs where the word is
+    /// harmless, and that list's mistakes are not symmetrical: a reader left
+    /// off it is refused, which costs a retype, and a *remover* wrongly on it
+    /// does the thing on the word that means do not do the thing, which is
+    /// `worklist-044` back with a new spelling. One list whose errors are all
+    /// benign beats two lists where the second one can kill a tree.
+    ///
+    /// And the cost being paid for that is small and was already being paid:
+    /// `wsp ls -n` exited 2 before this check existed too, on the tally
+    /// afterwards. What changed is that the refusal arrives first and the
+    /// listing no longer prints — which is a retype, on a command that has
+    /// nothing to lose.
+    #[test]
+    fn a_reading_verb_refuses_n_too_and_has_no_second_read_to_offer() {
+        for argv in [&["ls"][..], &["show", "t-1"][..], &["projects"][..]] {
+            let a = args(argv);
+            assert!(!super::dry_run(&a).0, "`wsp {}` accepts -n", argv.join(" "));
+            assert!(
+                super::signpost(&super::dry_run(&a).1).is_empty(),
+                "`wsp {}` is refused with a signpost, as if a preview of a read were a thing",
+                argv.join(" ")
+            );
+        }
     }
 
     /// The signpost in the refusal is read by somebody who has just been told

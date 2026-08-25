@@ -527,10 +527,21 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         return 2;
     }
 
+    // `-n`, and this verb is the cheapest real dry run in wsp: the loop below
+    // touches nothing but `groups`, which is a copy, and the single `save`
+    // after it is the whole act. So the preview is this function with one call
+    // skipped, rather than a second account of what it would have done — which
+    // is the arrangement `checkout --rm -n` had to build machinery to get.
+    let dry = args.has("dry-run");
     let mut groups = w.groups();
     let win = window(store, &w);
     let mut gone: Vec<String> = Vec::new();
-    let mut emptied = 0;
+    // The 1-based position each group had *before* any of this, carried in
+    // lockstep so a dropped group can be named by the number the reader can see
+    // in `wsp worklist show`. The live ordinals shift as groups go, which is
+    // exactly why the reported one must not be read off the mutated list.
+    let mut ordinal: Vec<usize> = (1..=groups.len()).collect();
+    let mut emptied: Vec<usize> = Vec::new();
     // The window is read once and the ordinals shift underneath it, which is
     // safe rather than lucky: a group is only ever dropped after it has passed
     // the check, so every drop is ahead of the position, and dropping a group
@@ -555,23 +566,45 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
         // said so rather than left as a numbered blank.
         if groups[gi].members.is_empty() {
             groups.remove(gi);
-            emptied += 1;
+            emptied.push(ordinal.remove(gi));
         }
         gone.push(id);
     }
 
-    w.log(&format!("removed {}", gone.join(" ")));
-    save(store, &mut w, &groups, "rm", &format!("rm {}", gone.join(" ")));
+    if !dry {
+        w.log(&format!("removed {}", gone.join(" ")));
+        save(store, &mut w, &groups, "rm", &format!("rm {}", gone.join(" ")));
+    }
 
     if args.json() {
-        println!("{}", worklist_json(store, &w));
+        // The list as it stands, which under `-n` is the list as it stands
+        // *unchanged* — the preview's answer is the two fields beside it, and
+        // reporting the groups this call computed but did not save would be a
+        // record of a list that does not exist.
+        let mut out = worklist_json(store, &w);
+        if let Some(o) = out.as_object_mut() {
+            o.insert("removed".into(), json!(gone));
+            o.insert("groups_dropped".into(), json!(emptied));
+            o.insert("dry_run".into(), json!(dry));
+        }
+        println!("{}", out);
     } else {
-        let tail = match emptied {
-            0 => String::new(),
-            1 => " · one group left empty and dropped".to_string(),
-            n => format!(" · {n} groups left empty and dropped"),
+        // Named rather than counted, because a group number is what the reader
+        // then has to type — `worklist mv --group N`, `worklist group <slug> N`
+        // — and because dropping group 2 of 4 is what renumbers 3 and 4. A
+        // count says something went and leaves the renumbering to be
+        // discovered.
+        let did = if dry { "would remove" } else { "removed" };
+        let left = if dry { "would be left empty and dropped" } else { "left empty and dropped" };
+        let tail = match emptied.as_slice() {
+            [] => String::new(),
+            [n] => format!(" · group {n} {left}"),
+            ns => {
+                let ns = ns.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+                format!(" · groups {ns} {left}")
+            }
         };
-        println!("removed {} from {}{tail}", gone.join("  "), w.id);
+        println!("{did} {} from {}{tail}", gone.join("  "), w.id);
     }
     0
 }
@@ -3119,6 +3152,82 @@ mod tests {
 
         assert_eq!(run(&store, &["rm", "batch", "wl-001"]), 0, "nothing has started, so nothing is behind");
         assert_eq!(groups_of(&store, "batch").len(), 2, "and the emptied group went with it");
+    }
+
+    /// `worklist-051`. The promise every dry run in wsp makes: what `-n` says
+    /// is what dropping it then does, asserted by doing exactly that.
+    ///
+    /// The consequence being previewed is the one nothing else prints. Removing
+    /// the only member of group 2 drops the group, which **renumbers 3 into 2**
+    /// — and a group number is what the reader has to type next, at `worklist
+    /// mv --group N` and `worklist group <slug> N`. `wsp worklist show` can be
+    /// read before and after and the renumbering worked out; it cannot be
+    /// asked. So the preview names the group by the position it has *now*,
+    /// which is the one on the screen the reader is looking at.
+    ///
+    /// And the store is untouched, which here is the whole verb: `rm` mutates a
+    /// copy of the groups and saves once at the end, so the dry run is that
+    /// function with the save skipped rather than a second account of it.
+    #[test]
+    fn what_a_dry_run_of_worklist_rm_says_is_what_the_removal_then_does() {
+        let store = scratch("wl-foresee");
+        for id in ["wl-001", "wl-002", "wl-003"] {
+            task(&store, id, "todo");
+        }
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["add", "batch", "wl-003"]);
+        let before = groups_of(&store, "batch");
+        let logged = store.worklist("batch").expect("the list").body.clone();
+
+        assert_eq!(flagged(&store, &["rm", "batch", "wl-002"], &[("dry-run", "true")]), 0);
+        assert_eq!(
+            groups_of(&store, "batch").iter().map(|g| g.members.clone()).collect::<Vec<_>>(),
+            before.iter().map(|g| g.members.clone()).collect::<Vec<_>>(),
+            "a dry run took a member out"
+        );
+        assert_eq!(
+            store.worklist("batch").expect("the list").body,
+            logged,
+            "a dry run wrote a line into the list's log"
+        );
+
+        // The same call without the word, and it has to agree.
+        assert_eq!(run(&store, &["rm", "batch", "wl-002"]), 0);
+        let after = groups_of(&store, "batch");
+        assert_eq!(after.len(), 2, "the emptied group was not dropped");
+        assert_eq!(after[1].members, ["wl-003"], "group 3 did not become group 2");
+    }
+
+    /// A dry run that reported a removal the verb would have refused would be
+    /// lying in the one direction that costs work, so `-n` is read *after* both
+    /// refusals rather than before them — the arrangement `checkout --rm -n`
+    /// settled on, arriving here for the same reason.
+    ///
+    /// Both refusals: a member the list does not hold, and the frozen window.
+    /// Neither is reachable by looking at the list, because the window is a
+    /// fact about the *run* — where it is up to — rather than about the
+    /// membership.
+    #[test]
+    fn a_dry_run_of_worklist_rm_refuses_everything_the_removal_would_refuse() {
+        let store = scratch("wl-foresee-refuse");
+        for id in ["wl-001", "wl-002", "wl-003"] {
+            task(&store, id, "todo");
+        }
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["add", "batch", "wl-003"]);
+        started(&store, "batch");
+        crossed(&store, "batch", 1);
+
+        let dry = &[("dry-run", "true")];
+        assert_eq!(flagged(&store, &["rm", "batch", "wl-001"], dry), 1, "behind the position: history");
+        assert_eq!(flagged(&store, &["rm", "batch", "wl-002"], dry), 1, "at the position: the barrier");
+        assert_eq!(flagged(&store, &["rm", "batch", "wl-404"], dry), 1, "not a member of this list");
+        assert_eq!(flagged(&store, &["rm", "batch", "wl-003"], dry), 0, "ahead of the work, and open");
+        assert_eq!(groups_of(&store, "batch").len(), 3, "a refused dry run moved something");
     }
 
     /// The rule the whole verb set is built on: a group at or behind the
