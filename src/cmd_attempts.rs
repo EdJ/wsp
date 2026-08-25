@@ -323,7 +323,11 @@ pub fn attempts_of(t: &Task) -> Vec<Attempt> {
                     a.outcome = Outcome::Reaped;
                 }
             }
-        } else if head == "→ review" {
+        // Both spellings. `review` takes an account and logs `review: …`
+        // beside `blocked:` and `parked:`; every row logged before that says
+        // `→ review`, and an attempt record that stopped reading them would
+        // lose the outcome of every attempt in the store's history.
+        } else if head == "→ review" || head.starts_with("review:") {
             a.reviewed = stamp.to_string();
             a.outcome = Outcome::Review;
         } else if head == "→ done" {

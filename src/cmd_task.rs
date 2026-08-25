@@ -1067,6 +1067,105 @@ pub fn block(store: &Store, args: &Args) -> i32 {
     })
 }
 
+/// The account, and the gate that is the whole of `robustness-101`.
+///
+/// `review` was [`set_status`] with no argument. That is the shape of a verb
+/// you type at the end, and thirteen of fourteen opencode rows typed it and
+/// stopped: `render-033` committed and never landed, `render-014` left two
+/// modified files in its tree with nothing on its branch, `worklist-ui-003`
+/// landed itself and wrote not a word, `ui-007` had nothing to land — which
+/// was correct — and still wrote its account only when the governor asked.
+/// Every one of them needed a person to notice and say so, and that person's
+/// turn is a cost `wsp attempts` cannot see.
+///
+/// # Why the account is the thing refused, and not the commit
+///
+/// The obvious gate is the title's: refuse when nothing is ahead of the trunk.
+/// It is wrong twice. It **passes** `ui-003` and `ui-006`, which committed and
+/// landed and wrote nothing, and it **fails** `ui-007`, which was genuinely
+/// finished with no diff — a row with nothing to land is correct to sit at
+/// review, and a verb that refuses it is a verb people learn to force. What is
+/// missing in all four is the same thing, and it is not a commit: it is the
+/// row's own prose.
+///
+/// And prose is worth refusing over on its own evidence. `compound-002`, asked
+/// for an account of work already at review, wrote: *"CLOEXEC on the master —
+/// writing this note found it missing and 6495b78 adds it."* Writing the
+/// account found a real defect in finished work. It is not bookkeeping and it
+/// is not a report for the governor's convenience; it is the one review step in
+/// the flow that is not a machine check, and it is the agent performing it on
+/// itself.
+///
+/// # Why it is taken here rather than looked for
+///
+/// A gate that *searches* for an account has to know where one lives, and on
+/// 2026-08-24 a governor and an agent disagreed about that in good faith:
+/// `compound-006` had appended its account to the row's **overview**, the
+/// governor was reading the **log**, and nothing in wsp said which was meant.
+/// Taking the account as the payload settles it by construction — the answer to
+/// "where does an account go" is "into `wsp review`, which puts it in the log",
+/// and there is no heuristic left to be wrong.
+///
+/// It also survives the thing habit does not. One agent wrote accounts
+/// unprompted on two consecutive rows and stopped the moment its window was
+/// cleared, because the habit lived in accumulated context. A gate on the verb
+/// is in the verb.
+///
+/// Same payload as [`block`] and [`park`], down to the stream form, because it
+/// is the same kind of sentence and this store already teaches `-`.
+pub fn review(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str =
+        "wsp review <id> \"what you did, and what you left\"   (or `-` to read it from stdin)";
+    // Before `prose_payload`, which would print `usage:` and stop. This is the
+    // refusal the whole task is about and it is the one moment an agent is
+    // certainly reading, so it says what an account is, where it goes, and how
+    // to get prose past a shell — and then names what it can see of the work,
+    // which is where `render-014` would have learnt about its two files.
+    if args.rest.len() < 2 {
+        let p = Paint::new();
+        eprintln!("wsp: review takes the account — what you did, what you left undone, and what the next reader needs");
+        eprintln!("usage: {USAGE}");
+        eprintln!(
+            "     {}",
+            p.dim("it goes in the log, which is what `wsp show` prints last and what a barrier reads")
+        );
+        if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+            for line in crate::cmd_checkout::outstanding(store, &t.id) {
+                eprintln!("     {}", p.dim(&line));
+            }
+        }
+        return 2;
+    }
+    let (account, from) = match prose_payload(args, USAGE) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let said = from.map(|src| format!("{} characters from {src}", account.len()));
+    let code = mutate_saying(store, args, "review", said.as_deref(), |t| {
+        t.set_status(Status::Review);
+        // `review: …`, the shape `blocked:` and `parked:` already have — the
+        // transition is implied by the prefix and the sentence is the entry.
+        // `wsp attempts` reads both spellings; rows logged before this say
+        // `→ review`.
+        t.log(&format!("review: {account}"));
+    });
+    if code != 0 {
+        return code;
+    }
+    // A warning and never a refusal, because this is exactly where `ui-007`
+    // sits: nothing ahead of the trunk and right to be here. So it names what
+    // it saw and leaves the judgement — and says nothing at all when the tree
+    // is clean and the branch is level, which is both the row that landed
+    // itself and the row that had nothing to land.
+    let p = Paint::new();
+    if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        for line in crate::cmd_checkout::outstanding(store, &t.id) {
+            eprintln!("  {}", p.yellow(&line));
+        }
+    }
+    0
+}
+
 /// Deliberately not yet — the other half of what `block` used to mean.
 ///
 /// Demands a reason for the same procedural reason `block` does, and wants a

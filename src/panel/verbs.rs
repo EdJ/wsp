@@ -41,6 +41,13 @@ pub(crate) enum Ask {
     /// it in one word — `until` — because a park with nothing written on it is
     /// the state this status exists to end.
     Park { task: String },
+    /// `v`, which used to be one keystroke and is now a sentence, because
+    /// `wsp review` takes the account — see [`crate::cmd_task::review`]. The
+    /// panel does not know that rule and does not need to: it asks for the
+    /// payload the CLI's own usage names, the way `b` and `p` already do, and
+    /// a refusal it had not anticipated would arrive as the next question
+    /// anyway.
+    Review { task: String },
     /// `from` is the title the prompt opened with. Carried so pressing `↵` on
     /// an untouched line can be nothing rather than a rename to the same
     /// words — which is a log entry, an event and a commit saying nothing.
@@ -72,6 +79,7 @@ impl Ask {
             Ask::NewProject { .. } => "project".into(),
             Ask::Block { .. } => "why".into(),
             Ask::Park { .. } => "until".into(),
+            Ask::Review { .. } => "account".into(),
             Ask::Rename { .. } => "title".into(),
             Ask::RenameProject { .. } => "name".into(),
             Ask::Note { .. } => "note".into(),
@@ -119,6 +127,7 @@ impl Ask {
             Ask::NewProject { parent: None } => vec!["project".into(), "add".into(), v],
             Ask::Block { task } => vec!["block".into(), task.clone(), v],
             Ask::Park { task } => vec!["park".into(), task.clone(), v],
+            Ask::Review { task } => vec!["review".into(), task.clone(), v],
             Ask::Rename { task, .. } => vec!["rename".into(), task.clone(), v],
             // One argv element, spaces and all: `project set` splits on the
             // first `=` and takes the rest whole, so a name is never quoted
@@ -1731,7 +1740,21 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 
         // ---- status, one key each ----
         Key::Char('s') => task_verb(&target, ui, "start"),
-        Key::Char('v') => task_verb(&target, ui, "review"),
+        // Not `task_verb`: review is the one status key that takes a payload.
+        Key::Char('v') => match &target {
+            Target::Task(id) => {
+                view.mode = Mode::Prompt {
+                    verb: Ask::Review { task: id.clone() },
+                    buffer: String::new(),
+                    armed: false,
+                };
+                Effect::None
+            }
+            _ => {
+                say(ui, "review needs a task");
+                Effect::None
+            }
+        },
         Key::Char('d') => task_verb(&target, ui, "done"),
         Key::Char('o') => task_verb(&target, ui, "reopen"),
 

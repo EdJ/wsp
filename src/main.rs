@@ -198,6 +198,10 @@ const LITERAL_AFTER: &[Literal] = &[
     Literal { cmd: "note", subject: 1, payload: "log entry", stream: true },
     Literal { cmd: "block", subject: 1, payload: "question", stream: true },
     Literal { cmd: "park", subject: 1, payload: "reason", stream: true },
+    // An account is prose *about the CLI* more reliably than any other payload
+    // here — it is a sentence about what a verb now does — so it wants this seam
+    // for the reason `note` does, and `-` for the reason `edit --overview` does.
+    Literal { cmd: "review", subject: 1, payload: "account", stream: true },
     Literal { cmd: "decide", subject: 1, payload: "decision", stream: true },
     Literal { cmd: "rename", subject: 1, payload: "title", stream: false },
     Literal { cmd: "tag", subject: 1, payload: "tag edits", stream: false },
@@ -919,7 +923,7 @@ fn main() {
         "done" | "close" => cmd_task::done(&store, &args),
         "block" => cmd_task::block(&store, &args),
         "park" | "pause" => cmd_task::park(&store, &args),
-        "review" => cmd_task::set_status(&store, &args, model::Status::Review),
+        "review" => cmd_task::review(&store, &args),
         "reopen" | "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
         "tag" => cmd_task::tag(&store, &args),

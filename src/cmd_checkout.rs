@@ -1886,6 +1886,44 @@ pub(crate) fn naming(store: &Store) -> impl Fn(&str) -> crate::cmd_checkout::Who
     }
 }
 
+/// What a task's work is still holding: an uncommitted tree, and commits the
+/// trunk has not got. Empty when there is nothing to say.
+///
+/// Through the same [`candidates`] → [`pick`] resolution `land` uses, and
+/// deliberately so: the point of the lines this returns is that they name the
+/// state `wsp land` is about to be typed against, so they have to be about the
+/// tree and branch `land` would act on — including through a renumbering,
+/// which is why the branch comes off [`Where::on`] rather than off the id.
+///
+/// **Empty is a real answer and the commonest correct one.** A branch level
+/// with the trunk is landed work *and* a branch cut at the trunk tip and never
+/// committed to, and a task with no tree is work that landed and was swept
+/// *or* work nothing ever ran for. None of those is worth a line, and
+/// [`crate::cmd_task::review`] prints one per line it gets — a verb that said
+/// "nothing committed" to every row that correctly had nothing to commit would
+/// be teaching its readers to stop reading it.
+pub(crate) fn outstanding(store: &Store, task: &str) -> Vec<String> {
+    let Ok(cwd) = std::env::current_dir() else { return Vec::new() };
+    let Ok(w) = pick(candidates(store, &cwd, task), task) else { return Vec::new() };
+    if !w.dir.join(".git").exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if dirty(&w.dir) {
+        out.push(format!(
+            "uncommitted work in {} — `wsp commit-help` first",
+            util::contract(&w.dir)
+        ));
+    }
+    if let Some(branch) = w.on() {
+        match ahead(&w.trunk, &w.branch, &branch).len() {
+            0 => {}
+            n => out.push(format!("{} not on {} — `wsp land {task}`?", n_commits(n), w.branch)),
+        }
+    }
+    out
+}
+
 pub fn land(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let w = match locate(store, args) {
