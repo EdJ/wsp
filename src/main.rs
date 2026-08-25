@@ -203,6 +203,12 @@ const LITERAL_AFTER: &[Literal] = &[
     // for the reason `note` does, and `-` for the reason `edit --overview` does.
     Literal { cmd: "review", subject: 1, payload: "account", stream: true },
     Literal { cmd: "decide", subject: 1, payload: "decision", stream: true },
+    // The only row with no subject: `say` speaks for the pane it is run in, so
+    // its payload starts at the first word. It is here for the stream form
+    // alone — `agent-018` was an agent that followed the handbook's "give a
+    // wsp verb its prose through a stream", got the literal `-` as its status
+    // line, and was told nothing.
+    Literal { cmd: "say", subject: 0, payload: "status line", stream: true },
     Literal { cmd: "rename", subject: 1, payload: "title", stream: false },
     Literal { cmd: "tag", subject: 1, payload: "tag edits", stream: false },
     // `wsp ref <id> -~/claude/spec.md` is the same `+`/`-` payload as `tag`,
@@ -253,7 +259,18 @@ fn literal(cmd: &str) -> Option<&'static Literal> {
 ///
 /// The cost is exact and small — a decision whose text is the bare word
 /// `--supersedes` — and `--` still ends flag parsing everywhere.
-const OWNED_AFTER: &[(&str, &str)] = &[("decide", "supersedes")];
+const OWNED_AFTER: &[(&str, &str)] = &[
+    ("decide", "supersedes"),
+    // `say` is the first row with `subject: 0`, so the payload begins at the
+    // word after the verb and *every* flag it reads falls inside it. These
+    // three are the whole of what `say` reads — `--pane` names the seat when
+    // the process is not standing in one, `--clear` takes the label off, and
+    // `--json` is the receipt — and without them here the row would trade the
+    // silent `-` for three silently swallowed flags.
+    ("say", "pane"),
+    ("say", "clear"),
+    ("say", "json"),
+];
 
 /// Verbs on which a [`BOOL_FLAGS`] name takes a value instead.
 ///
@@ -1485,6 +1502,7 @@ fn help_text() -> String {
   wsp decide <t|p> "…" --supersedes d1   …and which earlier one it replaces
   wsp note <id> "text"              append to the log
   wsp block|park|decide|note <id> - | --from FILE
+                                    …and `wsp say` the same way, with no id
                                     …or from stdin, or a file. A paragraph
                                     typed between double quotes is rewritten by
                                     the shell — every backtick in it runs a
@@ -1772,7 +1790,11 @@ fn help_text() -> String {
   wsp report <hook>                 a headless agent's Claude Code hook, saying
                                     what it is doing; silent outside a seat
   wsp doctor                        integrity check
-  wsp say "…" [--clear]             say where you have got to, on your pane
+  wsp say "…" | - | --from FILE     say where you have got to, on your pane;
+                                    `--clear` takes the label off again. Prose
+                                    through a stream, the spelling every other
+                                    prose verb takes — a bare `-` with nothing
+                                    piped in is refused rather than worn
   wsp flag <id> ["why"]             raise a hand on a task — at the seat that
                                     governs it, or on every panel if there is none
   wsp flag <id> --title T --body -  …with a card: a heading and a paragraph
@@ -2077,10 +2099,16 @@ mod tests {
         let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
         let caught = |line: &[&str]| super::swallowed_flag(&parse(line)).map(|(l, n, v)| (l.cmd, n, v));
 
-        // Every verb on the list, in the spelling the handbook taught.
+        // Every verb on the list, in the spelling the handbook taught. The
+        // subject comes off the row rather than being written in: `say` speaks
+        // for the pane it runs in and takes none, and a line with an id in it
+        // would be three positionals to the check rather than two.
         for l in super::LITERAL_AFTER {
+            let mut line = vec![l.cmd];
+            line.extend(std::iter::repeat("028").take(l.subject));
+            line.extend(["--body", "-"]);
             assert_eq!(
-                caught(&[l.cmd, "028", "--body", "-"]),
+                caught(&line),
                 Some((l.cmd, "body".to_string(), Some("-".to_string()))),
                 "{} recorded the flag as its {}",
                 l.cmd,
@@ -2218,6 +2246,62 @@ mod tests {
     /// nothing, and it would do nothing silently — the payload would go on
     /// being parsed as flags with the table looking correct. Same check the
     /// help gets, for the same reason.
+    /// `agent-018`: an agent followed the handbook's "give a wsp verb its
+    /// prose through a stream", ran `… | wsp say -`, and wore the single
+    /// character `-` as its status line until somebody noticed.
+    ///
+    /// Asserted on the parse rather than by calling `say`, because the failure
+    /// was upstream of it: `say` was not on [`LITERAL_AFTER`], so `--from` was
+    /// a flag to be swallowed and `-` was never a stream to anybody. Calling
+    /// `say` needs a herdr pane and would test the store, which the handbook
+    /// forbids; this tests the seam the bug was actually at.
+    #[test]
+    fn say_takes_its_prose_off_a_stream_like_every_other_prose_verb() {
+        use super::Args;
+        let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+        let source = |line: &[&str]| {
+            let a = parse(line);
+            crate::cmd_task::payload_source(a.rest.get(0..).unwrap_or_default())
+        };
+
+        // The three spellings the other prose verbs take, now true of `say`.
+        assert_eq!(source(&["say", "-"]), Some("-".into()), "a bare `-` names stdin");
+        assert_eq!(source(&["say", "--from", "/tmp/s.md"]), Some("/tmp/s.md".into()));
+        assert_eq!(source(&["say", "--from=/tmp/s.md"]), Some("/tmp/s.md".into()));
+
+        // `--from` survives the parse as a positional rather than being eaten
+        // as a flag — the half of the bug that made the handbook's spelling
+        // unreachable however `say` read its payload.
+        assert_eq!(parse(&["say", "--from", "/tmp/s.md"]).rest, vec!["--from", "/tmp/s.md"]);
+
+        // And what must go on being a status line. A sentence is one however
+        // it starts, which is why the row is `stream: true` and not a flag.
+        assert_eq!(source(&["say", "landed the doorbell fix"]), None);
+        assert_eq!(source(&["say", "--from is how you pass a file"]), None);
+        assert_eq!(source(&["say"]), None, "no payload is `--clear`, not a stream");
+
+        // Caught by driving a sandbox, not by this suite, and so written down
+        // here: `say` is the first row with `subject: 0`, which stops flag
+        // parsing at the word after the verb. Every flag it reads therefore
+        // has to be in `OWNED_AFTER` or it becomes payload — `--pane` was
+        // swallowed whole and `say` answered "no pane to name" on a line that
+        // named one.
+        let a = parse(&["say", "--pane", "w1:p1", "landed it"]);
+        assert_eq!(a.get("pane").as_deref(), Some("w1:p1"), "`--pane` is a flag, not the status line");
+        assert_eq!(a.text(0), "landed it");
+        assert!(parse(&["say", "--clear", "--pane", "w1:p1"]).has("clear"));
+        assert!(parse(&["say", "--json", "--pane", "w1:p1"]).json());
+
+        // Every flag `say` reads is owned. A fourth added to the verb without
+        // a row here is swallowed silently, which is this bug's whole shape.
+        for f in ["pane", "clear", "json"] {
+            assert!(
+                super::OWNED_AFTER.contains(&("say", f)),
+                "`say` reads --{f} but does not own it, so it lands in the payload"
+            );
+        }
+    }
+
     #[test]
     fn every_command_whose_payload_is_literal_is_a_command() {
         let arms = dispatch();

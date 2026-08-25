@@ -1220,7 +1220,7 @@ pub fn park(store: &Store, args: &Args) -> i32 {
 /// Only a payload that is *entirely* a source counts. Prose here is mostly
 /// about the CLI, so a note that merely begins with `--from` is a sentence
 /// somebody meant, and `--` is still the escape hatch under everything.
-fn payload_source(payload: &[String]) -> Option<String> {
+pub(crate) fn payload_source(payload: &[String]) -> Option<String> {
     match payload {
         // A lone `-`, and `--from` with nothing usable after it: both name the
         // stream, the second because `--from` is not worth an editor session
@@ -1275,9 +1275,21 @@ fn prose_payload(args: &Args, usage: &str) -> Result<(String, Option<String>), i
         }
         return Ok((text, None));
     };
+    let (text, named) = prose_from_source(&src)?;
+    Ok((text, Some(named)))
+}
+
+/// The stream half of [`prose_payload`], for the verbs whose payload does not
+/// begin after a subject.
+///
+/// Split out for `say`, which has no id to skip and so cannot share the
+/// positional arithmetic — but wants all three refusals here, and wants them
+/// worded the same. The guards are the point of the split, not the reading: a
+/// verb that grows a `-` form and not these grows the silent failure with it.
+pub(crate) fn prose_from_source(src: &str) -> Result<(String, String), i32> {
     // Named the way the rest of the CLI names a path — a receipt that says
     // `~/notes/survey.md` is one the reader recognises.
-    let named = if src == "-" { "stdin".to_string() } else { util::contract(&util::expand(&src)) };
+    let named = if src == "-" { "stdin".to_string() } else { util::contract(&util::expand(src)) };
     if src == "-" && util::stdin_is_tty() {
         // Reading a terminal is not an empty note, it is a command that stops
         // and says nothing while it swallows the keys. The one failure worse
@@ -1285,7 +1297,7 @@ fn prose_payload(args: &Args, usage: &str) -> Result<(String, Option<String>), i
         eprintln!("wsp: nothing is piped in — `-` reads the text from a stream");
         return Err(2);
     }
-    let text = match read_source(&src) {
+    let text = match read_source(src) {
         Ok(raw) => fold(&raw),
         Err(e) => {
             eprintln!("wsp: cannot read {named}: {e}");
@@ -1299,7 +1311,7 @@ fn prose_payload(args: &Args, usage: &str) -> Result<(String, Option<String>), i
         eprintln!("wsp: nothing on {named} — nothing recorded");
         return Err(2);
     }
-    Ok((text, Some(named)))
+    Ok((text, named))
 }
 
 pub fn note(store: &Store, args: &Args) -> i32 {

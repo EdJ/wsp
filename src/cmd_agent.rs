@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::cmd_govern;
+use crate::cmd_task;
 use crate::herdr;
 use crate::message::{self, About, Ask, Hand, Kind, Message, Party, Shape, Waiting};
 use crate::model::{Status, Task};
@@ -1719,12 +1720,24 @@ pub fn say(store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
-    let said = args.text(0);
+    // A stream form, for the reason `note` has one: the handbook tells every
+    // agent to give a wsp verb its prose through `-` or `--from`, and `say`
+    // was the exception that took the `-` as the status line itself and said
+    // nothing. Short by nature is still true — this is a sidebar label — but
+    // "short" is a fact about the text, not about where it came from, and the
+    // thing an agent pipes in is usually short and always shell-hostile.
+    let streamed = cmd_task::payload_source(args.rest.get(0..).unwrap_or_default());
+    let said = match &streamed {
+        Some(src) => match cmd_task::prose_from_source(src) {
+            Ok((text, _)) => text,
+            Err(code) => return code,
+        },
+        None => args.text(0).trim().to_string(),
+    };
     let said = said.trim();
-    // Short by nature and so no `-` form: this is a status line in a sidebar,
-    // and one that needed a stream would be one nobody ran. It gets the check
-    // anyway, and here it is a rendering question rather than a record one —
-    // an escape sequence reaching a pane label is drawn, not stored.
+    // Kept for both forms, and here it is a rendering question rather than a
+    // record one — an escape sequence reaching a pane label is drawn, not
+    // stored.
     if let Some(why) = util::terminal_output(said) {
         eprintln!("wsp: {why}");
         return 2;
