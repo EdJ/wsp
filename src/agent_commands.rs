@@ -2309,14 +2309,19 @@ fn listing() -> std::result::Result<Vec<Live>, String> {
 /// to look for, and saying so in the first clause rather than the last is the
 /// difference between a hedge and a lie — the reader must not have to reach the
 /// end of the line to learn that nothing answered.
+///
+/// Both name `wsp tell` as the way there rather than "sent by hand", which is
+/// what they used to say. That phrase reads as *type into the pane yourself*,
+/// which needs somebody at the terminal and is not what recovered the failures
+/// this advice was written for — every one of them was repaired by `wsp tell`
+/// from wherever the reader happened to be standing. It also stays true for
+/// `cmd_resume`, whose caller has no work order to send anybody.
 pub fn recovery(address: Option<Address>) -> Option<String> {
     Some(match address? {
-        Address::Confirmed(h) => {
-            format!("it is reachable as `{h}` — the work order can be sent there by hand")
-        }
+        Address::Confirmed(h) => format!("it is reachable as `{h}` — `wsp tell` reaches it"),
         Address::Unconfirmed(h) => format!(
             "nothing is answering to `{h}` — that is the name this spawn asked for, \
-             so if the agent comes up at all the work order can be sent there by hand"
+             so if the agent comes up at all, `wsp tell` will reach it"
         ),
     })
 }

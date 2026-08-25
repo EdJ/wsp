@@ -1477,11 +1477,12 @@ fn help_text() -> String {
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
                  [--model <m>] [--effort <e>]
-                                    open a workspace on it, claim it there, and
-                                    start an agent in it; --focus to go there,
-                                    --on to run it on another machine, --full to
-                                    start it with sub-agents, workflows and the
-                                    MCP servers it is otherwise spawned without.
+                                    open a workspace on it and claim it there;
+                                    --agent starts an agent in it too. --focus
+                                    to go there, --on to run it on another
+                                    machine, --full to start it with sub-agents,
+                                    workflows and the MCP servers it is
+                                    otherwise spawned without.
                                     --model fable|opus|sonnet|haiku, any with
                                     [1m], and --effort low|medium|high|xhigh|max
                                     say what tier to start it at; say neither and

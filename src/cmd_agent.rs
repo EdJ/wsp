@@ -1548,12 +1548,19 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
             0
         }
         // `NotTaken` is delivered-and-unmoved, which for this verb is the
-        // interesting answer rather than an error: the sentence is sitting in
-        // the composer unsent, and it is still there to be rescued. Named as
-        // such, because "failed" would make somebody send it twice.
+        // interesting answer rather than an error. Where the text now sits is
+        // said as the unknown it is: the keystrokes were written at the pane,
+        // and whether the TUI is still holding them in the composer or dropped
+        // them is inside the application, which wsp cannot read. The first
+        // wording asserted "sitting in the composer" flat out; the spawn
+        // failures of 2026-08-25 showed composers empty after deliveries that
+        // had been reported the same way, so the assertion was a guess that
+        // had already been wrong. The rescue differs by half, and peek tells
+        // the halves apart — which is why it is named before the keystroke:
+        // resending blind would duplicate a composer still holding the text.
         Err(Refusal::NotTaken) => {
-            eprintln!("wsp: {what} took the text and started nothing — it is sitting in the composer");
-            eprintln!("     `wsp peek {peek}` shows it; a return in the pane sends it");
+            eprintln!("wsp: {what} took the text and started nothing — it may be sitting in the composer or may have been dropped");
+            eprintln!("     `wsp peek {peek}` shows which; if it is sitting there, a return in the pane sends it");
             1
         }
         Err(e) => {

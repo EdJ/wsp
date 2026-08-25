@@ -1046,7 +1046,21 @@ fn hand_over(
             Err(e) => return Err(format!("{seat} did not take the work order: {e}")),
         }
     }
-    Err(format!("the work order is sitting in {seat} unsent"))
+    // Where the work order now sits, said as the unknown it is. herdr wrote
+    // the keystrokes either way — both of this function's endings are reached
+    // only after a delivery — but whether the TUI took them into a composer or
+    // dropped them on its floor is inside the application, and wsp has no
+    // reading of that. The first spawn to report this asserted "sitting in
+    // {seat} unsent", and the composer was empty when somebody looked three
+    // seconds later; twice more that week read the same way, and all three
+    // were recovered not by pressing return but by sending the order again,
+    // which is the one repair that works on either half of the uncertainty.
+    // Naming it is left to the caller, because the command is spelled with
+    // the task id and only the caller has one.
+    Err(format!(
+        "no turn started in {seat}: the work order went to the pane, and \
+         is either sitting unsent or was dropped — wsp cannot see which"
+    ))
 }
 
 /// Whether a turn started inside [`Patience::taken`].
@@ -1530,6 +1544,17 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                             Ok(()) => told = true,
                             Err(e) => {
                                 eprintln!("wsp: agent started but not working on it: {e}");
+                                // The repair first, and spelled so it can be
+                                // pasted: `wsp tell` takes a task id or a pane
+                                // id, and `-` reads the order from a stream —
+                                // the same prose this spawn was given. A task
+                                // is the readable form; a custodian has no
+                                // task, but the seat contains `:` and resolves
+                                // as the pane it is.
+                                eprintln!(
+                                    "wsp: send it again with `wsp tell {} -` — that repairs either",
+                                    work.task.as_deref().unwrap_or(seat.as_str())
+                                );
                                 unreached(how, place, &spawn);
                             }
                         },
@@ -1592,6 +1617,16 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             Some(c) => format!(" · {}", util::contract(&util::expand(c))),
             None => String::new(),
         })));
+        // What the bare form did not do, said beside what it did. The synopsis
+        // used to promise an agent for every spawn, and the sentence this
+        // prints on success — "opened a terminal in w5Q:p1" — is true while
+        // telling none of the story: three governors read it as somebody
+        // working and left a claimed task sitting idle behind a shell prompt.
+        // One dim line, on a verb run once per spawn rather than once per
+        // request, against a lost governor turn every time it goes unread.
+        if started.is_none() && !args.has("agent") && governing.is_none() {
+            println!("  {}", p.dim("no agent in it — --agent starts one"));
+        }
         if told {
             println!("  {}", p.dim("told it what it is holding"));
         }
@@ -3147,13 +3182,22 @@ mod tests {
     /// nothing has started. The press count is bounded arithmetic — three
     /// windows and two presses — because a loop that goes on pressing is the
     /// same silence with more typing in it.
+    ///
+    /// The wording is asserted on too, because it is the deliverable of
+    /// agent-009: the message names both places the order can be rather than
+    /// asserting one. "Sitting in w3M:p1 unsent" was printed about a composer
+    /// that was empty when somebody looked three seconds later, twice more that
+    /// week; a reader acting on the assertion would go digging for text that is
+    /// not there instead of sending the order again.
     #[test]
     fn an_agent_that_never_takes_the_work_order_fails_the_spawn_rather_than_reporting_one() {
         let place = Composer::of(None, true);
         let dial = util::Dial::new();
         assert_eq!(
             handing_over(&place, &dial),
-            Err("the work order is sitting in w3M:p1 unsent".into())
+            Err("no turn started in w3M:p1: the work order went to the pane, and \
+                 is either sitting unsent or was dropped — wsp cannot see which"
+                .into())
         );
         assert_eq!(place.pressed.get(), PRESSES, "the press loop is not bounded");
         assert_eq!(dial.elapsed(), TAKEN * (PRESSES + 1), "the wait is not bounded either");
@@ -3225,7 +3269,9 @@ mod tests {
         let dial = util::Dial::new();
         assert_eq!(
             handing_over(&place, &dial),
-            Err("the work order is sitting in w3M:p1 unsent".into())
+            Err("no turn started in w3M:p1: the work order went to the pane, and \
+                 is either sitting unsent or was dropped — wsp cannot see which"
+                .into())
         );
         assert_eq!(place.pressed.get(), PRESSES, "the press loop is not bounded");
         assert_eq!(dial.elapsed(), TAKEN * PRESSES, "the look it was spared was not spared");
