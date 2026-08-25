@@ -1339,7 +1339,15 @@ impl Store {
     /// Ephemeral state is out for a different reason and has stamps of its own
     /// where it needs them: a raised hand, a message and a panel's own scroll
     /// are not changes to the work, and a surface that wants them reads
-    /// [`Store::attention_stamp`] beside this rather than widening this.
+    /// [`Store::attention_stamp`] beside this rather than widening this. A
+    /// surface in *another process* reads both from `wsp stamp`, which also
+    /// answers for the half neither of them can — the agent census, which is
+    /// herdr's and not in any file here. That is [`crate::cmd_stamp`].
+    ///
+    /// **This number is published.** `wsp stamp` puts it on the CLI, so
+    /// changing what goes into the mix makes every such client see one spurious
+    /// change — harmless, because nothing compares these for order, and worth
+    /// knowing before widening it.
     ///
     /// **Cost, measured rather than assumed** — it is on the panel's tick, so
     /// widening it is a bill paid several times a second. Against the live
@@ -1702,6 +1710,11 @@ impl Store {
     /// here: a message is drawn on the same panel, in the same section, on the
     /// same tick. So the next one is a line in [`Store::attention_files`]
     /// rather than a hunt for the gates that need telling.
+    ///
+    /// Published on the CLI beside the fingerprint by `wsp stamp`, for a
+    /// surface that is a separate process — see [`crate::cmd_stamp`], which is
+    /// also where the argument lives for why the agent census did not become a
+    /// third file read in here.
     ///
     /// One `stat` per file, which is why it can sit in the same tick gate.
     /// Nanoseconds for the same reason the fingerprint uses them: raising and
