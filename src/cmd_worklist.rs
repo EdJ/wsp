@@ -1409,6 +1409,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 /// There is one in front of every group, including the first, and a run is the
 /// sequence of them being passed. What differs is where the prose to read at it
 /// lives and what passing it means.
+#[derive(Debug)]
 enum Gate {
     /// **Barrier zero.** The list has not been started, and the prose is its own
     /// `## Overview` — per `wsp-092`, a start condition on group N is stop
@@ -1433,6 +1434,7 @@ enum Gate {
 }
 
 /// The front of the run: what may be started now, and what is already going.
+#[derive(Debug)]
 struct Front {
     /// The members `wsp spawn` may be run on, in the order the group names
     /// them, with the cap already applied.
@@ -1454,6 +1456,7 @@ struct Front {
 /// `done`. Everything an agent runs repeatedly is paid for in context on every
 /// request of every session, so a state that does not fit on two lines is a
 /// state that has to earn it.
+#[derive(Debug)]
 enum State {
     /// Members may start. `wsp spawn <id>` each.
     Ready(Front),
@@ -2568,12 +2571,26 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     // their hands into.
     let list_seat = seat_on(store, &w);
 
+    // The state on the far side of what this call just did, so the answer can
+    // be given here instead of pointed at (`core-049`). Every turn an agent
+    // spends polling is a whole context re-read, and `go` is run exactly when
+    // "what may start now" changes — which is why the pointer stood here: it
+    // was one poll per barrier, per group, for every run. A dry run shows
+    // nothing, because nothing moved; answering with post-state would be a
+    // lie wearing the same words.
+    let ahead = match dry {
+        true => None,
+        false => {
+            let pos = worklist::position(store, &w, Reading::Landed);
+            let st = state(store, &w, &pos);
+            Some((pos, st))
+        }
+    };
+
     if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "worklist": w.id,
-                "dry_run": dry,
+        let mut out = json!({
+            "worklist": w.id,
+            "dry_run": dry,
                 // The routing answer and not the occupancy: `false` is a hand
                 // raised on a member reaching whatever seat sits above its own
                 // project. A caller driving this verb sees no output at all,
@@ -2594,9 +2611,15 @@ pub fn go(store: &Store, args: &Args) -> i32 {
                     "earlier": s.earlier,
                 })),
                 "dangling": gone,
-            }))
-            .unwrap_or_default()
-        );
+            });
+        // The far side, under the key the `next` reader already parses — same
+        // shape, same omissions (no evidence walk ran here, so `same_file` and
+        // friends are absent from it rather than empty). A driver that has
+        // never heard of the key reads this verb exactly as before.
+        if let Some((pos, st)) = &ahead {
+            out["next"] = next_json(&w, pos, st, &gone, None);
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
 
@@ -2662,7 +2685,15 @@ pub fn go(store: &Store, args: &Args) -> i32 {
             }
         }
     }
-    println!("{}", p.dim(&format!("{}  what may start now", how("next", &w, seat))));
+    // The answer where the pointer used to be: `report` is the same block
+    // `next` draws — ready ids, waiting members, the barrier if the far side of
+    // this barrier is already another one — and `gone` is left out because the
+    // lines above already said it, and `touched` because it did too. A dry run
+    // keeps the pointer, since nothing moved to report.
+    match &ahead {
+        Some((pos, st)) => report(&w, pos, st, &[], seat, None),
+        None => println!("{}", p.dim(&format!("{}  what may start now", how("next", &w, seat)))),
+    }
     0
 }
 
@@ -4066,6 +4097,50 @@ mod tests {
         assert_eq!(gate_of(&store, "batch"), "after 1 ", "shut, with nothing to read at it");
         assert_eq!(run(&store, &["go", "batch"]), 0, "and three words pass it");
         assert_eq!(gate_of(&store, "batch"), "ready wl-002");
+    }
+
+    /// The far side of a barrier is answered where the barrier is passed, not
+    /// pointed at (`core-049`). Every turn an agent spends polling is a whole
+    /// context re-read, and `go` runs exactly when "what may start now"
+    /// changes — so what this asserts is that the state `go` prints is the
+    /// state `next` would have been polled for: same walk, same shape, computed
+    /// after the write. The printing itself is `report`, shared unchanged; the
+    /// dry run keeps its pointer because nothing moved.
+    #[test]
+    fn go_answers_what_may_start_instead_of_sending_the_reader_to_next() {
+        let (_env, store) = running("answered");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+
+        // Through the flags parameter rather than the argv words: anything
+        // typed after the slug is the verdict's prose by the time `go` sees
+        // it, which is the whole point of that grammar.
+        assert_eq!(dispatch(&store, &Args::synth("worklist", &["go", "batch"], &[("dry-run", "true")])), 0);
+        let mut w = store.worklist("batch").unwrap();
+        // A dry run moved nothing: the barrier still stands, so there is no
+        // far side to print and the pointer is what remains.
+        assert!(
+            matches!(state(&store, &w, &worklist::position(&store, &w, Reading::Landed)), State::Shut { .. }),
+            "the dry run left the barrier shut"
+        );
+
+        assert_eq!(run(&store, &["go", "batch"]), 0);
+        w = store.worklist("batch").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let st = state(&store, &w, &pos);
+        match st {
+            State::Ready(f) => {
+                assert_eq!(f.ready, vec!["wl-002".to_string()], "the answer go now carries");
+                let v = next_json(&w, &pos, &State::Ready(f), &[], None);
+                assert_eq!(v["start"], json!(["wl-002"]), "and the JSON key the next reader parses");
+                assert_eq!(v["state"], json!("ready"));
+            }
+            other => panic!("the far side of the barrier is startable, got {other:?}"),
+        }
     }
 
     /// Per `wsp-092`, a start condition on group N is stop prose on group N−1 —

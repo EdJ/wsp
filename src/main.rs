@@ -14,6 +14,7 @@ mod attention;
 mod cmd_agent;
 mod cmd_attempts;
 mod cmd_brief;
+mod cmd_burn;
 mod cmd_checkout;
 mod cmd_govern;
 mod cmd_install;
@@ -1048,6 +1049,7 @@ fn main() {
         "attempts" => cmd_attempts::attempts(&store, &args),
         "stamp" => cmd_stamp::stamp(&store, &args),
         "brief" => cmd_brief::brief(&store, &args),
+        "burn" => cmd_burn::burn(&store, &args),
         "commit-help" => cmd_brief::commit_help(&store, &args),
         "verify" => cmd_verify::verify(&store, &args),
         "checkout" => cmd_checkout::checkout(&store, &args),
@@ -1806,6 +1808,9 @@ fn help_text() -> String {
   wsp hook <event>                  herdr event-hook entrypoint
   wsp report <hook>                 a headless agent's Claude Code hook, saying
                                     what it is doing; silent outside a seat
+  wsp burn [--json]                 tokens by seat, dearest first — input,
+                                    output and cache, tallied per hook from
+                                    the transcript; where core-049's cuts land
   wsp doctor                        integrity check
   wsp say "…" | - | --from FILE     say where you have got to, on your pane;
                                     `--clear` takes the label off again. Prose

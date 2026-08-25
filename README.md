@@ -113,7 +113,7 @@ wsp worklist next           # …or `next <slug>` where the workspace holds no s
                             #     then rotate — see the seat, below
                             #   nothing left — 4 groups, all …      → done
 wsp worklist go "…"         # pass the barrier: the verdict, the sweep behind it,
-                            #   and which members of that group touched one file
+                            #   and what may start on the far side — no poll needed
 wsp worklist go --from FILE # …the verdict out of the file it was composed in
 wsp worklist hold "…"       # start nothing more; what is running is left to finish
 ```
@@ -2828,6 +2828,34 @@ on `wsp` and nothing at all on four other projects, none of which carry an
 Overview or Details — a flag that does nothing on four things out of five is a
 flag nobody believes. Its expensive half was the decisions block, and that is
 fixed for everybody rather than for whoever remembers to ask.
+
+The payload got the same treatment from the other end (`core-049`): not *what
+may be dropped* but **what is certain-now against fetch-on-first-use**, because
+a token in the session payload is paid by every request of the session and a
+token behind a pointer is paid once by whoever needs it. Two bounds moved. A
+task's **Details** section stops at twenty-four lines with the rest named —
+measured, 2026-08-25: 211 open tasks carry prose, the median five lines of it
+in details, so every ordinary task is byte-for-byte what it was and the whales
+are pointed at. And a handbook **above** the project being worked arrives as
+its first paragraph plus its pointer: it is text every sibling spawn under that
+ancestor repeats, for standing rules that are needed before acting on them,
+not needed at request 0. The nearest project's handbook keeps the budget whole.
+The overview itself stays uncapped-but-named on robustness-031's measurement —
+that result defends handing over the work, and nothing here re-litigates it.
+
+And the spend became measurable rather than argued about:
+
+```sh
+wsp burn                # tokens by seat, dearest first — input, output, cache
+wsp burn --json         # the counts, for anything that wants to rank itself
+```
+
+Every hook a seated agent fires adds the transcript's new `usage` lines to a
+running total — one append per hook, never a re-read — and the ranking prices
+cache reads at roughly a tenth. It covers the seats wsp hosts end to end (the
+headless ones); a pane agent's hooks carry no seat identity today, which is a
+gap recorded on `core-049` rather than silently closed, since opening the gate
+would start reporting for every Claude Code on the machine.
 
 ## Spawning
 

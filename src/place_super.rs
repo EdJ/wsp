@@ -237,6 +237,37 @@ impl Supervisor<'static> {
             clock: &util::Wall,
         }
     }
+
+    /// Every seat's burn record that has one, seat id attached.
+    ///
+    /// The reading half of [`tally_burn`] (`core-049`): the ranking is a
+    /// question about *where the tokens went*, and the answer lives one file per
+    /// seat under here. A directory with no [`BURN_FILE`] is a seat that never
+    /// spoke through a hook carrying a transcript — a shell, or a kind that
+    /// keeps none — and it says nothing rather than saying zero.
+    pub fn burn(&self) -> Vec<(String, Value)> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let rec = read_json(&path.join(BURN_FILE));
+            if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
+                continue;
+            }
+            let id = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            out.push((id, rec));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 /// The directory under the store's state that holds the seats.
@@ -248,6 +279,10 @@ const SEAT_FILE: &str = "seat.json";
 
 /// What the agent knows about itself, written by [`report`] from inside a hook.
 const SAID_FILE: &str = "said.json";
+
+/// What the session has cost, tallied from the transcript's `usage` fields one
+/// hook at a time. See [`tally_burn`].
+const BURN_FILE: &str = "burn.json";
 
 /// The work orders, in the order they were given. The agent's stdin is a
 /// `tail -f` on this.
@@ -494,6 +529,124 @@ fn str_of(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
+/// Add this hook's slice of the transcript to the seat's running total.
+///
+/// Every request an agent makes re-reads its whole context, so **where the
+/// tokens are is the question `core-049` was filed to answer** — and Claude
+/// Code already writes the answer: every assistant message in the transcript
+/// carries a `usage` object with the input, output and cache counts of the
+/// request that produced it. Nothing else in wsp sees a transcript — they are
+/// session-private — so the hook is where this is read, one append at a time.
+///
+/// The tally is incremental and survives being wrong about nothing: a byte
+/// offset into the file says how far the last look got, only new lines are
+/// parsed (a Stop fires every turn, so re-reading a whole night's transcript
+/// each time would be quadratic in exactly the sessions this exists to
+/// measure), a shorter file than remembered means it was rotated or truncated
+/// and the count restarts rather than double-counts, and a different
+/// `session_id` means the seat was cleared — `/clear` ends an accounting as
+/// surely as it ends a context. A transcript with no `usage` lines (a kind that
+/// keeps none, or a format wsp does not read) tallies zero and costs one pass.
+///
+/// Written for [`heard`], which every hook reaches; best-effort like everything
+/// else on that path.
+fn tally_burn(dir: &PathBuf, payload: &Value) {
+    let path = str_of(payload, "transcript_path");
+    if path.is_empty() {
+        return;
+    }
+    let sid = str_of(payload, "session_id");
+    let was = read_json(&dir.join(BURN_FILE));
+    // Same session continues the running total; anything else starts one. An
+    // empty stored id is a seat that has not been tallied yet, which is also a
+    // start.
+    let same = !sid.is_empty() && str_of(&was, "session_id") == sid;
+    let mut offset = if same {
+        was.get("offset").and_then(|v| v.as_u64()).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut input = if same { u_at(&was, "input") } else { 0 };
+    let mut output = if same { u_at(&was, "output") } else { 0 };
+    let mut cache_read = if same { u_at(&was, "cache_read") } else { 0 };
+    let mut cache_write = if same { u_at(&was, "cache_write") } else { 0 };
+    let mut turns = if same { u_at(&was, "turns") } else { 0 };
+    let mut model = if same {
+        str_of(&was, "model")
+    } else {
+        String::new()
+    };
+
+    let Ok(file) = fs::File::open(&path) else {
+        return;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < offset {
+        // Rotated, swept or truncated: whatever happened, counting from a hole
+        // would count somebody twice.
+        offset = 0;
+        (input, output, cache_read, cache_write, turns) = (0, 0, 0, 0, 0);
+    }
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut reader = std::io::BufReader::new(file);
+    if reader.seek(SeekFrom::Start(offset)).is_err() {
+        return;
+    }
+    let mut fresh = Vec::new();
+    if reader.read_to_end(&mut fresh).is_err() {
+        return;
+    }
+    let text = match String::from_utf8(fresh) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        let Ok(line) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(usage) = line.get("message").and_then(|m| m.get("usage")) else {
+            continue;
+        };
+        let n = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        input += n("input_tokens");
+        output += n("output_tokens");
+        cache_read += n("cache_read_input_tokens");
+        cache_write += n("cache_creation_input_tokens");
+        turns += 1;
+        if model.is_empty() {
+            model = line
+                .get("message")
+                .and_then(|m| m.get("model"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+
+    let _ = write_atomic(
+        &dir.join(BURN_FILE),
+        &json!({
+            "session_id": sid,
+            "transcript": path,
+            "offset": offset + text.len() as u64,
+            "model": model,
+            "input": input,
+            "output": output,
+            "cache_read": cache_read,
+            "cache_write": cache_write,
+            "turns": turns,
+            "updated": util::now_iso(),
+        })
+        .to_string(),
+    );
+}
+
+/// A counter out of a burn record, absent meaning zero — the shape a first
+/// tally reads back as.
+fn u_at(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
 impl Supervisor<'_> {
     /// A seat's directory, refusing anything that is not a name this backend
     /// could have issued.
@@ -621,6 +774,7 @@ impl Supervisor<'_> {
             })
             .to_string(),
         );
+         tally_burn(&dir, payload);
     }
 
     /// The reading, from what is on disk and what is in the process table.
@@ -1463,5 +1617,160 @@ mod tests {
 
         // Somebody else's seat is not swept up with it.
         assert_eq!(place.state(&theirs).unwrap(), State::Starting);
+    }
+    /// A transcript line Claude Code writes per assistant message, with the
+    /// `usage` object the tally reads and nothing else it needs.
+    fn usage_line(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        model: &str,
+    ) -> String {
+        json!({
+            "type": "assistant",
+            "message": {
+                "model": model,
+                "usage": {
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_write,
+                },
+            },
+        })
+        .to_string()
+    }
+
+    /// The tally answers *where the tokens went* (`core-049`), so its own
+    /// arithmetic has to hold: only lines past where the last look stopped are
+    /// counted (a Stop fires every turn — re-reading a whole transcript each
+    /// time would be quadratic in exactly the sessions this exists to measure),
+    /// the running total survives between hooks, and the offset lands on the
+    /// end of what was read. The model is remembered from the first message
+    /// that names one, because that is what a ranking column wants.
+    #[test]
+    fn every_hook_tallies_only_the_transcript_slice_it_has_not_read() {
+        let scratch = Scratch::new("burn");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let transcript = scratch.root.join("transcript.jsonl");
+        let first = usage_line(100, 50, 1_000, 10, "claude-test");
+        fs::write(&transcript, format!("{first}\n")).unwrap();
+
+        let payload = json!({
+            "session_id": "s1",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        let burn = || read_json(&scratch.root.join(seat.as_str()).join(BURN_FILE));
+
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        assert_eq!(u_at(&burn(), "input"), 100);
+        assert_eq!(u_at(&burn(), "output"), 50);
+        assert_eq!(u_at(&burn(), "cache_read"), 1_000);
+        assert_eq!(u_at(&burn(), "turns"), 1);
+        assert_eq!(str_of(&burn(), "model"), "claude-test");
+
+        // A second turn appends to the file; only the new line may count.
+        let second = usage_line(200, 20, 2_000, 0, "claude-test");
+        let mut grown = std::fs::read_to_string(&transcript).unwrap();
+        grown.push_str(&second);
+        grown.push('\n');
+        fs::write(&transcript, &grown).unwrap();
+
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        assert_eq!(
+            u_at(&burn(), "input"),
+            300,
+            "the second turn's input, not the file re-read"
+        );
+        assert_eq!(u_at(&burn(), "cache_read"), 3_000);
+        assert_eq!(u_at(&burn(), "turns"), 2);
+
+        // And a cleared session starts over rather than carrying the last one's
+        // bill into it — `/clear` ends an accounting as surely as it ends a
+        // context. Live, a cleared session also gets a fresh transcript, so
+        // this points at one.
+        let other = scratch.root.join("transcript-2.jsonl");
+        fs::write(&other, format!("{}\n", usage_line(7, 0, 0, 0, "m"))).unwrap();
+        let fresh = json!({ "session_id": "s2", "transcript_path": other.to_string_lossy() });
+        place.heard(&seat, "SessionStart", State::Idle, &fresh);
+        let b = burn();
+        assert_eq!(str_of(&b, "session_id"), "s2");
+        // The tally rides every hook including this one, so the new session
+        // has already counted its own file — seven, and not the old three
+        // hundred it inherited nothing from.
+        assert_eq!(
+            u_at(&b, "input"),
+            7,
+            "a new session starts from its own transcript"
+        );
+        assert_eq!(u_at(&b, "turns"), 1);
+
+        // The synthetic corner a live run never produces — the old path handed
+        // in under the new id — still must not *add* to anything: the file is
+        // counted once, under whichever session owns it now.
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        assert_eq!(
+            u_at(&burn(), "input"),
+            300,
+            "re-attributed whole, never summed across sessions"
+        );
+    }
+
+    /// A transcript that shrank under the tally — swept, rotated, truncated —
+    /// restarts rather than counting from a hole, which would count somebody
+    /// twice.
+    #[test]
+    fn a_transcript_shorter_than_remembered_starts_over() {
+        let scratch = Scratch::new("burn-truncated");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let transcript = scratch.root.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                usage_line(100, 0, 0, 0, "m"),
+                usage_line(100, 0, 0, 0, "m")
+            ),
+        )
+        .unwrap();
+        let payload = json!({
+            "session_id": "s1",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        let burn_path = scratch.root.join(seat.as_str()).join(BURN_FILE);
+        assert_eq!(u_at(&read_json(&burn_path), "turns"), 2);
+
+        fs::write(&transcript, format!("{}\n", usage_line(7, 0, 0, 0, "m"))).unwrap();
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        let b = read_json(&burn_path);
+        assert_eq!(
+            u_at(&b, "turns"),
+            1,
+            "counted the shrunken file from its start"
+        );
+        assert_eq!(
+            u_at(&b, "input"),
+            7,
+            "and not the two old lines plus the new one"
+        );
+    }
+
+    /// The billed column's one judgement, pinned: cache reads bill at roughly a
+    /// tenth of an input token, everything else at face value. If pricing
+    /// changes, this changes with it — deliberately stated here rather than
+    /// left implicit in a ranking nobody could reproduce.
+    #[test]
+    fn billed_is_face_value_plus_cache_reads_at_a_tenth() {
+        use crate::cmd_burn::billed;
+        assert_eq!(billed(1_000, 500, 0, 0), 1_500);
+        assert_eq!(
+            billed(0, 0, 10_000, 2_000),
+            3_000,
+            "reads at a tenth, writes at face value"
+        );
     }
 }

@@ -93,8 +93,26 @@ impl Depth {
 /// briefing that stops mid-overview reads exactly like an overview that stops
 /// there.
 const MAX_TASK_LINES: usize = 120;
+/// Where the task's **Details** section stops in the payload. The split of the
+/// payload (`core-049`) is certain-now against fetch-on-first-use, and within a
+/// task's own prose the two halves are its sections: the overview is *what this
+/// is* — the thing robustness-031 measured an agent rebuilding at 14,450 tokens
+/// when it was not handed — and details is supplementary, read when the work
+/// turns out to need it. Measured on the live store, 2026-08-25: 211 open tasks
+/// carry prose, median five lines of it in details; the ten whales run past a
+/// hundred. Twenty-four keeps every ordinary task byte-for-byte what it was,
+/// points at the rest, and takes roughly half of every capped payload.
+const MAX_DETAILS_LINES: usize = 24;
 /// The handbook, over the whole project chain.
 const MAX_HANDBOOK_LINES: usize = 120;
+/// Where an **ancestor's** handbook stops in the payload. A handbook above the
+/// project being worked is the same text for every agent under that ancestor —
+/// paid for by every spawn beneath it, whatever it says — while what it carries
+/// is standing rules: needed before acting on them, not needed at request 0.
+/// Its first paragraph says what the place is; [`block`] prints where the rest
+/// lives. The nearest project's handbook stays under [`MAX_HANDBOOK_LINES`]
+/// whole, because that one was written for exactly this work.
+const MAX_HANDBOOK_LEAD: usize = 8;
 /// Decisions on the parent, most recent last. The parent is where direction
 /// lands, so these are the constraints on the piece in hand.
 const MAX_PARENT_DECISIONS: usize = 6;
@@ -855,10 +873,15 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
         // The task's own statement of itself. This is the single thing an
         // arriving agent fetched first and most expensively, and it is already
         // in the hand of whoever spawned it.
-        for sec in ["Overview", "Details"] {
+        //
+        // The two sections are capped differently, and that is the payload
+        // split applied within one task: overview at [`MAX_TASK_LINES`],
+        // details at [`MAX_DETAILS_LINES`] — what it is, whole-ish; how else
+        // to read it, pointed.
+        for (sec, max) in [("Overview", MAX_TASK_LINES), ("Details", MAX_DETAILS_LINES)] {
             if let Some(text) = crate::model::section_of(&t.body, sec) {
                 out.push(String::new());
-                block(&mut out, p, &sec.to_lowercase(), &text, MAX_TASK_LINES, &format!("wsp show {}", t.id));
+                block(&mut out, p, &sec.to_lowercase(), &text, max, &format!("wsp show {}", t.id));
             }
         }
         let own = crate::model::decisions(&t.body);
@@ -967,13 +990,15 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
     // is a pointer to the repository's own documentation rather than a copy of
     // it.
     let mut left = MAX_HANDBOOK_LINES;
-    for (proj, text) in &r.handbook {
+    let last = r.handbook.len().saturating_sub(1);
+    for (i, (proj, text)) in r.handbook.iter().enumerate() {
         if left == 0 {
             break;
         }
+        let max = if i == last { left } else { MAX_HANDBOOK_LEAD };
         out.push(String::new());
-        block(&mut out, p, "read", text, left, &format!("wsp project show {proj} --handbook"));
-        left = left.saturating_sub(text.lines().count());
+        block(&mut out, p, "read", text, max, &format!("wsp project show {proj} --handbook"));
+        left = left.saturating_sub(text.lines().count().min(max));
     }
     out
 }
@@ -1920,6 +1945,79 @@ mod tests {
             "the cut is stated, with where the rest lives:\n{handed}"
         );
         assert!(!handed.contains("TAILMARKER"), "{handed}");
+    }
+
+    /// The payload split, within one task's own prose (`core-049`): the
+    /// overview is *what this is* and rides whole-ish; details is
+    /// fetch-on-first-use and stops at its bound with the rest named. The cut
+    /// is stated by [`block`] like every other one here — a section that
+    /// stopped mid-argument with no count would read as prose that simply ends.
+    #[test]
+    fn details_arrives_pointed_and_the_overview_whole() {
+        let mut b = with_work();
+        for t in b.world.tasks.iter_mut() {
+            if t.id == "t-001" {
+                let mut body = String::from("## Overview\n");
+                for i in 0..30 {
+                    body += &format!("overview line {i}\n");
+                }
+                body += "\n## Details\n";
+                for i in 0..60 {
+                    body += &format!("details line {i}\n");
+                }
+                t.body = body.into();
+            }
+        }
+
+        let handed = session_text(&b);
+        // The overview survives past where details stops: the two sections are
+        // capped on different axes of neediness, not one budget shared.
+        assert!(handed.contains("overview line 29"), "{handed}");
+        assert!(handed.contains("details line 23"), "{handed}");
+        assert!(!handed.contains("details line 24"), "{handed}");
+        assert!(
+            handed.contains("(36 more lines — wsp show t-001)"),
+            "the rest is named, never silent:\n{handed}"
+        );
+    }
+
+    /// And the split across the chain: an ancestor's handbook arrives as its
+    /// lead and a pointer, because it is text every sibling spawn under that
+    /// ancestor repeats; the nearest project's handbook is what the budget was
+    /// for. Both halves still arrive — an agent that needs the rules above it
+    /// is told exactly where they live — but only once per session rather than
+    /// eagerly at every level.
+    #[test]
+    fn an_ancestor_handbook_arrives_as_a_lead_and_the_nearest_one_whole() {
+        let mut b = with_work();
+        for p in b.world.index.projects.iter_mut() {
+            match p.id.as_str() {
+                "wsp" => {
+                    let mut hb = String::from("## Handbook\nthe root handbook opens here\n");
+                    for i in 0..20 {
+                        hb += &format!("root rule line {i}\n");
+                    }
+                    p.body = hb.into();
+                }
+                "robustness" => {
+                    p.body = "## Handbook\nnothing lands here without a test\n".into();
+                }
+                _ => {}
+            }
+        }
+        b.project = Some("robustness".into());
+
+        let handed = session_text(&b);
+        assert!(handed.contains("the root handbook opens here"), "the lead still orients:\n{handed}");
+        assert!(!handed.contains("root rule line 7"), "{handed}");
+        assert!(
+            handed.contains(&format!("({} more lines — wsp project show wsp --handbook)", 21 - 8)),
+            "and says where the rest lives:\n{handed}"
+        );
+        assert!(
+            handed.contains("nothing lands here without a test"),
+            "the nearest handbook is not the thing that gets cut:\n{handed}"
+        );
     }
 
     /// A parent decision binds as its *rule* — the first sentence, the same cut
