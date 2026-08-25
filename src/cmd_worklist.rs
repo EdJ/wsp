@@ -1298,10 +1298,8 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             // Wrapped against the column it starts in, so the whole block
             // sits inside 80 however deep the ordinals go.
             let width = prose_width(groups.len());
-            if !g.stop.trim().is_empty() {
-                for (n, line) in util::wrap(g.stop.trim(), width).iter().enumerate() {
-                    println!("{indent}{}", p.dim(&format!("{}{line}", if n == 0 { "stop: " } else { "      " })));
-                }
+            for line in stop_lines(&p, g, &w.id, pos.at, ordinal, width, args.has("stops")) {
+                println!("{indent}{line}");
             }
             // The verdict under the stop condition it answers. A group with a
             // stop condition and no verdict under it is a barrier that has not
@@ -1470,14 +1468,18 @@ fn prose_width(groups: usize) -> usize {
     72usize.saturating_sub(groups.to_string().chars().count() + 9)
 }
 
-/// How much of a verdict [`show`] draws before it counts it instead.
+/// How much of a group's prose [`show`] draws before it counts it instead — a
+/// verdict's lines, and a stop condition's once it is behind the position.
 ///
 /// Six, and the corpus chose it rather than taste: of the nineteen verdicts
 /// written in this store, six run to 1–4 lines and thirteen to 13–54, with
 /// nothing at all in between. So the cap sits in an empty band — every
 /// verdict is comfortably one side of it or the other, and no barrier's prose
 /// is near enough the line for the number to be arguable.
-const VERDICT_LINES: usize = 6;
+///
+/// One number for both blocks because both are drawn on one page: two caps is
+/// two numbers a reader must learn, for no block either of them fits.
+const PROSE_LINES: usize = 6;
 
 /// The lines a group's verdict draws under it, most of them usually not drawn.
 ///
@@ -1524,7 +1526,7 @@ fn verdict_lines(p: &Paint, g: &Group, id: &str, width: usize, full: bool) -> Ve
     // reader who wants the prose never has to work out where it went. `--log`
     // holds it too, in the entry `go` wrote; `--verdicts` is the one that puts
     // it back where it is being read from.
-    if !full && body.len() > VERDICT_LINES {
+    if !full && body.len() > PROSE_LINES {
         return vec![p.dim(&format!(
             "{lead}{} lines · wsp worklist show {id} --verdicts",
             body.len()
@@ -1574,6 +1576,61 @@ fn landed_lines(p: &Paint, g: &Group) -> Vec<String> {
     ))]
 }
 
+/// What [`show`] draws of a group's stop condition: whole in front of the
+/// position, counted behind it.
+///
+/// **The split is by position, never by length.** The condition on the group
+/// at the position is the text a governor weighs before `go` passes the
+/// barrier, and an abridgement there has them pass on a summary of the thing
+/// they were supposed to read — so it draws whole however long it runs, the
+/// length being part of what was put at the barrier. Ahead of the position it
+/// is the only prose on the page nobody has read yet, which makes it the most
+/// useful text there rather than the least. Only behind the position is a
+/// stop condition history — its barrier was passed, and `at` moves forward
+/// only, so no reading will stand in front of it again — and there the rule
+/// is [`verdict_lines`]': over the cap, one line naming the weight and the
+/// command that prints it whole.
+///
+/// Under the cap the block is what it always was, behind the position or not:
+/// the count line costs as much as a short condition and carries none of it,
+/// so announcing a two-line stop would be a round trip bought for nothing —
+/// [`verdict_lines`] declines the same trade in the same words.
+///
+/// No writer-side notice, unlike a verdict's [`verdict_notice`]: a condition
+/// is composed ahead of the run, where this draws it whole, so the cut only
+/// ever reaches prose after the reader it was written for has had all of it.
+/// `--stops` puts every block back, in the place each was counted.
+fn stop_lines(
+    p: &Paint,
+    g: &Group,
+    id: &str,
+    at: Option<usize>,
+    ordinal: usize,
+    width: usize,
+    full: bool,
+) -> Vec<String> {
+    if g.stop.trim().is_empty() {
+        return Vec::new();
+    }
+    // A run with nowhere to stand is past every barrier, so every block here
+    // is history; a draft stands in front of group 1, so none of them is.
+    let behind = match at {
+        Some(a) => ordinal < a,
+        None => true,
+    };
+    let body = util::wrap(g.stop.trim(), width);
+    if behind && !full && body.len() > PROSE_LINES {
+        return vec![p.dim(&format!(
+            "stop: {} lines · wsp worklist show {id} --stops",
+            body.len()
+        ))];
+    }
+    body.iter()
+        .enumerate()
+        .map(|(n, line)| p.dim(&format!("{}{line}", if n == 0 { "stop: " } else { "      " })))
+        .collect()
+}
+
 /// What `go` tells the writer about the verdict it has just recorded, when
 /// there is anything to tell.
 ///
@@ -1590,7 +1647,7 @@ fn landed_lines(p: &Paint, g: &Group) -> Vec<String> {
 /// all under the cap, where what was written is what is drawn.
 fn verdict_notice(id: &str, said: &str, groups: usize) -> Option<String> {
     let n = util::wrap(said.trim(), prose_width(groups)).len();
-    (n > VERDICT_LINES).then(|| {
+    (n > PROSE_LINES).then(|| {
         format!("went  {n} lines · the plan reading shows this line instead · wsp worklist show {id} --verdicts")
     })
 }
@@ -3523,6 +3580,19 @@ mod tests {
         Group { members: vec!["wl-001".into()], verdict: verdict.into(), ..Group::default() }
     }
 
+    fn stop_group(stop: &str) -> Group {
+        Group { members: vec!["wl-001".into()], stop: stop.into(), ..Group::default() }
+    }
+
+    /// Longer than the cap at any of the widths tested, and about the work —
+    /// the way a real condition is written, not filler.
+    fn long_stop() -> String {
+        "every member lands inside its own module and nothing reaches \
+         into a neighbour's; the trunk builds green before `go` is given; \
+         any red flag on a member stops the group rather than the member. "
+            .repeat(6)
+    }
+
     /// `worklist-046`, and the reason the answer is a count and not a longer
     /// cut: **there is no first sentence of this verdict that is not a lie
     /// about it.** Read to its first sentence the group's own record says the
@@ -3568,10 +3638,122 @@ mod tests {
     fn the_flag_draws_the_verdict_whole_where_it_was_abridged() {
         let p = Paint::new();
         let drawn = verdict_lines(&p, &verdict_group(G2), "phase-four", 62, true);
-        assert!(drawn.len() > VERDICT_LINES, "the cap is off: {} lines", drawn.len());
+        assert!(drawn.len() > PROSE_LINES, "the cap is off: {} lines", drawn.len());
         let whole = drawn.join(" ");
         assert!(whole.contains("THIS IS THE G2 VERDICT"), "the lead is there");
         assert!(whole.contains("falsified the predicate"), "and so is the middle of it");
+    }
+
+    // ---- stop conditions, split by position and never by length ----------
+
+    /// `worklist-053`. Behind the position a stop condition is history — its
+    /// barrier was passed, `at` moves forward only — so over the cap it draws
+    /// as a count with the command that prints it whole, the verdict's rule
+    /// one group later.
+    #[test]
+    fn a_stop_condition_behind_the_position_is_counted_rather_than_drawn() {
+        let p = Paint::new();
+        let long = long_stop();
+        let drawn = stop_lines(&p, &stop_group(&long), "phase-five", Some(3), 1, 62, false);
+        assert_eq!(drawn.len(), 1, "one line, whatever the condition runs to: {drawn:?}");
+        let line = &drawn[0];
+        assert!(
+            line.contains("wsp worklist show phase-five --stops"),
+            "with the command that prints it: {line}",
+        );
+        assert!(
+            !line.contains("lands inside"),
+            "and none of the prose is promoted to standing for the block: {line}",
+        );
+    }
+
+    /// The rule this row exists to get right, asserted from both sides at
+    /// once. The group AT the position is the live barrier: its condition is
+    /// what a governor weighs before passing it, and a summary there has them
+    /// pass on words nobody read. Same length that drew as a count one line
+    /// up; here it draws whole.
+    #[test]
+    fn the_stop_at_the_live_barrier_reads_whole_however_long_it_runs() {
+        let p = Paint::new();
+        let long = long_stop();
+        let counted = stop_lines(&p, &stop_group(&long), "phase-five", Some(2), 1, 62, false);
+        assert_eq!(counted.len(), 1, "the same prose one barrier back draws as a count");
+        let whole = stop_lines(&p, &stop_group(&long), "phase-five", Some(1), 1, 62, false);
+        assert!(whole.len() > PROSE_LINES, "at the position the cap does not apply");
+        assert!(
+            whole.join(" ").contains("lands inside"),
+            "and it is the prose itself, not a summary of it",
+        );
+    }
+
+    /// Ahead of the position the prose is the only text on the page nobody
+    /// has read yet — the most useful writing in the plan reading, not the
+    /// least. Length is irrelevant there too, and this is the arm that makes
+    /// the split positional rather than a second verdict cap.
+    #[test]
+    fn a_group_ahead_of_the_position_has_unread_prose_and_it_draws_whole() {
+        let p = Paint::new();
+        let long = long_stop();
+        let drawn = stop_lines(&p, &stop_group(&long), "phase-six", Some(1), 2, 62, false);
+        assert!(drawn.len() > PROSE_LINES, "no cap in front of the run");
+        assert!(drawn.join(" ").contains("any red flag"), "and it is the prose");
+    }
+
+    /// The other half of the cap, on the verdicts' reasoning: announcing a
+    /// short condition costs the line the condition itself would have cost,
+    /// and carries none of it. A round trip bought for nothing teaches the
+    /// reader to type past every cap they meet.
+    #[test]
+    fn a_short_stop_behind_the_position_still_draws_rather_than_announces() {
+        let p = Paint::new();
+        let drawn =
+            stop_lines(&p, &stop_group("it has to land clean"), "batch", Some(4), 1, 62, false);
+        assert_eq!(drawn.len(), 1, "one line either way");
+        assert!(drawn[0].contains("land clean"), "but it is the condition: {:?}", drawn[0]);
+        assert!(!drawn[0].contains("--stops"), "and nothing to go and fetch: {:?}", drawn[0]);
+    }
+
+    /// Nothing is lost behind the position either, which is what makes the
+    /// positional cap safe to take: `--stops` is the block with the cap off,
+    /// in the place it was counted.
+    #[test]
+    fn the_flag_draws_a_counted_stop_whole_where_it_was_counted() {
+        let p = Paint::new();
+        let long = long_stop();
+        let drawn = stop_lines(&p, &stop_group(&long), "phase-five", Some(3), 1, 62, true);
+        assert!(drawn.len() > PROSE_LINES, "the cap is off: {} lines", drawn.len());
+        assert!(drawn.join(" ").contains("trunk builds green"), "and it is the prose");
+    }
+
+    /// A finished run stands past every barrier, so `at` is none and every
+    /// condition on the page is history — the state phase-four and phase-five
+    /// were actually read in, 88 lines of crossed prose between them.
+    #[test]
+    fn once_every_barrier_is_passed_every_condition_on_the_page_is_history() {
+        let p = Paint::new();
+        let long = long_stop();
+        for ordinal in [1usize, 2, 7] {
+            let drawn = stop_lines(&p, &stop_group(&long), "phase-four", None, ordinal, 62, false);
+            assert_eq!(
+                drawn.len(),
+                1,
+                "group {ordinal} of a finished list counts like any other behind"
+            );
+            assert!(drawn[0].contains("--stops"));
+        }
+    }
+
+    /// And the state that forbids the cut entirely: a draft stands in front
+    /// of group 1, nothing is behind anything, and no barrier on the page has
+    /// been read by anybody.
+    #[test]
+    fn a_draft_has_no_history_so_no_condition_is_counted() {
+        let p = Paint::new();
+        let long = long_stop();
+        let drawn = stop_lines(&p, &stop_group(&long), "fork-next", Some(1), 1, 62, false);
+        assert!(drawn.len() > PROSE_LINES, "group 1 of a draft is the live position");
+        let drawn = stop_lines(&p, &stop_group(&long), "fork-next", Some(1), 3, 62, false);
+        assert!(drawn.len() > PROSE_LINES, "and so is everything after it");
     }
 
     /// The writer's end of the same fact. A verdict is composed by somebody who
