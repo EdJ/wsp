@@ -1624,6 +1624,17 @@ and the rest the task. Against 14,450 fetched late, that is roughly 4:1 in
 favour, and it removes nineteen round-trips as well, each of which is itself a
 full context re-read.
 
+Two of those blocks are bounded as well as capped, because caps that count
+entries stopped being enough once review notes started landing in logs: a
+single log entry measured past 2,000 characters (~500 tokens), and six whole
+parent decisions past 3,000. So an entry longer than ~400 characters shows its
+head and the count of shortened entries names where the rest lives
+(`wsp show <id>`), and a parent decision binds as its *first sentence* — the
+rule — with the argument one command away, the same cut `wsp project show`
+abridges its own decisions index on. A decision or entry that is only ever its
+rule passes through whole; nothing reads like the brief did something to it
+unless it says so.
+
 **The same arithmetic is why plain `wsp brief` must not grow.** It is run
 constantly, mid-session, by every agent and by whoever is coordinating — so a
 thousand tokens added to the default is a thousand tokens times every call in
@@ -1692,8 +1703,9 @@ character, a brief is multi-line, and three spawns of three were refused with
 ### What it is *not* handed
 
 ```sh
-wsp spawn <id> --agent          # trimmed
-wsp spawn <id> --agent --full   # everything, for the spawn that needs it
+wsp spawn <id> --agent              # trimmed
+wsp spawn <id> --agent --subagents  # trimmed, but sub-agents stay
+wsp spawn <id> --agent --full       # everything, for the spawn that needs it
 ```
 
 The brief is not the expensive half. A spawned Claude Code session starts at
@@ -1715,6 +1727,18 @@ same task, read back off the transcripts: **37,756 → 25,306, a third off every
 request.** Worth stating against the estimate that prompted it, which hoped for
 28.6K: the system prompt underneath the schemas is ~25K and no flag reaches it.
 This is 44% of what was hoped for and the rest is not on offer.
+
+**The `Agent` row has an opposite number now, because that trim cuts both
+ways.** Removing sub-agents keeps 2,682 tokens off every request — and removes
+the only mechanism that keeps exploration from accumulating in the session's
+own context, which every request then re-reads. The store's own release records
+put long sessions at 200–380 turns with six figures of context riding the
+average request, where a sub-agent's context dies with its turn. So for the
+exploration-heavy spawn — surveying, bisecting, reading a codebase it did not
+write — `--subagents` re-arms `Agent` alone and keeps everything else denied.
+For a twenty-turn focused change it is pure overhead, which is why the default
+stays trimmed. `Workflow` stays denied either way: that is a rule about the
+work, not about context.
 
 It is a *denylist*, and deliberately not the allowlist the estimate called for.
 `--tools` takes an allowlist, and the first attempt here used one —

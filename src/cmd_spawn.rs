@@ -1504,6 +1504,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // the handle knowable in advance rather than discovered afterwards.
         let spawn = agent_commands::Spawn {
             full: args.has("full"),
+            subagents: args.has("subagents"),
             name: &name,
             seat: &seat,
             model: model.as_deref(),
@@ -2770,7 +2771,7 @@ mod tests {
         clock: &util::Dial,
     ) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None };
+            agent_commands::Spawn { full: false, subagents: false, name: "t-260817-010", seat, model: None, effort: None, order: None, resume: None };
         // The retry fields come from `retrying` because this test is about a
         // single attempt: a literal here would have to be updated every time the
         // retry's numbers move, for a wait that never reads them.
@@ -2849,7 +2850,7 @@ mod tests {
 
     fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
-            agent_commands::Spawn { full: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None };
+            agent_commands::Spawn { full: false, subagents: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None };
         let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
         start_agent(place, how, &spawn, &agent, "claude", wait)
     }
@@ -3132,6 +3133,7 @@ mod tests {
         let seat = Seat::new("w3M:p1");
         let spawn = agent_commands::Spawn {
             full: false,
+            subagents: false,
             name: "robustness-035",
             seat: &seat,
             model: None,

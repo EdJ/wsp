@@ -1590,17 +1590,21 @@ fn help_text() -> String {
                                     first
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
-                 [--model <m>] [--effort <e>]
+                 [--model <m>] [--effort <e>] [--subagents]
                                     open a workspace on it and claim it there;
                                     --agent starts an agent in it too. --focus
                                     to go there, --on to run it on another
                                     machine, --full to start it with sub-agents,
                                     workflows and the MCP servers it is
                                     otherwise spawned without.
-                                    --model fable|opus|sonnet|haiku, any with
-                                    [1m], and --effort low|medium|high|xhigh|max
-                                    say what tier to start it at; say neither and
-                                    it starts on your settings file, as before.
+                                    --subagents keeps just the Agent tool, for
+                                    exploration-heavy work whose searching would
+                                    otherwise pile up in the session's own
+                                    context; --model fable|opus|sonnet|haiku,
+                                    any with [1m], and --effort
+                                    low|medium|high|xhigh|max say what tier to
+                                    start it at; say neither and it starts on
+                                    your settings file, as before.
                                     haiku opens in manual mode, so it is refused
                                     unless --focus says you will be at the pane
   wsp despawn <id> | --pane <seat>  the other end of it, and the whole ending:

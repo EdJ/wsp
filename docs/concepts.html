@@ -3,8 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- Copied to joltsite as wsp.html. Source of truth: docs/concepts.html in
-     the wsp repository. Refresh with cp.
+<!-- Copied to joltsite as wsp-concepts.html, where it is the appendix behind
+     the short explainer at wsp.html — which joltsite owns and this repository
+     does not. Source of truth for this file: docs/concepts.html in the wsp
+     repository. Refresh with cp.
 
      Repo-relative, and no commit hash, for the same reason in both halves: a
      hash baked into a file is stale the moment that file is committed, and an
@@ -603,7 +605,7 @@
 
       <rect class="node-w" x="330" y="96" width="200" height="48" rx="10"/>
       <text class="tb" x="348" y="118">the seat on shop</text>
-      <text class="ts" x="348" y="134">a custodian agent holds it</text>
+      <text class="ts" x="348" y="134">an agent is sitting in it</text>
       <circle class="ring" cx="556" cy="120" r="10"/>
       <circle class="core" cx="556" cy="120" r="4.5"/>
 
@@ -715,7 +717,7 @@
     <li><strong>A coordination point, not an approval gate.</strong> No verb consults a seat
       before acting. The one guard runs the other way: <code>wsp despawn</code> refuses to end a
       governing pane without <code>--force</code>.</li>
-    <li><strong>A custodian is told a different job</strong>: sequence what runs next, write the
+    <li><strong>A governor is told a different job</strong>: sequence what runs next, write the
       direction an arriving agent needs, review finished work against the code rather than
       against the report, and hold the record — and <em>not</em> “go and claim something”, which
       is the move that turns a governor back into an agent working somebody else’s task.</li>

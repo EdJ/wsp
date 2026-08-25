@@ -815,6 +815,12 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
         // model it was started with is that session's, not this command's.
         agent_commands::Spawn {
             full: false,
+            // Same answer as `full`, and for the same reason: resume rebuilds
+            // the preamble of a session that already exists, and what it
+            // rebuilt yesterday is what it should rebuild today. An
+            // exploration-heavy task wants `wsp spawn --subagents` at birth;
+            // nothing here re-decides that on the way back in.
+            subagents: false,
             name: &name,
             seat: &seat,
             model: None,

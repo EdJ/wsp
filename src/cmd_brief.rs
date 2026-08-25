@@ -106,8 +106,26 @@ const MAX_REFS: usize = 8;
 /// churn, at about eight tokens a line — but not zero, because direction handed
 /// to a task after it was written arrives here and nowhere else. The log line
 /// on this very task carried the file list that saved its agent the 28,000
-/// tokens of searching the task exists to remove.
+/// tokens of searching the task exists to remove. Each entry is bounded too,
+/// by [`MAX_LOG_ENTRY_CHARS`]: the churn assumption stopped holding the day
+/// review notes started landing in logs.
 const MAX_LOG: usize = 4;
+/// How much of one log entry the payload shows, in characters rather than
+/// lines — an entry *is* one line in the store, so a line cap would be a
+/// tautology.
+///
+/// [`MAX_LOG`]'s pricing assumed churn: claimed, released, noted. Measured on
+/// the live store, single entries now run past 2,000 characters (~500 tokens),
+/// and four of those is half a payload spent on the one block the handbook
+/// itself names as the wrong home for prose. 400 is two or three sentences —
+/// enough to know what happened and whether the rest is worth fetching — and
+/// what is cut past it is named, never silent: see `session_lines`.
+const MAX_LOG_ENTRY_CHARS: usize = 400;
+/// Where an abridged parent decision stops. First sentence, then here: the
+/// sentence is the rule and the rest is the argument, which is exactly the
+/// split `wsp project show` abridges its own decisions block on — same cut,
+/// same reason, different pointer (`wsp show <parent>`).
+const MAX_BIND_LEAD: usize = 150;
 
 /// The protocol an agent works to, kept in the store rather than in this
 /// binary. It is the user's to write, versioned with the tasks it talks about,
@@ -856,11 +874,28 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
         }
         if !r.mine_log.is_empty() {
             out.push(String::new());
+            // Bounded per entry, and never bounded quietly: an entry that
+            // stops mid-sentence reads exactly like one that was written
+            // short, so the count of shortened entries is printed with where
+            // the rest lives. The `--json` payload carries the entries whole —
+            // this is the text surface's economy, not the record's.
+            let mut cut = 0;
             for (i, l) in r.mine_log.iter().enumerate() {
+                let shown = util::truncate(l, MAX_LOG_ENTRY_CHARS);
+                if shown.chars().count() < l.chars().count() {
+                    cut += 1;
+                }
                 out.push(format!(
                     "{} {}",
                     p.dim(&util::pad(if i == 0 { "log" } else { "" }, 6)),
-                    p.dim(l)
+                    p.dim(&shown)
+                ));
+            }
+            if cut > 0 {
+                out.push(format!(
+                    "{} {}",
+                    p.dim(&util::pad("", 6)),
+                    p.dim(&format!("{cut} of {} shortened · wsp show {}", r.mine_log.len(), t.id))
                 ));
             }
         }
@@ -869,12 +904,24 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
     // The parent's decisions. Direction lands on a parent and the work happens
     // a sub-task at a time, so these are the constraints on the piece in hand
     // and they are not written down anywhere the piece itself can see.
+    //
+    // Abridged to the first sentence, on the precedent of `wsp project show`'s
+    // decisions index: the sentence is the rule and what follows is the
+    // argument for it, and six whole decisions on this store measured past
+    // 3,000 tokens — d26 alone is ~600 — re-read by every request of every
+    // session beneath it. The rule survives; the argument is one command away,
+    // and the count below says how much went.
     if !r.parent_decided.is_empty() {
         let dropped = r.parent_decided.len().saturating_sub(MAX_PARENT_DECISIONS);
         out.push(String::new());
+        let mut cut = 0;
         for (i, (when, what)) in r.parent_decided.iter().skip(dropped).enumerate() {
+            let lead = util::truncate(util::first_sentence(what), MAX_BIND_LEAD);
+            if lead.chars().count() < what.trim_end().chars().count() {
+                cut += 1;
+            }
             out.push(format!(
-                "{} {} {what}",
+                "{} {} {lead}",
                 p.dim(&util::pad(if i == 0 { "binds" } else { "" }, 6)),
                 p.dim(when)
             ));
@@ -885,6 +932,14 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
                 "{} {}",
                 p.dim(&util::pad("", 6)),
                 p.dim(&format!("{dropped} earlier · wsp show {id}"))
+            ));
+        }
+        if cut > 0 {
+            let id = r.parent.as_ref().map(|t| t.id.as_str()).unwrap_or("");
+            out.push(format!(
+                "{} {}",
+                p.dim(&util::pad("", 6)),
+                p.dim(&format!("{cut} of {} abridged · wsp show {id}", r.parent_decided.len()))
             ));
         }
     }
@@ -1832,6 +1887,76 @@ mod tests {
             assert!(normal.contains(needle), "{normal}");
             assert!(session.contains(needle), "{session}");
         }
+    }
+    /// A log entry is bounded per entry, and the bound is stated rather than
+    /// silent. A review note that ran to 2,000 characters arrives looking
+    /// exactly like a sentence somebody wrote that long unless the brief says
+    /// it was cut — and says where the rest lives, which is the task itself,
+    /// not the brief.
+    #[test]
+    fn a_long_log_entry_is_shortened_and_the_shortening_is_named() {
+        let mut b = with_work();
+        for t in b.world.tasks.iter_mut() {
+            if t.id == "t-001" {
+                // Filler first, and a marker only the tail carries: the
+                // negative assertion has to be about something the visible
+                // head cannot contain.
+                t.body = "## Overview\nthe shape of it\n\n## Log\n\
+                          - 2026-08-17 claimed by pane w1:p1\n\
+                          - the governor's note, on testing: "
+                    .to_string()
+                    + &"and the argument runs on ".repeat(60)
+                    + "TAILMARKER\n";
+            }
+        }
+
+        let handed = session_text(&b);
+        // The churn line is untouched — it was never the problem.
+        assert!(handed.contains("claimed by pane w1:p1"), "{handed}");
+        // The long one shows its head and names the cut.
+        assert!(handed.contains("the governor's note"), "{handed}");
+        assert!(
+            handed.contains("1 of 2 shortened · wsp show t-001"),
+            "the cut is stated, with where the rest lives:\n{handed}"
+        );
+        assert!(!handed.contains("TAILMARKER"), "{handed}");
+    }
+
+    /// A parent decision binds as its *rule* — the first sentence, the same cut
+    /// `wsp project show` abridges its decisions index on — with the argument
+    /// one command away and the count of what went printed beside it. Six
+    /// whole decisions measured past 3,000 tokens of payload; d26 alone is
+    /// ~600, and none of it is the rule.
+    #[test]
+    fn a_long_parent_decision_binds_as_its_first_sentence() {
+        let mut b = with_work();
+        for t in b.world.tasks.iter_mut() {
+            if t.id == "t-004" {
+                t.body = "## Decisions\n- 2026-08-16 measure it, do not assume it. \
+                          What follows is six hundred words on why assuming cost somebody a day, \
+                          which no session beneath this one needs re-read to it on every request.\n"
+                    .into();
+            }
+        }
+
+        let handed = session_text(&b);
+        assert!(handed.contains("measure it, do not assume it."), "the rule survives:\n{handed}");
+        assert!(!handed.contains("six hundred words"), "the argument does not:\n{handed}");
+        assert!(
+            handed.contains("1 of 1 abridged · wsp show t-004"),
+            "and the cut is named:\n{handed}"
+        );
+    }
+
+    /// A decision that is only its rule is passed through whole: no ellipsis,
+    /// no abridged line, nothing that reads like the brief did something to it.
+    #[test]
+    fn a_parent_decision_that_is_one_sentence_is_untouched() {
+        let b = with_work();
+        let handed = session_text(&b);
+        // pad("binds", 6) plus the row's own space: two spaces after the label.
+        assert!(handed.contains("binds  2026-08-16 measure it"), "{handed}");
+        assert!(!handed.contains("abridged"), "{handed}");
     }
 
     /// What `wsp spawn` hands a kind with no session hook is this brief, whole,

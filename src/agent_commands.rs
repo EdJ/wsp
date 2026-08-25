@@ -653,6 +653,25 @@ pub trait Kind {
 pub struct Spawn<'a> {
     /// Keep the whole preamble: the way back from [`TRIM`].
     pub full: bool,
+    /// Keep the `Agent` tool while everything else in [`TRIM`] still goes.
+    ///
+    /// The exploration-heavy spawn's flag, and the reasoning is arithmetic
+    /// rather than taste. The trim exists because a preamble token is paid on
+    /// *every request*, and sub-agents were measured carrying their own copy
+    /// of it. What the trim also removed is the one mechanism that keeps
+    /// exploration out of the session's own context — and context
+    /// *accumulates*. Measured across this store's own release records:
+    /// compound sessions average ~120 turns, the longest ran 381 for 115M
+    /// cache-read tokens, and ~200K of context rode along on the average
+    /// request. Against that curve, 2,682 tokens once per request for an
+    /// isolated explorer can be the cheaper side; against a twenty-turn
+    /// focused change it is pure overhead.
+    ///
+    /// So the default stays trimmed and this flag names the case that flips
+    /// it. `Workflow` stays denied either way — the work order forbids it in
+    /// as many words, which is a rule about the work rather than about
+    /// context — and so does every MCP server.
+    pub subagents: bool,
     pub name: &'a str,
     pub seat: &'a Seat,
     /// The tier this spawn was asked for: which model, and how hard it thinks.
@@ -1522,6 +1541,17 @@ pub struct Claude;
 /// trimmed session asked what it has answers "No Workflow tool", "No mcp__
 /// prefixed tools", and lists its fourteen skills. It does not silently
 /// improvise around an absence it cannot see.
+///
+/// **The `Agent` half has an opposite number, and the trade is measured rather
+/// than felt.** Removing sub-agents kept 2,682 tokens off every request, and
+/// it also removed the only mechanism that keeps exploration from
+/// accumulating in the session's own context — which every request then
+/// re-reads. The store's release records put long sessions at hundreds of
+/// turns with six figures of context riding each one, where a sub-agent's
+/// context dies with its turn. That is why [`Spawn::subagents`] exists: for
+/// the exploration-heavy spawn the isolation can buy more than the preamble
+/// costs, and the flag re-arms `Agent` alone while this list keeps everything
+/// else.
 const TRIM: &[&str] = &["--strict-mcp-config", "--disallowedTools", "Agent", "Workflow"];
 
 /// The model aliases `wsp spawn --model` takes, and the whole of the list.
@@ -1588,10 +1618,19 @@ impl Kind for Claude {
     /// If a flag that takes a value is ever added to [`TRIM`], this is the line
     /// to re-check rather than the one to reorder around.
     fn args(&self, spawn: &Spawn) -> Vec<String> {
-        let mut argv: Vec<String> = match spawn.full {
-            true => Vec::new(),
-            false => TRIM.iter().map(|s| (*s).to_string()).collect(),
+        // Three states, and `full` wins over both: it is the way back from
+        // every capability change here, and a flag asking for one trim while
+        // another asks for none has no reading that survives contact with a
+        // person trying to remember what they asked for. The denylist is
+        // rebuilt rather than filtered at the call site, so the one name that
+        // moves is visible right here beside its reason — see
+        // [`Spawn::subagents`].
+        let denied: &[&str] = match (spawn.full, spawn.subagents) {
+            (true, _) => &[],
+            (false, true) => &["--strict-mcp-config", "--disallowedTools", "Workflow"],
+            (false, false) => TRIM,
         };
+        let mut argv: Vec<String> = denied.iter().map(|s| (*s).to_string()).collect();
         if let Some(handle) = mint(spawn.name, spawn.seat) {
             argv.push("-n".into());
             argv.push(handle);
@@ -2640,7 +2679,7 @@ mod tests {
     /// ~28K, and a trim that pushes work into Bash costs more than it saves.
     /// A spawn description, so the tests below argue about one thing each.
     fn spawn<'a>(full: bool, name: &'a str, seat: &'a Seat) -> Spawn<'a> {
-        Spawn { full, name, seat, model: None, effort: None, order: None, resume: None }
+        Spawn { full, subagents: false, name, seat, model: None, effort: None, order: None, resume: None }
     }
 
     /// The same, at a stated tier.
@@ -2949,6 +2988,47 @@ mod tests {
         for kept in ["Bash", "Read", "Edit", "Write"] {
             assert!(!trim.contains(&kept.to_string()), "{kept} is how the work gets done: {trim:?}");
         }
+    }
+
+    /// An exploration-heavy spawn keeps sub-agents and loses everything else
+    /// the trim takes.
+    ///
+    /// The case for re-arming `Agent` is arithmetic, not preference: a
+    /// sub-agent's context dies with its turn, while an un-isolated
+    /// exploration accumulates into the session's own context and is re-read
+    /// on every remaining request. The flag exists so the default can stay
+    /// cheap without making the long-horizon spawn pay the accumulation
+    /// instead. `Workflow` stays denied — that is a rule about the work, not
+    /// about context — and so does every MCP server.
+    #[test]
+    fn an_exploration_spawn_keeps_subagents_and_still_trims_the_rest() {
+        let seat = Seat::new("w2J:p1");
+        let argv = of("claude").args(&Spawn {
+            subagents: true,
+            ..spawn(false, "t-1", &seat)
+        });
+        assert!(!argv.contains(&"Agent".to_string()), "the explorer is back: {argv:?}");
+        // The rest of the denylist, untouched by the one name that moved.
+        assert!(argv.contains(&"--strict-mcp-config".to_string()), "{argv:?}");
+        assert!(argv.contains(&"--disallowedTools".to_string()), "{argv:?}");
+        assert!(argv.contains(&"Workflow".to_string()), "{argv:?}");
+    }
+
+    /// `--full` is the way back from every capability change, so it wins over
+    /// `--subagents` too: two flags pulling opposite ways resolve to "the
+    /// whole preamble", the only reading a person can be expected to remember.
+    #[test]
+    fn full_wins_when_it_is_asked_for_alongside_subagents() {
+        let seat = Seat::new("w2J:p1");
+        let argv = of("claude").args(&Spawn {
+            full: true,
+            subagents: true,
+            ..spawn(true, "t-1", &seat)
+        });
+        // The name goes on regardless — a handle is not a capability — but
+        // nothing is denied.
+        assert!(!argv.contains(&"--strict-mcp-config".to_string()), "{argv:?}");
+        assert!(!argv.contains(&"--disallowedTools".to_string()), "{argv:?}");
     }
 
     /// A spawn that names no tier is the spawn wsp did before tiers existed.
