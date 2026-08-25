@@ -775,6 +775,10 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
                     }),
                     t.seat_of.as_deref(),
                     t.task.as_deref(),
+                    // A resumed custodian is still a custodian: `seat_of` is
+                    // only ever set for one, so it is both the honest answer
+                    // here and the same one the original spawn made.
+                    t.seat_of.is_some(),
                 ),
                 on: herdr::host_of(&t.workspace).map(|m| m.to_string()),
                 show: false,
@@ -1366,7 +1370,7 @@ pub fn ask_on_startup(store: &Store) -> usize {
         // No occupant: what this seat is for is `wsp resume` at a shell, and
         // no agent is started in it. Configuring a runtime nobody is launching
         // would be a variable in a shell a person is about to type in.
-        env: cmd_spawn::seat_env(None, None, None),
+        env: cmd_spawn::seat_env(None, None, None, false),
         on: None,
         show: false,
     };

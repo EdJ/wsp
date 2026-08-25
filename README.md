@@ -110,12 +110,38 @@ wsp worklist next           # …or `next <slug>` where the workspace holds no s
                             #   group 2 of 4 — waiting on 2         → wait
                             #   group 1 of 4 finished — read this…  → go, or hold
                             #     (and what that group's lands touched, before you judge)
+                            #     then rotate — see the seat, below
                             #   nothing left — 4 groups, all …      → done
 wsp worklist go "…"         # pass the barrier: the verdict, the sweep behind it,
                             #   and which members of that group touched one file
 wsp worklist go --from FILE # …the verdict out of the file it was composed in
 wsp worklist hold "…"       # start nothing more; what is running is left to finish
 ```
+
+### The seat is reset per batch
+
+A custodian's context only grows, and a token in it is re-billed on every
+request it makes for the rest of the run — so the one thread that runs all
+night is also the most expensive thing on the machine. Since `core-049` the
+default answer is that **it does not run all night**: at each barrier the seat
+writes its verdict with `go` (the store now holds everything a successor needs —
+run position behind `next`, raised hands behind `flag --seat`, direction in task
+logs and decisions), seats a fresh custodian, and ends:
+
+```sh
+wsp spawn -p <slug> --govern    # the successor takes the slot, evicting you,
+                                # and re-briefs from the store for ~600 tokens
+```
+
+`next` prints this at every group's own barrier (never at barrier zero or the
+last), and `--json` carries the same command as `reseat`. Rotation keeps each
+custodian's window small by construction rather than by discipline; keeping
+direction out of the conversation and in task logs is what makes the rotation
+safe. The successor's seat also carries `WSP_TERSE=1` — a coordinating agent
+re-reads `brief` and `wip` several times an hour, and the two blocks `--terse`
+drops were being paid for by every one of those readings. The session payload
+itself is unaffected (`--session` outranks the variable), so the brief it starts
+with is whole.
 
 ## The panel
 
@@ -2425,7 +2451,11 @@ waits, write the direction an arriving agent needs and no more, review finished
 work against the code rather than against the agent's report, hold the record.
 The brief agrees with it: a custodian is told what it is answerable for, and it
 is *not* told to go and claim something, which is the move that turns a governor
-back into an agent working somebody else's task.
+back into an agent working somebody else's task. Since `core-049` it is also
+told to **rotate at each barrier** rather than hold the thread all night — see
+[The seat is reset per batch](#the-seat-is-reset-per-batch) — because the
+position exists to hold the *record*, and the record is in the store; a thread
+that held it too was paying rent on both.
 
 The record is keyed on the **project**, which is the one place this differs
 from the pins, mandates and claims beside it. Those are facts about a workspace

@@ -2202,6 +2202,30 @@ fn report(
             if !verbs.is_empty() {
                 println!("{}", p.dim(&verbs));
             }
+            // The rotation, taught where the decision it belongs to is made.
+            //
+            // A barrier is where a custodian's run is most expensive and most
+            // replaceable: the verdict it is composing goes into the store
+            // through `go`, and everything else it knows that is worth keeping
+            // should already be in a task log or a decision. So this line says
+            // what `core-049` made the default — pass the barrier, seat a fresh
+            // custodian, end — instead of leaving the thread to grow across a
+            // night of them. Only on a group's own barrier: there is nothing to
+            // succeed at barrier zero, and none left to sequence behind the
+            // last. The command is spelled rather than described, because an
+            // agent improvising around a noun is how the old habit survived.
+            if let Gate::After(n) = gate {
+                if *n < of {
+                    println!(
+                        "{}",
+                        p.dim(&format!(
+                            "then rotate — seat your successor from a fresh context, and end: \
+                             wsp spawn -p {} --govern",
+                            w.id
+                        ))
+                    );
+                }
+            }
         }
         State::Nothing => {
             println!(
@@ -2312,6 +2336,17 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
                     .collect::<Vec<_>>());
                 v["unread"] = json!(t.overlap.unread);
                 v["landed"] = landed_json(&t.landed);
+            }
+            // The rotation, as the command rather than a boolean — this key is
+            // the machine reader's copy of the dim line the text prints, and
+            // like every line here it names what to run. Absent at barrier zero
+            // and behind the last group, where the text says nothing either.
+            // Additive: a parser that has never heard of it reads a barrier
+            // exactly as before (`core-049`).
+            if let Gate::After(n) = gate {
+                if *n < w.groups().len() {
+                    v["reseat"] = json!(format!("wsp spawn -p {} --govern", w.id));
+                }
             }
         }
         State::Nothing => v["state"] = json!("finished"),

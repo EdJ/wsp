@@ -339,6 +339,17 @@ pub fn work_order(subject: &str, how: Handover) -> String {
         // is the project's brief — what is open beneath it and who is standing
         // in it — and picking one of those up itself is the failure mode, not
         // the job.
+        //
+        // The last sentence is `core-049`, and it is a change of policy rather
+        // than of wording: the seat used to be the one thread that ran all
+        // night, and its context grew with every verdict, flag receipt and
+        // `wip` poll it was handed — re-billed on every request it made, since
+        // a token in context is paid for by every later request. The store
+        // holds everything a successor needs — the run's position behind
+        // `worklist next`, raised hands behind `flag --seat`, decisions behind
+        // `project show` — so the thread does not have to hold anything at all.
+        // Rotation per barrier keeps each custodian's window small by
+        // construction instead of by discipline.
         Handover::Custodian => format!(
             "You are the custodian of the {subject} project. You have not been claimed onto a \
              task and you should not claim one. Your brief is already above: what {subject} is \
@@ -349,7 +360,11 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              not close with the task that found it. `wsp flag --seat` is your inbox and `wsp \
              spawn` puts agents under you. You coordinate rather than authorise, so nothing \
              waits on your permission. Say what you are doing with `wsp say`, and begin by \
-             reading what is open."
+             reading what is open. Keep direction in task logs and decisions rather than in \
+             this conversation, so nothing lives only here; and when you pass a worklist \
+             barrier, rotate: write the verdict with `wsp worklist go`, then run `wsp spawn \
+             -p {subject} --govern` to seat your successor from a fresh context, then end \
+             your session."
         ),
     }
 }
@@ -411,11 +426,17 @@ fn order(
     on: Option<&str>,
     show: bool,
     agent: Option<Occupant<'_>>,
+    custodian: bool,
 ) -> Order {
     Order {
         label: work.label.clone(),
         cwd: cwd.map(|c| c.to_string()),
-        env: seat_env(agent, work.project.as_deref(), work.task.as_deref()),
+        env: seat_env(
+            agent,
+            work.project.as_deref(),
+            work.task.as_deref(),
+            custodian,
+        ),
         on: on.map(|m| m.to_string()),
         show,
     }
@@ -472,10 +493,20 @@ pub(crate) struct Occupant<'a> {
 /// It goes on the **seat** rather than on the agent's command line, and why is
 /// on [`crate::agent_commands::Kind::env`], which is also where the names in it
 /// live: a module about placing work should not learn one runtime's spelling.
+///
+/// `custodian` is stated by the caller rather than inferred from `task` being
+/// `None`, for the same reason [`Occupant`] is: a bare project workspace is a
+/// seat with no agent in it and no job at all, and only the caller knows which
+/// kind of nothing it opened. What it buys is `WSP_TERSE=1` — a coordinating
+/// agent re-reads `brief` and `wip` several times an hour for a whole run, so
+/// the two blocks `--terse` drops are paid for by every one of those readings
+/// (`core-049`). The session payload is unaffected: `Depth` puts `--session`
+/// above `--terse` precisely so this variable cannot strip it.
 pub(crate) fn seat_env(
     agent: Option<Occupant<'_>>,
     project: Option<&str>,
     task: Option<&str>,
+    custodian: bool,
 ) -> BTreeMap<String, String> {
     // Shed first: everything below is something this seat is *for*, and none of
     // it collides with a name the caller's Claude Code set.
@@ -490,6 +521,9 @@ pub(crate) fn seat_env(
     }
     if let Some(t) = task {
         env.insert("WSP_TASK".into(), t.to_string());
+    }
+    if custodian {
+        env.insert("WSP_TERSE".into(), "1".into());
     }
     // The kind's own, last, so a runtime that needs configuring gets it and
     // every seat that does not is byte-for-byte what it was.
@@ -1522,7 +1556,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let outside = reach(store, work.task.as_deref(), cwd.as_deref());
     let occupant =
         will_start.then(|| Occupant { kind: &kind, brief: brief_at.as_deref(), reach: &outside });
-    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), occupant);
+    // `--govern` is the custodial spelling and the only one: it refuses a task
+    // outright, so the flag alone says everything `seat_env`'s `custodian` half
+    // needs. Asked here rather than read again below, because the environment
+    // is fixed by `open`, which this feeds.
+    let custodian = args.has("govern");
+    let order = order(&work, cwd.as_deref(), on.as_deref(), args.has("focus"), occupant, custodian);
     let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
@@ -2645,7 +2684,7 @@ mod tests {
             label: "robustness/004 · a title".into(),
             list: None,
         };
-        let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false, None);
+        let o = order(&work, Some("~/claude/wsp"), Some("mb2"), false, None, false);
         assert_eq!(o.label, "robustness/004 · a title");
         assert_eq!(o.cwd.as_deref(), Some("~/claude/wsp"), "expanded by the backend, not here");
         assert_eq!(o.on.as_deref(), Some("mb2"));
@@ -2660,7 +2699,7 @@ mod tests {
         // empty string somebody downstream has to test for.
         let proj =
             Work { task: None, project: Some("robustness".into()), label: "robustness".into(), list: None };
-        let o = order(&proj, None, None, true, None);
+        let o = order(&proj, None, None, true, None, false);
         assert!(o.env.get("WSP_TASK").is_none());
         assert!(o.on.is_none());
         assert!(o.show);
@@ -2690,6 +2729,7 @@ mod tests {
             None,
             false,
             Some(Occupant { kind: "opencode", brief: Some(&brief), reach: &[] }),
+            false,
         );
         let cfg = o.env.get("OPENCODE_CONFIG_CONTENT").expect("opencode was given no config");
         assert!(cfg.contains("permission"), "the brake is what the config is for: {cfg}");
@@ -2700,7 +2740,7 @@ mod tests {
         // A seat with nothing starting in it is a terminal in the right tree,
         // and configuring a runtime nobody is launching would be a variable in
         // a shell somebody else is about to type in.
-        let bare = order(&work, None, None, false, None);
+        let bare = order(&work, None, None, false, None, false);
         assert!(bare.env.get("OPENCODE_CONFIG_CONTENT").is_none());
 
         // And every kind that needs nothing gets byte-for-byte what it got
@@ -2719,7 +2759,7 @@ mod tests {
         );
         // …and the seat it is composed into is an ordinary one, which is the
         // other half of `unchanged` and the half `seat_env` could break.
-        let claude = order(&work, None, None, false, Some(Occupant { kind: "claude", brief: Some(&brief), reach: &[] }));
+        let claude = order(&work, None, None, false, Some(Occupant { kind: "claude", brief: Some(&brief), reach: &[] }), false);
         assert_eq!(claude.env.get("WSP_TASK").map(String::as_str), Some("oc-001"));
         assert!(claude.env.get("OPENCODE_CONFIG_CONTENT").is_none(), "one kind's spelling reached another's seat");
     }
@@ -2736,7 +2776,7 @@ mod tests {
     #[test]
     fn a_spawned_agent_is_not_handed_the_spawning_session() {
         let work = Work { task: None, project: None, label: "probe".into(), list: None };
-        let o = order(&work, None, None, false, None);
+        let o = order(&work, None, None, false, None, false);
         assert_eq!(
             o.env.get(crate::place::CHILD_MARKER).map(String::as_str),
             Some(""),
@@ -2828,6 +2868,62 @@ mod tests {
         // `SessionStart` hook has already run `wsp brief` with the slot in
         // place — asking again at request 1 is a whole context re-read.
         assert!(!text.contains("wsp brief"), "the hook has already injected it: {text}");
+        // And the rotation (`core-049`): the successor's name is spelled out,
+        // because a sentence that says "rotate" without the command is one an
+        // agent at 3am improvises around.
+        for owed in ["worklist go", "spawn -p robustness --govern", "end"] {
+            assert!(text.contains(owed), "the work order drops the rotation step `{owed}`: {text}");
+        }
+    }
+
+    /// The seat a custodian runs in carries `WSP_TERSE=1`, because a
+    /// coordinating agent re-reads `brief` and `wip` several times an hour for
+    /// a whole run and the blocks `--terse` drops are paid for by every one of
+    /// those readings (`core-049`). A worker's seat sets nothing: the variable
+    /// is the custodial spelling, not a default.
+    #[test]
+    fn a_custodians_seat_reads_terse_and_a_workers_does_not() {
+        let proj = Work {
+            task: None,
+            project: Some("robustness".into()),
+            label: "robustness".into(),
+            list: None,
+        };
+        let plain = order(&proj, None, None, false, None, false);
+        assert!(
+            plain.env.get("WSP_TERSE").is_none(),
+            "a bare project seat is not terse: {plain:?}"
+        );
+        assert!(
+            plain.env.get("WSP_TASK").is_none() && !plain.env.contains_key("WSP_TERSE"),
+            "nothing but the custodial half may turn it on"
+        );
+
+        let governing = order(&proj, None, None, false, None, true);
+        assert_eq!(
+            governing.env.get("WSP_TERSE").map(String::as_str),
+            Some("1")
+        );
+
+        // Same for a seat on a worklist — the scope a per-batch rotation is
+        // actually run on — and the session payload is unaffected either way:
+        // that protection lives in `Depth::of`, which puts `--session` above
+        // this variable, and is asserted there rather than duplicated here.
+        let list = Work {
+            task: None,
+            project: None,
+            label: "governor · tuning".into(),
+            list: Some("tuning".into()),
+        };
+        let on_list = order(&list, None, None, false, None, true);
+        assert_eq!(
+            on_list.env.get("WSP_TERSE").map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            on_list.env.get("WSP_PROJECT").is_none(),
+            "a worklist is not a place to stand"
+        );
     }
 
     /// A kind with no session hook says the same sentence every other spawn
