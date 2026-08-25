@@ -841,7 +841,17 @@ impl Place for Herdr<'_> {
             let seats = panes
                 .iter()
                 .map(|p| match running.iter().find(|a| a.pane_id == p.pane_id) {
-                    Some(a) => seated(a, state_of_agent(a)),
+                    // The state off the agent row and **the label off the pane
+                    // row**, because `agent.list` does not carry one — recorded
+                    // against herdr 0.7.5 on 2026-08-25, where the two listings
+                    // differ by exactly `label` and `scroll`. Taking the whole
+                    // row from `agent.list` left [`Seated::label`] empty for
+                    // every seat that had an agent in it, which is every seat a
+                    // person reading a census is reading about, and it is what
+                    // `wsp say` publishes. Nothing had noticed because no
+                    // consumer read a label off a census until `wsp stamp` did
+                    // — and the fake was answering one that herdr does not send.
+                    Some(a) => Seated { label: p.label.clone(), ..seated(a, state_of_agent(a)) },
                     None => seated(p, state_of_pane(p)),
                 })
                 .collect();
@@ -1462,6 +1472,17 @@ mod tests {
         assert_eq!(shell.cwd, "/tmp");
         assert_eq!(shell.agent.kind, "");
 
+        // **And the label survives the seat having an agent in it.** The state
+        // comes off `agent.list` and the label is not there to come off it —
+        // measured against herdr 0.7.5, the two listings differ by exactly
+        // `label` and `scroll`. A row taken whole from the agent listing was
+        // unlabelled for every seat with an agent in it, which is every seat
+        // anybody is reading a census about, and the label is what `wsp say`
+        // publishes. `w2:p2` is the control: a shell's label never came from
+        // anywhere else and so was never wrong.
+        assert_eq!(of("w1:p1").unwrap().label, "one", "a starting agent lost its label");
+        assert_eq!(of("w1:p2").unwrap().label, "two", "a working agent lost its label");
+        assert_eq!(shell.label, "a shell");
     }
 
     /// "Tell me when it stops" is the clause no poll carries, and this is the

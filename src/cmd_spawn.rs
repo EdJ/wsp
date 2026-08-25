@@ -1235,7 +1235,13 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
 /// Everything below this line is backend-agnostic already, which is the port
 /// earning itself: `place_work` was written against `&dyn Place` and needed no
 /// change to grow a second implementor.
-fn backend(args: &Args) -> Box<dyn Place> {
+///
+/// `pub(crate)` because `wsp stamp` asks the same question — which backend is
+/// running the agents — and a second copy of this match is a second place to
+/// forget when a third implementor lands. That is this repository's oldest
+/// lesson about hand-kept lists, and the port is the thing that makes one copy
+/// enough.
+pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
     match args.has("headless") {
         true => Box::new(crate::place_super::Supervisor::new()),
         false => Box::new(Herdr::new()),

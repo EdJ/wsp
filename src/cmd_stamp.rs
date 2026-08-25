@@ -21,7 +21,7 @@
 //! A composite is the one shape that cannot be taken apart again, and taking
 //! it apart is the client's whole decision. The two halves do not change at the
 //! same rate and do not cost the same to re-read: the record is 468 files and
-//! moves a few times an hour, the agent census is two socket calls and moves at
+//! moves a few times an hour, the agent census is a backend call and moves at
 //! every turn boundary of every agent. Mixed into one token, the cheap frequent
 //! change pays for the expensive rare one on every occurrence. The panel is the
 //! proof — it keeps its own gates apart, at 5/s for attention and 30s for the
@@ -29,10 +29,10 @@
 //!
 //! A client is still never asked to *combine* anything. Each stamp gates one
 //! refetch, and a client that only wants "did anything move" compares three
-//! strings for equality instead of one. There is no arithmetic to get wrong,
+//! values for equality instead of one. There is no arithmetic to get wrong,
 //! which is the failure a single token is usually chosen to prevent.
 //!
-//! ## The agents stamp is taken from herdr and not from the state directory
+//! ## The census is not in the store, and it is not herdr's either
 //!
 //! `fingerprint`'s doc leaves ephemeral state out on the grounds that a raised
 //! hand is not a change to the work and has a stamp of its own where it needs
@@ -42,76 +42,110 @@
 //!
 //! The hole is not filled by a third stamp over `~/.local/state/wsp/`, and that
 //! is the thing worth writing down, because a list of state files is the
-//! obvious answer. **The census is not in those files.** `turning` and the
-//! waiting states are read by [`crate::place_herdr::state_of_agent`] out of
-//! `agent_status`, `interactive_ready` and `launch_pending`, which are herdr's
-//! fields and reach wsp only over the socket. A stamp over the state directory
-//! cannot see an agent begin a turn, finish one, or die.
+//! obvious answer. **The census is not in those files.** Whether a turn is in
+//! flight is [`State::turn_in_flight`], and no file in the store carries it: a
+//! stamp over the state directory cannot see an agent begin a turn, finish one,
+//! or die. The seat facts wsp *does* keep need no stamp of their own either,
+//! because the verbs that write them write a task as well — `claim` ends in
+//! `save_task`, so it has already moved the record stamp.
 //!
-//! The seat facts wsp *does* keep — a binding, a claim — need no stamp of their
-//! own either, because the verbs that write them write a task as well:
-//! `claim` ends in `save_task`, so it has already moved the record stamp. What
-//! is left is the state a pane exiting leaves behind, and a pane exiting is the
-//! most visible thing there is in herdr's own answer.
-//!
-//! So the agents stamp is a digest of `herdr::panes()` — the same call the
-//! panel's own status poll makes, over the same fan-out, so a far machine's
-//! agents are in it and a partition is not read as everybody stopping.
+//! **The other place is not herdr.** This file digested `herdr::panes()` and
+//! read `agent_status`, `interactive_ready` and `launch_pending` for one day,
+//! and that is a tie the rest of wsp spent [`crate::place`] removing — a port
+//! written so that nothing in a signature names a pane, a window or a tab. Its
+//! second implementor hosts agents with no terminal at all, and a surface that
+//! polls this verb is a candidate third. A stamp wired to herdr's field names
+//! would have to be unpicked again by exactly the migration this verb exists to
+//! serve, so it asks [`Place::census`] and digests [`Seated`] — `seat`, `label`,
+//! `agent`, `state`, `session`, in wsp's vocabulary — and [`State`] is already
+//! backend-neutral.
 //!
 //! **Widening [`Store::attention_stamp`] was the other candidate and is worse.**
 //! Its argument is that it is two `stat`s and can therefore sit on the fastest
-//! tick there is, five times a second across twenty-two panels; a socket
-//! round-trip cannot go there. And it is addressed-to-somebody-*now* by
-//! definition — a hand, a question — while an agent quietly finishing a turn is
-//! news without being addressed to anyone. Folding the two would make the gate
-//! that exists for questions fire on every `wsp say`.
+//! tick there is, five times a second across twenty-two panels; a backend call
+//! cannot go there. And it is addressed-to-somebody-*now* by definition — a
+//! hand, a question — while an agent quietly finishing a turn is news without
+//! being addressed to anyone. Folding the two would make the gate that exists
+//! for questions fire on every `wsp say`.
+//!
+//! ## Silence is a state, and it is not "unchanged"
+//!
+//! **A `null` that means "I could not ask" compares equal to itself for ever.**
+//! A client polling on an interval reads `null`, finds it equal to the `null`
+//! before it, concludes nothing changed and goes on drawing the last census it
+//! managed to fetch — live, beside a record half that is still moving. That is
+//! a surface lying, and a client cannot tell the lie from this side of the
+//! wire. It is `compound-062`.
+//!
+//! [`Census`] was built for this and says so: `heard` and `silent` are
+//! different constructors, there is no `Default`, and *the cost of this bug is
+//! a `Vec::new()` that looks like an answer*. So the answer here is never a
+//! bare token. `agents` is an object carrying `heard`, a `stamp` and the
+//! `silent` list, and **a client reads `heard` before it compares anything**:
+//! `heard: false` is no signal, and the census it is holding is unknown rather
+//! than unchanged.
+//!
+//! **A partial answer is an answer**, which is [`Census`]'s own rule — one
+//! machine down out of four is three machines' worth of fact, and reading it as
+//! a failure would empty the panel every time a laptop closed. So a silent
+//! machine leaves `heard: true`, a stamp that still covers everybody who
+//! answered, and its own row in `silent`.
+//!
+//! And the silent set is **in** the stamp, which is the half that is easy to
+//! miss: when a far machine drops off, its seats simply stop appearing, and a
+//! digest over the rows alone would move once and then read as *everybody there
+//! stopped*. Hashing the set of silent machines makes the partition itself the
+//! change, so a client refetches, finds them in `silent`, and draws them
+//! unknown instead of empty. The *reason* is not hashed — a backend's error
+//! text is a backend's error text and may differ run to run — so the stamp
+//! moves when the set of silent machines changes and not when the wording does.
 //!
 //! ## What is in the digest, and why the rest is not
 //!
-//! `pane_id`, `workspace_id`, `agent`, `agent_name`, `agent_status`,
-//! `session_id`, `label`, `interactive_ready`, `launch_pending` — identity,
-//! where it stands, what is running in it, what state that is in, and the
-//! sentence it is wearing, which is what `wsp say` publishes.
+//! `seat`, `label`, `agent.kind`, `agent.name`, `state`, `session` — identity,
+//! what is running in it, what state that is in, and the sentence it is
+//! wearing, which is what `wsp say` publishes into the label.
 //!
-//! `title`, `cwd` and `focused` are deliberately out. A terminal rewrites its
-//! own title on every prompt and `focused` moves whenever somebody looks at
-//! another window: a stamp that moves when nothing a census draws has moved
-//! costs a full refetch every time a person types, which is the same bill as
-//! not having a stamp at all.
+//! `cwd` is deliberately out, and it is the same exclusion that kept herdr's
+//! `title` and `focused` out before it: a stamp that moves when nothing a
+//! census draws has moved costs a full refetch every time somebody types, which
+//! is the same bill as not having a stamp at all. `agent.args` is out because
+//! it is a fact about how a seat was *opened* rather than about what is in it,
+//! and no census fills it in.
 //!
-//! Sorted by pane id before hashing, because herdr's ordering is herdr's and a
-//! reordering is not news. Counted as well as hashed for the reason
-//! [`Store::fingerprint`] counts files — but here every pane's id is in the
-//! hash, so a pane leaving is already visible and the count is the hash's own.
+//! Sorted by seat before hashing, because a backend's ordering is the
+//! backend's and a reordering is not news.
 //!
-//! ## Absence is not news
+//! ## Which backend is asked
 //!
-//! `herdr::panes()` degrades to an error here and to an empty list on a far
-//! machine that said nothing, and the panel's rule about that is explicit: an
-//! empty list is herdr not answering rather than everybody finishing at once,
-//! and reading it as news clears the dock every time the socket hiccups. A CLI
-//! process has no previous answer to fall back on, so it says so instead — the
-//! stamp is `null` in JSON and `-` in the text form, and **a client treats that
-//! as "no news", never as a change.** Two absences in a row are not a change
-//! either, which is the point: only a value that differs from a previous
-//! *value* is.
+//! The one `--headless` selects, through `cmd_spawn::backend` — the same choice
+//! `spawn` and `resume` make, kept in one place so that a third implementor
+//! changes it there and leaves this file alone. Not a union of every backend:
+//! [`Census`] is keyed by *machine*, and two backends on one machine would file
+//! two answers under one name, which is precisely the confusion the type
+//! exists to prevent.
 //!
 //! ## Cost, measured rather than assumed
 //!
 //! It is on a client's interval, so the whole verb is the bill. Against the
-//! live store on 2026-08-25, release build, the mean of 50 runs: **10.3ms** end
-//! to end, of which 5.2ms is process start-up — `wsp --version` on the same
+//! live store on 2026-08-25, release build, the mean of 50 runs: **11.5ms** end
+//! to end, of which 4.9ms is process start-up — `wsp --version` on the same
 //! machine — and 4.09ms is [`Store::fingerprint`]'s own measured walk over 468
-//! tasks. The two `stat`s and the socket round-trip together are the rest, and
-//! a run with the socket removed measures the same to within the noise: the
-//! census is not what this costs.
+//! tasks. The rest is two `stat`s and the census. `--headless` measures 8.6ms:
+//! a supervisor's census is a directory pass, with no socket in it.
+//!
+//! **The port costs 1.2ms against the raw `herdr::panes()` this file digested
+//! before it** — 11.5ms against 10.3ms, measured the same way — and the 1.2ms
+//! buys the reading rather than only the decoupling: [`Place::census`] asks
+//! `pane.list` *and* `agent.list`, which is the only way to tell a starting
+//! agent from an idle one. A stamp blind to [`State::Starting`] would miss the
+//! launch window, which is the window `agent.prompt` refuses in.
 //!
 //! What it replaces is `wsp ls --json --all`, 48.2ms on the same store, times
 //! the four calls it takes to cover the record — and it replaces them on every
 //! interval on which the answer is "nothing changed".
 //!
 //! ## Opaque
-//
 //!
 //! Sixteen hex digits, and hex rather than a number so that nothing can subtract
 //! them without first deciding to. Compared for equality and for nothing else:
@@ -119,9 +153,9 @@
 //! collision is silent. A client that reads one as a version, a time or a size
 //! is a client wsp will break.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
-use crate::herdr;
+use crate::place::{Census, Place, Seated};
 use crate::store::Store;
 use crate::util::Paint;
 use crate::Args;
@@ -130,8 +164,26 @@ use crate::Args;
 struct Stamps {
     record: u64,
     attention: u64,
-    /// `None` is herdr not answering. See the module doc: absence is not news.
-    agents: Option<u64>,
+    agents: Agents,
+}
+
+/// The census half: a stamp when somebody answered, and who did not.
+struct Agents {
+    /// `None` is **nobody answered**, which is not the same fact as an empty
+    /// census and must never be compared as one. See the module doc.
+    stamp: Option<u64>,
+    /// machine → why, for every backend that said nothing. `""` is this
+    /// machine. Non-empty beside a `stamp` is a *partial* answer, which is
+    /// still an answer.
+    silent: Vec<(String, String)>,
+}
+
+impl Agents {
+    /// Whether there is a census here at all. The first thing a client reads,
+    /// and the thing a bare `null` could not say.
+    fn heard(&self) -> bool {
+        self.stamp.is_some()
+    }
 }
 
 fn hex(v: u64) -> String {
@@ -152,90 +204,119 @@ fn digest(bytes: &[u8]) -> u64 {
 
 /// The census, as one number.
 ///
-/// A separate function from the socket call so that what is *in* the stamp is
-/// testable without a herdr — the fields are the whole argument of this file
-/// and a test that had to spawn a terminal to check them would not be written.
-fn census(panes: &[herdr::Pane]) -> u64 {
-    let mut ids: Vec<&herdr::Pane> = panes.iter().collect();
-    ids.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+/// Takes a [`Census`] and not a backend, which is the whole point: what is in
+/// the stamp is a fact about the port's vocabulary, so it is testable against
+/// any implementor — including one with no terminal — without a socket
+/// anywhere near it.
+fn census(c: &Census) -> u64 {
+    let mut seats: Vec<&Seated> = c.seats().collect();
+    seats.sort_by(|a, b| a.seat.as_str().cmp(b.seat.as_str()));
     let mut buf = String::new();
-    for p in ids {
-        // `\u{1f}` between fields so that two fields cannot be slid past each
-        // other — a label ending in the next pane's id would otherwise hash the
-        // same as the pair the other way round.
-        for f in [
-            &p.pane_id,
-            &p.workspace_id,
-            &p.agent,
-            &p.agent_name,
-            &p.agent_status,
-            &p.session_id,
-            &p.label,
-        ] {
-            buf.push_str(f);
-            buf.push('\u{1f}');
-        }
-        // Three states and not two: herdr never sends `false`, so absence and
-        // `false` mean different things — see [`herdr::Pane::interactive_ready`].
-        for f in [p.interactive_ready, p.launch_pending] {
-            buf.push(match f {
-                Some(true) => 'y',
-                Some(false) => 'n',
-                None => '?',
-            });
-            buf.push('\u{1f}');
-        }
+    // `\u{1f}` between fields so that two cannot be slid past each other — a
+    // label ending in the next seat's id would otherwise hash the same as the
+    // pair the other way round.
+    fn field(buf: &mut String, s: &str) {
+        buf.push_str(s);
+        buf.push('\u{1f}');
+    }
+    for s in seats {
+        field(&mut buf, s.seat.as_str());
+        field(&mut buf, &s.label);
+        field(&mut buf, &s.agent.kind);
+        field(&mut buf, &s.agent.name);
+        field(&mut buf, s.state.as_str());
+        field(&mut buf, &s.session);
         buf.push('\u{1e}');
+    }
+    // The partition itself, so that a machine dropping off is a change rather
+    // than its agents quietly ceasing to exist. The reason is left out on
+    // purpose — see the module doc.
+    let mut quiet: Vec<&str> = c.unheard().map(|(m, _)| m).collect();
+    quiet.sort_unstable();
+    for m in quiet {
+        field(&mut buf, m);
+        buf.push('\u{1d}');
     }
     digest(buf.as_bytes())
 }
 
-/// What herdr says the census is, or nothing at all.
+/// Who said nothing, and why, in the shape the answer publishes.
+fn silences(c: &Census) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> =
+        c.unheard().map(|(m, why)| (m.to_string(), why.to_string())).collect();
+    out.sort();
+    out
+}
+
+/// Ask the backend, and keep the difference between an empty census and no
+/// census at all.
+fn agents_now(place: &dyn Place) -> Agents {
+    match place.census() {
+        Ok(c) => Agents { stamp: Some(census(&c)), silent: silences(&c) },
+        // Nobody answered. [`Place::census`] returns this only when *nothing*
+        // did — a far machine being silent comes back inside an `Ok`.
+        Err(why) => Agents { stamp: None, silent: vec![(String::new(), why.to_string())] },
+    }
+}
+
+fn take(store: &Store, place: &dyn Place) -> Stamps {
+    Stamps {
+        record: store.fingerprint(),
+        attention: store.attention_stamp(),
+        agents: agents_now(place),
+    }
+}
+
+/// A machine's name for a person. `""` is this one, and printing nothing there
+/// puts a reason on the line with no subject.
+fn named(machine: &str) -> &str {
+    match machine.is_empty() {
+        true => "this machine",
+        false => machine,
+    }
+}
+
+/// The answer as a client reads it.
 ///
-/// An `Err` is this machine's socket not answering. An `Ok` that is empty is
-/// the same thing one layer up — herdr returns an empty list rather than an
-/// error when the connection is refused mid-fan-out — and the panel already
-/// refuses to read that as everybody finishing at once.
-fn agents_now() -> Option<u64> {
-    if !herdr::available() {
-        return None;
-    }
-    match herdr::panes() {
-        Ok(p) if !p.is_empty() => Some(census(&p)),
-        _ => None,
-    }
-}
-
-fn take(store: &Store) -> Stamps {
-    Stamps { record: store.fingerprint(), attention: store.attention_stamp(), agents: agents_now() }
-}
-
-/// The answer as a client reads it. `agents` is `null` and not missing: a key
-/// that comes and goes is a key a client forgets to look for, and the whole
-/// contract here is that the absence is *read* — as no news — rather than
-/// skipped over.
-fn document(s: &Stamps) -> serde_json::Value {
+/// `agents` is an object and never a bare token, so that "I could not ask"
+/// cannot be reached by comparing one string to another — `heard` is read
+/// first, and a client that skips it gets an object that still differs from the
+/// one before it. See the module doc.
+fn document(s: &Stamps) -> Value {
     json!({
         "record": hex(s.record),
         "attention": hex(s.attention),
-        "agents": s.agents.map(hex),
+        "agents": {
+            "heard": s.agents.heard(),
+            "stamp": s.agents.stamp.map(hex),
+            "silent": s.agents.silent.iter()
+                .map(|(m, why)| json!({ "machine": m, "why": why }))
+                .collect::<Vec<_>>(),
+        },
     })
 }
 
 /// The same three, for a person. Names on the left in a fixed column so the
-/// tokens line up under each other, which is the only way two of these are
-/// ever compared by eye.
+/// tokens line up under each other, which is the only way two of these are ever
+/// compared by eye.
 fn lines(s: &Stamps, p: &Paint) -> Vec<String> {
     let row = |name: &str, v: String| format!("{} {}", p.dim(&format!("{name:<9}")), v);
-    vec![
+    let mut out = vec![
         row("record", hex(s.record)),
         row("attention", hex(s.attention)),
-        row("agents", s.agents.map(hex).unwrap_or_else(|| "-".into())),
-    ]
+        // "no signal" and not "-": a dash reads as a value that happens to be
+        // empty, which is the reading this whole section exists to refuse.
+        row("agents", s.agents.stamp.map(hex).unwrap_or_else(|| "no signal".into())),
+    ];
+    for (m, why) in &s.agents.silent {
+        out.push(row("silent", format!("{} · {why}", named(m))));
+    }
+    out
 }
 
 pub fn stamp(store: &Store, args: &Args) -> i32 {
-    let s = take(store);
+    let place = crate::cmd_spawn::backend(args);
+    let s = take(store, place.as_ref());
     match args.json() {
         true => println!("{}", document(&s)),
         false => {
@@ -250,129 +331,194 @@ pub fn stamp(store: &Store, args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::place::{Agent, Order, Refusal, Seat, State};
 
-    fn pane(id: &str) -> herdr::Pane {
-        herdr::Pane {
-            pane_id: id.into(),
-            workspace_id: "w1".into(),
-            agent: "claude".into(),
-            agent_status: "idle".into(),
-            ..Default::default()
+    fn seated(seat: &str) -> Seated {
+        Seated {
+            seat: Seat::new(seat),
+            agent: Agent { kind: "claude".into(), ..Agent::default() },
+            state: State::Idle,
+            ..Seated::default()
         }
     }
 
-    /// The four waiting states are read off these three fields and nowhere
-    /// else, so a stamp that misses any of them leaves a surface drawing an
-    /// agent that stopped an hour ago. This is the whole reason the agents
-    /// stamp is taken from herdr rather than from the state directory: none of
-    /// these has a file.
+    fn here(seats: Vec<Seated>) -> Census {
+        Census::heard("", seats)
+    }
+
+    /// The reading no file in the store carries, and the reason the census is
+    /// asked of a backend at all: an agent starting a turn, finishing one, or
+    /// stopping in front of a permission prompt.
     #[test]
     fn an_agent_changing_state_moves_the_census() {
-        let idle = vec![pane("p1")];
-        let mut turning = idle.clone();
-        turning[0].agent_status = "running".into();
-        assert_ne!(census(&idle), census(&turning), "a turn starting was invisible");
-
-        let mut ready = idle.clone();
-        ready[0].interactive_ready = Some(true);
-        assert_ne!(census(&idle), census(&ready), "interactive_ready was invisible");
-
-        let mut launching = idle.clone();
-        launching[0].launch_pending = Some(true);
-        assert_ne!(census(&idle), census(&launching), "launch_pending was invisible");
+        let idle = here(vec![seated("p1")]);
+        for other in [State::Working, State::Starting, State::Blocked, State::Gone] {
+            let mut row = seated("p1");
+            row.state = other;
+            assert_ne!(
+                census(&idle),
+                census(&here(vec![row])),
+                "{} was invisible beside idle",
+                other.as_str()
+            );
+        }
     }
 
-    /// Absence and `false` are two different answers from herdr — it never
-    /// sends `false` — and a stamp that flattened them would move once, on the
-    /// day herdr starts sending it, and never explain why.
+    /// `wsp say` publishes its sentence into the seat's label, so the label is
+    /// where a status line changing is visible; a census that skipped it would
+    /// draw yesterday's sentence.
     #[test]
-    fn an_unset_field_is_not_the_same_as_a_false_one() {
-        let mut absent = vec![pane("p1")];
-        absent[0].interactive_ready = None;
-        let mut no = absent.clone();
-        no[0].interactive_ready = Some(false);
-        assert_ne!(census(&absent), census(&no));
+    fn a_seat_saying_something_new_moves_the_census() {
+        let before = here(vec![seated("p1")]);
+        let mut row = seated("p1");
+        row.label = "landed the doorbell fix".into();
+        assert_ne!(census(&before), census(&here(vec![row])));
     }
 
-    /// `wsp say` publishes its sentence as the pane's label and keeps nothing
-    /// in the store unless the label had to be cut — so the label is where a
-    /// status line changing is visible, and a census that skipped it would draw
-    /// yesterday's sentence.
-    #[test]
-    fn a_pane_saying_something_new_moves_the_census() {
-        let before = vec![pane("p1")];
-        let mut after = before.clone();
-        after[0].label = "landed the doorbell fix".into();
-        assert_ne!(census(&before), census(&after));
-    }
-
-    /// A pane arriving or leaving is the loudest thing in a census, and it is
-    /// what the state directory cannot see: a pane exiting clears its binding
+    /// A seat arriving or leaving is the loudest thing in a census, and it is
+    /// what the state directory cannot see: a seat ending clears its binding
     /// only once a daemon tick has reconciled it.
     #[test]
-    fn a_pane_arriving_or_leaving_moves_the_census() {
-        let one = vec![pane("p1")];
-        let two = vec![pane("p1"), pane("p2")];
+    fn a_seat_arriving_or_leaving_moves_the_census() {
+        let one = here(vec![seated("p1")]);
+        let two = here(vec![seated("p1"), seated("p2")]);
         assert_ne!(census(&one), census(&two), "a second agent was invisible");
-        assert_ne!(census(&two), census(&vec![pane("p2")]), "a departure was invisible");
+        assert_ne!(census(&two), census(&here(vec![seated("p2")])), "a departure was invisible");
     }
 
-    /// herdr's ordering is herdr's own and a reordering is not news. Without
-    /// the sort this would refetch the whole store on whatever order a
-    /// `pane.list` happened to come back in.
+    /// A backend's ordering is the backend's own. Without the sort this would
+    /// refetch the whole store on whatever order a listing came back in.
     #[test]
-    fn the_same_panes_in_another_order_are_not_news() {
-        let a = vec![pane("p1"), pane("p2"), pane("p3")];
-        let b = vec![pane("p3"), pane("p1"), pane("p2")];
+    fn the_same_seats_in_another_order_are_not_news() {
+        let a = here(vec![seated("p1"), seated("p2"), seated("p3")]);
+        let b = here(vec![seated("p3"), seated("p1"), seated("p2")]);
         assert_eq!(census(&a), census(&b));
     }
 
-    /// The exclusions are the half of the argument a test usually loses. A
-    /// terminal rewrites its title on every prompt and `focused` moves whenever
-    /// somebody looks at another window; either one in the stamp is a full
-    /// refetch every time a person types.
+    /// The exclusion is the half of an argument a test usually loses. A cwd
+    /// moves whenever somebody cds, and a stamp that moves when nothing a
+    /// census draws has moved costs a full refetch every time a person types.
     #[test]
-    fn a_title_or_a_focus_change_is_not_census_news() {
-        let before = vec![pane("p1")];
-        let mut typing = before.clone();
-        typing[0].title = "~/claude/wsp — vim src/store.rs".into();
-        assert_eq!(census(&before), census(&typing), "a terminal title moved the stamp");
-
-        let mut looked_at = before.clone();
-        looked_at[0].focused = true;
-        assert_eq!(census(&before), census(&looked_at), "switching windows moved the stamp");
+    fn a_seat_changing_directory_is_not_census_news() {
+        let before = here(vec![seated("p1")]);
+        let mut row = seated("p1");
+        row.cwd = "~/claude/wsp/.worktrees/wsp-100".into();
+        assert_eq!(census(&before), census(&here(vec![row])), "a cwd moved the stamp");
     }
 
-    /// Fields are separated rather than run together, so no pane can be slid
+    /// Fields are separated rather than run together, so no seat can be slid
     /// past its neighbour into the same digest.
     #[test]
-    fn two_panes_cannot_be_confused_for_one_by_running_their_fields_together() {
-        let mut a = vec![pane("p1")];
-        a[0].agent = "claude".into();
-        a[0].agent_name = "wsp-100".into();
-        let mut b = vec![pane("p1")];
-        b[0].agent = "claudewsp".into();
-        b[0].agent_name = "-100".into();
-        assert_ne!(census(&a), census(&b));
+    fn two_seats_cannot_be_confused_for_one_by_running_their_fields_together() {
+        let mut a = seated("p1");
+        a.agent = Agent { kind: "claude".into(), name: "wsp-100".into(), args: Vec::new() };
+        let mut b = seated("p1");
+        b.agent = Agent { kind: "claudewsp".into(), name: "-100".into(), args: Vec::new() };
+        assert_ne!(census(&here(vec![a])), census(&here(vec![b])));
     }
 
-    /// A client polling this cannot ask again for a value it did not get, so
-    /// silence has to be *in* the answer rather than inferred from a missing
-    /// key. Both spellings are contract: `null`, and `-` for the person.
+    /// **A machine dropping off is a change, not its agents ceasing to exist.**
+    /// Its seats stop appearing in `seats()`, so a digest over the rows alone
+    /// would move once and thereafter read as everybody there having stopped.
     #[test]
-    fn herdr_not_answering_is_said_rather_than_left_out() {
-        let quiet = Stamps { record: 1, attention: 2, agents: None };
+    fn a_machine_going_silent_is_a_change_and_not_an_empty_machine() {
+        let both = here(vec![seated("p1")]).and(Census::heard("mb2", vec![seated("p9@mb2")]));
+        let partitioned =
+            here(vec![seated("p1")]).and(Census::silent("mb2", Refusal::Unreachable("gone".into())));
+        assert_ne!(census(&both), census(&partitioned), "the partition was invisible");
+
+        // …and it is not the same as mb2 answering that it holds nothing.
+        let empty = here(vec![seated("p1")]).and(Census::heard("mb2", vec![]));
+        assert_ne!(
+            census(&empty),
+            census(&partitioned),
+            "a silent machine hashed the same as one holding no agents"
+        );
+    }
+
+    /// The wording of a refusal is a backend's own and may differ run to run.
+    /// A stamp that moved with it would refetch the store on the phrasing of an
+    /// error message.
+    #[test]
+    fn the_wording_of_a_refusal_is_not_in_the_stamp() {
+        let a = Census::silent("mb2", Refusal::Unreachable("connection refused".into()));
+        let b = Census::silent("mb2", Refusal::Backend("no route to host".into()));
+        assert_eq!(census(&here(vec![seated("p1")]).and(a)), census(&here(vec![seated("p1")]).and(b)));
+    }
+
+    /// `compound-062`. A client polling reads `heard` before it compares
+    /// anything, because "I could not ask" compares equal to itself for ever
+    /// and would otherwise be read as "nothing changed" — a census frozen
+    /// beside a record half that is still moving.
+    #[test]
+    fn nobody_answering_is_said_rather_than_left_to_compare_equal() {
+        let quiet = Stamps {
+            record: 1,
+            attention: 2,
+            agents: Agents { stamp: None, silent: vec![(String::new(), "no herdr socket".into())] },
+        };
         let doc = document(&quiet);
-        assert!(doc.get("agents").is_some(), "the key went missing instead of saying nothing");
-        assert!(doc["agents"].is_null(), "silence came back as a value: {}", doc["agents"]);
+        assert_eq!(doc["agents"]["heard"], json!(false), "silence did not say so");
+        assert!(doc["agents"]["stamp"].is_null(), "silence came back as a value");
+        assert_eq!(doc["agents"]["silent"][0]["machine"], json!(""));
+        assert_eq!(doc["agents"]["silent"][0]["why"], json!("no herdr socket"));
+
         let drawn = lines(&quiet, &Paint::plain());
         assert!(
-            drawn.iter().any(|l| l.split_whitespace().eq(["agents", "-"])),
+            drawn.iter().any(|l| l.contains("no signal")),
             "no row said the census was unanswered: {drawn:?}"
         );
+        assert!(drawn.iter().any(|l| l.contains("this machine")), "{drawn:?}");
+    }
 
-        let live = Stamps { record: 1, attention: 2, agents: Some(3) };
-        assert_eq!(document(&live)["agents"], json!(hex(3)));
+    /// The other side of it: a census that *was* heard and holds nothing is a
+    /// fact, and it must not read as silence.
+    #[test]
+    fn a_backend_holding_nothing_is_an_answer_and_not_a_silence() {
+        let heard_nothing = here(vec![]);
+        let empty = Stamps {
+            record: 1,
+            attention: 2,
+            agents: Agents { stamp: Some(census(&heard_nothing)), silent: Vec::new() },
+        };
+        let doc = document(&empty);
+        assert_eq!(doc["agents"]["heard"], json!(true), "an empty census read as no answer");
+        assert!(doc["agents"]["stamp"].is_string());
+        assert_eq!(doc["agents"]["silent"], json!([]));
+    }
+
+    /// **A second backend, and it has no terminal at all.** The digest is a
+    /// function of the port's vocabulary, so a supervisor's seats arrive in it
+    /// on exactly the same terms as a pane's — which is the whole reason this
+    /// file no longer reads `agent_status`.
+    #[test]
+    fn a_backend_with_no_terminal_answers_into_the_same_stamp() {
+        let root = std::env::temp_dir()
+            .join(format!("wsp-stamp-super-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let place = crate::place_super::Supervisor::at(root.clone());
+
+        let empty = agents_now(&place);
+        assert!(empty.heard(), "a supervisor with no seats still answered");
+        assert!(empty.silent.is_empty());
+
+        let seat = place
+            .open(&Order { label: "wsp-100 · stamp".into(), ..Order::default() })
+            .expect("a seat");
+        let opened = agents_now(&place);
+        assert_ne!(opened.stamp, empty.stamp, "a seat opening was invisible to the stamp");
+
+        // And the same rows, however they were come by, are the same stamp:
+        // nothing in the digest knows which backend filled them in.
+        let by_hand = Census::heard(
+            "",
+            place.census().unwrap().seats().cloned().collect::<Vec<_>>(),
+        );
+        assert_eq!(opened.stamp, Some(census(&by_hand)));
+
+        place.stop(&seat).expect("the seat was there");
+        assert_ne!(agents_now(&place).stamp, opened.stamp, "the seat ending was invisible");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Hex and not a number, so that a client wanting to subtract two stamps

@@ -849,6 +849,15 @@ fn launching_json(spot: &Spot) -> Value {
 fn agent_json(spot: &Spot) -> Value {
     let (agent, status, ready) = of_state(spot);
     let mut v = pane_json(spot);
+    // **`agent.list` carries no label.** Measured against the live herdr 0.7.5
+    // on 2026-08-25: its two listings differ by exactly `label` and `scroll`,
+    // both of which only `pane.list` has. Building this on `pane_json` handed
+    // out a field the real backend does not send, and a census reading its rows
+    // from here came back with a label the same code could never get in
+    // production — which is how `Seated::label` was empty for every running
+    // agent for a day without a test noticing. A fake more generous than the
+    // thing it stands in for is worse than no fake.
+    v.as_object_mut().map(|o| o.remove("label"));
     v["agent"] = json!(agent.unwrap_or(""));
     v["agent_status"] = json!(status);
     v["state_change_seq"] = json!(1);

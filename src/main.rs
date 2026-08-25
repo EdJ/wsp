@@ -1639,14 +1639,17 @@ fn help_text() -> String {
   wsp unpin [-w ws]                 take the pin off again
   wsp where                         what project am I in, and why
   wsp wip                           everything in flight, with agents
-  wsp stamp [--json]                has anything changed? Three opaque tokens
+  wsp stamp [--headless] [--json]   has anything changed? Three opaque tokens
                                     for a separate process polling on an
                                     interval — the records, the raised hands,
-                                    and the agent census read from herdr, which
-                                    no file in the store can answer for.
-                                    Compared for equality and never ordered or
-                                    subtracted; `-` for the census is herdr not
-                                    answering, which is not a change
+                                    and the agent census, which no file in the
+                                    store can answer for and which is asked of
+                                    whatever backend runs the agents. Compared
+                                    for equality and never ordered or
+                                    subtracted. The census answers `heard`
+                                    before it answers a stamp: `no signal` is
+                                    nobody having answered, which is not a
+                                    change and is not an empty census either
   wsp watch [<project>] [<signal>…]  the few facts a governor acts on, as they
                                     become true: needs-a-person, review,
                                     blocked, flag, unanswered, agent-gone, and

@@ -1342,7 +1342,8 @@ impl Store {
     /// [`Store::attention_stamp`] beside this rather than widening this. A
     /// surface in *another process* reads both from `wsp stamp`, which also
     /// answers for the half neither of them can — the agent census, which is
-    /// herdr's and not in any file here. That is [`crate::cmd_stamp`].
+    /// no file's to answer and is asked of [`crate::place::Place`] instead.
+    /// That is [`crate::cmd_stamp`].
     ///
     /// **This number is published.** `wsp stamp` puts it on the CLI, so
     /// changing what goes into the mix makes every such client see one spurious
