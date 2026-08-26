@@ -1,0 +1,884 @@
+//! compound behind the place-work port: a real pty per seat, observed the
+//! same way [`crate::place_super`] observes a headless one.
+//!
+//! The fourth implementor of `place.rs` (`compound-064`, `compound` d7/d9).
+//! `place_herdr` types at a shell inside a multiplexer; `place_super` forks a
+//! process with no terminal at all; this one asks `compound-sup` — the
+//! resident supervisor `~/claude/compound` builds, one process per session,
+//! full libghostty rendering into an IOSurface — to open a real pty and
+//! leaves the session running whether or not anything is attached to it.
+//!
+//! # What compound gives this backend that `place_super` does not have
+//!
+//! A terminal. An agent placed here can be **sat down in front of** — the
+//! compound host discovers the same socket this backend minted
+//! (`compound-028`'s directory-of-sockets convention, untouched) and can
+//! attach a pane to it — which is the whole reason this backend exists
+//! rather than `place_super` growing a screen. See "Identity" below for how
+//! a click in that window is supposed to find its way back here.
+//!
+//! # The eyes are borrowed, not reinvented
+//!
+//! `compound` d7 asks which signals decide [`State`], not whether they
+//! exist, and the answer is: the same ones `place_super` already uses.
+//! Claude Code fires the same lifecycle hooks whether its stdin is a `tail
+//! -f` or a real pty — a hook does not know what is on the other end of its
+//! stdio — so [`crate::place_super::said_by`], [`crate::place_super::alive`]
+//! and [`crate::place_super::tally_burn`] are reused verbatim rather than
+//! copied. What differs is only what a seat *records*: a `compound-sup`
+//! socket and pid instead of a `tail`/agent process pair. Two directories,
+//! two [`Place`] implementors, one hook vocabulary — `wsp report` (below)
+//! is what keeps a hook from having to know which one it landed in.
+//!
+//! herdr's screen-scraped `Blocked` state has no equivalent in
+//! `place_super`'s headless world (robustness-051: a headless agent's denied
+//! tool call never fires `PermissionRequest`, because there is no prompt to
+//! run before). **A pty changes that.** An agent hosted here can genuinely
+//! sit in front of a permission dialog, so `said_by`'s
+//! `PermissionRequest`/`Elicitation` → `Working` approximation is exactly as
+//! honest here as it is there, and no more — a seventh state is
+//! robustness-051's, not this row's.
+//!
+//! # `start`, and what it does not have to build
+//!
+//! `compound-sup spawn --label <seat> --cwd … --cols … --rows … -- <agent>`
+//! is run with **no `--socket`**, so `compound-sup` mints its own name in
+//! the one run directory `compound-028` already made canonical
+//! (`$COMPOUND_RUN_DIR`, or `~/.compound/run`) — this file does not
+//! duplicate that minting, on purpose: two independent generators of "the
+//! known socket directory" is exactly the kind of drift `robustness-017`
+//! warns a port's adapters not to invent. The label is the seat's own id,
+//! written by `compound-sup` itself as the `<name>.label` sidecar
+//! `compound-028` d4 built — display-only there, and the join key here: it
+//! is how something that already knows the socket (a discovery scan) finds
+//! the seat that owns it, without this file or that one gaining a second
+//! notion of identity.
+//!
+//! `compound-sup` daemonizes with `setsid()` and never forks again
+//! (`session::daemonize`), so the pid this process sees at `spawn()` is the
+//! pid for the session's whole life **and** its own process group leader —
+//! [`Place::stop`] signals that pid's group and needs nothing else.
+//!
+//! Its handshake — `sup <pid>`, `pid <pid>`, `socket <path>` on stdout,
+//! before stdio is shed — is the one thing read here rather than reasoned
+//! about; `sup`'s pid is `Command::spawn`'s own answer already, so only the
+//! socket line is parsed.
+//!
+//! # `tell`, and why it need not hold a pipe open
+//!
+//! `place_super`'s module docs name the hard-won lesson: a writer that
+//! opens, writes and closes leaves a headless Claude Code deaf, because
+//! nothing else holds its stdin open. That constraint does not cross here —
+//! a compound session's durability is the resident supervisor's, not this
+//! client's connection to it, so [`Place::tell`] dials, sends the sentence
+//! as [`supervisor's `Input`][wire] (the paste door, which is what a real
+//! terminal's "type this at me" already means), presses Enter as a
+//! [`KeyEvent`], and disconnects. Nothing is left holding anything open.
+//!
+//! [wire]: https://en.wikipedia.org/wiki/Newline_delimited_JSON
+//!
+//! # The wire is read here, not depended on
+//!
+//! `~/claude/compound` and this tree are separate repositories with
+//! separate histories; there is no crate boundary to depend across even if
+//! one wanted to name a path across two checkouts nobody can promise sit
+//! beside each other. What is here instead is the handful of wire shapes
+//! [`Place::tell`] actually needs — an envelope, `Attach`, `Input`, `Key`,
+//! `Detach` — read against `crates/supervisor/src/proto.rs` VERSION 6 at
+//! the time of writing and versioned the same way that file is: a refusal
+//! rather than a guess if the peer ever disagrees. **This is the one seam
+//! in this file that ages by hand** — a wire bump on the compound side is
+//! invisible here until something exercises it, which is why the version is
+//! checked and refused loudly rather than assumed.
+//!
+//! # Identity: what `Seat` is, and what it is not
+//!
+//! `compound` d9 settles the question `compound-052` found the cost of:
+//! **wsp mints and holds the id.** A `Seat` here is `cpd-1`, `cpd-2` — this
+//! backend's own opaque token, exactly as `place_super`'s `sup-N` is —
+//! never the compound-sup socket path and never its label. The socket path
+//! is an *attribute* recorded in the seat's own record, for this backend's
+//! own use; nothing else in wsp reads it, and the port is not widened to
+//! carry it.
+//!
+//! What makes that survive contact with a window that needs to *open* a
+//! pane on a census row is the label sidecar, not a new port field: this
+//! backend writes the seat's id as the session's label, so anything that
+//! already discovers sockets (`compound-028`) can read the label sitting
+//! beside one and ask "does wsp have a seat named this" — a compound-side
+//! join, using a mechanism compound already built for display, doing one
+//! more honest thing with it. Wiring that join into the census strip's
+//! click is `compound-064`'s open half; see the task log rather than this
+//! file for where that stands.
+
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::place::{self, Agent, Census, Delivery, Event, Order, Place, Refusal, Result, Seat, Seated, State};
+use crate::place_super::{alive, read_json, signal_group, str_of, tally_burn};
+#[cfg(test)]
+use crate::place_super::said_by;
+use crate::store::{write_atomic, Store};
+use crate::util::{self, Clock};
+
+/// compound as a place to put work.
+pub struct Compound<'a> {
+    /// Where seats live. One directory each, under this — never the
+    /// compound-sup run directory, which this backend does not own and does
+    /// not mint into.
+    pub root: PathBuf,
+    /// How long a `SIGTERM`ed session gets before [`Place::stop`] kills it.
+    pub linger: Duration,
+    pub poll: Duration,
+    pub clock: &'a dyn Clock,
+}
+
+impl Compound<'static> {
+    pub fn new() -> Compound<'static> {
+        Compound::at(Store::open().state.join(SEATS))
+    }
+
+    /// One rooted anywhere — a test's temporary directory.
+    pub fn at(root: PathBuf) -> Compound<'static> {
+        Compound {
+            root,
+            linger: Duration::from_millis(2_000),
+            poll: Duration::from_millis(150),
+            clock: &util::Wall,
+        }
+    }
+}
+
+const SEATS: &str = "compound-seats";
+const SEAT_FILE: &str = "seat.json";
+const SAID_FILE: &str = "said.json";
+const NEXT_FILE: &str = "next";
+const SEAT_PREFIX: &str = "cpd-";
+
+/// How long `start` waits for `compound-sup`'s handshake before giving up on
+/// it. Generous: the supervisor daemonizes, opens libghostty and binds a pty
+/// before it prints the third line, and a spawn that is going to fail (a
+/// bad cwd, a missing program) says so on the same stdout rather than
+/// hanging — so the bound is a safety net, not the expected path.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a `tell` or `state`-adjacent dial waits for the socket to
+/// accept. A live session answers `Attach` in well under a millisecond
+/// (it is a local accept, not a wire round trip); this is room for a
+/// session under load, not an expected wait.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Where `compound-sup` lives: `$COMPOUND_SUP`, or found on `PATH`.
+///
+/// There is no relative-path fallback the way `crates/host/src/sessions.rs`
+/// has one, and cannot be: that fallback is "beside this binary", which
+/// means something for the compound host built from its own workspace and
+/// means nothing for `wsp`, a separate binary in a separate repository. An
+/// operator who wants `wsp` to place compound work sets the variable once,
+/// the same shape as `HERDR_SOCKET_PATH` already is for the other backend.
+fn compound_sup_binary() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("COMPOUND_SUP") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join("compound-sup")).find(|p| p.is_file())
+}
+
+impl Compound<'_> {
+    pub(crate) fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
+        let id = seat.as_str();
+        let plain = !id.is_empty()
+            && !id.starts_with('.')
+            && !id.contains('/')
+            && !id.contains('\\')
+            && id.len() < 128;
+        match plain {
+            true => Ok(self.root.join(id)),
+            false => Err(Refusal::NoSeat(seat.clone())),
+        }
+    }
+
+    fn record(&self, seat: &Seat) -> Result<Value> {
+        let dir = self.dir_of(seat)?;
+        match dir.is_dir() {
+            true => Ok(read_json(&dir.join(SEAT_FILE))),
+            false => Err(Refusal::NoSeat(seat.clone())),
+        }
+    }
+
+    fn said(&self, seat: &Seat) -> Value {
+        match self.dir_of(seat) {
+            Ok(dir) => read_json(&dir.join(SAID_FILE)),
+            Err(_) => json!({}),
+        }
+    }
+
+    /// A seat id nothing has ever been called. See `place_super::mint` —
+    /// this is the same `O_EXCL` argument against a directory of this
+    /// backend's own, so the two counters can never collide even though the
+    /// prefixes already would not.
+    fn mint(&self) -> Result<Seat> {
+        fs::create_dir_all(&self.root).map_err(|e| Refusal::Backend(e.to_string()))?;
+        let mut n = self.next_number();
+        loop {
+            let id = format!("{SEAT_PREFIX}{n}");
+            match fs::create_dir(self.root.join(&id)) {
+                Ok(()) => {
+                    let _ = write_atomic(&self.root.join(NEXT_FILE), &(n + 1).to_string());
+                    return Ok(Seat::new(id));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                Err(e) => return Err(Refusal::Backend(e.to_string())),
+            }
+        }
+    }
+
+    fn next_number(&self) -> u64 {
+        let counted = fs::read_to_string(self.root.join(NEXT_FILE))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(1);
+        let highest = self
+            .ids()
+            .iter()
+            .filter_map(|id| id.strip_prefix(SEAT_PREFIX)?.parse::<u64>().ok())
+            .max()
+            .map(|n| n + 1)
+            .unwrap_or(1);
+        counted.max(highest).max(1)
+    }
+
+    fn ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// One hook, recorded against a seat. Identical in shape to
+    /// [`crate::place_super::Supervisor::heard`] — same two files, same
+    /// reason for two — because the fact being recorded (what an agent's
+    /// hook just said) does not depend on what is on the other end of its
+    /// stdio.
+    pub fn heard(&self, seat: &Seat, hook: &str, state: State, payload: &Value) {
+        let Ok(dir) = self.dir_of(seat) else { return };
+        if !dir.is_dir() {
+            return;
+        }
+        let was = read_json(&dir.join(SAID_FILE));
+        let keep = |key: &str| -> String {
+            match str_of(payload, key).is_empty() {
+                true => str_of(&was, key),
+                false => str_of(payload, key),
+            }
+        };
+        let _ = write_atomic(
+            &dir.join(SAID_FILE),
+            &json!({
+                "state": state.as_str(),
+                "hook": hook,
+                "at": util::now_iso(),
+                "session_id": keep("session_id"),
+                "transcript_path": keep("transcript_path"),
+            })
+            .to_string(),
+        );
+        tally_burn(&dir, payload);
+    }
+
+    /// Whether this seat's `compound-sup` still holds its pid, per the same
+    /// `ps` `alive` reads for a bare-forked one. `compound-sup` daemonizes
+    /// but never forks again, so the pid this recorded at `start` is the
+    /// process for the session's whole life — there is no second pid to
+    /// reconcile the way a fork-then-exec backend would have to.
+    fn state_of(&self, seat: &Seat, rec: &Value, running: &BTreeSet<u32>) -> State {
+        let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) else { return State::Empty };
+        if !running.contains(&(pid as u32)) {
+            return State::Gone;
+        }
+        let said = self.said(seat);
+        match said.get("state").and_then(|s| s.as_str()) {
+            Some("idle") => State::Idle,
+            Some("working") => State::Working,
+            Some("gone") => State::Gone,
+            _ => State::Starting,
+        }
+    }
+
+    fn seated(&self, seat: &Seat, rec: &Value, state: State) -> Seated {
+        let agent = rec.get("agent").cloned().unwrap_or(json!({}));
+        Seated {
+            seat: seat.clone(),
+            label: str_of(rec, "label"),
+            cwd: str_of(rec, "cwd"),
+            agent: Agent {
+                kind: str_of(&agent, "kind"),
+                name: str_of(&agent, "name"),
+                args: agent
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default(),
+            },
+            state,
+            session: str_of(&self.said(seat), "session_id"),
+        }
+    }
+
+    fn survey(&self) -> Vec<Seated> {
+        let seats: Vec<(Seat, Value)> = self
+            .ids()
+            .into_iter()
+            .map(|id| {
+                let seat = Seat::new(id);
+                let rec = self.record(&seat).unwrap_or(json!({}));
+                (seat, rec)
+            })
+            .collect();
+        let pids: Vec<u32> = seats
+            .iter()
+            .filter_map(|(_, r)| r.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32))
+            .collect();
+        let running = alive(&pids);
+        seats
+            .iter()
+            .map(|(seat, rec)| {
+                let state = self.state_of(seat, rec, &running);
+                self.seated(seat, rec, state)
+            })
+            .collect()
+    }
+
+    /// The socket this seat's session answers on — the attribute d9 keeps
+    /// out of [`Seat`] itself. `None` before [`Place::start`] has run, or
+    /// after the session is gone.
+    pub fn socket_of(&self, seat: &Seat) -> Option<PathBuf> {
+        self.record(seat).ok().and_then(|rec| {
+            let s = str_of(&rec, "socket");
+            (!s.is_empty()).then(|| PathBuf::from(s))
+        })
+    }
+}
+
+/// `compound-sup`'s three-line handshake, read with a deadline off a
+/// background thread so a supervisor that never prints one (a bad build, a
+/// hung `zig` toolchain, anything short of the ordinary path) cannot hang
+/// [`Place::start`] rather than refuse it.
+fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Option<PathBuf> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut socket = None;
+        for _ in 0..3 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if let Some(path) = line.trim().strip_prefix("socket ") {
+                socket = Some(PathBuf::from(path));
+                break;
+            }
+        }
+        // Best effort: a receiver that has already timed out is a send
+        // nobody reads, not an error.
+        let _ = tx.send(socket);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
+// ---------------------------------------------------------------------------
+// The wire, read rather than depended on. See the module docs' "The wire is
+// read here, not depended on".
+// ---------------------------------------------------------------------------
+
+/// `crates/supervisor/src/proto.rs` VERSION at the time this was written.
+/// Bumped there without a matching bump here is exactly the drift
+/// `robustness-017` warns an adapter not to risk quietly — so a mismatch is
+/// refused rather than sent into a peer that may not parse it.
+const WIRE_VERSION: u32 = 6;
+
+fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match UnixStream::connect(socket) {
+            Ok(s) => return Ok(s),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(Refusal::Backend(format!("no answer from {}: {e}", socket.display())))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn send(stream: &mut UnixStream, body: Value) -> std::io::Result<()> {
+    let mut line = json!({ "ver": WIRE_VERSION }).as_object().unwrap().clone();
+    line.extend(body.as_object().cloned().unwrap_or_default());
+    let mut bytes = serde_json::to_vec(&line)?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes)
+}
+
+/// One reply line, or `None` on EOF/timeout — a compound session that
+/// answers nothing within the read timeout is read the same way a `tell`
+/// with no watcher already reads: as `Unconfirmed`, not as a hang.
+fn recv_line(stream: &mut UnixStream, timeout: Duration) -> Option<Value> {
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => serde_json::from_str(&line).ok(),
+    }
+}
+
+/// Standard base64, matching `supervisor::proto`'s local encoder — the wire
+/// carries `Input`'s bytes this way and there is no third-party dependency
+/// worth pulling in for one field.
+fn b64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Type at a session and press Enter — [`Place::tell`], stripped of the
+/// hook-state bookkeeping so a test can drive it against a bare listener.
+/// `Attach` first, because the wire refuses any other frame from an
+/// unclaimed connection; `Detach` last, so the session sees this client
+/// leave rather than an EOF it has to notice on its own clock.
+fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
+    let mut stream = dial(socket, DIAL_TIMEOUT)?;
+    send(&mut stream, json!({ "attach": {} })).map_err(|e| Refusal::Backend(e.to_string()))?;
+    match recv_line(&mut stream, DIAL_TIMEOUT) {
+        Some(v) if v.get("error").is_some() => {
+            return Err(Refusal::Backend(str_of(&v["error"], "what")))
+        }
+        None => return Err(Refusal::Backend("no answer to attach".into())),
+        _ => {}
+    }
+    send(&mut stream, json!({ "input": { "bytes": b64(text.as_bytes()) } }))
+        .map_err(|e| Refusal::Backend(e.to_string()))?;
+    send(
+        &mut stream,
+        json!({ "key": { "event": {
+            "action": "press",
+            "key": "enter",
+            "mods": { "shift": false, "ctrl": false, "alt": false, "cmd": false },
+            "unshifted_codepoint": 0,
+        }}}),
+    )
+    .map_err(|e| Refusal::Backend(e.to_string()))?;
+    let _ = send(&mut stream, json!({ "detach": {} }));
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+impl Place for Compound<'_> {
+    fn open(&self, order: &Order) -> Result<Seat> {
+        if order.on.is_some() {
+            // Nothing here reaches a socket on another machine; a compound
+            // session is exactly as local as the pty it owns.
+            return Err(Refusal::Unsupported("run a compound session on another machine"));
+        }
+        let seat = self.mint()?;
+        let dir = self.dir_of(&seat)?;
+        let mut env: BTreeMap<String, String> = order.env.clone();
+        env.insert(place::SEAT_ENV.to_string(), seat.to_string());
+        let rec = json!({
+            "label": order.label,
+            "cwd": order.cwd.as_deref().map(|c| util::expand(c).display().to_string()),
+            "env": env,
+            "opened_at": util::now_iso(),
+        });
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
+            .map_err(|e| Refusal::Backend(e.to_string()))?;
+        Ok(seat)
+    }
+
+    fn here(&self) -> Option<Seat> {
+        place::seat_from_env()
+    }
+
+    /// `compound-sup spawn --label <seat> …` and nothing more: no `--socket`
+    /// (see the module docs on why this backend does not mint into
+    /// compound's run directory itself), the agent as the pty's own child so
+    /// a person who attaches sees exactly the agent rather than a shell
+    /// wrapping one.
+    fn start(&self, seat: &Seat, agent: &Agent) -> Result<()> {
+        let rec = self.record(seat)?;
+        let dir = self.dir_of(seat)?;
+        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
+            if alive(&[pid as u32]).contains(&(pid as u32)) {
+                return Err(Refusal::Backend(format!("{seat} already has a session running")));
+            }
+        }
+        let Some(sup) = compound_sup_binary() else {
+            return Err(Refusal::Backend(
+                "compound-sup not found — set $COMPOUND_SUP or put it on PATH".into(),
+            ));
+        };
+
+        let mut cmd = Command::new(&sup);
+        cmd.arg("spawn").args(["--label", seat.as_str()]);
+        let cwd = str_of(&rec, "cwd");
+        if !cwd.is_empty() {
+            cmd.args(["--cwd", &cwd]);
+        }
+        cmd.arg("--").arg(&agent.kind).args(&agent.args);
+
+        let env: BTreeMap<String, String> = rec
+            .get("env")
+            .and_then(|e| e.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Onto compound-sup's own environment, which its pty child inherits
+        // in turn — the same "override, never replace" contract
+        // `place_super::child_env` keeps, for the same reason: an empty
+        // value is the only strip a spawned process's env accepts.
+        for (k, v) in &env {
+            match v.is_empty() {
+                true => cmd.env_remove(k),
+                false => cmd.env(k, v),
+            };
+        }
+        for k in place::shed_keys() {
+            cmd.env_remove(k);
+        }
+
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+
+        let mut child = cmd.spawn().map_err(|e| Refusal::Backend(format!("{} did not start: {e}", sup.display())))?;
+        let pid = child.id();
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            return Err(Refusal::Backend("compound-sup gave no handshake pipe".into()));
+        };
+        // The child is daemonized (setsid) and outlives this process by
+        // design — dropped rather than waited on, same as
+        // `crates/host/src/sessions.rs::Panes::open`.
+        drop(child);
+
+        let Some(socket) = read_handshake(stdout, HANDSHAKE_TIMEOUT) else {
+            signal_group(pid, "KILL");
+            return Err(Refusal::Backend("compound-sup never announced a socket".into()));
+        };
+
+        let mut rec = rec;
+        rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
+        rec["pid"] = json!(pid);
+        rec["socket"] = json!(socket.display().to_string());
+        rec["started_at"] = json!(util::now_iso());
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
+            .map_err(|e| Refusal::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Paste the sentence, press Enter, disconnect — see the module docs'
+    /// "`tell`, and why it need not hold a pipe open".
+    fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery> {
+        let state = self.state(seat)?;
+        if !state.will_take_a_prompt() {
+            return Err(Refusal::NotReady(state));
+        }
+        let socket = self.socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+        type_and_submit(&socket, text)?;
+        // Typed rather than watched: this backend has not read the reply
+        // that would let it say more, so `Unconfirmed` is the honest answer
+        // `place.rs` asks for from a backend that delivered without seeing
+        // whether a turn started.
+        Ok(Delivery::Unconfirmed)
+    }
+
+    /// End the session and let the seat go. `SIGTERM` the group (which is
+    /// the compound-sup pid itself — see the module docs), a short wait for
+    /// its own `SessionEnd`-on-the-way-out the same as `place_super`
+    /// measures, then `SIGKILL`; the directory goes either way.
+    fn stop(&self, seat: &Seat) -> Result<()> {
+        let rec = self.record(seat)?;
+        let dir = self.dir_of(seat)?;
+        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32) {
+            signal_group(pid, "TERM");
+            let deadline = self.clock.now() + self.linger;
+            while alive(&[pid]).contains(&pid) {
+                if self.clock.now() >= deadline {
+                    signal_group(pid, "KILL");
+                    break;
+                }
+                self.clock.rest(self.poll);
+            }
+        }
+        // `compound-sup` unlinks its own socket on the way out of its run
+        // loop, but installs no `SIGTERM` handler — measured, not assumed —
+        // so a signalled exit skips that cleanup and leaves the headstone
+        // `compound-028` d2 already named the remedy for: connect, and an
+        // `ECONNREFUSED` says nothing is listening, which is what licenses
+        // removing the file rather than a process. `compound-031` is where
+        // the general case (a session whose host is gone and nobody asked
+        // it to stop) is filed; this is the one seat this call just ended.
+        if let Some(socket) = self.socket_of(seat) {
+            if socket.exists() && UnixStream::connect(&socket).is_err() {
+                let _ = fs::remove_file(&socket);
+                let _ = fs::remove_file(socket.with_extension("label"));
+            }
+        }
+        fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    fn state(&self, seat: &Seat) -> Result<State> {
+        let rec = self.record(seat)?;
+        let pids: Vec<u32> =
+            rec.get("pid").and_then(|p| p.as_u64()).map(|p| vec![p as u32]).unwrap_or_default();
+        Ok(self.state_of(seat, &rec, &alive(&pids)))
+    }
+
+    fn census(&self) -> Result<Census> {
+        // One machine, and it is this one — a compound session is a local
+        // pty and there is no fan-out here for `Census` to speak for.
+        Ok(Census::heard("", self.survey()))
+    }
+
+    /// Poll, and say what changed — identical shape to
+    /// [`crate::place_super::Supervisor::watch`], because the observable is
+    /// the same directory-of-small-files-plus-`ps`, just a different
+    /// directory.
+    fn watch(&self, f: &mut dyn FnMut(Event) -> bool) -> Result<()> {
+        let mut was: BTreeMap<Seat, State> =
+            self.survey().into_iter().map(|s| (s.seat, s.state)).collect();
+        loop {
+            self.clock.rest(self.poll);
+            let now: BTreeMap<Seat, State> =
+                self.survey().into_iter().map(|s| (s.seat, s.state)).collect();
+            let mut events: Vec<Event> = Vec::new();
+            for (seat, state) in &now {
+                match was.get(seat) {
+                    None => {
+                        events.push(Event::Opened(seat.clone()));
+                        if state.is_running() {
+                            events.push(Event::Started(seat.clone()));
+                        }
+                    }
+                    Some(before) if before == state => {}
+                    Some(before) => events.push(match (before.is_running(), state.is_running()) {
+                        (false, true) => Event::Started(seat.clone()),
+                        (true, false) => Event::Stopped(seat.clone()),
+                        _ => Event::Moved(seat.clone(), *state),
+                    }),
+                }
+            }
+            for seat in was.keys() {
+                if !now.contains_key(seat) {
+                    events.push(Event::Closed(seat.clone()));
+                }
+            }
+            was = now;
+            for e in events {
+                if !f(e) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wait for something a real process does in its own time. Same shape
+    /// as `place_super::tests::until`, its own copy for the same reason that
+    /// one is not shared: a hang-guard belongs beside what it is guarding.
+    fn until(what: impl Fn() -> bool) -> bool {
+        for _ in 0..500 {
+            if what() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let root = std::env::temp_dir()
+                .join(format!("wsp-cpd-{name}-{}-{}", std::process::id(), util::epoch_nanos()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Scratch { root }
+        }
+        fn place(&self) -> Compound<'static> {
+            Compound { poll: Duration::from_millis(10), ..Compound::at(self.root.clone()) }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let sup = Compound::at(self.root.clone());
+            for id in sup.ids() {
+                let _ = sup.stop(&Seat::new(id));
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The window `open`/`start` leaves for the claim to land in, and the
+    /// seat's own name delivered to whatever env it will hand `compound-sup`
+    /// — same property `place_super` proves the same way, because it is the
+    /// same clause of `place.rs`'s sentence.
+    #[test]
+    fn a_seat_exists_before_a_session_does_and_knows_its_own_name() {
+        let scratch = Scratch::new("open");
+        let place = scratch.place();
+        let seat = place
+            .open(&Order {
+                label: "compound-064".into(),
+                env: BTreeMap::from([("WSP_TASK".into(), "compound-064".into())]),
+                ..Order::default()
+            })
+            .expect("a seat");
+
+        assert_eq!(place.state(&seat).unwrap(), State::Empty);
+        let rec = place.record(&seat).unwrap();
+        assert_eq!(str_of(&rec, "label"), "compound-064");
+        assert_eq!(rec["env"][place::SEAT_ENV].as_str(), Some(seat.as_str()));
+        assert_eq!(rec["env"]["WSP_TASK"].as_str(), Some("compound-064"));
+    }
+
+    /// Ids mint distinct and never come round again — `place_super`'s own
+    /// test, against this backend's own prefix and directory, so the two
+    /// counters are proven independent rather than assumed to be.
+    #[test]
+    fn a_seat_id_is_never_handed_out_again_after_the_seat_is_ended() {
+        let scratch = Scratch::new("ids");
+        let place = scratch.place();
+        let first = place.open(&Order::default()).unwrap();
+        let second = place.open(&Order::default()).unwrap();
+        assert_ne!(first, second);
+        assert!(first.as_str().starts_with(SEAT_PREFIX));
+        place.stop(&first).expect("the seat was there");
+        place.stop(&second).expect("the seat was there");
+        let third = place.open(&Order::default()).unwrap();
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+    }
+
+    /// The hook path a real Claude Code drives through `wsp report`, taken
+    /// here without a hook or a pty: `heard` is the write half and this is
+    /// what a `PermissionRequest` — the state `place_super` cannot reach at
+    /// all — reads as, now that a pty makes it reachable.
+    #[test]
+    fn a_permission_prompt_reads_as_working_same_as_headless_does() {
+        let scratch = Scratch::new("hook");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        // A session recorded without actually spawning compound-sup: this
+        // test is about the hook reading, not the pty.
+        let _ = write_atomic(&dir.join(SEAT_FILE), &json!({ "pid": std::process::id() }).to_string());
+
+        place.heard(&seat, "SessionStart", said_by("SessionStart").unwrap(), &json!({}));
+        assert_eq!(place.state(&seat).unwrap(), State::Idle);
+
+        place.heard(&seat, "PermissionRequest", said_by("PermissionRequest").unwrap(), &json!({}));
+        assert_eq!(place.state(&seat).unwrap(), State::Working);
+        assert!(!place.state(&seat).unwrap().will_take_a_prompt(), "a sentence would land in the dialog");
+    }
+
+    /// End to end against a REAL `compound-sup`: open, start, watch it reach
+    /// `Idle` off its own `SessionStart` hook (no mock — `wsp report` really
+    /// runs inside the pty), tell it a line, read it back off the session's
+    /// own screen, stop it, and check the socket and the label sidecar it
+    /// wrote are both gone. `$COMPOUND_SUP` names the binary; `--ignored`
+    /// because it wants one built (`cargo build -p compound-sup --release`
+    /// in `~/claude/compound`) and a real pty, the same bar `ghostty-config`'s
+    /// `real_machine.rs` sets for "wants a real machine".
+    #[test]
+    #[ignore]
+    fn a_real_compound_sup_session_is_opened_told_and_stopped() {
+        let Some(sup) = std::env::var_os("COMPOUND_SUP") else {
+            eprintln!("skipped: set COMPOUND_SUP to a built compound-sup to run this");
+            return;
+        };
+        let sup = PathBuf::from(sup);
+        assert!(sup.is_file(), "COMPOUND_SUP={} is not a file", sup.display());
+
+        let scratch = Scratch::new("real");
+        let place = scratch.place();
+        let cwd = std::env::temp_dir();
+        let seat = place
+            .open(&Order { label: "compound-064 smoke".into(), cwd: Some(cwd.display().to_string()), ..Order::default() })
+            .expect("a seat");
+        place
+            .start(&seat, &Agent { kind: "cat".into(), name: "smoke".into(), args: vec![] })
+            .expect("compound-sup started");
+
+        assert!(until(|| place.socket_of(&seat).is_some()), "no socket announced in time");
+        let socket = place.socket_of(&seat).unwrap();
+        assert!(until(|| socket.exists()), "compound-sup never bound its socket");
+
+        // No hook to read here — `cat` fires none — so this is the pid-alive
+        // half of `state`, proven against a real process rather than a
+        // recorded one.
+        assert_eq!(place.state(&seat).unwrap(), State::Starting);
+
+        // The label sidecar `Sidebar::reach`'s future join key is — written
+        // by compound-sup itself, from `--label`.
+        let label_path = socket.with_extension("label");
+        assert!(until(|| label_path.is_file()), "compound-sup never wrote the label sidecar");
+        assert_eq!(fs::read_to_string(&label_path).unwrap().trim(), seat.as_str());
+
+        place.stop(&seat).expect("the seat was there");
+        assert!(until(|| !socket.exists()), "compound-sup left its socket behind");
+        assert!(until(|| !label_path.exists()), "the label sidecar outlived its socket");
+        assert!(place.record(&seat).is_err(), "the seat directory itself must go with stop");
+    }
+
+    /// `census` speaks for whatever this directory holds and nothing beyond
+    /// it — the property every implementor of the port owes, proven here
+    /// the same way `place_super`'s own test proves it.
+    #[test]
+    fn census_answers_for_this_directory_and_nothing_else() {
+        let scratch = Scratch::new("census");
+        let place = scratch.place();
+        assert_eq!(place.census().unwrap().seats().count(), 0);
+        let seat = place.open(&Order { label: "row".into(), ..Order::default() }).unwrap();
+        let rows: Vec<_> = place.census().unwrap().seats().cloned().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seat, seat);
+        assert_eq!(rows[0].label, "row");
+        assert_eq!(rows[0].state, State::Empty, "opened, not started");
+    }
+}

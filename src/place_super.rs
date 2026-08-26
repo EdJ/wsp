@@ -383,7 +383,7 @@ impl Recipe {
 /// `will_take_a_prompt` says no to it. The hook's own name is written to
 /// `said.json` beside the state, so the fact is kept rather than dropped and
 /// nothing has to be re-plumbed to read it.
-fn said_by(hook: &str) -> Option<State> {
+pub(crate) fn said_by(hook: &str) -> Option<State> {
     Some(match hook.trim() {
         // The launch window closes here, and this is the whole of the readiness
         // question herdr answers by looking for a missing field.
@@ -414,6 +414,15 @@ fn said_by(hook: &str) -> Option<State> {
 /// shell and a cron job all fall through it in silence, and nothing has to ask
 /// which backend is running.
 ///
+/// **Two backends now write this hook's answer, and the hook does not know
+/// which one it landed in.** A headless seat lives under `place_super`'s own
+/// directory; a compound seat (`compound-064`) lives under
+/// `place_compound`'s, one pty instead of none, same six hook names. Rather
+/// than teach the hook which backend minted its seat — a second thing
+/// `SEAT_ENV` would have to carry — this tries the directory that actually
+/// holds the seat's name and is silent if neither does, exactly as it was
+/// already silent for a seat named by no backend at all.
+///
 /// **A hook that arrives after the seat is gone does not bring it back.** The
 /// record is written into an existing directory or not at all, because a
 /// `SessionEnd` racing a [`Place::stop`] would otherwise recreate a seat that
@@ -432,7 +441,15 @@ pub fn report(args: &crate::Args) -> i32 {
             serde_json::from_str(&buf).unwrap_or(json!({}))
         }
     };
-    Supervisor::new().heard(&seat, &hook, state, &payload);
+    let super_place = Supervisor::new();
+    if super_place.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
+        super_place.heard(&seat, &hook, state, &payload);
+        return 0;
+    }
+    let compound = crate::place_compound::Compound::new();
+    if compound.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
+        compound.heard(&seat, &hook, state, &payload);
+    }
     0
 }
 
@@ -510,7 +527,7 @@ pub(crate) fn alive(pids: &[u32]) -> BTreeSet<u32> {
 /// `Bash` tool call is a shell under the agent, and a `stop` that left it running
 /// would be the sort of half-ending that leaves a build writing into a tree wsp
 /// has told somebody else is free.
-fn signal_group(group: u32, sig: &str) {
+pub(crate) fn signal_group(group: u32, sig: &str) {
     let _ = Command::new("kill")
         .arg(format!("-{sig}"))
         .arg(format!("-{group}"))
@@ -521,11 +538,11 @@ fn signal_group(group: u32, sig: &str) {
 
 /// A file read as JSON, or an empty object — a seat whose record is missing is
 /// the caller's question rather than this function's.
-fn read_json(path: &PathBuf) -> Value {
+pub(crate) fn read_json(path: &PathBuf) -> Value {
     fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}))
 }
 
-fn str_of(v: &Value, key: &str) -> String {
+pub(crate) fn str_of(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
@@ -556,7 +573,7 @@ fn str_of(v: &Value, key: &str) -> String {
 ///
 /// Written for [`heard`], which every hook reaches; best-effort like everything
 /// else on that path.
-fn tally_burn(dir: &PathBuf, payload: &Value) {
+pub(crate) fn tally_burn(dir: &PathBuf, payload: &Value) {
     let path = str_of(payload, "transcript_path");
     if path.is_empty() {
         return;

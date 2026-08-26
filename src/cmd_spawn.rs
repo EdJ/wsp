@@ -1427,29 +1427,34 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
     place_work(backend(args).as_ref(), store, args)
 }
 
-/// Which backend places this work: a terminal, or a supervisor with none.
+/// Which backend places this work: a terminal, a supervisor with none, or a
+/// compound session — a terminal wsp itself owns rather than herdr's.
 ///
 /// The flag is the whole of the choice and there is deliberately no inference
 /// behind it. What `--headless` buys is an agent that can be started, told,
 /// observed and stopped with no terminal anywhere; what it costs is the one
 /// thing a supervisor cannot give you, which is an agent you can **sit down in
-/// front of** — no permission prompts, no input box, no attaching. That is a
-/// decision about how you mean to work with this agent rather than a detail of
-/// where it runs, so it is asked rather than guessed.
+/// front of** — no permission prompts, no input box, no attaching. `--compound`
+/// buys that back through a different multiplexer: a real pty, hosted by
+/// `compound-sup` rather than herdr (`compound-064`). That is a decision about
+/// how you mean to work with this agent rather than a detail of where it runs,
+/// so it is asked rather than guessed, and the two flags are mutually
+/// exclusive for the same reason a seat cannot be in two backends at once.
 ///
 /// Everything below this line is backend-agnostic already, which is the port
 /// earning itself: `place_work` was written against `&dyn Place` and needed no
-/// change to grow a second implementor.
+/// change to grow a second implementor, or now a fourth.
 ///
 /// `pub(crate)` because `wsp stamp` asks the same question — which backend is
 /// running the agents — and a second copy of this match is a second place to
-/// forget when a third implementor lands. That is this repository's oldest
+/// forget when the next implementor lands. That is this repository's oldest
 /// lesson about hand-kept lists, and the port is the thing that makes one copy
 /// enough.
 pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
-    match args.has("headless") {
-        true => Box::new(crate::place_super::Supervisor::new()),
-        false => Box::new(Herdr::new()),
+    match (args.has("headless"), args.has("compound")) {
+        (true, _) => Box::new(crate::place_super::Supervisor::new()),
+        (false, true) => Box::new(crate::place_compound::Compound::new()),
+        (false, false) => Box::new(Herdr::new()),
     }
 }
 

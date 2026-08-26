@@ -48,6 +48,7 @@ mod model;
 mod overlap;
 mod panel;
 mod place;
+mod place_compound;
 mod place_herdr;
 mod place_super;
 mod resolve;
