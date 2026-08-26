@@ -461,6 +461,28 @@ fn turning(seat: &Seat) -> bool {
     look(seat).ok().flatten().is_some_and(|a| state_of_pane(&a).turn_in_flight())
 }
 
+/// One machine's two listings, joined into census rows.
+///
+/// The state off the `agent.list` row and **the label off the `pane.list`
+/// row**, because `agent.list` does not carry one — recorded against herdr
+/// 0.7.5 on 2026-08-25, where the two listings differ by exactly `label` and
+/// `scroll`. Taking the whole row from `agent.list` left [`Seated::label`]
+/// empty for every seat that had an agent in it, which is every seat a person
+/// reading a census is reading about, and it is what `wsp say` publishes.
+///
+/// Pulled out of [`Herdr::census`] so `cmd_watch`'s `Probe` — which already
+/// holds both listings for its own reason and would rather not ask herdr a
+/// second time to get the rows this way — can build the same census.
+pub(crate) fn seated_rows(agents: &[herdr::Pane], panes: &[herdr::Pane]) -> Vec<Seated> {
+    panes
+        .iter()
+        .map(|p| match agents.iter().find(|a| a.pane_id == p.pane_id) {
+            Some(a) => Seated { label: p.label.clone(), ..seated(a, state_of_agent(a)) },
+            None => seated(p, state_of_pane(p)),
+        })
+        .collect()
+}
+
 /// A `herdr::Pane` as a census row.
 fn seated(p: &herdr::Pane, state: State) -> Seated {
     Seated {
@@ -838,24 +860,7 @@ impl Place for Herdr<'_> {
                 .and_then(|(_, a)| a.as_ref().ok())
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let seats = panes
-                .iter()
-                .map(|p| match running.iter().find(|a| a.pane_id == p.pane_id) {
-                    // The state off the agent row and **the label off the pane
-                    // row**, because `agent.list` does not carry one — recorded
-                    // against herdr 0.7.5 on 2026-08-25, where the two listings
-                    // differ by exactly `label` and `scroll`. Taking the whole
-                    // row from `agent.list` left [`Seated::label`] empty for
-                    // every seat that had an agent in it, which is every seat a
-                    // person reading a census is reading about, and it is what
-                    // `wsp say` publishes. Nothing had noticed because no
-                    // consumer read a label off a census until `wsp stamp` did
-                    // — and the fake was answering one that herdr does not send.
-                    Some(a) => Seated { label: p.label.clone(), ..seated(a, state_of_agent(a)) },
-                    None => seated(p, state_of_pane(p)),
-                })
-                .collect();
-            Census::heard(&machine, seats)
+            Census::heard(&machine, seated_rows(running, &panes))
         });
         // `each` asks this machine first and always, so there is always a first
         // answer; the `None` arm is unreachable and is written as a refusal

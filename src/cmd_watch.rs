@@ -2208,11 +2208,14 @@ impl Source for Poll<'_> {
             claims: self.store.claims(),
             pins: self.store.pins(),
             governors: self.store.governors(),
-            agents,
-            workspaces: match up {
-                true => herdr::workspaces().unwrap_or_default(),
-                false => Vec::new(),
-            },
+            // The same join `Herdr::census` performs, built from the listings
+            // this probe already holds rather than asking herdr again — see
+            // `seated_rows`. Empty seats are dropped: `wip` is about who is
+            // working, the rule `Wip::live` applies to every backend.
+            agents: crate::place_herdr::seated_rows(&agents, &panes)
+                .into_iter()
+                .filter(|s| s.state != crate::place::State::Empty)
+                .collect(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -2373,7 +2376,7 @@ impl Source for Poll<'_> {
                 if !mine(t) {
                     continue;
                 }
-                let detail = match cmd_agent::bound_state(pane, &wip.agents, &panes, &answered) {
+                let detail = match cmd_agent::bound_state(pane, &agents, &panes, &answered) {
                     Bound::Emptied => format!("{pane} · pane alive, agent gone — the claim and the tree are still held"),
                     Bound::Gone => format!("{pane} · the pane is gone — wsp sync reaps the binding"),
                     _ => continue,
