@@ -1473,6 +1473,16 @@ pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
     [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new())]
 }
 
+/// The name a whole backend's own silence is filed under — `wsp stamp`
+/// (`compound-064` item 2), paired with [`local_backends`] by position, so
+/// this file stays the one place that ordering is named rather than
+/// re-assumed at a call site. `""` is herdr's own local machine
+/// ([`Census::heard`]'s spelling, unchanged); `"compound"` distinguishes
+/// the second backend's total refusal from a machine of that name, since a
+/// backend is not a machine and the two silences must not collide in a
+/// listing.
+pub(crate) const LOCAL_BACKEND_NAMES: [&str; 2] = ["", "compound"];
+
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
