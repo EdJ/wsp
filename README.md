@@ -40,7 +40,7 @@ Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` a
 | `~/wsp/archive/projects/` | removed projects, handbook and decisions intact |
 | `~/wsp/ids.json` | retired id → the id it became, so old ones still resolve |
 | `~/wsp/hooks/on-<event>` | executables fed event JSON on stdin |
-| `~/.local/state/wsp/` | claims, bindings, pins, mandates, `said.json`, `worked.json`, `events.jsonl` — machine-local, not in git |
+| `~/.local/state/wsp/` | claims, bindings, pins, mandates, governors, handovers, `said.json`, `worked.json`, `events.jsonl` — machine-local, not in git |
 
 Override the store with `WSP_HOME`, state with `WSP_STATE`, and disable
 autocommit with `WSP_NO_COMMIT=1`.
@@ -121,27 +121,61 @@ wsp worklist hold "…"       # start nothing more; what is running is left to f
 ### The seat is reset per batch
 
 A custodian's context only grows, and a token in it is re-billed on every
-request it makes for the rest of the run — so the one thread that runs all
-night is also the most expensive thing on the machine. Since `core-049` the
+request of every session for the rest of the run — so the one thread that runs
+all night is also the most expensive thing on the machine. Since `core-049` the
 default answer is that **it does not run all night**: at each barrier the seat
 writes its verdict with `go` (the store now holds everything a successor needs —
 run position behind `next`, raised hands behind `flag --seat`, direction in task
 logs and decisions), seats a fresh custodian, and ends:
 
 ```sh
-wsp spawn -p <slug> --govern    # the successor takes the slot, evicting you,
-                                # and re-briefs from the store for ~600 tokens
+wsp govern <slug> --rotate      # one verb, and the custodian's last act:
+                                #   seats the successor, waits until its first
+                                #   turn starts, moves the seat, and leaves your
+                                #   ending to it
 ```
 
+Rotation is one verb rather than a three-step composition (`spawn --govern`,
+then end your session) because a step an agent performs after deciding it is
+finished is a step that can be skipped — observed on 2026-08-25, where the work
+order sat unsent in the successor's composer while the third instruction ran
+anyway and the pane closed over the sentence naming the repair. The rule the
+verb encodes: **nothing is ended on a promise.** The successor's seat exists,
+its agent starts, its first turn is confirmed — and only then does the slot
+move; failing any of that says what it found, exits non-zero, and degrades to
+*the predecessor is still seated*, which is the state before the attempt. The
+slot moves last also means there is no vacancy window and no restore path.
+
+The caller's own ending cannot be step four, because a verb that ends the pane
+it runs in cannot report what happened. So the ending is handed to the
+**successor**: the rotation writes a record through the store, the successor's
+brief carries it ("run `wsp despawn --pane …`"), and `despawn` consumes the
+record when the pane actually goes. The typed work order was the one piece of
+handover state that did not go through the store — which is exactly why it
+could be dropped at all, and why the death warrant for the caller's pane does
+not ride it. `wsp despawn --pane` is reused whole; nothing grew a second way to
+end an agent.
+
 `next` prints this at every group's own barrier (never at barrier zero or the
-last), and `--json` carries the same command as `reseat`. Rotation keeps each
-custodian's window small by construction rather than by discipline; keeping
-direction out of the conversation and in task logs is what makes the rotation
-safe. The successor's seat also carries `WSP_TERSE=1` — a coordinating agent
-re-reads `brief` and `wip` several times an hour, and the two blocks `--terse`
+last), and `--json` carries the same command as `reseat`. The verb refuses when
+there is nothing to rotate into — behind the last barrier of a run — by the
+same condition that puts the line there. Rotation keeps each custodian's window
+small by construction rather than by discipline; keeping direction out of the
+conversation and in task logs is what makes the handover safe. The successor's
+seat also carries `WSP_TERSE=1` — a coordinating agent re-reads `brief` and
+`wip` several times an hour, and the two blocks `--terse`
 drops were being paid for by every one of those readings. The session payload
 itself is unaffected (`--session` outranks the variable), so the brief it starts
 with is whole.
+
+**The seat-stalled wake is the backstop, not the mechanism.** It fires on the
+half-success rotation now refuses to allow — a seat running no turn with
+nothing moving under it while members wait — and it is addressed *above* the
+seat, terminating at every panel when nothing above is filled. Two conditions
+gate it, both of which must hold: `wsp daemon` is up (the wake is typed by the
+daemon's attention pass), and the run has outstanding unattended members. With
+rotation as one verb it should never fire on a handover again; it is still
+there because a stall has more causes than a handover.
 
 ## The panel
 
@@ -2452,7 +2486,9 @@ work against the code rather than against the agent's report, hold the record.
 The brief agrees with it: a custodian is told what it is answerable for, and it
 is *not* told to go and claim something, which is the move that turns a governor
 back into an agent working somebody else's task. Since `core-049` it is also
-told to **rotate at each barrier** rather than hold the thread all night — see
+told to **rotate at each barrier** rather than hold the thread all night, and
+since `core-050` rotation is one verb — `wsp govern <scope> --rotate`, which
+moves the slot only after the successor's first turn is confirmed; see
 [The seat is reset per batch](#the-seat-is-reset-per-batch) — because the
 position exists to hold the *record*, and the record is in the store; a thread
 that held it too was paying rent on both.
@@ -4167,7 +4203,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
 | `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker |
 | `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, who each one is addressed to, and the six ways silence lies |
-| `src/cmd_spawn.rs` | a workspace on a task, an agent started in it, and both ended again |
+| `src/cmd_spawn.rs` | a workspace on a task, an agent started in it and both ended again — and `govern --rotate`, the custodial handover as one verb |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on — in a seat that can carry what their kind needs |
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |

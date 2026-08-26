@@ -287,8 +287,17 @@ pub(crate) fn reach(store: &Store, task: Option<&str>, tree: Option<&str>) -> Ve
 /// swallowed. The agent would start perfectly well — opencode ignores a missing
 /// `instructions` file without a word — and would be told its brief was above
 /// it when nothing was, which is the failure `core-027` found by driving and
-/// this row was filed to remove.
-fn lay_brief(store: &Store, work: &Work, seat: &Seat, cwd: Option<&str>, path: &std::path::Path) -> Laid {
+/// this row was filed to remove. Rotation composes its successor's brief
+/// through this same one writer: a second copy of the write would be a second
+/// answer to where a seat's brief lives, and [`despawn`] looks in exactly one
+/// place to take it away again.
+fn lay_brief(
+    store: &Store,
+    work: &Work,
+    seat: &Seat,
+    cwd: Option<&str>,
+    path: &std::path::Path,
+) -> Laid {
     let ws = workspace_of(seat);
     let text = crate::cmd_brief::session_text(&crate::cmd_brief::Briefing::at(
         store,
@@ -350,6 +359,13 @@ pub fn work_order(subject: &str, how: Handover) -> String {
         // `project show` — so the thread does not have to hold anything at all.
         // Rotation per barrier keeps each custodian's window small by
         // construction instead of by discipline.
+        //
+        // Since `core-050` rotation is one verb, and the order names it rather
+        // than composing it out of three instructions — the third of which,
+        // ending your own session, was the one that could be skipped. The verb
+        // carries its own failure mode in the sentence: nothing ends on a
+        // promise, so a handover that cannot confirm the successor says so and
+        // leaves the caller holding the seat.
         Handover::Custodian => format!(
             "You are the custodian of the {subject} project. You have not been claimed onto a \
              task and you should not claim one. Your brief is already above: what {subject} is \
@@ -362,9 +378,10 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              waits on your permission. Say what you are doing with `wsp say`, and begin by \
              reading what is open. Keep direction in task logs and decisions rather than in \
              this conversation, so nothing lives only here; and when you pass a worklist \
-             barrier, rotate: write the verdict with `wsp worklist go`, then run `wsp spawn \
-             -p {subject} --govern` to seat your successor from a fresh context, then end \
-             your session."
+             barrier, rotate: write the verdict with `wsp worklist go`, then make `wsp govern \
+             {subject} --rotate` your last act. It seats your successor, waits until its first \
+             turn starts, moves the seat, and arranges your ending; if any of that fails it \
+             says so, exits non-zero, and you are still the seat."
         ),
     }
 }
@@ -1242,6 +1259,35 @@ fn took_it(place: &dyn Place, seat: &Seat, wait: &Patience) -> bool {
     }
 }
 
+/// Hand over the work order, and resend it once if no turn started.
+///
+/// The detection is [`hand_over`]'s and predates rotation; what rotation adds
+/// is the retry, because the reader between detection and repair used to be a
+/// person reading stderr, and the custodian's pane is exactly what rotation is
+/// taking out of the loop. One resend of the *same* text, then stop — bounded,
+/// because a send is not free either: worklist-010 was three copies of one
+/// paragraph delivered to a seat that had queued the first. Here nothing is
+/// resent unless no turn started at all, which is the evidence the order was
+/// never taken; and the resend is the repair that worked on every recorded
+/// failure of this shape, whether the text sat unsent in a composer or was
+/// dropped outright.
+fn confirm_turn(
+    place: &dyn Place,
+    how: &dyn agent_commands::Kind,
+    spawn: &agent_commands::Spawn,
+    text: &str,
+    wait: &Patience,
+) -> Result<(), String> {
+    match hand_over(place, how, spawn, text, wait) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            eprintln!("wsp: no turn started - sending the work order once more");
+            hand_over(place, how, spawn, text, wait)
+                .map_err(|second| format!("{first}; resent once and {second}"))
+        }
+    }
+}
+
 /// Say how to reach an agent a spawn could not, where the kind knows a way.
 ///
 /// The failure this softens is measured rather than imagined: `spawn`'s work
@@ -1842,6 +1888,292 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// `wsp govern <scope> --rotate` — the handover as one verb, and the
+/// custodian's last act.
+///
+/// **The rule the verb encodes: nothing is ended on a promise.** Rotation used
+/// to be a three-step instruction in this work order — pass the verdict with
+/// `go`, run `spawn -p <scope> --govern`, end your session. The composition was
+/// right against the alternatives and wrong in one specific way: it had a step
+/// that could half-succeed. `spawn` seats the successor and starts its agent,
+/// and the work order can then sit unsent in the composer — observed on an
+/// ordinary spawn on 2026-08-25, detected (`hand_over` names it, non-zero), and
+/// not repaired, because the third step was a separate instruction to an agent
+/// that had already decided it was finished. The slot was filled, so no vacancy
+/// fired; the successor held no order; the sentence naming the repair printed
+/// into a pane that was closing. Detected was not good enough: the seat-stalled
+/// wake fires on exactly this shape but is addressed *above* the seat, so an
+/// unattended night woke a person five minutes later instead of nobody at all.
+///
+/// So one verb does all of it, in an order where every failure degrades to
+/// *the predecessor is still seated*:
+///
+/// 1. Seat the successor and start its agent — [`place.open`], brief,
+///    [`start_agent`], exactly as any custodial spawn.
+/// 2. Confirm a turn started on the handover — [`confirm_turn`], with one
+///    resend of the same order before giving up.
+/// 3. Only then move the slot and let go.
+///
+/// Failing at 2 leaves the caller seated, says what it found, exits non-zero.
+/// There is no restore path because nothing needs restoring: **the slot moves
+/// last**, where `spawn --govern` evicts the incumbent up front. Holding the
+/// seat until the successor's first turn also removes the vacancy window the
+/// up-front eviction opens, which is what makes it strictly better than both
+/// the old composition and the `--handover` flag argued down before core-049.
+///
+/// One kind of successor is refused outright: a kind whose work order travels
+/// in argv (`opencode`). There is nothing to confirm against — "the turn it
+/// starts is the agent's own doing, and wsp has no submit to press", as
+/// [`agent_commands::Kind::order_in_args`] puts it — so a rotation into one
+/// could only move the slot on a promise, which is the thing this verb refuses
+/// to do. Rotate with a kind wsp can hear from.
+///
+/// # The ending rides the store, because the work order cannot be trusted with it
+///
+/// A verb that ends the pane it runs in cannot report what happened, so the
+/// caller's despawn is not step 4 here — it is handed to the successor, carried
+/// in the custodial brief rather than in the typed order. The typed order is
+/// the one piece of handover state that does not go through the store, which is
+/// why it can be dropped at all; putting the predecessor's death warrant in it
+/// would rebuild the exact half-success this verb exists to remove. The record
+/// ([`Store::set_handover`]) is written the moment the successor's seat exists,
+/// read by the brief ([`crate::cmd_govern::incoming`]), and cleared by
+/// [`despawn`] when the pane it names actually goes — one ending, the one
+/// `despawn` already has, reused rather than grown anew.
+///
+/// The write happens before the agent starts, because the brief is composed at
+/// start; if the rotation fails below, it is taken back — a stale record orders
+/// the death of a pane that is still the seated custodian, and that must only
+/// ever exist while a confirmed successor stands ready to inherit.
+pub fn rotate(store: &Store, args: &Args) -> i32 {
+    rotate_on(&Herdr::new(), store, args, &Patience::default())
+}
+
+/// [`rotate`] against a stated backend and clock, which is the shape every test
+/// of it takes: a herdr that answers from a script, and waits measured on a
+/// dial rather than on the machine.
+fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> i32 {
+    let p = Paint::new();
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp govern <project|worklist> --rotate");
+        return 2;
+    };
+    let index = Index::new(store.projects());
+    let Some(scope) = cmd_govern::scope_of(store, &index, &needle) else {
+        eprintln!("wsp: no such project or worklist `{needle}`");
+        return 1;
+    };
+
+    // Refuse when there is nothing to rotate into, by the same condition that
+    // puts the rotate line in front of a custodian: `next` offers it only while
+    // a group stands behind the barrier just passed, and seating a successor at
+    // the end of a run seats an agent with nothing left to sequence. A project
+    // scope has no run to consult, and a list that is held or not yet started
+    // has groups still owed, so both rotate as usual.
+    if store.worklist(&scope).is_some() {
+        let over = crate::worklist::running_position(store, &scope).is_some_and(|pos| pos.finished());
+        if over {
+            eprintln!("wsp: the {scope} run is finished - there is no group left to sequence");
+            eprintln!("wsp: stand down instead: wsp govern {scope} --clear");
+            return 1;
+        }
+    }
+
+    // Rotation is the seat's own act, from the seat's own pane. Anyone else
+    // running it would be handing a position away behind its holder's back,
+    // and "the caller stays seated" means nothing for a caller that was never
+    // seated. Read the way `govern` reads them: workspace from the room, pane
+    // exact, because a room can hold more than one agent (worklist-035).
+    let env = crate::herdr::Env::read();
+    let (Some(ws), Some(me)) =
+        (env.workspace_id.clone(), env.pane_id.clone().filter(|p| !p.is_empty()))
+    else {
+        eprintln!("wsp: {scope} is rotated by whoever holds its seat, from its own pane");
+        return 2;
+    };
+    let governors = store.governors();
+    match cmd_govern::governs(&governors, &ws, Some(&me)) {
+        Some(held) if held == scope => {}
+        Some(other) => {
+            eprintln!("wsp: this pane holds the {other} seat, not {scope}");
+            return 1;
+        }
+        // Not the seat, said precisely: named who has it when there is one to
+        // name, and where an empty seat is filled from when there is not.
+        // Either way this pane does not hold what it is trying to hand over,
+        // and every branch here stops before anything is opened.
+        None => {
+            match cmd_govern::seat_of_scope(&scope, &governors) {
+                Some(seat) => eprintln!(
+                    "wsp: the {scope} seat is held by {} - only that pane can rotate it",
+                    seat.workspace
+                ),
+                None => eprintln!("wsp: nobody holds the {scope} seat - wsp spawn fills an empty one"),
+            }
+            return 1;
+        }
+    }
+
+    // The successor, resolved through the same door any custodial spawn walks:
+    // a scope is a project or a worklist, and `resolve` under `--govern`
+    // already knows both without being told twice.
+    let asked_kind = args.get("kind");
+    let asked_on = args.get("on");
+    let mut flags: Vec<(&str, &str)> = vec![("govern", "true")];
+    if let Some(k) = &asked_kind {
+        flags.push(("kind", k.as_str()));
+    }
+    if let Some(o) = &asked_on {
+        flags.push(("on", o.as_str()));
+    }
+    let spawn_args = Args::synth("spawn", &[scope.as_str()], &flags);
+    let work = match resolve(store, &spawn_args, &index) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+    let on = match placement(store, &spawn_args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    };
+    let kind = asked_kind.unwrap_or_else(|| DEFAULT_KIND.to_string());
+    // Before anything is opened, like every other refusal here. The evidence
+    // step two turns on is a turn wsp can see; a kind whose order goes out on
+    // the command line gives none, ever.
+    if agent_commands::of(&kind).order_in_args() {
+        eprintln!(
+            "wsp: {kind} takes its work order in argv, where no turn can be confirmed - \
+             the slot would move on a promise"
+        );
+        eprintln!("wsp: rotate with a kind wsp can hear from - --kind claude");
+        return 2;
+    }
+    // A project root, inherited; a worklist scope stands nowhere, exactly as a
+    // first custodian's seat does.
+    let cwd = work.project.as_deref().and_then(|proj| index.root_of(proj));
+    let subject = work.list.clone().or_else(|| work.project.clone()).unwrap_or_default();
+
+    let how = agent_commands::of(&kind);
+    let brief_at =
+        (!subject.is_empty() && how.brief_file()).then(|| brief_path(store, &subject));
+    let outside = reach(store, None, cwd.as_deref());
+    // An agent is the whole point of a rotation — a successor with no agent in
+    // it is a seat that answers for raised hands and cannot read one — so there
+    // is no bare-workspace case here to make this conditional.
+    let occupant = Occupant { kind: &kind, brief: brief_at.as_deref(), reach: &outside };
+    let open_order = order(&work, cwd.as_deref(), on.as_deref(), false, Some(occupant), true);
+
+    // Step 1. The seat exists before anything is recorded or started — its id
+    // is half of the handover record, and the brief cannot name the ending
+    // until there is a pane to address.
+    let seat = match place.open(&open_order) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
+
+    // The record goes down before the agent starts, because the successor's
+    // brief is composed at start and the ending has to already be in it. Taken
+    // back on every failure below: between this line and a confirmed turn, the
+    // record is a promise, and a promise wsp failed to keep must not survive
+    // as somebody's standing instruction to end a seated custodian's pane.
+    store.set_handover(&scope, json!({ "from": me, "to": seat.as_str(), "since": util::now_iso() }));
+
+    let laid = match &brief_at {
+        Some(path) => lay_brief(store, &work, &seat, cwd.as_deref(), path),
+        None => Laid::Elsewhere,
+    };
+    let text = handover(&subject, Handover::Custodian, route(how, laid));
+    let in_args = how.order_in_args();
+    let spawn = agent_commands::Spawn {
+        full: false,
+        subagents: false,
+        name: &subject,
+        seat: &seat,
+        model: None,
+        effort: None,
+        order: match in_args {
+            true => Some(text.as_str()),
+            false => None,
+        },
+        resume: None,
+    };
+    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: how.args(&spawn) };
+
+    // Step 2. Started, then heard from: a turn running is the only evidence
+    // that the handover was taken, and everything after this point depends on
+    // it having been.
+    if let Err(e) = start_agent(place, how, &spawn, &agent, &kind, wait) {
+        store.clear_handover(&scope);
+        eprintln!("wsp: {kind} did not start in {seat}: {e}");
+        unreached(how, place, &spawn);
+        eprintln!("wsp: nothing moved - the {scope} seat is still yours");
+        return 1;
+    }
+    if !in_args {
+        if let Err(e) = confirm_turn(place, how, &spawn, &text, wait) {
+            store.clear_handover(&scope);
+            eprintln!("wsp: agent started but not working on it: {e}");
+            eprintln!("wsp: send the order again with `wsp tell {} -`", seat.as_str());
+            unreached(how, place, &spawn);
+            eprintln!(
+                "wsp: nothing moved - the {scope} seat is still yours, and {} sits idle",
+                seat.as_str()
+            );
+            return 1;
+        }
+    }
+
+    // Step 3. The slot moves last, now that it is earned. `take` says whom it
+    // displaced — which is this pane, by construction — and renames both rooms
+    // after the fact.
+    let Some(ws_new) = workspace_of(&seat) else {
+        // The port gap a first custodian's spawn also hits: the workspace id is
+        // herdr's word and the port has none for it. Nothing here may guess it,
+        // and the seat must not move onto a record that cannot name its room.
+        // The record stays, because the successor did take the handover and its
+        // brief does tell it to end this pane once it is the seat.
+        eprintln!(
+            "wsp: {} took the handover, but its workspace could not be read - \
+             the seat has not moved",
+            seat.as_str()
+        );
+        eprintln!("wsp: run `wsp govern {scope}` from {} to finish the move", seat.as_str());
+        return 1;
+    };
+    cmd_govern::take(store, &scope, &ws_new, seat.as_str());
+
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "rotated": true,
+                "scope": scope,
+                "successor": seat.as_str(),
+                // The same answer the text gives as "your ending is arranged":
+                // which pane the successor has been handed the despawn of.
+                "predecessor": me,
+                "told": true,
+            })
+        );
+    } else {
+        println!("{} {}", p.cyan("▣"), p.bold(&format!("{scope} rotated")));
+        println!("  {}", p.dim(&format!("successor in {} - its first turn is running", seat.as_str())));
+        println!(
+            "  {}",
+            p.dim("your ending is arranged: the successor ends this pane. Nothing here is left to do")
+        );
+    }
+    0
+}
+
 /// The workspace a pane is in, which is the id a slot is recorded against.
 ///
 /// The one herdr-shaped question `spawn` asks outside the port. `place::Seat`
@@ -2160,6 +2492,17 @@ fn end_work(
     // What the binding said, unless the release found something else there —
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);
+
+    // An inherited ending is consumed by being done. A rotation leaves a record
+    // telling the successor to end exactly this pane; once it has — or once the
+    // pane was already gone, which is the same fact to this verb — the record
+    // has said its whole say, and leaving it would make every later brief of
+    // that pane's successor order an ending that already happened.
+    for (scope, rec) in store.handovers() {
+        if rec.get("from").and_then(|v| v.as_str()) == Some(seat.as_str()) {
+            store.clear_handover(&scope);
+        }
+    }
 
     // The brief this seat was started with, if it had one. Removed here because
     // this is the verb that ends a seat, and a brief left behind is a stale
@@ -2868,12 +3211,16 @@ mod tests {
         // `SessionStart` hook has already run `wsp brief` with the slot in
         // place — asking again at request 1 is a whole context re-read.
         assert!(!text.contains("wsp brief"), "the hook has already injected it: {text}");
-        // And the rotation (`core-049`): the successor's name is spelled out,
-        // because a sentence that says "rotate" without the command is one an
-        // agent at 3am improvises around.
-        for owed in ["worklist go", "spawn -p robustness --govern", "end"] {
+        // And the rotation (`core-049`, one verb since `core-050`). The
+        // command is spelled out, because a sentence that says "rotate" without
+        // the command is one an agent at 3am improvises around; and the
+        // three-step composition it replaced is gone, not standing beside it —
+        // its third step was the one that could be skipped.
+        for owed in ["worklist go", "govern robustness --rotate", "still the seat"] {
             assert!(text.contains(owed), "the work order drops the rotation step `{owed}`: {text}");
         }
+        assert!(!text.contains("--govern"), "the old composition, still in prose beside the verb: {text}");
+        assert!(!text.contains("end your session"), "an ending the agent must remember is an ending that gets skipped: {text}");
     }
 
     /// The seat a custodian runs in carries `WSP_TERSE=1`, because a
@@ -4188,6 +4535,415 @@ mod tests {
         assert_eq!(code, 2);
         assert!(place.asked.borrow().is_empty(), "it asked the backend to end this pane");
         assert!(store.claims().contains_key("t-260816-095"), "and it dropped its own claim");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    // ---- rotation ----------------------------------------------------------
+
+    /// A herdr that is not herdr: answers every call with one fixture. That is
+    /// everything a rotation asks of a live herdr — one `pane.list`, so the
+    /// successor's workspace id is readable (`place` has no word for a room),
+    /// and whatever renames a moved slot triggers, whose answers nothing here
+    /// reads. Same shape as herdr's own tests' stand-in; private to that file,
+    /// which is why this is written out.
+    fn herdr_stand_in(path: &std::path::Path, n: usize, reply: serde_json::Value) {
+        use std::io::{BufRead, BufReader, Write};
+        let _ = std::fs::remove_file(path);
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((stream, _)) = listener.accept() else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    break;
+                }
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let out = json!({ "id": req["id"], "result": reply });
+                let mut stream = stream;
+                let _ = stream.write_all(format!("{out}\n").as_bytes());
+                let _ = stream.flush();
+            }
+        });
+    }
+
+    /// The pane the stand-in answers with: the successor's seat, in workspace
+    /// `w9`. The room is what a moved slot is recorded against.
+    fn successor_pane() -> serde_json::Value {
+        json!({ "panes": [{
+            "pane_id": "w9:p2", "workspace_id": "w9", "tab_id": "", "label": "",
+            "agent": "", "agent_status": "", "cwd": "/", "title": "",
+            "focused": false, "session_id": "", "agent_name": "",
+        }] })
+    }
+
+    /// A backend that opens one seat, starts whatever it is told, delivers every
+    /// sentence, and answers state off a script — the first readings popped in
+    /// order, then the last held for ever. Idle first makes the agent ready;
+    /// Working after it starts the turn.
+    struct Seats {
+        opened: std::cell::RefCell<Vec<Order>>,
+        started: std::cell::Cell<u32>,
+        told: std::cell::RefCell<Vec<String>>,
+        states: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<State>>>,
+        last: crate::place::Result<State>,
+    }
+
+    impl Seats {
+        fn of(script: Vec<crate::place::Result<State>>) -> Seats {
+            Seats {
+                opened: std::cell::RefCell::new(Vec::new()),
+                started: std::cell::Cell::new(0),
+                told: std::cell::RefCell::new(Vec::new()),
+                last: script.last().cloned().unwrap_or(Ok(State::Unknown)),
+                states: std::cell::RefCell::new(script.into()),
+            }
+        }
+    }
+
+    impl Place for Seats {
+        fn open(&self, order: &Order) -> crate::place::Result<Seat> {
+            self.opened.borrow_mut().push(order.clone());
+            Ok(Seat::new("w9:p2"))
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            self.started.set(self.started.get() + 1);
+            Ok(())
+        }
+        fn tell(&self, _: &Seat, text: &str) -> crate::place::Result<Delivery> {
+            self.told.borrow_mut().push(text.to_string());
+            Ok(Delivery::Started)
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            match self.states.borrow_mut().pop_front() {
+                Some(s) => s,
+                None => self.last.clone(),
+            }
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("rotation does not end seats")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("rotation is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("rotation does not subscribe")
+        }
+        fn here(&self) -> Option<Seat> {
+            panic!("rotation opens a seat rather than asking which one it is in")
+        }
+    }
+
+    /// The waits, on the tests' clock: nothing here sleeps. One poll of
+    /// readiness, ten polls of confirmation, no start retries.
+    fn handover_wait<'a>(clock: &'a util::Dial) -> Patience<'a> {
+        Patience {
+            ready: STEP,
+            taken: TAKEN,
+            nudges: PRESSES,
+            poll: STEP,
+            gone: GRACE,
+            attempts: 0,
+            backoff: STEP,
+            steeper: 1,
+            rearm: GRACE,
+            clock,
+        }
+    }
+
+    /// A store of its own plus the caller env, which rotation reads the way
+    /// `govern` does: from herdr's context variables.
+    fn rotating_as(tag: &str, ws: &str, pane: &str) -> (util::Isolated, Store) {
+        let env = util::isolated(tag);
+        std::env::set_var("HERDR_WORKSPACE_ID", ws);
+        std::env::set_var("HERDR_PANE_ID", pane);
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        (env, store)
+    }
+
+    /// Cleared before any assertion can panic: these are process-wide, the
+    /// isolation guard does not know them, and the test next door must not
+    /// inherit this one's pane.
+    fn stop_being_a_seat() {
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("HERDR_PANE_ID");
+    }
+
+    /// **The whole verb, working:** the successor is seated, its first turn is
+    /// confirmed, and only then does the slot move. The ending rides the store,
+    /// addressed to the pane that inherited it.
+    #[test]
+    fn a_rotation_moves_the_seat_only_once_the_successors_turn_is_running() {
+        let (_env, store) = rotating_as("rotate-ok", "w1", "w1:p9");
+        let sock = _env.path("herdr.sock");
+        herdr_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+
+        store.save_project(&Project::new("core")).unwrap();
+        cmd_govern::take(&store, "core", "w1", "w1:p9");
+
+        let dial = util::Dial::new();
+        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+        let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 0);
+        assert_eq!(place.started.get(), 1, "one successor");
+
+        // The slot moved, and to whom: the record names the successor's room
+        // and pane now, where before the verb ran it named the caller's.
+        let rec = &store.governors()["core"];
+        assert_eq!(rec["workspace"], "w9");
+        assert_eq!(rec["pane"], "w9:p2");
+
+        // The ending rode the store rather than the typed order, addressed to
+        // the pane that inherited it.
+        let h = store.handovers();
+        assert_eq!(h["core"]["from"], "w1:p9", "the pane to end");
+        assert_eq!(h["core"]["to"], "w9:p2", "the pane told to end it");
+
+        // Delivered once and confirmed - not sent twice on a healthy handover.
+        let told = place.told.borrow();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("custodian of the core project"), "{told:?}");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **The failure the verb exists for, degrading the way it was designed
+    /// to:** the successor started but never took the handover, so nothing is
+    /// ended, the record is taken back, and the caller is still the seat.
+    #[test]
+    fn a_rotation_that_never_starts_a_turn_ends_nothing_and_leaves_the_caller_seated() {
+        let (_env, store) = rotating_as("rotate-stall", "w1", "w1:p9");
+        store.save_project(&Project::new("core")).unwrap();
+        cmd_govern::take(&store, "core", "w1", "w1:p9");
+
+        let dial = util::Dial::new();
+        // Idle for ever: ready to be told, never taking.
+        let place = Seats::of(vec![Ok(State::Idle)]);
+        let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 1, "an unconfirmed handover is not a successful one");
+        // The slot never moved: failing at step two is the predecessor still
+        // seated, which is the state before the attempt and the safest one.
+        let rec = &store.governors()["core"];
+        assert_eq!(rec["workspace"], "w1");
+        assert_eq!(rec["pane"], "w1:p9");
+        // The promise was kept only while it could still be honoured: a stale
+        // record orders the death of a seated custodian's pane.
+        assert!(store.handovers().is_empty(), "{:?}", store.handovers());
+        // And the repair was tried before giving up - the resend is the half a
+        // person used to do after reading stderr.
+        assert_eq!(place.told.borrow().len(), 2, "{:?}", place.told.borrow());
+        assert_eq!(
+            place.opened.borrow().len(), 1,
+            "one successor was seated, and sits there idle"
+        );
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// Rotation is the seat's own act. A pane holding nothing, holding another
+    /// scope, or standing outside any room at all is refused before anything
+    /// is opened, and a finished run has nothing to rotate into by the same
+    /// condition that puts the rotate line in front of a custodian.
+    #[test]
+    fn a_rotation_refuses_before_anything_is_opened_when_the_caller_or_the_run_do_not_qualify() {
+        use crate::model::{Group, Status, Task, Worklist, WorklistStatus};
+
+        // No caller identity at all.
+        {
+            let env = util::isolated("rotate-nobody");
+            std::env::remove_var("HERDR_WORKSPACE_ID");
+            std::env::remove_var("HERDR_PANE_ID");
+            let store = Store::at(env.home(), env.state());
+            store.ensure_dirs().unwrap();
+            store.save_project(&Project::new("core")).unwrap();
+            cmd_govern::take(&store, "core", "w1", "w1:p9");
+            let dial = util::Dial::new();
+            let place = Seats::of(vec![Ok(State::Idle)]);
+            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 2);
+            assert!(place.opened.borrow().is_empty(), "nothing was opened");
+            assert!(cmd_govern::governs(&store.governors(), "w1", Some("w1:p9")).is_some(),
+                "and the seat stayed where it was");
+        }
+
+        // A caller that holds a different scope than the one named.
+        {
+            let (_env, store) = rotating_as("rotate-wrong-scope", "w2", "w2:p2");
+            store.save_project(&Project::new("core")).unwrap();
+            store.save_project(&Project::new("other")).unwrap();
+            cmd_govern::take(&store, "other", "w2", "w2:p2");
+            let dial = util::Dial::new();
+            let place = Seats::of(vec![Ok(State::Idle)]);
+            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 1);
+            assert!(place.opened.borrow().is_empty());
+            stop_being_a_seat();
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
+
+        // A caller that holds nothing at all, naming a seat somebody else
+        // holds. The refusal names the holder - and stops, where a fall-through
+        // here would seat a successor for a handover nobody asked this pane to
+        // make.
+        {
+            let (_env, store) = rotating_as("rotate-unseated", "w3", "w3:p1");
+            store.save_project(&Project::new("core")).unwrap();
+            cmd_govern::take(&store, "core", "w1", "w1:p9");
+            let dial = util::Dial::new();
+            let place = Seats::of(vec![Ok(State::Idle)]);
+            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 1);
+            assert!(place.opened.borrow().is_empty(), "{:?}", place.opened.borrow());
+            assert!(store.handovers().is_empty());
+            stop_being_a_seat();
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
+
+        // A successor whose work order wsp could never see taken. Moving the
+        // slot into one would be exactly the promise the verb refuses to end
+        // anything on, so it is refused before the seat opens - and `opencode`
+        // is not merely an example here: it is the one kind that takes its
+        // order in argv today.
+        {
+            let (_env, store) = rotating_as("rotate-argv-kind", "w1", "w1:p9");
+            store.save_project(&Project::new("core")).unwrap();
+            cmd_govern::take(&store, "core", "w1", "w1:p9");
+            let dial = util::Dial::new();
+            let place = Seats::of(vec![Ok(State::Idle)]);
+            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "opencode")]);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 2);
+            assert!(place.opened.borrow().is_empty(), "no successor was seated");
+            stop_being_a_seat();
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
+
+        // A run whose last barrier has been passed: `next` offers the rotate
+        // line only while `n < of`, and the verb refuses on the same fact -
+        // seating a successor at the end of a run seats an agent with nothing
+        // left to sequence.
+        {
+            let (_env, store) = rotating_as("rotate-finished", "w1", "w1:p9");
+            store.save_project(&Project::new("core")).unwrap();
+            let mut t = Task::new("landed", "t-1");
+            t.project = Some("core".into());
+            t.set_status(Status::Done);
+            store.save_task(&t).unwrap();
+            let mut w = Worklist::new("batch", "Overnight batch");
+            w.set_status(WorklistStatus::Running);
+            w.set_groups(&[Group {
+                members: vec!["t-1".into()],
+                cap: None,
+                stop: String::new(),
+                verdict: "2026-08-20T00:00:00Z clean".into(),
+                landed: Vec::new(),
+            }]);
+            store.save_worklist(&w).unwrap();
+            cmd_govern::take(&store, "batch", "w1", "w1:p9");
+
+            let dial = util::Dial::new();
+            let place = Seats::of(vec![Ok(State::Idle)]);
+            let args = Args::synth("govern", &["batch"], &[("rotate", "true"), ("kind", "plain")]);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 1);
+            assert!(place.opened.borrow().is_empty(), "no successor was seated");
+            assert_eq!(
+                cmd_govern::governs(&store.governors(), "w1", Some("w1:p9")).as_deref(),
+                Some("batch"),
+                "the caller keeps the seat",
+            );
+            stop_being_a_seat();
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
+    }
+
+    /// The boundary from the other side: with a group still owed behind the
+    /// barrier just passed, the rotation goes ahead - which is the ordinary
+    /// per-barrier case, scoped to a worklist rather than a project.
+    #[test]
+    fn a_run_with_a_group_still_owed_behind_the_barrier_still_rotates() {
+        use crate::model::{Group, Task, Worklist, WorklistStatus};
+
+        let (_env, store) = rotating_as("rotate-midrun", "w1", "w1:p9");
+        let sock = _env.path("herdr.sock");
+        herdr_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+
+        store.save_project(&Project::new("core")).unwrap();
+        let mut landed = Task::new("landed", "t-1");
+        landed.project = Some("core".into());
+        landed.set_status(crate::model::Status::Done);
+        store.save_task(&landed).unwrap();
+        let mut owed = Task::new("still running", "t-2");
+        owed.project = Some("core".into());
+        store.save_task(&owed).unwrap();
+
+        let mut w = Worklist::new("batch", "Overnight batch");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[
+            Group {
+                members: vec!["t-1".into()],
+                cap: None,
+                stop: String::new(),
+                verdict: "2026-08-20T00:00:00Z clean".into(),
+                landed: Vec::new(),
+            },
+            Group {
+                members: vec!["t-2".into()],
+                cap: None,
+                stop: String::new(),
+                verdict: String::new(),
+                landed: Vec::new(),
+            },
+        ]);
+        store.save_worklist(&w).unwrap();
+        cmd_govern::take(&store, "batch", "w1", "w1:p9");
+
+        let dial = util::Dial::new();
+        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+        let args = Args::synth("govern", &["batch"], &[("rotate", "true"), ("kind", "plain")]);
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 0);
+        let rec = &store.governors()["batch"];
+        assert_eq!(rec["workspace"], "w9");
+        assert_eq!(store.handovers()["batch"]["to"], "w9:p2");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// The inherited ending is consumed by being done. Once the pane a record
+    /// names has been despawned - or was already gone, which is the same fact
+    /// to the verb - the record must go with it, or every later brief of that
+    /// successor orders an ending that already happened.
+    #[test]
+    fn despawning_the_predecessor_consumes_the_ending_it_was_told_to_do() {
+        let _env = no_backend();
+        let store = seat("rotate-consume");
+        working(&store, "t-260816-095", "w1:p1");
+        store.set_handover("core", json!({ "from": "w1:p1", "to": "w9:p2" }));
+        // Another rotation, aimed at a different pane: untouched.
+        store.set_handover("verb", json!({ "from": "w8:p8", "to": "w9:p3" }));
+
+        let place = Ends::ok();
+        let tidied = Tidied::default();
+        let code =
+            end_work(&place, &store, &Args::synth("despawn", &[], &[("pane", "w1:p1")]), None, &tidied.f());
+
+        assert_eq!(code, 0);
+        let left = store.handovers();
+        assert!(!left.contains_key("core"), "the ending that was owed is done: {left:?}");
+        assert!(left.contains_key("verb"), "somebody else's ending is not this verb's to spend: {left:?}");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }

@@ -814,6 +814,29 @@ pub fn host_of(governors: &BTreeMap<String, Value>, project: &str) -> String {
     }
 }
 
+/// The rotation this pane is the named successor of, if one is in flight.
+///
+/// The brief's key into the handover record. A record is written the moment a
+/// successor's seat exists and names both ends — the pane to end and the pane
+/// the instruction is for — so the successor's first sight of its job carries
+/// the predecessor's ending with it, read off the store rather than out of the
+/// typed work order. That channel is the one piece of handover state that does
+/// not go through the store, which is exactly why it can be dropped at all;
+/// see [`crate::cmd_spawn::rotate`] for the whole argument.
+///
+/// `(scope, from)` — what this pane is about to hold, and whose pane to end
+/// once it holds it. `None` for every pane on the machine but one.
+pub fn incoming(
+    handovers: &BTreeMap<String, Value>,
+    pane: Option<&str>,
+) -> Option<(String, String)> {
+    let pane = pane?;
+    handovers
+        .iter()
+        .find(|(_, rec)| str_at(rec, "to") == pane)
+        .map(|(scope, rec)| (scope.clone(), str_at(rec, "from")))
+}
+
 /// Record against each seat what the backend says is sitting in it: the session
 /// it is running under, the tree it was started in, and its kind.
 ///
@@ -945,7 +968,11 @@ pub fn occupant(seat: &Seat) -> Option<herdr::Pane> {
 /// **The status is not asked.** A seat is taken on a list before it runs —
 /// that is how somebody comes to be sitting there to start it — and it is only
 /// the routing in [`seat_for`] that cares whether the run has begun.
-fn scope_of(store: &Store, index: &Index, needle: &str) -> Option<String> {
+/// The scope this needle names — a worklist slug or a project id. `pub(crate)`
+/// because `wsp govern <scope> --rotate` resolves its subject through this same
+/// one key space and must refuse a name nothing governs before anything else
+/// happens.
+pub(crate) fn scope_of(store: &Store, index: &Index, needle: &str) -> Option<String> {
     let n = needle.trim().to_ascii_lowercase();
     if n.is_empty() {
         return None;
@@ -963,8 +990,16 @@ fn scope_of(store: &Store, index: &Index, needle: &str) -> Option<String> {
     }
 }
 
-/// `wsp govern [<scope>] [--clear|--remove|--tell "…"]`
+/// `wsp govern [<scope>] [--clear|--remove|--tell "…"]`, and the one flag that
+/// is a whole other verb: `--rotate`.
 pub fn govern(store: &Store, args: &Args) -> i32 {
+    // Rotation is not an edit to this seat — it ends it, by handing it to
+    // somebody else. It lives with the placement machinery in `cmd_spawn`,
+    // which is what seats the successor, and is routed from here because the
+    // verb a custodian types names this one. See [`crate::cmd_spawn::rotate`].
+    if args.has("rotate") {
+        return crate::cmd_spawn::rotate(store, args);
+    }
     let p = Paint::new();
     let index = Index::new(store.projects());
     let env = herdr::Env::read();

@@ -1644,6 +1644,42 @@ impl Store {
         removed
     }
 
+    // ---- handovers --------------------------------------------------------
+    //
+    // The one fact a rotation must carry through the store rather than through
+    // the typed work order: the pane the successor is to end. `wsp govern
+    // <scope> --rotate` seats a successor while the caller still holds the
+    // slot, so the predecessor's ending cannot be an instruction typed into the
+    // successor's composer — that channel is exactly the one that can be
+    // dropped, which is the failure this record exists to make impossible. It
+    // rides the brief instead, like every other fact a successor needs, and it
+    // is cleared by `despawn` when the pane it names actually goes.
+    //
+    // State rather than store: a pane id is herdr's and dies with the session,
+    // the same argument the seat record itself makes.
+
+    /// scope -> handover record: `{from, to, since}` — the pane to end, and the
+    /// pane the brief must say so to. One per scope; a new rotation overwrites
+    /// its predecessor's.
+    pub fn handovers(&self) -> BTreeMap<String, Value> {
+        match self.read_json("handovers.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_handover(&self, scope: &str, value: Value) {
+        self.update_json("handovers.json", |h| {
+            h.insert(scope.to_string(), value);
+        });
+    }
+
+    pub fn clear_handover(&self, scope: &str) -> bool {
+        let mut removed = false;
+        self.update_json("handovers.json", |h| removed = h.remove(scope).is_some());
+        removed
+    }
+
     // ---- raised hands, as they used to be kept --------------------------
     //
     // A flag is an agent asking to be looked at: this task, and here is why. It

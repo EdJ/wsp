@@ -151,8 +151,9 @@ const BOOL_FLAGS: &[&str] = &[
     "keep-tree",
     // And `govern`, whose positional is a project: `wsp spawn -p wsp --govern`
     // and `wsp govern wsp --remove` both put the flag last, where anything not
-    // known here swallows the argument after it.
-    "govern", "remove",
+    // known here swallows the argument after it. `--rotate` is the same shape:
+    // `wsp govern core --rotate` names the scope after the verb.
+    "govern", "remove", "rotate",
     // And `wsp watch <signal>…`, whose positionals are signal names.
     "now", "once", "status",
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
@@ -1634,9 +1635,15 @@ fn help_text() -> String {
                                     `--tell -`, or `--from FILE`: between double
                                     quotes a shell runs every backtick in it, and
                                     the message arrives fluent with the nouns gone
-  wsp spawn -p <proj> --govern      …or start one: a workspace on the project, an
-                                    agent in it, the seat taken, and a custodial
-                                    work order rather than a claim
+  wsp govern <proj> --rotate        the handover as one verb, and a custodian's
+                                    last act: seats the successor, waits until
+                                    its first turn starts, moves the seat, and
+                                    leaves your ending to it. Failing says so,
+                                    exits non-zero, and you are still the seat
+  wsp spawn -p <proj> --govern      fill an empty seat directly: a workspace on
+                                    the project, an agent in it, the seat taken,
+                                    and a custodial work order rather than a
+                                    claim. For handover, use --rotate above
   wsp release                       unbind this pane, leaving whatever is in it
   wsp release <id>                  …or end that task's claim, wherever it is
                                     held — including a claim no pane is under

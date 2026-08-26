@@ -2216,14 +2216,18 @@ fn report(
             // night of them. Only on a group's own barrier: there is nothing to
             // succeed at barrier zero, and none left to sequence behind the
             // last. The command is spelled rather than described, because an
-            // agent improvising around a noun is how the old habit survived.
+            // agent improvising around a noun is how the old habit survived;
+            // and since `core-050` it names the one verb rather than a three-
+            // step composition whose last step could be skipped — `rotate`
+            // confirms the successor's first turn before anything is ended,
+            // which was the half a separate "then end your session" never did.
             if let Gate::After(n) = gate {
                 if *n < of {
                     println!(
                         "{}",
                         p.dim(&format!(
-                            "then rotate — seat your successor from a fresh context, and end: \
-                             wsp spawn -p {} --govern",
+                            "then rotate - one verb seats your successor, confirms its first \
+                             turn, and arranges your ending: wsp govern {} --rotate",
                             w.id
                         ))
                     );
@@ -2345,10 +2349,13 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
             // like every line here it names what to run. Absent at barrier zero
             // and behind the last group, where the text says nothing either.
             // Additive: a parser that has never heard of it reads a barrier
-            // exactly as before (`core-049`).
+            // exactly as before (`core-049`). The key keeps its name while the
+            // value became `govern --rotate` (`core-050`), which seats the
+            // successor, confirms its first turn, then moves the seat — a
+            // renamed key would break a reader for the benefit of a word.
             if let Gate::After(n) = gate {
                 if *n < w.groups().len() {
-                    v["reseat"] = json!(format!("wsp spawn -p {} --govern", w.id));
+                    v["reseat"] = json!(format!("wsp govern {} --rotate", w.id));
                 }
             }
         }
