@@ -756,8 +756,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     let custodian = governed.clone().or_else(|| {
         b.incoming.as_ref().map(|(scope, _)| scope.clone())
     });
-    let rotation_pending =
-        matches!(&b.incoming, Some((scope, _)) if governed.as_deref() != Some(scope.as_str()));
+    let rotation_pending = cmd_govern::rotation_pending(governed.as_deref(), b.incoming.as_ref());
 
     Brief {
         handbook,

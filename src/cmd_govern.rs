@@ -837,6 +837,29 @@ pub fn incoming(
         .map(|(scope, rec)| (scope.clone(), str_at(rec, "from")))
 }
 
+/// Is a rotation into this pane still in flight — named successor, slot not yet
+/// moved?
+///
+/// The window [`crate::cmd_spawn::rotate`] holds open on purpose: the record is
+/// written the moment the successor's seat exists, and the slot moves last,
+/// once the successor's first turn is confirmed. Between those two the
+/// successor is a live agent holding an ending it has not earned yet, and the
+/// pane it has been told to end is the one running `rotate`.
+///
+/// Written once because two surfaces ask it and would drift apart on the day it
+/// mattered: the brief phrases the seat line differently either side of the
+/// move, and `despawn` refuses on one side of it. It is a predicate over two
+/// values its callers already hold rather than a reader of its own — the same
+/// bargain [`needs_a_person`] makes, for the same reason.
+///
+/// `governed` is what this pane holds the slot of *now* ([`governs`]);
+/// `incoming` is what [`incoming`] found. Nothing in flight, no rotation
+/// pending — which is every pane on the machine but one, for the seconds a
+/// handover takes.
+pub fn rotation_pending(governed: Option<&str>, incoming: Option<&(String, String)>) -> bool {
+    matches!(incoming, Some((scope, _)) if governed != Some(scope.as_str()))
+}
+
 /// Record against each seat what the backend says is sitting in it: the session
 /// it is running under, the tree it was started in, and its kind.
 ///

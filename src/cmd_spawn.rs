@@ -1941,6 +1941,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
 /// [`despawn`] when the pane it names actually goes — one ending, the one
 /// `despawn` already has, reused rather than grown anew.
 ///
+/// The brief also says *when*: the seat moves on your first turn, and only then
+/// is the ending yours to do. That sentence is not what enforces it. `despawn`
+/// refuses the predecessor while the record names the caller as successor and
+/// the slot has not moved ([`crate::cmd_govern::rotation_pending`]), because a
+/// successor acting on its session-start text without re-reading would kill
+/// this pane between step 2 and step 3 — a vacancy produced by the verb built
+/// to prevent one.
+///
 /// The write happens before the agent starts, because the brief is composed at
 /// start; if the rotation fails below, it is taken back — a stale record orders
 /// the death of a pane that is still the seated custodian, and that must only
@@ -2286,7 +2294,35 @@ pub(crate) fn workspace_of(seat: &Seat) -> Option<String> {
 pub fn despawn(store: &Store, args: &Args) -> i32 {
     let keep = args.has("keep-tree");
     let tidy = |seat: &Seat, task: Option<&str>, ws: Option<&str>| swept_up(store, seat, task, ws, keep);
-    end_work(backend(args).as_ref(), store, args, cmd_agent::my_pane().as_deref(), &tidy)
+    let pane = cmd_agent::my_pane();
+    // What this pane holds the slot of *now*, read here for the same reason the
+    // pane is: it is the one thing about the caller that comes out of the
+    // environment, and `end_work` is tested without one.
+    let governors = store.governors();
+    let governs = crate::herdr::Env::read()
+        .workspace_id
+        .as_deref()
+        .and_then(|ws| cmd_govern::governs(&governors, ws, pane.as_deref()));
+    let me = Caller { pane: pane.as_deref(), governs: governs.as_deref() };
+    end_work(backend(args).as_ref(), store, args, me, &tidy)
+}
+
+/// Which pane is running this despawn, and what it holds the seat of.
+///
+/// Two facts about the caller rather than one, because two of this verb's
+/// refusals turn on who is asking: ending the pane you are standing in, and
+/// ending the pane you are in the middle of taking a seat from. Both arrive as
+/// arguments for the reason on [`end_work`] — a test that had to export
+/// `HERDR_PANE_ID` to reach them would be changing a process-wide variable
+/// every other test can see.
+#[derive(Default, Clone, Copy)]
+struct Caller<'a> {
+    /// This process's seat, or `None` for a caller standing outside one.
+    pane: Option<&'a str>,
+    /// The scope whose slot this pane sits in at this moment. During a rotation
+    /// this is the fact that changes: `None` until the slot moves, the scope
+    /// afterwards.
+    governs: Option<&'a str>,
 }
 
 /// What the ending took away after the seat itself.
@@ -2419,7 +2455,7 @@ fn end_work(
     place: &dyn Place,
     store: &Store,
     args: &Args,
-    me: Option<&str>,
+    me: Caller,
     tidy: &dyn Fn(&Seat, Option<&str>, Option<&str>) -> Leftovers,
 ) -> i32 {
     let p = Paint::new();
@@ -2437,9 +2473,40 @@ fn end_work(
     // nobody left to release the claim. Refused rather than reordered, because
     // an agent that wants to put its work down has a verb for that already, and
     // a loop that has resolved its own seat by accident wants to be told.
-    if me == Some(seat.as_str()) {
+    if me.pane == Some(seat.as_str()) {
         eprintln!("wsp: {seat} is this pane — `wsp release`, then leave");
         return 2;
+    }
+
+    // The ending a rotation hands you is owed, but not yet. `rotate` seats you,
+    // confirms your first turn, and only then moves the slot — and `confirm_turn`
+    // returns when the turn *starts*, so your first turn and its `take` are
+    // running at the same time. Ending the predecessor inside that window kills
+    // the pane on its way to `take`: the slot never moves, the predecessor is
+    // gone, and you are left holding a record naming a pane that no longer
+    // exists. **A vacancy produced by the one verb built to prevent one.**
+    //
+    // A guard rather than a sentence in the brief, which is the whole argument
+    // of `core-050`: a step that depends on an agent following prose is a step
+    // that half-succeeds. The brief does say to wait; this is what happens when
+    // an agent acts on its session-start text without re-reading.
+    //
+    // Not behind `--force`, and that is deliberate. The seat guard below offers
+    // force because what it protects is a thread somebody may knowingly spend;
+    // forcing *this* one destroys the rotation in progress, and the message an
+    // agent reads here must not name the door that does the damage. It cannot
+    // wedge: the slot moving clears it, and where `rotate` could not move the
+    // slot itself it already prints the manual `wsp govern <scope>` that does.
+    let incoming = cmd_govern::incoming(&store.handovers(), me.pane);
+    if cmd_govern::rotation_pending(me.governs, incoming.as_ref()) {
+        // Only the pane the record actually names. A successor mid-rotation may
+        // still have ordinary agents of its own to end.
+        if let Some((scope, from)) = incoming.filter(|(_, from)| from == seat.as_str()) {
+            eprintln!("{} {seat} is still the {scope} seat — the rotation has not landed", p.yellow("✗"));
+            eprintln!("  {}", p.dim("it is running `wsp govern --rotate`, which moves the slot to you once your first turn is confirmed"));
+            eprintln!("  {}", p.dim(&format!("wait, then `wsp despawn --pane {from}` · if it has stopped, take the slot first: wsp govern {scope}")));
+            return 1;
+        }
     }
 
     // A governing pane is the one agent that cannot be restarted. Everything
@@ -4150,7 +4217,7 @@ mod tests {
 
         // And the ending takes it away. A brief left behind is a stale answer
         // waiting to be handed to whoever is spawned onto the task next.
-        assert_eq!(end_work(&place, &store, &Args::synth("despawn", &["t-1"], &[]), None, &|_, _, _| {
+        assert_eq!(end_work(&place, &store, &Args::synth("despawn", &["t-1"], &[]), Caller::default(), &|_, _, _| {
             Leftovers { tree: Tree::Absent, builds: Vec::new() }
         }), 0);
         assert!(!std::path::Path::new(&named).exists(), "the brief outlived the seat: {named}");
@@ -4393,7 +4460,7 @@ mod tests {
 
         let place = Ends::refusing(Refusal::Backend("pane is not going anywhere".into()));
         let tidied = Tidied::default();
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None, &tidied.f());
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Caller::default(), &tidied.f());
 
         assert_eq!(code, 1, "a despawn that ended nothing must not report success");
         assert_eq!(place.asked.borrow().len(), 1, "it did try");
@@ -4420,7 +4487,7 @@ mod tests {
 
         let place = Ends::ok();
         let tidied = Tidied::default();
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None, &tidied.f());
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Caller::default(), &tidied.f());
 
         assert_eq!(code, 0);
         assert_eq!(place.asked.borrow().as_slice(), &[Seat::new("w1:p1")], "the bound seat");
@@ -4455,7 +4522,7 @@ mod tests {
 
         let place = Ends::refusing(Refusal::NoSeat(Seat::new("w1:p1")));
         let tidied = Tidied::default();
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), None, &tidied.f());
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Caller::default(), &tidied.f());
 
         assert_eq!(code, 0);
         assert!(!store.claims().contains_key("t-260816-095"));
@@ -4465,7 +4532,7 @@ mod tests {
         working(&store, "t-260816-094", "w1:p2");
         let quiet = Ends::refusing(Refusal::Unreachable("no socket".into()));
         let untidied = Tidied::default();
-        assert_eq!(end_work(&quiet, &store, &Args::synth("despawn", &["094"], &[]), None, &untidied.f()), 1);
+        assert_eq!(end_work(&quiet, &store, &Args::synth("despawn", &["094"], &[]), Caller::default(), &untidied.f()), 1);
         assert!(untidied.0.borrow().is_empty(), "an ending that released nothing must not remove a tree");
         assert!(store.claims().contains_key("t-260816-094"), "released on a backend's silence");
 
@@ -4530,7 +4597,7 @@ mod tests {
 
         let place = Ends::ok();
         let tidied = Tidied::default();
-        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Some("w1:p1"), &tidied.f());
+        let code = end_work(&place, &store, &Args::synth("despawn", &["095"], &[]), Caller { pane: Some("w1:p1"), ..Caller::default() }, &tidied.f());
 
         assert_eq!(code, 2);
         assert!(place.asked.borrow().is_empty(), "it asked the backend to end this pane");
@@ -4938,12 +5005,62 @@ mod tests {
         let place = Ends::ok();
         let tidied = Tidied::default();
         let code =
-            end_work(&place, &store, &Args::synth("despawn", &[], &[("pane", "w1:p1")]), None, &tidied.f());
+            end_work(&place, &store, &Args::synth("despawn", &[], &[("pane", "w1:p1")]), Caller::default(), &tidied.f());
 
         assert_eq!(code, 0);
         let left = store.handovers();
         assert!(!left.contains_key("core"), "the ending that was owed is done: {left:?}");
         assert!(left.contains_key("verb"), "somebody else's ending is not this verb's to spend: {left:?}");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// The window `rotate` holds open, and the one move that ruins it.
+    ///
+    /// `confirm_turn` returns when the successor's turn *starts*, and `take`
+    /// runs after it — so the successor's first turn and the slot's move are in
+    /// flight together. A successor acting on its session-start text without
+    /// re-reading can despawn its predecessor inside that window, killing the
+    /// pane on its way to `take`: the slot never moves, the predecessor is
+    /// gone, and a live successor holds a record naming a pane that no longer
+    /// exists. A vacancy produced by the one verb built to prevent one.
+    ///
+    /// Refused rather than sequenced by prose, which is the whole argument of
+    /// `core-050`. The seat guard below already stopped the plain call — the
+    /// predecessor does still hold the slot — but it stopped it with the wrong
+    /// sentence, naming `--force` and `wsp govern --clear` as the way through,
+    /// and both of those are the damage. So the refusal that matters is the
+    /// forced one: that is the assertion that fails without this guard.
+    #[test]
+    fn a_successor_cannot_end_its_predecessor_before_the_slot_has_moved() {
+        let _env = no_backend();
+        let store = seat("rotate-early");
+        working(&store, "t-260816-095", "w1:p1");
+        cmd_govern::take(&store, "core", "w1", "w1:p1");
+        store.set_handover("core", json!({ "from": "w1:p1", "to": "w9:p2" }));
+
+        let place = Ends::ok();
+        let tidied = Tidied::default();
+        let ending = Args::synth("despawn", &[], &[("pane", "w1:p1")]);
+        // The successor, mid-rotation: named `to`, holding no slot yet.
+        let early = Caller { pane: Some("w9:p2"), governs: None };
+        assert_eq!(end_work(&place, &store, &ending, early, &tidied.f()), 1);
+        assert!(place.asked.borrow().is_empty(), "nothing was ended");
+        assert!(store.handovers().contains_key("core"), "and the ending is still owed");
+        // The gap. `--force` skips the seat guard, which is the door the seat
+        // guard's own message sends an agent to — and forcing here kills the
+        // pane that is still on its way to `take`.
+        let forced = Args::synth("despawn", &[], &[("pane", "w1:p1"), ("force", "true")]);
+        assert_eq!(end_work(&place, &store, &forced, early, &tidied.f()), 1);
+        assert!(place.asked.borrow().is_empty(), "--force is not the way out of this one");
+
+        // Once the slot has moved, the ending is the successor's to do — this
+        // is the same call, one state later, and it goes through.
+        cmd_govern::take(&store, "core", "w9", "w9:p2");
+        let now = Caller { pane: Some("w9:p2"), governs: Some("core") };
+        assert_eq!(end_work(&place, &store, &ending, now, &tidied.f()), 0);
+        assert_eq!(place.asked.borrow().len(), 1, "the predecessor was ended");
+        assert!(!store.handovers().contains_key("core"), "and the record is consumed");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
