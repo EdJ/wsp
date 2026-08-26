@@ -2882,13 +2882,16 @@ that result defends handing over the work, and nothing here re-litigates it.
 And the spend became measurable rather than argued about:
 
 ```sh
-wsp burn                # tokens by seat, dearest first — input, output, cache
-wsp burn --json         # the counts, for anything that wants to rank itself
+wsp burn                # cost by seat, dearest first — input, output, cache
+wsp burn --json         # the counts and the cost, for anything ranking itself
 ```
 
 Every hook a seated agent fires adds the transcript's new `usage` lines to a
-running total — one append per hook, never a re-read — and the ranking prices
-cache reads at roughly a tenth. It covers the seats wsp hosts end to end (the
+running total — one append per hook, never a re-read — and each request is
+priced at the tier that served it, because the fleet is deliberately
+heterogeneous and a token count across tiers ranks a cheap seat with eight
+times the volume above an expensive one that cost more. The price table is in
+`cmd_burn.rs` with the date it was read on. It covers the seats wsp hosts end to end (the
 headless ones); a pane agent's hooks carry no seat identity today, which is a
 gap recorded on `core-049` rather than silently closed, since opening the gate
 would start reporting for every Claude Code on the machine.

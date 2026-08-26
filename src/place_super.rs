@@ -539,14 +539,20 @@ fn str_of(v: &Value, key: &str) -> String {
 /// session-private — so the hook is where this is read, one append at a time.
 ///
 /// The tally is incremental and survives being wrong about nothing: a byte
-/// offset into the file says how far the last look got, only new lines are
-/// parsed (a Stop fires every turn, so re-reading a whole night's transcript
-/// each time would be quadratic in exactly the sessions this exists to
-/// measure), a shorter file than remembered means it was rotated or truncated
-/// and the count restarts rather than double-counts, and a different
-/// `session_id` means the seat was cleared — `/clear` ends an accounting as
-/// surely as it ends a context. A transcript with no `usage` lines (a kind that
-/// keeps none, or a format wsp does not read) tallies zero and costs one pass.
+/// offset into the file says how far the last look got, only new *whole* lines
+/// are parsed and only whole lines advance the offset (a Stop fires every turn,
+/// so re-reading a whole night's transcript each time would be quadratic in
+/// exactly the sessions this exists to measure), a shorter file than remembered
+/// means it was rotated or truncated and the count restarts rather than
+/// double-counts, and a different `session_id` means the seat was cleared —
+/// `/clear` ends an accounting as surely as it ends a context. A transcript
+/// with no `usage` lines (a kind that keeps none, or a format wsp does not
+/// read) tallies zero and costs one pass.
+///
+/// Two things it counts *once* that the first draft counted wrong, both of them
+/// silent: the fragment at the end of a read, and the repeated `usage` object
+/// Claude Code writes per content block. The argument for each is at the line
+/// that does it.
 ///
 /// Written for [`heard`], which every hook reaches; best-effort like everything
 /// else on that path.
@@ -571,11 +577,14 @@ fn tally_burn(dir: &PathBuf, payload: &Value) {
     let mut cache_read = if same { u_at(&was, "cache_read") } else { 0 };
     let mut cache_write = if same { u_at(&was, "cache_write") } else { 0 };
     let mut turns = if same { u_at(&was, "turns") } else { 0 };
-    let mut model = if same {
-        str_of(&was, "model")
-    } else {
-        String::new()
-    };
+    let mut model = if same { str_of(&was, "model") } else { String::new() };
+    // Not `u_at`: a record from before the tally priced anything has totals and
+    // no cost, and starting from zero would report a whole night as costing
+    // whatever the next few turns did.
+    let mut cost = if same { crate::cmd_burn::cost_of(&was) } else { 0 };
+    // The last request counted, carried between hooks so the dedupe below
+    // survives a slice boundary landing in the middle of one.
+    let mut last = if same { str_of(&was, "last_request") } else { String::new() };
 
     let Ok(file) = fs::File::open(&path) else {
         return;
@@ -585,7 +594,8 @@ fn tally_burn(dir: &PathBuf, payload: &Value) {
         // Rotated, swept or truncated: whatever happened, counting from a hole
         // would count somebody twice.
         offset = 0;
-        (input, output, cache_read, cache_write, turns) = (0, 0, 0, 0, 0);
+        (input, output, cache_read, cache_write, turns, cost) = (0, 0, 0, 0, 0, 0);
+        last.clear();
     }
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut reader = std::io::BufReader::new(file);
@@ -600,26 +610,60 @@ fn tally_burn(dir: &PathBuf, payload: &Value) {
         Ok(t) => t,
         Err(_) => return,
     };
-    for line in text.lines() {
+    // Only whole lines are counted, and only whole lines are consumed. A hook
+    // fires on the writer's clock, not on the writer's line endings, so a read
+    // can land inside a record that is still being written — and an offset
+    // advanced past the fragment would leave the next read starting inside a
+    // record it can no longer parse, dropping it for good. Silent undercount in
+    // an instrument whose whole job is counting.
+    let whole = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    for line in text[..whole].lines() {
         let Ok(line) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let Some(usage) = line.get("message").and_then(|m| m.get("usage")) else {
+        let Some(message) = line.get("message") else {
             continue;
         };
+        let Some(usage) = message.get("usage") else {
+            continue;
+        };
+        // One request, one bill. Claude Code writes a transcript line per
+        // *content block* and repeats the request's whole `usage` object on
+        // each of them, so an assistant turn that spoke and then called a tool
+        // is three identical lines. Measured on this store on 2026-08-26: 49
+        // usage lines over 30 requests, which a naive sum reports as 1.6x the
+        // real bill. The blocks of one request are written together, so
+        // remembering the last id counted is enough to tell a repeat from a
+        // new request.
+        let id = match str_of(&line, "requestId") {
+            // `message.id` is the same key one level in, and the fallback for a
+            // transcript that carries no request id of its own.
+            s if s.is_empty() => str_of(message, "id"),
+            s => s,
+        };
+        if !id.is_empty() && id == last {
+            continue;
+        }
+        if !id.is_empty() {
+            last = id;
+        }
         let n = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-        input += n("input_tokens");
-        output += n("output_tokens");
-        cache_read += n("cache_read_input_tokens");
-        cache_write += n("cache_creation_input_tokens");
+        let (i, o) = (n("input_tokens"), n("output_tokens"));
+        let (cr, cw) = (n("cache_read_input_tokens"), n("cache_creation_input_tokens"));
+        input += i;
+        output += o;
+        cache_read += cr;
+        cache_write += cw;
         turns += 1;
-        if model.is_empty() {
-            model = line
-                .get("message")
-                .and_then(|m| m.get("model"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+        // Priced against the model *this request* ran on, not against the one
+        // the session opened with: an agent that types `/model` mid-session is
+        // billed at both tiers and neither total is a lie about the other. The
+        // stored `model` is therefore what the seat is on now, and the cost is
+        // not derivable from it — see [`crate::cmd_burn::cost`].
+        let ran_on = str_of(message, "model");
+        cost += crate::cmd_burn::cost(&ran_on, i, o, cr, cw);
+        if !ran_on.is_empty() {
+            model = ran_on;
         }
     }
 
@@ -628,8 +672,10 @@ fn tally_burn(dir: &PathBuf, payload: &Value) {
         &json!({
             "session_id": sid,
             "transcript": path,
-            "offset": offset + text.len() as u64,
+            "offset": offset + whole as u64,
             "model": model,
+            "last_request": last,
+            "cost": cost,
             "input": input,
             "output": output,
             "cache_read": cache_read,
@@ -1647,8 +1693,9 @@ mod tests {
     /// counted (a Stop fires every turn — re-reading a whole transcript each
     /// time would be quadratic in exactly the sessions this exists to measure),
     /// the running total survives between hooks, and the offset lands on the
-    /// end of what was read. The model is remembered from the first message
-    /// that names one, because that is what a ranking column wants.
+    /// end of what was read. The model is the last one seen, because a ranking
+    /// column wants the tier the seat is on now — the cost is priced per
+    /// request and does not come from it.
     #[test]
     fn every_hook_tallies_only_the_transcript_slice_it_has_not_read() {
         let scratch = Scratch::new("burn");
@@ -1759,18 +1806,144 @@ mod tests {
         );
     }
 
-    /// The billed column's one judgement, pinned: cache reads bill at roughly a
-    /// tenth of an input token, everything else at face value. If pricing
-    /// changes, this changes with it — deliberately stated here rather than
-    /// left implicit in a ranking nobody could reproduce.
+    /// The pricing judgements, pinned: the rate is the model's, cache reads
+    /// bill at a tenth of input and cache writes at a quarter above it. If the
+    /// table changes, this changes with it — stated here rather than left
+    /// implicit in a ranking nobody could reproduce.
     #[test]
-    fn billed_is_face_value_plus_cache_reads_at_a_tenth() {
-        use crate::cmd_burn::billed;
-        assert_eq!(billed(1_000, 500, 0, 0), 1_500);
+    fn a_request_is_priced_at_the_rate_of_the_model_that_served_it() {
+        use crate::cmd_burn::cost;
+        // A million input tokens on opus is five dollars; on haiku, one.
+        assert_eq!(cost("claude-opus-5", 1_000_000, 0, 0, 0), 5_000_000);
+        assert_eq!(cost("claude-haiku-4-5-20251001", 1_000_000, 0, 0, 0), 1_000_000);
+        assert_eq!(cost("claude-sonnet-5", 0, 1_000_000, 0, 0), 10_000_000);
+        // The two multipliers, on the tier that makes them easiest to read.
         assert_eq!(
-            billed(0, 0, 10_000, 2_000),
-            3_000,
-            "reads at a tenth, writes at face value"
+            cost("claude-opus-5", 0, 0, 1_000_000, 1_000_000),
+            500_000 + 6_250_000,
+            "reads at a tenth of input, writes at a quarter above it"
+        );
+        // The whole finding in one line: volume alone ranks these the wrong way
+        // round. Eight million haiku input tokens cost less than two million
+        // opus ones, and the old column said the opposite.
+        assert!(
+            cost("claude-haiku-4-5", 8_000_000, 0, 0, 0)
+                < cost("claude-opus-5", 2_000_000, 0, 0, 0)
+        );
+        // A name the table does not know is not cheap. It prices at the dearest
+        // row, so an unrecognised spender cannot hide at the bottom.
+        assert_eq!(
+            cost("gpt-something", 1_000_000, 0, 0, 0),
+            cost("claude-fable-5", 1_000_000, 0, 0, 0)
+        );
+    }
+
+    /// A hook fires on the writer's clock, not on its line endings. The tally
+    /// used to advance its offset by everything it read, so a record caught
+    /// half-written was consumed, failed to parse, and was never seen again —
+    /// a silent undercount in the one thing here whose job is counting.
+    #[test]
+    fn a_record_still_being_written_is_counted_once_it_is_finished() {
+        let scratch = Scratch::new("burn-partial");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let transcript = scratch.root.join("transcript.jsonl");
+        let payload = json!({
+            "session_id": "s1",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        let burn = || read_json(&scratch.root.join(seat.as_str()).join(BURN_FILE));
+
+        // One whole record, and the first half of the next.
+        let whole = usage_line(100, 0, 0, 0, "claude-test");
+        let next = usage_line(500, 0, 0, 0, "claude-test");
+        let (head, tail) = next.split_at(next.len() / 2);
+        fs::write(&transcript, format!("{whole}\n{head}")).unwrap();
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        assert_eq!(u_at(&burn(), "input"), 100, "the finished record only");
+        assert_eq!(u_at(&burn(), "turns"), 1);
+
+        // The writer finishes it. Nothing was consumed that did not parse, so
+        // the second read starts at the record rather than inside it.
+        fs::write(&transcript, format!("{whole}\n{head}{tail}\n")).unwrap();
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        assert_eq!(
+            u_at(&burn(), "input"),
+            600,
+            "the completed record counted exactly once"
+        );
+        assert_eq!(u_at(&burn(), "turns"), 2);
+    }
+
+    /// Claude Code writes a transcript line per *content block* and repeats the
+    /// request's whole `usage` object on each one, so a turn that spoke and then
+    /// called a tool is two identical bills. Measured on this store on
+    /// 2026-08-26: 49 usage lines over 30 requests. A naive sum reported 1.6x
+    /// the real spend, which is the wrong direction for a report whose only job
+    /// is to be believed.
+    #[test]
+    fn one_request_is_billed_once_however_many_blocks_it_wrote() {
+        let scratch = Scratch::new("burn-blocks");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let transcript = scratch.root.join("transcript.jsonl");
+        let payload = json!({
+            "session_id": "s1",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        let burn = || read_json(&scratch.root.join(seat.as_str()).join(BURN_FILE));
+
+        let block = |req: &str| {
+            let mut v: Value = serde_json::from_str(&usage_line(100, 10, 0, 0, "claude-test")).unwrap();
+            v["requestId"] = json!(req);
+            v.to_string()
+        };
+        fs::write(&transcript, format!("{}\n{}\n", block("req-1"), block("req-1"))).unwrap();
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        assert_eq!(u_at(&burn(), "turns"), 1, "two blocks, one request");
+        assert_eq!(u_at(&burn(), "input"), 100);
+
+        // The blocks of one request can straddle a read, so the last id counted
+        // is remembered between hooks — otherwise the dedupe would fire only
+        // inside a slice and the boundary would double-bill.
+        let mut grown = std::fs::read_to_string(&transcript).unwrap();
+        grown.push_str(&format!("{}\n{}\n", block("req-1"), block("req-2")));
+        fs::write(&transcript, &grown).unwrap();
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        assert_eq!(u_at(&burn(), "turns"), 2, "the third block was the same request");
+        assert_eq!(u_at(&burn(), "input"), 200);
+    }
+
+    /// A session that changes tier partway through is billed at both, because
+    /// the price belongs to the request and not to the session. First-seen-wins
+    /// billed a whole night to whatever tier the agent opened on; the stored
+    /// model is now what the seat is *on*, and the cost does not come from it.
+    #[test]
+    fn a_session_that_changes_model_is_billed_at_both_tiers() {
+        let scratch = Scratch::new("burn-switch");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let transcript = scratch.root.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                usage_line(1_000_000, 0, 0, 0, "claude-haiku-4-5"),
+                usage_line(1_000_000, 0, 0, 0, "claude-opus-5")
+            ),
+        )
+        .unwrap();
+        let payload = json!({
+            "session_id": "s1",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        let b = read_json(&scratch.root.join(seat.as_str()).join(BURN_FILE));
+        assert_eq!(str_of(&b, "model"), "claude-opus-5", "the tier it is on now");
+        assert_eq!(
+            u_at(&b, "cost"),
+            1_000_000 + 5_000_000,
+            "a dollar of haiku and five of opus, not six of either"
         );
     }
 }
