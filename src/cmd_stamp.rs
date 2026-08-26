@@ -297,14 +297,20 @@ fn agents_now(place: &dyn Place) -> Agents {
 /// Ask every backend wsp can spawn onto and fold the answers into one
 /// census — the module doc's "Which backend is asked" has the reasoning.
 ///
-/// A backend's own [`Refusal`] becomes [`Census::silent`] under
-/// [`crate::cmd_spawn::LOCAL_BACKEND_NAMES`]'s name for it rather than being
-/// kept apart, so [`Census::and`] folds it exactly as it folds a silent
-/// MACHINE — one list, one digest, one `unheard` to read either kind of gap
-/// off. [`Census::was_heard`] only goes false once every backend and every
-/// machine inside it said nothing; a backend nobody has installed folds in
-/// silent beside one that answered, which is what keeps it a partial answer
-/// rather than a blackout.
+/// **The decision this function makes: a silent BACKEND reads the same way
+/// a silent MACHINE already does.** A backend's own [`Refusal`] becomes
+/// [`Census::silent`] under [`crate::cmd_spawn::LOCAL_BACKEND_NAMES`]'s name
+/// for it, and [`Census::and`] folds it in exactly as it folds a far
+/// machine's silence — one list, one digest, one `unheard` to read either
+/// kind of gap off. No second rule: [`Census::was_heard`] is reused rather
+/// than reinvented, so "a partial answer is an answer" — this file's
+/// standing rule for one machine going quiet — now also covers a whole
+/// backend nobody has installed folding in silent beside one that answered,
+/// rather than reading as the fleet gone quiet. Proven against a real
+/// compound seat with no herdr socket anywhere
+/// (`a_compound_only_machine_is_heard_even_though_herdr_never_answers`):
+/// `heard()` stays true, and the stamp still moves when that seat opens and
+/// again when it closes.
 fn combined_census() -> Census {
     let mut c: Option<Census> = None;
     for (name, backend) in crate::cmd_spawn::LOCAL_BACKEND_NAMES.iter().zip(crate::cmd_spawn::local_backends()) {
