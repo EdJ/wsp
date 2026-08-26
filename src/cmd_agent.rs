@@ -1318,10 +1318,6 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
         Ok(t) => t,
         Err(code) => return code,
     };
-    if !herdr::available() {
-        eprintln!("wsp: no herdr socket — nothing to say it to");
-        return 1;
-    }
 
     // Not `peek_target`, and the difference is worth a line rather than the
     // reuse. That resolver's whole value is that it also finds the panel, the
@@ -1337,12 +1333,18 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
         }
     };
 
-    let place = Herdr::new();
-    let Some(pane) = herdr::panes().ok().and_then(|ps| ps.into_iter().find(|x| x.pane_id == seat)) else {
-        eprintln!("wsp: herdr does not list {seat}");
+    // Asked of every backend wsp can spawn onto (`compound-077`), not herdr
+    // alone: a seat is a herdr pane, a compound seat, or nothing this
+    // machine knows, and only the census that made it can say which. This is
+    // the same fold `Wip::live` already does — `wsp tell` had its own copy of
+    // "herdr or nothing" until this row, which is why a headless or
+    // `compound`-hosted agent could not be told anything at all.
+    let backends = crate::cmd_spawn::local_backends();
+    let Some((place, row)) = locate_seat(&backends, &seat) else {
+        eprintln!("wsp: nothing answers for {seat} — `wsp wip` says who holds what");
         return 1;
     };
-    if pane.agent.trim().is_empty() {
+    if row.agent.kind.is_empty() {
         eprintln!("wsp: no agent in {seat} — the pane is alive and empty. `wsp spawn {needle}` puts one in it");
         return 1;
     }
@@ -1350,22 +1352,23 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // checked here rather than left to the backend. A blocked agent has a
     // permission dialog holding the keyboard, so the text does not queue behind
     // anything — it is typed *at the dialog*, where a sentence about what to do
-    // next can select an answer nobody chose. herdr cannot refuse this for us:
-    // from its side the prompt was delivered and the pane took the keys.
-    if matches!(crate::place_herdr::state_of_pane(&pane), State::Blocked) {
+    // next can select an answer nobody chose. Asked of the port's own `State`
+    // now rather than herdr's screen-scraped one, so this guard holds for
+    // whichever backend answered.
+    if row.state == State::Blocked {
         eprintln!("wsp: {what} is stopped on a prompt only a person can answer — answer that first");
         eprintln!("     `wsp peek {needle}` shows what it is asking");
         return 1;
     }
 
-    let how = crate::agent_commands::of(&pane.agent);
+    let how = crate::agent_commands::of(&row.agent.kind);
     let sent = Sent::new(&what, &what, &seat, &needle, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
             return twice(&sent, ago, &p);
         }
     }
-    delivered(store, how.tell(&place, &crate::place::Seat::new(&seat), &text), &sent)
+    delivered(store, how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &text), &sent)
 }
 
 /// One sentence on its way to one pane: everything both `tell` verbs need to
@@ -1578,6 +1581,20 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
 /// the caller is how a sentence meant for one agent reaches its neighbour —
 /// `govern --tell` may do it because a governorship *is* the workspace's, and a
 /// task is held by a pane.
+/// Which of `backends` answers for `seat`, and the row it answered with —
+/// `wsp tell`'s own join, pulled out so it can be proven without a real
+/// `Place::tell` to receive anything (`compound-077`). The same "ask every
+/// backend, take whichever one's census names this seat" `Wip::live` already
+/// does, one seat at a time instead of the whole list.
+fn locate_seat<'a>(
+    backends: &'a [Box<dyn Place>; 2],
+    seat: &str,
+) -> Option<(&'a Box<dyn Place>, crate::place::Seated)> {
+    backends.iter().find_map(|b| {
+        b.census().ok().and_then(|c| c.seats().find(|s| s.seat.as_str() == seat).cloned()).map(|row| (b, row))
+    })
+}
+
 fn target(store: &Store, needle: &str) -> Option<(String, String)> {
     if needle.contains(':') {
         return Some((needle.to_string(), format!("pane {needle}")));
@@ -3490,8 +3507,7 @@ pub(crate) struct Wip {
 
 impl Wip {
     pub(crate) fn live(store: &Store) -> Wip {
-        let backends: [Box<dyn Place>; 2] =
-            [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new())];
+        let backends = crate::cmd_spawn::local_backends();
         let mut agents = Vec::new();
         for backend in &backends {
             if let Ok(census) = backend.census() {
@@ -6532,6 +6548,11 @@ mod tests {
         let dir = compound.dir_of(&seat).unwrap();
         let mut rec: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
         rec["pid"] = json!(std::process::id());
+        // `agent` is what tells `state_of` this pid is a started session
+        // rather than `compound-081`'s bare terminal — without it the seat
+        // reads `State::Empty` and `Wip::live` filters it out before this
+        // test ever gets to assert on it.
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
         std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
         compound.heard(
             &seat,
@@ -6544,6 +6565,36 @@ mod tests {
         let panes: Vec<&str> = w.agents.iter().map(|s| s.seat.as_str()).collect();
         assert!(panes.contains(&"w1:p1"), "herdr's own row is still there: {panes:?}");
         assert!(panes.contains(&seat.as_str()), "and compound's, folded into the same census: {panes:?}");
+    }
+
+    /// `compound-077`: `wsp tell` used to ask herdr alone whether a seat
+    /// existed at all, so a `compound`-hosted agent read as "nothing holds
+    /// this" no matter what it was doing. `locate_seat` is the fix, proven
+    /// directly against a real compound seat and no herdr socket at all —
+    /// the case that used to fail before this row even reached the
+    /// "no agent"/"blocked" checks below it.
+    #[test]
+    fn locate_seat_finds_a_compound_hosted_agent_with_no_herdr_socket_up() {
+        let _env = util::isolated("locate-seat-compound");
+        let compound = crate::place_compound::Compound::new();
+        let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let dir = compound.dir_of(&seat).unwrap();
+        let mut rec: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
+        rec["pid"] = json!(std::process::id());
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+
+        let backends = crate::cmd_spawn::local_backends();
+        let (_, row) = locate_seat(&backends, seat.as_str())
+            .unwrap_or_else(|| panic!("{} answers for itself even with no herdr up", seat.as_str()));
+        assert_eq!(row.seat, seat);
+        assert_eq!(row.agent.kind, "claude", "the agent this seat holds, not just that it exists");
+
+        assert!(
+            locate_seat(&backends, "cpd-does-not-exist").is_none(),
+            "a seat nothing opened answers for nothing"
+        );
     }
 
     /// The row that was wrong for a whole night. `w2:p1` is idle on a task that

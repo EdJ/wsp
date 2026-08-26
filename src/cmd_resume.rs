@@ -1113,6 +1113,11 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
 
     let mut failed = 0;
     let (mut resumed, mut refused) = (0, 0);
+    // `cmd_spawn::backend(args)`, not a bare `Herdr::new()` — `compound-076`.
+    // `bring_back` used to hardcode herdr because herdr was the only place an
+    // agent could BE; `compound-064` made that false, and a `compound`-hosted
+    // session still could not be resumed through this command at all until
+    // this line asked the same question `spawn` and `stamp` already ask.
     for r in &chosen {
         let t = &r.thread;
         if !t.here() {
@@ -1154,7 +1159,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
             Some(s) => println!("{} — {}, resuming anyway", p.bold(&t.row()), p.dim(&s.why())),
             None => {}
         }
-        match bring_back(store, &Herdr::new(), t) {
+        match bring_back(store, cmd_spawn::backend(args).as_ref(), t) {
             Ok(seat) => {
                 // Off the offer, exactly. See `Store::forget_held`: the agent
                 // is known to be back because this line put it back, which is a

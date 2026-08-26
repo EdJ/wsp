@@ -314,6 +314,15 @@ impl Compound<'_> {
         if !running.contains(&(pid as u32)) {
             return State::Gone;
         }
+        // No agent recorded: `compound-081`'s bare terminal — a pty with a
+        // shell in it and nothing this backend watches for hooks.
+        // `State::Empty`'s own doc names this case — "a terminal somebody
+        // opened" — so a live, agent-less pid reads exactly the way no pid
+        // at all does, and `said` (which no shell ever writes) is never
+        // consulted for one.
+        if rec.get("agent").is_none() {
+            return State::Empty;
+        }
         let said = self.said(seat);
         match said.get("state").and_then(|s| s.as_str()) {
             Some("idle") => State::Idle,
@@ -498,45 +507,19 @@ fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
     Ok(())
 }
 
-impl Place for Compound<'_> {
-    fn open(&self, order: &Order) -> Result<Seat> {
-        if order.on.is_some() {
-            // Nothing here reaches a socket on another machine; a compound
-            // session is exactly as local as the pty it owns.
-            return Err(Refusal::Unsupported("run a compound session on another machine"));
-        }
-        let seat = self.mint()?;
-        let dir = self.dir_of(&seat)?;
-        let mut env: BTreeMap<String, String> = order.env.clone();
-        env.insert(place::SEAT_ENV.to_string(), seat.to_string());
-        let rec = json!({
-            "label": order.label,
-            "cwd": order.cwd.as_deref().map(|c| util::expand(c).display().to_string()),
-            "env": env,
-            "opened_at": util::now_iso(),
-        });
-        write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
-            .map_err(|e| Refusal::Backend(e.to_string()))?;
-        Ok(seat)
-    }
-
-    fn here(&self) -> Option<Seat> {
-        place::seat_from_env()
-    }
-
+impl Compound<'_> {
     /// `compound-sup spawn --label <seat> …` and nothing more: no `--socket`
     /// (see the module docs on why this backend does not mint into
-    /// compound's run directory itself), the agent as the pty's own child so
-    /// a person who attaches sees exactly the agent rather than a shell
-    /// wrapping one.
-    fn start(&self, seat: &Seat, agent: &Agent) -> Result<()> {
-        let rec = self.record(seat)?;
-        let dir = self.dir_of(seat)?;
-        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
-            if alive(&[pid as u32]).contains(&(pid as u32)) {
-                return Err(Refusal::Backend(format!("{seat} already has a session running")));
-            }
-        }
+    /// compound's run directory itself), `program`/`args` as the pty's own
+    /// child so a person who attaches sees exactly that and nothing wrapping
+    /// it. Shared by [`Place::start`] (an agent's own argv) and
+    /// [`Place::open`] (a bare shell, `compound-081`) — everything below the
+    /// choice of what runs in the pty is one path, not two.
+    ///
+    /// Returns `rec` with `pid`/`socket`/`started_at` folded in; the caller
+    /// decides what else changed (`start` adds `agent`; `open` adds
+    /// nothing) and writes it.
+    fn spawn_sup(&self, seat: &Seat, rec: &Value, program: &str, args: &[String]) -> Result<Value> {
         let Some(sup) = compound_sup_binary() else {
             return Err(Refusal::Backend(
                 "compound-sup not found — set $COMPOUND_SUP or put it on PATH".into(),
@@ -545,11 +528,11 @@ impl Place for Compound<'_> {
 
         let mut cmd = Command::new(&sup);
         cmd.arg("spawn").args(["--label", seat.as_str()]);
-        let cwd = str_of(&rec, "cwd");
+        let cwd = str_of(rec, "cwd");
         if !cwd.is_empty() {
             cmd.args(["--cwd", &cwd]);
         }
-        cmd.arg("--").arg(&agent.kind).args(&agent.args);
+        cmd.arg("--").arg(program).args(args);
 
         let env: BTreeMap<String, String> = rec
             .get("env")
@@ -592,11 +575,112 @@ impl Place for Compound<'_> {
             return Err(Refusal::Backend("compound-sup never announced a socket".into()));
         };
 
-        let mut rec = rec;
-        rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
+        let mut rec = rec.clone();
         rec["pid"] = json!(pid);
         rec["socket"] = json!(socket.display().to_string());
         rec["started_at"] = json!(util::now_iso());
+        Ok(rec)
+    }
+
+    /// `SIGTERM` the group, wait, `SIGKILL` if it lingers, and sweep the
+    /// socket once nothing answers it. The shared tail of ending whatever
+    /// currently occupies a seat's pty — whether the SEAT is going with it
+    /// ([`Place::stop`]) or is about to hold a fresh session in its place
+    /// ([`Place::start`] replacing a bare terminal, `compound-081`).
+    fn end_process(&self, seat: &Seat, rec: &Value) {
+        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32) {
+            signal_group(pid, "TERM");
+            let deadline = self.clock.now() + self.linger;
+            while alive(&[pid]).contains(&pid) {
+                if self.clock.now() >= deadline {
+                    signal_group(pid, "KILL");
+                    break;
+                }
+                self.clock.rest(self.poll);
+            }
+        }
+        // `compound-sup` unlinks its own socket on the way out of its run
+        // loop, but installs no `SIGTERM` handler — measured, not assumed —
+        // so a signalled exit skips that cleanup and leaves the headstone
+        // `compound-028` d2 already named the remedy for: connect, and an
+        // `ECONNREFUSED` says nothing is listening, which is what licenses
+        // removing the file rather than a process.
+        if let Some(socket) = self.socket_of(seat) {
+            if socket.exists() && UnixStream::connect(&socket).is_err() {
+                let _ = fs::remove_file(&socket);
+                let _ = fs::remove_file(socket.with_extension("label"));
+            }
+        }
+    }
+}
+
+impl Place for Compound<'_> {
+    /// Mints the seat's record, then — `compound-081` — puts a real shell in
+    /// its pty, the same way herdr's `open` leaves a person looking at a
+    /// prompt rather than a blank pane: **agents and command lines**, Ed's
+    /// own words for what this port has to cover, and a bare `wsp spawn`
+    /// giving a task record with nothing to attach to was the half that
+    /// answered neither.
+    ///
+    /// **Best effort, deliberately.** A seat is real the moment its record
+    /// is — every other verb here already depends on that being true before
+    /// any pty exists — so a `compound-sup` this machine cannot find (no
+    /// binary on `PATH`, no `$COMPOUND_SUP`) fails the SHELL, not the open:
+    /// the seat comes back exactly as it did before this row, holding no
+    /// session, `State::Empty` for the reason its own doc always named
+    /// ("a seat opened and never started") rather than for the newer one.
+    /// [`Place::start`] still refuses loudly when compound-sup is missing,
+    /// because starting an AGENT with nothing to run it in is the failure a
+    /// caller asked to hear about.
+    fn open(&self, order: &Order) -> Result<Seat> {
+        if order.on.is_some() {
+            // Nothing here reaches a socket on another machine; a compound
+            // session is exactly as local as the pty it owns.
+            return Err(Refusal::Unsupported("run a compound session on another machine"));
+        }
+        let seat = self.mint()?;
+        let dir = self.dir_of(&seat)?;
+        let mut env: BTreeMap<String, String> = order.env.clone();
+        env.insert(place::SEAT_ENV.to_string(), seat.to_string());
+        let rec = json!({
+            "label": order.label,
+            "cwd": order.cwd.as_deref().map(|c| util::expand(c).display().to_string()),
+            "env": env,
+            "opened_at": util::now_iso(),
+        });
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
+            .map_err(|e| Refusal::Backend(e.to_string()))?;
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        if let Ok(rec) = self.spawn_sup(&seat, &rec, &shell, &[]) {
+            let _ = write_atomic(&dir.join(SEAT_FILE), &rec.to_string());
+        }
+        Ok(seat)
+    }
+
+    fn here(&self) -> Option<Seat> {
+        place::seat_from_env()
+    }
+
+    /// An agent's own argv as the pty's child. A seat already holding a
+    /// BARE terminal — `compound-081`'s `open` — is replaced rather than
+    /// refused: that pty was never an agent's to begin with, so putting one
+    /// there is the same act `start` always was, not a second session
+    /// beside the first. A seat already holding an AGENT is still refused,
+    /// unchanged.
+    fn start(&self, seat: &Seat, agent: &Agent) -> Result<()> {
+        let rec = self.record(seat)?;
+        let dir = self.dir_of(seat)?;
+        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
+            if alive(&[pid as u32]).contains(&(pid as u32)) {
+                if rec.get("agent").is_some() {
+                    return Err(Refusal::Backend(format!("{seat} already has a session running")));
+                }
+                self.end_process(seat, &rec);
+            }
+        }
+        let mut rec = self.spawn_sup(seat, &rec, &agent.kind, &agent.args)?;
+        rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
             .map_err(|e| Refusal::Backend(e.to_string()))?;
         Ok(())
@@ -625,31 +709,10 @@ impl Place for Compound<'_> {
     fn stop(&self, seat: &Seat) -> Result<()> {
         let rec = self.record(seat)?;
         let dir = self.dir_of(seat)?;
-        if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32) {
-            signal_group(pid, "TERM");
-            let deadline = self.clock.now() + self.linger;
-            while alive(&[pid]).contains(&pid) {
-                if self.clock.now() >= deadline {
-                    signal_group(pid, "KILL");
-                    break;
-                }
-                self.clock.rest(self.poll);
-            }
-        }
-        // `compound-sup` unlinks its own socket on the way out of its run
-        // loop, but installs no `SIGTERM` handler — measured, not assumed —
-        // so a signalled exit skips that cleanup and leaves the headstone
-        // `compound-028` d2 already named the remedy for: connect, and an
-        // `ECONNREFUSED` says nothing is listening, which is what licenses
-        // removing the file rather than a process. `compound-031` is where
-        // the general case (a session whose host is gone and nobody asked
-        // it to stop) is filed; this is the one seat this call just ended.
-        if let Some(socket) = self.socket_of(seat) {
-            if socket.exists() && UnixStream::connect(&socket).is_err() {
-                let _ = fs::remove_file(&socket);
-                let _ = fs::remove_file(socket.with_extension("label"));
-            }
-        }
+        // `compound-031` is where the general case (a session whose host is
+        // gone and nobody asked it to stop) is filed; this is the one seat
+        // this call just ended.
+        self.end_process(seat, &rec);
         fs::remove_dir_all(&dir).map_err(|e| Refusal::Backend(e.to_string()))?;
         Ok(())
     }
@@ -806,8 +869,14 @@ mod tests {
         let seat = place.open(&Order::default()).unwrap();
         let dir = place.dir_of(&seat).unwrap();
         // A session recorded without actually spawning compound-sup: this
-        // test is about the hook reading, not the pty.
-        let _ = write_atomic(&dir.join(SEAT_FILE), &json!({ "pid": std::process::id() }).to_string());
+        // test is about the hook reading, not the pty. `agent` is set by
+        // hand for the same reason `start` sets it — its absence now reads
+        // as `compound-081`'s bare terminal, which is a different test.
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
+                .to_string(),
+        );
 
         place.heard(&seat, "SessionStart", said_by("SessionStart").unwrap(), &json!({}));
         assert_eq!(place.state(&seat).unwrap(), State::Idle);
@@ -815,6 +884,71 @@ mod tests {
         place.heard(&seat, "PermissionRequest", said_by("PermissionRequest").unwrap(), &json!({}));
         assert_eq!(place.state(&seat).unwrap(), State::Working);
         assert!(!place.state(&seat).unwrap().will_take_a_prompt(), "a sentence would land in the dialog");
+    }
+
+    /// `compound-081`: a live pid with no `agent` recorded is `open`'s bare
+    /// terminal, and reads `Empty` exactly as no pid at all does — `said`
+    /// (which no shell ever writes to) is never consulted for one, so a
+    /// stale hook file from a PREVIOUS agent in this seat cannot leak
+    /// through a bare shell that replaced it.
+    #[test]
+    fn a_bare_terminal_reads_empty_while_alive_and_gone_once_its_shell_exits() {
+        let scratch = Scratch::new("bare");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        // A stale hook file, as if this seat held an agent before — the
+        // case the `said`-skip in `state_of` exists to guard.
+        let _ = write_atomic(&dir.join(SAID_FILE), &json!({ "state": "working" }).to_string());
+
+        let _ = write_atomic(&dir.join(SEAT_FILE), &json!({ "pid": std::process::id() }).to_string());
+        assert_eq!(
+            place.state(&seat).unwrap(),
+            State::Empty,
+            "a live shell with no agent in it reads the same as none opened"
+        );
+
+        // A pid nothing alive could plausibly hold.
+        let _ = write_atomic(&dir.join(SEAT_FILE), &json!({ "pid": 999_999_991u32 }).to_string());
+        assert_eq!(place.state(&seat).unwrap(), State::Gone, "the shell is not running");
+    }
+
+    /// `compound-081`, end to end: `open` alone already has a real
+    /// `compound-sup` behind it — a bare terminal, `State::Empty`, a socket
+    /// on disk — and `start` REPLACES that pty's shell with an agent rather
+    /// than refusing because a session already occupies the seat.
+    #[test]
+    #[ignore]
+    fn open_alone_has_a_real_terminal_and_start_replaces_its_bare_shell() {
+        let Some(sup) = std::env::var_os("COMPOUND_SUP") else {
+            eprintln!("skipped: set COMPOUND_SUP to a built compound-sup to run this");
+            return;
+        };
+        assert!(PathBuf::from(&sup).is_file(), "COMPOUND_SUP is not a file");
+
+        let scratch = Scratch::new("bare-real");
+        let place = scratch.place();
+        let cwd = std::env::temp_dir();
+        let seat = place
+            .open(&Order { label: "compound-081 smoke".into(), cwd: Some(cwd.display().to_string()), ..Order::default() })
+            .expect("a seat");
+
+        assert!(until(|| place.socket_of(&seat).is_some()), "open minted no socket in time");
+        let bare_socket = place.socket_of(&seat).unwrap();
+        assert!(until(|| bare_socket.exists()), "compound-sup never bound the bare shell's socket");
+        assert_eq!(place.state(&seat).unwrap(), State::Empty, "a shell with nobody's agent in it");
+        let bare_pid = place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid");
+
+        place
+            .start(&seat, &Agent { kind: "cat".into(), name: "smoke".into(), args: vec![] })
+            .expect("start replaces the bare shell rather than refusing");
+
+        let agent_pid = place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid");
+        assert_ne!(agent_pid, bare_pid, "a fresh process, not the shell wearing an agent's name");
+        assert!(until(|| alive(&[bare_pid as u32]).is_empty()), "the bare shell was actually ended");
+        assert_eq!(place.state(&seat).unwrap(), State::Starting, "an agent is recorded now");
+
+        place.stop(&seat).expect("the seat was there");
     }
 
     /// End to end against a REAL `compound-sup`: open, start, watch it reach

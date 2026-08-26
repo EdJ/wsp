@@ -1458,6 +1458,21 @@ pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
     }
 }
 
+/// Every backend wsp can spawn onto, for the readers that do not get to ask —
+/// `wsp wip` folds all of them into one census (`Wip::live`, `wsp-100`+
+/// `compound-078`) and `wsp tell` (`compound-077`) has to find the ONE that
+/// answers for a seat before it knows how to reach it. `headless` is left
+/// out: `place_super` has no terminal to fold into a listing and no prose to
+/// receive that is not already reachable through its own `agent.prompt` —
+/// see `robustness-022`'s three fates.
+///
+/// The same "one copy" argument [`backend`] makes: a reader that built its
+/// own array would be a second list to update when a fifth implementor
+/// lands.
+pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
+    [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new())]
+}
+
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
