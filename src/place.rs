@@ -299,6 +299,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The environment variable a seat's occupant finds its own handle in, for a
 /// backend that has no name of its own for it.
@@ -704,6 +705,46 @@ impl State {
 
 /// One seat, as the backend currently sees it.
 ///
+/// An id for an agent that outlives the agent's sessions.
+///
+/// **The identity `compound-092` exists to create**, and the decision behind it
+/// is Ed's: *"we can keep the IDs between agent sessions, since it's technically
+/// the same agent."* So it cannot be a session id, a pane id or a seat id —
+/// all three end and come back, and the thing this names does not. `wsp resume`
+/// carries it across a restart and across a change of BACKEND, which is what
+/// makes `compound-065`'s cutover — close down in herdr, come back in compound,
+/// on the same claim — a move rather than a replacement. `wsp govern --rotate`
+/// does not carry it: a successor is a different agent and mints its own.
+///
+/// Minted by wsp and never by a backend (`compound` d9: *"wsp mints and holds
+/// the id, and the backend's own name for a thing becomes an attribute of it
+/// rather than its identity"*).
+///
+/// # Why it is shaped like a message id and not like a uuid
+///
+/// Ed asked for a uuid and this is the same guarantee by a cheaper route. wsp
+/// takes one dependency — `serde_json` — so a uuid crate would be the second,
+/// for a value that never leaves this machine's own store. What actually
+/// matters is the property `message::new_id` documents and a uuid would give
+/// only by accident: **an agent id must live outside the task id space.**
+/// `Store::rename_tasks` rewrites a renumbering through the raw text of every
+/// state file, matching whole `[A-Za-z0-9_-]` tokens against a map of old task
+/// ids — so an id that could collide with one would be silently rewritten by a
+/// `wsp mv`, and the claim naming it would lose its agent. Task ids end in
+/// digits after their last `-`; this ends in `p` plus base 36, which no task id
+/// has ever had.
+pub fn new_agent_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("a-{}-p{:x}{:x}", crate::util::base36(crate::util::epoch_nanos()), std::process::id(), n)
+}
+
+/// Is this one of ours? The complement of a task id, asserted in both
+/// directions by the test, exactly as `message::is_message_id` is.
+pub fn is_agent_id(s: &str) -> bool {
+    s.starts_with("a-") && s.rsplit('-').next().is_some_and(|tail| tail.starts_with('p'))
+}
+
 /// The census row. `session` is the agent's own session id where the backend
 /// knows one — Claude Code's, which a binding already records and which is what
 /// ties a seat to the JSONL transcript a TTY-less agent leaves behind.
@@ -1272,6 +1313,38 @@ mod tests {
     /// Nothing in the port reads an id. This is the closest a test can get:
     /// a seat is whatever the backend said, unaltered, including the `@mb2`
     /// suffix the `Remote` decorator puts on it.
+    /// **An agent id must not look like a task id**, and the reason is the
+    /// one `message::new_id` documents: `Store::rename_tasks` rewrites a
+    /// renumbering through the raw text of every state file, matching whole
+    /// tokens against a map of old task ids. An id that could collide would be
+    /// silently rewritten by a `wsp mv`, and the claim naming it would lose its
+    /// agent — a failure with no error and no way back.
+    ///
+    /// Both task shapes end in digits after their last `-`; this ends in `p`.
+    #[test]
+    fn an_agent_id_cannot_be_mistaken_for_a_task_id_a_renumbering_would_rewrite() {
+        let id = new_agent_id();
+        assert!(is_agent_id(&id), "{id}");
+        assert!(id.starts_with("a-"), "{id}");
+        let tail = id.rsplit('-').next().expect("a last segment");
+        assert!(
+            tail.starts_with('p'),
+            "no task id has ever ended in a `p` segment, which is the whole guarantee: {id}"
+        );
+        for task in ["wsp-105", "t-260817-014", "compound-092"] {
+            assert!(!is_agent_id(task), "{task} is a task id and must not read as ours");
+        }
+    }
+
+    /// Two minted in the same process are two agents. The counter is there
+    /// because two inside one nanosecond are still two.
+    #[test]
+    fn two_agents_minted_together_are_not_one_agent() {
+        let a = new_agent_id();
+        let b = new_agent_id();
+        assert_ne!(a, b, "a seat handed on twice in one tick is two agents");
+    }
+
     #[test]
     fn a_seat_is_carried_rather_than_parsed() {
         for id in ["w0:p3", "w0:p3@mb2", "7", "sess_01HQ", ""] {

@@ -1210,3 +1210,23 @@ mod tests {
         assert_eq!(money_of("$hat"), None);
     }
 }
+
+/// Base 36, lowercase — the compact spelling every minted id in this store
+/// shares (`message::new_id`, `place::new_agent_id`).
+///
+/// Here rather than beside either caller because two of them now exist, and a
+/// second copy of a number-to-text function is the kind of divergence nobody
+/// notices until two ids sort differently.
+pub fn base36(mut n: u64) -> String {
+    const D: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".into();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(D[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}

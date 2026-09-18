@@ -2356,10 +2356,32 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // outside it deliberately — a commit can take longer than any other agent
     // should be made to wait, and `wsp reconcile` already rebuilds bindings
     // from claims if the two ever part company.
+    // The agent's own id, minted once and kept for as long as the agent is
+    // (`compound-092`). REUSED where this seat already holds one, because Ed's
+    // decision is that an id survives an agent's sessions — a restart, a
+    // `wsp resume`, a move between backends — and a second claim by the same
+    // agent is the same agent. A seat that has been handed on gets a new id
+    // because `agent_in_seat` answers with the newest row and this writes one.
+    let agent_id = store
+        .agent_in_seat(&pane)
+        .unwrap_or_else(crate::place::new_agent_id);
+
     store.locked(|| {
         for other in &displaced {
             store.clear_binding(other);
         }
+        // The agent, under the id wsp minted, with the backend's own names for
+        // it as attributes. Written inside the lock with the claim it belongs
+        // to, so no reader can see a claim naming an agent that has no row.
+        store.set_agent(
+            &agent_id,
+            json!({
+                "seat": pane,
+                "session": session,
+                "cwd": cwd,
+                "started": util::now_iso(),
+            }),
+        );
         store.set_binding(
             &pane,
             json!({
@@ -2383,6 +2405,11 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         store.set_claim(
             &t.id,
             json!({
+                // The identity that replaces the three below it
+                // (`compound-092`). Written now and read by nothing yet: the
+                // store is durable, so the id has to exist on records for a
+                // while before anything is allowed to depend on it.
+                "agent_id": agent_id,
                 "workspace_id": workspace,
                 "workspace_label": named.clone().unwrap_or_else(|| ws_label.clone()),
                 "cwd": cwd,

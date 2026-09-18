@@ -941,7 +941,7 @@ pub fn new_id() -> String {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     // Nanoseconds because two messages inside one second are two messages, and
     // the counter because two inside one nanosecond are still two.
-    format!("m-{}-p{:x}{:x}", base36(util::epoch_nanos()), std::process::id(), n)
+    format!("m-{}-p{:x}{:x}", util::base36(util::epoch_nanos()), std::process::id(), n)
 }
 
 /// Is this one of ours? The complement of a task id, and the test drives both
@@ -950,19 +950,7 @@ pub fn is_message_id(s: &str) -> bool {
     s.starts_with("m-") && s.rsplit('-').next().is_some_and(|tail| tail.starts_with('p'))
 }
 
-fn base36(mut n: u64) -> String {
-    const D: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    if n == 0 {
-        return "0".into();
-    }
-    let mut out = Vec::new();
-    while n > 0 {
-        out.push(D[(n % 36) as usize]);
-        n /= 36;
-    }
-    out.reverse();
-    String::from_utf8(out).unwrap_or_default()
-}
+
 
 // ---- refusals -------------------------------------------------------------
 

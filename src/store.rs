@@ -1577,6 +1577,57 @@ impl Store {
         }
     }
 
+    // ---- agents -----------------------------------------------------------
+    //
+    // The agent itself, under an id wsp minted (`compound-092`). This is the
+    // record `compound` d9 describes without naming a file: wsp mints and holds
+    // the id, and a backend's own name for the thing — its seat, its session —
+    // is an ATTRIBUTE here rather than the identity.
+    //
+    // It exists because the two things it replaces could not carry an identity
+    // that survives. A claim is per TASK, so an agent holding none has no row
+    // in it at all, and a mandate was keyed by WORKSPACE precisely because a
+    // mandate is pinned to a room before anybody is in it. Neither survives a
+    // session ending, which is the one property Ed's decision requires.
+    //
+    // A row here is not a claim to work: an agent with a row and no claim is
+    // exactly what `cmd_govern::occupant` is going to look for when it stops
+    // asking which workspace somebody is in — *unassigned* is a fact about
+    // wsp's own record, where "the same workspace" was a fact about herdr's
+    // furniture.
+
+    /// agent id -> agent record
+    pub fn agents_held(&self) -> BTreeMap<String, Value> {
+        match self.read_json("agents.json") {
+            Value::Object(m) => m.into_iter().collect(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn set_agent(&self, id: &str, value: Value) {
+        self.update_json("agents.json", |a| {
+            a.insert(id.to_string(), value);
+        });
+    }
+
+    /// The agent sitting in a seat, by the seat a backend named — the join
+    /// that turns a census row into an identity (`compound` d9's "attribute,
+    /// never the identity", read back the one direction that needs it).
+    ///
+    /// A seat is reused after an agent leaves it, so the newest row wins: an
+    /// id is minted with `started` on it and the comparison is that, never the
+    /// map order, which `BTreeMap` sorts by id and not by time.
+    pub fn agent_in_seat(&self, seat: &str) -> Option<String> {
+        self.agents_held()
+            .into_iter()
+            .filter(|(_, v)| v.get("seat").and_then(|s| s.as_str()) == Some(seat))
+            .max_by(|a, b| {
+                let at = |v: &Value| v.get("started").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                at(&a.1).cmp(&at(&b.1))
+            })
+            .map(|(id, _)| id)
+    }
+
     // ---- mandates ---------------------------------------------------------
     //
     // A claim says what an agent is doing now. A mandate says what it is *for*
@@ -3155,6 +3206,34 @@ mod tests {
 
         let why = store.task_or_why("t-260815-024").expect_err("not live under either name");
         assert!(why.contains("data-009") && why.contains("archived"), "{why}");
+    }
+
+    /// **A seat is reused and an agent is not**, so the join from one to the
+    /// other has to answer with the newest row (`compound-092`).
+    ///
+    /// The ordering is explicitly NOT the map's. `BTreeMap` sorts by key, and
+    /// an agent id begins with a base-36 nanosecond stamp — which sorts by time
+    /// only until the digit count changes, and then sorts a newer id before an
+    /// older one. So the comparison is on `started`, and this test is what says
+    /// so: the id that sorts FIRST is the one that started second.
+    #[test]
+    fn the_agent_in_a_seat_is_the_one_that_started_last_and_not_the_one_that_sorts_first() {
+        let store = scratch("agent-in-seat");
+        store.set_agent("a-zzzz-p1", json!({ "seat": "w1:p1", "started": "2026-09-18T09:00:00Z" }));
+        store.set_agent("a-aaaa-p2", json!({ "seat": "w1:p1", "started": "2026-09-18T11:00:00Z" }));
+        store.set_agent("a-mmmm-p3", json!({ "seat": "w1:p2", "started": "2026-09-18T12:00:00Z" }));
+
+        assert_eq!(
+            store.agent_in_seat("w1:p1").as_deref(),
+            Some("a-aaaa-p2"),
+            "the seat's current occupant, which is not the one a key sort puts first"
+        );
+        assert_eq!(store.agent_in_seat("w1:p2").as_deref(), Some("a-mmmm-p3"));
+        assert_eq!(
+            store.agent_in_seat("w9:p9"),
+            None,
+            "a seat nothing has sat in holds nobody, which is what `unassigned` will read"
+        );
     }
 
     fn scratch(tag: &str) -> Store {
