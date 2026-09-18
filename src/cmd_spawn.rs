@@ -1984,7 +1984,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
 /// the death of a pane that is still the seated custodian, and that must only
 /// ever exist while a confirmed successor stands ready to inherit.
 pub fn rotate(store: &Store, args: &Args) -> i32 {
-    rotate_on(&Herdr::new(), store, args, &Patience::default())
+    // The successor OPENS a seat, which is a spawn — so it opens wherever a
+    // spawn would, through the same one-copy choice (`compound-091`). It used
+    // to name herdr here, which meant `--compound` was honoured by every verb
+    // that starts an agent except the one that replaces a custodian.
+    rotate_on(backend(args).as_ref(), store, args, &Patience::default())
 }
 
 /// [`rotate`] against a stated backend and clock, which is the shape every test

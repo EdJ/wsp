@@ -1586,7 +1586,7 @@ pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &
 /// `Place::tell` to receive anything (`compound-077`). The same "ask every
 /// backend, take whichever one's census names this seat" `Wip::live` already
 /// does, one seat at a time instead of the whole list.
-fn locate_seat<'a>(
+pub(crate) fn locate_seat<'a>(
     backends: &'a [Box<dyn Place>; 2],
     seat: &str,
 ) -> Option<(&'a Box<dyn Place>, crate::place::Seated)> {

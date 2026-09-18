@@ -487,24 +487,29 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
         receipt(false, "nobody to tell — the answer is on the record and in the log");
         return 0;
     }
-    if !herdr::available() {
-        receipt(false, &format!("no herdr socket — {pane} was not told; the answer is written"));
-        return 0;
-    }
-    let found = herdr::panes().ok().and_then(|ps| ps.into_iter().find(|x| x.pane_id == pane));
-    let Some(found) = found else {
-        receipt(false, &format!("herdr does not list {pane} any more — the answer is written"));
+    // Asked of every backend wsp can spawn onto (`compound-091`), not herdr
+    // alone — the same fold `wsp tell` makes since `compound-077` and for the
+    // same reason: a seat is a herdr pane, a compound seat, or nothing this
+    // machine knows, and only the census that made it can say which. This verb
+    // used to gate on `herdr::available()` and then scan `herdr::panes()`, so
+    // an answer addressed to a compound-hosted agent was filed as "no herdr
+    // socket" and never delivered, on a machine where the agent was running.
+    let backends = crate::cmd_spawn::local_backends();
+    let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
+        receipt(false, &format!("nothing answers for {pane} any more — the answer is written"));
         return 0;
     };
-    if found.agent.trim().is_empty() {
+    if found.agent.kind.trim().is_empty() {
         receipt(false, &format!("{pane} holds no agent — the answer is written"));
         return 0;
     }
     // The one state a message must not be sent into, checked here for the same
     // reason `wsp tell` checks it: a blocked agent has a permission dialog
     // holding the keyboard, so the text is typed *at the dialog*, where a
-    // sentence about what to do next can select an answer nobody chose.
-    if matches!(crate::place_herdr::state_of_pane(&found), State::Blocked) {
+    // sentence about what to do next can select an answer nobody chose. Asked
+    // of the port's own `State` rather than herdr's screen-scraped one, so the
+    // guard holds for whichever backend answered.
+    if found.state == State::Blocked {
         receipt(
             false,
             &format!("{pane} is stopped on a prompt only a person can answer — the answer is written; `wsp peek {pane}` shows what it is asking"),
@@ -513,15 +518,14 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     }
 
     let text = wire(closed);
-    let how = crate::agent_commands::of(&found.agent);
+    let how = crate::agent_commands::of(&found.agent.kind);
     let sent = crate::cmd_agent::Sent::new(&pane, &whose(closed), &pane, &pane, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
             return crate::cmd_agent::twice(&sent, ago, &p);
         }
     }
-    let place = crate::place_herdr::Herdr::new();
-    let out = how.tell(&place, &crate::place::Seat::new(&pane), &text);
+    let out = how.tell(place.as_ref(), &crate::place::Seat::new(&pane), &text);
     // `delivered` owns the honest-reporting rule and the `agent-told` event, so
     // this reuses it whole rather than reimplementing either. Its non-zero exit
     // on `NotTaken` is right for `wsp tell`, where the sentence is the only
