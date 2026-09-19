@@ -1618,14 +1618,22 @@ impl Store {
     /// id is minted with `started` on it and the comparison is that, never the
     /// map order, which `BTreeMap` sorts by id and not by time.
     pub fn agent_in_seat(&self, seat: &str) -> Option<String> {
-        self.agents_held()
-            .into_iter()
+        Self::agent_in_seat_from_map(&self.agents_held(), seat)
+    }
+
+    /// The same answer, from a map somebody has already read — the panel's
+    /// reason, and it is [`crate::cmd_mandate::from_map`]'s: a refresh joins
+    /// twenty panes against `agents.json` and a store read per pane would be
+    /// twenty reads of one small map.
+    pub fn agent_in_seat_from_map(agents: &BTreeMap<String, Value>, seat: &str) -> Option<String> {
+        agents
+            .iter()
             .filter(|(_, v)| v.get("seat").and_then(|s| s.as_str()) == Some(seat))
             .max_by(|a, b| {
                 let at = |v: &Value| v.get("started").and_then(|s| s.as_str()).unwrap_or("").to_string();
                 at(&a.1).cmp(&at(&b.1))
             })
-            .map(|(id, _)| id)
+            .map(|(id, _)| id.clone())
     }
 
     // ---- mandates ---------------------------------------------------------
@@ -1633,10 +1641,30 @@ impl Store {
     // A claim says what an agent is doing now. A mandate says what it is *for*
     // — the question it has to answer for itself every time it finishes
     // something, and the one thing standing between "record what you were told"
-    // and "pick up the next piece". Keyed on the workspace, like a pin, because
-    // that is the unit a person points at a piece of work.
+    // and "pick up the next piece".
+    //
+    // Keyed on the agent (`compound-092` stage B), not the workspace it was
+    // keyed on before. It was workspace-keyed for one reason — a mandate is
+    // pinned to a room before anybody is in it, which a claim (per-task) or a
+    // binding (per-pane, cleared the moment an agent lets go) cannot survive
+    // being. An agent's row outlives both the same way a workspace did: it is
+    // minted once per seat and kept for as long as that agent holds the seat
+    // (`compound-092`'s "an id survives an agent's sessions"). `cmd_mandate`'s
+    // own doc comment on `mandate()` says what "pinned before anybody is in
+    // it" becomes under this key — an agent's row minted at the same moment
+    // the direction is set, not only at a claim.
+    //
+    // A store on disk outlives a release, so a mandate written under the old
+    // key does not stop reading the day this lands. `store::mandates()` stays
+    // a dumb map — it does not know which shape a key is in — and
+    // [`crate::cmd_mandate::from_map`] is where that is decided, the same
+    // split `agent_in_seat` above draws between the raw map and its reading.
+    // A **writer** never has that excuse: `set_mandate` takes the agent id
+    // outright, because a record written new should never be written in the
+    // shape this migration exists to leave behind.
 
-    /// workspace id -> mandate record
+    /// key (agent id, or — for one release — a legacy workspace id) -> mandate
+    /// record
     pub fn mandates(&self) -> BTreeMap<String, Value> {
         match self.read_json("mandates.json") {
             Value::Object(m) => m.into_iter().collect(),
@@ -1644,21 +1672,30 @@ impl Store {
         }
     }
 
-    pub fn set_mandate(&self, workspace: &str, value: Value) {
+    pub fn set_mandate(&self, agent: &str, value: Value) {
         self.update_json("mandates.json", |m| {
-            m.insert(workspace.to_string(), value);
+            m.insert(agent.to_string(), value);
         });
     }
 
-    pub fn clear_mandate(&self, workspace: &str) -> bool {
+    /// Clears whichever key holds the mandate — the agent's, the legacy
+    /// workspace's, or both, if a store carries one of each for the same
+    /// standing direction. A clear that only knew the new shape would leave a
+    /// pre-migration mandate unclearable by the same command that set it.
+    pub fn clear_mandate(&self, agent: Option<&str>, workspace: &str) -> bool {
         let mut removed = false;
-        self.update_json("mandates.json", |m| removed = m.remove(workspace).is_some());
+        self.update_json("mandates.json", |m| {
+            if let Some(a) = agent {
+                removed |= m.remove(a).is_some();
+            }
+            removed |= m.remove(workspace).is_some();
+        });
         removed
     }
 
     // ---- governors --------------------------------------------------------
     //
-    // A mandate says a workspace may take work in a project. A governor says a
+    // A mandate says an agent may take work in a project. A governor says a
     // workspace is the *coordination point* for one — where a raised hand goes,
     // and which agent is sequencing rather than working.
     //

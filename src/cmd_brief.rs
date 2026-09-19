@@ -395,9 +395,13 @@ impl Briefing {
             .clone()
             .or_else(|| incoming.as_ref().map(|(scope, _)| scope.clone()))
             .and_then(|scope| crate::worklist::running_position(store, &scope));
+        // The agent's row already exists by the time this is asked — the
+        // claim that landed before this call minted it (`compound-092`
+        // stage B) — so this is a plain lookup, never a mint.
+        let agent = seat.pane.and_then(|p| store.agent_in_seat(p));
         Briefing {
             project: seat.project.map(str::to_string),
-            mandate: cmd_mandate::current(store, seat.workspace),
+            mandate: cmd_mandate::current(store, agent.as_deref(), seat.workspace),
             lists: crate::worklist::Running::read(store),
             seat_at,
             governors,
@@ -427,14 +431,16 @@ impl Briefing {
             .workspace_id
             .as_deref()
             .and_then(|ws| cmd_govern::governs(&governors, ws, env.pane_id.as_deref()));
-        let incoming = cmd_govern::incoming(&store.handovers(), cmd_agent::my_pane().as_deref());
+        let pane = cmd_agent::my_pane();
+        let incoming = cmd_govern::incoming(&store.handovers(), pane.as_deref());
         let seat_at = governed
             .clone()
             .or_else(|| incoming.as_ref().map(|(scope, _)| scope.clone()))
             .and_then(|scope| crate::worklist::running_position(store, &scope));
+        let agent = pane.as_deref().and_then(|p| store.agent_in_seat(p));
         Briefing {
             project: current_project(store, args, &world.index).unwrap_or(None),
-            mandate: cmd_mandate::current(store, env.workspace_id.as_deref()),
+            mandate: cmd_mandate::current(store, agent.as_deref(), env.workspace_id.as_deref()),
             lists: crate::worklist::Running::read(store),
             seat_at,
             governors,
@@ -445,7 +451,7 @@ impl Briefing {
             // whether it is the governing one — and a headless agent that read
             // no seat opened believing it held nothing, which is the whole of
             // what a `SessionStart` brief exists to prevent.
-            pane: cmd_agent::my_pane(),
+            pane,
             workspace: env.workspace_id,
             incoming,
             cwd: std::env::current_dir().ok().map(|c| util::contract(&c)),

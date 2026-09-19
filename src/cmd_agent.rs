@@ -63,6 +63,10 @@ pub(crate) struct Here {
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
     pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The agent sitting in `pane`, if one has ever claimed there — read for
+    /// the mandate lookup below, which tries this before the legacy workspace
+    /// key (`compound-092` stage B).
+    pub agent: Option<String>,
     pub tasks: Vec<Task>,
     /// Read for one field, and only at the bottom of the chain: the label of
     /// the workspace this pane stands in.
@@ -75,12 +79,14 @@ pub(crate) struct Here {
 impl Here {
     pub(crate) fn live(store: &Store, index: &Index) -> Here {
         let env = herdr::Env::read();
+        let pane = my_pane();
         Here {
             index: Index::new(index.projects.clone()),
             pins: store.pins(),
             bindings: store.bindings(),
             claims: store.claims(),
             mandates: store.mandates(),
+            agent: pane.as_deref().and_then(|p| store.agent_in_seat(p)),
             tasks: store.tasks(),
             workspaces: match (&env.workspace_id, herdr::available()) {
                 (Some(_), true) => herdr::workspaces().unwrap_or_default(),
@@ -92,7 +98,7 @@ impl Here {
             // terminal resolved to no binding at all: measured 2026-08-17, a
             // headless spawn whose `SessionStart` brief said "nothing claimed"
             // about the task the same command had just claimed for it.
-            pane: my_pane(),
+            pane,
             workspace: env.workspace_id,
             cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
         }
@@ -116,10 +122,7 @@ pub(crate) fn standing_in(h: &Here) -> Option<String> {
     // the work actually in hand. Checked here rather than inside `resolve` so
     // that the panel and `overlap` go on placing panes by where they stand:
     // standing direction says nothing about which tree a pane is in.
-    let mandate = h
-        .workspace
-        .as_deref()
-        .and_then(|ws| crate::cmd_mandate::from_map(&h.mandates, ws));
+    let mandate = crate::cmd_mandate::from_map(&h.mandates, h.agent.as_deref(), h.workspace.as_deref());
 
     let r = resolve::resolve(
         &h.index,
@@ -7165,6 +7168,7 @@ mod tests {
             bindings: std::collections::BTreeMap::new(),
             claims: std::collections::BTreeMap::new(),
             mandates: std::collections::BTreeMap::new(),
+            agent: None,
             tasks: vec![wip_task("t-001", "somebody else's tree", Some("strata"), "doing")],
             workspaces: vec![herdr::Workspace {
                 id: "w1".into(),

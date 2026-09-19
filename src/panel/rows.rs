@@ -1183,10 +1183,15 @@ pub struct Snapshot {
     pub tasks: Vec<Task>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
     pub pins: std::collections::BTreeMap<String, String>,
-    /// workspace id -> mandate record. Here because a pane with no task still
-    /// has a project it is *for*, and that is the one the panel sends it to
-    /// look in.
+    /// key (agent id, or a legacy workspace id) -> mandate record. Here
+    /// because a pane with no task still has a project it is *for*, and that
+    /// is the one the panel sends it to look in.
     pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
+    /// agent id -> agent record. Read alongside `mandates` for one join — a
+    /// pane's own seat, into whichever agent is sitting in it — so the loop
+    /// below can try a pane's mandate under the new key without a store read
+    /// per pane (`compound-092` stage B; the reason is `mandates`'s own).
+    pub agents: std::collections::BTreeMap<String, serde_json::Value>,
     /// task id -> claim record. Read for one field, `claimed_at`: how long a
     /// pane has been holding what it holds is the difference between an agent
     /// working and an agent stuck, and it is the one fact herdr cannot supply.
@@ -1241,6 +1246,7 @@ impl Snapshot {
             bindings: store.bindings(),
             pins: store.pins(),
             mandates: store.mandates(),
+            agents: store.agents_held(),
             claims: store.claims(),
             flags: crate::message::raised(store)
                 .into_iter()
@@ -1834,7 +1840,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         // for, and that is what a verb sends it to work. A mandate on `data`
         // and a cwd in `wsp` are both true at once — the tree wants the second
         // and `f` wants the first.
-        let direction = crate::cmd_mandate::from_map(&snap.mandates, &a.workspace)
+        let seat_agent = crate::store::Store::agent_in_seat_from_map(&snap.agents, &a.pane);
+        let direction = crate::cmd_mandate::from_map(&snap.mandates, seat_agent.as_deref(), Some(&a.workspace))
             .filter(|p| index.get(p).is_some())
             .or_else(|| r.project.clone());
         direction_of.insert(a.pane.clone(), direction.clone());
@@ -3684,6 +3691,7 @@ mod tests {
             bindings: Default::default(),
             pins: Default::default(),
             mandates: Default::default(),
+            agents: Default::default(),
             claims: Default::default(),
             flags: Vec::new(),
             said: Default::default(),

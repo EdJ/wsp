@@ -289,6 +289,7 @@ are arriving too clean for the room the rest of the patch implies.\n\n\
         bindings,
         pins: BTreeMap::new(),
         mandates,
+        agents: BTreeMap::new(),
         // No `claimed_at` anywhere: a live claim prints how long it has been
         // held, and a fixture that says `356d` is a fixture whose age is
         // showing. The panel draws the duration when there is one and says
