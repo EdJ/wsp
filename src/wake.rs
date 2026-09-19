@@ -304,12 +304,12 @@ impl Sink for Tell<'_> {
             self.why = "no seat on this scope";
             return false;
         };
-        let Some(pane) = cmd_govern::occupant(&seat) else {
+        let backends = crate::cmd_spawn::local_backends();
+        let Some((place, found)) = cmd_govern::occupant(self.store, &backends, &seat) else {
             self.why = "the seat is empty";
             return false;
         };
-        let how = agent_commands::of(&pane.agent);
-        let place = crate::place_herdr::Herdr::new();
+        let how = agent_commands::of(&found.agent.kind);
         // The gate: one state read, two questions, and both of them are about
         // a transport that delivers by *typing at a pane*.
         // [`agent_commands::Kind::queue_is_the_agents`] is that transport
@@ -340,12 +340,12 @@ impl Sink for Tell<'_> {
         // [`crate::place::State::will_take_a_prompt`], and asking the wider one
         // costs nothing this path was not already paying, because refusing is
         // the ordinary answer here.
-        let addressee = Pane::new(&pane.pane_id);
+        let addressee: Pane = found.seat.clone();
         if how.queue_is_the_agents() {
             // `State::Unknown` when herdr could not be asked, which
             // [`held_because`] refuses — an absence is not a fact, least of all
             // the fact that somebody is there to read this.
-            let state = crate::place::Place::state(&place, &addressee).unwrap_or_default();
+            let state = place.state(&addressee).unwrap_or_default();
             if let Some(why) = held_because(state) {
                 self.why = why;
                 return false;
@@ -353,7 +353,7 @@ impl Sink for Tell<'_> {
         }
         let text = format!("{}\n{}", preamble(&self.scope), said.join("\n"));
         // No `Sent`, no `already_sent`, no `twice` — see this type's docs.
-        match how.tell(&place, &addressee, &text) {
+        match how.tell(place.as_ref(), &addressee, &text) {
             Ok(_) => true,
             Err(_) => {
                 self.why = "the seat would not take it";

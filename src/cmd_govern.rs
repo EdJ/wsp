@@ -153,7 +153,7 @@
 //! seat only when it found one. With no governor set, every output in this tree
 //! is byte-for-byte what it was.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
@@ -948,35 +948,78 @@ pub fn learn_seats<'a>(
     learned.len()
 }
 
-/// The pane the slot's agent is in *now*, which is not the pane it started in.
+/// The seat's agent, resolved through the port — as it is *now*, which is not
+/// necessarily the pane it started in.
 ///
 /// The record names a workspace because that is the durable half, and the pane
 /// on it can go stale — an agent cleared and restarted comes back on another
-/// pane in the same room. So anything that speaks to a slot asks the runner who
-/// is in that room at the moment of speaking, and a slot answered by nobody is
-/// a vacancy rather than a stale address.
+/// pane, possibly on another backend entirely. So anything that speaks to a
+/// slot asks whichever backend answers for it at the moment of speaking, and a
+/// slot answered by nobody is a vacancy rather than a stale address.
 ///
-/// **The room stands in for the pane only where the room is unambiguous**, and
-/// that qualification is worklist-035's. This is the *speaking* path — `wsp
-/// govern <scope> --tell`, and the panel's `T` — so a wrong answer here hands a
-/// custodial work order to whichever agent the iterator reached first. With one
-/// agent in the room the fallback is sound: that agent is the restarted seat,
-/// there is nobody else it could be. With two it is a guess, and a guess that
-/// delivers direction meant for the custodian to a worker under it. Two agents
-/// and a stale pane is exactly the state that fault was filed on, so the
-/// fallback stops there and the caller gets *the seat is empty* — which is
-/// true, and which names the repair.
-pub fn occupant(seat: &Seat) -> Option<herdr::Pane> {
-    let panes = herdr::panes().ok()?;
-    // The recorded pane first when it is still there and still has an agent.
-    if let Some(p) = panes.iter().find(|p| p.pane_id == seat.pane && !p.agent.is_empty()) {
-        return Some(p.clone());
+/// **Off `locate_seat` over `local_backends()`, the same fold `wsp tell` and
+/// `wsp answer` make** (`compound-077`, `compound-091`) — not `herdr::panes()`
+/// alone, which is what stopped a `compound`-hosted governor from ever being
+/// found. `backends` is the caller's, not built here: it is a fan-out over
+/// every backend this machine can spawn onto, and a caller that already paid
+/// for one (`wsp answer`'s own `locate_seat`, a loop over several seats) is not
+/// made to pay for it twice.
+///
+/// # The room stood in for the pane, and it no longer can
+///
+/// Before `compound-092` gave every agent an id of its own, an agent cleared
+/// and restarted in the same herdr window was found by asking who else was
+/// standing in that *workspace* — sound with one agent in the room, a guess
+/// with two, and worklist-035 is the night that guess went wrong. That fallback
+/// was herdr's furniture: wsp has had no workspace of its own to ask since
+/// `compound-092`, and a `compound` seat has no workspace at all to fall back
+/// to.
+///
+/// **What replaces it is a fact this process already keeps twice over.** An
+/// agent gets a row in `agents.json` the moment it claims, and a claim names
+/// its agent as `agent_id` (both `cd68f27`) — so *unassigned* is a join over
+/// two files this process owns, no socket and no backend asked. `store` never
+/// keeps a claim past the task it was on: `clear_claim` runs the moment one
+/// ends, so there is no state here for "claimed, but finished" to occupy — an
+/// agent with no claim in `store.claims()` is the whole of "holds no claim",
+/// and the harder reading (no claim, or every claim already finished) is not a
+/// second case this store can be in.
+///
+/// **Scoped to agents started since this seat was taken**, because the room
+/// used to buy that scoping for free and an unqualified "the one unassigned
+/// agent on the machine" is answering a different question — a fleet can be
+/// mid-restart on more than one seat at once, and another seat's turnover is
+/// not this one's replacement. More than one candidate is exactly the
+/// ambiguity the old fallback refused to guess through, so it reads the same
+/// way here: the caller gets *the seat is empty*, which is true, and which
+/// names the repair.
+pub fn occupant<'a>(
+    store: &Store,
+    backends: &'a [Box<dyn crate::place::Place>; 2],
+    seat: &Seat,
+) -> Option<(&'a Box<dyn crate::place::Place>, crate::place::Seated)> {
+    // The recorded pane first, if a backend still answers for it and
+    // something is sitting there.
+    if let Some((place, row)) = crate::cmd_agent::locate_seat(backends, &seat.pane) {
+        if !row.agent.kind.is_empty() {
+            return Some((place, row));
+        }
     }
-    let mut in_the_room = panes.iter().filter(|p| p.workspace_id == seat.workspace && !p.agent.is_empty());
-    match (in_the_room.next(), in_the_room.next()) {
-        (Some(only), None) => Some(only.clone()),
-        _ => None,
-    }
+    let claims = store.claims();
+    let claimed: BTreeSet<String> = claims
+        .values()
+        .filter_map(|c| c.get("agent_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut unassigned = store
+        .agents_held()
+        .into_iter()
+        .filter(|(id, rec)| !claimed.contains(id) && str_at(rec, "started") > seat.since);
+    let (_, rec) = match (unassigned.next(), unassigned.next()) {
+        (Some(only), None) => only,
+        _ => return None,
+    };
+    crate::cmd_agent::locate_seat(backends, &str_at(&rec, "seat")).filter(|(_, row)| !row.agent.kind.is_empty())
 }
 
 /// What a name means as a **scope**: a worklist slug, or a project.
@@ -1170,8 +1213,6 @@ fn told(args: &Args) -> String {
 /// governor's context to speak to it would destroy the one thing the position
 /// exists to hold.
 fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &str, args: &Args) -> i32 {
-    use crate::place::Seat as Pane;
-
     let text = text.trim();
     if text.is_empty() {
         eprintln!("wsp: nothing to say");
@@ -1181,18 +1222,18 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
         eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} fills it");
         return 1;
     };
-    let Some(pane) = occupant(&seat) else {
+    let backends = crate::cmd_spawn::local_backends();
+    let Some((place, found)) = occupant(store, &backends, &seat) else {
         eprintln!("wsp: the {scope} seat is empty — nobody is in {} to tell", seat.workspace);
         return 1;
     };
 
-    let place = crate::place_herdr::Herdr::new();
-    let how = crate::agent_commands::of(&pane.agent);
+    let how = crate::agent_commands::of(&found.agent.kind);
     let sent = crate::cmd_agent::Sent::new(
         scope,
         &format!("the {scope} seat"),
-        &pane.pane_id,
-        &pane.pane_id,
+        found.seat.as_str(),
+        found.seat.as_str(),
         text,
         args,
     );
@@ -1201,7 +1242,7 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
             return crate::cmd_agent::twice(&sent, ago, &Paint::new());
         }
     }
-    crate::cmd_agent::delivered(store, how.tell(&place, &Pane::new(&pane.pane_id), text), &sent)
+    crate::cmd_agent::delivered(store, how.tell(place.as_ref(), &found.seat, text), &sent)
 }
 
 /// `wsp govern --clear [<project>]` — this workspace stops being the seat.
@@ -1589,6 +1630,79 @@ mod tests {
             !needs_a_person(true, true, governs(&g, "w1", Some("w1:p2")).is_some()),
             "and the seat is still idle between the agents it is waiting on",
         );
+    }
+
+    /// **`compound-094`: the replacement is found by wsp's own record, not by
+    /// asking who else is standing in the room** — the fallback
+    /// worklist-035 put a stop to for a *co-custodian* is the same fallback
+    /// `occupant` used to make for a *restarted* one, and it is gone from both.
+    ///
+    /// The recorded pane (`w1:p1`) answers for nobody. Three agents exist:
+    /// one that held the seat before and is long since irrelevant (started
+    /// before the seat was even taken), one still holding a claim (a worker,
+    /// not a replacement, whatever room it is in), and one holding neither —
+    /// which is the only fact `occupant` now asks about.
+    #[test]
+    fn a_replacement_is_found_by_its_own_unclaimed_record_not_by_the_room() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+
+        let (env, store) = store("replacement-found");
+        store.set_governor(
+            "acc",
+            json!({ "workspace": "w1", "pane": "w1:p1", "host": util::hostname(), "since": util::iso_at(1_000) }),
+        );
+        let seat = seat_of("acc", store.governors().get("acc").unwrap()).unwrap();
+
+        // Stale: it predates the seat, so it is not this restart's agent
+        // whatever it holds.
+        store.set_agent("a-old", json!({ "seat": "w1:p0", "started": util::iso_at(500) }));
+        // A worker: newer than the seat, but claimed, so it answers for a task
+        // and not for this seat.
+        store.set_agent("a-worker", json!({ "seat": "w1:p3", "started": util::iso_at(1_100) }));
+        store.set_claim("t-1", json!({ "agent_id": "a-worker" }));
+        // The replacement: newer than the seat, and holds nothing.
+        store.set_agent("a-new", json!({ "seat": "w1:p2", "started": util::iso_at(1_200) }));
+
+        let mut stage = Stage::new();
+        stage.put(Spot::agent("w1:p2", "claude", "acc", State::Idle));
+        stage.put(Spot::agent("w1:p3", "claude", "t-1", State::Idle));
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let backends = crate::cmd_spawn::local_backends();
+        let (_, found) = occupant(&store, &backends, &seat).expect("the unclaimed agent is the seat now");
+        assert_eq!(found.seat.as_str(), "w1:p2");
+    }
+
+    /// Two candidates is the ambiguity the room used to refuse to guess
+    /// through, and the record-based read refuses it the same way: a seat two
+    /// restarts could each claim reads as empty rather than as either of them.
+    #[test]
+    fn two_unclaimed_agents_is_the_same_ambiguity_as_two_in_the_room() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+
+        let (env, store) = store("replacement-ambiguous");
+        store.set_governor(
+            "acc",
+            json!({ "workspace": "w1", "pane": "w1:p1", "host": util::hostname(), "since": util::iso_at(1_000) }),
+        );
+        let seat = seat_of("acc", store.governors().get("acc").unwrap()).unwrap();
+
+        store.set_agent("a-new", json!({ "seat": "w1:p2", "started": util::iso_at(1_200) }));
+        store.set_agent("a-newer", json!({ "seat": "w1:p3", "started": util::iso_at(1_300) }));
+
+        let mut stage = Stage::new();
+        stage.put(Spot::agent("w1:p2", "claude", "acc", State::Idle));
+        stage.put(Spot::agent("w1:p3", "claude", "acc", State::Idle));
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let backends = crate::cmd_spawn::local_backends();
+        assert!(occupant(&store, &backends, &seat).is_none(), "neither is guessed at");
     }
 
     /// The one caller that is genuinely asking about the *room* keeps the
