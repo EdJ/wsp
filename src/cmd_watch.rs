@@ -3395,7 +3395,8 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
         let pane = env.pane_id.unwrap_or_default();
         let seated = !workspace.is_empty()
             && workspace == here
-            && cmd_govern::governs(&governors, &here, Some(&pane)).as_deref() == Some(name.as_str());
+            && cmd_govern::governs(&governors, &cmd_govern::seat_query(&here, Some(&pane))).as_deref()
+                == Some(name.as_str());
         return Ok(Scope { seated, name, workspace, pane, all: false });
     }
     let env = herdr::Env::read();
@@ -3403,7 +3404,7 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
         return Err("wsp: no scope. Run this in the seat's workspace, or say `wsp watch -p <project>`".into());
     };
     let pane = env.pane_id.unwrap_or_default();
-    match cmd_govern::governs(&governors, &ws, Some(&pane)) {
+    match cmd_govern::governs(&governors, &cmd_govern::seat_query(&ws, Some(&pane))) {
         Some(name) => Ok(Scope { name, seated: true, workspace: ws, pane, all: false }),
         None => Err("wsp: this workspace is nobody's seat, so there is no scope to watch.\n\
                      \x20    `wsp watch <project>` watches one, `wsp govern <project>` takes the seat"
@@ -3772,8 +3773,12 @@ fn run(store: &Store, poll: &mut Poll, spec: &Spec) -> i32 {
         // A seat's subscription ends when the seat does. Free, and it is the
         // natural end the flag asks callers to supply.
         if spec.scope.seated
-            && cmd_govern::governs(&store.governors(), &spec.scope.workspace, Some(&spec.scope.pane)).as_deref()
-            != Some(spec.scope.name.as_str())
+            && cmd_govern::governs(
+                &store.governors(),
+                &cmd_govern::seat_query(&spec.scope.workspace, Some(&spec.scope.pane)),
+            )
+            .as_deref()
+                != Some(spec.scope.name.as_str())
         {
             break Over::SeatVacated;
         }

@@ -603,7 +603,7 @@ pub(crate) fn unname_after_task(store: &Store, pane: &str, task_id: &str) {
         // This pane's, not the room's: a worker finishing a task in a
         // custodian's workspace was renamed `governor · <project>` — it took
         // the seat's name off a seat it does not hold. worklist-035.
-        let governs = cmd_govern::governs(&store.governors(), &p.workspace_id, Some(pane));
+        let governs = cmd_govern::governs(&store.governors(), &cmd_govern::seat_query(&p.workspace_id, Some(pane)));
         let _ = match &governs {
             Some(project) => herdr::rename_pane(pane, &cmd_govern::governor_of(project)),
             None => herdr::rename_pane(pane, UNASSIGNED_LABEL),
@@ -1213,7 +1213,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     let mine = env
         .workspace_id
         .as_deref()
-        .and_then(|ws| cmd_govern::governs(&governors, ws, env.pane_id.as_deref()));
+        .and_then(|ws| cmd_govern::governs(&governors, &cmd_govern::seat_query(ws, env.pane_id.as_deref())));
     let only_mine = args.has("seat");
     // Asked for an inbox from a pane that has no seat. Said plainly, because
     // "nothing raised for you" and "you are not the seat" look identical from
@@ -3620,7 +3620,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // spelling so the next word herdr adds does not read as work.
         let stopped = a.state.stopped();
         let doing = bound.map(|t| t.status() == Status::Doing).unwrap_or(false);
-        let seat_of_project = cmd_govern::governs(&w.governors, workspace_id, Some(seat));
+        let seat_of_project = cmd_govern::governs(&w.governors, &cmd_govern::seat_query(workspace_id, Some(seat)));
         let needs_you = cmd_govern::needs_a_person(stopped, doing, seat_of_project.is_some());
 
         rows.push(WipRow {

@@ -447,18 +447,54 @@ pub fn seat_above(governors: &BTreeMap<String, Value>, index: &Index, scope: &st
 /// naming a room this process is not standing in — falls back to the room,
 /// because there is nothing better to compare and a seat with no address is
 /// still a seat.
-pub fn governs(
-    governors: &BTreeMap<String, Value>,
-    workspace: &str,
-    pane: Option<&str>,
-) -> Option<String> {
-    if workspace.is_empty() {
+pub fn governs(governors: &BTreeMap<String, Value>, seat: &crate::place::Seat) -> Option<String> {
+    let who = seat.as_str();
+    if who.is_empty() {
         return None;
     }
+    // Off the record's own fields, read raw, rather than through [`seat_of`]
+    // and [`Seat::sat_in`] — deliberately, so this reads as the row that
+    // leaves `Seat::workspace` unused: nothing here names the struct field,
+    // so deleting it costs this function nothing to keep answering right.
+    //
+    // A pane id already carries its workspace (`"w1:p1"`), which is what
+    // makes one string enough where two used to be needed: an exact pane
+    // match no longer has to be confirmed against a separate workspace,
+    // because two different rooms cannot mint the same qualified pane id.
+    // What a bare workspace comparison bought — matching *any* pane of the
+    // room, and matching a `wsp govern -w` record that names no pane at all
+    // — is recovered the same way: `who == workspace` catches the caller
+    // that is asking about the room by name, and the prefix check catches
+    // the caller standing in a pane of a room a `-w` record claimed without
+    // ever learning that pane's id.
     governors
         .iter()
-        .find(|(p, rec)| seat_of(p, rec).is_some_and(|s| s.sat_in(workspace, pane)))
+        .find(|(_, rec)| {
+            let host = rec.get("host").and_then(Value::as_str).unwrap_or("");
+            if !host.is_empty() && host != util::hostname() {
+                return false;
+            }
+            let workspace = rec.get("workspace").and_then(Value::as_str).unwrap_or_default();
+            if workspace.is_empty() {
+                return false;
+            }
+            let pane = rec.get("pane").and_then(Value::as_str).unwrap_or_default();
+            who == pane || who == workspace || (pane.is_empty() && who.starts_with(&format!("{workspace}:")))
+        })
         .map(|(p, _)| p.clone())
+}
+
+/// The seat a caller means, from what it has in hand: the pane if there is
+/// one, the workspace itself otherwise.
+///
+/// The bridge between the shape most callers still carry — a workspace and
+/// maybe a pane, straight off a herdr record or a stored claim — and the one
+/// [`governs`] now asks for. `pane` wins when it is not empty because it is
+/// the more exact of the two; `workspace` alone is the room-wide question
+/// `wsp govern -w` and a bare `--clear` ask, and is exactly what a caller
+/// passes when it has no pane to be exact about.
+pub fn seat_query(workspace: &str, pane: Option<&str>) -> crate::place::Seat {
+    crate::place::Seat::new(pane.filter(|p| !p.is_empty()).unwrap_or(workspace))
 }
 
 /// Is this stopped agent a person's problem?
@@ -556,7 +592,7 @@ fn rename_seat(store: &Store, workspace: &str) {
     }
     // The room's question, not a pane's: this names the workspace after its
     // seat, so it wants to know whether the room holds one at all.
-    let held = governs(&store.governors(), workspace, None);
+    let held = governs(&store.governors(), &seat_query(workspace, None));
     let panes = herdr::panes().unwrap_or_default();
     // Every agent pane in the room. A workspace usually has one; a second agent
     // in there is somebody else's work and keeps its own name, which is why
@@ -615,7 +651,7 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
     // opposite failure: a seat re-taken from a new pane in the same room would
     // leave the old record standing, and two records naming one workspace is a
     // shape `rename_seat` cannot name and `occupant` cannot resolve.
-    if let Some(had) = governs(&store.governors(), workspace, None).filter(|p| p != project) {
+    if let Some(had) = governs(&store.governors(), &seat_query(workspace, None)).filter(|p| p != project) {
         vacate(store, &had);
     }
 
@@ -897,7 +933,7 @@ pub fn learn_seats<'a>(
     let learned: Vec<(String, String, String, String)> = seen
         .filter(|(_, _, session, _, _)| !session.trim().is_empty())
         .filter_map(|(workspace, pane, session, cwd, kind)| {
-            let project = governs(&governors, workspace, Some(pane))?;
+            let project = governs(&governors, &seat_query(workspace, Some(pane)))?;
             let seat = seat_of(&project, governors.get(&project)?)?;
             // The session and the kind are the two fields a change is judged
             // on, and the cwd is not: a cwd that has moved under a session wsp
@@ -1143,7 +1179,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     // Asked of the room and not of this pane, for [`take`]'s reason: what is
     // being handed back is a *write*, and a write leaves the coarse reading
     // alone deliberately.
-    let handed_back = governs(&governors, &ws, None).filter(|p| p != &scope);
+    let handed_back = governs(&governors, &seat_query(&ws, None)).filter(|p| p != &scope);
     let displaced = take(store, &scope, &ws, pane.as_deref().unwrap_or_default());
 
     if args.json() {
@@ -1288,7 +1324,7 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
             // `--clear` stands the *room* down, because a session ending is a
             // room emptying and a custodian back on a new pane must still be
             // able to give up the seat it holds.
-            Some(ws) => governs(&governors, ws, None),
+            Some(ws) => governs(&governors, &seat_query(ws, None)),
             None => {
                 eprintln!("wsp: no workspace — pass -w, or name the scope");
                 return 2;
@@ -1326,7 +1362,7 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
     let governors = store.governors();
     // "What am I the seat for" is a read, so it is the pane's — a worker
     // sharing a room with a custodian is not the custodian. See [`governs`].
-    let mine: Option<String> = workspace.and_then(|ws| governs(&governors, ws, pane));
+    let mine: Option<String> = workspace.and_then(|ws| governs(&governors, &seat_query(ws, pane)));
 
     let slots = slots(&governors);
 
@@ -1591,7 +1627,7 @@ mod tests {
         take(&store, "robustness", "w1", "w1:p1");
         take(&store, "batch", "w1", "w1:p1");
 
-        assert_eq!(governs(&store.governors(), "w1", Some("w1:p1")).as_deref(), Some("batch"));
+        assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("batch"));
         let slots = slots(&store.governors());
         let robustness = slots.iter().find(|s| s.scope == "robustness").expect("the post stayed");
         assert!(!robustness.filled(), "and it was handed back, empty");
@@ -1616,18 +1652,18 @@ mod tests {
         take(&store, "acc", "w1", "w1:p2");
         let g = store.governors();
 
-        assert_eq!(governs(&g, "w1", Some("w1:p2")).as_deref(), Some("acc"), "the seat itself");
-        assert_eq!(governs(&g, "w1", Some("w1:p1")), None, "and its neighbour, which is nobody's seat");
+        assert_eq!(governs(&g, &seat_query("w1", Some("w1:p2"))).as_deref(), Some("acc"), "the seat itself");
+        assert_eq!(governs(&g, &seat_query("w1", Some("w1:p1"))), None, "and its neighbour, which is nobody's seat");
 
         // The consequence, said as the predicate an unattended run depends on:
         // a worker stopped on a `doing` task is a person's problem, and sharing
         // a room with a custodian does not make it stop being one.
         assert!(
-            needs_a_person(true, true, governs(&g, "w1", Some("w1:p1")).is_some()),
+            needs_a_person(true, true, governs(&g, &seat_query("w1", Some("w1:p1"))).is_some()),
             "the worker beside the seat is still the loudest row on the panel",
         );
         assert!(
-            !needs_a_person(true, true, governs(&g, "w1", Some("w1:p2")).is_some()),
+            !needs_a_person(true, true, governs(&g, &seat_query("w1", Some("w1:p2"))).is_some()),
             "and the seat is still idle between the agents it is waiting on",
         );
     }
@@ -1716,17 +1752,49 @@ mod tests {
         let (_env, store) = store("room");
         take(&store, "wsp", "w1", "w1:p6");
         assert_eq!(
-            governs(&store.governors(), "w1", None).as_deref(),
+            governs(&store.governors(), &seat_query("w1", None)).as_deref(),
             Some("wsp"),
             "the workspace holds a seat, which is what the workspace token says",
         );
 
         let hand_written = seated(&[("wsp", "w1")]);
         assert_eq!(
-            governs(&hand_written, "w1", Some("w1:p1")).as_deref(),
+            governs(&hand_written, &seat_query("w1", Some("w1:p1"))).as_deref(),
             Some("wsp"),
             "no pane recorded is nothing to compare, and a seat with no address is still a seat",
         );
+    }
+
+    /// `governs` in the shape the row actually asked for: one seat, no
+    /// separate workspace beside it — not through [`seat_query`], which every
+    /// other test here uses because it still holds both. `whoami` is the
+    /// caller that never has a workspace to offer any more, so this is its
+    /// call written out directly.
+    #[test]
+    fn governs_answers_a_bare_seat_with_no_workspace_beside_it() {
+        let (_env, store) = store("bare-seat");
+        take(&store, "robustness", "w1", "w1:p1");
+        take(&store, "wsp", "w2", "w2:p1");
+
+        assert_eq!(
+            governs(&store.governors(), &crate::place::Seat::new("w1:p1")).as_deref(),
+            Some("robustness"),
+        );
+        assert_eq!(
+            governs(&store.governors(), &crate::place::Seat::new("w2:p1")).as_deref(),
+            Some("wsp"),
+        );
+        // A `-w` record answers for any pane of its room, exactly as it does
+        // through `seat_query` — proven here from the bare pane id alone,
+        // with nothing passed that names the workspace on its own.
+        let room_only = seated(&[("acc", "w9")]);
+        assert_eq!(
+            governs(&room_only, &crate::place::Seat::new("w9:p3")).as_deref(),
+            Some("acc"),
+        );
+        // A pane in a room nobody governs, or in no room at all, is nobody's.
+        assert_eq!(governs(&store.governors(), &crate::place::Seat::new("w3:p1")), None);
+        assert_eq!(governs(&store.governors(), &crate::place::Seat::default()), None);
     }
 
     /// The `wip` row that was wrong all night. Idle on a `doing` task is a
@@ -1735,7 +1803,7 @@ mod tests {
     #[test]
     fn an_idle_seat_is_not_a_person_being_the_blocker() {
         let g = seated(&[("robustness", "w1")]);
-        let seat = |ws: &str| governs(&g, ws, Some(&format!("{ws}:p1"))).is_some();
+        let seat = |ws: &str| governs(&g, &seat_query(ws, Some(&format!("{ws}:p1")))).is_some();
         assert!(needs_a_person(true, true, seat("w2")), "an ordinary agent, stopped");
         assert!(!needs_a_person(true, true, seat("w1")), "the seat, between agents");
         assert!(!needs_a_person(false, true, seat("w2")), "working is never a stall");
@@ -1749,7 +1817,7 @@ mod tests {
     fn with_no_seats_the_rule_is_exactly_what_it_was() {
         let none = BTreeMap::new();
         for (idle, doing) in [(true, true), (true, false), (false, true), (false, false)] {
-            assert_eq!(needs_a_person(idle, doing, governs(&none, "w1", Some("w1:p1")).is_some()), idle && doing);
+            assert_eq!(needs_a_person(idle, doing, governs(&none, &seat_query("w1", Some("w1:p1"))).is_some()), idle && doing);
         }
     }
 
@@ -1772,19 +1840,19 @@ mod tests {
     fn one_agent_holds_one_governorship_and_taking_another_hands_it_back() {
         let (_env, store) = store("one");
         take(&store, "robustness", "w1", "w1:p1");
-        assert_eq!(governs(&store.governors(), "w1", Some("w1:p1")).as_deref(), Some("robustness"));
+        assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("robustness"));
 
         take(&store, "wsp", "w1", "w1:p1");
-        assert_eq!(governs(&store.governors(), "w1", Some("w1:p1")).as_deref(), Some("wsp"), "it moved");
+        assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("wsp"), "it moved");
         let slots = slots(&store.governors());
         let robustness = slots.iter().find(|s| s.scope == "robustness").expect("the post stayed");
         assert!(!robustness.filled(), "and it is empty rather than gone");
 
         // Another workspace's seat is untouched by either.
         take(&store, "data", "w2", "w2:p1");
-        assert_eq!(governs(&store.governors(), "w2", Some("w2:p1")).as_deref(), Some("data"));
-        assert_eq!(governs(&store.governors(), "w1", Some("w1:p1")).as_deref(), Some("wsp"));
-        assert_eq!(governs(&store.governors(), "w3", Some("w3:p1")), None);
+        assert_eq!(governs(&store.governors(), &seat_query("w2", Some("w2:p1"))).as_deref(), Some("data"));
+        assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("wsp"));
+        assert_eq!(governs(&store.governors(), &seat_query("w3", Some("w3:p1"))), None);
     }
 
     /// The check that was missing, and the whole reason worklist-035 was found

@@ -593,16 +593,22 @@ fn addressed(store: &Store, task: &crate::model::Task) -> String {
 /// it, because a question asked from a seat still has to be answered back into
 /// the workspace the seat is sitting in.
 fn whoami(store: &Store) -> (Party, Option<String>) {
-    let env = herdr::Env::read();
-    let pane = env.pane_id.filter(|p| !p.is_empty());
-    let scope = env
-        .workspace_id
+    // Off `my_pane()` and not `HERDR_WORKSPACE_ID`: after `compound-092` there
+    // is no workspace to ask, only the seat, and `my_pane()` is already the
+    // one place that picks it — a supervisor's `WSP_SEAT_ID` first, herdr's
+    // `HERDR_PANE_ID` after — so a caller outside herdr is not told it is
+    // nobody just because this file used to reach for herdr's own variable.
+    let pane = crate::cmd_agent::my_pane();
+    let scope = pane
         .as_deref()
-        .and_then(|ws| crate::cmd_govern::governs(&store.governors(), ws, pane.as_deref()));
+        .and_then(|p| crate::cmd_govern::governs(&store.governors(), &crate::place::Seat::new(p)));
     match (scope, &pane) {
         (Some(scope), _) => (Party::seat(&scope), pane.clone()),
         (None, Some(p)) => (
-            Party::pane(p, env.workspace_id.as_deref().unwrap_or_default()),
+            // The workspace here is a byline's, for a panel to jump to — not a
+            // decision, so herdr's own variable is still the honest source for
+            // it, and empty (as it is under any other backend) is correct.
+            Party::pane(p, herdr::Env::read().workspace_id.as_deref().unwrap_or_default()),
             pane.clone(),
         ),
         // Outside herdr entirely, which is a person at a shell. The fallback is

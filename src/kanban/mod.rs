@@ -321,7 +321,10 @@ impl Ctx {
 pub(crate) fn seated(panes: Vec<AgentRef>, governors: &BTreeMap<String, Value>) -> Vec<AgentRef> {
     panes
         .into_iter()
-        .map(|p| AgentRef { seat: crate::cmd_govern::governs(governors, &p.workspace, Some(&p.pane)), ..p })
+        .map(|p| AgentRef {
+            seat: crate::cmd_govern::governs(governors, &crate::cmd_govern::seat_query(&p.workspace, Some(&p.pane))),
+            ..p
+        })
         .collect()
 }
 

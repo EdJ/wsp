@@ -1718,7 +1718,10 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
             // wearing no label of ours is still named after its workspace, and
             // that name was cut by the same rule.
             full: crate::cmd_agent::full_name(&snap.said, &a.pane, &a.where_(), held),
-            seat: crate::cmd_govern::governs(&snap.governors, &a.workspace, Some(&a.pane)),
+            seat: crate::cmd_govern::governs(
+                &snap.governors,
+                &crate::cmd_govern::seat_query(&a.workspace, Some(&a.pane)),
+            ),
             ..a.clone()
         }
     };

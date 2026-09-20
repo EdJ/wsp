@@ -118,7 +118,10 @@ fn roster(
                     .get(&p.pane_id)
                     .and_then(|b| b.get("task_id"))
                     .and_then(Value::as_str),
-                "seat": crate::cmd_govern::governs(governors, &p.workspace_id, Some(&p.pane_id)),
+                "seat": crate::cmd_govern::governs(
+                    governors,
+                    &crate::cmd_govern::seat_query(&p.workspace_id, Some(&p.pane_id)),
+                ),
             })
         })
         .collect()
@@ -275,7 +278,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         // this token is drawn on the workspace, and a workspace containing a
         // seat is a workspace containing a seat however many panes are in it.
         // Every other reader here is a pane and passes one.
-        let seat = crate::cmd_govern::governs(&governors, &ws.id, None);
+        let seat = crate::cmd_govern::governs(&governors, &crate::cmd_govern::seat_query(&ws.id, None));
 
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("proj", proj.clone()),
@@ -315,7 +318,10 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
         // what it reports, and `scope` falls back to it for the same reason: the
         // ten columns a narrow sidebar keeps for "which piece of work is this"
         // are better spent on `wsp` than on nothing.
-        let seat = crate::cmd_govern::governs(&governors, &a.workspace_id, Some(&a.pane_id));
+        let seat = crate::cmd_govern::governs(
+            &governors,
+            &crate::cmd_govern::seat_query(&a.workspace_id, Some(&a.pane_id)),
+        );
         let tokens: Vec<(&str, Option<String>)> = vec![
             ("task", t.map(|t| util::truncate(&t.title, 44))),
             ("taskid", t.map(|t| t.id.clone())),

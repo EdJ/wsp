@@ -1827,7 +1827,7 @@ fn seated(store: &Store, args: &Args) -> Option<Worklist> {
         Some(_) => None,
         None => env.pane_id.as_deref(),
     };
-    let scope = crate::cmd_govern::governs(&store.governors(), &ws, pane)?;
+    let scope = crate::cmd_govern::governs(&store.governors(), &crate::cmd_govern::seat_query(&ws, pane))?;
     store.worklist(&scope)
 }
 

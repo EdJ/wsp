@@ -388,7 +388,7 @@ impl Briefing {
         // would introduce it as a worker with a strange order to run.
         let governed = seat
             .workspace
-            .and_then(|ws| cmd_govern::governs(&governors, ws, seat.pane));
+            .and_then(|ws| cmd_govern::governs(&governors, &cmd_govern::seat_query(ws, seat.pane)));
         let incoming =
             seat.pane.and_then(|pane| cmd_govern::incoming(&store.handovers(), Some(pane)));
         let seat_at = governed
@@ -426,12 +426,14 @@ impl Briefing {
         let governors = store.governors();
         // The same two-step read [`Briefing::at`] makes, for the same reason:
         // a rotation's successor reads its brief from its `SessionStart` hook,
-        // which runs before the slot moves to it.
-        let governed = env
-            .workspace_id
-            .as_deref()
-            .and_then(|ws| cmd_govern::governs(&governors, ws, env.pane_id.as_deref()));
+        // which runs before the slot moves to it. Off `my_pane()` rather than
+        // `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID` — `cmd_message::whoami`'s reason,
+        // here too: this is a decision and not a display, so the port's own
+        // answer to *where am I* is the one it is asked with.
         let pane = cmd_agent::my_pane();
+        let governed = pane
+            .as_deref()
+            .and_then(|p| cmd_govern::governs(&governors, &crate::place::Seat::new(p)));
         let incoming = cmd_govern::incoming(&store.handovers(), pane.as_deref());
         let seat_at = governed
             .clone()
@@ -758,7 +760,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     let governed = b
         .workspace
         .as_deref()
-        .and_then(|ws| cmd_govern::governs(&b.governors, ws, b.pane.as_deref()));
+        .and_then(|ws| cmd_govern::governs(&b.governors, &cmd_govern::seat_query(ws, b.pane.as_deref())));
     let custodian = governed.clone().or_else(|| {
         b.incoming.as_ref().map(|(scope, _)| scope.clone())
     });

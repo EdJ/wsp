@@ -2034,7 +2034,7 @@ fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> 
         return 2;
     };
     let governors = store.governors();
-    match cmd_govern::governs(&governors, &ws, Some(&me)) {
+    match cmd_govern::governs(&governors, &cmd_govern::seat_query(&ws, Some(&me))) {
         Some(held) if held == scope => {}
         Some(other) => {
             eprintln!("wsp: this pane holds the {other} seat, not {scope}");
@@ -2336,7 +2336,7 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
     let governs = crate::herdr::Env::read()
         .workspace_id
         .as_deref()
-        .and_then(|ws| cmd_govern::governs(&governors, ws, pane.as_deref()));
+        .and_then(|ws| cmd_govern::governs(&governors, &cmd_govern::seat_query(ws, pane.as_deref())));
     let me = Caller { pane: pane.as_deref(), governs: governs.as_deref() };
     end_work(backend(args).as_ref(), store, args, me, &tidy)
 }
@@ -4874,7 +4874,7 @@ mod tests {
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
             assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 2);
             assert!(place.opened.borrow().is_empty(), "nothing was opened");
-            assert!(cmd_govern::governs(&store.governors(), "w1", Some("w1:p9")).is_some(),
+            assert!(cmd_govern::governs(&store.governors(), &cmd_govern::seat_query("w1", Some("w1:p9"))).is_some(),
                 "and the seat stayed where it was");
         }
 
@@ -4958,7 +4958,7 @@ mod tests {
             assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 1);
             assert!(place.opened.borrow().is_empty(), "no successor was seated");
             assert_eq!(
-                cmd_govern::governs(&store.governors(), "w1", Some("w1:p9")).as_deref(),
+                cmd_govern::governs(&store.governors(), &cmd_govern::seat_query("w1", Some("w1:p9"))).as_deref(),
                 Some("batch"),
                 "the caller keeps the seat",
             );
