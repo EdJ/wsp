@@ -188,6 +188,22 @@ const SEATS: &str = "compound-seats";
 const SEAT_FILE: &str = "seat.json";
 const SAID_FILE: &str = "said.json";
 
+/// Every hook this seat has ever been heard from, oldest first, one JSON line
+/// each — `compound-107`'s answer to the question `said.json` alone cannot
+/// answer.
+///
+/// `said.json` is a single slot, overwritten on every call, by design: it is
+/// what `state_of` reads and it should hold nothing but the latest word. That
+/// design is exactly what left `compound-107` unable to tell two very
+/// different pasts apart from one one look at a live seat: a session whose
+/// hooks stopped firing after `SessionStart`, and a session whose hooks fired
+/// on every turn but whose seat was inspected between them, long after the
+/// last one aged out (`compound-097`'s `VOUCH_SECS`). Both leave `said.json`
+/// holding one `SessionStart` record; only this file tells them apart, and
+/// only if it was already running when the seat needed it — a governor
+/// cannot go back and ask a hook to have logged itself after the fact.
+const HOOKS_FILE: &str = "hooks.jsonl";
+
 /// How long a hook's word stays evidence about NOW (`compound-097`).
 ///
 /// Not a timeout on the agent — a bound on what this backend is willing to
@@ -343,7 +359,22 @@ impl Compound<'_> {
             })
             .to_string(),
         );
+        self.append_hooks_log(&dir, hook, state);
         tally_burn(&dir, payload);
+    }
+
+    /// Append one line to [`HOOKS_FILE`]. Best-effort, like everything else a
+    /// hook touches — a write that fails here must not be the write that
+    /// fails the hook, and a reader missing one line is a smaller loss than a
+    /// session that stalls on it.
+    fn append_hooks_log(&self, dir: &std::path::Path, hook: &str, state: State) {
+        use std::io::Write;
+        let line = json!({ "at": util::now_iso(), "hook": hook, "state": state.as_str() });
+        if let Ok(mut f) =
+            fs::OpenOptions::new().create(true).append(true).open(dir.join(HOOKS_FILE))
+        {
+            let _ = writeln!(f, "{line}");
+        }
     }
 
     /// Whether this seat's `compound-sup` still holds its pid, per the same
@@ -949,6 +980,49 @@ mod tests {
         place.heard(&seat, "PermissionRequest", said_by("PermissionRequest").unwrap(), &json!({}));
         assert_eq!(place.state(&seat).unwrap(), State::Working);
         assert!(!place.state(&seat).unwrap().will_take_a_prompt(), "a sentence would land in the dialog");
+    }
+
+    /// **`compound-107`: `said.json` cannot tell "one hook ever fired" from
+    /// "many fired, and this is just the latest" — this file can.**
+    ///
+    /// `cpd-5`'s `said.json` held one `SessionStart` record six hours and 128
+    /// turns into its session, and that single slot cannot say whether every
+    /// later hook was silently lost or whether it simply was not looked at
+    /// again until the last one had aged out. Both pasts overwrite the same
+    /// slot with the same content. `hooks.jsonl` is the file that was not
+    /// there to answer it, so this pins the property it needs to have next
+    /// time: every call, in order, kept.
+    #[test]
+    fn every_hook_call_lands_in_the_log_even_though_said_json_only_ever_shows_the_last_one() {
+        let scratch = Scratch::new("hooks-log");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
+                .to_string(),
+        );
+
+        for hook in ["SessionStart", "UserPromptSubmit", "Stop", "UserPromptSubmit", "Stop"] {
+            place.heard(&seat, hook, said_by(hook).unwrap(), &json!({}));
+        }
+
+        // said.json: one slot, the latest word only.
+        assert_eq!(str_of(&place.said(&seat), "hook"), "Stop");
+
+        // hooks.jsonl: every call this seat was ever heard from, in order —
+        // the answer `said.json` alone cannot give.
+        let logged = fs::read_to_string(dir.join(HOOKS_FILE)).unwrap();
+        let hooks: Vec<String> = logged
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["hook"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            hooks,
+            vec!["SessionStart", "UserPromptSubmit", "Stop", "UserPromptSubmit", "Stop"],
+            "every call this seat was ever heard from, in the order it happened"
+        );
     }
 
     /// **A hook's word expires, and the guard it feeds comes back with it**
