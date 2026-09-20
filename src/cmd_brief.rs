@@ -1498,6 +1498,7 @@ mod tests {
                 pins: std::collections::BTreeMap::new(),
                 bindings,
                 claims: std::collections::BTreeMap::new(),
+                agents_held: std::collections::BTreeMap::new(),
             },
             mandate: Some("wsp".into()),
             // Nothing running, which is the baseline every line below is
@@ -1838,6 +1839,7 @@ mod tests {
                 pins: std::collections::BTreeMap::new(),
                 bindings: std::collections::BTreeMap::new(),
                 claims: std::collections::BTreeMap::new(),
+                agents_held: std::collections::BTreeMap::new(),
             },
             mandate: None,
             lists: crate::worklist::Running::default(),

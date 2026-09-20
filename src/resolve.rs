@@ -429,18 +429,25 @@ pub struct Held {
 }
 
 
-/// The project of the task this workspace holds, if it holds one.
+/// The project of the task this agent — or, failing that, this workspace —
+/// holds a claim on, if any.
 ///
-/// Matched on the workspace id first and its label second — the label is what
-/// survives a workspace being rebuilt under a new id, which is the same
-/// fallback `reconcile` uses to find a claim's pane again. A claim made on
-/// another machine says nothing about this one, and a claim on work that is
-/// finished is not work in hand: both are passed over. Of what is left, the
-/// most recent claim wins, because a workspace that has moved on from one task
-/// to the next is doing the second.
+/// Matched on the agent id first (`compound-092` stage A put one on every
+/// claim; `compound-106` is what starts reading it) and, for a claim a
+/// pre-migration writer left with none, the workspace id and then its label —
+/// the label is what survives a workspace being rebuilt under a new id, which
+/// is the same fallback `reconcile` uses to find a claim's pane again. The
+/// three are tried in that order and not merged, the same rule
+/// `cmd_mandate::from_map` applies to a mandate: a store on disk outlives a
+/// release, so a claim under the shape a writer used before this one still
+/// has to read correctly. A claim made on another machine says nothing about
+/// this one, and a claim on work that is finished is not work in hand: both
+/// are passed over. Of what is left, the most recent claim wins, because a
+/// workspace that has moved on from one task to the next is doing the second.
 pub fn claimed_project(
     claims: &BTreeMap<String, serde_json::Value>,
     tasks: &[Task],
+    agent: Option<&str>,
     workspace_id: Option<&str>,
     workspace_label: Option<&str>,
 ) -> Option<String> {
@@ -451,9 +458,10 @@ pub fn claimed_project(
         if !get("host").is_empty() && get("host") != host {
             continue;
         }
-        let names_it = match (workspace_id, workspace_label) {
-            (Some(id), _) if !id.is_empty() && get("workspace_id") == id => true,
-            (_, Some(l)) if !l.is_empty() && get("workspace_label") == l => true,
+        let names_it = match (agent.filter(|a| crate::place::is_agent_id(a)), workspace_id, workspace_label) {
+            (Some(a), _, _) if get("agent_id") == a => true,
+            (_, Some(id), _) if !id.is_empty() && get("workspace_id") == id => true,
+            (_, _, Some(l)) if !l.is_empty() && get("workspace_label") == l => true,
             _ => false,
         };
         if !names_it {
@@ -476,18 +484,25 @@ pub fn resolve(
     index: &Index,
     pins: &BTreeMap<String, String>,
     held: Held,
+    agent: Option<&str>,
     workspace_id: Option<&str>,
     workspace_label: Option<&str>,
     cwd: Option<&str>,
 ) -> Resolution {
-    if let Some(ws) = workspace_id {
-        if let Some(p) = pins.get(ws) {
-            if p == TOP_LEVEL {
-                return Resolution { project: None, source: "top" };
-            }
-            if index.get(p).is_some() {
-                return Resolution { project: Some(p.clone()), source: "pin" };
-            }
+    // Agent id first, the legacy workspace key second — the same order
+    // `claimed_project` and `cmd_mandate::from_map` read a pin's neighbours
+    // in, and for the same reason: this is a mandate with a different word on
+    // it (`compound-106`).
+    let pinned = agent
+        .filter(|a| crate::place::is_agent_id(a))
+        .and_then(|a| pins.get(a))
+        .or_else(|| workspace_id.and_then(|ws| pins.get(ws)));
+    if let Some(p) = pinned {
+        if p == TOP_LEVEL {
+            return Resolution { project: None, source: "top" };
+        }
+        if index.get(p).is_some() {
+            return Resolution { project: Some(p.clone()), source: "pin" };
         }
     }
     if let Some(p) = held.binding {
@@ -627,7 +642,7 @@ mod tests {
     }
 
     fn held(cl: &BTreeMap<String, serde_json::Value>, tasks: &[Task], ws: &str, label: &str) -> Held {
-        Held { binding: None, claim: claimed_project(cl, tasks, Some(ws), Some(label)) }
+        Held { binding: None, claim: claimed_project(cl, tasks, None, Some(ws), Some(label)) }
     }
 
     /// A shell in the folder ten workspaces share is standing there in the
@@ -640,6 +655,7 @@ mod tests {
             &index(),
             &BTreeMap::new(),
             held(&cl, &tasks, "w7", "Trance Video"),
+            None,
             Some("w7"),
             Some("Trance Video"),
             Some("/home/ed/claude/vst"),
@@ -652,6 +668,7 @@ mod tests {
             &index(),
             &BTreeMap::new(),
             Held::default(),
+            None,
             Some("w7"),
             Some("Trance Video"),
             Some("/home/ed/claude/vst"),
@@ -668,7 +685,7 @@ mod tests {
         let tasks = vec![task("t-1", "trance", "doing")];
         let mut h = held(&cl, &tasks, "w7", "Trance Video");
         h.binding = Some("vst".into());
-        let r = resolve(&index(), &BTreeMap::new(), h, Some("w7"), Some("Trance Video"), None);
+        let r = resolve(&index(), &BTreeMap::new(), h, None, Some("w7"), Some("Trance Video"), None);
         assert_eq!(r.project.as_deref(), Some("vst"));
         assert_eq!(r.source, "binding");
     }
@@ -684,11 +701,33 @@ mod tests {
             &index(),
             &pins,
             held(&cl, &tasks, "w7", "Trance Video"),
+            None,
             Some("w7"),
             Some("Trance Video"),
             None,
         );
         assert_eq!(r.project.as_deref(), Some("vst"));
+        assert_eq!(r.source, "pin");
+    }
+
+    /// A pin keyed by the agent id wins over a legacy pin still keyed by the
+    /// workspace it was set from — the agent id is what a writer produces now
+    /// (`compound-106`), so a reader that checked the legacy key first would
+    /// go on answering with a pin `wsp pin` has already moved off of.
+    #[test]
+    fn an_agent_keyed_pin_is_read_before_the_legacy_workspace_one() {
+        let pins: BTreeMap<String, String> =
+            [("w7".to_string(), "vst".to_string()), ("a-1-p1".to_string(), "trance".to_string())].into();
+        let r = resolve(
+            &index(),
+            &pins,
+            Held::default(),
+            Some("a-1-p1"),
+            Some("w7"),
+            None,
+            None,
+        );
+        assert_eq!(r.project.as_deref(), Some("trance"));
         assert_eq!(r.source, "pin");
     }
 
@@ -698,7 +737,7 @@ mod tests {
     fn a_claim_on_finished_work_places_nothing() {
         let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
         let tasks = vec![task("t-1", "trance", "done")];
-        assert_eq!(claimed_project(&cl, &tasks, Some("w7"), Some("Trance Video")), None);
+        assert_eq!(claimed_project(&cl, &tasks, None, Some("w7"), Some("Trance Video")), None);
     }
 
     /// Claims are machine-local — a workspace id on the laptop means nothing
@@ -709,7 +748,7 @@ mod tests {
         c["host"] = json!("somebody-elses-mac");
         let cl = claims(&[("t-1", c)]);
         let tasks = vec![task("t-1", "trance", "doing")];
-        assert_eq!(claimed_project(&cl, &tasks, Some("w7"), Some("Trance Video")), None);
+        assert_eq!(claimed_project(&cl, &tasks, None, Some("w7"), Some("Trance Video")), None);
     }
 
     /// A workspace rebuilt under a new id keeps its label, which is why
@@ -719,7 +758,7 @@ mod tests {
         let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
         let tasks = vec![task("t-1", "trance", "doing")];
         assert_eq!(
-            claimed_project(&cl, &tasks, Some("w22"), Some("Trance Video")).as_deref(),
+            claimed_project(&cl, &tasks, None, Some("w22"), Some("Trance Video")).as_deref(),
             Some("trance")
         );
     }
@@ -734,7 +773,39 @@ mod tests {
         ]);
         let tasks = vec![task("t-1", "vst", "doing"), task("t-2", "trance", "doing")];
         assert_eq!(
-            claimed_project(&cl, &tasks, Some("w7"), Some("Trance Video")).as_deref(),
+            claimed_project(&cl, &tasks, None, Some("w7"), Some("Trance Video")).as_deref(),
+            Some("trance")
+        );
+    }
+
+    /// **The barrier itself**: an agent id on the claim is matched ahead of
+    /// its workspace fields — `compound-092` stage A wrote one onto every
+    /// claim, `compound-106` is what starts reading it — so a claim moved to
+    /// a rebuilt workspace (a new id, a relabelled shell) still resolves
+    /// through the identity that survived the move, without needing either
+    /// legacy field to agree with the caller's environment at all.
+    #[test]
+    fn an_agent_id_on_the_claim_is_matched_ahead_of_its_workspace_fields() {
+        let mut c = claim("w7", "Trance Video", "2026-08-14T10:00:00Z");
+        c["agent_id"] = json!("a-1-p1");
+        let cl = claims(&[("t-1", c)]);
+        let tasks = vec![task("t-1", "trance", "doing")];
+        assert_eq!(
+            claimed_project(&cl, &tasks, Some("a-1-p1"), Some("some-other-w"), Some("Some Other Label"))
+                .as_deref(),
+            Some("trance")
+        );
+    }
+
+    /// A pre-`compound-092` claim carries no `agent_id` at all, so the caller's
+    /// own agent id — real as it is — must not match an absent field. The
+    /// legacy workspace fallback is what still finds this claim.
+    #[test]
+    fn a_pre_migration_claim_with_no_agent_id_still_reads_by_workspace() {
+        let cl = claims(&[("t-1", claim("w7", "Trance Video", "2026-08-14T10:00:00Z"))]);
+        let tasks = vec![task("t-1", "trance", "doing")];
+        assert_eq!(
+            claimed_project(&cl, &tasks, Some("a-1-p1"), Some("w7"), Some("Trance Video")).as_deref(),
             Some("trance")
         );
     }

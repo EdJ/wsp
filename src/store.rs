@@ -371,6 +371,37 @@ impl Store {
         ]
     }
 
+    /// Every collection this store keeps, whatever it is keyed by — read by a
+    /// test that walks it rather than trusts a count taken by grepping
+    /// "workspace" in a design doc, which is exactly how `compound-092`
+    /// missed `pins.json`. Wider than [`Store::state_files_with_ids`], which
+    /// is only the files a task renumbering has to rewrite; this is every
+    /// file, whatever shape its keys are in.
+    pub fn files() -> &'static [&'static str] {
+        &[
+            "agents.json",
+            "bindings.json",
+            "claims.json",
+            "daemon.json",
+            "detail.json",
+            "events.jsonl",
+            "flags.json",
+            "governors.json",
+            "handovers.json",
+            "machines.json",
+            "mandates.json",
+            "messages.json",
+            "panel-view.json",
+            "panels.json",
+            "pins.json",
+            "resumable.json",
+            "resume-held.json",
+            "said.json",
+            "watches.json",
+            "worked.json",
+        ]
+    }
+
     pub fn exists(&self) -> bool {
         self.projects_dir().is_dir() || self.tasks_dir().is_dir()
     }
@@ -1636,6 +1667,23 @@ impl Store {
             .map(|(id, _)| id.clone())
     }
 
+    /// The agent a new identity-keyed record on `seat` should attach to:
+    /// whoever already holds it, or a freshly minted row if nobody does yet.
+    ///
+    /// The one mint site every writer moving off a workspace key shares —
+    /// `claim` (`compound-092` stage A) and `cmd_mandate::mandate` both reach
+    /// it, because a mandate or a pin can be set on a room before anybody has
+    /// claimed onto it, the same ordering question a workspace-keyed record
+    /// never had to answer. Kept here rather than duplicated per writer: two
+    /// copies of "mint or reuse" is how they drift.
+    pub fn agent_for_seat(&self, seat: &str) -> String {
+        self.agent_in_seat(seat).unwrap_or_else(|| {
+            let id = crate::place::new_agent_id();
+            self.set_agent(&id, json!({ "seat": seat, "started": util::now_iso() }));
+            id
+        })
+    }
+
     // ---- mandates ---------------------------------------------------------
     //
     // A claim says what an agent is doing now. A mandate says what it is *for*
@@ -2147,7 +2195,20 @@ impl Store {
         dropped
     }
 
-    /// workspace_id -> project_id
+    // ---- pins ---------------------------------------------------------
+    //
+    // A pin says *which project this room is working in*, read by `resolve`
+    // to decide where a bare `wsp add` lands. That is a mandate with a
+    // different word on it, and `compound-106` re-keys it exactly the way
+    // `compound-092` stage B re-keyed mandates: onto the agent id, with the
+    // reader accepting a legacy workspace-keyed row for one release and the
+    // writer never producing one. See `cmd_mandate::from_map` — `resolve`'s
+    // own pin lookup follows the same split between "the map" and "reading
+    // it", for the same reason: two opinions on which shape a key is in is
+    // how the two answers diverge.
+
+    /// key (agent id, or — for one release — a legacy workspace id) ->
+    /// project id
     pub fn pins(&self) -> BTreeMap<String, String> {
         match self.read_json("pins.json") {
             Value::Object(m) => m
@@ -2158,15 +2219,26 @@ impl Store {
         }
     }
 
-    pub fn set_pin(&self, workspace: &str, project: &str) {
+    /// Always agent-keyed: a record written new should never be written in
+    /// the shape this migration exists to leave behind.
+    pub fn set_pin(&self, agent: &str, project: &str) {
         self.update_json("pins.json", |p| {
-            p.insert(workspace.to_string(), Value::String(project.to_string()));
+            p.insert(agent.to_string(), Value::String(project.to_string()));
         });
     }
 
-    pub fn clear_pin(&self, workspace: &str) -> bool {
+    /// Clears whichever key holds the pin — the agent's, the legacy
+    /// workspace's, or both — the same dual clear `clear_mandate` does and
+    /// for the same reason: a clear that only knew the new shape would leave
+    /// a pre-migration pin stuck.
+    pub fn clear_pin(&self, agent: Option<&str>, workspace: &str) -> bool {
         let mut removed = false;
-        self.update_json("pins.json", |p| removed = p.remove(workspace).is_some());
+        self.update_json("pins.json", |p| {
+            if let Some(a) = agent {
+                removed |= p.remove(a).is_some();
+            }
+            removed |= p.remove(workspace).is_some();
+        });
         removed
     }
 
@@ -3271,6 +3343,80 @@ mod tests {
             None,
             "a seat nothing has sat in holds nobody, which is what `unassigned` will read"
         );
+    }
+
+    /// `agent_for_seat` reuses a seat's existing row rather than minting a
+    /// second one — the one mint site `claim` and `cmd_mandate::mandate`
+    /// both reach through it, so two calls for the same seat must answer
+    /// with the same agent.
+    #[test]
+    fn agent_for_seat_mints_once_and_reuses_it() {
+        let store = scratch("agent-for-seat");
+        let first = store.agent_for_seat("w1:p1");
+        assert!(crate::place::is_agent_id(&first), "{first}");
+        assert_eq!(store.agent_for_seat("w1:p1"), first, "the same seat, the same agent");
+        assert_eq!(store.agents_held().len(), 1, "one row, not two");
+    }
+
+    /// **The barrier itself for pins**: a pin set new is keyed on the agent,
+    /// never on the workspace it was named with — `compound-106`'s half of
+    /// the rule `compound-093` already proved for mandates.
+    #[test]
+    fn a_new_pin_is_keyed_on_the_agent_never_on_the_workspace() {
+        let store = scratch("pin-new-shape");
+        store.set_pin("a-abc-p1", "wsp");
+        let p = store.pins();
+        assert!(p.contains_key("a-abc-p1"));
+        assert!(!p.contains_key("w1"), "the workspace name never becomes a key");
+    }
+
+    /// A pre-migration pin, keyed on the workspace the way every pin was
+    /// before this row, is still readable and still clearable through the
+    /// dual-key clear `clear_mandate` already does this for.
+    #[test]
+    fn a_legacy_workspace_keyed_pin_still_reads_and_clears() {
+        let store = scratch("pin-legacy");
+        store.set_pin("w1", "wsp");
+        assert_eq!(store.pins().get("w1").map(String::as_str), Some("wsp"));
+        assert!(store.clear_pin(Some("a-nobody-p9"), "w1"), "the legacy key is still found and removed");
+        assert!(store.pins().is_empty());
+    }
+
+    /// **The check this row exists to leave behind**: walking every
+    /// collection `Store::files()` names, the two whose whole reason for
+    /// being re-keyed was to stop naming a workspace — `mandates.json` and
+    /// `pins.json` — write no workspace-shaped key once the real writer is
+    /// the one doing the writing. A count taken by grepping "workspace" in a
+    /// design doc is how `compound-092` missed `pins.json` in the first
+    /// place; this is a check instead of a sentence, so the next store this
+    /// migration forgets fails a test rather than a review.
+    ///
+    /// `governors.json` is deliberately excluded — its workspace KEY is the
+    /// one `compound-096`'s verdict said must stay, because a room is
+    /// addressed by that name and not by who is sitting in it.
+    #[test]
+    fn no_agent_keyed_collection_accepts_a_fresh_write_shaped_like_a_workspace() {
+        assert!(
+            Store::files().contains(&"mandates.json") && Store::files().contains(&"pins.json"),
+            "the two collections this test is about have to be on the authoritative list"
+        );
+        let store = scratch("no-fresh-workspace-keys");
+        store.set_agent("a-1-p1", json!({ "seat": "w1:p1", "started": util::now_iso() }));
+
+        let agent = store.agent_for_seat("w1:p1");
+        store.set_mandate(&agent, json!({ "project": "wsp", "host": util::hostname() }));
+        store.set_pin(&agent, "wsp");
+
+        for (file, keys) in [("mandates.json", store.mandates().into_keys().collect::<Vec<_>>()),
+            ("pins.json", store.pins().into_keys().collect())]
+        {
+            for key in keys {
+                assert!(
+                    crate::place::is_agent_id(&key),
+                    "{file} took a fresh write keyed on `{key}`, which is not an agent id"
+                );
+            }
+        }
     }
 
     fn scratch(tag: &str) -> Store {

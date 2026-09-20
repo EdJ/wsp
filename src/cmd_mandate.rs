@@ -84,23 +84,6 @@ pub fn from_map(
     rec.get("project").and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-/// The agent a mandate on `seat` should attach to: whoever already holds it,
-/// or a freshly minted row if nobody does yet.
-///
-/// The same mint site `claim` uses (`store::agent_in_seat(seat).unwrap_or_else
-/// (new_agent_id)`), reached from a second place for the same reason a
-/// workspace could always be mandated before anybody claimed onto it: a claim
-/// made afterwards in this pane finds this row through `agent_in_seat` and
-/// reuses it rather than minting a second one, so the mandate this leaves
-/// behind is already attached to the agent that claim goes on to use.
-fn agent_for_seat(store: &Store, seat: &str) -> String {
-    store.agent_in_seat(seat).unwrap_or_else(|| {
-        let id = crate::place::new_agent_id();
-        store.set_agent(&id, json!({ "seat": seat, "started": util::now_iso() }));
-        id
-    })
-}
-
 pub fn mandate(store: &Store, args: &Args) -> i32 {
     let env = herdr::Env::read();
     let Some(ws) = args.get("workspace").or(env.workspace_id.clone()) else {
@@ -175,7 +158,7 @@ pub fn mandate(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: mandate can only be set from the room it names — run it there, or omit -w");
         return 2;
     };
-    let agent_id = agent.unwrap_or_else(|| agent_for_seat(store, seat));
+    let agent_id = agent.unwrap_or_else(|| store.agent_for_seat(seat));
 
     store.set_mandate(
         &agent_id,
@@ -252,7 +235,7 @@ mod tests {
         let (_env, store) = scratch("mandate-new-shape");
         store.set_agent("a-abc-p1", json!({ "seat": "w1:p1", "started": "2026-09-19T00:00:00Z" }));
 
-        let agent_id = agent_for_seat(&store, "w1:p1");
+        let agent_id = store.agent_for_seat("w1:p1");
         assert_eq!(agent_id, "a-abc-p1", "the seat's existing row is reused, not re-minted");
 
         store.set_mandate(&agent_id, json!({ "project": "wsp", "host": util::hostname() }));
@@ -271,7 +254,7 @@ mod tests {
         let (_env, store) = scratch("mandate-mints-agent");
         assert!(store.agents_held().is_empty(), "nobody has claimed here yet");
 
-        let minted = agent_for_seat(&store, "w1:p1");
+        let minted = store.agent_for_seat("w1:p1");
         assert!(crate::place::is_agent_id(&minted), "{minted}");
         assert_eq!(
             store.agents_held().get(&minted).and_then(|a| a.get("seat")).and_then(|s| s.as_str()),
@@ -280,7 +263,7 @@ mod tests {
 
         // A second call — standing in for the claim that follows — reuses the
         // same row rather than minting a second one.
-        assert_eq!(agent_for_seat(&store, "w1:p1"), minted);
+        assert_eq!(store.agent_for_seat("w1:p1"), minted);
         assert_eq!(store.agents_held().len(), 1, "one row, not two");
     }
 

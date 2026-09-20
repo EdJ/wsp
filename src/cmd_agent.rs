@@ -129,8 +129,9 @@ pub(crate) fn standing_in(h: &Here) -> Option<String> {
         &h.pins,
         resolve::Held {
             binding: bound_project,
-            claim: resolve::claimed_project(&h.claims, &h.tasks, h.workspace.as_deref(), None),
+            claim: resolve::claimed_project(&h.claims, &h.tasks, h.agent.as_deref(), h.workspace.as_deref(), None),
         },
+        h.agent.as_deref(),
         h.workspace.as_deref(),
         None,
         h.cwd.as_deref(),
@@ -3308,17 +3309,37 @@ pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) 
     (removed, released)
 }
 
+/// The seat a pin set on `ws` should attach to: this process's own, and only
+/// when `ws` is the room it is standing in.
+///
+/// A pin is `wsp mandate` with a different word on it (`compound-106`) —
+/// *this workspace is working in project X* rather than *this workspace is
+/// for project X* — so setting one follows the same rule `mandate` sets for
+/// itself: a `-w` naming some other room says nothing about who, if anyone,
+/// is sitting there, so it gets no seat to attach an agent's identity to and
+/// cannot set a pin, only read or clear one by its legacy workspace key.
+fn pin_seat(ws: &str) -> Option<String> {
+    let env = herdr::Env::read();
+    (env.workspace_id.as_deref() == Some(ws)).then(my_pane).flatten()
+}
+
 pub fn pin(store: &Store, args: &Args) -> i32 {
+    let Some(ws) = args.get("workspace").or_else(|| herdr::Env::read().workspace_id) else {
+        eprintln!("wsp: no workspace — pass -w, or run inside herdr");
+        return 2;
+    };
+    let Some(seat) = pin_seat(&ws) else {
+        eprintln!("wsp: pin can only be set from the room it names — run it there, or omit -w");
+        return 2;
+    };
+    let agent_id = store.agent_for_seat(&seat);
+
     // `--top` marks a workspace as belonging to no project on purpose: the
     // home for whatever runs the whole space, and for terminals that are not
     // work. Without it, "no project" only ever means "nothing resolved", and
     // the two are not the same thing.
     if args.has("top") {
-        let Some(ws) = args.get("workspace").or_else(|| herdr::Env::read().workspace_id) else {
-            eprintln!("wsp: no workspace — pass -w, or run inside herdr");
-            return 2;
-        };
-        store.set_pin(&ws, crate::resolve::TOP_LEVEL);
+        store.set_pin(&agent_id, crate::resolve::TOP_LEVEL);
         if args.json() {
             println!("{}", json!({ "workspace": ws, "project": null, "top": true }));
         } else {
@@ -3335,12 +3356,8 @@ pub fn pin(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no such project `{needle}`");
         return 1;
     };
-    let Some(ws) = args.get("workspace").or_else(|| herdr::Env::read().workspace_id) else {
-        eprintln!("wsp: no workspace — pass -w, or run inside herdr");
-        return 2;
-    };
 
-    store.set_pin(&ws, &proj.id);
+    store.set_pin(&agent_id, &proj.id);
     let mut cache = sync::Cache::default();
     let _ = sync::sync(store, &mut cache, true);
 
@@ -3357,7 +3374,10 @@ pub fn unpin(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: no workspace — pass -w, or run inside herdr");
         return 2;
     };
-    let removed = store.clear_pin(&ws);
+    // A clear works from outside the room, unlike a set: it only has to name
+    // whichever key holds the pin, and `clear_pin` already checks both.
+    let agent = pin_seat(&ws).and_then(|seat| store.agent_in_seat(&seat));
+    let removed = store.clear_pin(agent.as_deref(), &ws);
     let mut cache = sync::Cache::default();
     let _ = sync::sync(store, &mut cache, true);
     if args.json() {
@@ -3391,6 +3411,10 @@ pub(crate) struct Whereabouts {
     /// environment names — the second of which only a multiplexer has.
     pub pane: Option<String>,
     pub workspace: Option<String>,
+    /// The agent sitting in `pane`, if one has ever claimed there — tried
+    /// ahead of `workspace` everywhere a claim or a pin is matched
+    /// (`compound-106`), the same precedence `Here` gives it.
+    pub agent: Option<String>,
     /// The process's own directory rather than the pane's: herdr reports the
     /// shell's cwd, which is stale the moment anyone `cd`s.
     pub cwd: Option<String>,
@@ -3399,6 +3423,7 @@ pub(crate) struct Whereabouts {
 impl Whereabouts {
     pub(crate) fn live(store: &Store) -> Whereabouts {
         let env = herdr::Env::read();
+        let pane = my_pane();
         Whereabouts {
             index: Index::new(store.projects()),
             pins: store.pins(),
@@ -3409,7 +3434,8 @@ impl Whereabouts {
                 (Some(_), true) => herdr::workspaces().unwrap_or_default(),
                 _ => Vec::new(),
             },
-            pane: my_pane(),
+            agent: pane.as_deref().and_then(|p| store.agent_in_seat(p)),
+            pane,
             workspace: env.workspace_id,
             cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
         }
@@ -3451,10 +3477,12 @@ pub(crate) fn locate(w: &Whereabouts) -> Located {
             claim: resolve::claimed_project(
                 &w.claims,
                 &w.tasks,
+                w.agent.as_deref(),
                 w.workspace.as_deref(),
                 label.as_deref(),
             ),
         },
+        w.agent.as_deref(),
         w.workspace.as_deref(),
         label.as_deref(),
         w.cwd.as_deref(),
@@ -3562,6 +3590,10 @@ pub(crate) struct Wip {
     /// (`robustness-017`) rather than herdr alone, which is the whole reason
     /// a seat opened with `--compound` now shows up here too.
     pub agents: Vec<crate::place::Seated>,
+    /// agent id -> agent record, read once so each row's claim and pin lookup
+    /// joins against it rather than asking the store again (`compound-106`,
+    /// the same reason `governors` above is read once for every row).
+    pub agents_held: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Wip {
@@ -3581,6 +3613,7 @@ impl Wip {
             pins: store.pins(),
             governors: store.governors(),
             agents,
+            agents_held: store.agents_held(),
         }
     }
 }
@@ -3631,13 +3664,15 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
         // the whole string stands in for one that matches nothing, which pins
         // and governors already treat as the seat holding no project.
         let workspace_id = seat.split(':').next().unwrap_or(seat);
+        let agent = Store::agent_in_seat_from_map(&w.agents_held, seat);
         let r = resolve::resolve(
             &w.index,
             &w.pins,
             resolve::Held {
                 binding: bound.and_then(|t| t.project.clone()),
-                claim: resolve::claimed_project(&w.claims, &w.tasks, Some(workspace_id), None),
+                claim: resolve::claimed_project(&w.claims, &w.tasks, agent.as_deref(), Some(workspace_id), None),
             },
+            agent.as_deref(),
             Some(workspace_id),
             None,
             Some(&a.cwd),
@@ -4249,7 +4284,7 @@ pub fn hook(store: &Store, args: &Args) -> i32 {
         }
         "workspace.closed" | "workspace_closed" => {
             if let Some(ws) = env.workspace_id.clone() {
-                store.clear_pin(&ws);
+                store.clear_pin(None, &ws);
             }
         }
         _ => {}
@@ -5189,6 +5224,7 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
                     &index,
                     &pins,
                     resolve::Held::default(),
+                    None,
                     Some(&w.id),
                     Some(&w.label),
                     Some(&pane.cwd),
@@ -5227,9 +5263,15 @@ pub fn adopt(store: &Store, args: &Args) -> i32 {
         if store.save_task(&t).is_err() {
             continue;
         }
+        // A writer moving off the workspace key never produces a row in its
+        // shape: this claim is agent-first from the moment it exists, the
+        // same rule the ordinary `claim` verb already follows
+        // (`compound-092` stage A) — leaving `workspace_id`/`workspace_label`
+        // beside it only as what a pre-migration reader still needs.
         store.set_claim(
             &t.id,
             json!({
+                "agent_id": store.agent_for_seat(pane),
                 "workspace_id": ws,
                 "workspace_label": label,
                 "cwd": panes.iter().find(|p| &p.pane_id == pane).map(|p| p.cwd.clone()).unwrap_or_default(),
@@ -5268,6 +5310,31 @@ mod tests {
         let store = Store::open();
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// A pin is a mandate with a different word on it (`compound-106`), and
+    /// setting one is refused the same way: with no herdr environment there
+    /// is no seat this process is standing in, so there is nothing to attach
+    /// a fresh agent id to.
+    #[test]
+    fn pin_refuses_to_set_from_outside_the_room() {
+        let (_env, store) = scratch("pin-outside-room");
+        store.save_project(&crate::model::Project::new("wsp")).unwrap();
+        let args = Args::synth("pin", &["wsp"], &[("workspace", "w1")]);
+        assert_eq!(pin(&store, &args), 2);
+        assert!(store.pins().is_empty(), "a refused set writes nothing");
+    }
+
+    /// `wsp unpin` clears a pin a pre-migration writer left keyed on the
+    /// workspace, with nobody ever having claimed the room — the dual clear
+    /// `store::clear_pin` does needs no agent to find it.
+    #[test]
+    fn unpin_clears_a_legacy_workspace_keyed_pin() {
+        let (_env, store) = scratch("unpin-legacy");
+        store.set_pin("w1", "wsp");
+        let args = Args::synth("unpin", &[], &[("workspace", "w1")]);
+        assert_eq!(unpin(&store, &args), 0);
+        assert!(store.pins().is_empty(), "the legacy key is gone, not left behind");
     }
 
     fn a_task(store: &Store, id: &str) -> Task {
@@ -6479,6 +6546,7 @@ mod tests {
                 // An agent holding nothing, which is its own kind of row.
                 seated_agent("w3:p1", "working", "reading the README"),
             ],
+            agents_held: std::collections::BTreeMap::new(),
         }
     }
 
@@ -6783,6 +6851,7 @@ mod tests {
             }],
             pane: Some("w1:p1".into()),
             workspace: Some("w1".into()),
+            agent: None,
             cwd: Some("/home/ed/claude/wsp".into()),
         }
     }

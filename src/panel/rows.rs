@@ -1824,6 +1824,7 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         // workspace with three shells in it places all three by the task it
         // holds — which is the whole of what `adopt` wrote down and nothing
         // was reading.
+        let seat_agent = crate::store::Store::agent_in_seat_from_map(&snap.agents, &a.pane);
         let r = resolve::resolve(
             &index,
             pins,
@@ -1832,10 +1833,12 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                 claim: resolve::claimed_project(
                     &snap.claims,
                     &tasks,
+                    seat_agent.as_deref(),
                     Some(&a.workspace),
                     Some(&a.workspace_label),
                 ),
             },
+            seat_agent.as_deref(),
             Some(&a.workspace),
             Some(&a.workspace_label),
             Some(&a.cwd),
@@ -1844,7 +1847,6 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
         // for, and that is what a verb sends it to work. A mandate on `data`
         // and a cwd in `wsp` are both true at once — the tree wants the second
         // and `f` wants the first.
-        let seat_agent = crate::store::Store::agent_in_seat_from_map(&snap.agents, &a.pane);
         let direction = crate::cmd_mandate::from_map(&snap.mandates, seat_agent.as_deref(), Some(&a.workspace))
             .filter(|p| index.get(p).is_some())
             .or_else(|| r.project.clone());

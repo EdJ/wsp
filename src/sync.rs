@@ -141,6 +141,7 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
     let bindings = store.bindings();
     let claims = store.claims();
     let governors = store.governors();
+    let agents_held = store.agents_held();
 
     let workspaces = herdr::workspaces()?;
     let agents = herdr::agents()?;
@@ -241,13 +242,22 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
             .filter(|a| a.workspace_id == ws.id)
             .find_map(|a| task_for_pane(&a.pane_id).and_then(|t| t.project.clone()));
 
+        // Any pane living in this workspace answers for its agent — a
+        // workspace's occupant is one agent at a time in the cases this join
+        // matters for, and `claimed_project`/the pin lookup below fall back to
+        // the workspace fields the moment none is found.
+        let agent = agents
+            .iter()
+            .filter(|a| a.workspace_id == ws.id)
+            .find_map(|a| Store::agent_in_seat_from_map(&agents_held, &a.pane_id));
         let r = resolve::resolve(
             &index,
             &pins,
             resolve::Held {
                 binding: bound_project,
-                claim: resolve::claimed_project(&claims, &tasks, Some(&ws.id), Some(&ws.label)),
+                claim: resolve::claimed_project(&claims, &tasks, agent.as_deref(), Some(&ws.id), Some(&ws.label)),
             },
+            agent.as_deref(),
             Some(&ws.id),
             Some(&ws.label),
             cwd.as_deref(),

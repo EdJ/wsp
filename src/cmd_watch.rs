@@ -2208,6 +2208,7 @@ impl Source for Poll<'_> {
             claims: self.store.claims(),
             pins: self.store.pins(),
             governors: self.store.governors(),
+            agents_held: self.store.agents_held(),
             // The same join `Herdr::census` performs, built from the listings
             // this probe already holds rather than asking herdr again — see
             // `seated_rows`. Empty seats are dropped: `wip` is about who is

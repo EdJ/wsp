@@ -171,6 +171,9 @@ pub(crate) struct World {
     pub pins: BTreeMap<String, String>,
     pub bindings: BTreeMap<String, Value>,
     pub claims: BTreeMap<String, Value>,
+    /// agent id -> agent record, joined against a pane's id below to find the
+    /// agent a claim or a pin is keyed on now (`compound-106`).
+    pub agents_held: BTreeMap<String, Value>,
 }
 
 impl World {
@@ -189,6 +192,7 @@ impl World {
             pins: store.pins(),
             bindings: store.bindings(),
             claims: store.claims(),
+            agents_held: store.agents_held(),
         }
     }
 }
@@ -252,6 +256,7 @@ pub(crate) fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<
         w.tasks.iter().find(|t| t.id == id)
     };
     let project_of = |p: &herdr::Pane| {
+        let agent = crate::store::Store::agent_in_seat_from_map(&w.agents_held, &p.pane_id);
         resolve::resolve(
             &w.index,
             &w.pins,
@@ -260,10 +265,12 @@ pub(crate) fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<
                 claim: resolve::claimed_project(
                     &w.claims,
                     &w.tasks,
+                    agent.as_deref(),
                     Some(&p.workspace_id),
                     Some(&label_of(&p.workspace_id)),
                 ),
             },
+            agent.as_deref(),
             Some(&p.workspace_id),
             Some(&label_of(&p.workspace_id)),
             Some(&p.cwd),
@@ -376,6 +383,7 @@ mod tests {
             pins: BTreeMap::new(),
             bindings: BTreeMap::new(),
             claims: BTreeMap::new(),
+            agents_held: BTreeMap::new(),
         }
     }
 
