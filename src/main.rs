@@ -164,7 +164,11 @@ const BOOL_FLAGS: &[&str] = &[
     // order somebody types, and without this the reason is eaten as the flag's
     // value and the verb refuses for want of a sentence it was given. `--again`
     // is the escape from the repeat guard and is shared with both `tell` verbs.
-    "abandon", "again",
+    // `--anyway` is the escape from the readiness guard on a backend that
+    // cannot vouch for a seat (`compound-097`), and it sits beside `--again`
+    // for the same reason: both are a person overriding a refusal that is
+    // right in general.
+    "abandon", "again", "anyway",
 ];
 
 /// Flags that keep their meaning inside a command's payload.
@@ -1726,7 +1730,12 @@ fn help_text() -> String {
                                     it away.
                                     The same sentence twice inside two minutes
                                     is read as a retry and refused; `--again`
-                                    means it
+                                    means it. A seat that cannot say whether it
+                                    is at a prompt is refused rather than typed
+                                    at, because the text would land in whatever
+                                    dialog is holding the keyboard; look with
+                                    `wsp peek`, then `--anyway` takes the
+                                    decision yourself
 
 {machines}
   wsp machine add <name> [<ssh>]    a second machine to run agents on; <ssh> is

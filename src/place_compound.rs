@@ -141,6 +141,22 @@ pub struct Compound<'a> {
     /// How long a `SIGTERM`ed session gets before [`Place::stop`] kills it.
     pub linger: Duration,
     pub poll: Duration,
+    /// Deliver to a seat that cannot vouch for itself (`compound-097`).
+    ///
+    /// `false` everywhere except where a person has said so. `state` answers
+    /// `Unknown` once a hook's word has expired, and `tell` then refuses
+    /// rather than typing into whatever is on screen — which is right, and
+    /// which would also be a lockout with no way past it, because nothing
+    /// else refreshes that record today.
+    ///
+    /// So this is the way past: a governor who has LOOKED — `compound-sup
+    /// screen` is the honest surface — passes `wsp tell --anyway` and takes
+    /// the decision themselves. It is a field on the backend rather than a
+    /// widening of `Place`, for the reason `linger` and `poll` are: it
+    /// configures this implementation, it does not change what the port
+    /// promises. `compound-065` says a row that finds itself widening the
+    /// port stops and asks, and this one did not have to.
+    pub insist: bool,
     pub clock: &'a dyn Clock,
 }
 
@@ -155,14 +171,40 @@ impl Compound<'static> {
             root,
             linger: Duration::from_millis(2_000),
             poll: Duration::from_millis(150),
+            insist: false,
             clock: &util::Wall,
         }
+    }
+
+    /// The same backend, willing to deliver to a seat that cannot vouch for
+    /// itself. See [`Compound::insist`] — this is `wsp tell --anyway` and
+    /// nothing else builds it.
+    pub fn insisting(self) -> Compound<'static> {
+        Compound { insist: true, ..self }
     }
 }
 
 const SEATS: &str = "compound-seats";
 const SEAT_FILE: &str = "seat.json";
 const SAID_FILE: &str = "said.json";
+
+/// How long a hook's word stays evidence about NOW (`compound-097`).
+///
+/// Not a timeout on the agent — a bound on what this backend is willing to
+/// claim on its behalf. Past it the answer is `State::Unknown`, which is
+/// honest rather than pessimistic: nothing has told us anything, and the
+/// difference between an agent at a prompt, an agent mid-turn and an agent
+/// holding a dialog is invisible from here.
+///
+/// **Two minutes, and the number is chosen against the two real cases rather
+/// than picked.** A work order goes out seconds after `SessionStart` fires,
+/// so a spawn must still be able to deliver — this is comfortably wide enough
+/// for that. And a claim of idleness made two hours ago is worth nothing,
+/// which is the case that cost an answer nobody chose. If the turn-boundary
+/// hooks ever fire for a compound-hosted agent the way they do elsewhere,
+/// every idle seat gets a fresh record each turn and this stops being
+/// reachable in normal use — which is the right direction for it to fail in.
+const VOUCH_SECS: i64 = 120;
 const NEXT_FILE: &str = "next";
 const SEAT_PREFIX: &str = "cpd-";
 
@@ -324,6 +366,28 @@ impl Compound<'_> {
             return State::Empty;
         }
         let said = self.said(seat);
+        // **A hook's word is evidence about the moment it was written, and
+        // this backend has no second source** (`compound-097`). herdr watches
+        // a pty and can answer about NOW; compound answers from the last hook
+        // that fired, so a record that has not been refreshed says what was
+        // true then and nothing about since.
+        //
+        // The failure that made this a row rather than a nicety: a seat whose
+        // only `said` was its own `SessionStart` read `Idle` two hours later
+        // while its agent was mid-turn holding a question dialog, and a
+        // `wsp tell` was typed AT the dialog and selected an answer nobody
+        // chose. `Place::tell` refuses unless `will_take_a_prompt`, and
+        // `cmd_agent::tell` refuses on `Blocked` — both guards are sound and
+        // both were inert, because they are only as good as this function.
+        //
+        // So an expired record answers `Unknown`, whose own doc is exactly
+        // this case — *"the backend did not say, or could not be asked"* —
+        // and which `will_take_a_prompt` already refuses. The guard re-arms
+        // without either caller changing.
+        let at = util::epoch_of(&str_of(&said, "at"));
+        if at == 0 || util::epoch_secs().saturating_sub(at) > VOUCH_SECS {
+            return State::Unknown;
+        }
         match said.get("state").and_then(|s| s.as_str()) {
             Some("idle") => State::Idle,
             Some("working") => State::Working,
@@ -690,7 +754,8 @@ impl Place for Compound<'_> {
     /// "`tell`, and why it need not hold a pipe open".
     fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery> {
         let state = self.state(seat)?;
-        if !state.will_take_a_prompt() {
+        // `insist` is a person saying they have looked; see its own doc.
+        if !self.insist && !state.will_take_a_prompt() {
             return Err(Refusal::NotReady(state));
         }
         let socket = self.socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
@@ -884,6 +949,106 @@ mod tests {
         place.heard(&seat, "PermissionRequest", said_by("PermissionRequest").unwrap(), &json!({}));
         assert_eq!(place.state(&seat).unwrap(), State::Working);
         assert!(!place.state(&seat).unwrap().will_take_a_prompt(), "a sentence would land in the dialog");
+    }
+
+    /// **A hook's word expires, and the guard it feeds comes back with it**
+    /// (`compound-097`).
+    ///
+    /// The seat that cost an answer nobody chose had exactly one `said`
+    /// record — its own `SessionStart` — and read `Idle` two hours later
+    /// while its agent was mid-turn on a question dialog. Both guards that
+    /// exist to stop a sentence landing in that dialog are built on this
+    /// function, so both were inert.
+    ///
+    /// Asserted in both directions, because a bound that only ever refuses
+    /// would break every spawn: a fresh record still vouches, so the work
+    /// order that goes out seconds after `SessionStart` is delivered.
+    #[test]
+    fn a_hook_that_has_not_spoken_recently_says_unknown_rather_than_idle() {
+        let scratch = Scratch::new("vouch");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
+                .to_string(),
+        );
+
+        // Fresh: the spawn case, and it must keep working.
+        place.heard(&seat, "SessionStart", said_by("SessionStart").unwrap(), &json!({}));
+        assert_eq!(place.state(&seat).unwrap(), State::Idle);
+        assert!(
+            place.state(&seat).unwrap().will_take_a_prompt(),
+            "a work order goes out seconds after SessionStart and must still be delivered"
+        );
+
+        // The same record, aged past the bound. Nothing else changes — the
+        // pid is alive and the agent is recorded — so this is the claim
+        // expiring and not the seat going away.
+        let aged = json!({
+            "state": "idle",
+            "hook": "SessionStart",
+            "at": util::iso_at(util::epoch_secs() - (VOUCH_SECS + 60)),
+        });
+        let _ = write_atomic(&dir.join(SAID_FILE), &aged.to_string());
+        assert_eq!(
+            place.state(&seat).unwrap(),
+            State::Unknown,
+            "nothing has told us anything since, and Unknown is what that is called"
+        );
+        assert!(
+            !place.state(&seat).unwrap().will_take_a_prompt(),
+            "so `Place::tell` refuses rather than typing at whatever is on screen"
+        );
+
+        // A record with no stamp at all — written before this existed —
+        // cannot vouch either, and must not read as 1970 or as idle.
+        let _ = write_atomic(&dir.join(SAID_FILE), &json!({ "state": "idle" }).to_string());
+        assert_eq!(place.state(&seat).unwrap(), State::Unknown);
+    }
+
+    /// **The refusal has a way past it, or it is a lockout** (`compound-097`).
+    ///
+    /// Nothing refreshes a compound seat's `said` record today, so once the
+    /// vouch expires every seat refuses — and a governor who has LOOKED, with
+    /// `compound-sup screen`, must still be able to reach an agent that is
+    /// plainly waiting. `--anyway` is that, and this asserts the gate opens
+    /// rather than that the text arrives: there is no socket behind this
+    /// fixture, so the insisting backend gets PAST the readiness check and
+    /// fails on the dial instead, which is exactly the distinction worth
+    /// pinning.
+    #[test]
+    fn a_seat_that_cannot_vouch_refuses_until_somebody_insists() {
+        let scratch = Scratch::new("insist");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
+                .to_string(),
+        );
+        let _ = write_atomic(
+            &dir.join(SAID_FILE),
+            &json!({
+                "state": "idle",
+                "hook": "SessionStart",
+                "at": util::iso_at(util::epoch_secs() - (VOUCH_SECS + 60)),
+            })
+            .to_string(),
+        );
+
+        match place.tell(&seat, "anybody there") {
+            Err(Refusal::NotReady(State::Unknown)) => {}
+            other => panic!("a seat that cannot vouch must refuse, got {other:?}"),
+        }
+
+        let insisting = scratch.place().insisting();
+        assert!(
+            !matches!(insisting.tell(&seat, "anybody there"), Err(Refusal::NotReady(_))),
+            "insisting gets past the readiness gate — what it fails on next is the socket"
+        );
     }
 
     /// `compound-081`: a live pid with no `agent` recorded is `open`'s bare

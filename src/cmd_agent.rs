@@ -1352,7 +1352,12 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // the same fold `Wip::live` already does — `wsp tell` had its own copy of
     // "herdr or nothing" until this row, which is why a headless or
     // `compound`-hosted agent could not be told anything at all.
-    let backends = crate::cmd_spawn::local_backends();
+    // `--anyway` is a person saying they have looked at the seat and it is
+    // waiting; see `place_compound::Compound::insist`.
+    let backends = match args.has("anyway") {
+        true => crate::cmd_spawn::insisting_backends(),
+        false => crate::cmd_spawn::local_backends(),
+    };
     let Some((place, row)) = locate_seat(&backends, &seat) else {
         eprintln!("wsp: nothing answers for {seat} — `wsp wip` says who holds what");
         return 1;
@@ -1371,6 +1376,19 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     if row.state == State::Blocked {
         eprintln!("wsp: {what} is stopped on a prompt only a person can answer — answer that first");
         eprintln!("     `wsp peek {needle}` shows what it is asking");
+        return 1;
+    }
+
+    // A seat that cannot vouch for itself refuses rather than typing into
+    // whatever is on screen (`compound-097`), and this is the way past it for
+    // somebody who has looked. Named here as well as refused below, because a
+    // refusal whose remedy is not in the message is one people work around.
+    if !row.state.will_take_a_prompt() && !args.has("anyway") {
+        eprintln!(
+            "wsp: {what} cannot say whether it is at a prompt — it reads {}",
+            row.state.as_str()
+        );
+        eprintln!("     look first, then `wsp tell {needle} --anyway -` if it is waiting");
         return 1;
     }
 

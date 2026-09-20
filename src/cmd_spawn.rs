@@ -1473,6 +1473,18 @@ pub(crate) fn local_backends() -> [Box<dyn Place>; 2] {
     [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new())]
 }
 
+/// The same two, with compound willing to deliver to a seat that cannot vouch
+/// for itself (`compound-097`).
+///
+/// One caller — `wsp tell --anyway` — and it is deliberately a second function
+/// rather than a parameter on the one above, so that every OTHER reader of the
+/// fleet keeps the safe backend by construction and cannot acquire the unsafe
+/// one by passing the wrong bool. herdr is unchanged: it watches a pty and can
+/// answer about now, so it has nothing to insist past.
+pub(crate) fn insisting_backends() -> [Box<dyn Place>; 2] {
+    [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new().insisting())]
+}
+
 /// The name a whole backend's own silence is filed under — `wsp stamp`
 /// (`compound-064` item 2), paired with [`local_backends`] by position, so
 /// this file stays the one place that ordering is named rather than
