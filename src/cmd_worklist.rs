@@ -1818,16 +1818,17 @@ fn words(args: &Args, from: usize) -> Result<String, i32> {
 /// how a workspace comes to hold a worklist seat, and one key space means the
 /// scope it holds is either a project or a list with no ambiguity to settle.
 fn seated(store: &Store, args: &Args) -> Option<Worklist> {
-    let env = crate::herdr::Env::read();
-    let ws = args.get("workspace").or_else(|| env.workspace_id.clone())?;
     // `-w` names a room this process is not standing in, so its own pane says
     // nothing about who is sitting there — the same rule `wsp govern` applies
-    // to the pane it stamps on the record.
-    let pane = match args.get("workspace") {
-        Some(_) => None,
-        None => env.pane_id.as_deref(),
+    // to the pane it stamps on the record. With no `-w`, off `my_pane()` and
+    // not `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID` (`compound-105`): a
+    // compound-hosted seat has neither, only the one string `my_pane()`
+    // already resolves either way.
+    let who = match args.get("workspace") {
+        Some(ws) => crate::place::Seat::new(ws),
+        None => crate::place::Seat::new(crate::cmd_agent::my_pane()?),
     };
-    let scope = crate::cmd_govern::governs(&store.governors(), &crate::cmd_govern::seat_query(&ws, pane))?;
+    let scope = crate::cmd_govern::governs(&store.governors(), &who)?;
     store.worklist(&scope)
 }
 

@@ -1219,17 +1219,18 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     // row instead. `--seat` is for the agent that only wants its own.
     let index = Index::new(store.projects());
     let governors = store.governors();
-    let env = herdr::Env::read();
-    let mine = env
-        .workspace_id
-        .as_deref()
-        .and_then(|ws| cmd_govern::governs(&governors, &cmd_govern::seat_query(ws, env.pane_id.as_deref())));
+    // Off `my_pane()` and not `HERDR_WORKSPACE_ID`, `whoami`'s reason
+    // (`compound-095`) and `compound-105`'s: a compound-hosted agent has no
+    // workspace to read, only the seat, and `my_pane()` already picks the
+    // right one either way.
+    let mine =
+        my_pane().and_then(|pane| cmd_govern::governs(&governors, &crate::place::Seat::new(pane)));
     let only_mine = args.has("seat");
     // Asked for an inbox from a pane that has no seat. Said plainly, because
     // "nothing raised for you" and "you are not the seat" look identical from
     // an empty list, and only one of them is worth acting on.
     if only_mine && mine.is_none() {
-        println!("{}", p.dim("this workspace is nobody's seat — wsp flag alone shows them all"));
+        println!("{}", p.dim("this seat is nobody's — wsp flag alone shows them all"));
         return 0;
     }
     let mut shown = 0;

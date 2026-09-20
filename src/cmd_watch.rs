@@ -3390,23 +3390,23 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let env = herdr::Env::read();
-        let here = env.workspace_id.unwrap_or_default();
-        let pane = env.pane_id.unwrap_or_default();
-        let seated = !workspace.is_empty()
-            && workspace == here
-            && cmd_govern::governs(&governors, &cmd_govern::seat_query(&here, Some(&pane))).as_deref()
-                == Some(name.as_str());
-        return Ok(Scope { seated, name, workspace, pane, all: false });
+        // Off `my_pane()` and not `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID`
+        // (`compound-105`): a compound-hosted seat has neither, only the one
+        // string `my_pane()` already resolves either way, and `governs`
+        // matches an exact pane on its own — the separate `workspace == here`
+        // check this used to need is exactly what `compound-095` made
+        // redundant.
+        let here = cmd_agent::my_pane().unwrap_or_default();
+        let seated = !here.is_empty()
+            && cmd_govern::governs(&governors, &crate::place::Seat::new(&here)).as_deref() == Some(name.as_str());
+        return Ok(Scope { seated, name, workspace, pane: here, all: false });
     }
-    let env = herdr::Env::read();
-    let Some(ws) = env.workspace_id else {
-        return Err("wsp: no scope. Run this in the seat's workspace, or say `wsp watch -p <project>`".into());
+    let Some(here) = cmd_agent::my_pane() else {
+        return Err("wsp: no scope — nowhere to ask from. Run this from the seat, or say `wsp watch -p <project>`".into());
     };
-    let pane = env.pane_id.unwrap_or_default();
-    match cmd_govern::governs(&governors, &cmd_govern::seat_query(&ws, Some(&pane))) {
-        Some(name) => Ok(Scope { name, seated: true, workspace: ws, pane, all: false }),
-        None => Err("wsp: this workspace is nobody's seat, so there is no scope to watch.\n\
+    match cmd_govern::governs(&governors, &crate::place::Seat::new(&here)) {
+        Some(name) => Ok(Scope { name, seated: true, workspace: here.clone(), pane: here, all: false }),
+        None => Err("wsp: this seat is nobody's, so there is no scope to watch.\n\
                      \x20    `wsp watch <project>` watches one, `wsp govern <project>` takes the seat"
             .into()),
     }

@@ -2036,17 +2036,16 @@ fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> 
     // Rotation is the seat's own act, from the seat's own pane. Anyone else
     // running it would be handing a position away behind its holder's back,
     // and "the caller stays seated" means nothing for a caller that was never
-    // seated. Read the way `govern` reads them: workspace from the room, pane
-    // exact, because a room can hold more than one agent (worklist-035).
-    let env = crate::herdr::Env::read();
-    let (Some(ws), Some(me)) =
-        (env.workspace_id.clone(), env.pane_id.clone().filter(|p| !p.is_empty()))
-    else {
+    // seated. Off `my_pane()` and not `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID`
+    // (`compound-105`): a compound-hosted agent has neither, only the seat
+    // `my_pane()` already names, and `governs` matches an exact pane on its
+    // own — no separate workspace to pass beside it (`compound-095`).
+    let Some(me) = crate::cmd_agent::my_pane() else {
         eprintln!("wsp: {scope} is rotated by whoever holds its seat, from its own pane");
         return 2;
     };
     let governors = store.governors();
-    match cmd_govern::governs(&governors, &cmd_govern::seat_query(&ws, Some(&me))) {
+    match cmd_govern::governs(&governors, &crate::place::Seat::new(&me)) {
         Some(held) if held == scope => {}
         Some(other) => {
             eprintln!("wsp: this pane holds the {other} seat, not {scope}");
@@ -2345,10 +2344,11 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
     // pane is: it is the one thing about the caller that comes out of the
     // environment, and `end_work` is tested without one.
     let governors = store.governors();
-    let governs = crate::herdr::Env::read()
-        .workspace_id
-        .as_deref()
-        .and_then(|ws| cmd_govern::governs(&governors, &cmd_govern::seat_query(ws, pane.as_deref())));
+    // Off `pane` and not `HERDR_WORKSPACE_ID` (`compound-105`): a
+    // compound-hosted seat has no workspace to read, only the pane already
+    // read above, and `governs` matches an exact pane on its own.
+    let governs =
+        pane.as_deref().and_then(|p| cmd_govern::governs(&governors, &crate::place::Seat::new(p)));
     let me = Caller { pane: pane.as_deref(), governs: governs.as_deref() };
     end_work(backend(args).as_ref(), store, args, me, &tidy)
 }
@@ -4768,11 +4768,17 @@ mod tests {
     }
 
     /// A store of its own plus the caller env, which rotation reads the way
-    /// `govern` does: from herdr's context variables.
+    /// `govern` does: from herdr's context variables. `WSP_SEAT_ID` is
+    /// stripped rather than left alone (`compound-105`): `my_pane()` checks
+    /// the supervisor's variable ahead of herdr's, so a `cargo test` run
+    /// inside a real compound seat — this one, for instance — would answer
+    /// `here` with the outer seat and never reach the herdr vars this test is
+    /// actually about.
     fn rotating_as(tag: &str, ws: &str, pane: &str) -> (util::Isolated, Store) {
         let env = util::isolated(tag);
         std::env::set_var("HERDR_WORKSPACE_ID", ws);
         std::env::set_var("HERDR_PANE_ID", pane);
+        std::env::remove_var("WSP_SEAT_ID");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         (env, store)
