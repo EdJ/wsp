@@ -172,9 +172,10 @@ pub struct Seat {
     /// `wsp` seat and a flag on a member of tonight's list to the list's, and
     /// the reader wants to be told which.
     pub scope: String,
-    pub workspace: String,
     /// The pane the agent was in when it took the seat, and the *exact* half of
-    /// the record where [`Seat::workspace`] is the durable one.
+    /// the record where the governor record's `workspace` key is the durable
+    /// one — kept on the record, off this struct
+    /// (`compound-096`; see [`room_of`]).
     ///
     /// No longer display-only, which is worklist-035 — [`governs`] carries the
     /// argument. It can still go stale, and what answers that is
@@ -208,15 +209,17 @@ pub struct Seat {
     pub kind: String,
 }
 
-impl Seat {
-    /// Is *this* pane the one sitting in the slot?
-    ///
-    /// Written once because three places were asking it and two of them were
-    /// asking it of the room. [`governs`] is this same predicate over a whole
-    /// map and is where the argument lives; `pane: None` is the caller that has
-    /// no pane and means the room.
-    pub fn sat_in(&self, workspace: &str, pane: Option<&str>) -> bool {
-        self.workspace == workspace && (self.pane.is_empty() || pane.is_none_or(|p| p == self.pane))
+/// The room a scope's seat is filed under, read off the governor record
+/// itself rather than off a parsed [`Seat`] — the field that carried it,
+/// `Seat::workspace`, is gone (`compound-096`); the record's own `workspace`
+/// key is not and is what every caller here reads instead, the way
+/// [`governs`] already did. Mirrors [`host_of`]: a live record answers first,
+/// a vacated one's `last` second, and a scope with neither answers empty.
+pub fn room_of(governors: &BTreeMap<String, Value>, scope: &str) -> String {
+    let Some(rec) = governors.get(scope) else { return String::new() };
+    match str_at(rec, "workspace") {
+        w if !w.is_empty() => w,
+        _ => rec.get("last").map(|l| str_at(l, "workspace")).unwrap_or_default(),
     }
 }
 
@@ -308,7 +311,6 @@ fn seat_of(scope: &str, rec: &Value) -> Option<Seat> {
     }
     Some(Seat {
         scope: scope.to_string(),
-        workspace: workspace.to_string(),
         pane: rec.get("pane").and_then(Value::as_str).unwrap_or_default().to_string(),
         since: rec.get("since").and_then(Value::as_str).unwrap_or_default().to_string(),
         session: str_at(rec, "session"),
@@ -626,17 +628,20 @@ fn rename_seat(store: &Store, workspace: &str) {
     }
 }
 
-pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option<Seat> {
+pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option<(Seat, String)> {
     // Taking a seat somebody else is in is allowed and is said out loud. The
     // alternative is a refusal on a record whose whole content is "an agent is
     // sitting here", which goes stale every time a session ends without
     // standing down — and a seat you cannot take back after a crash is worse
     // than one that changes hands with a line of output.
-    let displaced = store
-        .governors()
-        .get(project)
-        .and_then(|rec| seat_of(project, rec))
-        .filter(|s| s.workspace != workspace);
+    //
+    // The room comes along beside the seat, read here rather than after the
+    // write below — `room_of` would answer for a record this call is about to
+    // overwrite, and the displaced room is exactly what the write erases.
+    let displaced = store.governors().get(project).and_then(|rec| {
+        let was = str_at(rec, "workspace");
+        (was != workspace).then(|| seat_of(project, rec).map(|s| (s, was))).flatten()
+    });
 
     // One agent, one governorship. Taking a second slot stands this workspace
     // down from the one it held, the way claiming a second task hands off the
@@ -755,7 +760,8 @@ pub fn health(probe: &crate::cmd_agent::Probe, store: &Store, problems: &mut Vec
     if panes.is_empty() {
         return;
     }
-    for slot in slots(&store.governors()) {
+    let governors = store.governors();
+    for slot in slots(&governors) {
         let Some(seat) = &slot.occupant else { continue };
         // Nothing to check against. `wsp govern -w` names a room this process
         // was not standing in and writes no pane, and a record with no address
@@ -766,17 +772,18 @@ pub fn health(probe: &crate::cmd_agent::Probe, store: &Store, problems: &mut Vec
         if panes.iter().any(|p| p.pane_id == seat.pane) {
             continue;
         }
+        let room = room_of(&governors, &slot.scope);
         // The pane and the room are said separately because the repairs
         // differ, and the repair is the half of this line worth reading. A room
         // that is still open can be sat in again as it stands; one that has
         // gone with its pane needs somewhere to sit first.
-        let (state, fill) = match panes.iter().any(|p| p.workspace_id == seat.workspace) {
+        let (state, fill) = match panes.iter().any(|p| p.workspace_id == room) {
             true => (
-                format!("its pane {} is gone and {} is still open", seat.pane, seat.workspace),
-                format!("`wsp govern {} -w {}` puts somebody back in it", slot.scope, seat.workspace),
+                format!("its pane {} is gone and {room} is still open", seat.pane),
+                format!("`wsp govern {} -w {room}` puts somebody back in it", slot.scope),
             ),
             false => (
-                format!("its pane {} and its workspace {} are both gone", seat.pane, seat.workspace),
+                format!("its pane {} and its workspace {room} are both gone", seat.pane),
                 // Not `wsp spawn --govern`, which takes a project: a scope here
                 // is a project *or* a worklist slug, and half the hints would
                 // have named a verb that cannot take it.
@@ -829,7 +836,6 @@ pub fn last_seat(governors: &BTreeMap<String, Value>, scope: &str) -> Option<Sea
         let workspace = str_at(r, "workspace");
         (!workspace.is_empty()).then(|| Seat {
             scope: scope.to_string(),
-            workspace,
             pane: str_at(r, "pane"),
             since: str_at(r, "since"),
             session: str_at(r, "session"),
@@ -1193,15 +1199,15 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
                 // a name.
                 "project": scope,
                 "workspace": ws,
-                "displaced": displaced.map(|s| s.workspace),
+                "displaced": displaced.map(|(_, room)| room),
                 "stood_down_from": handed_back,
             })
         );
         return 0;
     }
     println!("{} {}", p.cyan("▣"), p.bold(&scope));
-    if let Some(was) = displaced {
-        println!("  {}", p.dim(&format!("taken from {}", was.workspace)));
+    if let Some((_, room)) = displaced {
+        println!("  {}", p.dim(&format!("taken from {room}")));
     }
     // Not in the same grey as the hint below it. One agent holds one
     // governorship, so this line is the whole of an eviction: the seat it names
@@ -1260,7 +1266,7 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
     };
     let backends = crate::cmd_spawn::local_backends();
     let Some((place, found)) = occupant(store, &backends, &seat) else {
-        eprintln!("wsp: the {scope} seat is empty — nobody is in {} to tell", seat.workspace);
+        eprintln!("wsp: the {scope} seat is empty — nobody is in {} to tell", room_of(governors, scope));
         return 1;
     };
 
@@ -1375,7 +1381,7 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
                     // key is what a reader was written against and the value is
                     // now a scope.
                     "project": s.scope,
-                    "workspace": s.occupant.as_ref().map(|o| o.workspace.clone()),
+                    "workspace": s.occupant.as_ref().map(|_| room_of(&governors, &s.scope)),
                     "pane": s.occupant.as_ref().map(|o| o.pane.clone()),
                     "filled": s.filled(),
                     "host": s.host,
@@ -1397,8 +1403,8 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
         let here = mine.as_deref() == Some(s.scope.as_str());
         let mark = if here { p.cyan("▣") } else { p.dim("·") };
         let who = match (&s.occupant, s.elsewhere()) {
-            (Some(o) , _) if o.pane.is_empty() => o.workspace.clone(),
-            (Some(o), _) => format!("{} · {}", o.workspace, o.pane),
+            (Some(o), _) if o.pane.is_empty() => room_of(&governors, &s.scope),
+            (Some(o), _) => format!("{} · {}", room_of(&governors, &s.scope), o.pane),
             (None, true) => format!("on {}", s.host),
             (None, false) => "empty · wsp spawn -p <project> --govern fills it".to_string(),
         };
@@ -1483,7 +1489,7 @@ mod tests {
     fn a_hand_raised_in_a_project_with_a_seat_reaches_that_seat() {
         let g = seated(&[("robustness", "w1"), ("wsp", "w9")]);
         let s = seat_for(&g, &tree(), None, Some("robustness")).unwrap();
-        assert_eq!((s.scope.as_str(), s.workspace.as_str()), ("robustness", "w1"));
+        assert_eq!((s.scope.as_str(), room_of(&g, &s.scope).as_str()), ("robustness", "w1"));
     }
 
     /// The escalation question the overview asks, and the answer is that there
@@ -1539,7 +1545,7 @@ mod tests {
     fn a_hand_on_a_member_of_a_running_list_reaches_the_lists_seat() {
         let g = seated(&[("batch", "w7"), ("robustness", "w1"), ("wsp", "w9")]);
         let s = seat_for(&g, &tree(), Some("batch"), Some("robustness")).unwrap();
-        assert_eq!((s.scope.as_str(), s.workspace.as_str()), ("batch", "w7"));
+        assert_eq!((s.scope.as_str(), room_of(&g, &s.scope).as_str()), ("batch", "w7"));
 
         // And the same task with nothing running is answered by its project,
         // which is the sentence above read backwards: the list is the only
@@ -1632,7 +1638,8 @@ mod tests {
         let robustness = slots.iter().find(|s| s.scope == "robustness").expect("the post stayed");
         assert!(!robustness.filled(), "and it was handed back, empty");
         assert_eq!(
-            seat_for(&store.governors(), &tree(), Some("batch"), Some("robustness")).map(|s| s.workspace),
+            seat_for(&store.governors(), &tree(), Some("batch"), Some("robustness"))
+                .map(|s| room_of(&store.governors(), &s.scope)),
             Some("w1".to_string())
         );
     }
@@ -1954,7 +1961,7 @@ mod tests {
         assert!(!vacate(&store, "wsp"), "already empty");
         take(&store, "wsp", "w2", "w2:p1");
         assert_eq!(
-            seat_for(&store.governors(), &tree(), None, Some("wsp")).map(|s| s.workspace),
+            seat_for(&store.governors(), &tree(), None, Some("wsp")).map(|s| room_of(&store.governors(), &s.scope)),
             Some("w2".to_string())
         );
     }

@@ -792,12 +792,13 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         )
         .map(|s| {
             // The pane's and not the room's: a worker beside a custodian was
-            // told the seat above its work was itself. `Seat::sat_in` is that
-            // rule, written once — worklist-035.
-            let mine = b
-                .workspace
-                .as_deref()
-                .is_some_and(|ws| s.sat_in(ws, b.pane.as_deref()));
+            // told the seat above its work was itself — worklist-035. The
+            // room comes off the governor record (`cmd_govern::room_of`)
+            // rather than a struct field (`compound-096`).
+            let mine = b.workspace.as_deref().is_some_and(|ws| {
+                let room = cmd_govern::room_of(&b.governors, &s.scope);
+                room == ws && (s.pane.is_empty() || b.pane.as_deref().is_none_or(|p| p == s.pane))
+            });
             (s, mine)
         }),
         list: mine.and_then(|t| b.lists.of(&t.id)).cloned(),
@@ -850,7 +851,7 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
             // held to is that with no worklist running every output in this
             // tree is byte-for-byte what it was, and a renamed key breaks a
             // reader for the benefit of a word.
-            "project": s.scope, "workspace": s.workspace, "pane": s.pane, "mine": mine,
+            "project": s.scope, "workspace": cmd_govern::room_of(&b.governors, &s.scope), "pane": s.pane, "mine": mine,
         })),
         "custodian": r.custodian,
         "task": r.mine.as_ref().map(|t| t.json()),

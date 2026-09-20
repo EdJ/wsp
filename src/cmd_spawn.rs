@@ -1701,8 +1701,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     if let Some(project) = &governing {
         match workspace_of(&seat) {
             Some(ws) => {
-                if let Some(was) = cmd_govern::take(store, project, &ws, seat.as_str()) {
-                    println!("  {}", p.dim(&format!("{project} seat taken from {}", was.workspace)));
+                if let Some((_, room)) = cmd_govern::take(store, project, &ws, seat.as_str()) {
+                    println!("  {}", p.dim(&format!("{project} seat taken from {room}")));
                 }
             }
             // The workspace id is herdr's word and the port has none for it, so
@@ -2046,9 +2046,9 @@ fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> 
         // and every branch here stops before anything is opened.
         None => {
             match cmd_govern::seat_of_scope(&scope, &governors) {
-                Some(seat) => eprintln!(
+                Some(_) => eprintln!(
                     "wsp: the {scope} seat is held by {} - only that pane can rotate it",
-                    seat.workspace
+                    cmd_govern::room_of(&governors, &scope)
                 ),
                 None => eprintln!("wsp: nobody holds the {scope} seat - wsp spawn fills an empty one"),
             }

@@ -1110,7 +1110,12 @@ fn hand_rows(m: &Message, p: &Paint) -> Vec<String> {
 /// tell a question from a notice. That is `worklist-018`'s second owed check
 /// and it failed: `--ask claim` raised with no sentence drew a task title, a
 /// pane and an age, and nothing that said a keypress would answer it.
-fn hand_aside(m: &Message, seat: Option<&cmd_govern::Seat>, held_here: bool) -> String {
+fn hand_aside(
+    governors: &std::collections::BTreeMap<String, serde_json::Value>,
+    m: &Message,
+    seat: Option<&cmd_govern::Seat>,
+    held_here: bool,
+) -> String {
     let mut out: Vec<String> = Vec::new();
     let who = m.from.byline();
     if !who.is_empty() {
@@ -1128,7 +1133,12 @@ fn hand_aside(m: &Message, seat: Option<&cmd_govern::Seat>, held_here: bool) -> 
     if let Some(s) = seat {
         out.push(match held_here {
             true => format!("{} yours · {}", glyph_seat(), s.scope),
-            false => format!("{} {} · {}", glyph_seat(), cmd_govern::governor_of(&s.scope), s.workspace),
+            false => format!(
+                "{} {} · {}",
+                glyph_seat(),
+                cmd_govern::governor_of(&s.scope),
+                cmd_govern::room_of(governors, &s.scope)
+            ),
         });
     }
     out.join(" · ")
@@ -1152,13 +1162,13 @@ fn addressed(store: &Store, task: &Task) -> String {
     // raised hand: a member of tonight's run is answered for by whoever is
     // running it, not by whoever governs the project it happens to live in.
     let lists = crate::worklist::Running::read(store);
-    match cmd_govern::seat_for(
-        &store.governors(),
-        &index,
-        lists.list_of(&task.id),
-        task.project.as_deref(),
-    ) {
-        Some(s) => format!("raised to the {} governor · {} · x there lowers it", s.scope, s.workspace),
+    let governors = store.governors();
+    match cmd_govern::seat_for(&governors, &index, lists.list_of(&task.id), task.project.as_deref()) {
+        Some(s) => format!(
+            "raised to the {} governor · {} · x there lowers it",
+            s.scope,
+            cmd_govern::room_of(&governors, &s.scope)
+        ),
         None => "raised on every panel · x there lowers it".into(),
     }
 }
@@ -1258,7 +1268,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         for l in hand_rows(m, &p) {
             println!("{l}");
         }
-        let aside = hand_aside(m, seat.as_ref(), held_here);
+        let aside = hand_aside(&governors, m, seat.as_ref(), held_here);
         if !aside.is_empty() {
             println!("  {}", p.dim(&aside));
         }
@@ -5491,16 +5501,16 @@ mod tests {
 
         let up = crate::message::raised(&store);
         assert!(
-            hand_aside(&up[0], None, false).contains("asks to take it"),
+            hand_aside(&std::collections::BTreeMap::new(), &up[0], None, false).contains("asks to take it"),
             "a question read as a notice: {}",
-            hand_aside(&up[0], None, false),
+            hand_aside(&std::collections::BTreeMap::new(), &up[0], None, false),
         );
 
         // And a hand that asks for nothing does not pretend to: the phrase is
         // only worth its width when it is true.
         raise_one(&store, &["wsp-001", "just look at this"], &[]);
         let up = crate::message::raised(&store);
-        assert!(!hand_aside(&up[1], None, false).contains("asks to"), "a notice claimed to be a question");
+        assert!(!hand_aside(&std::collections::BTreeMap::new(), &up[1], None, false).contains("asks to"), "a notice claimed to be a question");
     }
 
     /// And the ambiguity that follows is said out loud rather than guessed at.

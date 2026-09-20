@@ -1750,7 +1750,8 @@ pub(crate) fn collect(snap: &Snapshot, view: &View) -> Ui {
                 // workspace with a custodian and a worker in it was drawing
                 // whichever the iterator reached first as the custodian.
                 let occupant = slot.occupant.as_ref().and_then(|s| {
-                    let mut room = panes.iter().filter(|a| a.workspace == s.workspace && a.agent);
+                    let workspace = crate::cmd_govern::room_of(&snap.governors, &s.scope);
+                    let mut room = panes.iter().filter(|a| a.workspace == workspace && a.agent);
                     panes
                         .iter()
                         .find(|a| a.pane == s.pane && a.agent)

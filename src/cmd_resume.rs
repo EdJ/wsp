@@ -602,7 +602,7 @@ pub fn thread_for_seat(store: &Store, project: &str) -> Option<Thread> {
         session,
         cwd,
         host: cmd_govern::host_of(&governors, project),
-        workspace: seat.map(|s| s.workspace).unwrap_or_default(),
+        workspace: seat.is_some().then(|| cmd_govern::room_of(&governors, project)).unwrap_or_default(),
         kind: cmd_spawn::kind_or_default(&kind),
         from,
     })

@@ -572,13 +572,13 @@ fn whose(closed: &message::Closed) -> String {
 fn addressed(store: &Store, task: &crate::model::Task) -> String {
     let index = crate::resolve::Index::new(store.projects());
     let lists = crate::worklist::Running::read(store);
-    match crate::cmd_govern::seat_for(
-        &store.governors(),
-        &index,
-        lists.list_of(&task.id),
-        task.project.as_deref(),
-    ) {
-        Some(s) => format!("asked of the {} governor · {}", s.scope, s.workspace),
+    let governors = store.governors();
+    match crate::cmd_govern::seat_for(&governors, &index, lists.list_of(&task.id), task.project.as_deref()) {
+        Some(s) => format!(
+            "asked of the {} governor · {}",
+            s.scope,
+            crate::cmd_govern::room_of(&governors, &s.scope)
+        ),
         None => "asked of every panel — no governor above it".into(),
     }
 }
