@@ -113,6 +113,51 @@
 //! and a fresh instruction on top of that is the one thing guaranteed to be out
 //! of date. The whole value of the id is that the sentence has already been
 //! said.
+//!
+//! # What "brought back" means on `compound` (`compound-122`)
+//!
+//! Everything above was written for herdr, where the event is one thing: herdr
+//! restarts, restores every workspace it drew, and kills every agent that was
+//! in them (`robustness-053`). One restart, one moment, one census of what to
+//! offer back — which is exactly what [`resumable`] and [`ask_on_startup`]
+//! are: a read of `sync`'s roster, itself nothing but a projection of the
+//! store into *herdr's own sidebar tokens* (see that module's own first
+//! line). Neither reaches past herdr's panes, on purpose, and neither should
+//! be widened to.
+//!
+//! **A compound-hosted session does not have that event.** `place_compound`'s
+//! own docs are the reason: `compound-sup` daemonizes with `setsid()` and
+//! keeps a seat's agent running "whether or not anything is attached to it".
+//! The host — wsp's own window, or herdr's, whichever spawned it — can close,
+//! restart, or crash, and the seat is untouched, because it was never the
+//! thing holding the agent up. So the herdr question — "what was running
+//! before the thing hosting it went away" — has no compound answer, because
+//! closing the host is not an event a compound seat survives *badly*; it is
+//! one it does not notice.
+//!
+//! The event that does end a compound seat is narrower: `compound-sup`
+//! itself being killed — a crash, a `kill -9`, the machine going down — which
+//! takes the pty and the agent under it with it. That is the only thing on
+//! compound this verb is for, and it is reached the one way this file already
+//! reaches anything durable: **by name.** `wsp resume <task>` /
+//! `wsp resume <project>` reads the claim or the governor record — backend-
+//! agnostic, written by whichever backend ran the agent — rather than
+//! herdr's roster, and [`bring_back`] has started an agent on whichever
+//! backend it is given since `compound-076`. So a compound seat killed this
+//! way is found and restarted exactly the way a herdr one is, through the
+//! door that was never herdr's to begin with.
+//!
+//! **What stays out of scope, and why it is not this row's gap to close:**
+//! the *batch* offer — `wsp resume` with no id, and the one [`ask_on_startup`]
+//! puts up unasked — stays herdr-only. There is no single moment analogous to
+//! "herdr just restarted" that a compound machine's daemon start can key off:
+//! compound-sup processes are independent of wsp's own restart and of each
+//! other, so there is no one roster of "what a restart just interrupted" to
+//! read back, and inventing one — polling every seat's liveness on every
+//! daemon start to guess what might have died since — would be answering a
+//! question this backend does not ask in the shape herdr asks it. A smaller,
+//! correct verb: named resume reaches compound; the unprompted offer does
+//! not, and is not supposed to.
 
 use std::io::{Read, Write};
 
@@ -1724,6 +1769,49 @@ mod tests {
         );
         let t = thread_for_task(&store, "ocsand-001").unwrap();
         assert_eq!((t.kind.as_str(), t.from), ("opencode", Source::Record));
+    }
+
+    /// `compound-122`: what the named door reaches that the batch offer
+    /// cannot, and the reason the two differ.
+    ///
+    /// `resumable` is herdr's own roster, filtered by herdr's own panes — it
+    /// exists because herdr restarting kills every agent in the workspaces it
+    /// restores, and `sync` is the projection that feeds herdr's sidebar in
+    /// the first place (see that module's own doc line one). A compound seat
+    /// is never in it, and every test in this file runs against a herdr that
+    /// answers nothing at all (`crate::util::isolated`), which is this
+    /// machine's honest state once `compound-112` made compound the default:
+    /// no herdr, so an empty roster and an empty offer, correctly.
+    ///
+    /// `wsp resume <task>` does not go through that roster. It reads the
+    /// claim — the durable record `bring_back` and every backend already
+    /// share — so a task never offered because no herdr ever held it is still
+    /// found by name, and `compound-076`'s threaded backend still starts it.
+    /// Nothing here asks herdr anything, which is the whole of the answer.
+    #[test]
+    fn a_task_named_directly_is_found_though_the_batch_offer_never_held_it() {
+        let (_env, store) = store("resume-compound-task");
+        task_at(&store, "cpd-001", Status::Doing);
+        store.set_claim(
+            "cpd-001",
+            json!({
+                "agent_session_id": "ses-1",
+                "agent_kind": "opencode",
+                "cwd": "/tmp/work",
+                "host": util::hostname(),
+            }),
+        );
+        assert!(
+            resumable(&store).is_empty(),
+            "herdr never held this session, so it is not on the batch offer"
+        );
+        let t = thread_for(&store, "cpd-001").expect("the claim finds it anyway");
+        assert_eq!(t.session, "ses-1");
+        assert!(t.workspace.is_empty(), "no herdr workspace was ever recorded for it");
+
+        let place = Opens(std::cell::RefCell::new(Vec::new()));
+        let seat = bring_back(&store, &place, &t).expect("it starts on whatever place it is given");
+        assert_eq!(seat.as_str(), "w9:p1");
     }
 
     /// `core-031`'s second decision, asserted rather than described: a record
