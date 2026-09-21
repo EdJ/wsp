@@ -172,7 +172,6 @@ use crate::cmd_govern;
 use crate::herdr;
 use crate::model::{Status, Task};
 use crate::place::State;
-use crate::place_herdr;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -2329,12 +2328,19 @@ impl Source for Poll<'_> {
                 continue;
             }
             // The one reading that changes the answer's urgency, and it is read
-            // off the published row's own `state` word rather than by asking
-            // herdr again. A modal has the keyboard: the repair is a keypress,
-            // and waiting five minutes to mention it would be waiting five
-            // minutes to say a word — `quiet_note` makes the same exception for
-            // the same reason.
-            let s = match place_herdr::of_word(&r.state) {
+            // off the published row's own typed state rather than by asking
+            // herdr again — or, as this did before, by parsing the row's
+            // *string* back through herdr's word table. That string is wsp's
+            // own vocabulary (`State::as_str`), not herdr's, and reading it as
+            // herdr's is exactly the mistake `compound-064` refused: a
+            // `place_compound` or `place_super` seat's word read through
+            // herdr's table. `state_typed` is the port's own answer, already
+            // resolved by whichever backend the seat is, so there is nothing
+            // here to get wrong. A modal has the keyboard: the repair is a
+            // keypress, and waiting five minutes to mention it would be
+            // waiting five minutes to say a word — `quiet_note` makes the same
+            // exception for the same reason.
+            let s = match r.state_typed {
                 State::Blocked => Signal::new(
                     Kind::NeedsAPerson,
                     &t.id,
@@ -4247,6 +4253,7 @@ mod tests {
             pane: pane.into(),
             workspace: "w1".into(),
             state: String::new(),
+            state_typed: crate::place::State::Unknown,
             turning,
             needs_you: false,
             seat: None,
@@ -5260,6 +5267,7 @@ mod tests {
             pane: pane.into(),
             workspace: pane.split(':').next().unwrap_or(pane).into(),
             state: String::new(),
+            state_typed: crate::place::State::Unknown,
             turning,
             needs_you: false,
             seat: seat.map(str::to_string),

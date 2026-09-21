@@ -3633,6 +3633,14 @@ pub(crate) struct WipRow {
     pub(crate) pane: String,
     pub(crate) workspace: String,
     pub(crate) state: String,
+    /// The same fact, typed, straight off [`place::Seated::state`] rather than
+    /// re-derived from the string above. `state` is wsp's own vocabulary
+    /// (`State::as_str`), not herdr's — a caller that fed it back through
+    /// `place_herdr::of_word` would be reading a non-herdr row's word through
+    /// herdr's table, which is exactly the mistake `compound-064` refused. A
+    /// caller that wants to branch on the state reads this field and does no
+    /// parsing at all.
+    pub(crate) state_typed: crate::place::State,
     /// Whether a turn is actually running in it. Beside `state` rather than
     /// derived from it at the point of drawing, because it is the answer to the
     /// question the heading asks — and because reading it off the word is the
@@ -3696,6 +3704,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             pane: seat.to_string(),
             workspace: workspace_id.to_string(),
             state: a.state.as_str().to_string(),
+            state_typed: a.state,
             turning: a.state.turn_in_flight(),
             needs_you,
             seat: seat_of_project,
@@ -6611,6 +6620,42 @@ mod tests {
         let mut w = wip_world();
         w.agents[1].state = crate::place_herdr::of_word("something-new");
         assert!(wip_rows(&w).iter().all(|r| !r.needs_you), "not knowing is not knowing it stopped");
+    }
+
+    /// `state` on the row is wsp's own vocabulary (`State::as_str`), not
+    /// herdr's — `working`/`idle`/`blocked`/`gone`/`starting`/`empty`/`unknown`,
+    /// not herdr's `idle`/`working`/`blocked`/`done`. A caller that fed it back
+    /// through `place_herdr::of_word` — as `cmd_watch` did before this row —
+    /// would be reading it as herdr's raw word and losing `starting` and
+    /// `gone`, which `of_word` has no arm for. `state_typed` is the port's own
+    /// answer, carried alongside rather than re-derived, so it survives the
+    /// round trip.
+    #[test]
+    fn the_typed_state_survives_words_of_word_cannot_read_back() {
+        for word in ["working", "idle", "blocked", "done", "something-new"] {
+            let mut w = wip_world();
+            w.agents[1].state = crate::place_herdr::of_word(word);
+            let row = wip_rows(&w).into_iter().find(|r| r.pane == "w2:p1").unwrap();
+            assert_eq!(row.state_typed, w.agents[1].state, "{word}");
+            assert_eq!(row.state, w.agents[1].state.as_str(), "{word}");
+        }
+
+        // `starting` and `gone` are real answers a backend other than herdr's
+        // census can give (`place_compound`, `place_super`), and words neither
+        // one is in `place_herdr::of_word`'s table — that function only
+        // understands herdr's own vocabulary. Re-parsing the row's string
+        // through it loses both; reading `state_typed` does not.
+        for state in [crate::place::State::Starting, crate::place::State::Gone] {
+            let mut w = wip_world();
+            w.agents[1].state = state;
+            let row = wip_rows(&w).into_iter().find(|r| r.pane == "w2:p1").unwrap();
+            assert_eq!(row.state_typed, state);
+            assert_ne!(
+                crate::place_herdr::of_word(&row.state),
+                state,
+                "{state:?} round-tripped through of_word, which is the bug"
+            );
+        }
     }
 
     /// A pane holding nothing still appears — `wip` is who is running, not who
