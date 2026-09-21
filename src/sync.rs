@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::herdr;
+use crate::place::Place;
+use crate::place_compound::Compound;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util;
@@ -158,7 +160,28 @@ pub fn sync(store: &Store, cache: &mut Cache, force: bool) -> std::io::Result<Re
     let reaped = match herdr::panes() {
         Err(_) => 0,
         Ok(panes) => {
-            let live: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+            // Herdr's panes, plus every seat compound is holding — a binding is
+            // just as often on the second backend since `compound-112` made it
+            // the default, and this reap used to know only the first one. A
+            // compound seat's id carries no `@machine`, so `machine_of` reads it
+            // as local and `may_reap` would call it gone the moment herdr's own
+            // local pane answered — the same reap deciding herdr is quiet was
+            // taken as proof compound was too. Added straight to `live` rather
+            // than folded into `answered`: compound not answering must not make
+            // its bindings *more* reapable, only leave them exactly as exposed
+            // to herdr's evidence as they already were, so a census error here
+            // changes nothing rather than something (`compound-119`'s rule,
+            // unreadable means keep).
+            let live: Vec<String> = panes
+                .iter()
+                .map(|p| p.pane_id.clone())
+                .chain(
+                    Compound::new()
+                        .census()
+                        .map(|c| c.seats().map(|s| s.seat.as_str().to_string()).collect())
+                        .unwrap_or_else(|_| Vec::new()),
+                )
+                .collect();
             let answered =
                 crate::cmd_agent::answered_by_machine(live.iter().map(|s| s.as_str()));
             let keep = kept_bindings(&live, bindings.keys(), &answered);
@@ -432,6 +455,50 @@ mod tests {
 
         assert!(keep.contains(&"w0:p1".to_string()), "a live pane lost its binding");
         assert!(!keep.contains(&"w1:p3".to_string()), "a pane that is gone kept its binding");
+    }
+
+    /// A live compound seat is not a herdr pane and never will be, so it must
+    /// never be judged by whether herdr's local machine has answered. This is
+    /// `compound-123`: a binding on `cpd-16` has no `@machine` suffix, so
+    /// `machine_of` reads it as the same local bucket herdr's own panes fall
+    /// in, and a herdr that has answered with even one pane of its own used to
+    /// be read as evidence that `cpd-16` was gone too — which it never was.
+    /// `sync::sync` is the fix: it folds `Compound::census()`'s seats into
+    /// `live` before this function ever runs, so a live compound seat is kept
+    /// outright rather than surviving on `may_reap`'s say-so. Proved here at
+    /// the one level this module can reach without a live herdr or a live
+    /// compound-sup: the same silent drop `w1:p3` suffers above must not
+    /// happen to `cpd-16` once it is in `live_panes`, whatever the local
+    /// machine answered.
+    #[test]
+    fn a_live_compound_seat_is_not_reaped_by_herdrs_local_silence() {
+        let bindings = bound(&["w0:p1", "cpd-16"]);
+
+        // Herdr alone answers with its own pane and knows nothing of
+        // compound's — exactly what `live` held before this row, since
+        // `sync::sync` asked only `herdr::panes()`.
+        let herdr_only_live = bound(&["w0:p1"]);
+        let answered =
+            crate::cmd_agent::answered_by_machine(herdr_only_live.iter().map(|s| s.as_str()));
+        let keep = kept_bindings(&herdr_only_live, bindings.iter(), &answered);
+        assert!(
+            !keep.contains(&"cpd-16".to_string()),
+            "the bug this row fixed: a live compound seat with no `@machine` \
+             reads as herdr's own local machine, and herdr answering at all \
+             used to be taken as proof `cpd-16` had gone too"
+        );
+
+        // `sync::sync` now folds `Compound::census()`'s seats into `live`
+        // before this function ever runs, so `cpd-16` is kept outright
+        // rather than surviving on `may_reap`'s say-so.
+        let combined_live = bound(&["w0:p1", "cpd-16"]);
+        let answered =
+            crate::cmd_agent::answered_by_machine(combined_live.iter().map(|s| s.as_str()));
+        let keep = kept_bindings(&combined_live, bindings.iter(), &answered);
+        assert!(
+            keep.contains(&"cpd-16".to_string()),
+            "a live compound seat was reaped even once it was in `live`"
+        );
     }
 
     /// One machine's silence must not reap another machine's bindings. This is
