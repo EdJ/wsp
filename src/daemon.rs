@@ -159,6 +159,36 @@ fn watch_machines(
     }
 }
 
+/// Is there nothing at all for the daemon to run for?
+///
+/// Read this before touching the herdr-only gate it replaces: the gate used
+/// to be `!herdr::available()`, which refused every start on the ordinary
+/// machine since `compound-112` made compound the default backend and took
+/// herdr off it. `cmd_spawn::local_backends()` is the fold every other
+/// reader — `wip`, `tell`, `census` — already uses instead of asking herdr
+/// alone, and a machine with compound and no herdr has a backend: `Compound`
+/// surveys a local directory and never fails to answer it, herdr or no. So
+/// this is `true` only when literally nothing does — every backend's
+/// [`crate::place::Place::census`] came back `Err` — which in practice means
+/// the process list or the compound state directory itself could not be
+/// read, not "no herdr socket".
+///
+/// **This does not mean the daemon then sees everything.** `sync::sync` and
+/// `cmd_agent::reconcile` still read `herdr::panes()`/`herdr::workspaces()`
+/// directly, the way this predicate no longer does, so on a compound-only
+/// machine they fail every tick and the sidebar-token push, the herdr pane
+/// reap and the restart-time resume offer all go on seeing nothing — quietly,
+/// because that failure is swallowed rather than fatal. What does run for
+/// real is `attention::tick`, the daemon's actual reason for being (see the
+/// module docs): it reads the store, not herdr, so it is exactly as good on
+/// a compound-only machine as anywhere else. Folding `sync`'s two herdr calls
+/// onto `local_backends()` the same way is `compound-123`, filed as its own
+/// row rather than done here, because it is a read-first question about what
+/// `sync` is even for and not a one-line gate.
+fn nothing_answered(backend_ok: &[bool]) -> bool {
+    backend_ok.iter().all(|ok| !ok)
+}
+
 /// Why this daemon must not run: it is pointed at a herdr that is not the
 /// machine's, and at a store nobody named.
 ///
@@ -535,15 +565,26 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         eprintln!("wsp: {why}");
         return 2;
     }
-    if !herdr::available() {
-        eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
+    let backend_ok: Vec<bool> =
+        crate::cmd_spawn::local_backends().iter().map(|b| b.census().is_ok()).collect();
+    if nothing_answered(&backend_ok) {
+        eprintln!(
+            "wsp: no backend answered — no herdr socket at {} and compound has nothing to run for either",
+            herdr::socket_path().display()
+        );
         return 1;
+    }
+    if verbose && !herdr::available() {
+        eprintln!(
+            "wsp daemon: no herdr socket at {} — sidebar sync and herdr's pane reap stay idle; the attention pass still runs, compound seats included",
+            herdr::socket_path().display()
+        );
     }
 
     // Third gate, and after the other two on purpose: a daemon that is going to
     // refuse for a sharper reason should never have written itself into the
-    // marker, and one with no herdr to talk to is not the daemon this store
-    // wants to be holding it.
+    // marker, and one with nothing at all to run for is not the daemon this
+    // store wants to be holding it.
     let me = std::process::id();
     let holder = store.daemon_holder();
     match claim(holder.as_ref().map(|(p, _)| *p), me, running(&store.state).as_deref()) {
@@ -809,6 +850,19 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate this replaces refused every start with no herdr socket, which
+    /// since `compound-112` is the ordinary machine. One backend answering —
+    /// compound's local directory, which never fails to survey — is enough to
+    /// run for; only every backend failing is "nothing to run for".
+    #[test]
+    fn the_daemon_runs_if_any_local_backend_answers() {
+        assert!(!nothing_answered(&[true, false]), "herdr down, compound up, refused anyway");
+        assert!(!nothing_answered(&[false, true]), "order should not matter");
+        assert!(!nothing_answered(&[true, true]));
+        assert!(nothing_answered(&[false, false]), "nothing answering was let through");
+        assert!(nothing_answered(&[]), "an empty backend list answered for nobody");
+    }
 
     /// The husk test's evidence, and the field it is read out of: `ps -E`
     /// prints the command and the environment as one blob, so the pane a
