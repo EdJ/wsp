@@ -128,11 +128,12 @@
 //!    reads it and reports a watch whose pid has died or whose last tick is
 //!    stale — a *reporter* that has stopped is exactly the fact no other
 //!    surface in wsp could state.
-//! 4. **It is running and blind.** herdr unreachable means half the predicates
-//!    cannot be evaluated at all, so [`Kind::Blind`] goes up, and it is the one
-//!    signal exempt from priming: a watch that is blind from its first tick
-//!    must say so, because its whole output is otherwise indistinguishable from
-//!    a quiet fleet.
+//! 4. **It is running and blind.** A backend not answering — herdr, or, since
+//!    `compound-115`, `place_compound` — means half the predicates cannot be
+//!    evaluated at all, so [`Kind::Blind`] goes up, once per silent source, and
+//!    it is the one signal exempt from priming: a watch that is blind from its
+//!    first tick must say so, because its whole output is otherwise
+//!    indistinguishable from a quiet fleet.
 //! 5. **It ended and the reason was not said.** Every exit prints a line naming
 //!    why, and a fault exits non-zero. There is no silent return.
 //! 6. **The subject moved out from under it.** A correct reporter, ticking, on
@@ -171,7 +172,7 @@ use crate::cmd_agent::{self, Bound, Probe, Wip};
 use crate::cmd_govern;
 use crate::herdr;
 use crate::model::{Status, Task};
-use crate::place::State;
+use crate::place::{Census, Place, Refusal, State};
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -921,8 +922,9 @@ impl Spool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Signal {
     pub(crate) kind: Kind,
-    /// A task id, mostly. A pane for a binding whose task is gone, the literal
-    /// `herdr` for [`Kind::Blind`], and **a seat's scope** for
+    /// A task id, mostly. A pane for a binding whose task is gone, the source's
+    /// own name (`herdr`, `compound`, …) for [`Kind::Blind`], and **a seat's
+    /// scope** for
     /// [`Kind::SeatStalled`] — a project id or a worklist slug, which share one
     /// key space with each other and with nothing else here.
     ///
@@ -2194,12 +2196,37 @@ impl Source for Poll<'_> {
         // and the agent listing come from one probe. `Wip::live` would ask
         // herdr for the agents a second time, and two listings taken a
         // round-trip apart is how a pane comes to be in one and not the other.
-        let (agents, panes, blind) = match &probe {
-            Probe::Up { agents, panes } => (agents.clone(), panes.clone(), None),
-            Probe::Unreachable(e) => (Vec::new(), Vec::new(), Some(format!("herdr unreachable: {e}"))),
-            Probe::Down => (Vec::new(), Vec::new(), Some("no herdr socket on this machine".to_string())),
+        // Folded into a `Census` of its own rather than left as a bare
+        // `Option<String>`, so it can join the second source below the same
+        // way any other multi-backend reader does — `Census::and` and
+        // `was_heard`'s argument (`compound-064`), arriving here as its third
+        // place (`compound-115`).
+        let (agents, panes, herdr_census) = match &probe {
+            Probe::Up { agents, panes } => {
+                (agents.clone(), panes.clone(), Census::heard("", crate::place_herdr::seated_rows(agents, panes)))
+            }
+            Probe::Unreachable(e) => (
+                Vec::new(),
+                Vec::new(),
+                Census::silent("", Refusal::Unreachable(format!("herdr unreachable: {e}"))),
+            ),
+            Probe::Down => (
+                Vec::new(),
+                Vec::new(),
+                Census::silent("", Refusal::Unreachable("no herdr socket on this machine".to_string())),
+            ),
         };
-        let up = blind.is_none();
+        let up = matches!(probe, Probe::Up { .. });
+        // The second source. A compound seat is not on herdr's socket at all,
+        // so a governor reading only the probe above is blind to every
+        // compound-hosted agent on a machine that runs one — the gap
+        // `compound-115` was opened for, and the one `compound-112`'s flip
+        // makes the common case rather than the rare one.
+        let compound_census = match crate::place_compound::Compound::new().census() {
+            Ok(c) => c,
+            Err(e) => Census::silent("compound", e),
+        };
+        let census = herdr_census.and(compound_census);
         let wip = Wip {
             tasks: self.store.tasks(),
             index: Index::new(self.store.projects()),
@@ -2208,14 +2235,10 @@ impl Source for Poll<'_> {
             pins: self.store.pins(),
             governors: self.store.governors(),
             agents_held: self.store.agents_held(),
-            // The same join `Herdr::census` performs, built from the listings
-            // this probe already holds rather than asking herdr again — see
-            // `seated_rows`. Empty seats are dropped: `wip` is about who is
-            // working, the rule `Wip::live` applies to every backend.
-            agents: crate::place_herdr::seated_rows(&agents, &panes)
-                .into_iter()
-                .filter(|s| s.state != crate::place::State::Empty)
-                .collect(),
+            // Every backend's census, folded — the same rule `Wip::live`
+            // applies. Empty seats are dropped: `wip` is about who is
+            // working.
+            agents: census.seats().filter(|s| s.state != State::Empty).cloned().collect(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -2392,10 +2415,17 @@ impl Source for Poll<'_> {
             }
         }
 
-        if let Some(why) = blind {
+        // Per source, not a single latch: a machine with herdr up and
+        // compound unreadable (or the reverse) should say so honestly rather
+        // than reporting nothing wrong, or reporting one blindness as the
+        // other's. `""` is herdr's own name in a `Census` (`Census::heard`'s
+        // spelling); every other source is named the way `LOCAL_BACKEND_NAMES`
+        // files it.
+        for (source, why) in census.unheard() {
+            let subject = if source.is_empty() { "herdr" } else { source };
             out.push(Signal::new(
                 Kind::Blind,
-                "herdr",
+                subject,
                 &format!("{why} — the agent half of this watch is not being read"),
             ));
         }
@@ -5649,6 +5679,59 @@ mod tests {
                     "daemon": true, "every": 60, "tick": util::iso_at(util::epoch_secs() - 86_400) }),
         );
         assert!(!said(&scope("wsp", true)).contains("already wakes"), "advice that does not work is worse than none");
+    }
+
+    // ---- reading the agent half through the port, not through herdr alone ---
+    //
+    // `compound-115`. Before this, [`Poll::sample`] read `Probe::live()` alone
+    // for its agent listing, so a governor on a machine with no herdr socket
+    // was blind to every seat `wsp` itself had opened. `util::isolated` already
+    // points `HERDR_SOCKET_PATH` at a socket nothing is listening on, so this
+    // is that machine without any extra setup — the case `compound-112`'s flip
+    // is about to make the common one.
+
+    /// A `compound`-hosted agent, stopped on a task nobody governs, is still
+    /// [`Kind::NeedsAPerson`] with no herdr socket up at all — and the `blind`
+    /// this watch says so about is herdr's alone, because the second source it
+    /// now reads answered for itself.
+    #[test]
+    fn a_compound_hosted_stall_is_seen_with_no_herdr_socket_up() {
+        let env = util::isolated("watch-compound-agent");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+
+        let compound = crate::place_compound::Compound::new();
+        let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let dir = compound.dir_of(&seat).unwrap();
+        let mut rec: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
+        rec["pid"] = json!(std::process::id());
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+        // `SessionStart` -> `State::Idle`, stopped and not turning — the state
+        // a `wsp tell` is waiting to see, not the bare-terminal `Empty` a pid
+        // with no `agent` recorded would read as.
+        compound.heard(&seat, "SessionStart", crate::place_super::said_by("SessionStart").unwrap(), &json!({}));
+
+        let mut t = Task::new("stalled on a compound seat", "cpd-1");
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        store.set_binding(seat.as_str(), json!({ "task_id": "cpd-1" }));
+
+        let mut poll = Poll::new(&store, Scope::machine(), [Kind::NeedsAPerson].into_iter().collect(), None);
+        let now = poll.sample();
+
+        let blind: Vec<&str> = now
+            .iter()
+            .filter(|s| s.kind == Kind::Blind)
+            .map(|s| s.subject.as_str())
+            .collect();
+        assert_eq!(blind, vec!["herdr"], "herdr is the only source that said nothing: {now:?}");
+
+        assert!(
+            now.iter().any(|s| s.kind == Kind::NeedsAPerson && s.subject == "cpd-1"),
+            "a compound seat's own stall reaches the watch without herdr: {now:?}"
+        );
     }
 
     // ---- the wake -----------------------------------------------------------
