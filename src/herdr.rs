@@ -63,10 +63,31 @@ pub fn socket_path() -> PathBuf {
 /// how a config system starts. If one ever exists, this is its first tenant.
 pub fn available() -> bool {
     static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ANSWER.get_or_init(|| {
-        let path = socket_path();
-        path.exists() && UnixStream::connect(&path).is_ok()
-    })
+    *ANSWER.get_or_init(probe)
+}
+
+fn probe() -> bool {
+    let path = socket_path();
+    path.exists() && UnixStream::connect(&path).is_ok()
+}
+
+/// The same test as [`available`], without the process-wide cache.
+///
+/// One caller: `cmd_checkout::who_is_standing`, asked once per `checkout
+/// --sweep`/`--rm` or `despawn` rather than in a hot loop, so the syscall
+/// [`available`]'s doc comment caches against is not the cost here. The cache
+/// is the wrong tool for it regardless of frequency: `available`'s answer is
+/// fixed for as long as ONE `wsp` invocation runs, which is the process it
+/// was written for, but a test binary runs thousands of invocations' worth of
+/// tests in that one process, and a single fake herdr server anywhere earlier
+/// in the run latches the answer `true` for every test after it — including
+/// ones with no herdr of their own. A cache built for "a server does not
+/// appear inside one invocation" is exactly wrong for a harness that is
+/// hundreds of invocations wearing one process, and `who_is_standing` is the
+/// call this whole audit is about getting right on a real socket, not the
+/// call to trust that artifact through.
+pub(crate) fn available_now() -> bool {
+    probe()
 }
 
 /// Take a host-qualified id apart: `w0:p3@mb2` is pane `w0:p3` on machine

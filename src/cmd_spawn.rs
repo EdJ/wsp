@@ -2445,40 +2445,12 @@ fn swept_up(
     // `cpd-` seat never asked who else was standing in the tree and reported
     // "kept ~/…/compound-093 — herdr did not say who is standing in it" for a
     // tree herdr never had an opinion about in the first place.
-    let herdr_seen: Result<Vec<(String, String)>, String> = match crate::herdr::available() {
-        // No herdr on this machine is not a pane in the tree: `place_super`
-        // runs agents with no terminal at all, and a cleanup that refused
-        // without one would remove nothing there, ever.
-        false => Ok(Vec::new()),
-        // A socket that is there and will not answer is a different fact, and
-        // the direction to fail in is the one `sync.rs:41` already argues:
-        // silence is not evidence that nobody is standing in the tree.
-        true => crate::herdr::panes()
-            .map(|ps| ps.into_iter().map(|p| (p.pane_id, p.cwd)).collect())
-            .map_err(|e| format!("herdr did not say who is standing in it: {e}")),
-    };
-    // A compound census is always local and never silent the way a socket can
-    // be (`place_compound::census` reads its own directory), so there is no
-    // second `available()` to gate it on. Asked independently of herdr's own
-    // result — an `.and_then` chain here would short-circuit past this call
-    // the moment herdr errors, which still keeps the tree (an unasked backend
-    // is exactly the silence this whole check refuses to read as "nobody
-    // there"), but would do it without ever actually asking compound, leaving
-    // the row this fix added to check unreachable whenever herdr also had a
-    // bad moment.
-    let compound_seen: Result<Vec<(String, String)>, String> = crate::place_compound::Compound::new()
-        .census()
-        .map(|c| c.seats().map(|s| (s.seat.as_str().to_string(), s.cwd.clone())).collect())
-        .map_err(|e| format!("compound did not say who is standing in it: {e}"));
-    let seen: Result<Vec<(String, String)>, String> = match (herdr_seen, compound_seen) {
-        (Ok(mut rows), Ok(more)) => {
-            rows.extend(more);
-            Ok(rows)
-        }
-        (Err(why), _) | (_, Err(why)) => Err(why),
-    };
+    //
+    // `cmd_checkout::who_is_standing` — `Occupied` asks the identical question
+    // for `--sweep`/`--rm` (`compound-120`) and this used to be its own copy
+    // of the same herdr-then-compound merge.
     let seen: Result<Vec<(String, String)>, String> =
-        seen.map(|rows| rows.into_iter().filter(|(id, _)| id != seat.as_str()).collect());
+        cmd_checkout::who_is_standing().map(|rows| rows.into_iter().filter(|(id, _)| id != seat.as_str()).collect());
     let standing = |dir: &std::path::Path| -> Option<String> {
         let dir = util::real(&dir.display().to_string());
         if here.starts_with(&dir) {

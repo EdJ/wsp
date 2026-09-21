@@ -172,6 +172,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 
 use crate::cmd_verify::{git, git_ok, toplevel};
+use crate::place::Place;
 use crate::store::Store;
 use crate::util;
 use crate::Args;
@@ -1000,31 +1001,69 @@ pub(crate) fn sweep_passed(
     out
 }
 
+/// Every backend wsp can spawn onto, asked who is standing where — the same
+/// merge `cmd_spawn::swept_up` builds for `despawn`'s tree check
+/// (`compound-111`), pulled out here because `Occupied` is now a second caller
+/// of the identical question and a second hand-assembled copy is exactly the
+/// hand-kept list this codebase keeps warning itself about.
+///
+/// Two backends, asked independently rather than through `local_backends()`'s
+/// `&dyn Place` fold: `locate_seat` answers "does *this named seat* exist",
+/// and the question here is "does *any* seat's cwd fall under this tree" —
+/// a census, not a lookup, so a `Place` object gains nothing a raw
+/// `(id, cwd)` pair doesn't already have.
+///
+/// **A herdr that is not there answers nothing**, so its half of the merge is
+/// simply empty when the socket is down. A herdr that IS there and errors, or
+/// a compound census that errors, is a different fact — the direction to fail
+/// in is `sync.rs:41`'s: silence is not evidence that nobody is standing in
+/// the tree, so either error becomes the one `Err` for the whole merge, and
+/// every tree this run checks is kept on it rather than some trees seeing the
+/// error and others silently not.
+pub(crate) fn who_is_standing() -> Result<Vec<(String, String)>, String> {
+    let herdr_seen: Result<Vec<(String, String)>, String> = match crate::herdr::available_now() {
+        false => Ok(Vec::new()),
+        true => crate::herdr::panes()
+            .map(|ps| ps.into_iter().map(|p| (p.pane_id, p.cwd)).collect())
+            .map_err(|e| format!("herdr did not say who is standing in it: {e}")),
+    };
+    let compound_seen: Result<Vec<(String, String)>, String> = crate::place_compound::Compound::new()
+        .census()
+        .map(|c| c.seats().map(|s| (s.seat.as_str().to_string(), s.cwd.clone())).collect())
+        .map_err(|e| format!("compound did not say who is standing in it: {e}"));
+    match (herdr_seen, compound_seen) {
+        (Ok(mut rows), Ok(more)) => {
+            rows.extend(more);
+            Ok(rows)
+        }
+        (Err(why), _) | (_, Err(why)) => Err(why),
+    }
+}
+
 /// Who is still in a tree, which is everything about a sweep that is not git's
 /// to answer.
 ///
 /// One rule, read once and asked of many trees, because `--sweep` and the
 /// barrier are looking at the same directories and two answers to "is anybody
 /// in there" is how a tree comes to be taken out from under somebody. Three
-/// facts in the order they are sure: the caller's own cwd, a pane herdr reports
-/// standing in the tree, and a claim still held.
+/// facts in the order they are sure: the caller's own cwd, a seat
+/// [`who_is_standing`] reports standing in the tree — herdr or compound, not
+/// herdr alone — and a claim still held.
 ///
-/// **A herdr that is not there answers nothing**, so the middle fact is simply
-/// absent when the socket is down, and the other two still hold. All three
-/// refuse in the safe direction — they keep a tree that could have gone — and
-/// none of them can be made wrong by a socket being down.
+/// All three refuse in the safe direction — they keep a tree that could have
+/// gone — and none of them can be made wrong by a backend having a bad moment;
+/// an unreadable backend is the one case that keeps every tree this call is
+/// asked about, not just the one it happened to be asked about first.
 pub(crate) struct Occupied {
     here: PathBuf,
-    panes: Vec<crate::herdr::Pane>,
+    seen: Result<Vec<(String, String)>, String>,
     claimed: Vec<String>,
 }
 
 impl Occupied {
     pub(crate) fn now(store: &Store) -> Occupied {
         let here = std::env::current_dir().map(|c| util::real(&c.display().to_string())).unwrap_or_default();
-        let panes =
-            if crate::herdr::available() { crate::herdr::panes().unwrap_or_default() } else { Vec::new() };
-        Occupied { here, panes, claimed: store.claims().keys().cloned().collect() }
+        Occupied { here, seen: who_is_standing(), claimed: store.claims().keys().cloned().collect() }
     }
 
     /// Why `task`'s tree at `dir` has to be left standing, or `None`.
@@ -1033,8 +1072,16 @@ impl Occupied {
         if self.here.starts_with(&dir) {
             return Some("you are standing in it".into());
         }
-        if let Some(pane) = self.panes.iter().find(|x| util::real(&x.cwd).starts_with(&dir)) {
-            return Some(format!("{} is standing in it", pane.pane_id));
+        match &self.seen {
+            Ok(rows) => {
+                if let Some((id, _)) = rows.iter().find(|(_, cwd)| util::real(cwd).starts_with(&dir)) {
+                    return Some(format!("{id} is standing in it"));
+                }
+            }
+            // A backend that will not answer is not evidence nobody is
+            // standing in the tree — keep it, and name why, exactly as
+            // `swept_up`'s equivalent does for `despawn`.
+            Err(why) => return Some(why.clone()),
         }
         // A claim on a tree that is finished with is unusual and it is still
         // somebody: the agent that did the work and has not let go of it yet.
@@ -3050,6 +3097,62 @@ mod tests {
         }
         ensure(&dir, &wt, "t-3", "master").unwrap();
         assert!(wt.join("unlanded.txt").exists(), "reopening the task did not get the work back");
+    }
+
+    /// **`compound-120`**, proved the way the barrier asked for it: not a unit
+    /// test standing in for a backend, a real one. `Occupied::now` used to ask
+    /// `herdr::panes()` and nothing else, so a compound seat standing in a
+    /// tree was invisible to it and the tree read as empty — exactly the same
+    /// bug `compound-111` fixed in `despawn`'s tree check, in a second copy.
+    #[test]
+    fn a_compound_seat_standing_in_a_tree_keeps_it_from_a_sweep() {
+        let (_env, dir) = scratch("occupied-compound");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-9");
+        ensure(&dir, &wt, "t-9", "master").unwrap();
+
+        let store = Store::open();
+        assert!(Occupied::now(&store).of("t-9", &wt).is_none(), "an empty tree was reported occupied");
+
+        let compound = crate::place_compound::Compound::new();
+        let seat = compound
+            .open(&crate::place::Order { cwd: Some(wt.display().to_string()), ..Default::default() })
+            .unwrap();
+
+        let why = Occupied::now(&store)
+            .of("t-9", &wt)
+            .expect("a compound seat standing in the tree was not seen — the herdr-only bug this row fixed");
+        assert!(why.contains(seat.as_str()), "the reason did not name the seat standing there: {why}");
+    }
+
+    /// The direction to fail in, and it is the whole design: a herdr that is
+    /// there and will not answer is not evidence that nobody is standing in
+    /// the tree, so it must keep every tree it is asked about rather than let
+    /// one go on the strength of a backend that never actually answered.
+    #[test]
+    fn an_unreadable_herdr_keeps_a_tree_it_never_actually_asked_about() {
+        let env = util::isolated("occupied-unreadable");
+        let dir = env.path("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-10");
+        ensure(&dir, &wt, "t-10", "master").unwrap();
+
+        let fake = crate::fake::Fake::bind(env.path("herdr.sock"), crate::fake::Stage::new()).unwrap();
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+        // Accepts the connection and hangs up without a word — `available_now`
+        // sees a live socket, `panes()` gets nothing back.
+        fake.goes(crate::fake::Quiet::HangsUp);
+
+        let store = Store::open();
+        let why = Occupied::now(&store)
+            .of("t-10", &wt)
+            .expect("a backend that would not answer was read as nobody being there");
+        assert!(
+            why.starts_with("herdr did not say"),
+            "the reason must name the backend that refused, not invent a seat: {why}"
+        );
     }
 
     /// Which of the three came back, for a panic message that names it.
