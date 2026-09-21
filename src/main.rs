@@ -137,6 +137,12 @@ const BOOL_FLAGS: &[&str] = &[
     "no-focus",
     // `spawn --headless <task>`, whose positional is a task id.
     "headless",
+    // `spawn --herdr <task>` the same way, and it is the OPT-IN since
+    // `compound-112` flipped the default: compound is what a spawn gets when
+    // it says nothing, and this asks for the fork by name. `--compound` stays
+    // beside it and means what it always did, so a script, a shell history or
+    // a work order that still says it keeps working.
+    "herdr", "compound",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm", "alone",
@@ -1598,9 +1604,12 @@ fn help_text() -> String {
                                     first
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
-                 [--model <m>] [--effort <e>] [--subagents]
+                 [--model <m>] [--effort <e>] [--subagents] [--herdr]
                                     open a workspace on it and claim it there;
-                                    --agent starts an agent in it too. --focus
+                                    in a compound session by default — --herdr
+                                    opens it in the fork instead, and
+                                    --headless in a supervisor with no terminal
+                                    at all. --agent starts an agent in it too. --focus
                                     to go there, --on to run it on another
                                     machine, --full to start it with sub-agents,
                                     workflows and the MCP servers it is

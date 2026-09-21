@@ -1450,11 +1450,47 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
 /// forget when the next implementor lands. That is this repository's oldest
 /// lesson about hand-kept lists, and the port is the thing that makes one copy
 /// enough.
+/// Which backend a spawn asked for, as a value.
+///
+/// Split out of [`backend`] so the CHOICE can be tested without constructing
+/// one: `Place` has no `name()` — `cmd_stamp` pairs `LOCAL_BACKEND_NAMES` with
+/// `local_backends()` by position for exactly that reason — so a test that
+/// reached for the concrete type would pass just as happily with the arms the
+/// wrong way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chosen {
+    Headless,
+    Herdr,
+    Compound,
+}
+
+pub(crate) fn chosen(args: &Args) -> Chosen {
+    // `--compound` is still accepted and still means compound; since the flip
+    // it names the default rather than departing from it, so every script and
+    // work order written during the migration keeps working.
+    match (args.has("headless"), args.has("herdr") && !args.has("compound")) {
+        (true, _) => Chosen::Headless,
+        (false, true) => Chosen::Herdr,
+        (false, false) => Chosen::Compound,
+    }
+}
+
 pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
-    match (args.has("headless"), args.has("compound")) {
+    match (args.has("headless"), args.has("herdr") && !args.has("compound")) {
         (true, _) => Box::new(crate::place_super::Supervisor::new()),
-        (false, true) => Box::new(crate::place_compound::Compound::new()),
-        (false, false) => Box::new(Herdr::new()),
+        // **The default is compound** (`compound-112`), and `--herdr` is what
+        // asks for the fork by name. It was the other way round until the
+        // fleet had run a fortnight of agents on compound without one: the
+        // flag every spawn on `chrome-port`, `compound-parity`, `herdr-out`
+        // and `native-window` had to carry was `--compound`, which is the
+        // definition of a default pointing the wrong way.
+        //
+        // Reversible in one line, which is why it is a default and not a
+        // deletion. `place_herdr` stays, `--herdr` selects it, and
+        // `--on <machine>` still reaches another machine's. What changes is
+        // only what you get when you say nothing.
+        (false, true) => Box::new(Herdr::new()),
+        (false, false) => Box::new(crate::place_compound::Compound::new()),
     }
 }
 
@@ -2744,6 +2780,43 @@ mod tests {
     use super::*;
     use crate::model::{Project, Task};
     use crate::place::Delivery;
+
+    /// **The flip** (`compound-112`): a spawn that says nothing gets compound.
+    ///
+    /// Asserted through `Place::name` rather than by matching on a type,
+    /// because what this row changed is which backend a caller is HANDED, and
+    /// a test that reached for the concrete type would pass just as happily
+    /// with the arms the other way round.
+    ///
+    /// `--compound` is kept working deliberately: every spawn on `chrome-port`,
+    /// `compound-parity`, `herdr-out` and `native-window` carried it while the
+    /// default pointed the other way, and a script or a work order that still
+    /// says it should not start opening panes somewhere else.
+    #[test]
+    fn a_spawn_that_names_no_backend_opens_on_compound() {
+        let args = |flags: &[&str]| {
+            let mut argv = vec!["spawn".to_string(), "t-1".to_string()];
+            argv.extend(flags.iter().map(|f| f.to_string()));
+            Args::parse(argv)
+        };
+        assert_eq!(chosen(&args(&[])), Chosen::Compound, "the default since compound-112");
+        assert_eq!(chosen(&args(&["--herdr"])), Chosen::Herdr, "--herdr asks for the fork by name");
+        assert_eq!(
+            chosen(&args(&["--compound"])),
+            Chosen::Compound,
+            "and the migration's own flag still means what it said"
+        );
+        assert_eq!(
+            chosen(&args(&["--headless"])),
+            Chosen::Headless,
+            "headless is unchanged and still wins"
+        );
+        assert_eq!(
+            chosen(&args(&["--headless", "--herdr"])),
+            Chosen::Headless,
+            "a seat with no terminal cannot also be a pane in one"
+        );
+    }
 
     fn seat(tag: &str) -> Store {
         let root = std::env::temp_dir().join(format!("wsp-place-{tag}-{}", std::process::id()));

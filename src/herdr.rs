@@ -37,8 +37,36 @@ pub fn socket_path() -> PathBuf {
     }
 }
 
+/// Is herdr a backend this machine can actually use?
+///
+/// **A connect, not a file test** (`compound-114`). This asked
+/// `socket_path().exists()` until Ed moved the fleet off herdr, and a unix
+/// socket file outlives its server: herdr had not run here for a week while
+/// its socket sat in `~/.config/herdr/` from three weeks earlier, so every
+/// caller was told herdr was present and every call then failed. The two
+/// facts that matters distinguish are *herdr is not on this machine*, whose
+/// honest answer is an empty list, and *herdr is here and unwell*, whose
+/// honest answer is to refuse — and a file cannot tell them apart. The cost
+/// was a `wsp despawn` keeping the worktree it had just finished with,
+/// permanently, because nothing removes a stale socket.
+///
+/// **Cached for the process, deliberately.** Twenty-nine callers ask this,
+/// some in loops, and a connect each time would be a syscall per ask for an
+/// answer that cannot change mid-run: a server does not appear inside one
+/// `wsp` invocation, and one that dies mid-run is the `Unreachable` refusal
+/// every caller already handles. The long-lived readers — `wsp watch`, the
+/// daemon — are the exception worth knowing about, and they re-exec on
+/// install, so the staleness window is a tick rather than a day.
+///
+/// A configured answer would be better than a probed one, and is not built
+/// here: wsp has no settings store, and inventing one for a single flag is
+/// how a config system starts. If one ever exists, this is its first tenant.
 pub fn available() -> bool {
-    socket_path().exists()
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let path = socket_path();
+        path.exists() && UnixStream::connect(&path).is_ok()
+    })
 }
 
 /// Take a host-qualified id apart: `w0:p3@mb2` is pane `w0:p3` on machine
