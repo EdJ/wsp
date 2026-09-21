@@ -4087,10 +4087,11 @@ pub(crate) fn peek_target(
 }
 
 pub fn peek(store: &Store, args: &Args) -> i32 {
-    if !herdr::available() {
-        eprintln!("wsp: no herdr socket");
-        return 1;
-    }
+    // Not gated on `herdr::available()` any more — that refused every peek
+    // outright on a compound-only machine, although `peek_target` below
+    // already tolerates no herdr (an empty pane list) and `Peeked::At` can
+    // name a `cpd-` seat this process resolves through the store rather than
+    // through herdr's census at all.
     let env = herdr::Env::read();
     let here = args.get("workspace").or(env.workspace_id.clone());
     let panes = herdr::panes().unwrap_or_default();
@@ -4126,21 +4127,58 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
     // like" means. `recent` reaches back through what has scrolled past, for
     // when the question is what happened rather than what is showing.
     let source = args.get("source").unwrap_or_else(|| "visible".into());
-    let mut params = json!({ "pane_id": pane, "source": source, "format": "text" });
-    if let Some(n) = args.get("lines").and_then(|l| l.parse::<u64>().ok()) {
-        params["lines"] = json!(n);
-    }
-    let Ok(r) = herdr::call("pane.read", params) else {
-        eprintln!("wsp: herdr would not read {pane}");
-        return 1;
+
+    // Which backend holds this pane, asked rather than assumed to be herdr's
+    // (`compound-091`'s fold). `wsp peek` used to call herdr's `pane.read`
+    // unconditionally, so a `cpd-` seat read back "herdr would not read
+    // cpd-2" — the seat's id already said which backend it was on, and this
+    // is the one verb that had no workaround for it, unlike `wsp despawn
+    // --compound`.
+    //
+    // A targeted `socket_of` rather than a full `census()` scan: the latter
+    // reads every compound seat's record to answer a question about one, and
+    // `read_screen` below reads this seat's record again regardless — no
+    // sense paying for the whole directory to answer "is it this one".
+    let compound = crate::place_compound::Compound::new();
+    let compound_seat = crate::place::Seat::new(&pane);
+    let on_compound = compound.socket_of(&compound_seat).is_some();
+
+    let (text, truncated) = if on_compound {
+        // No scrollback here: `compound-sup screen` is one frame, the same
+        // limit `panel::surface_frame` already lives with, so `--source` and
+        // `--lines` — herdr's reach into what has scrolled past — have
+        // nothing to ask for on this backend.
+        match compound.read_screen(&compound_seat) {
+            Ok(t) => (t, false),
+            Err(e) => {
+                eprintln!("wsp: compound would not read {pane}: {e}");
+                return 1;
+            }
+        }
+    } else {
+        if !herdr::available() {
+            eprintln!("wsp: no herdr socket");
+            return 1;
+        }
+        let mut params = json!({ "pane_id": pane, "source": source, "format": "text" });
+        if let Some(n) = args.get("lines").and_then(|l| l.parse::<u64>().ok()) {
+            params["lines"] = json!(n);
+        }
+        let Ok(r) = herdr::call("pane.read", params) else {
+            eprintln!("wsp: herdr would not read {pane}");
+            return 1;
+        };
+        let body = read_body(&r);
+        let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let truncated = body.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false);
+        (text, truncated)
     };
-    let body = read_body(&r);
-    let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let text = text.as_str();
 
     if args.json() {
         println!("{}", serde_json::to_string_pretty(&json!({
             "pane": pane, "what": what, "source": source, "text": text,
-            "truncated": body.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false),
+            "truncated": truncated,
         })).unwrap_or_default());
         return 0;
     }

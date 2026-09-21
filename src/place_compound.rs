@@ -480,6 +480,43 @@ impl Compound<'_> {
             (!s.is_empty()).then(|| PathBuf::from(s))
         })
     }
+
+    /// What this seat's pty is showing right now — `compound-sup screen
+    /// <socket>`, the same call a person types by hand.
+    ///
+    /// Not on [`Place`]: reading a pane is the observe half `place.rs`'s
+    /// module docs put outside this port, which is why `wsp peek` already
+    /// calls herdr's `pane.read` directly rather than through a trait method
+    /// — this is that seam's compound answer, called the same way. Named in
+    /// `compound-111`: with no read of any kind, `compound-sup screen
+    /// <socket>`, typed by a person, was "the only honest surface all week".
+    ///
+    /// `compound-sup`'s own presentation is a `NNN|text` line per row and a
+    /// trailing `size WxH`; stripped here down to bare text so `wsp peek`
+    /// prints the same shape whichever backend answered.
+    pub(crate) fn read_screen(&self, seat: &Seat) -> Result<String> {
+        let socket = self.socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+        let sup = compound_sup_binary()
+            .ok_or_else(|| Refusal::Backend("compound-sup not found — set $COMPOUND_SUP or put it on PATH".into()))?;
+        let out = Command::new(&sup)
+            .args(["screen"])
+            .arg(&socket)
+            .output()
+            .map_err(|e| Refusal::Backend(e.to_string()))?;
+        if !out.status.success() {
+            return Err(Refusal::Backend(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let mut lines: Vec<&str> = raw.lines().collect();
+        if lines.last().is_some_and(|l| l.starts_with("size ")) {
+            lines.pop();
+        }
+        Ok(lines
+            .into_iter()
+            .map(|l| l.split_once('|').map_or(l, |(_, t)| t))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
 }
 
 /// `compound-sup`'s three-line handshake, read with a deadline off a
@@ -1237,6 +1274,59 @@ mod tests {
         assert!(until(|| !socket.exists()), "compound-sup left its socket behind");
         assert!(until(|| !label_path.exists()), "the label sidecar outlived its socket");
         assert!(place.record(&seat).is_err(), "the seat directory itself must go with stop");
+    }
+
+    /// `compound-111`: `wsp peek` had no way to read a compound seat at all —
+    /// "herdr would not read cpd-2" — and the workaround all week was a
+    /// person typing `compound-sup screen <socket>` by hand. This is that
+    /// call, against a real session, proving the text a person would have
+    /// read on their own screen comes back through [`Compound::read_screen`]
+    /// with `compound-sup`'s own `NNN|` prefixes and trailing `size WxH`
+    /// stripped off.
+    #[test]
+    #[ignore]
+    fn read_screen_shows_what_a_person_watching_by_hand_would_see() {
+        let Some(sup) = std::env::var_os("COMPOUND_SUP") else {
+            eprintln!("skipped: set COMPOUND_SUP to a built compound-sup to run this");
+            return;
+        };
+        assert!(PathBuf::from(&sup).is_file(), "COMPOUND_SUP is not a file");
+
+        let scratch = Scratch::new("read-screen");
+        let place = scratch.place();
+        let seat = place
+            .open(&Order { label: "compound-111 smoke".into(), ..Order::default() })
+            .expect("a seat");
+        place
+            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "printf UNIQUE-COMPOUND-111-MARK; sleep 5".into()] })
+            .expect("compound-sup started");
+
+        assert!(until(|| place.socket_of(&seat).is_some()), "no socket announced in time");
+        assert!(until(|| place.socket_of(&seat).is_some_and(|s| s.exists())), "compound-sup never bound its socket");
+
+        let text = until_text(&place, &seat, "UNIQUE-COMPOUND-111-MARK");
+        assert!(text.contains("UNIQUE-COMPOUND-111-MARK"), "not what the shell printed: {text:?}");
+        assert!(!text.contains('|'), "compound-sup's own line-number prefix leaked through: {text:?}");
+        assert!(!text.lines().any(|l| l.starts_with("size ")), "the trailing `size WxH` line leaked through: {text:?}");
+
+        place.stop(&seat).expect("the seat was there");
+    }
+
+    /// Poll [`Compound::read_screen`] until it contains `mark` or the guard
+    /// gives up, and return whatever it last saw — the pty needs a moment to
+    /// actually draw what was written to it.
+    fn until_text(place: &Compound<'static>, seat: &Seat, mark: &str) -> String {
+        let mut last = String::new();
+        for _ in 0..500 {
+            if let Ok(t) = place.read_screen(seat) {
+                if t.contains(mark) {
+                    return t;
+                }
+                last = t;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        last
     }
 
     /// `census` speaks for whatever this directory holds and nothing beyond

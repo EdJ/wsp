@@ -2403,7 +2403,13 @@ fn swept_up(
     // tree. herdr can go on listing a pane for a moment after `pane.close`
     // returns, and reading that back as an occupant is how a cleanup verb comes
     // to refuse on the pane it removed itself.
-    let seen: Result<Vec<crate::herdr::Pane>, String> = match crate::herdr::available() {
+    //
+    // Asked of every backend wsp can spawn onto (`compound-091`), not herdr
+    // alone: this used to read `herdr::panes()` only, so a despawn ending a
+    // `cpd-` seat never asked who else was standing in the tree and reported
+    // "kept ~/…/compound-093 — herdr did not say who is standing in it" for a
+    // tree herdr never had an opinion about in the first place.
+    let herdr_seen: Result<Vec<(String, String)>, String> = match crate::herdr::available() {
         // No herdr on this machine is not a pane in the tree: `place_super`
         // runs agents with no terminal at all, and a cleanup that refused
         // without one would remove nothing there, ever.
@@ -2412,22 +2418,43 @@ fn swept_up(
         // the direction to fail in is the one `sync.rs:41` already argues:
         // silence is not evidence that nobody is standing in the tree.
         true => crate::herdr::panes()
-            .map(|ps| ps.into_iter().filter(|p| p.pane_id != seat.as_str()).collect())
+            .map(|ps| ps.into_iter().map(|p| (p.pane_id, p.cwd)).collect())
             .map_err(|e| format!("herdr did not say who is standing in it: {e}")),
     };
+    // A compound census is always local and never silent the way a socket can
+    // be (`place_compound::census` reads its own directory), so there is no
+    // second `available()` to gate it on. Asked independently of herdr's own
+    // result — an `.and_then` chain here would short-circuit past this call
+    // the moment herdr errors, which still keeps the tree (an unasked backend
+    // is exactly the silence this whole check refuses to read as "nobody
+    // there"), but would do it without ever actually asking compound, leaving
+    // the row this fix added to check unreachable whenever herdr also had a
+    // bad moment.
+    let compound_seen: Result<Vec<(String, String)>, String> = crate::place_compound::Compound::new()
+        .census()
+        .map(|c| c.seats().map(|s| (s.seat.as_str().to_string(), s.cwd.clone())).collect())
+        .map_err(|e| format!("compound did not say who is standing in it: {e}"));
+    let seen: Result<Vec<(String, String)>, String> = match (herdr_seen, compound_seen) {
+        (Ok(mut rows), Ok(more)) => {
+            rows.extend(more);
+            Ok(rows)
+        }
+        (Err(why), _) | (_, Err(why)) => Err(why),
+    };
+    let seen: Result<Vec<(String, String)>, String> =
+        seen.map(|rows| rows.into_iter().filter(|(id, _)| id != seat.as_str()).collect());
     let standing = |dir: &std::path::Path| -> Option<String> {
         let dir = util::real(&dir.display().to_string());
         if here.starts_with(&dir) {
             return Some("you are standing in it".into());
         }
-        let panes = match &seen {
-            Ok(panes) => panes,
+        let rows = match &seen {
+            Ok(rows) => rows,
             Err(why) => return Some(why.clone()),
         };
-        panes
-            .iter()
-            .find(|p| util::real(&p.cwd).starts_with(&dir))
-            .map(|p| format!("{} is standing in it", p.pane_id))
+        rows.iter()
+            .find(|(_, cwd)| util::real(cwd).starts_with(&dir))
+            .map(|(id, _)| format!("{id} is standing in it"))
     };
 
     let tree = match task.filter(|_| !keep) {
@@ -2588,7 +2615,22 @@ fn end_work(
     // has gone cannot say which one it was in.
     let workspace = workspace_of(&seat);
 
-    let closed = match place.stop(&seat) {
+    // Which backend actually holds this seat, asked rather than guessed
+    // (`compound-091`'s fold, over `local_backends()`, same as `wsp tell` and
+    // `wsp answer`). `place` is a flag-selected default — herdr unless told
+    // otherwise — and a `cpd-` seat is never herdr's, so ending one with no
+    // `--compound` used to fail with "no socket at herdr.sock" although the
+    // seat id said exactly which backend it was on. Falling back to `place`
+    // when nobody claims the seat keeps `--headless` working, since a
+    // supervisor is not in `local_backends()`, and keeps the existing
+    // "already gone" reading for a herdr seat this census can no longer see.
+    let backends = crate::cmd_spawn::local_backends();
+    let target: &dyn Place = match crate::cmd_agent::locate_seat(&backends, seat.as_str()) {
+        Some((found, _)) => found.as_ref(),
+        None => place,
+    };
+
+    let closed = match target.stop(&seat) {
         Ok(()) => true,
         // Already gone. The first half of the verb is done, however it happened.
         Err(Refusal::NoSeat(_)) => false,
@@ -5063,6 +5105,67 @@ mod tests {
         let left = store.handovers();
         assert!(!left.contains_key("core"), "the ending that was owed is done: {left:?}");
         assert!(left.contains_key("verb"), "somebody else's ending is not this verb's to spend: {left:?}");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `compound-111`: `wsp despawn` asked its flag-selected default —
+    /// herdr, unless told `--compound` by hand — rather than the seat's own
+    /// id, so ending a `cpd-` seat with no flag failed with "no backend
+    /// answered: no socket at herdr.sock" although the seat named exactly
+    /// which backend it was on. Now it asks `local_backends()`
+    /// (`compound-091`'s fold, the same one `wsp tell` and `wsp answer`
+    /// already use) and finds it there — the fallback `place` here is a
+    /// fake that panics if `stop` is called on it, so the test fails loudly
+    /// if the old, flag-only routing comes back.
+    #[test]
+    fn despawn_finds_a_compound_seat_with_no_compound_flag() {
+        let _env = no_backend();
+        let store = seat("despawn-compound");
+
+        let compound = crate::place_compound::Compound::new();
+        let cpd_seat = compound.open(&Order::default()).expect("a compound seat");
+        compound.start(&cpd_seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).expect("started");
+
+        struct MustNotBeAsked;
+        impl Place for MustNotBeAsked {
+            fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+                panic!("the flag-selected default was asked instead of the seat's own backend")
+            }
+            fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+                panic!("despawn does not open seats")
+            }
+            fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+                panic!("despawn does not start agents")
+            }
+            fn here(&self) -> Option<Seat> {
+                None
+            }
+            fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+                panic!("despawn does not talk to agents")
+            }
+            fn state(&self, _: &Seat) -> crate::place::Result<State> {
+                panic!("despawn does not ask how the work is going")
+            }
+            fn census(&self) -> crate::place::Result<crate::place::Census> {
+                panic!("despawn is about one seat")
+            }
+            fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+                panic!("despawn does not wait for anything")
+            }
+        }
+
+        let tidied = Tidied::default();
+        let code = end_work(
+            &MustNotBeAsked,
+            &store,
+            &Args::synth("despawn", &[], &[("pane", cpd_seat.as_str())]),
+            Caller::default(),
+            &tidied.f(),
+        );
+
+        assert_eq!(code, 0, "the compound seat answered for itself");
+        assert!(compound.state(&cpd_seat).is_err(), "the seat this ended must actually be gone");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
