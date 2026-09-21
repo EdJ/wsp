@@ -400,6 +400,81 @@ pub(crate) fn said_by(hook: &str) -> Option<State> {
     })
 }
 
+/// Every hook name [`said_by`] answers for. Kept as its own list rather than
+/// derived from that match, because nothing can enumerate a match's arms —
+/// and named here, beside [`hook_snippet_health`], for the reason
+/// `compound-107` exists: a hook `said_by` learns and this forgets to check
+/// for reads as installed on every machine until the day a seat goes quiet
+/// and nobody can say why.
+const HOOK_NAMES: [&str; 7] =
+    ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "Elicitation"];
+
+/// Where Claude Code reads its settings on this machine — `$CLAUDE_CONFIG_DIR`,
+/// or `~/.claude`, the same authority [`place::shed`]'s own docs name for that
+/// variable: a setting about where configuration lives, not an identity to
+/// strip.
+fn claude_settings_path() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::expand("~/.claude"))
+        .join("settings.json")
+}
+
+/// `compound-107`, the half the account of it left out: a machine can look
+/// configured — the file exists, `SessionStart` is in it, an agent's brief
+/// arrives on launch exactly as expected — while six of the other seven hooks
+/// are silently absent, and nothing before this said so. That is not a
+/// hypothetical: it is `cpd-5`'s whole explanation. Only `SessionStart` was
+/// ever in `~/.claude/settings.json`, so only `SessionStart` could ever fire,
+/// and a session that starts once writes exactly one record however many
+/// turns follow — indistinguishable, from `wsp wip`, from a healthy fleet
+/// nobody has looked at recently, which is exactly why it went a week.
+///
+/// **A check that only fired on total absence would have said nothing on the
+/// exact case that cost that week.** So this fires on any of the seven
+/// missing, names which, and names the fix — `merge
+/// claude-code/settings.snippet.json in` — rather than waiting for all seven
+/// to be gone before it has anything to say.
+///
+/// The file simply not existing is a different fact and a smaller one: a
+/// machine that has never merged the snippet in at all is not lying about
+/// being configured, so that is a note. A file that exists and is short some
+/// of the seven is the sneaky case, and that is a problem.
+pub fn hook_snippet_health(problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    let path = claude_settings_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        notes.push(format!(
+            "no Claude Code settings at {} — wsp-session.sh is not installed, so no hook ever tells a headless or compound seat's state; see claude-code/settings.snippet.json",
+            util::contract(&path)
+        ));
+        return;
+    };
+    let Ok(settings) = serde_json::from_str::<Value>(&text) else {
+        problems.push(format!("{}: not valid JSON — could not check which hooks are installed", util::contract(&path)));
+        return;
+    };
+    let installed = |event: &str| -> bool {
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|matcher| matcher["hooks"].as_array())
+            .flatten()
+            .filter_map(|h| h["command"].as_str())
+            .any(|c| c.contains("wsp-session.sh"))
+    };
+    let missing: Vec<&str> = HOOK_NAMES.iter().copied().filter(|e| !installed(e)).collect();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "{}: wsp-session.sh is missing from {} of {} hooks — {} — those turns never reach `wsp report`, and state reads stale or Unknown for them; merge the missing entries in from claude-code/settings.snippet.json (compound-107)",
+            util::contract(&path),
+            missing.len(),
+            HOOK_NAMES.len(),
+            missing.join(", ")
+        ));
+    }
+}
+
 /// `wsp report <hook>` — an agent saying what it has just done, from inside its
 /// own hook.
 ///
@@ -1962,5 +2037,93 @@ mod tests {
             1_000_000 + 5_000_000,
             "a dollar of haiku and five of opus, not six of either"
         );
+    }
+
+    /// A settings dir of its own, so the check can be pointed somewhere real
+    /// without touching whatever the machine running the suite actually has.
+    struct SettingsScratch {
+        dir: PathBuf,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl SettingsScratch {
+        fn write(hooks: &Value) -> SettingsScratch {
+            let dir = std::env::temp_dir()
+                .join(format!("wsp-cc-settings-{}-{}", std::process::id(), util::epoch_nanos()));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("settings.json"), json!({ "hooks": hooks }).to_string()).unwrap();
+            let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
+            std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
+            SettingsScratch { dir, saved }
+        }
+
+        fn missing() -> SettingsScratch {
+            let dir = std::env::temp_dir()
+                .join(format!("wsp-cc-settings-{}-{}", std::process::id(), util::epoch_nanos()));
+            let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
+            std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
+            SettingsScratch { dir, saved }
+        }
+    }
+
+    impl Drop for SettingsScratch {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// One entry naming `wsp-session.sh` under a hook is what "installed" means
+    /// — anything else under that key (herdr's own `SessionStart` entry,
+    /// beside it) is not this backend's business.
+    fn hook_entry(command: &str) -> Value {
+        json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }])
+    }
+
+    /// `compound-107`, reproduced rather than described: `SessionStart` alone,
+    /// exactly `cpd-5`'s settings. This is the case a check that only fires on
+    /// total absence would have missed.
+    #[test]
+    fn only_session_start_installed_is_named_a_problem_not_silence() {
+        let _s = SettingsScratch::write(&json!({
+            "SessionStart": hook_entry("sh '/x/wsp-session.sh' SessionStart"),
+        }));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        hook_snippet_health(&mut problems, &mut notes);
+        assert_eq!(problems.len(), 1, "silent here is exactly the bug this row exists to end");
+        for name in ["SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "PermissionRequest", "Elicitation"] {
+            assert!(problems[0].contains(name), "{name} missing from the finding: {}", problems[0]);
+        }
+        assert!(!problems[0].contains("SessionStart,"), "the one hook that IS installed should not be named missing");
+    }
+
+    /// All seven, correctly installed: nothing to say, which is doctor's own
+    /// convention for a check that passed.
+    #[test]
+    fn all_seven_installed_is_silent() {
+        let entries: serde_json::Map<String, Value> = HOOK_NAMES
+            .iter()
+            .map(|h| (h.to_string(), hook_entry(&format!("sh '/x/wsp-session.sh' {h}"))))
+            .collect();
+        let _s = SettingsScratch::write(&Value::Object(entries));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        hook_snippet_health(&mut problems, &mut notes);
+        assert!(problems.is_empty());
+        assert!(notes.is_empty());
+    }
+
+    /// No settings file at all is a smaller, different fact than a short one —
+    /// a machine that never merged the snippet in is not lying about being
+    /// configured, so it is a note rather than a problem.
+    #[test]
+    fn no_settings_file_is_a_note_not_a_problem() {
+        let _s = SettingsScratch::missing();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        hook_snippet_health(&mut problems, &mut notes);
+        assert!(problems.is_empty());
+        assert_eq!(notes.len(), 1);
     }
 }
