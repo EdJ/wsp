@@ -144,10 +144,13 @@ pub struct Compound<'a> {
     /// Deliver to a seat that cannot vouch for itself (`compound-097`).
     ///
     /// `false` everywhere except where a person has said so. `state` answers
-    /// `Unknown` once a hook's word has expired, and `tell` then refuses
-    /// rather than typing into whatever is on screen — which is right, and
-    /// which would also be a lockout with no way past it, because nothing
-    /// else refreshes that record today.
+    /// `Unknown` once a hook's word has expired AND `detected_state` has
+    /// nothing either (`compound-109`) — the detector is the floor under a
+    /// hook, not a full replacement for one, so `Unknown` is still reachable
+    /// whenever it has nothing to read (no socket, no `compound-sup`, an
+    /// agent kind it has no manifest for), and `tell` then refuses rather
+    /// than typing into whatever is on screen — which is right, and which
+    /// would also be a lockout with no way past it in that case.
     ///
     /// So this is the way past: a governor who has LOOKED — `compound-sup
     /// screen` is the honest surface — passes `wsp tell --anyway` and takes
@@ -411,13 +414,16 @@ impl Compound<'_> {
         // `cmd_agent::tell` refuses on `Blocked` — both guards are sound and
         // both were inert, because they are only as good as this function.
         //
-        // So an expired record answers `Unknown`, whose own doc is exactly
-        // this case — *"the backend did not say, or could not be asked"* —
-        // and which `will_take_a_prompt` already refuses. The guard re-arms
-        // without either caller changing.
+        // So an expired record falls to `detected_state` — the screen this
+        // backend can still read even with no hook to trust — and only to
+        // `Unknown`, whose own doc is exactly this case — *"the backend did
+        // not say, or could not be asked"* — when that has nothing either.
+        // `will_take_a_prompt` already refuses `Unknown`, so the guard
+        // re-arms without either caller changing; it just has a floor under
+        // it now instead of a bare fallback (`compound-109`).
         let at = util::epoch_of(&str_of(&said, "at"));
         if at == 0 || util::epoch_secs().saturating_sub(at) > VOUCH_SECS {
-            return State::Unknown;
+            return self.detected_state(seat, rec).unwrap_or(State::Unknown);
         }
         match said.get("state").and_then(|s| s.as_str()) {
             Some("idle") => State::Idle,
@@ -516,6 +522,57 @@ impl Compound<'_> {
             .map(|l| l.split_once('|').map_or(l, |(_, t)| t))
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+
+    /// The floor under a hook's word, not a replacement for it
+    /// (`compound-109`). [`Compound::state_of`] falls here only once the
+    /// hook record cannot answer — absent, or aged past [`VOUCH_SECS`] — and
+    /// that is not a rare seam for every agent this backend hosts: opencode
+    /// fires none of the hooks `heard` listens for, so a compound-hosted
+    /// opencode seat's `said.json` never exists at all, and every call here
+    /// used to read `Unknown` for its whole life. This is that seat's only
+    /// source of a live answer.
+    ///
+    /// Shells to `compound-sup state <socket> <kind>` — `compound-109`'s
+    /// verb, wrapping the ported half of herdr's agent-detection engine —
+    /// exactly as [`Compound::read_screen`] shells to `compound-sup screen`:
+    /// this backend does not link compound's crates, so this is a wire read
+    /// the same way that one is, not a dependency.
+    ///
+    /// `None` when there is nothing to ask: no socket minted yet, no
+    /// `compound-sup` reachable, or an agent kind the ported engine has no
+    /// manifest for — only `claude` and `opencode` are compiled
+    /// (`compound-109`'s overview); anything else falls back to
+    /// [`State::Unknown`] exactly as it did before this existed.
+    ///
+    /// **A process spawn and a socket round trip, not a free read.**
+    /// Measured (`compound-109`, `compound-sup state` against a live
+    /// opencode session, 20 calls): ~22ms each. `survey` calls [`state_of`]
+    /// once per seat in the directory, serially, so a census of N seats
+    /// whose hooks cannot answer costs N × ~22ms here — fine for the sizes
+    /// `wsp ls`/`wsp kanban` run against today, and worth re-measuring
+    /// before this is anywhere near an input path or a seat count that
+    /// matters at that rate.
+    fn detected_state(&self, seat: &Seat, rec: &Value) -> Option<State> {
+        let agent = rec.get("agent")?;
+        let kind = str_of(agent, "kind");
+        if !matches!(kind.as_str(), "claude" | "opencode") {
+            return None;
+        }
+        let socket = self.socket_of(seat)?;
+        let sup = compound_sup_binary()?;
+        let out = Command::new(&sup).args(["state"]).arg(&socket).arg(&kind).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&out.stdout).lines().next()? {
+            "idle" => Some(State::Idle),
+            "working" => Some(State::Working),
+            "blocked" => Some(State::Blocked),
+            // "unknown", or a shape this backend does not recognise yet —
+            // read the same as no answer at all rather than guessed at.
+            _ => Some(State::Unknown),
+        }
     }
 }
 
@@ -1274,6 +1331,87 @@ mod tests {
         assert!(until(|| !socket.exists()), "compound-sup left its socket behind");
         assert!(until(|| !label_path.exists()), "the label sidecar outlived its socket");
         assert!(place.record(&seat).is_err(), "the seat directory itself must go with stop");
+    }
+
+    /// `compound-109`'s barrier: `idle` is not proof `detected_state`
+    /// discriminates anything, because it is also what a screen with no
+    /// opinion falls back to — the claude case would look identical with no
+    /// manifest at all. opencode is the one worth proving, and not only
+    /// because it is the other compiled manifest: opencode fires none of the
+    /// hooks [`Compound::heard`] listens for, so a real opencode seat's
+    /// `said.json` never exists, and `state()` for one is *entirely*
+    /// `detected_state`'s answer for its whole life, not a fallback taking
+    /// over once something else expires.
+    ///
+    /// So this drives a real one through a real prompt: idle before, working
+    /// once `opencode`'s `interrupt_hint_working`/`progress_bar_working`
+    /// rules see the "esc to interrupt" chrome mid-turn, and something other
+    /// than working once it settles — proof the rule set discriminates a
+    /// live screen rather than defaulting through it twice.
+    #[test]
+    #[ignore]
+    fn detected_state_discriminates_a_real_opencode_seat_between_working_and_not() {
+        let Some(sup) = std::env::var_os("COMPOUND_SUP") else {
+            eprintln!("skipped: set COMPOUND_SUP to a built compound-sup to run this");
+            return;
+        };
+        assert!(PathBuf::from(&sup).is_file(), "COMPOUND_SUP is not a file");
+
+        let scratch = Scratch::new("opencode-detect");
+        let place = scratch.place();
+        let seat = place
+            .open(&Order { label: "compound-109 smoke".into(), ..Order::default() })
+            .expect("a seat");
+        place
+            .start(&seat, &Agent { kind: "opencode".into(), name: "smoke".into(), args: vec![] })
+            .expect("compound-sup started");
+
+        assert!(until(|| place.socket_of(&seat).is_some()), "no socket announced in time");
+        assert!(until(|| place.socket_of(&seat).is_some_and(|s| s.exists())), "compound-sup never bound its socket");
+
+        // No `said.json` will ever exist for this seat — opencode fires no
+        // hook — so every read from here on is `detected_state` alone.
+        //
+        // `will_take_a_prompt` alone is not the gate: a still-loading screen
+        // ALSO reads `Idle` — no rule has matched it yet either — so it goes
+        // true within the first poll, well before opencode's own input
+        // handling is actually live. Measured directly (`compound-109`):
+        // typing into that window is silently swallowed, no error, nothing
+        // on screen — not a wire bug, `type_and_submit` proved sound against
+        // the same seat with `cat` in its place. So this also waits for its
+        // own placeholder text, the screen's own claim that it is ready.
+        assert!(
+            until(|| place.state(&seat).unwrap().will_take_a_prompt()),
+            "opencode never reached an idle prompt: {:?}",
+            place.state(&seat)
+        );
+        assert!(
+            until(|| place.read_screen(&seat).unwrap_or_default().contains("Ask anything")),
+            "opencode's prompt box never actually rendered: {}",
+            place.read_screen(&seat).unwrap_or_default()
+        );
+
+        place.tell(&seat, "Count slowly from 1 to 50, one number per line, pausing to think between each one. Do not write or edit any files.").expect("delivered");
+
+        assert!(
+            until(|| place.state(&seat).unwrap() == State::Working),
+            "opencode never read as working after a prompt: {:?}\nscreen:\n{}",
+            place.state(&seat),
+            place.read_screen(&seat).unwrap_or_default()
+        );
+
+        // A real turn can run well past `until`'s 10s budget; give leaving
+        // `Working` room without pretending that is the steady-state bound.
+        let left_working = (0..1200).any(|_| {
+            if place.state(&seat).unwrap() != State::Working {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            false
+        });
+        assert!(left_working, "opencode never left working: {:?}", place.state(&seat));
+
+        place.stop(&seat).expect("the seat was there");
     }
 
     /// `compound-111`: `wsp peek` had no way to read a compound seat at all —
