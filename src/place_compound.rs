@@ -1145,6 +1145,10 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         let dir = place.dir_of(&seat).unwrap();
+        // Read BEFORE the record below overwrites it with this process's own
+        // pid — from there on `stop` can no longer find the real supervisor
+        // (`compound-127`).
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
         // A session recorded without actually spawning compound-sup: this
         // test is about the hook reading, not the pty. `agent` is set by
         // hand for the same reason `start` sets it — its absence now reads
@@ -1179,6 +1183,10 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         let dir = place.dir_of(&seat).unwrap();
+        // Read BEFORE the record below overwrites it with this process's own
+        // pid — from there on `stop` can no longer find the real supervisor
+        // (`compound-127`).
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
         let _ = write_atomic(
             &dir.join(SEAT_FILE),
             &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
@@ -1224,6 +1232,10 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         let dir = place.dir_of(&seat).unwrap();
+        // Read BEFORE the record below overwrites it with this process's own
+        // pid — from there on `stop` can no longer find the real supervisor
+        // (`compound-127`).
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
         let _ = write_atomic(
             &dir.join(SEAT_FILE),
             &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
@@ -1279,6 +1291,10 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         let dir = place.dir_of(&seat).unwrap();
+        // Read BEFORE the record below overwrites it with this process's own
+        // pid — from there on `stop` can no longer find the real supervisor
+        // (`compound-127`).
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
         let _ = write_atomic(
             &dir.join(SEAT_FILE),
             &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
