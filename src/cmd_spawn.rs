@@ -1476,8 +1476,14 @@ pub(crate) fn chosen(args: &Args) -> Chosen {
 }
 
 pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
-    match (args.has("headless"), args.has("herdr") && !args.has("compound")) {
-        (true, _) => Box::new(crate::place_super::Supervisor::new()),
+    // Through [`chosen`] rather than re-matching the flags, which is the same
+    // "one copy" rule this module argues everywhere else and which this
+    // function broke for a fortnight: the arms below were a verbatim second
+    // copy of `chosen`'s, so the tests that assert the default since
+    // `compound-112` were asserting it against a function nothing called.
+    // They would have gone on passing had this copy drifted.
+    match chosen(args) {
+        Chosen::Headless => Box::new(crate::place_super::Supervisor::new()),
         // **The default is compound** (`compound-112`), and `--herdr` is what
         // asks for the fork by name. It was the other way round until the
         // fleet had run a fortnight of agents on compound without one: the
@@ -1489,8 +1495,8 @@ pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
         // deletion. `place_herdr` stays, `--herdr` selects it, and
         // `--on <machine>` still reaches another machine's. What changes is
         // only what you get when you say nothing.
-        (false, true) => Box::new(Herdr::new()),
-        (false, false) => Box::new(crate::place_compound::Compound::new()),
+        Chosen::Herdr => Box::new(Herdr::new()),
+        Chosen::Compound => Box::new(crate::place_compound::Compound::new()),
     }
 }
 
