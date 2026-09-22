@@ -2860,8 +2860,26 @@ pub(crate) fn answered_by_machine<'a>(
 /// holds being handed back. Silence — unreachable, answering with nothing, or
 /// never asked — is not the same as "the work stopped", and only the machine
 /// that spoke gets its claims examined.
+///
+/// **An empty id names no machine, so it is never examined either
+/// (`compound-124`).** `machine_of("")` reads as `""` — this same local
+/// bucket herdr's own workspaces and panes fall in — so once herdr had
+/// answered with even one of its own, an empty id used to be waved through as
+/// belonging to a machine that had spoken. A compound claim's `workspace_id`
+/// is empty this way in the ordinary case: `cmd_agent::claim` falls back to
+/// `""` for a seat no herdr workspace backs, which is every compound seat, so
+/// this is not a stale or half-written record but compound's normal shape.
+/// The shape `compound-123` fixed in `sync` — herdr's own local answer read
+/// as evidence a second backend's seat had gone — is reachable here through
+/// this field instead of a pane id, and the fix is the same rule stated
+/// where every caller of this function meets it: an id that names no machine
+/// cannot be judged by whether one answered. [`Census::nobody_in`]'s
+/// `pane_gone` already refuses to compare an empty pane for the identical
+/// reason; this generalises it to `room_gone`, reached through the same
+/// function, and to the claim reap in [`reconcile`] that reads
+/// `workspace_id` directly.
 pub(crate) fn may_reap(answered: &std::collections::BTreeMap<&str, usize>, id: &str) -> bool {
-    answered.contains_key(machine_of(id))
+    !id.is_empty() && answered.contains_key(machine_of(id))
 }
 
 /// What herdr answered with, and the one question a seat record asks of it.
@@ -6143,6 +6161,52 @@ mod tests {
         let answered = answered_by_machine(std::iter::empty());
         assert!(!may_reap(&answered, "w0"));
         assert!(!may_reap(&answered, ""), "a claim too old to carry a workspace id either");
+    }
+
+    /// `compound-124`: the same drop `compound-123` fixed in `sync`, reached
+    /// through a different field. A compound claim's `workspace_id` is empty
+    /// — `cmd_agent::claim` falls back to `""` for a seat no herdr workspace
+    /// backs, which is every compound seat — and `machine_of("")` reads as
+    /// the same local bucket herdr's own workspaces fall in. The bug this
+    /// test reproduces first: once herdr had answered with even one local
+    /// workspace of its own, that used to be read as evidence a compound
+    /// claim's workspace — which never existed to begin with — had closed,
+    /// and `reconcile --reap` would hand the task off as "workspace closed"
+    /// out from under a live compound seat. `may_reap` now refuses an empty
+    /// id outright, the same refusal `Census::nobody_in`'s `pane_gone` was
+    /// already making for an empty pane.
+    #[test]
+    fn a_compound_claims_missing_workspace_id_is_not_reaped_by_herdrs_local_answer() {
+        // Herdr has answered, and with a workspace of its own — the ordinary
+        // case on a machine that also runs a herdr pane or two, and exactly
+        // what used to be enough to call a compound claim's absent workspace
+        // "closed".
+        let answered = answered_by_machine(["w0"]);
+
+        assert!(
+            !may_reap(&answered, ""),
+            "the bug this row fixed: herdr answering locally at all used to be \
+             taken as proof that a compound claim's workspace — which never \
+             existed — had closed"
+        );
+
+        // The same guard reached through `Census::nobody_in`, which is what
+        // reconcile's workspace-vacate path actually calls: an empty
+        // workspace on a governor record reads exactly the same way, and
+        // must not stand a compound-hosted governor down the moment herdr
+        // has answered about anything of its own.
+        let heard_panes = answered_by_machine(std::iter::empty());
+        let census = Census {
+            workspaces: &["w0"],
+            panes: &[],
+            heard_workspaces: &answered,
+            heard_panes: &heard_panes,
+        };
+        assert!(
+            !census.nobody_in("", ""),
+            "a governor record with no workspace and no pane — compound's shape \
+             — has nothing for this reap to compare against"
+        );
     }
 
     /// The claim's `host` field cannot key this. An agent on an executor runs a
