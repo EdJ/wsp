@@ -611,7 +611,22 @@ fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Optio
 /// Bumped there without a matching bump here is exactly the drift
 /// `robustness-017` warns an adapter not to risk quietly — so a mismatch is
 /// refused rather than sent into a peer that may not parse it.
-const WIRE_VERSION: u32 = 6;
+///
+/// **That drift happened, 2026-09-22, and this is what it looks like.**
+/// `compound-031` bumped the supervisor to v7 for `Body::Close`, correctly
+/// re-reading `proto.rs` at rebase exactly as its decision told it to — but
+/// this constant is in the OTHER repository, so nothing it could read named
+/// it. The first symptom was `wsp tell` refused with `unsupported ver 6`,
+/// which reads as a fault in the seat rather than in a hand-copied number.
+/// v7 is purely additive (`Close {}` added, no shape changed), so every
+/// message wsp already sends stays valid at it and this is a one-line catch-up
+/// rather than a port.
+///
+/// The duplication itself is `compound-026`, which is where it should be
+/// fixed: a constant maintained by hand in two repositories will drift again,
+/// and the only reason this cost minutes rather than a day is that the
+/// supervisor refuses a version it does not know instead of guessing.
+const WIRE_VERSION: u32 = 7;
 
 fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
     let deadline = Instant::now() + timeout;
