@@ -5702,6 +5702,7 @@ mod tests {
 
         let compound = crate::place_compound::Compound::new();
         let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let _stops = crate::place_compound::StopsOnDrop(seat.clone());
         let dir = compound.dir_of(&seat).unwrap();
         let mut rec: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();

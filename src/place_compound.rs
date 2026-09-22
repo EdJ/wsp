@@ -963,6 +963,37 @@ impl Place for Compound<'_> {
     }
 }
 
+/// Stops a real compound seat when the test that opened one goes out of scope.
+///
+/// A test that calls [`Compound::open`] has spawned a `compound-sup` holding a
+/// pty, and that process outlives the temp directory the test is cleaned up
+/// with: the state directory goes, the supervisor does not, and it sits there
+/// holding ~10MB until the machine is rebooted. 256 of them had accumulated
+/// when this was written, from three tests in three modules, and the first
+/// symptom was not memory — it was `start` timing out in the very test that
+/// leaks, because the machine was near its process limit.
+///
+/// An explicit `stop` at the end of a test is not enough and is the reason
+/// this is a guard: a leak happens precisely when an assert fails, so the
+/// cleanup has to run on unwind. `place_compound`'s own `Scratch` already
+/// does this for tests inside this module; this is the same promise for the
+/// tests outside it, which had no way to make it.
+///
+/// Declare it AFTER the env guard so it drops BEFORE one — the seat has to be
+/// stopped while the state directory naming it still exists.
+#[cfg(test)]
+pub(crate) struct StopsOnDrop(pub(crate) Seat);
+
+#[cfg(test)]
+impl Drop for StopsOnDrop {
+    fn drop(&mut self) {
+        // Best effort by construction: a seat whose supervisor already exited
+        // is the ordinary case at the end of a despawn test, and a cleanup
+        // that panicked would turn a passing test red for tidying up.
+        let _ = Compound::new().stop(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

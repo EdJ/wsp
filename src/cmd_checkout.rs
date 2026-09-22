@@ -3118,6 +3118,9 @@ mod tests {
         let seat = compound
             .open(&crate::place::Order { cwd: Some(wt.display().to_string()), ..Default::default() })
             .unwrap();
+        // The seat is a real `compound-sup` holding a pty; without this it
+        // outlives the temp tree and the test leaks one per run.
+        let _stops = crate::place_compound::StopsOnDrop(seat.clone());
 
         let why = Occupied::now(&store)
             .of("t-9", &wt)
