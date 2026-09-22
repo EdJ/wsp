@@ -89,15 +89,22 @@ impl Index {
         None
     }
 
-    /// Where a project's work lives on disk: its own first root, or failing
-    /// that the nearest ancestor's.
+    /// Where a project's work lives on disk: its own roots, or failing that
+    /// the nearest ancestor's — every root that project declared, not just
+    /// the first.
     ///
     /// Inherited for the same reason tags are. The backlog is split into
     /// `wsp/render` and `wsp/data`, and neither has a checkout of its own —
     /// they are two halves of one tree, and saying so twice more would be two
     /// more paths to keep true. Without the walk, opening a workspace for a
     /// task in either landed it wherever the panel happened to be installed.
-    pub fn root_of(&self, id: &str) -> Option<String> {
+    ///
+    /// [`root_of`](Index::root_of) is this with the ordinary case in mind — one
+    /// root, so "first" and "only" agree. A project whose work spans two
+    /// repositories, `compound-127`'s `compound`, is the case this exists for:
+    /// callers that can tell its roots apart (a task's own `refs`, a branch
+    /// search across each) ask here instead of silently taking the first.
+    pub fn roots_of(&self, id: &str) -> Option<Vec<String>> {
         let mut guard: HashSet<String> = HashSet::new();
         let mut cur = Some(id.to_string());
         while let Some(cid) = cur {
@@ -105,12 +112,42 @@ impl Index {
                 break; // parent cycle; doctor reports it
             }
             let p = self.get(&cid)?;
-            if let Some(r) = p.roots.first() {
-                return Some(r.clone());
+            if !p.roots.is_empty() {
+                return Some(p.roots.clone());
             }
             cur = p.parent.clone();
         }
         None
+    }
+
+    pub fn root_of(&self, id: &str) -> Option<String> {
+        self.roots_of(id).and_then(|r| r.into_iter().next())
+    }
+
+    /// Which of a project's roots a task's own work is in, when there is more
+    /// than one to choose from.
+    ///
+    /// A project with one root answers with it, exactly as [`root_of`] does —
+    /// the ordinary case is every project but `compound-127`'s, and this must
+    /// not change it. Where a project carries several, `spawn` has to choose
+    /// before any branch exists to search for, so the choice cannot be made
+    /// the way the worklist's [`crate::worklist::Repos`] makes it — a task's
+    /// own `refs` is where that choice is recorded instead, and this looks
+    /// there for a ref that names one of the roots exactly (`wsp add --ref
+    /// ~/claude/wsp` on the row). No match, and none of the ordinary
+    /// behaviour before this row existed had a way to know either — it falls
+    /// back to the first root, the same silent default `root_of` always gave,
+    /// rather than refusing a spawn that used to work.
+    pub fn root_for(&self, project: &str, refs: &[String]) -> Option<String> {
+        let roots = self.roots_of(project)?;
+        if roots.len() <= 1 {
+            return roots.into_iter().next();
+        }
+        let hit = refs.iter().find_map(|r| {
+            let target = util::real(r);
+            roots.iter().find(|root| util::real(root) == target).cloned()
+        });
+        hit.or_else(|| roots.into_iter().next())
     }
 
     pub fn ancestors(&self, id: &str) -> Vec<String> {

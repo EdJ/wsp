@@ -1612,9 +1612,17 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // store and `~` expands here, which is right while the machines mirror each
     // other and is exactly what the Linux box breaks; host-qualified roots are
     // wsp-025 and are not smuggled in here.
+    //
+    // `root_for` rather than `root_of`: a project with one root answers the
+    // same either way, but `compound`'s two roots mean `root_of`'s silent
+    // first-root default is exactly wsp-112's bug — every row in that project
+    // landing in `~/claude/compound` whatever its code is. A task whose work
+    // is the other root names it with `wsp add --ref`, which `root_for` checks
+    // before falling back to the same first root `root_of` always gave.
+    let refs = work.task.as_deref().and_then(|t| store.task(t)).map(|t| t.refs).unwrap_or_default();
     let cwd = args
         .get("cwd")
-        .or_else(|| work.project.as_deref().and_then(|p| index.root_of(p)));
+        .or_else(|| work.project.as_deref().and_then(|p| index.root_for(p, &refs)));
 
     // One tree per agent, which is the whole of robustness-010 and is done here
     // rather than asked of the agent. Every softer version of it has been tried
@@ -3378,6 +3386,57 @@ mod tests {
         let mut b = Project::new("b");
         b.parent = Some("a".into());
         assert_eq!(Index::new(vec![a, b]).root_of("a"), None);
+    }
+
+    /// wsp-112: a project with one root answers `root_for` exactly as
+    /// `root_of` does — the ordinary case is unaffected by a project ever
+    /// having a second root.
+    #[test]
+    fn a_project_with_one_root_answers_root_for_the_same_as_root_of() {
+        let mut wsp = Project::new("wsp");
+        wsp.roots = vec!["~/claude/wsp".into()];
+        let index = Index::new(vec![wsp]);
+        assert_eq!(index.root_for("wsp", &[]), index.root_of("wsp"));
+        assert_eq!(
+            index.root_for("wsp", &["~/some/unrelated/ref.md".into()]),
+            Some("~/claude/wsp".into()),
+            "a ref that names no root is not a match and does not change the answer"
+        );
+    }
+
+    /// wsp-112: `compound`'s shape. A project with two roots sends a task to
+    /// the one its own `--ref` names, not the first — `root_of`'s old
+    /// behaviour, which is `compound-121`'s bug: every row in that project
+    /// got a tree in `~/claude/compound` whatever its code was in.
+    #[test]
+    fn a_task_whose_ref_names_the_other_root_is_sent_there() {
+        let mut compound = Project::new("compound");
+        compound.roots = vec!["~/claude/compound".into(), "~/claude/wsp".into()];
+        let index = Index::new(vec![compound]);
+        assert_eq!(
+            index.root_for("compound", &["~/claude/wsp".into()]),
+            Some("~/claude/wsp".into())
+        );
+        assert_eq!(
+            index.root_for("compound", &[]),
+            Some("~/claude/compound".into()),
+            "no ref names either root, so the first is still the silent default"
+        );
+    }
+
+    /// wsp-112: `roots_of` is `root_of`'s walk with nothing dropped — every
+    /// root a project (or its nearest root-bearing ancestor) declared, not
+    /// just the first.
+    #[test]
+    fn roots_of_names_every_root_root_of_would_have_narrowed_to_one() {
+        let mut compound = Project::new("compound");
+        compound.roots = vec!["~/claude/compound".into(), "~/claude/wsp".into()];
+        let index = Index::new(vec![compound]);
+        assert_eq!(
+            index.roots_of("compound"),
+            Some(vec!["~/claude/compound".to_string(), "~/claude/wsp".to_string()])
+        );
+        assert_eq!(index.root_of("compound").as_deref(), Some("~/claude/compound"));
     }
 
     /// The sentence an agent is handed work with has one definition and two

@@ -1039,12 +1039,18 @@ pub fn sweep(store: &Store, p: &Position, dry: bool) -> Result<Sweep, String> {
         let Some(project) = store.task_now(&repos.renamed, &m.id).and_then(|t| t.project) else {
             continue;
         };
-        let Some(trunk) = repos.of(&project) else { continue };
-        members.push(cmd_checkout::Passed {
-            task: m.id.clone(),
-            trunk: trunk.dir,
-            trunk_branch: trunk.branch,
-        });
+        // One `Passed` per trunk the project could mean, not just the first —
+        // `sweep_passed` already skips a trunk with no `.worktrees/<task>` on
+        // disk, so naming every trunk costs nothing where there is one root
+        // and finds the tree where there are two, instead of only ever
+        // looking in the first.
+        for trunk in repos.of(&project) {
+            members.push(cmd_checkout::Passed {
+                task: m.id.clone(),
+                trunk: trunk.dir,
+                trunk_branch: trunk.branch,
+            });
+        }
     }
     let closed = cmd_checkout::finished(store);
     let occupied = cmd_checkout::Occupied::now(store);
@@ -1131,7 +1137,7 @@ pub fn passed_by_running(store: &Store) -> BTreeSet<String> {
 pub struct Repos {
     index: Index,
     renamed: BTreeMap<String, String>,
-    seen: HashMap<String, Option<Trunk>>,
+    seen: HashMap<String, Vec<Trunk>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1145,23 +1151,34 @@ impl Repos {
         Repos { index: Index::new(store.projects()), renamed: store.renamed_ids(), seen: HashMap::new() }
     }
 
-    /// The trunk a project's work lands on, resolved once. `None` where there
-    /// is nothing to ask: no root, or a root that is not a repository.
-    fn of(&mut self, project: &str) -> Option<Trunk> {
+    /// Every trunk a project's work might land on, resolved once. Empty where
+    /// there is nothing to ask: no root, or a root that is not a repository.
+    ///
+    /// **Every root, not the first.** `compound-127`'s bug was this call
+    /// answering the wrong repository and doing it silently — `root_of` took
+    /// the project's first root, so every barrier on `herdr-audit` scanned
+    /// `~/claude/compound`'s reflog for work that landed in `~/claude/wsp`.
+    /// `landing` and `touched` both already loop a task's id over every name
+    /// it has had (`branches`, below) to find the branch a renumbering left
+    /// behind; looping the small number of roots a project has is the same
+    /// shape of search, and it costs one `git worktree list` per extra root
+    /// rather than a git process per member.
+    fn of(&mut self, project: &str) -> Vec<Trunk> {
         if let Some(known) = self.seen.get(project) {
             return known.clone();
         }
-        let found = self
+        let found: Vec<Trunk> = self
             .index
-            .root_of(project)
-            .map(|r| util::expand(&r))
-            .as_deref()
-            .and_then(toplevel)
-            .and_then(|repo| {
+            .roots_of(project)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                let repo = toplevel(&util::expand(r))?;
                 let dir = cmd_checkout::trunk(&repo)?;
                 let branch = cmd_checkout::trunk_branch(&dir)?;
                 Some(Trunk { dir, branch })
-            });
+            })
+            .collect();
         self.seen.insert(project.to_string(), found.clone());
         found
     }
@@ -1183,15 +1200,28 @@ impl Repos {
 /// Whether a member's work is on the trunk.
 fn landing(repos: &mut Repos, t: &Task) -> Landing {
     let Some(project) = t.project.as_deref() else { return Landing::NoRepo };
-    let Some(trunk) = repos.of(project) else { return Landing::NoRepo };
+    let trunks = repos.of(project);
+    if trunks.is_empty() {
+        return Landing::NoRepo;
+    }
 
+    // Every trunk the project could mean, every name the task could be under
+    // in each — a project with two roots and a renumbered task is the product
+    // of both loops, and neither alone finds a tree cut under the old id in
+    // the repository the new id's work actually landed in.
+    //
     // Asked before it is compared, and this is the state `ahead()` alone does
     // not have: on a branch that does not exist it reports nothing outstanding,
     // which is indistinguishable from landed. The form is `ensure`'s, which is
     // what creates the branch in the first place.
-    let Some(branch) = repos.branches(&t.id).into_iter().find(|b| {
-        git(&trunk.dir, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_some()
-    }) else {
+    let hit = trunks.iter().find_map(|trunk| {
+        let branch = repos
+            .branches(&t.id)
+            .into_iter()
+            .find(|b| git(&trunk.dir, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_some())?;
+        Some((trunk.clone(), branch))
+    });
+    let Some((trunk, branch)) = hit else {
         return Landing::NoBranch;
     };
 
@@ -1383,30 +1413,36 @@ pub fn touched(store: &Store, members: &[String]) -> Touched {
             out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
             continue;
         };
-        let Some(trunk) = task.project.as_deref().and_then(|p| repos.of(p)) else {
+        let trunks = task.project.as_deref().map(|p| repos.of(p)).unwrap_or_default();
+        if trunks.is_empty() {
             out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
             continue;
-        };
-        let log = logs
-            .entry(trunk.dir.clone())
-            .or_insert_with(|| cmd_checkout::Landings::read(&trunk.dir, &trunk.branch));
-        // The branch is asked for under every name the task has had, for the
-        // reason `Repos::branches` gives: a tree made before a renumbering is
-        // on a branch of the old id, and that is the ref the reflog holds.
+        }
+        // The branch is asked for under every name the task has had, in every
+        // trunk the project could mean — `Repos::branches` for the reason a
+        // renumbered task's tree is on a branch of the old id, and every trunk
+        // for the reason `landing` loops it too: `compound-127`'s bug was this
+        // walk running against one repository's reflog while the entry it
+        // wanted was in the other.
         //
         // **Every name, not the first one that answers.** A task renumbered
         // between two lands has one land under each name, and stopping at the
         // first reads the newer and drops the older — the same "one is all
         // there is" mistake `placed` had within a single name, one level up.
         // A name that never landed answers `None` here legitimately, because
-        // it is a name and not a claim, so it is *no* name answering that
-        // means nobody could place the member.
+        // it is a name and not a claim, so it is *no* name across every trunk
+        // and every branch that means nobody could place the member.
         let mut files: BTreeSet<String> = BTreeSet::new();
         let mut placed: Option<String> = None;
-        for b in repos.branches(&task.id) {
-            if let Some(p) = log.placed(&trunk.dir, &b) {
-                placed = placed.or(Some(p.commit));
-                files.extend(p.files);
+        for trunk in &trunks {
+            let log = logs
+                .entry(trunk.dir.clone())
+                .or_insert_with(|| cmd_checkout::Landings::read(&trunk.dir, &trunk.branch));
+            for b in repos.branches(&task.id) {
+                if let Some(p) = log.placed(&trunk.dir, &b) {
+                    placed = placed.or(Some(p.commit));
+                    files.extend(p.files);
+                }
             }
         }
         match &placed {
@@ -2149,6 +2185,55 @@ mod tests {
         );
         land(&other, "wsp-1");
         assert!(position(&store, &w, Reading::Landed).at_barrier());
+    }
+
+    /// wsp-112: `compound`'s shape, reproduced without `--cwd` or any per-task
+    /// hint — a project with two roots, and work landed in the **second**.
+    ///
+    /// `root_of`'s bug was silent: it took the first root and searched only
+    /// that repository's reflog, so `compound-12N`'s land in `~/claude/wsp`
+    /// went unread against `~/claude/compound`'s history and every barrier on
+    /// `herdr-audit` reported the group unlanded and unreadable. This is the
+    /// same shape with the order of `p.roots` chosen so the naive first-root
+    /// read fails: were `landing` or `touched` still asking only `roots[0]`,
+    /// `at_barrier` below would stay false and `commit` would stay `None`.
+    #[test]
+    fn a_project_with_two_roots_is_read_off_whichever_one_holds_the_work() {
+        let (env, store, first) = scratch("tworoots");
+        let second = env.path("second");
+        std::fs::create_dir_all(&second).unwrap();
+        git_run(&second, &["init", "--quiet", "-b", "trunk"]);
+        std::fs::write(second.join("kept.txt"), "one\n").unwrap();
+        git_run(&second, &["add", "kept.txt"]);
+        git_run(&second, &["commit", "--quiet", "-m", "first"]);
+
+        let mut p = store.project("wsp").unwrap();
+        // `first` stays `roots[0]` — the root a naive read would stop at.
+        p.roots.push(second.display().to_string());
+        store.save_project(&p).unwrap();
+        assert!(first.exists(), "the first root is real and untouched by this task's work");
+
+        task(&store, "wsp-1", "review");
+        committed(&second, "wsp-1");
+        let w = list("- 1  wsp-1\n");
+        assert_eq!(
+            position(&store, &w, Reading::Landed).at,
+            Some(1),
+            "unlanded, and found — not `NoRepo` or `NoBranch` — in the second root"
+        );
+
+        land(&second, "wsp-1");
+        assert!(
+            position(&store, &w, Reading::Landed).at_barrier(),
+            "landed in the project's second root, found with no flag and no per-task hint"
+        );
+
+        let t = touched(&store, &["wsp-1".to_string()]);
+        assert!(t.overlap.unread.is_empty(), "the member's land was found, not reported as unread");
+        assert!(
+            t.landed[0].commit.is_some(),
+            "commit read back off the second root's reflog, the account `herdr-audit` could not get"
+        );
     }
 
     /// A task renumbered mid-run keeps its work on a branch of the name it had

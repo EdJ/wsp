@@ -616,7 +616,7 @@ pub fn thread_for_task(store: &Store, task: &str) -> Option<Thread> {
 fn tree_of(store: &Store, task: &str) -> Option<String> {
     let t = store.task(task)?;
     let index = Index::new(store.projects());
-    let root = index.root_of(t.project.as_deref()?)?;
+    let root = index.root_for(t.project.as_deref()?, &t.refs)?;
     crate::cmd_checkout::tree_for(&root, task)
 }
 

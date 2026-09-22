@@ -1489,12 +1489,21 @@ pub(crate) fn candidates(store: &Store, cwd: &Path, task: &str) -> Vec<PathBuf> 
         }
     };
     add(toplevel(cwd));
-    let root = store
-        .task(task)
-        .and_then(|t| t.project)
-        .and_then(|p| crate::resolve::Index::new(store.projects()).root_of(&p))
-        .map(|r| util::expand(&r));
-    add(root.as_deref().and_then(toplevel));
+    // Every root the project could mean, the one the task's own `refs` names
+    // first — `Index::root_for` — and then the rest, because a project with
+    // two roots (`compound-127`'s `compound`) may hold a tree for this task
+    // in either, and stopping at the first the way `root_of` used to is the
+    // wrong-repository bug this function exists to route around.
+    if let Some(t) = store.task(task) {
+        if let Some(project) = t.project.as_deref() {
+            let index = crate::resolve::Index::new(store.projects());
+            let preferred = index.root_for(project, &t.refs).map(|r| util::expand(&r));
+            add(preferred.as_deref().and_then(toplevel));
+            for r in index.roots_of(project).unwrap_or_default() {
+                add(toplevel(&util::expand(&r)));
+            }
+        }
+    }
     out
 }
 
