@@ -1535,7 +1535,16 @@ pub(crate) fn insisting_backends() -> [Box<dyn Place>; 2] {
 /// the second backend's total refusal from a machine of that name, since a
 /// backend is not a machine and the two silences must not collide in a
 /// listing.
-pub(crate) const LOCAL_BACKEND_NAMES: [&str; 2] = ["", "compound"];
+/// `herdr` rather than `""`: the empty string is unique among BACKENDS but
+/// collides with the MACHINE namespace, where `cmd_stamp::named` reads it as
+/// "this machine". Since `compound-112` herdr is normally absent, so its total
+/// refusal is the ordinary case, and under `""` it drew as the whole machine
+/// having gone silent while `heard` was true and compound had answered in full
+/// — `cmd_stamp`'s own doc asks for a name that cannot be mistaken for a
+/// machine's, and this is that name. Only herdr's WHOLESALE refusal is labelled
+/// here; when its census answers, `place_herdr` names each row by machine
+/// itself.
+pub(crate) const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
 
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let p = Paint::new();

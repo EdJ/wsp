@@ -122,7 +122,7 @@
 //! item 2.** This used to be `cmd_spawn::backend(args)`, the one `--headless`
 //! selects — singular, herdr by default — on the reasoning directly below,
 //! now stale: `Census` keys by machine, not backend, so two backends folded
-//! with [`Census::and`] file under `""` and `"compound"`
+//! with [`Census::and`] file under `"herdr"` and `"compound"`
 //! ([`crate::cmd_spawn::LOCAL_BACKEND_NAMES`]) rather than colliding on one
 //! name, which is the fact that makes the fold safe. It had to change because
 //! `Wip::live` went plural first (`compound-078`): `wsp wip --json` already
@@ -587,7 +587,7 @@ mod tests {
 
     /// `compound-064` item 2's own decision, proven against real backends:
     /// a machine with `compound` sessions and no herdr up at all is HEARD —
-    /// herdr's own total refusal folds in as a silent row under `""`
+    /// herdr's own total refusal folds in as a silent row under `"herdr"`
     /// (`crate::cmd_spawn::LOCAL_BACKEND_NAMES`), never as the whole answer
     /// going to `None`. `stamp` (the CLI verb) is what this file used to ask
     /// a single, flag-selected backend for; asking `combined_census` proves
@@ -603,8 +603,9 @@ mod tests {
         let before = take(&store);
         assert!(before.agents.heard(), "a real (if empty) compound census is still an answer");
         assert!(
-            before.agents.silent.iter().any(|(m, _)| m == ""),
-            "herdr's own refusal is on record: {:?}",
+            before.agents.silent.iter().any(|(m, _)| m == "herdr"),
+            "herdr's own refusal is on record, under its own name and not `\"\"`, \
+             which `named` would draw as this whole machine: {:?}",
             before.agents.silent
         );
         assert!(
