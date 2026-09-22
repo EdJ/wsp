@@ -982,7 +982,58 @@ impl Place for Compound<'_> {
 /// Declare it AFTER the env guard so it drops BEFORE one — the seat has to be
 /// stopped while the state directory naming it still exists.
 #[cfg(test)]
-pub(crate) struct StopsOnDrop(pub(crate) Seat);
+pub(crate) struct StopsOnDrop {
+    seat: Seat,
+    // The ROOT, pinned when the guard is made, not read again at drop.
+    // `Compound::new()` resolves it from the environment, and `util::isolated`
+    // moves the environment under a process-wide lock it releases between
+    // tests — so a guard that called `new()` in its own `drop` resolved
+    // whichever root happened to be current then, which under a parallel run
+    // is often another test's. That is the difference between this leaking
+    // nothing in a single test and leaking six per full suite.
+    root: PathBuf,
+    pid: Option<u32>,
+}
+
+#[cfg(test)]
+impl StopsOnDrop {
+    pub(crate) fn new(seat: Seat) -> StopsOnDrop {
+        let place = Compound::new();
+        // The pid as well as the seat, read NOW. `stop` is the right verb and
+        // is tried first, but it can only work through the seat record, and a
+        // test is free to overwrite that record (several do, to exercise
+        // `state`) or to leave the environment pointing elsewhere by the time
+        // this drops. The pid cannot be falsified by either, so it is the
+        // backstop — and a leaked supervisor holds a pty, which this machine
+        // has 511 of (`compound-127`).
+        let pid = place.record(&seat).ok().and_then(|r| r["pid"].as_u64()).map(|p| p as u32);
+        StopsOnDrop { seat, root: place.root, pid }
+    }
+}
+
+/// Ends a `compound-sup` by the pid it really has, for the tests that make
+/// [`StopsOnDrop`] impossible.
+///
+/// A test exercising [`Compound::state`] has to put pids in the seat record
+/// that nothing holds — a live one with no agent, then one no process could
+/// plausibly be. Doing so OVERWRITES the record `stop` reads, so the seat
+/// becomes unstoppable by its own backend the moment the test scribbles on it:
+/// `end_process` signals a pid nothing holds and the real supervisor lives on,
+/// holding its pty, past the temp directory and past the test run.
+///
+/// That is what leaked 275 supervisors and 480 of this machine's 511 ptys
+/// (`compound-127`). The remedy is to read the pid the supervisor really has
+/// BEFORE the record is rewritten, and end that process directly rather than
+/// through a record the test is about to falsify.
+#[cfg(test)]
+pub(crate) struct EndsOnDrop(pub(crate) u32);
+
+#[cfg(test)]
+impl Drop for EndsOnDrop {
+    fn drop(&mut self) {
+        signal_group(self.0, "KILL");
+    }
+}
 
 #[cfg(test)]
 impl Drop for StopsOnDrop {
@@ -990,7 +1041,12 @@ impl Drop for StopsOnDrop {
         // Best effort by construction: a seat whose supervisor already exited
         // is the ordinary case at the end of a despawn test, and a cleanup
         // that panicked would turn a passing test red for tidying up.
-        let _ = Compound::new().stop(&self.0);
+        let _ = Compound::at(self.root.clone()).stop(&self.seat);
+        if let Some(pid) = self.pid {
+            if alive(&[pid]).contains(&pid) {
+                signal_group(pid, "KILL");
+            }
+        }
     }
 }
 
@@ -1261,6 +1317,9 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         let dir = place.dir_of(&seat).unwrap();
+        // Read BEFORE the record is falsified below: from here on `stop` can
+        // no longer find this supervisor, so the pid is the only handle left.
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
         // A stale hook file, as if this seat held an agent before — the
         // case the `said`-skip in `state_of` exists to guard.
         let _ = write_atomic(&dir.join(SAID_FILE), &json!({ "state": "working" }).to_string());

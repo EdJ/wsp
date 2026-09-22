@@ -5702,8 +5702,16 @@ mod tests {
 
         let compound = crate::place_compound::Compound::new();
         let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
-        let _stops = crate::place_compound::StopsOnDrop(seat.clone());
         let dir = compound.dir_of(&seat).unwrap();
+        // By the pid rather than through `stop`: the record is rewritten two
+        // lines down with THIS process's id, which would make `stop` signal
+        // the test runner's own group and leave the supervisor standing.
+        let _ends = crate::place_compound::EndsOnDrop(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("seat.json")).unwrap())
+                .unwrap()["pid"]
+                .as_u64()
+                .expect("a live pid") as u32,
+        );
         let mut rec: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
         rec["pid"] = json!(std::process::id());

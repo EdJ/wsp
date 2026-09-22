@@ -3120,7 +3120,7 @@ mod tests {
             .unwrap();
         // The seat is a real `compound-sup` holding a pty; without this it
         // outlives the temp tree and the test leaks one per run.
-        let _stops = crate::place_compound::StopsOnDrop(seat.clone());
+        let _stops = crate::place_compound::StopsOnDrop::new(seat.clone());
 
         let why = Occupied::now(&store)
             .of("t-9", &wt)

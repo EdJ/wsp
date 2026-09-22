@@ -615,6 +615,7 @@ mod tests {
         );
 
         let seat = compound.open(&Order::default()).expect("a compound seat");
+        let _stops = crate::place_compound::StopsOnDrop::new(seat.clone());
         let opened = take(&store);
         assert_ne!(
             opened.agents.stamp, before.agents.stamp,

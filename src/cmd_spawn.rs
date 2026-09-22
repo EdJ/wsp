@@ -5185,7 +5185,7 @@ mod tests {
 
         let compound = crate::place_compound::Compound::new();
         let cpd_seat = compound.open(&Order::default()).expect("a compound seat");
-        let _stops = crate::place_compound::StopsOnDrop(cpd_seat.clone());
+        let _stops = crate::place_compound::StopsOnDrop::new(cpd_seat.clone());
         compound.start(&cpd_seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).expect("started");
 
         struct MustNotBeAsked;

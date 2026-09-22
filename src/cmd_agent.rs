@@ -6757,10 +6757,19 @@ mod tests {
         let seat = compound
             .open(&crate::place::Order { label: "compound-row".into(), ..Default::default() })
             .expect("a compound seat");
-        // `state` reads a pid before it reads a hook at all — nothing here
-        // spawns a real `compound-sup`, so the seat's own record is given
-        // one by hand, this process's, which `alive` will find running.
+        // `state` reads a pid before it reads a hook at all, so the seat's own
+        // record is given one by hand — this process's, which `alive` will
+        // find running. `open` DOES spawn a real `compound-sup` (this comment
+        // used to say it did not), and overwriting the record is what makes
+        // that supervisor unstoppable by `stop`, so its pid is taken first and
+        // ended directly — `compound-127`.
         let dir = compound.dir_of(&seat).unwrap();
+        let _ends = crate::place_compound::EndsOnDrop(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("seat.json")).unwrap())
+                .unwrap()["pid"]
+                .as_u64()
+                .expect("a live pid") as u32,
+        );
         let mut rec: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
         rec["pid"] = json!(std::process::id());
         // `agent` is what tells `state_of` this pid is a started session
@@ -6794,6 +6803,14 @@ mod tests {
         let compound = crate::place_compound::Compound::new();
         let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
         let dir = compound.dir_of(&seat).unwrap();
+        // Before the record is overwritten below, which is what would strand
+        // the real supervisor (`compound-127`).
+        let _ends = crate::place_compound::EndsOnDrop(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("seat.json")).unwrap())
+                .unwrap()["pid"]
+                .as_u64()
+                .expect("a live pid") as u32,
+        );
         let mut rec: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
         rec["pid"] = json!(std::process::id());
