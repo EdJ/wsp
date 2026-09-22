@@ -628,6 +628,87 @@ fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Optio
 /// supervisor refuses a version it does not know instead of guessing.
 const WIRE_VERSION: u32 = 7;
 
+/// What `doctor` says about the two ways this constant has already drifted
+/// (`compound-026`), asked of the installed pieces rather than read out of
+/// either repository's source — the same discipline the rest of this file
+/// already keeps for the wire itself.
+///
+/// **Two checks, because the two instances were two different shapes.** The
+/// August one was a build-ordering trap: `cargo run -p host` rebuilds only
+/// `host`, and the two binaries land beside each other in one cargo
+/// workspace's `target/<profile>/`, so a `host` newer than the `compound-sup`
+/// sitting next to it is exactly that trap, caught by an mtime comparison
+/// that needs nothing from either source tree. The September one was this
+/// constant itself going stale against a `proto.rs` bump the wsp repository
+/// never reads — caught by asking the installed `compound-sup` what it
+/// actually speaks, the same way [`compound_sup_binary`]'s callers already
+/// ask it for `state` rather than trusting a guess.
+///
+/// Both are notes until they are not: no `compound-sup` on this machine is
+/// not a problem — the herdr backend needs none of this — and a
+/// `compound-sup` that cannot answer `wire-version` yet is an older binary,
+/// not a broken one. What one function should never do is fix either: a
+/// version check that started rebuilding or restarting somebody else's
+/// binaries would be `robustness-090` d1's forbidden act wearing a doctor
+/// badge, so this only ever says what is wrong and the verb that fixes it.
+pub fn wire_health(problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    let Some(sup) = compound_sup_binary() else {
+        notes.push(
+            "compound-sup not found ($COMPOUND_SUP or PATH) — nothing to check about the compound wire".into(),
+        );
+        return;
+    };
+    wire_health_of(&sup, problems, notes);
+}
+
+/// [`wire_health`], given the binary rather than finding it — split out so a
+/// test can point this at a fake script instead of racing every other test in
+/// this process over `$COMPOUND_SUP` (`wsp-env-breaks-cargo-test`'s lesson,
+/// one door over: a global is a global whether it names a store or a binary).
+fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    // Follow the PATH symlink to the real binary, whose directory is the
+    // cargo workspace's own `target/<profile>/` — where `host` lands too,
+    // built by the same `cargo build` that builds this one. Not a path this
+    // file invented: `scripts/supervisor_outlives_host_rebuild.sh` in the
+    // compound repository already names both binaries at that convention.
+    let real = fs::canonicalize(sup).unwrap_or_else(|_| sup.to_path_buf());
+    if let Some(dir) = real.parent() {
+        let host = dir.join("host");
+        if let (Ok(hm), Ok(sm)) =
+            (fs::metadata(&host).and_then(|m| m.modified()), fs::metadata(&real).and_then(|m| m.modified()))
+        {
+            if hm > sm {
+                problems.push(format!(
+                    "{} is newer than {} — a host-only rebuild (`cargo run -p host`) leaves compound-sup stale, \
+                     and its version refusal will name the session rather than the build — `cargo build` rebuilds both (compound-026)",
+                    util::contract(&host),
+                    util::contract(&real),
+                ));
+            }
+        }
+    }
+
+    match ask_wire_version(&sup) {
+        Some(v) if v != WIRE_VERSION => problems.push(format!(
+            "wsp's WIRE_VERSION is {WIRE_VERSION}, installed compound-sup speaks {v} — bump WIRE_VERSION in \
+             src/place_compound.rs to match crates/supervisor/src/proto.rs (compound-026)"
+        )),
+        Some(_) => {}
+        None => notes.push(format!(
+            "{} does not answer `wire-version` — wsp cannot check its WIRE_VERSION ({WIRE_VERSION}) against it (compound-026)",
+            util::contract(&sup),
+        )),
+    }
+}
+
+/// `compound-sup wire-version` → the bare number, or `None` if the installed
+/// binary predates that verb (an older build, not a broken one) or will not
+/// answer at all.
+fn ask_wire_version(bin: &std::path::Path) -> Option<u32> {
+    let out = Command::new(bin).arg("wire-version").stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok()).flatten()
+}
+
 fn dial(socket: &PathBuf, timeout: Duration) -> Result<UnixStream> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1602,5 +1683,109 @@ mod tests {
         assert_eq!(rows[0].seat, seat);
         assert_eq!(rows[0].label, "row");
         assert_eq!(rows[0].state, State::Empty, "opened, not started");
+    }
+
+    // -- wire_health (compound-026) ------------------------------------------
+    //
+    // Against fake scripts stood in for `compound-sup`, never `$COMPOUND_SUP`
+    // — that env var is process-global and every other test in this file
+    // shares the process (`wsp-env-breaks-cargo-test`'s lesson, one door
+    // over). `wire_health_of` takes the binary as an argument for exactly
+    // this reason.
+
+    /// A shell script at `dir/compound-sup`, executable, that prints `reply`
+    /// to stdout and exits 0 when called as `wire-version` — or exits 2 with
+    /// nothing on stdout otherwise, the same shape a real older binary's
+    /// unrecognised-verb arm already takes ([`main`]'s `verb =>` arm in the
+    /// compound repository).
+    fn fake_sup(dir: &std::path::Path, reply: Option<&str>) -> PathBuf {
+        let path = dir.join("compound-sup");
+        let body = match reply {
+            Some(v) => format!("#!/bin/sh\ncase \"$1\" in\n  wire-version) echo {v}; exit 0 ;;\n  *) exit 2 ;;\nesac\n"),
+            None => "#!/bin/sh\nexit 2\n".to_string(),
+        };
+        fs::write(&path, body).unwrap();
+        let mut perm = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        fs::set_permissions(&path, perm).unwrap();
+        path
+    }
+
+    /// The ordinary case, now that both checks can pass: a `compound-sup`
+    /// that answers the wsp-side `WIRE_VERSION` and no `host` beside it to
+    /// disagree with — nothing to say.
+    #[test]
+    fn wire_health_says_nothing_when_the_installed_pieces_agree() {
+        let scratch = Scratch::new("wire-ok");
+        let sup = fake_sup(&scratch.root, Some(&WIRE_VERSION.to_string()));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// `compound-031`'s shape: the installed binary speaks a version this
+    /// hand-copied constant does not, named as a problem — not a note, the
+    /// way a spawn this actually blocks deserves — and the fix line says
+    /// which file to edit rather than leaving that to be rediscovered.
+    #[test]
+    fn wire_health_catches_wsps_own_constant_going_stale() {
+        let scratch = Scratch::new("wire-stale-const");
+        let other = WIRE_VERSION + 1;
+        let sup = fake_sup(&scratch.root, Some(&other.to_string()));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains(&WIRE_VERSION.to_string()), "{}", problems[0]);
+        assert!(problems[0].contains(&other.to_string()), "{}", problems[0]);
+        assert!(problems[0].contains("place_compound.rs"), "{}", problems[0]);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// An installed `compound-sup` old enough to predate the `wire-version`
+    /// verb is a fact this cannot check, not a fault — a note, same as no
+    /// `compound-sup` at all reads as one.
+    #[test]
+    fn wire_health_notes_rather_than_alarms_when_the_verb_is_unknown() {
+        let scratch = Scratch::new("wire-no-verb");
+        let sup = fake_sup(&scratch.root, None);
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("wire-version"), "{}", notes[0]);
+    }
+
+    /// August's shape, reproduced without needing a real cargo workspace:
+    /// `host` sitting beside `compound-sup` with a later mtime is exactly
+    /// what a `host`-only rebuild leaves behind, caught with no source tree
+    /// read at all.
+    #[test]
+    fn wire_health_catches_a_host_only_rebuild_by_mtime() {
+        let scratch = Scratch::new("wire-stale-host");
+        let sup = fake_sup(&scratch.root, Some(&WIRE_VERSION.to_string()));
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(scratch.root.join("host"), "not a real binary, only its mtime matters here").unwrap();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("is newer than"), "{}", problems[0]);
+        assert!(problems[0].contains("cargo build"), "{}", problems[0]);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// The reverse of the case above: `compound-sup` rebuilt at least as
+    /// recently as `host` is the ordinary state of the world (a full
+    /// `cargo build`, or `host` simply untouched since) and says nothing.
+    #[test]
+    fn wire_health_says_nothing_when_compound_sup_is_not_older_than_host() {
+        let scratch = Scratch::new("wire-host-not-stale");
+        fs::write(scratch.root.join("host"), "not a real binary, only its mtime matters here").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let sup = fake_sup(&scratch.root, Some(&WIRE_VERSION.to_string()));
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        wire_health_of(&sup, &mut problems, &mut notes);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(notes.is_empty(), "{notes:?}");
     }
 }

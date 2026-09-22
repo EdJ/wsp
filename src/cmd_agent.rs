@@ -5112,6 +5112,11 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // brief arrives — while every other turn boundary is silently invisible
     // (`compound-107`).
     crate::place_super::hook_snippet_health(&mut problems, &mut notes);
+    // And whether the compound wire agrees with itself: wsp's own hand-copied
+    // WIRE_VERSION against what the installed compound-sup actually speaks,
+    // and the host binary beside it against a build that only touched one of
+    // the two — the two shapes `compound-026` was filed for.
+    crate::place_compound::wire_health(&mut problems, &mut notes);
 
     if args.json() {
         println!("{}", json!({ "problems": problems, "notes": notes }));
