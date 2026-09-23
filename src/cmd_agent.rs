@@ -4162,7 +4162,8 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
     let on_compound = compound.socket_of(&compound_seat).is_some();
 
     let (text, truncated) = if on_compound {
-        // No scrollback here: `compound-sup screen` is one frame, the same
+        // No scrollback here: `compound-render screen` (`compound-sup` before
+        // the pty/renderer split, `compound-136`) is one frame, the same
         // limit `panel::surface_frame` already lives with, so `--source` and
         // `--lines` — herdr's reach into what has scrolled past — have
         // nothing to ask for on this backend.

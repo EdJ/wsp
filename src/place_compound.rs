@@ -84,12 +84,22 @@
 //! one wanted to name a path across two checkouts nobody can promise sit
 //! beside each other. What is here instead is the handful of wire shapes
 //! [`Place::tell`] actually needs — an envelope, `Attach`, `Input`, `Key`,
-//! `Detach` — read against `crates/supervisor/src/proto.rs` VERSION 6 at
-//! the time of writing and versioned the same way that file is: a refusal
-//! rather than a guess if the peer ever disagrees. **This is the one seam
-//! in this file that ages by hand** — a wire bump on the compound side is
-//! invisible here until something exercises it, which is why the version is
-//! checked and refused loudly rather than assumed.
+//! `Detach` — read against `crates/supervisor/src/proto.rs` VERSION 8 at the
+//! time of writing and versioned the same way that file is: a refusal rather
+//! than a guess if the peer ever disagrees. **This is the one seam in this
+//! file that ages by hand** — a wire bump on the compound side is invisible
+//! here until something exercises it, which is why the version is checked
+//! and refused loudly rather than assumed.
+//!
+//! **Two sockets since `compound-101`'s split, one process each
+//! (`compound-136`).** `<name>.sock`, served by the durable `compound-sup`,
+//! answers only `DurableBody` — `Vitals` and `Close` — with no VT and no
+//! renderer required; `<name>.rsock`, served by the disposable
+//! `compound-render`, answers everything [`Place::tell`] hand-rolls a client
+//! for (`Attach`/`Input`/`Key`/`Detach`) plus `screen`/`state`, called as
+//! subprocesses the same way `compound-sup screen`/`state` used to be. Both
+//! sockets share one version number; what differs by socket is which `Body`
+//! it accepts, not which wire it speaks.
 //!
 //! # Identity: what `Seat` is, and what it is not
 //!
@@ -152,8 +162,9 @@ pub struct Compound<'a> {
     /// than typing into whatever is on screen — which is right, and which
     /// would also be a lockout with no way past it in that case.
     ///
-    /// So this is the way past: a governor who has LOOKED — `compound-sup
-    /// screen` is the honest surface — passes `wsp tell --anyway` and takes
+    /// So this is the way past: a governor who has LOOKED — `compound-render
+    /// screen` (`compound-sup screen` before `compound-101`'s split) is the
+    /// honest surface — passes `wsp tell --anyway` and takes
     /// the decision themselves. It is a field on the backend rather than a
     /// widening of `Place`, for the reason `linger` and `poll` are: it
     /// configures this implementation, it does not change what the port
@@ -255,6 +266,29 @@ fn compound_sup_binary() -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|d| d.join("compound-sup")).find(|p| p.is_file())
+}
+
+/// Where `compound-render` lives: `$COMPOUND_RENDER`, `PATH`, or beside
+/// whichever `compound-sup` this process is already using.
+///
+/// The third door matters more than it looks (`compound-136`): the two
+/// binaries are always built together into one `cargo build --target-dir`
+/// (`compound-sup`'s own `renderer_binary_path` takes the identical
+/// shortcut, one process over — they land beside each other by construction,
+/// not by convention this file invented), so an operator or a test that has
+/// only ever had to point wsp at `$COMPOUND_SUP` keeps working without
+/// learning a second variable.
+fn compound_render_binary() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("COMPOUND_RENDER") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(p) = std::env::split_paths(&path).map(|d| d.join("compound-render")).find(|p| p.is_file()) {
+            return Some(p);
+        }
+    }
+    compound_sup_binary()?.parent().map(|d| d.join("compound-render")).filter(|p| p.is_file())
 }
 
 impl Compound<'_> {
@@ -487,24 +521,50 @@ impl Compound<'_> {
         })
     }
 
-    /// What this seat's pty is showing right now — `compound-sup screen
-    /// <socket>`, the same call a person types by hand.
+    /// The renderer's own socket for this seat's session (`<name>.rsock`,
+    /// `compound-101`) — pixels, keys, mouse, screen text: everything that
+    /// needs libghostty. `None` before [`Place::start`]/[`Place::open`] has
+    /// run, after the session is gone, or if `compound-sup`'s handshake
+    /// never announced one (an older binary, from before the split).
+    /// Reachable only while a renderer is actually up; [`Compound::vitals_osc_title`]
+    /// is the durable half's own answer for when it is not.
+    pub(crate) fn render_socket_of(&self, seat: &Seat) -> Option<PathBuf> {
+        self.record(seat).ok().and_then(|rec| {
+            let s = str_of(&rec, "render_socket");
+            (!s.is_empty()).then(|| PathBuf::from(s))
+        })
+    }
+
+    /// What this seat's pty is showing right now — `compound-render screen
+    /// <render-socket>`, the same call a person types by hand.
+    ///
+    /// **Render-side since `compound-101`'s split (`compound-136`).** `screen`
+    /// needs a VT, which only `compound-render` still links; the durable
+    /// `compound-sup` half answers `vitals`/`close` and nothing that reads
+    /// pixels. A renderer that has died — a seat between renderers, or one
+    /// that never got one — answers nothing here; that is a real "cannot
+    /// read this pane right now", not this call's to paper over. [`Compound::state_of`]'s
+    /// own fallback for that case is `vitals`'s OSC title, not this.
     ///
     /// Not on [`Place`]: reading a pane is the observe half `place.rs`'s
     /// module docs put outside this port, which is why `wsp peek` already
     /// calls herdr's `pane.read` directly rather than through a trait method
     /// — this is that seam's compound answer, called the same way. Named in
     /// `compound-111`: with no read of any kind, `compound-sup screen
-    /// <socket>`, typed by a person, was "the only honest surface all week".
+    /// <socket>` (as it was before the split), typed by a person, was "the
+    /// only honest surface all week".
     ///
-    /// `compound-sup`'s own presentation is a `NNN|text` line per row and a
-    /// trailing `size WxH`; stripped here down to bare text so `wsp peek`
-    /// prints the same shape whichever backend answered.
+    /// `compound-render`'s own presentation is a `NNN|text` line per row, a
+    /// trailing `size WxH`, and — since the split — a further trailing
+    /// `osc_title <title>` line; all three sidecar lines are stripped here
+    /// down to bare text so `wsp peek` prints the same shape whichever
+    /// backend answered.
     pub(crate) fn read_screen(&self, seat: &Seat) -> Result<String> {
-        let socket = self.socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
-        let sup = compound_sup_binary()
-            .ok_or_else(|| Refusal::Backend("compound-sup not found — set $COMPOUND_SUP or put it on PATH".into()))?;
-        let out = Command::new(&sup)
+        let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+        let render = compound_render_binary().ok_or_else(|| {
+            Refusal::Backend("compound-render not found — set $COMPOUND_RENDER or put it on PATH".into())
+        })?;
+        let out = Command::new(&render)
             .args(["screen"])
             .arg(&socket)
             .output()
@@ -514,6 +574,9 @@ impl Compound<'_> {
         }
         let raw = String::from_utf8_lossy(&out.stdout);
         let mut lines: Vec<&str> = raw.lines().collect();
+        if lines.last().is_some_and(|l| l.starts_with("osc_title ")) {
+            lines.pop();
+        }
         if lines.last().is_some_and(|l| l.starts_with("size ")) {
             lines.pop();
         }
@@ -533,35 +596,58 @@ impl Compound<'_> {
     /// used to read `Unknown` for its whole life. This is that seat's only
     /// source of a live answer.
     ///
-    /// Shells to `compound-sup state <socket> <kind>` — `compound-109`'s
-    /// verb, wrapping the ported half of herdr's agent-detection engine —
-    /// exactly as [`Compound::read_screen`] shells to `compound-sup screen`:
-    /// this backend does not link compound's crates, so this is a wire read
-    /// the same way that one is, not a dependency.
+    /// Two tiers, since `compound-101`'s split (`compound-136`). Screen-based
+    /// detection needs a VT, which only `compound-render` holds now; a seat
+    /// whose renderer has died is not thereby a seat with nothing to say —
+    /// `compound-113` established that compound stands on the screen
+    /// *including the title* for both agents, and the title survives on the
+    /// durable half (`vitals`) with no renderer required at all. So this
+    /// tries the richer, screen-aware answer first and only falls to the
+    /// title alone once that cannot be reached — not once it runs and
+    /// disagrees, which is a real "unknown" and not this function's to
+    /// second-guess.
     ///
-    /// `None` when there is nothing to ask: no socket minted yet, no
-    /// `compound-sup` reachable, or an agent kind the ported engine has no
-    /// manifest for — only `claude` and `opencode` are compiled
-    /// (`compound-109`'s overview); anything else falls back to
-    /// [`State::Unknown`] exactly as it did before this existed.
-    ///
-    /// **A process spawn and a socket round trip, not a free read.**
-    /// Measured (`compound-109`, `compound-sup state` against a live
-    /// opencode session, 20 calls): ~22ms each. `survey` calls [`state_of`]
-    /// once per seat in the directory, serially, so a census of N seats
-    /// whose hooks cannot answer costs N × ~22ms here — fine for the sizes
-    /// `wsp ls`/`wsp kanban` run against today, and worth re-measuring
-    /// before this is anywhere near an input path or a seat count that
-    /// matters at that rate.
+    /// `None` when there is nothing to ask at all: no socket minted yet, or
+    /// an agent kind the ported engine has no manifest for — only `claude`
+    /// and `opencode` are compiled (`compound-109`'s overview); anything else
+    /// falls back to [`State::Unknown`] exactly as it did before this
+    /// existed.
     fn detected_state(&self, seat: &Seat, rec: &Value) -> Option<State> {
         let agent = rec.get("agent")?;
         let kind = str_of(agent, "kind");
         if !matches!(kind.as_str(), "claude" | "opencode") {
             return None;
         }
-        let socket = self.socket_of(seat)?;
-        let sup = compound_sup_binary()?;
-        let out = Command::new(&sup).args(["state"]).arg(&socket).arg(&kind).output().ok()?;
+        if let Some(state) = self.screen_state(seat, &kind) {
+            return Some(state);
+        }
+        // The renderer could not be reached — dead, or never started. Fall to
+        // the one signal that survives that (`compound-113`'s title, over
+        // `vitals` on the durable socket) rather than reading Unknown when a
+        // real answer is still standing.
+        self.vitals_osc_title(seat).and_then(|t| title_state(&kind, &t))
+    }
+
+    /// Shells to `compound-render state <render-socket> <kind>` —
+    /// `compound-109`'s verb, wrapping the ported half of herdr's
+    /// agent-detection engine — exactly as [`Compound::read_screen`] shells
+    /// to `compound-render screen`: this backend does not link compound's
+    /// crates, so this is a wire read the same way that one is, not a
+    /// dependency.
+    ///
+    /// **A process spawn and a socket round trip, not a free read.**
+    /// Measured (`compound-109`, `compound-sup state` against a live
+    /// opencode session before the split, 20 calls): ~22ms each — the split
+    /// moved which binary answers, not the cost. `survey` calls [`state_of`]
+    /// once per seat in the directory, serially, so a census of N seats whose
+    /// hooks cannot answer costs N × ~22ms here — fine for the sizes `wsp
+    /// ls`/`wsp kanban` run against today, and worth re-measuring before this
+    /// is anywhere near an input path or a seat count that matters at that
+    /// rate.
+    fn screen_state(&self, seat: &Seat, kind: &str) -> Option<State> {
+        let socket = self.render_socket_of(seat)?;
+        let render = compound_render_binary()?;
+        let out = Command::new(&render).args(["state"]).arg(&socket).arg(kind).output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -574,30 +660,95 @@ impl Compound<'_> {
             _ => Some(State::Unknown),
         }
     }
+
+    /// The child's last OSC window/tab title, straight off `compound-sup
+    /// vitals <socket>` — the durable half, answerable with no VT and no
+    /// renderer at all (`compound-101`, `compound-109`). `None` when there is
+    /// no socket, no `compound-sup` reachable, or the call fails outright;
+    /// empty when the durable half is up but no renderer has ever reported a
+    /// title, which [`title_state`] also reads as nothing rather than as
+    /// idle.
+    fn vitals_osc_title(&self, seat: &Seat) -> Option<String> {
+        let socket = self.socket_of(seat)?;
+        let sup = compound_sup_binary()?;
+        let out = Command::new(&sup).args(["vitals"]).arg(&socket).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("osc_title ").map(str::to_string))
+    }
 }
 
-/// `compound-sup`'s three-line handshake, read with a deadline off a
-/// background thread so a supervisor that never prints one (a bad build, a
-/// hung `zig` toolchain, anything short of the ordinary path) cannot hang
-/// [`Place::start`] rather than refuse it.
-fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Option<PathBuf> {
+/// `compound-113`'s two OSC-title rules — `osc_title_working` and
+/// `osc_title_idle` in `vendor/herdr-detection/manifests/claude.toml`,
+/// ported rather than shelled to, because there is no CLI verb for "classify
+/// this string" and spawning a process to run a two-line regex would be a
+/// strange place to draw that line. **A floor under `screen_state`'s answer,
+/// not a second copy of it**: [`Compound::detected_state`] only reaches this
+/// once the render socket cannot be asked at all, so this can never disagree
+/// with the richer, screen-aware detector while a renderer is actually up —
+/// it only has anything to say once that detector has nothing to say at all.
+///
+/// opencode's manifest carries no `osc_title` rule (`compound-109`'s
+/// overview) — it never has, split or not — so this returns `None` for it,
+/// same as the render-side detector would with no renderer: opencode fires
+/// none of the hooks [`Compound::heard`] listens for either, so a seat whose
+/// renderer died genuinely has no answer left, and `Unknown` is the honest
+/// one. wsp does not own the manifest this mirrors; a rule changing there is
+/// a `compound-113`-shaped row on the compound side, not a silent divergence
+/// here — this is two characters, not the engine.
+fn title_state(kind: &str, osc_title: &str) -> Option<State> {
+    if kind != "claude" {
+        return None;
+    }
+    let mut chars = osc_title.chars();
+    let first = chars.next()?;
+    if chars.next() != Some(' ') {
+        return None;
+    }
+    if first == '\u{2733}' {
+        return Some(State::Idle);
+    }
+    if ('\u{2800}'..='\u{28FF}').contains(&first) || ('\u{25D0}'..='\u{25D3}').contains(&first) {
+        return Some(State::Working);
+    }
+    None
+}
+
+/// `compound-sup`'s four-line handshake since `compound-101`'s split — `sup
+/// <pid>`, `pid <pid>`, `socket <path>`, `render <path>` — read with a
+/// deadline off a background thread so a supervisor that never prints one (a
+/// bad build, a hung `zig` toolchain, anything short of the ordinary path)
+/// cannot hang [`Place::start`] rather than refuse it.
+///
+/// Only `socket` and `render` are parsed; `sup`'s pid is `Command::spawn`'s
+/// own answer already, and `pid` is read from the record this same call
+/// writes. Reads up to four lines rather than stopping the instant `render`
+/// is seen, so an even older, pre-split `compound-sup` — three lines, no
+/// `render` — still hands back its socket rather than timing out waiting for
+/// a fourth line that binary will never print.
+fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Option<(PathBuf, Option<PathBuf>)> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut socket = None;
-        for _ in 0..3 {
+        let mut render = None;
+        for _ in 0..4 {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 break;
             }
-            if let Some(path) = line.trim().strip_prefix("socket ") {
+            let line = line.trim();
+            if let Some(path) = line.strip_prefix("socket ") {
                 socket = Some(PathBuf::from(path));
+            } else if let Some(path) = line.strip_prefix("render ") {
+                render = Some(PathBuf::from(path));
                 break;
             }
         }
         // Best effort: a receiver that has already timed out is a send
         // nobody reads, not an error.
-        let _ = tx.send(socket);
+        let _ = tx.send(socket.map(|s| (s, render)));
     });
     rx.recv_timeout(timeout).ok().flatten()
 }
@@ -626,7 +777,22 @@ fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Optio
 /// fixed: a constant maintained by hand in two repositories will drift again,
 /// and the only reason this cost minutes rather than a day is that the
 /// supervisor refuses a version it does not know instead of guessing.
-const WIRE_VERSION: u32 = 7;
+///
+/// **v8, `compound-101`'s split, caught the same way (`compound-136`).**
+/// This time the drift was worse than a stale number: `compound-101` moved
+/// `screen`/`state` off `compound-sup` entirely, onto a second binary
+/// (`compound-render`) answering a second socket (`<name>.rsock`) that this
+/// file did not know existed. A wire-version-aware wsp calling a verb that
+/// had moved would have failed exactly the same way a stale `WIRE_VERSION`
+/// does — refused loudly, but for the wrong stated reason — so this bump
+/// came with [`compound_render_binary`], [`Compound::render_socket_of`] and
+/// every call site that used to dial `compound-sup` for a screen-shaped
+/// answer moving to dial `compound-render` instead. v8 is *not* purely
+/// additive the way v7 was: it is a new socket with a smaller `Body` on the
+/// old one, which is exactly the "whole shape" `compound` d2 says a version
+/// bump claims, and every caller in this file was re-checked against it
+/// rather than assumed compatible.
+const WIRE_VERSION: u32 = 8;
 
 /// What `doctor` says about the two ways this constant has already drifted
 /// (`compound-026`), asked of the installed pieces rather than read out of
@@ -855,7 +1021,7 @@ impl Compound<'_> {
         // `crates/host/src/sessions.rs::Panes::open`.
         drop(child);
 
-        let Some(socket) = read_handshake(stdout, HANDSHAKE_TIMEOUT) else {
+        let Some((socket, render)) = read_handshake(stdout, HANDSHAKE_TIMEOUT) else {
             signal_group(pid, "KILL");
             return Err(Refusal::Backend("compound-sup never announced a socket".into()));
         };
@@ -863,6 +1029,9 @@ impl Compound<'_> {
         let mut rec = rec.clone();
         rec["pid"] = json!(pid);
         rec["socket"] = json!(socket.display().to_string());
+        if let Some(render) = &render {
+            rec["render_socket"] = json!(render.display().to_string());
+        }
         rec["started_at"] = json!(util::now_iso());
         Ok(rec)
     }
@@ -894,6 +1063,14 @@ impl Compound<'_> {
             if socket.exists() && UnixStream::connect(&socket).is_err() {
                 let _ = fs::remove_file(&socket);
                 let _ = fs::remove_file(socket.with_extension("label"));
+            }
+        }
+        // The renderer unlinks its own `.rsock` on a clean exit
+        // (`compound-101`), but a signalled one skips that the same way the
+        // durable half's does — same headstone, same remedy, one socket over.
+        if let Some(render) = self.render_socket_of(seat) {
+            if render.exists() && UnixStream::connect(&render).is_err() {
+                let _ = fs::remove_file(&render);
             }
         }
     }
@@ -973,13 +1150,21 @@ impl Place for Compound<'_> {
 
     /// Paste the sentence, press Enter, disconnect — see the module docs'
     /// "`tell`, and why it need not hold a pipe open".
+    ///
+    /// **Render socket, not durable, since `compound-101`'s split**
+    /// (`compound-136`). `Attach`/`Input`/`Key`/`Detach` are `Body` variants,
+    /// answered on `<name>.rsock` by `compound-render` — the durable
+    /// `<name>.sock` speaks only `DurableBody` (`Vitals`/`Close`) and would
+    /// refuse an `Attach` frame as an unknown shape rather than type into
+    /// anything. A seat with no renderer up has nothing to type into either
+    /// way; that failure belongs to the dial below, not to a silent no-op.
     fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery> {
         let state = self.state(seat)?;
         // `insist` is a person saying they have looked; see its own doc.
         if !self.insist && !state.will_take_a_prompt() {
             return Err(Refusal::NotReady(state));
         }
-        let socket = self.socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+        let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         type_and_submit(&socket, text)?;
         // Typed rather than watched: this backend has not read the reply
         // that would let it say more, so `Unconfirmed` is the honest answer
@@ -1613,7 +1798,16 @@ mod tests {
         });
         assert!(left_working, "opencode never left working: {:?}", place.state(&seat));
 
+        // `stop` (`compound-136`) has to end BOTH halves of the split and
+        // clean up both sockets, not just the durable one `compound-031`
+        // predates — `end_process`'s render-socket cleanup is new here and
+        // this is what proves it against a real renderer rather than a
+        // fixture.
+        let socket = place.socket_of(&seat).expect("a durable socket was recorded");
+        let render_socket = place.render_socket_of(&seat).expect("a render socket was recorded");
         place.stop(&seat).expect("the seat was there");
+        assert!(!socket.exists(), "the durable socket outlived stop");
+        assert!(!render_socket.exists(), "the render socket outlived stop");
     }
 
     /// `compound-111`: `wsp peek` had no way to read a compound seat at all —
