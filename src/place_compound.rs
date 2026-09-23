@@ -792,7 +792,7 @@ fn read_handshake(stdout: std::process::ChildStdout, timeout: Duration) -> Optio
 /// old one, which is exactly the "whole shape" `compound` d2 says a version
 /// bump claims, and every caller in this file was re-checked against it
 /// rather than assumed compatible.
-const WIRE_VERSION: u32 = 8;
+const WIRE_VERSION: u32 = 9;
 
 /// What `doctor` says about the two ways this constant has already drifted
 /// (`compound-026`), asked of the installed pieces rather than read out of
