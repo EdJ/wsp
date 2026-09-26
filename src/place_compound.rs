@@ -198,6 +198,21 @@ impl Compound<'static> {
     }
 }
 
+impl Compound<'_> {
+    /// Every seat's burn record under this backend's root, seat id attached.
+    ///
+    /// The tally is not this backend's — `heard` calls [`tally_burn`] verbatim,
+    /// the same call `place_super` makes, so the records are the same shape
+    /// either way. The *reader* was, and that is what `wsp-116` is: `wsp burn`
+    /// asked `place_super` alone, whose root is a different directory, so it
+    /// reported no burn at all for a fleet that was entirely this backend's.
+    /// See [`crate::place_super::burn_under`], which is the shared half and
+    /// says why the root has to be a parameter.
+    pub fn burn(&self) -> Vec<(String, Value)> {
+        crate::place_super::burn_under(&self.root)
+    }
+}
+
 const SEATS: &str = "compound-seats";
 const SEAT_FILE: &str = "seat.json";
 const SAID_FILE: &str = "said.json";

@@ -185,7 +185,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -238,36 +238,67 @@ impl Supervisor<'static> {
         }
     }
 
-    /// Every seat's burn record that has one, seat id attached.
-    ///
-    /// The reading half of [`tally_burn`] (`core-049`): the ranking is a
-    /// question about *where the tokens went*, and the answer lives one file per
-    /// seat under here. A directory with no [`BURN_FILE`] is a seat that never
-    /// spoke through a hook carrying a transcript — a shell, or a kind that
-    /// keeps none — and it says nothing rather than saying zero.
+    /// Every seat's burn record that has one, seat id attached. This backend's
+    /// seats only — see [`burn_under`] for why that is not the whole answer.
     pub fn burn(&self) -> Vec<(String, Value)> {
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for e in entries.flatten() {
-            let path = e.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let rec = read_json(&path.join(BURN_FILE));
-            if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
-                continue;
-            }
-            let id = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            out.push((id, rec));
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        burn_under(&self.root)
     }
+}
+
+/// Every seat's burn record under one root, seat id attached.
+///
+/// The reading half of [`tally_burn`] (`core-049`): the ranking is a question
+/// about *where the tokens went*, and the answer lives one file per seat.
+///
+/// **The root is a parameter because two backends write these files and only
+/// one of them grew a reader.** `tally_burn` is shared verbatim —
+/// `place_compound` calls it at its own `heard` — so a compound seat tallies
+/// exactly like a headless one, into a directory of its own
+/// (`place_compound::SEATS`). This function living here as a method on
+/// [`Supervisor`] therefore read `seats/`, and on a machine where every seat is
+/// a compound one — which is the common case since `compound-112` — that
+/// directory does not exist at all: `wsp burn` reported no burn for a fleet of
+/// eight seats holding real records, and said so in the present tense
+/// (`wsp-116`). Nothing about the *shape* was wrong; the reader was pointed at
+/// one backend's store in a codebase whose seats are spread over two.
+///
+/// So the reader is a free function over a root, each backend reaches it
+/// through its own `burn()`, and the report folds the two — the same
+/// herdr-then-compound fold `sync.rs`, `cmd_watch` and `cmd_checkout` already
+/// make, and for the same reason: a source nobody folds is a source nobody is
+/// looking at.
+///
+/// **A seat that tallied zero turns is skipped**, which is not the same thing
+/// as a seat with no [`BURN_FILE`] and used to be documented as if it were. The
+/// two come apart: a hook carrying a transcript whose lines carry no `usage` —
+/// a kind that keeps none, or a format this does not read — writes a record
+/// with `turns: 0` and real totals of zero, and it is dropped here. That is
+/// right, and deliberately so: a seat at $0.00 is not a rank, and the report is
+/// a ranking. A seat with *no* file is the case the doc used to name, and it is
+/// dropped by the same line for a better reason — there is nothing there to
+/// read.
+pub(crate) fn burn_under(root: &Path) -> Vec<(String, Value)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let rec = read_json(&path.join(BURN_FILE));
+        if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
+            continue;
+        }
+        let id = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push((id, rec));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// The directory under the store's state that holds the seats.
@@ -1854,6 +1885,69 @@ mod tests {
             u_at(&burn(), "input"),
             300,
             "re-attributed whole, never summed across sessions"
+        );
+    }
+
+    /// The reader is over a *root*, not over this backend — which is the whole
+    /// of `wsp-116`. A record this backend never wrote, sitting in a directory
+    /// it has no name for, is still a seat that spent money, and a reader that
+    /// can only be pointed at its own root is a reader that will report a
+    /// machine full of agents as a machine that spent nothing.
+    #[test]
+    fn the_burn_reader_reads_any_root_it_is_given_rather_than_only_its_own() {
+        let scratch = Scratch::new("burn-any-root");
+        // A root with no relationship to `Supervisor::new()` — the compound
+        // seats directory, under the same isolated state.
+        let elsewhere = scratch.root.join("some-other-backend-seats");
+        let seat = elsewhere.join("cpd-7");
+        fs::create_dir_all(&seat).unwrap();
+        fs::write(
+            seat.join(BURN_FILE),
+            json!({ "turns": 12, "model": "claude-opus-5-5", "input": 40, "output": 900 })
+                .to_string(),
+        )
+        .unwrap();
+
+        let read = burn_under(&elsewhere);
+        assert_eq!(read.len(), 1, "the record is there to be found");
+        assert_eq!(read[0].0, "cpd-7");
+        assert_eq!(u_at(&read[0].1, "turns"), 12);
+        assert_eq!(u_at(&read[0].1, "output"), 900);
+
+        // And pointed at its own root it still reads only that: a reader with
+        // no root parameter would have made this second assertion the first.
+        assert!(
+            burn_under(&scratch.root).is_empty(),
+            "one root's seats are not another's"
+        );
+    }
+
+    /// A seat that tallied nothing is not a row. The two cases come apart — a
+    /// record with `turns: 0` and a directory with no record at all — and both
+    /// are dropped, for the reason the reader's own docs now give rather than
+    /// the one they used to.
+    #[test]
+    fn a_seat_that_tallied_no_turns_is_not_a_row_and_a_directory_with_no_record_is_not_either() {
+        let scratch = Scratch::new("burn-zero-turns");
+        for (seat, rec) in [
+            ("sup-1", json!({ "turns": 3, "output": 100 })),
+            // A hook fired, a transcript existed, and no line in it carried a
+            // `usage` — real, and worth zero of everything.
+            ("sup-2", json!({ "turns": 0, "output": 0, "offset": 19_230 })),
+            ("sup-3", json!({})),
+        ] {
+            let dir = scratch.root.join(seat);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(BURN_FILE), rec.to_string()).unwrap();
+        }
+        // A file where a directory belongs is not a seat either.
+        fs::write(scratch.root.join("stray"), "not a seat").unwrap();
+
+        let read = burn_under(&scratch.root);
+        assert_eq!(
+            read.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["sup-1"],
+            "one seat spent something; the other two are not ranks"
         );
     }
 

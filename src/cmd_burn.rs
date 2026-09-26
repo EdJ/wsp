@@ -19,6 +19,13 @@
 //! precisely what cannot measure it.
 //!
 //! Read-only, like everything else that only reports.
+//!
+//! **The fleet is both backends' seats.** A hook tallies into the directory of
+//! whichever backend opened the seat, and there are two of those, so a report
+//! that read one described a fraction of the machine while looking like the
+//! whole of it — eight seats holding real records, and a table that said
+//! nothing had been spent (`wsp-116`). [`fleet`] is where that fold lives and
+//! why it is two calls.
 
 use serde_json::json;
 
@@ -131,7 +138,9 @@ fn n(v: &serde_json::Value, key: &str) -> u64 {
 }
 
 pub fn burn(_store: &crate::store::Store, args: &Args) -> i32 {
-    let seats = Supervisor::new().burn();
+    // Every backend, not one — the fold is the fix and the reason is in this
+    // file's docs; asking a single one is `wsp-116`.
+    let seats = fleet();
     if args.json() {
         let rows: Vec<serde_json::Value> = seats
             .iter()
@@ -186,9 +195,14 @@ pub fn burn(_store: &crate::store::Store, args: &Args) -> i32 {
     rows.sort_by(|a, b| b.0.cmp(&a.0));
 
     if rows.is_empty() {
+        // Says what it means rather than how it found out. "No seated agent has
+        // spoken through a hook" was both narrower than the truth — the fold
+        // above now looks at every backend, so an empty table is the whole
+        // machine — and a claim about a mechanism, in a report whose one job is
+        // to be read as an amount.
         println!(
             "{}",
-            p.dim("no burn recorded — no seated agent has spoken through a hook yet")
+            p.dim("no burn recorded — no seat on this machine has spent anything this can see")
         );
         return 0;
     }
@@ -224,6 +238,31 @@ pub fn burn(_store: &crate::store::Store, args: &Args) -> i32 {
     0
 }
 
+/// Every seat on this machine that has a burn record, whichever backend opened
+/// it, by seat id.
+///
+/// **Two sources, because a seat's cost is tallied into the directory of
+/// whichever backend opened it and there are two of those** — a report that
+/// read one of them described a fraction of the machine while looking like the
+/// whole of it (`wsp-116`). This is the same fold `sync.rs`, `cmd_watch` and
+/// `cmd_checkout` already make over herdr and compound, for the same reason: a
+/// source nobody folds is a source nobody is looking at.
+///
+/// The concatenation is sound rather than lucky because seat ids are disjoint
+/// by construction — each backend mints under its own prefix, `sup-` and `cpd-`
+/// — so no row can be counted twice, and the SEAT column says which backend a
+/// spend came from.
+///
+/// Split out from [`burn`] so a test can plant seats in an isolated store and
+/// ask the question the bug was about — *is the fleet here?* — without standing
+/// a terminal up to read a table off stdout.
+fn fleet() -> Vec<(String, serde_json::Value)> {
+    let mut seats = Supervisor::new().burn();
+    seats.extend(crate::place_compound::Compound::new().burn());
+    seats.sort_by(|a, b| a.0.cmp(&b.0));
+    seats
+}
+
 fn str_or_dash(v: &serde_json::Value, key: &str) -> String {
     match v.get(key).and_then(|x| x.as_str()).unwrap_or("") {
         "" => "—".to_string(),
@@ -250,4 +289,89 @@ fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plant a burn record where a backend would have written one.
+    fn seat(state: &std::path::Path, dir: &str, id: &str, turns: u64, output: u64) {
+        let d = state.join(dir).join(id);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("burn.json"),
+            json!({ "turns": turns, "output": output, "cost": output * 100 }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// **The bug, as a sentence.** A machine whose seats are all compound seats
+    /// has no `seats/` directory at all — that is not a corruption, it is what
+    /// a machine that has only ever run compound looks like — and the report
+    /// used to read that one directory and say, in the present tense, that
+    /// nothing had been spent. Eight seats held real records while it said so.
+    #[test]
+    fn a_fleet_of_only_compound_seats_is_still_a_fleet() {
+        let iso = crate::util::isolated("burn-compound-only");
+        assert!(
+            !iso.state().join("seats").exists(),
+            "the premise: the headless root is not merely empty, it is absent"
+        );
+        seat(&iso.state(), "compound-seats", "cpd-62", 148, 121_519);
+        seat(&iso.state(), "compound-seats", "cpd-67", 16, 4_677);
+
+        let read = fleet();
+        assert_eq!(
+            read.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["cpd-62", "cpd-67"],
+            "both compound seats, ranked by what they cost"
+        );
+    }
+
+    /// Both backends' seats, in one table, and neither counted twice. The
+    /// prefixes are what make the concatenation sound, so this is the test that
+    /// says so rather than leaving it to a comment.
+    #[test]
+    fn both_backends_seats_are_in_one_report_without_double_counting() {
+        let iso = crate::util::isolated("burn-both-backends");
+        seat(&iso.state(), "seats", "sup-1", 5, 500);
+        seat(&iso.state(), "compound-seats", "cpd-2", 7, 700);
+
+        let read = fleet();
+        assert_eq!(
+            read.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["cpd-2", "sup-1"],
+            "one row per seat, and neither backend's seat shadowing the other's"
+        );
+        // A seat id is the join key between a report row and the seat it is
+        // about, so two rows claiming one id would be a report that cannot be
+        // acted on rather than merely a wrong total.
+        let mut ids: Vec<&str> = read.iter().map(|(id, _)| id.as_str()).collect();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "every seat id in the report is distinct");
+    }
+
+    /// A machine with no seats at all is the case the empty message is for, and
+    /// it must not be reachable by a report that simply failed to look. So: the
+    /// fold finds nothing *because there is nothing*, which is asserted by
+    /// planting both roots and emptying both.
+    #[test]
+    fn an_empty_report_means_both_roots_were_read_and_were_empty() {
+        let iso = crate::util::isolated("burn-nothing");
+        for dir in ["seats", "compound-seats"] {
+            std::fs::create_dir_all(iso.state().join(dir)).unwrap();
+        }
+        assert!(
+            fleet().is_empty(),
+            "both roots present and empty is the only route to an empty report"
+        );
+        // The near-miss that produced the bug: one root existing and the other
+        // absent is indistinguishable from *both* absent unless the reader is
+        // the one naming the root.
+        seat(&iso.state(), "compound-seats", "cpd-1", 1, 1);
+        assert_eq!(fleet().len(), 1, "and the root that does exist is still read");
+    }
 }
