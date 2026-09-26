@@ -205,6 +205,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::cmd_spawn::Reach;
 use crate::place::{Delivery, Place, Refusal, Result, Seat, Seated};
 use crate::util;
 use crate::util::Clock;
@@ -433,12 +434,12 @@ pub trait Kind {
     /// content is not.
     ///
     /// `reach` is the directories outside this agent's own tree that it may
-    /// use without asking — [`crate::cmd_spawn::reach`] decides them, from what
-    /// wsp already holds, and a kind that has no way to say so ignores them.
-    /// Empty is not a failure and not a default: it is a seat wsp knows of
-    /// nothing outside the tree for, and it must produce the configuration the
-    /// seat had before this parameter existed.
-    fn env(&self, _brief: Option<&Path>, _reach: &[PathBuf]) -> BTreeMap<String, String> {
+    /// use without asking, and the few it may not — [`crate::cmd_spawn::reach`]
+    /// decides both, from what wsp already holds, and a kind that has no way to
+    /// say so ignores them. Empty is not a failure and not a default: it is a
+    /// seat wsp knows of nothing outside the tree for, and it must produce the
+    /// configuration the seat had before this parameter existed.
+    fn env(&self, _brief: Option<&Path>, _reach: &Reach) -> BTreeMap<String, String> {
         BTreeMap::new()
     }
 
@@ -913,19 +914,23 @@ const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 /// it* and becomes **what does wsp already know**.
 ///
 /// [`crate::cmd_spawn::reach`] answers that and is where the paths come from —
-/// the store it was built with and the row's own `refs`, never a constant in
-/// this file. What is *not* here is the project root. Three agents asked for
-/// `~/claude/wsp/*` and the transcripts say none of them needed it: two were
-/// reaching for the handbook's *"`README.md` at the root"* in the main checkout
+/// the store it was built with, the row's own `refs`, and the root of the
+/// project the row is in, never a constant in this file. **The project root is
+/// `wsp-123`, and the earlier refusal of it is what this overturned.** Three
+/// agents asked for `~/claude/wsp/*` and the transcripts say none of them
+/// needed it: two were reaching for the handbook's *"`README.md` at the root"*
 /// while holding a copy of it in their own tree, and the third wanted `git
 /// worktree add`, which a linked worktree can run perfectly well from where it
-/// stands. Against that, `edit` is `allow` and an `external_directory` rule is
-/// a path rule and not an operation rule — so the grant would hand a spawned
-/// agent write access to the shared checkout somebody else is standing in.
-/// `ui-001`'s agent, which was allowed it by hand, edited `src/cmd_task.rs`
-/// **in the main checkout** and had to `git apply -R` its way back out. The
-/// allow is refused and the reach is closed at the other end, in the sentence
-/// [`crate::cmd_brief`] writes about the tree.
+/// stands. Against that, two seats on `compound` rows each stopped on
+/// `external_directory` inside ninety seconds, one of them for
+/// `~/claude/compound` — the trunk of the project they were working in — and a
+/// seat held on a prompt holds its pane until a person walks past, which is the
+/// outcome this whole policy exists to prevent. So the root is granted, and what
+/// the refusal was protecting is protected by name instead: the root's own
+/// `.worktrees` is denied, after the allow that covers it, which leaves the
+/// trunk reachable and every other seat's tree not. The trunk is a write the
+/// seat may now make, and the sentence [`crate::cmd_brief`] writes into the
+/// brief is what says not to.
 ///
 /// **What the replay says, which is the acceptance test the decision named.**
 /// Against `ui-007`'s own 32 requests — 28 `bash`, 3 `edit`, 1
@@ -959,7 +964,7 @@ const WSP_DENIED: &[&str] = &["done", "rm", "project rm", "archive"];
 /// Scoped to the seat and not to the machine. Ed's own opencode is untouched by
 /// this, which is the other half of the decision: wsp configures the agents it
 /// starts and nothing else.
-fn config(brief: Option<&Path>, reach: &[PathBuf]) -> String {
+fn config(brief: Option<&Path>, reach: &Reach) -> String {
     let mut rules: Vec<(String, &str)> = Vec::new();
     // The posture. Everything a shell can do, in a tree wsp made and nobody
     // has landed.
@@ -972,10 +977,10 @@ fn config(brief: Option<&Path>, reach: &[PathBuf]) -> String {
         .map(|(pattern, action)| format!("{}:{}", Value::from(pattern.as_str()), Value::from(*action)))
         .collect::<Vec<_>>()
         .join(",");
-    // Where this agent may reach outside its own tree, as allows and nothing
-    // else. The paragraph above carries the argument; what it comes to here is
-    // that a key holding only allows adds rules and takes none away, so the
-    // asking default survives underneath it for every path nobody named.
+    // Where this agent may reach outside its own tree, as allows, and the one
+    // exception to them. The paragraph above carries the argument; what it comes
+    // to here is that a key holding allows adds rules and takes none away, so
+    // the asking default survives underneath it for every path nobody named.
     //
     // `<dir>/*` is opencode's own spelling for a directory, and its `*` spans
     // separators: a rule on `.../T/opencode/*` answered a request for
@@ -984,6 +989,16 @@ fn config(brief: Option<&Path>, reach: &[PathBuf]) -> String {
     // Written only when there is something to write, so a seat with nothing to
     // reach for is byte-for-byte the config it had before this existed.
     //
+    // **The denies go last, and that is the whole of what they are for.**
+    // `Permission.evaluate` is a `findLast`, so a `deny` written before the
+    // allow it narrows is a rule that never applies. The one that exists is a
+    // project root's own `.worktrees`: a granted root that is this seat's own
+    // parent would otherwise hand the seat every sibling seat's uncommitted
+    // work, and the argument and the measurement are on
+    // [`crate::cmd_spawn::reach`]. Driven on 2026-09-27: with
+    // `{root/*:allow, root/.worktrees/*:deny}` a read in the trunk answered and
+    // a read of `root/.worktrees/seat-2/other.txt` was refused by that rule.
+    //
     // The brief's own directory is in here too, and it is this function's to
     // add rather than [`crate::cmd_spawn::reach`]'s: **a config may not name a
     // file it forbids reaching.** Found by driving a real spawn on 2026-08-23 —
@@ -991,29 +1006,26 @@ fn config(brief: Option<&Path>, reach: &[PathBuf]) -> String {
     // stopped on `external_directory` for `<state>/briefs/*`. That is
     // `core-027` d2's finding in a new place: the brake fired on the one thing
     // wsp had told the agent to look at. Stated as an invariant so it cannot
-    // drift, the brief's path being the only path this config hands out.
+    // drift, and it reads the denies as well as the allows now that a config can
+    // refuse as well as allow: a second source of paths this config refuses is a
+    // second way to name one.
     let named: Vec<PathBuf> = brief
         .and_then(|b| b.parent())
         .map(|d| d.to_path_buf())
         .into_iter()
-        .filter(|d| !reach.iter().any(|r| d.starts_with(r)))
+        .filter(|d| !reach.allow.iter().chain(reach.deny.iter()).any(|r| d.starts_with(r)))
         .collect();
-    let outside = match reach.is_empty() && named.is_empty() {
+    let outside = match reach.allow.is_empty() && reach.deny.is_empty() && named.is_empty() {
         true => String::new(),
         false => {
-            let allows = reach
-                .iter()
-                .chain(named.iter())
-                .map(|dir| {
-                    format!(
-                        "{}:{}",
-                        Value::from(format!("{}/*", dir.display())),
-                        Value::from("allow")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(r#","external_directory":{{{allows}}}"#)
+            let rule = |dir: &Path, action: &str| {
+                format!("{}:{}", Value::from(format!("{}/*", dir.display())), Value::from(action))
+            };
+            let allows = reach.allow.iter().chain(named.iter()).map(|dir| rule(dir, "allow"));
+            // After every allow, because `findLast` — see above.
+            let denies = reach.deny.iter().map(|dir| rule(dir, "deny"));
+            let rules = allows.chain(denies).collect::<Vec<_>>().join(",");
+            format!(r#","external_directory":{{{rules}}}"#)
         }
     };
     let mut cfg =
@@ -1300,7 +1312,7 @@ impl Kind for OpenCode {
 
     /// [`config`], which is the whole of it. The argument is on that function,
     /// on [`WSP_DENIED`] and on [`Kind::env`].
-    fn env(&self, brief: Option<&Path>, reach: &[PathBuf]) -> BTreeMap<String, String> {
+    fn env(&self, brief: Option<&Path>, reach: &Reach) -> BTreeMap<String, String> {
         BTreeMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), config(brief, reach))])
     }
 
@@ -2381,6 +2393,16 @@ mod tests {
     use super::*;
     use crate::place::{Agent, Event, Order, Seated, State};
 
+    /// A reach, from the two lists [`crate::cmd_spawn::reach`] keeps apart —
+    /// which is the point of it, so a test that cannot say both is not asking
+    /// the question `wsp-123` is about.
+    fn reaching(allow: &[&str], deny: &[&str]) -> Reach {
+        Reach {
+            allow: allow.iter().map(PathBuf::from).collect(),
+            deny: deny.iter().map(PathBuf::from).collect(),
+        }
+    }
+
     /// A capture of `claude agents --json` from this machine on 2026-08-17,
     /// trimmed to the rows that matter and otherwise byte-for-byte as sent.
     ///
@@ -2764,7 +2786,7 @@ mod tests {
 
     #[test]
     fn a_spawned_opencode_works_in_its_own_tree_freely_and_still_cannot_end_a_task() {
-        let env = of("opencode").env(None, &[]);
+        let env = of("opencode").env(None, &Reach::default());
         let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("the policy is on the seat");
         let v: Value = serde_json::from_str(cfg).expect("valid config, composed not concatenated");
         let bash = &v["permission"]["bash"];
@@ -2804,15 +2826,16 @@ mod tests {
     /// the catch-all next.
     #[test]
     fn where_an_opencode_may_reach_is_named_path_by_path_and_never_as_a_catch_all() {
-        let plain = of("opencode").env(None, &[]);
+        let plain = of("opencode").env(None, &Reach::default());
         assert!(
             !plain["OPENCODE_CONFIG_CONTENT"].contains("external_directory"),
             "a seat with nothing outside its tree is the config it was before this existed"
         );
 
-        let store = PathBuf::from("/Users/somebody/wsp");
-        let spec = PathBuf::from("/Users/somebody/specs");
-        let env = of("opencode").env(None, &[store, spec]);
+        let env = of("opencode").env(
+            None,
+            &reaching(&["/Users/somebody/wsp", "/Users/somebody/specs"], &[]),
+        );
         let cfg = &env["OPENCODE_CONFIG_CONTENT"];
         let v: Value = serde_json::from_str(cfg).expect("valid config, composed not concatenated");
         let out = &v["permission"]["external_directory"];
@@ -2829,17 +2852,55 @@ mod tests {
         assert_eq!(v["permission"]["bash"]["wsp done*"], "deny");
     }
 
+    /// A deny is written after every allow, because `findLast` is what makes it
+    /// one.
+    ///
+    /// The rule is `wsp-123`'s, and the deny is the project root's own
+    /// `.worktrees`: a seat may reach the root of the project it works in, which
+    /// is where its own tree lives, and must not reach the trees beside its own.
+    /// Asserted on the raw string, because a parsed `Value` is a `BTreeMap` and
+    /// the order under test is the one the text was written in — the same reason
+    /// [`the_catch_all_is_written_before_the_denies_that_have_to_beat_it`] reads
+    /// the string.
+    #[test]
+    fn a_deny_on_the_seats_own_projects_worktrees_is_written_after_the_allow_it_narrows() {
+        let env = of("opencode").env(
+            None,
+            &reaching(&["/Users/somebody/compound"], &["/Users/somebody/compound/.worktrees"]),
+        );
+        let cfg = &env["OPENCODE_CONFIG_CONTENT"];
+        let at = |needle: &str| cfg.find(needle).unwrap_or_else(|| panic!("no {needle} in {cfg}"));
+        assert!(
+            at(r#""/Users/somebody/compound/*":"allow""#)
+                < at(r#""/Users/somebody/compound/.worktrees/*":"deny""#),
+            "a deny written first is a rule that never applies, and every other seat's \
+             uncommitted work is reachable through the file tools — {cfg}"
+        );
+        // And it is a rule inside the one object rather than a key of its own:
+        // `external_directory` takes a single map, and the order is inside it.
+        let v: Value = serde_json::from_str(cfg).expect("valid config");
+        assert_eq!(
+            v["permission"]["external_directory"]["/Users/somebody/compound/.worktrees/*"],
+            "deny",
+            "{cfg}"
+        );
+    }
+
     /// A config may not name a file it forbids reaching.
     ///
     /// Found by driving a real spawn rather than by reading this file: the
     /// agent went to re-read the brief `instructions` had pointed it at and
     /// stopped on `external_directory` for the directory it sits in. `core-027`
     /// d2 is the same finding one layer up — the brake fired on the agent
-    /// finding out what it was for — and the invariant is stated here because
-    /// the brief's path is the only path this config hands out.
+    /// finding out what it was for — and the invariant is stated here because a
+    /// config that can refuse is a second way to name a path it must not name,
+    /// which since `wsp-123` it can.
     #[test]
     fn the_brief_this_config_names_is_a_brief_the_agent_may_go_back_and_read() {
-        let env = of("opencode").env(Some(Path::new("/var/state/wsp/briefs/ui-007.md")), &[]);
+        let env = of("opencode").env(
+            Some(Path::new("/var/state/wsp/briefs/ui-007.md")),
+            &Reach::default(),
+        );
         let v: Value = serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("valid config");
         assert_eq!(v["instructions"][0], "/var/state/wsp/briefs/ui-007.md");
         assert_eq!(
@@ -2848,11 +2909,32 @@ mod tests {
         );
 
         // And it is not said twice when something already reaches it.
-        let store = PathBuf::from("/var/state/wsp");
-        let env = of("opencode").env(Some(Path::new("/var/state/wsp/briefs/ui-007.md")), &[store]);
+        let env = of("opencode").env(
+            Some(Path::new("/var/state/wsp/briefs/ui-007.md")),
+            &reaching(&["/var/state/wsp"], &[]),
+        );
         let v: Value = serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("valid config");
         let out = v["permission"]["external_directory"].as_object().expect("some allows");
         assert_eq!(out.len(), 1, "the parent already answers for it — {out:?}");
+
+        // Nor when something refuses it, which is the case `wsp-123` added. A
+        // deny is a path this config has promised not to reach, so naming the
+        // brief's own directory as an allow beside it would put two rules for
+        // one path in one map and leave the winner to be whichever opencode
+        // evaluated last. (A deny over the brief's directory is not reachable in
+        // practice — it takes a state directory under a project's `.worktrees` —
+        // so this asserts the rule and not a refusal: the seat is still built,
+        // and what it may not do is read its own brief.)
+        let env = of("opencode").env(
+            Some(Path::new("/var/state/wsp/briefs/ui-007.md")),
+            &reaching(&[], &["/var/state/wsp/briefs"]),
+        );
+        let v: Value = serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("valid config");
+        assert_ne!(
+            v["permission"]["external_directory"]["/var/state/wsp/briefs/*"],
+            "allow",
+            "a config may not name a file it forbids reaching — {v}"
+        );
     }
 
     /// The order the map is written in, because opencode reads it as one.
@@ -2866,7 +2948,7 @@ mod tests {
     /// keeping the denies from being decoration.
     #[test]
     fn the_catch_all_is_written_before_the_denies_that_have_to_beat_it() {
-        let env = of("opencode").env(None, &[]);
+        let env = of("opencode").env(None, &Reach::default());
         let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("nothing on the seat");
         let at = |needle: &str| cfg.find(needle).unwrap_or_else(|| panic!("no {needle} in {cfg}"));
         assert!(
@@ -2890,7 +2972,7 @@ mod tests {
     #[test]
     fn the_brief_arrives_on_the_same_variable_as_the_policy_and_does_not_disturb_it() {
         let cfg = |brief| {
-            let env = of("opencode").env(brief, &[]);
+            let env = of("opencode").env(brief, &Reach::default());
             let raw = env.get("OPENCODE_CONFIG_CONTENT").expect("nothing on the seat").clone();
             serde_json::from_str::<Value>(&raw).expect("valid config")
         };
@@ -2941,9 +3023,10 @@ mod tests {
 
     #[test]
     fn no_other_kinds_seat_is_touched() {
+        let brief = Some(Path::new("/tmp/b.md"));
         assert!(
-            of("claude").env(Some(Path::new("/tmp/b.md")), &[]).is_empty()
-                && of("codex").env(Some(Path::new("/tmp/b.md")), &[]).is_empty(),
+            of("claude").env(brief, &Reach::default()).is_empty()
+                && of("codex").env(brief, &Reach::default()).is_empty(),
             "the compatibility rule everywhere here: an unmeasured kind is left exactly as it was, \
              and a brief it has no way to read does not change that"
         );

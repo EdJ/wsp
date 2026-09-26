@@ -183,7 +183,7 @@ fn brief_path(store: &Store, subject: &str) -> std::path::PathBuf {
 /// answer is not to widen the boundary; it is to name the few places wsp
 /// already knows the work is, and leave everything else asking.
 ///
-/// **Two sources, and neither is guessed.**
+/// **Three sources, and none of them is guessed.**
 ///
 /// The **store** is where task files live, and reading one is the most ordinary
 /// thing an agent does: `wsp show` prints the id, the agent reaches for
@@ -203,25 +203,68 @@ fn brief_path(store: &Store, subject: &str) -> std::path::PathBuf {
 /// it sits in. So a row that has to reach somewhere says where, once, on the
 /// row, and every agent that runs it reaches there without asking. That is a
 /// thing a person writes down rather than a thing wsp infers, which is the
-/// point: the list of outside paths is per-row and finite, and the alternative
-/// is a standing grant that covers every row for ever.
+/// point: the list of outside paths is per-row and finite, and what the third
+/// source below replaced as the alternative to a standing grant is a standing
+/// grant narrowed to the project rather than to the row.
 ///
-/// **What is deliberately absent is the project's `roots`**, and the argument
-/// is on [`crate::agent_commands::OpenCode`]'s config: a worktree already holds
-/// every tracked file, the three agents that asked for the parent were each
-/// reaching for something their own tree had, and an `external_directory` allow
-/// is a path rule rather than an operation rule — so granting it would hand a
-/// spawned agent write access to the checkout somebody else is standing in.
+/// **The project's `roots` are the third source, and they are the row
+/// `wsp-123` is about.** A seat on `compound-201` was configured with a reach
+/// that named the **wsp** store and nothing else, because the store is the one
+/// thing every seat shares; a row in any other project got no grant covering its
+/// own checkout, and two compound seats in one evening each stopped on
+/// `external_directory` within ninety seconds of starting — one of them for
+/// `~/claude/compound`, the project's own trunk. That is a person interrupted
+/// for a path inside the agent's own project, and the standing grant it tempts
+/// the agent to write instead is aimed at nobody's review. The root is derived
+/// from the row's project, so a new project is covered by having a project.
+///
+/// **And the root is where this seat's own tree lives**, which is the whole
+/// difficulty in it: `<checkout>/.worktrees/<task>` means a rule on the root
+/// covers every sibling tree — every other agent's uncommitted work — as well
+/// as the shared checkout. So a granted root that is an ancestor of this seat's
+/// tree also earns a **deny** on `<root>/.worktrees`, which opencode's
+/// `findLast` puts after the allow and which cannot reach the seat's own tree,
+/// because the boundary opencode draws is its own directory. Driven on
+/// 2026-09-27 rather than reasoned about: with `{root/*:allow,
+/// root/.worktrees/*:deny}` a read of a file in the trunk answered and a read of
+/// `root/.worktrees/seat-2/other.txt` was refused by that rule, in one turn;
+/// and with a blanket `deny` on the session's own directory a read inside it
+/// still answered, so the deny is not a brake on the seat's own work. That is
+/// what keeps `ui-001`'s lesson — an agent editing `src/cmd_task.rs` in the
+/// shared checkout — to the trunk, where a dirty `git status` shows it, and off
+/// every other seat's work.
+///
+/// The trunk itself is a write the seat may now make, and it is bought
+/// deliberately: the earlier refusal rested on a worktree already holding every
+/// tracked file, which three agents asking for `~/claude/wsp/*` appeared to
+/// confirm and which two compound seats falsified. What survives of it is the
+/// sentence [`crate::cmd_brief`] writes into the brief — the agent is told its
+/// own tree is the whole project — and the four verbs that destroy records,
+/// which are above all of this.
+///
+/// A root is resolved through [`util::real`] rather than [`util::expand`],
+/// because the same 2026-09-27 drive is what showed opencode matching the
+/// **resolved** path: a rule naming a root that is a symlink matches nothing,
+/// which is this row's failure wearing a different hat. A root that does not
+/// exist resolves to itself and grants nothing, which is the right answer for a
+/// project whose checkout is on another machine.
 ///
 /// The directory rather than the file, because that is opencode's own unit: it
 /// asks about `<dir>/*` and never about a single path. Deduplicated, and a
 /// directory under one already named is dropped, since opencode's `*` spans
 /// separators and the parent already answers for it.
 ///
-/// Nothing above the tree survives, whatever named it — see the filter below,
-/// where the reason is written: a rule on any ancestor of `.worktrees/<task>`
-/// covers every sibling tree, which is every other agent's uncommitted work.
-pub(crate) fn reach(store: &Store, task: Option<&str>, tree: Option<&str>) -> Vec<std::path::PathBuf> {
+/// Nothing above the tree survives **the store and a ref** — see the filter
+/// below, where the reason is written: a rule on any ancestor of
+/// `.worktrees/<task>` covers every sibling tree, which is every other agent's
+/// uncommitted work. A project's own root is the one exception, and it carries
+/// a deny in place of the refusal.
+pub(crate) fn reach(
+    store: &Store,
+    task: Option<&str>,
+    project: Option<&str>,
+    tree: Option<&str>,
+) -> Reach {
     let tree = tree.map(util::expand);
     let mut dirs: Vec<std::path::PathBuf> = vec![store.root.clone()];
     // A ref is written the way a person types a path — `~/claude/strata-spec.md`,
@@ -265,6 +308,31 @@ pub(crate) fn reach(store: &Store, task: Option<&str>, tree: Option<&str>) -> Ve
     if let Some(t) = &tree {
         dirs.retain(|d| !d.starts_with(t) && !t.starts_with(d));
     }
+    // The project's own roots, which are the one ancestor of the tree that is
+    // granted — with a deny in place of the refusal, and the argument for both
+    // halves on this function. Read from the row when the caller named no
+    // project, so a seat spawned onto a row and a seat rotated onto a scope
+    // cannot disagree about which project they are in.
+    let named = project
+        .map(str::to_string)
+        .or_else(|| task.and_then(|t| store.task(t)).and_then(|t| t.project));
+    let roots: Vec<std::path::PathBuf> = named
+        .as_deref()
+        .and_then(|p| Index::new(store.projects()).roots_of(p))
+        .unwrap_or_default()
+        .iter()
+        .map(|r| util::real(r))
+        .collect();
+    // Where the seat's own tree stands, the worktrees under that root are every
+    // other seat's work and are refused by name. Only for a root the tree is
+    // inside: a root the seat is not standing in has no trees of ours under it,
+    // and a rule matching nothing is noise.
+    let deny: Vec<std::path::PathBuf> = roots
+        .iter()
+        .filter(|r| tree.as_ref().is_some_and(|t| t.starts_with(r)))
+        .map(|r| r.join(cmd_checkout::WORKTREES))
+        .collect();
+    dirs.extend(roots);
     dirs.sort();
     dirs.dedup();
     // Shortest first, so the parent is always seen before anything under it.
@@ -274,7 +342,20 @@ pub(crate) fn reach(store: &Store, task: Option<&str>, tree: Option<&str>) -> Ve
             kept.push(d);
         }
     }
-    kept
+    Reach { allow: kept, deny }
+}
+
+/// What a seat may reach outside its own tree, in the two forms opencode reads.
+///
+/// `allow` is the whole of it and `deny` is the exception, kept apart because
+/// the order between them is the meaning: opencode evaluates the **last**
+/// matching rule, so a deny is only a deny once it is written after the allow it
+/// narrows. One list of paths could not say that, and a deny that arrived first
+/// would be a seat that could not write anything at all.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Reach {
+    pub allow: Vec<std::path::PathBuf>,
+    pub deny: Vec<std::path::PathBuf>,
 }
 
 /// Compose this seat's brief and write it where the agent will read it.
@@ -482,7 +563,7 @@ pub(crate) struct Occupant<'a> {
     /// three. A default computed in this file would be the same two builders
     /// that have to agree, one of which would quietly hand a resumed agent a
     /// narrower world than the spawn it is continuing.
-    pub reach: &'a [std::path::PathBuf],
+    pub reach: &'a Reach,
 }
 
 /// Everything the occupant of a seat wsp opens finds in its environment: what
@@ -1700,7 +1781,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // What this seat may reach outside its tree, settled here for the same
     // reason the brief's path is: the environment is fixed when the seat opens,
     // and by then the tree and the task are both known.
-    let outside = reach(store, work.task.as_deref(), cwd.as_deref());
+    let outside = reach(store, work.task.as_deref(), work.project.as_deref(), cwd.as_deref());
     let occupant =
         will_start.then(|| Occupant { kind: &kind, brief: brief_at.as_deref(), reach: &outside });
     // `--govern` is the custodial spelling and the only one: it refuses a task
@@ -2173,7 +2254,7 @@ fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> 
     let how = agent_commands::of(&kind);
     let brief_at =
         (!subject.is_empty() && how.brief_file()).then(|| brief_path(store, &subject));
-    let outside = reach(store, None, cwd.as_deref());
+    let outside = reach(store, None, work.project.as_deref(), cwd.as_deref());
     // An agent is the whole point of a rotation — a successor with no agent in
     // it is a seat that answers for raised hands and cannot read one — so there
     // is no bare-workspace case here to make this conditional.
@@ -2832,8 +2913,8 @@ mod tests {
     fn every_seat_may_read_the_store_it_is_recorded_in() {
         let store = seat("reach-store");
         assert_eq!(
-            reach(&store, None, None),
-            vec![store.root.clone()],
+            reach(&store, None, None, None),
+            Reach { allow: vec![store.root.clone()], deny: vec![] },
             "wsp knows where it keeps its own record; nothing here is guessed"
         );
     }
@@ -2848,7 +2929,7 @@ mod tests {
     /// it would be a rule about the agent's own directory in a policy whose
     /// only subject is leaving it.
     #[test]
-    fn a_ref_that_points_out_of_the_tree_is_the_only_kind_that_earns_a_reach() {
+    fn a_ref_that_points_out_of_the_tree_becomes_the_directory_it_sits_in() {
         let store = seat("reach-refs");
         let tree = std::env::temp_dir().join("wsp-reach-refs-tree/.worktrees/ui-009");
         let spec = std::env::temp_dir().join("wsp-reach-refs-spec");
@@ -2856,34 +2937,37 @@ mod tests {
         t.refs = vec!["src/model.rs".into(), spec.join("surface.md").display().to_string()];
         store.save_task(&t).unwrap();
 
-        let out = reach(&store, Some("ui-009"), Some(&tree.display().to_string()));
+        let out = reach(&store, Some("ui-009"), None, Some(&tree.display().to_string()));
         assert!(
-            out.contains(&spec),
+            out.allow.contains(&spec),
             "the directory the ref sits in, because that is opencode's unit — {out:?}"
         );
         assert!(
-            !out.iter().any(|d| d.starts_with(&tree)),
+            !out.allow.iter().any(|d| d.starts_with(&tree)),
             "a relative ref is a file the worktree already holds — {out:?}"
         );
     }
 
-    /// Nothing above the agent's own tree is reachable, however it was asked
-    /// for — and a written-down `ref` is the way it would be asked for.
+    /// A ref above the agent's own tree is still refused, and the project's own
+    /// root is the one thing that is not.
     ///
     /// Three agents asked for `~/claude/wsp/*` and none of them needed it: two
     /// were reaching for the handbook's *"`README.md` at the root"* in the main
     /// checkout while holding a copy in their own tree, and one wanted `git
     /// worktree add`, which a linked worktree runs from where it stands. But
-    /// the reason it is refused *mechanically* rather than merely left out is
-    /// stronger than any of that: a tree lives at `<checkout>/.worktrees/<task>`
-    /// and an `external_directory` rule is a path rule and not an operation
-    /// rule, so under `core-041`'s `edit: allow` a grant on any directory above
-    /// it is write access to every sibling worktree — every other agent's
-    /// uncommitted work — as well as to the shared checkout. `ui-001`'s agent,
-    /// allowed the parent by hand, edited `src/cmd_task.rs` in the main
-    /// checkout and had to `git apply -R` its way back out.
+    /// the reason a **ref** is refused *mechanically* rather than merely left
+    /// out is stronger than any of that: a tree lives at
+    /// `<checkout>/.worktrees/<task>` and an `external_directory` rule is a path
+    /// rule and not an operation rule, so under `core-041`'s `edit: allow` a
+    /// grant on any directory above it is write access to every sibling
+    /// worktree — every other agent's uncommitted work — as well as to the
+    /// shared checkout. `ui-001`'s agent, allowed the parent by hand, edited
+    /// `src/cmd_task.rs` in the main checkout and had to `git apply -R` its way
+    /// back out. `wsp-123` grants the project's root and pays for it with a
+    /// deny on the worktrees under it; a ref is nobody's project, so it buys
+    /// nothing and is still refused.
     #[test]
-    fn nothing_above_the_agents_own_tree_is_reachable_however_it_was_asked_for() {
+    fn a_ref_above_the_agents_own_tree_is_refused_and_only_a_projects_root_is_not() {
         let store = seat("reach-parent");
         let checkout = std::env::temp_dir().join("wsp-reach-parent-checkout");
         let tree = checkout.join(".worktrees/ui-010");
@@ -2893,11 +2977,105 @@ mod tests {
         t.refs = vec![checkout.join("README.md").display().to_string()];
         store.save_task(&t).unwrap();
 
-        let out = reach(&store, Some("ui-010"), Some(&tree.display().to_string()));
+        let out = reach(&store, Some("ui-010"), None, Some(&tree.display().to_string()));
         assert_eq!(
             out,
-            vec![store.root.clone()],
+            Reach { allow: vec![store.root.clone()], deny: vec![] },
             "a rule on the parent covers every sibling tree under it — {out:?}"
+        );
+    }
+
+    /// A seat reaches the root of the project its row is in, and not the trees
+    /// beside its own.
+    ///
+    /// **`wsp-123`, and the test the row asks for is here rather than in the
+    /// config, because the choice is made here.** A compound seat was configured
+    /// with a reach that named the **wsp** store and nothing else — the store is
+    /// the one thing every seat shares — and two such seats each stopped on
+    /// `external_directory` within ninety seconds of starting, one of them for
+    /// `~/claude/compound`, the trunk of the project they were working in. A
+    /// grant that names the store is a grant that names one repository, which is
+    /// `wsp-116`, `wsp-119` and `wsp-115`'s failure wearing a different hat: a
+    /// value that was right for one project and left behind when the work moved
+    /// to another. So the root comes from the row's project, and a project
+    /// nobody has heard of is covered by having a project.
+    ///
+    /// `compound`'s two roots are the shape that matters, and both halves of
+    /// `roots_of` are asserted rather than one: `wsp-112` made that walk name
+    /// every root precisely so a caller that can tell them apart does, and a
+    /// reach that quietly took the first would leave a row whose work is in the
+    /// second prompting exactly as this row's did.
+    #[test]
+    fn a_seat_reaches_the_root_of_the_project_its_row_is_in_and_not_its_siblings_trees() {
+        let store = seat("reach-root");
+        let home = std::env::temp_dir().join("wsp-reach-root-home");
+        let _ = std::fs::remove_dir_all(&home);
+        let mut compound = Project::new("compound");
+        compound.roots = vec![
+            home.join("compound").display().to_string(),
+            home.join("wsp").display().to_string(),
+        ];
+        store.save_project(&compound).unwrap();
+        let mut t = Task::new("work in a project of two roots", "compound-201");
+        t.project = Some("compound".into());
+        store.save_task(&t).unwrap();
+        // The tree is where `wsp checkout` puts it, which is inside the first
+        // root: the ancestor case is the one that earns a deny.
+        let tree = home.join("compound/.worktrees/compound-201");
+
+        // No project named by the caller, so this is the row's own — which is
+        // how `spawn` calls it and how a resumed seat is answered too.
+        let out = reach(&store, Some("compound-201"), None, Some(&tree.display().to_string()));
+        assert!(
+            out.allow.contains(&home.join("compound")),
+            "the root the seat's own tree stands in — {out:?}"
+        );
+        assert!(
+            out.allow.contains(&home.join("wsp")),
+            "and the project's other root, which `roots_of` names and `root_of` would not — {out:?}"
+        );
+        assert_eq!(
+            out.deny,
+            vec![home.join("compound").join(cmd_checkout::WORKTREES)],
+            "every other seat's uncommitted work, refused by name — {out:?}"
+        );
+        assert!(
+            !out.deny.contains(&home.join("wsp").join(cmd_checkout::WORKTREES)),
+            "a root this seat is not standing in has no trees of ours under it, and a rule \
+             matching nothing is noise — {out:?}"
+        );
+
+        // And the same project reached by name rather than through the row,
+        // which is the custodian's route: one answer, not two.
+        let named = reach(&store, None, Some("compound"), Some(&tree.display().to_string()));
+        assert_eq!(named, out, "a scope and a row are the same question — {named:?}");
+    }
+
+    /// A project's root is resolved, not written as a person typed it.
+    ///
+    /// The 2026-09-27 drive behind `wsp-123` is what showed opencode matching
+    /// the **resolved** path: a rule naming a symlinked root matches nothing at
+    /// all, which is this row's own failure — a seat prompting inside its own
+    /// project — wearing a different hat. A root that does not exist resolves to
+    /// itself and grants nothing, which is the right answer for a project whose
+    /// checkout lives on another machine.
+    #[test]
+    fn a_projects_root_is_resolved_because_opencode_matches_the_resolved_path() {
+        let store = seat("reach-real");
+        let real = std::env::temp_dir().join("wsp-reach-real-compound");
+        let _ = std::fs::remove_dir_all(&real);
+        std::fs::create_dir_all(&real).unwrap();
+        let link = std::env::temp_dir().join("wsp-reach-real-link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut p = Project::new("linked");
+        p.roots = vec![link.display().to_string()];
+        store.save_project(&p).unwrap();
+
+        let out = reach(&store, None, Some("linked"), Some("/nowhere/near"));
+        assert!(
+            out.allow.contains(&real.canonicalize().unwrap()),
+            "the path opencode compares against — {out:?}"
         );
     }
 
@@ -2918,10 +3096,10 @@ mod tests {
         ];
         store.save_task(&t).unwrap();
 
-        let out = reach(&store, Some("ui-011"), Some("/nowhere/near"));
+        let out = reach(&store, Some("ui-011"), None, Some("/nowhere/near"));
         assert_eq!(
             out,
-            vec![store.root.clone()],
+            Reach { allow: vec![store.root.clone()], deny: vec![] },
             "the store already answers for everything under it — {out:?}"
         );
     }
@@ -3294,7 +3472,7 @@ mod tests {
             None,
             None,
             false,
-            Some(Occupant { kind: "opencode", brief: Some(&brief), reach: &[] }),
+            Some(Occupant { kind: "opencode", brief: Some(&brief), reach: &Reach::default() }),
             false,
         );
         let cfg = o.env.get("OPENCODE_CONFIG_CONTENT").expect("opencode was given no config");
@@ -3320,12 +3498,13 @@ mod tests {
         // neighbours are right to set what they read, and a claim about one
         // kind should not need the whole suite to hold still.
         assert!(
-            agent_commands::of("claude").env(Some(&brief), &[]).is_empty(),
+            agent_commands::of("claude").env(Some(&brief), &Reach::default()).is_empty(),
             "a kind that needs no configuring is unchanged"
         );
         // …and the seat it is composed into is an ordinary one, which is the
         // other half of `unchanged` and the half `seat_env` could break.
-        let claude = order(&work, None, None, false, Some(Occupant { kind: "claude", brief: Some(&brief), reach: &[] }), false);
+        let seat = Some(Occupant { kind: "claude", brief: Some(&brief), reach: &Reach::default() });
+        let claude = order(&work, None, None, false, seat, false);
         assert_eq!(claude.env.get("WSP_TASK").map(String::as_str), Some("oc-001"));
         assert!(claude.env.get("OPENCODE_CONFIG_CONTENT").is_none(), "one kind's spelling reached another's seat");
     }

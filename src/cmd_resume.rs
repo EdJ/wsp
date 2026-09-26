@@ -694,7 +694,7 @@ fn thread_for(store: &Store, needle: &str) -> Result<Thread, String> {
 /// Asked with the emptiest seat there is — no brief, nothing outside the tree —
 /// so the answer is about the kind and not about which row is being resumed.
 fn needs_a_seat_wsp_opened(kind: &str) -> bool {
-    !agent_commands::of(kind).env(None, &[]).is_empty()
+    !agent_commands::of(kind).env(None, &cmd_spawn::Reach::default()).is_empty()
 }
 
 /// Where to start the agent: back in the room it was in, or a new one.
@@ -816,7 +816,17 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
                         // half and none of the runtime's — a resumed agent
                         // doing the same work under a narrower policy would be
                         // that defect written again.
-                        reach: &cmd_spawn::reach(store, t.task.as_deref(), Some(&t.cwd)),
+                        reach: &cmd_spawn::reach(
+                            store,
+                            t.task.as_deref(),
+                            // A custodian's project is recorded as its scope
+                            // rather than as its task's project, and `reach`
+                            // reads the row's own when it is given nothing — so
+                            // a resumed seat reaches exactly what the spawn
+                            // reached.
+                            t.seat_of.as_deref(),
+                            Some(&t.cwd),
+                        ),
                     }),
                     t.seat_of.as_deref(),
                     t.task.as_deref(),

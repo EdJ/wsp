@@ -1095,9 +1095,15 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // project's recorded root walks up out of its own tree — and three opencodes
     // did, one of them editing `src/cmd_task.rs` in the shared checkout before
     // anyone noticed. Every tracked file is already here, including the
-    // `README.md` the handbook sends them to, and the alternative to this
-    // clause is a standing `external_directory` allow on the parent, which
-    // would cover every sibling agent's tree as well. Six words against that.
+    // `README.md` the handbook sends them to. Six words against that.
+    //
+    // **It is also the only thing standing between an agent and the shared
+    // checkout now that `wsp-123` grants one**, which is a sentence to be
+    // uneasy about rather than a guardrail. The grant is a path rule and not an
+    // operation rule, so the trunk is writeable through the file tools and this
+    // is what says not to; the trees beside this one are denied by name, which
+    // is the half that is enforced. A dirty `git status` in the trunk is what a
+    // crossed line looks like, which is how `ui-001` was caught.
     if r.own_tree.is_some() {
         row(
             "tree",
