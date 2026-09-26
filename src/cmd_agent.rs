@@ -4494,6 +4494,47 @@ impl Probe {
     }
 }
 
+/// Every seat on this machine, from every backend that will answer.
+///
+/// **The one fleet reading, and it exists because there were three
+/// (`wsp-119`).** `wip`, the panel and the attention pass each built a census,
+/// and the one that judged a *binding* — [`bound_state`], and with it `doctor`
+/// and the `agent-gone` signal — built it out of two herdr listings and nothing
+/// else. A compound seat is not a herdr pane, so on the machine
+/// `compound-112`'s flip makes the ordinary one, that reading had no answer for
+/// every seat in the fleet and said so by reporting nothing.
+///
+/// Three readers of one question is already two too many; three *definitions*
+/// of it is how the exception for a seat nobody is watching got quietly lost
+/// from one of them. So the fold lives here, beside [`Probe`] because herdr's
+/// half is the probe's two listings rather than a second round trip — two
+/// listings taken a moment apart is how a pane comes to be in one and not the
+/// other, which is the fault [`Probe::Up`] exists to keep out.
+///
+/// A backend that said nothing is a [`crate::place::Census::silent`] entry and
+/// not an absence: `unheard()` is how `wsp watch` tells a governor which source
+/// it is blind through, and dropping the entry would have it report blindness
+/// nowhere on a machine that is blind everywhere.
+pub(crate) fn fleet_census(probe: &Probe) -> crate::place::Census {
+    let herdr = match probe {
+        Probe::Up { agents, panes } => {
+            crate::place::Census::heard("", crate::place_herdr::seated_rows(agents, panes))
+        }
+        Probe::Unreachable(e) => crate::place::Census::silent(
+            "",
+            crate::place::Refusal::Unreachable(format!("herdr unreachable: {e}")),
+        ),
+        Probe::Down => crate::place::Census::silent(
+            "",
+            crate::place::Refusal::Unreachable("no herdr socket on this machine".to_string()),
+        ),
+    };
+    match crate::place_compound::Compound::new().census() {
+        Ok(compound) => herdr.and(compound),
+        Err(e) => herdr.and(crate::place::Census::silent("compound", e)),
+    }
+}
+
 /// Which of five states a bound pane is in, and the two in the middle are the
 /// ones a census kept confusing with work.
 ///
@@ -4517,42 +4558,81 @@ impl Probe {
 /// all seven and said `herdr up, 12 agents`. Nothing had been written to a task
 /// in hours. The reading that separates them was on the socket the whole time
 /// (`place::State::turn_in_flight`), and this asks it.
+///
+/// **[`Bound::Emptied`] is the third, and it is this function being asked a
+/// herdr question and handed a compound seat.** `wsp-119`. This took two
+/// `herdr::Pane` listings, so a seat no herdr socket lists — every seat
+/// `compound-112`'s flip opens, which after it is every seat on the ordinary
+/// machine — missed both arms and fell to [`may_reap`], which a compound seat
+/// never passes: it names no herdr machine, so the answer is [`Bound::Unheard`]
+/// and the check concludes it knows nothing about a seat it could have read in
+/// full. The failure was not a threshold and no threshold would have fixed it.
+/// **A dead compound seat raised nothing**: its pid had exited, its claim and
+/// its worktree were still held, and the one reading that could have seen that
+/// was a herdr listing with nothing in it.
+///
+/// So the rows come from the port now, from the same folded [`crate::place::Census`]
+/// `wip` builds, and this function is a reading of *a seat* rather than of a
+/// herdr pane. That is the whole of the repair, and it is two defects rather
+/// than one: a dead compound seat raised nothing, and the readers that judged
+/// a stopped seat were reading two different sources — `wip` and the panel off
+/// the census, this and `doctor` off herdr — so nothing stopped a signal and
+/// the census beside it from disagreeing about the same seat in the same
+/// second.
 pub(crate) enum Bound {
     /// A turn is in flight. This, and only this, is work happening.
     Turning,
-    /// An agent is in the pane and no turn is running. Finished, stopped, or
+    /// An agent is in the seat and no turn is running. Finished, stopped, or
     /// waiting on a person — see [`State::turn_in_flight`] for why this does not
     /// try to say which, and [`quiet_note`] for what makes it worth reporting.
     Quiet(State),
-    /// The pane is listed and no agent is in it. `despawn`, then decide.
+    /// The seat is still there and its agent is not: a pane herdr lists with
+    /// nothing in it, or a compound seat whose pid has exited. `despawn`, then
+    /// decide.
     Emptied,
-    /// The pane is not listed, and its machine did answer. `sync` reaps it.
+    /// No source lists it, and the machine that could have said something did.
+    /// `sync` reaps it — this arm exists to agree with the sweep exactly, and
+    /// [`crate::sync`] is where that agreement is load-bearing.
     Gone,
-    /// The machine this pane is on said nothing, so nothing is known.
+    /// Nothing that could have listed this seat said anything, so nothing is
+    /// known. Never reaped on, never reported.
     Unheard,
 }
 
 pub(crate) fn bound_state(
-    pane: &str,
-    agents: &[herdr::Pane],
-    panes: &[herdr::Pane],
+    seat: &str,
+    rows: &[crate::place::Seated],
     answered: &std::collections::BTreeMap<&str, usize>,
 ) -> Bound {
-    if let Some(a) = agents.iter().find(|a| a.pane_id == pane) {
-        // The status alone. See `place_herdr::state_of_pane` for why a census
-        // must not qualify this by readiness.
-        let state = crate::place_herdr::state_of_pane(a);
-        return match state.turn_in_flight() {
-            true => Bound::Turning,
-            false => Bound::Quiet(state),
-        };
-    }
-    if panes.iter().any(|p| p.pane_id == pane) {
-        return Bound::Emptied;
-    }
-    match may_reap(answered, pane) {
-        true => Bound::Gone,
-        false => Bound::Unheard,
+    // The census's own reading, unqualified. See `place_herdr::state_of_pane`
+    // for why a reading of *whether work is happening* must not be qualified by
+    // readiness — and [`fleet_census`] for why the qualification herdr's *own*
+    // census does apply is the one that has to stand, so that this and `wip`
+    // cannot answer differently about one seat.
+    match rows.iter().find(|r| r.seat.as_str() == seat) {
+        Some(r) => match r.state {
+            s if s.turn_in_flight() => Bound::Turning,
+            s if s.is_running() => Bound::Quiet(s),
+            // A seat that is still there with nothing running in it. A pane with
+            // no agent in it and a compound seat whose pid has exited are the
+            // same fact reached two ways, and `State::Gone`'s own doc is the
+            // second of them — herdr cannot answer it from a listing, which is
+            // why this arm reads the agent as well as the state: a row whose
+            // state nobody can vouch for but which names an agent in it is an
+            // agent we cannot see, not an empty seat, and the two want opposite
+            // handling.
+            _ if r.agent.kind.is_empty() || matches!(r.state, crate::place::State::Gone) => {
+                Bound::Emptied
+            }
+            // An agent in a seat that is not turning and not visibly running:
+            // `Quiet`, and `quiet_note` has nothing to say about a state this
+            // far from a fact.
+            _ => Bound::Quiet(r.state),
+        },
+        None => match may_reap(answered, seat) {
+            true => Bound::Gone,
+            false => Bound::Unheard,
+        },
     }
 }
 
@@ -4639,89 +4719,110 @@ fn few(named: &[String]) -> String {
 
 /// What `doctor` says about herdr, and about the bindings that outlived it.
 ///
-/// `tasks` is here for one reason: an agent's last turn is a fact about herdr
+/// `tasks` is here for one reason: an agent's last turn is a fact about a seat
 /// and its last *output* is a fact about the store, and the check this function
 /// gained needs both in the same place. See [`quiet_note`].
-fn herdr_health(
+///
+/// **`seats` rather than a herdr listing, and the binding loop is no longer
+/// inside the `Probe::Up` arm (`wsp-119`).** It used to be both, and each was
+/// right about the machine it was written for: a machine with no herdr on it has
+/// nothing to say about bindings *herdr* holds, and one with herdr up has no
+/// compound seats to have gone quiet. Which left the ordinary machine — the one
+/// `compound-112`'s flip leaves with every seat on it a compound seat — with a
+/// `doctor` that reported no problem about any of them, on the day six of seven
+/// agents were killed by a limit. The census is asked instead, and it answers
+/// for every backend wsp can spawn onto; what is left of the probe is the
+/// machine's own health, which is the only part of this that is herdr's to say.
+fn seat_health(
     probe: &Probe,
+    seats: &[crate::place::Seated],
     bindings: &std::collections::BTreeMap<String, serde_json::Value>,
     tasks: &[Task],
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
-    match probe {
-        Probe::Up { agents, panes } => {
-            let answered = answered_by_machine(panes.iter().map(|p| p.pane_id.as_str()));
-            let (mut emptied, mut gone) = (Vec::new(), Vec::new());
-            let (mut quiet, mut turning) = (Vec::new(), 0usize);
-            for (pane, b) in bindings {
-                // Named by the work rather than by the pane, because the work
-                // is what the reader has to decide about and what the verb
-                // underneath takes.
-                let task = b.get("task_id").and_then(|x| x.as_str()).unwrap_or("");
-                let named = match task.is_empty() {
-                    true => pane.clone(),
-                    false => format!("{task} ({pane})"),
-                };
-                match bound_state(pane, agents, panes, &answered) {
-                    Bound::Emptied => emptied.push(named),
-                    Bound::Gone => gone.push(named),
-                    Bound::Turning => turning += 1,
-                    Bound::Quiet(state) => {
-                        // The later of the two, because either one moving is
-                        // the work advancing: `started_at` covers an agent put
-                        // on a task that already had a long history, and
-                        // `updated` covers everything after that.
-                        let started = b.get("started_at").and_then(|x| x.as_str());
-                        let touched = tasks.iter().find(|t| t.id == task).map(|t| t.updated.as_str());
-                        let last = [started, touched].into_iter().flatten().max();
-                        let status = tasks
-                            .iter()
-                            .find(|t| t.id == task)
-                            .map(|t| t.status())
-                            .unwrap_or(Status::Doing);
-                        if let Some(why) = quiet_note(state, status, last) {
-                            quiet.push(format!("{named} — {why}"));
-                        }
-                    }
-                    Bound::Unheard => {}
+    let (agents, panes): (&[herdr::Pane], &[herdr::Pane]) = match probe {
+        Probe::Up { agents, panes } => (agents, panes),
+        // Nothing was heard from, so nothing may be judged: `answered` comes out
+        // empty and every binding on a herdr machine reads [`Bound::Unheard`],
+        // which is the same judgement `sync` makes before it reaps.
+        _ => (&[], &[]),
+    };
+    // The sweep over every binding, judged on the census rather than on the
+    // machine herdr happens to be on.
+    let answered = answered_by_machine(panes.iter().map(|p| p.pane_id.as_str()));
+    let (mut emptied, mut gone) = (Vec::new(), Vec::new());
+    let (mut quiet, mut turning) = (Vec::new(), 0usize);
+    for (pane, b) in bindings {
+        // Named by the work rather than by the seat, because the work is what
+        // the reader has to decide about and what the verb underneath takes.
+        let task = b.get("task_id").and_then(|x| x.as_str()).unwrap_or("");
+        let named = match task.is_empty() {
+            true => pane.clone(),
+            false => format!("{task} ({pane})"),
+        };
+        match bound_state(pane, seats, &answered) {
+            Bound::Emptied => emptied.push(named),
+            Bound::Gone => gone.push(named),
+            Bound::Turning => turning += 1,
+            Bound::Quiet(state) => {
+                // The later of the two, because either one moving is the work
+                // advancing: `started_at` covers an agent put on a task that
+                // already had a long history, and `updated` covers everything
+                // after that.
+                let started = b.get("started_at").and_then(|x| x.as_str());
+                let touched = tasks.iter().find(|t| t.id == task).map(|t| t.updated.as_str());
+                let last = [started, touched].into_iter().flatten().max();
+                let status = tasks
+                    .iter()
+                    .find(|t| t.id == task)
+                    .map(|t| t.status())
+                    .unwrap_or(Status::Doing);
+                if let Some(why) = quiet_note(state, status, last) {
+                    quiet.push(format!("{named} — {why}"));
                 }
             }
-            if !emptied.is_empty() {
-                notes.push(format!(
-                    "{} pane(s) alive with the agent gone — {} — claim and worktree \
-                     still held, and `wsp sync` will not touch these. `wsp despawn <id>` \
-                     gives one up; `wsp spawn <id>` puts a fresh agent on it",
-                    emptied.len(),
-                    few(&emptied)
-                ));
-            }
-            if !gone.is_empty() {
-                notes.push(format!(
-                    "{} binding(s) on panes herdr no longer lists — `wsp sync` reaps them",
-                    gone.len()
-                ));
-            }
-            // A problem rather than a note, which is the whole point of the
-            // task this came from: it was a note-shaped failure — everything
-            // reporting healthy — that cost a night. The conversation in each
-            // of these is intact, so `wsp tell` is the first thing to try and
-            // `wsp despawn` the last.
-            problems.extend(quiet.iter().cloned());
-            // Counted rather than listed, and the count is the correction. The
-            // old line said "12 agents" of a machine on which five were turning
-            // and seven had stopped, and read as health.
-            notes.push(format!(
-                "herdr up, {} agents — {turning} of {} claimed pane(s) running a turn",
-                agents.len(),
-                bindings.len()
-            ));
+            Bound::Unheard => {}
         }
+    }
+    if !emptied.is_empty() {
+        notes.push(format!(
+            "{} seat(s) alive with the agent gone — {} — claim and worktree \
+             still held, and `wsp sync` will not touch these. `wsp despawn <id>` \
+             gives one up; `wsp spawn <id>` puts a fresh agent on it",
+            emptied.len(),
+            few(&emptied)
+        ));
+    }
+    if !gone.is_empty() {
+        notes.push(format!(
+            "{} binding(s) on panes herdr no longer lists — `wsp sync` reaps them",
+            gone.len()
+        ));
+    }
+    // A problem rather than a note, which is the whole point of the task this
+    // came from: it was a note-shaped failure — everything reporting healthy —
+    // that cost a night. The conversation in each of these is intact, so
+    // `wsp tell` is the first thing to try and `wsp despawn` the last.
+    problems.extend(quiet.iter().cloned());
+    // And then the machine itself, which is the only part of this herdr's to
+    // answer. It goes last because on a machine with no herdr on it the sweep
+    // above can still have found something, and a line saying the socket is
+    // missing reads as the whole report.
+    match probe {
+        // Counted rather than listed, and the count is the correction. The old
+        // line said "12 agents" of a machine on which five were turning and
+        // seven had stopped, and read as health.
+        Probe::Up { .. } => notes.push(format!(
+            "herdr up, {} agents — {turning} of {} claimed seat(s) running a turn",
+            agents.len(),
+            bindings.len()
+        )),
         Probe::Unreachable(e) => problems.push(format!("herdr socket present but unreachable: {e}")),
         // Not a problem. A machine with no herdr on it is a machine wsp works
         // on, and calling that broken is how a check nobody can act on gets
         // ignored along with the ones they can.
-        Probe::Down => notes
+        _ => notes
             .push("herdr socket not found (CLI still works, sidebar tokens will not update)".into()),
     }
 }
@@ -5073,7 +5174,11 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     section_damage(store, args, &tasks, &index.projects, &mut problems, &mut notes);
 
     let probe = Probe::live();
-    herdr_health(&probe, &bindings, &tasks, &mut problems, &mut notes);
+    // The census every backend answers for, and the same one `wip` builds — so
+    // a binding this reports on and a row a person is looking at cannot be two
+    // readings of one seat. `wsp-119`; see [`seat_health`].
+    let seats: Vec<crate::place::Seated> = fleet_census(&probe).seats().cloned().collect();
+    seat_health(&probe, &seats, &bindings, &tasks, &mut problems, &mut notes);
     // And whether anybody is in the seats. Off the same probe, because a check
     // that read herdr again could disagree with the one above it about what
     // answered — see [`cmd_govern::health`], which is the only thing in wsp
@@ -5878,11 +5983,41 @@ mod tests {
         assert_eq!(up[0].body(), "The retry hazard is live.");
     }
 
-    /// A row of `agent.list`, and deliberately without `interactive_ready`:
-    /// that is how a plugin-reported agent arrives, and a census that could not
-    /// read one would be blind to a whole class of agent.
+    /// A row of `agent.list`, with the readiness a herdr sends for an agent it
+    /// launched — which is every agent wsp starts, and the only reason
+    /// [`crate::place_herdr::state_of_agent`] will read a status word at all.
+    ///
+    /// It used to be built *without* that field, to model a plugin-reported
+    /// agent, and `bound_state` read the status off such a row regardless
+    /// because it asked [`crate::place_herdr::state_of_pane`] rather than the
+    /// census. **That was the disagreement this row's own change removed**
+    /// (`wsp-119`): `wip` read the same seat as `Unknown` — nothing known — and
+    /// `bound_state` read it as `Working`, so the panel and `doctor` could
+    /// report opposite facts about one agent in the same second. One reading is
+    /// left, it is the census's, and a plugin-reported agent is `Unknown` in
+    /// both, which is the direction an absence has to fail in.
     fn listed(pane: &str, status: &str) -> herdr::Pane {
-        herdr::parse_pane(&json!({ "pane_id": pane, "agent": "claude", "agent_status": status }))
+        herdr::parse_pane(&json!({
+            "pane_id": pane, "agent": "claude", "agent_status": status, "interactive_ready": true
+        }))
+    }
+
+    /// The census a herdr's two listings produce, which is what `bound_state` is
+    /// asked about now. `place_herdr`'s own call rather than a hand-built row
+    /// list, so a fixture here cannot agree with the code by construction.
+    fn census_of(agents: &[herdr::Pane], panes: &[herdr::Pane]) -> Vec<crate::place::Seated> {
+        crate::place_herdr::seated_rows(agents, panes)
+    }
+
+    /// The same, from a probe — the shape `doctor` hands `seat_health`, and
+    /// deliberately *only* herdr's half of it. `fleet_census` would add every
+    /// other backend on this machine, and a test that wants to know what herdr
+    /// said must not have the machine's real compound seats folded in beside it.
+    fn census_of_probe(probe: &Probe) -> Vec<crate::place::Seated> {
+        match probe {
+            Probe::Up { agents, panes } => census_of(agents, panes),
+            _ => Vec::new(),
+        }
     }
 
     /// The failure this file's census was rebuilt for, at the one line that
@@ -5897,7 +6032,8 @@ mod tests {
     fn an_agent_that_is_listed_is_not_thereby_working() {
         let answered = answered_by_machine(["w1:p1", "w2:p1", "w3:p1"]);
         let panes = vec![listed("w1:p1", "working"), listed("w2:p1", "idle"), listed("w3:p1", "blocked")];
-        let bound = |p: &str| bound_state(p, &panes, &panes, &answered);
+        let rows = census_of(&panes, &panes);
+        let bound = |p: &str| bound_state(p, &rows, &answered);
 
         assert!(matches!(bound("w1:p1"), Bound::Turning), "a turn in flight is the only working");
         assert!(matches!(bound("w2:p1"), Bound::Quiet(State::Idle)), "alive, and nothing happening");
@@ -5909,8 +6045,79 @@ mod tests {
         // And the two states that were already named stay where they were: this
         // split the `Yes` arm and left the `No` arms alone.
         let empty = herdr::parse_pane(&json!({ "pane_id": "w4:p1" }));
-        assert!(matches!(bound_state("w4:p1", &[], &[empty], &answered), Bound::Emptied));
-        assert!(matches!(bound_state("w9:p1", &[], &[], &answered), Bound::Gone));
+        let with_empty = census_of(&[], std::slice::from_ref(&empty));
+        assert!(matches!(bound_state("w4:p1", &with_empty, &answered), Bound::Emptied));
+        assert!(matches!(bound_state("w9:p1", &[], &answered), Bound::Gone));
+    }
+
+    /// **The defect this row was filed for, in the one direction that was
+    /// silent** (`wsp-119`): a seat that is not a herdr pane, whose agent has
+    /// exited, with its claim and its worktree still held.
+    ///
+    /// A compound seat never appears in either herdr listing, so the old
+    /// signature missed both arms and fell through to the reap guard — which a
+    /// compound id cannot pass, because it names no herdr machine. The answer
+    /// was `Unheard`, and `Unheard` is the arm that says *nothing is known*, so
+    /// the check reported ignorance about a seat it could have read in full, and
+    /// said nothing about a dead one. Both callers inherited it: `doctor` on
+    /// every machine, and the `agent-gone` signal on every machine without a
+    /// herdr socket, which after `compound-112` is every machine.
+    ///
+    /// Driven through the census rather than through a herdr fixture, because
+    /// the whole of the fault was that the answer came from somewhere that
+    /// could not see the seat.
+    #[test]
+    fn a_compound_seat_whose_agent_exited_is_emptied_rather_than_unheard() {
+        let answered = answered_by_machine(["w1:p1"]);
+        let rows = vec![crate::place::Seated {
+            seat: crate::place::Seat::new("cpd-70"),
+            label: String::new(),
+            cwd: String::new(),
+            agent: crate::place::Agent { kind: "claude".into(), ..Default::default() },
+            // What `place_compound::state_of` answers when the pid the seat
+            // recorded is not in the process table.
+            state: State::Gone,
+            session: String::new(),
+        }];
+        assert!(
+            matches!(bound_state("cpd-70", &rows, &answered), Bound::Emptied),
+            "the seat is there and its agent is not, which is what herdr calls an emptied pane"
+        );
+        // The other answer, and it is `may_reap`'s rather than this function's:
+        // a seat no source listed is `Gone` exactly when `sync` would reap its
+        // binding, which is the agreement `doctor` has to keep with the sweep
+        // (`sync.rs`'s `kept_bindings` — compound-119 folded compound's own live
+        // seats into that `live` for exactly this id shape).
+        assert!(matches!(bound_state("cpd-71", &[], &answered), Bound::Gone));
+        // And on a machine where no herdr answered, nothing may be judged at
+        // all — the arm that has to mean *nobody knows anything about this*.
+        assert!(matches!(bound_state("cpd-71", &[], &BTreeMap::new()), Bound::Unheard));
+    }
+
+    /// A seat with an agent in it that no source can vouch for is `Quiet`, and
+    /// not `Emptied`.
+    ///
+    /// The arm that would send a person to `wsp despawn` a seat that may still
+    /// have a live agent in it is the one that has to be careful, and the way to
+    /// be careful is to read the agent as well as the state: herdr cannot
+    /// distinguish an exited agent's pane from a shell, so a row whose state is
+    /// unreadable but which names an agent is an agent we cannot *see* — and
+    /// `State::stopped`'s own doc is the rule, applied one step earlier.
+    #[test]
+    fn a_seat_with_an_unreadable_agent_in_it_is_not_called_emptied() {
+        let answered = answered_by_machine(["w1:p1"]);
+        let rows = vec![crate::place::Seated {
+            seat: crate::place::Seat::new("w1:p1"),
+            label: String::new(),
+            cwd: String::new(),
+            agent: crate::place::Agent { kind: "claude".into(), ..Default::default() },
+            state: State::Unknown,
+            session: String::new(),
+        }];
+        assert!(
+            matches!(bound_state("w1:p1", &rows, &answered), Bound::Quiet(State::Unknown)),
+            "we cannot see it, so we do not tell a person to despawn it"
+        );
     }
 
     /// herdr answers `done` for an agent that went idle while nobody was
@@ -5927,8 +6134,9 @@ mod tests {
     fn an_agent_nobody_has_looked_at_is_idle_and_not_a_mystery() {
         let answered = answered_by_machine(["w1:p1"]);
         let panes = vec![listed("w1:p1", "done")];
+        let rows = census_of(&panes, &panes);
         assert!(matches!(
-            bound_state("w1:p1", &panes, &panes, &answered),
+            bound_state("w1:p1", &rows, &answered),
             Bound::Quiet(State::Idle)
         ));
     }
@@ -6603,12 +6811,21 @@ mod tests {
 
     // ---- wip, offline ------------------------------------------------------
 
+    /// A `herdr::Pane` as `agent.list` and `pane.list` render one, **with** the
+    /// `interactive_ready` a herdr sends for an agent it launched. That field is
+    /// not decoration: `place_herdr::state_of_agent` refuses to read a status
+    /// word without it, so a fixture that omits it is an agent herdr has never
+    /// described, and the census reads it as `Unknown` — a seat wsp cannot see.
+    /// `wsp-119`: `bound_state` used to read the status off such a row anyway,
+    /// which is how `doctor` and `wip` came to hold opposite facts about one
+    /// agent.
     fn wip_agent(pane: &str, ws: &str, state: &str, title: &str) -> herdr::Pane {
         herdr::Pane {
             pane_id: pane.to_string(),
             workspace_id: ws.to_string(),
             agent: "claude".into(),
             agent_status: state.to_string(),
+            interactive_ready: Some(true),
             title: title.to_string(),
             ..Default::default()
         }
@@ -7142,7 +7359,8 @@ mod tests {
 
         let say = |probe: Probe| {
             let (mut problems, mut notes) = (Vec::new(), Vec::new());
-            herdr_health(&probe, &bindings, &[], &mut problems, &mut notes);
+            let seats = census_of_probe(&probe);
+            seat_health(&probe, &seats, &bindings, &[], &mut problems, &mut notes);
             (problems, notes)
         };
 
@@ -7178,7 +7396,7 @@ mod tests {
         // read as twelve agents working on the night seven of them had
         // stopped, and the count that answers that question is the second one.
         assert!(
-            notes.iter().any(|n| n == "herdr up, 1 agents — 1 of 1 claimed pane(s) running a turn"),
+            notes.iter().any(|n| n == "herdr up, 1 agents — 1 of 1 claimed seat(s) running a turn"),
             "{notes:?}"
         );
     }
@@ -7215,7 +7433,8 @@ mod tests {
         let emptied = labelled("w2:p1", "w2", "");
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         let probe = Probe::Up { agents: vec![busy.clone()], panes: vec![busy, emptied] };
-        herdr_health(&probe, &bindings, &[], &mut problems, &mut notes);
+        let seats = census_of_probe(&probe);
+        seat_health(&probe, &seats, &bindings, &[], &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
 
         let gone = note_about(&notes, "no longer lists");
@@ -7223,7 +7442,7 @@ mod tests {
         assert!(gone.contains("wsp sync"), "the sweep is right for a pane that is gone: {gone}");
 
         let empty = note_about(&notes, "agent gone");
-        assert!(empty.starts_with("1 pane(s)"), "{empty}");
+        assert!(empty.starts_with("1 seat(s)"), "{empty}");
         assert!(empty.contains("t-002 (w2:p1)"), "named by the work to decide about: {empty}");
         assert!(!empty.contains("t-001"), "an agent that is working is not emptied: {empty}");
         assert!(!empty.contains("t-003"), "an absent pane is the other state: {empty}");
@@ -7257,7 +7476,9 @@ mod tests {
         }
 
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
-        herdr_health(&Probe::live(), &bindings, &[], &mut problems, &mut notes);
+        let probe = Probe::live();
+        let seats = census_of_probe(&probe);
+        seat_health(&probe, &seats, &bindings, &[], &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
         assert!(notes.iter().any(|n| n.starts_with("herdr up, 1 agents")), "{notes:?}");
 
@@ -7285,12 +7506,74 @@ mod tests {
         let here = wip_agent("w1:p1", "w1", "working", "");
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         let probe = Probe::Up { agents: vec![here.clone()], panes: vec![here] };
-        herdr_health(&probe, &bindings, &[], &mut problems, &mut notes);
+        let seats = census_of_probe(&probe);
+        seat_health(&probe, &seats, &bindings, &[], &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
 
         let gone = note_about(&notes, "no longer lists");
         assert!(gone.starts_with("1 binding(s)"), "mb2 was never heard from: {gone}");
         assert!(!gone.contains("mb2"), "{gone}");
+    }
+
+    /// **`doctor` on the machine `compound-112`'s flip leaves** (`wsp-119`): no
+    /// herdr socket, one compound seat, its agent killed.
+    ///
+    /// The whole binding sweep used to live inside the `Probe::Up` arm, so on
+    /// this machine it did not run at all — and `doctor`, the one tool a person
+    /// runs to tell a broken machine from a healthy one, printed *no problems*
+    /// over a claim and a worktree held by a seat with nothing in it. That is
+    /// `robustness-083`'s failure wearing a different hat: everything reporting
+    /// healthy, for a fleet that was not.
+    ///
+    /// Driven through the real census rather than a hand-built row, because the
+    /// fault was never in the reading — it was in which seats got read.
+    #[test]
+    fn doctor_reports_a_compound_seat_with_a_dead_agent_on_a_machine_with_no_herdr() {
+        let env = util::isolated("doctor-compound-dead");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+
+        let compound = crate::place_compound::Compound::new();
+        let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let dir = compound.dir_of(&seat).unwrap();
+        let _ends = crate::place_compound::EndsOnDrop(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("seat.json")).unwrap())
+                .unwrap()["pid"]
+                .as_u64()
+                .expect("a live pid") as u32,
+        );
+        let mut child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        child.wait().unwrap();
+        let mut rec: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
+        rec["pid"] = json!(child.id());
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+        let t = Task::new("held by a seat with nobody in it", "cpd-70");
+        store.save_task(&t).unwrap();
+        store.set_binding(seat.as_str(), json!({ "task_id": "cpd-70" }));
+        let bindings = store.bindings();
+        assert_eq!(bindings.len(), 1, "the seat is bound: {bindings:?}");
+
+        // `Probe::Down` and not `Probe::live()`: `herdr::available` caches its
+        // answer for the process, so in a full run some earlier test's fake
+        // server has already latched it to `true` and the live probe would be
+        // answering about that socket rather than about this machine. The value
+        // under test is the shape of the sweep when herdr is not here, and that
+        // is a constructor.
+        let probe = Probe::Down;
+        let seats = fleet_census(&probe).seats().cloned().collect::<Vec<_>>();
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        seat_health(&probe, &seats, &bindings, &store.tasks(), &mut problems, &mut notes);
+
+        assert!(problems.is_empty(), "a dead agent is not a fault in the store: {problems:?}");
+        let empty = note_about(&notes, "agent gone");
+        assert!(empty.contains("cpd-70"), "named by the work: {empty}");
+        assert!(empty.contains("wsp despawn"), "{empty}");
+        // And the machine's own line is still said, because a reader who is told
+        // the socket is missing has to be able to tell that from the whole
+        // report.
+        assert!(notes.iter().any(|n| n.contains("socket not found")), "{notes:?}");
     }
 
     fn labelled(pane: &str, ws: &str, label: &str) -> herdr::Pane {

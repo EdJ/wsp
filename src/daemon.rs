@@ -518,7 +518,7 @@ pub(crate) fn health(
         [] => {
             // Only where it means something is missing. A machine with no herdr
             // is a machine wsp works on and does not need a daemon for, and
-            // `herdr_health` has already said so in its own words.
+            // `cmd_agent::seat_health` has already said so in its own words.
             if herdr_up {
                 notes.push(
                     "no wsp daemon running — tokens and TTLs will not refresh (`wsp daemon`)".into(),

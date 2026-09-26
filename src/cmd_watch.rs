@@ -172,7 +172,7 @@ use crate::cmd_agent::{self, Bound, Probe, Wip};
 use crate::cmd_govern;
 use crate::herdr;
 use crate::model::{Status, Task};
-use crate::place::{Census, Place, Refusal, State};
+use crate::place::State;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -2192,41 +2192,30 @@ impl<'a> Poll<'a> {
 impl Source for Poll<'_> {
     fn sample(&mut self) -> Vec<Signal> {
         let probe = Probe::live();
-        // Constructed here rather than through `Wip::live` so the pane listing
-        // and the agent listing come from one probe. `Wip::live` would ask
-        // herdr for the agents a second time, and two listings taken a
-        // round-trip apart is how a pane comes to be in one and not the other.
-        // Folded into a `Census` of its own rather than left as a bare
-        // `Option<String>`, so it can join the second source below the same
-        // way any other multi-backend reader does — `Census::and` and
-        // `was_heard`'s argument (`compound-064`), arriving here as its third
-        // place (`compound-115`).
-        let (agents, panes, herdr_census) = match &probe {
-            Probe::Up { agents, panes } => {
-                (agents.clone(), panes.clone(), Census::heard("", crate::place_herdr::seated_rows(agents, panes)))
-            }
-            Probe::Unreachable(e) => (
-                Vec::new(),
-                Vec::new(),
-                Census::silent("", Refusal::Unreachable(format!("herdr unreachable: {e}"))),
-            ),
-            Probe::Down => (
-                Vec::new(),
-                Vec::new(),
-                Census::silent("", Refusal::Unreachable("no herdr socket on this machine".to_string())),
-            ),
+        // Every backend's census, folded in one place — `cmd_agent::fleet_census`
+        // — rather than here. This used to fold its own, and so did `wip` and so
+        // did the reading that judged a binding, and the three were three
+        // definitions of one question: whose seat is this, and is anybody in it.
+        // `wsp-119`, and the disagreement it cost was a signal about a compound
+        // seat and a census row about the same compound seat, seconds apart.
+        //
+        // Constructed through the probe rather than through `Wip::live` so the
+        // pane listing and the agent listing come from one probe. `Wip::live`
+        // would ask herdr for the agents a second time, and two listings taken
+        // a round-trip apart is how a pane comes to be in one and not the other.
+        // Herdr's silence is folded in rather than dropped, so `unheard()` below
+        // can say which source a governor is blind through — `compound-064`,
+        // `compound-115`, arriving here as its third place.
+        let census = cmd_agent::fleet_census(&probe);
+        let panes = match &probe {
+            Probe::Up { panes, .. } => panes.clone(),
+            _ => Vec::new(),
         };
-        let up = matches!(probe, Probe::Up { .. });
-        // The second source. A compound seat is not on herdr's socket at all,
-        // so a governor reading only the probe above is blind to every
-        // compound-hosted agent on a machine that runs one — the gap
-        // `compound-115` was opened for, and the one `compound-112`'s flip
-        // makes the common case rather than the rare one.
-        let compound_census = match crate::place_compound::Compound::new().census() {
-            Ok(c) => c,
-            Err(e) => Census::silent("compound", e),
-        };
-        let census = herdr_census.and(compound_census);
+        // Every seat, empty ones included: `wip` drops a seat with nothing in
+        // it because `wip` is about who is working, and (d) below must not,
+        // because "a seat is there and its agent is not" is exactly what it has
+        // to report.
+        let seats: Vec<crate::place::Seated> = census.seats().cloned().collect();
         let wip = Wip {
             tasks: self.store.tasks(),
             index: Index::new(self.store.projects()),
@@ -2235,10 +2224,9 @@ impl Source for Poll<'_> {
             pins: self.store.pins(),
             governors: self.store.governors(),
             agents_held: self.store.agents_held(),
-            // Every backend's census, folded — the same rule `Wip::live`
-            // applies. Empty seats are dropped: `wip` is about who is
-            // working.
-            agents: census.seats().filter(|s| s.state != State::Empty).cloned().collect(),
+            // The same rows (d) is about, with the empty ones dropped. One
+            // reading, filtered twice, rather than two readings.
+            agents: seats.iter().filter(|s| s.state != State::Empty).cloned().collect(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -2398,21 +2386,35 @@ impl Source for Poll<'_> {
         // two callers. `Quiet` is deliberately not handled — a pane with an
         // agent in it and no turn running is (c)'s, and reporting it twice is
         // how a governor learns to skim.
-        if up {
-            let answered = cmd_agent::answered_by_machine(panes.iter().map(|p| p.pane_id.as_str()));
-            for (pane, b) in &wip.bindings {
-                let id = b.get("task_id").and_then(Value::as_str).unwrap_or("");
-                let Some(t) = task_of(id) else { continue };
-                if !mine(t) {
-                    continue;
-                }
-                let detail = match cmd_agent::bound_state(pane, &agents, &panes, &answered) {
-                    Bound::Emptied => format!("{pane} · pane alive, agent gone — the claim and the tree are still held"),
-                    Bound::Gone => format!("{pane} · the pane is gone — wsp sync reaps the binding"),
-                    _ => continue,
-                };
-                out.push(Signal::new(Kind::AgentGone, &t.id, &detail).settling());
+        //
+        // **No `if up` around this, and that gate was the second half of the
+        // fault** (`wsp-119`). It stood for "we know something", and on a machine
+        // with no herdr socket it meant the whole arm stood down — which, after
+        // `compound-112`'s flip, is every ordinary machine, and every agent on
+        // it a compound seat. The honest gate is the one inside
+        // [`cmd_agent::bound_state`]: a seat no source listed is
+        // [`Bound::Unheard`], and `Unheard` raises nothing, on any machine,
+        // without this arm having to know which sources exist.
+        let answered = cmd_agent::answered_by_machine(panes.iter().map(|p| p.pane_id.as_str()));
+        for (pane, b) in &wip.bindings {
+            let id = b.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let Some(t) = task_of(id) else { continue };
+            if !mine(t) {
+                continue;
             }
+            let detail = match cmd_agent::bound_state(pane, &seats, &answered) {
+                // What happened, and not "no turn running": the repair for a
+                // seat with nobody in it is not a sentence, and a reader who
+                // was told to `wsp tell` a dead seat would be typing at a
+                // corpse.
+                Bound::Emptied => format!(
+                    "{pane} · the seat is there and the agent is gone — the claim and the \
+                     worktree are still held · `wsp despawn <id>` gives it up"
+                ),
+                Bound::Gone => format!("{pane} · the pane is gone — wsp sync reaps the binding"),
+                _ => continue,
+            };
+            out.push(Signal::new(Kind::AgentGone, &t.id, &detail).settling());
         }
 
         // Per source, not a single latch: a machine with herdr up and
@@ -4122,6 +4124,9 @@ fn status(store: &Store, args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests open a seat on a backend; the module itself asks the
+    // census, which is the read that does not need the port's methods.
+    use crate::place::Place;
 
     fn sig(kind: Kind, subject: &str) -> Signal {
         Signal::new(kind, subject, "because")
@@ -5741,6 +5746,153 @@ mod tests {
             now.iter().any(|s| s.kind == Kind::NeedsAPerson && s.subject == "cpd-1"),
             "a compound seat's own stall reaches the watch without herdr: {now:?}"
         );
+    }
+
+    // ---- one reading of a seat, whoever is holding it (`wsp-119`) ----------
+    //
+    // Arm (d) used to be wrapped in `if up` and to ask [`cmd_agent::bound_state`]
+    // two herdr pane listings, so on a machine with no herdr socket — which is
+    // every machine `compound-112`'s flip leaves — the whole arm stood down and
+    // the two defects were one: nothing was ever said about a compound seat,
+    // and a seat that *was* reported on was reported on by a different reader
+    // than `wip`'s, which is how a signal and the census beside it could
+    // disagree about one agent in the same second.
+    //
+    // Both are asserted here, and the second is asserted as a *comparison*
+    // rather than as a fixture: the pass and `wip` are handed the same census
+    // and the test holds them to the same answer.
+
+    /// A compound seat with a task bound to it, standing or not.
+    ///
+    /// `pid` is what the seat record says and `said` is what its last hook said,
+    /// because a compound seat's state is those two things and nothing else:
+    /// `place_compound::state_of` reads a live pid, then a fresh `said.json`,
+    /// then the screen, and this is the first two. A live pid with no agent
+    /// recorded reads `Empty`, which is a bare terminal and not a seat with an
+    /// agent in it, so the record always names one.
+    fn compound_seat(store: &Store, id: &str, pid: u32, said: Option<crate::place::State>) -> String {
+        let compound = crate::place_compound::Compound::new();
+        let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let dir = compound.dir_of(&seat).unwrap();
+        let _ends = crate::place_compound::EndsOnDrop(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("seat.json")).unwrap())
+                .unwrap()["pid"]
+                .as_u64()
+                .expect("a live pid") as u32,
+        );
+        let mut rec: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
+        rec["pid"] = json!(pid);
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+        if let Some(state) = said {
+            // The hook names `place_super` maps to each state, so the fixture is
+            // the one a real seat would have written rather than a `said.json`
+            // wsp invented.
+            let hook = match state {
+                crate::place::State::Working => "UserPromptSubmit",
+                _ => "Stop",
+            };
+            compound.heard(&seat, hook, state, &json!({}));
+        }
+        let mut t = Task::new("on a compound seat", id);
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        store.set_binding(seat.as_str(), json!({ "task_id": id }));
+        seat.as_str().to_string()
+    }
+
+    /// A pid that has certainly exited — a child this process reaped — because
+    /// a fabricated number is a guess and a guess here would be a seat that
+    /// reads `Gone` or reads `Working` depending on what the machine is doing.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("a shell");
+        child.wait().expect("it exits");
+        child.id()
+    }
+
+    /// **The half of `wsp-119` that was silent, and the whole reason the row
+    /// exists.** A compound seat whose agent was killed by a limit, with its
+    /// claim and its worktree still held.
+    ///
+    /// It raised nothing at all: the seat is not a herdr pane, so `bound_state`
+    /// found it in neither listing, and the arm that would have said so was
+    /// behind `if up` besides. The level that leaves here has to say *what
+    /// happened* — a reader who is told "no turn running" goes and runs
+    /// `wsp tell` against a seat with nobody in it, which is `worklist-013`'s
+    /// shape with a corpse on the end of it.
+    #[test]
+    fn a_compound_seat_whose_agent_was_killed_says_so_rather_than_no_turn_running() {
+        let env = util::isolated("watch-compound-killed");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let seat = compound_seat(&store, "cpd-70", dead_pid(), None);
+
+        let mut poll = Poll::new(
+            &store,
+            Scope::machine(),
+            [Kind::NeedsAPerson, Kind::AgentGone].into_iter().collect(),
+            None,
+        );
+        let now = poll.sample();
+
+        let said: Vec<&Signal> = now.iter().filter(|s| s.subject == "cpd-70").collect();
+        assert_eq!(said.len(), 1, "one stoppage, one line — two would be how a governor skims: {now:?}");
+        assert_eq!(said[0].kind, Kind::AgentGone, "a dead agent is not a stalled one: {now:?}");
+        assert!(said[0].detail.contains("the agent is gone"), "{said:?}");
+        assert!(
+            said[0].detail.contains("wsp despawn"),
+            "the sentence has to carry the repair that works: {said:?}"
+        );
+        assert!(
+            !said[0].detail.contains("no turn running") && !said[0].detail.contains("wsp tell"),
+            "and not the one that types at a corpse: {said:?}"
+        );
+        // Named by the seat, because the seat is what has to be opened.
+        assert!(said[0].detail.contains(seat.as_str()), "{said:?}");
+    }
+
+    /// **The other half, in the direction that costs money.** A compound seat
+    /// mid-turn, on a `doing` task, raises nothing from either arm.
+    ///
+    /// (c) asks `needs_you`, which is `stopped && doing && !seat`, and a
+    /// working seat is not stopped; (d) asks `bound_state`, and a seat with a
+    /// turn in it is `Turning`, which (d) has never reported. The two answers
+    /// have to come from the same reading for that to be a fact rather than a
+    /// coincidence — which is the assertion below, and the reason it is written
+    /// as one: the pass and `wip` are both handed this census and must say the
+    /// same thing about this seat.
+    #[test]
+    fn a_working_compound_seat_raises_nothing_and_wip_agrees_that_it_is_working() {
+        let env = util::isolated("watch-compound-working");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let seat = compound_seat(&store, "cpd-71", std::process::id(), Some(crate::place::State::Working));
+
+        let mut poll = Poll::new(
+            &store,
+            Scope::machine(),
+            [Kind::NeedsAPerson, Kind::AgentGone].into_iter().collect(),
+            None,
+        );
+        let now = poll.sample();
+        assert!(
+            !now.iter().any(|s| s.subject == "cpd-71"),
+            "a seat with a turn in it is not a person’s problem, on any backend: {now:?}"
+        );
+
+        // And the same seat read the way a person reads it. `wip` is the
+        // published row — `needs_you` has been in `wsp wip --json` all along —
+        // so this is not a second opinion about the seat, it is the assertion
+        // that the two surfaces are looking at one thing.
+        let w = cmd_agent::Wip::live(&store);
+        let rows = cmd_agent::wip_rows(&w);
+        let row = rows.iter().find(|r| r.pane == seat).expect("wip lists the seat");
+        assert_eq!(row.state_typed, crate::place::State::Working, "{}", row.state);
+        assert!(row.turning && !row.needs_you, "turning={} needs_you={}", row.turning, row.needs_you);
     }
 
     // ---- the wake -----------------------------------------------------------

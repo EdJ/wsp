@@ -562,7 +562,7 @@ fn carried_by(dst: &Path) -> Option<String> {
 /// What `doctor` says about the binary every pane re-execs into.
 ///
 /// Notes rather than problems, all of them, and the reason is the same one
-/// `herdr_health` gives for not calling a machine without herdr broken: being
+/// `cmd_agent::seat_health` gives for not calling a machine without herdr broken: being
 /// a few commits behind is the ordinary state of an installed binary between
 /// one deliberate install and the next, and a check that shows red every hour
 /// of every day is a check that gets skipped along with the ones that mean
