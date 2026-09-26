@@ -1047,6 +1047,33 @@ pub fn occupant<'a>(
             return Some((place, row));
         }
     }
+    // **Then the room, and this is `compound-174`.** A record can name no
+    // pane and still name the seat exactly: a compound seat has no herdr pane
+    // behind it, so one id is the room AND the seat in it, and `wsp govern` in
+    // one wrote the room and left the pane empty. Looking only at the pane is
+    // then looking in a field that is empty by construction, and the answer
+    // was *the seat is empty* for a seat with somebody sitting in it — which
+    // is how a governor on a compound seat could be drawn by `wip` and told
+    // nothing by every verb that reaches one.
+    //
+    // `room_of` and not `Seat::workspace`, because `compound-096` took that
+    // field off the struct deliberately; the record's own key is the durable
+    // one and every other reader here already goes through it.
+    //
+    // **This is a lookup, not a widening.** The match is exact, so a herdr
+    // `workspace` — `w1`, a room — resolves only to a seat literally named
+    // `w1`, and no seat has that name. A room that holds several panes still
+    // answers *empty*, which is the despawn guard's hazard arriving by
+    // another road if this ever stops being true;
+    // `a_herdr_room_with_no_pane_is_still_not_guessed_at` holds that line.
+    let room = room_of(&store.governors(), &seat.scope);
+    if !room.is_empty() && room != seat.pane {
+        if let Some((place, row)) = crate::cmd_agent::locate_seat(backends, &room) {
+            if !row.agent.kind.is_empty() {
+                return Some((place, row));
+            }
+        }
+    }
     let claims = store.claims();
     let claimed: BTreeSet<String> = claims
         .values()
@@ -1111,16 +1138,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let index = Index::new(store.projects());
     let env = herdr::Env::read();
-    let workspace = args.get("workspace").or(env.workspace_id.clone());
-    // The pane is the environment's only when the workspace is too. `-w` names
-    // a room this process is not standing in, so its own pane says nothing
-    // about who is sitting there — it must not be stamped onto that record
-    // (the despawn guard would point at a pane in another workspace) and it
-    // must not be used to ask who the seat is either.
-    let pane = match args.get("workspace") {
-        Some(_) => None,
-        None => env.pane_id.clone().filter(|p| !p.is_empty()),
-    };
+    let (workspace, pane) = room_and_pane(args.get("workspace").as_deref(), &env);
     let governors = store.governors();
 
     if args.has("clear") || args.has("remove") {
@@ -1222,6 +1240,47 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     }
     println!("  {}", p.dim("raised hands here reach this workspace · wsp govern --clear to stand down"));
     0
+}
+
+/// The room and the pane a governor taking a seat right now should record, and
+/// the whole of `compound-174`'s first fault in one function.
+///
+/// Three cases, in this order, and the order is the argument:
+///
+/// 1. **`-w` names a room this process is not standing in.** The pane is
+///    `None`, deliberately: the process's own pane says nothing about who is
+///    sitting in *that* room, stamping it would point the despawn guard at a
+///    pane in another workspace, and asking with it would ask the wrong
+///    question. Unchanged by this row.
+/// 2. **herdr's variables are here, so this is a herdr pane.** They are
+///    authoritative and `WSP_SEAT_ID` is ignored entirely — `place_herdr`
+///    records that a stale `WSP_SEAT_ID` inherited from somewhere names a pane
+///    that backend never had, so believing it here would be believing exactly
+///    the value that warns against it.
+/// 3. **No herdr variables at all, which is a compound seat** (`compound-105`,
+///    `compound-174`). `WSP_SEAT_ID` names it, and a compound seat has no
+///    herdr pane behind it, so that one id is the room *and* the seat in it.
+///    Both fields are filled with it.
+///
+/// Case 3 is what the verb could not do before: it read herdr's environment,
+/// found nothing, and refused with *"no workspace — pass -w, or run inside
+/// herdr"* — advice that is wrong on a compound seat, where there is no herdr
+/// to run inside. With `-w` forced, the record was then written with an empty
+/// pane, which is the delivery half fixed in [`occupant`].
+fn room_and_pane(named: Option<&str>, env: &herdr::Env) -> (Option<String>, Option<String>) {
+    if let Some(ws) = named {
+        return (Some(ws.to_string()), None);
+    }
+    match env.workspace_id.clone().filter(|w| !w.is_empty()) {
+        Some(ws) => (Some(ws), env.pane_id.clone().filter(|p| !p.is_empty())),
+        None => match crate::place::seat_from_env() {
+            Some(seat) => {
+                let id = seat.to_string();
+                (Some(id.clone()), Some(id))
+            }
+            None => (None, None),
+        },
+    }
 }
 
 /// The sentence as it was typed, out of the three shapes the flag parser can
@@ -1746,6 +1805,136 @@ mod tests {
 
         let backends = crate::cmd_spawn::local_backends();
         assert!(occupant(&store, &backends, &seat).is_none(), "neither is guessed at");
+    }
+
+    /// **The delivery half of `compound-174`, and the fault exactly as it
+    /// stands on a compound seat.** A governor's record is read by pane to
+    /// find out who to hand a sentence to, and a compound seat's record has
+    /// no pane: it names itself with ONE id, which is the room *and* the seat
+    /// in it, because there is no herdr pane behind it to name. So the record
+    /// is filed, `wsp wip` draws the governor on it, and `wsp govern --tell`
+    /// answers *the seat is empty — nobody is in cpd-60 to tell*.
+    ///
+    /// The seat is not empty. The lookup is looking in the wrong place, and the
+    /// room is the other name the same seat answers to.
+    #[test]
+    fn a_seat_with_no_pane_on_its_record_is_still_found_through_its_room() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+
+        let (env, store) = store("pane-less-seat");
+        store.set_governor(
+            "acc",
+            json!({ "workspace": "cpd-60", "pane": "", "host": util::hostname(), "since": util::iso_at(1_000) }),
+        );
+        let seat = seat_of("acc", store.governors().get("acc").unwrap()).unwrap();
+        assert!(seat.pane.is_empty(), "the record names no pane — that is the fault, not the setup");
+
+        let mut stage = Stage::new();
+        stage.put(Spot::agent("cpd-60", "claude", "acc", State::Idle));
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let backends = crate::cmd_spawn::local_backends();
+        let (_, found) = occupant(&store, &backends, &seat).expect("the room names the seat");
+        assert_eq!(found.seat.as_str(), "cpd-60", "found through the room, and by exact match");
+    }
+
+    /// **And the half that decides whether the fix above is safe.** A herdr
+    /// `workspace` is a ROOM — `w1` — and no seat is named `w1`, so asking the
+    /// backends for the room finds nothing and the answer is byte-for-byte
+    /// what it was: the seat is empty, and the fallback never guesses a pane
+    /// out of a room that holds several.
+    ///
+    /// This is the property that makes the fallback a lookup rather than a
+    /// widening. If it ever fails, some `-w` record has started resolving to
+    /// an arbitrary pane in the room it named, which is the despawn guard's
+    /// hazard (`compound-174`) arriving by another road.
+    #[test]
+    fn a_herdr_room_with_no_pane_is_still_not_guessed_at() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+
+        let (env, store) = store("room-is-not-a-seat");
+        store.set_governor(
+            "acc",
+            json!({ "workspace": "w1", "pane": "", "host": util::hostname(), "since": util::iso_at(1_000) }),
+        );
+        let seat = seat_of("acc", store.governors().get("acc").unwrap()).unwrap();
+
+        // Two panes in the room, and neither is the room.
+        let mut stage = Stage::new();
+        stage.put(Spot::agent("w1:p1", "claude", "acc", State::Idle));
+        stage.put(Spot::agent("w1:p2", "claude", "acc", State::Idle));
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let backends = crate::cmd_spawn::local_backends();
+        assert!(
+            occupant(&store, &backends, &seat).is_none(),
+            "`w1` is a room, not a seat: the fallback must not resolve it to either pane"
+        );
+    }
+
+    /// The three cases [`room_and_pane`] decides between, and the one that was
+    /// missing before `compound-174` is the third.
+    ///
+    /// The herdr cases are here as guards rather than as novelty: case 1 is
+    /// `-w`, whose refusal to stamp a pane is load-bearing (the despawn guard),
+    /// and case 2 must keep ignoring `WSP_SEAT_ID` even when it is set, because
+    /// a stale one names a pane herdr never had.
+    #[test]
+    fn a_governor_records_the_room_it_is_standing_in_on_whichever_backend_that_is() {
+        let herdr = herdr::Env {
+            pane_id: Some("w1:p6".to_string()),
+            workspace_id: Some("w1".to_string()),
+            event: None,
+            event_json: None,
+        };
+        // A compound seat: no herdr variables at all, and one id of its own.
+        let nowhere = herdr::Env {
+            pane_id: None,
+            workspace_id: None,
+            event: None,
+            event_json: None,
+        };
+        let isolated = util::isolated("room-and-pane");
+
+        assert_eq!(
+            room_and_pane(Some("w9"), &herdr),
+            (Some("w9".to_string()), None),
+            "`-w` names another room, so it stamps no pane: the despawn guard reads that field",
+        );
+        assert_eq!(
+            room_and_pane(None, &herdr),
+            (Some("w1".to_string()), Some("w1:p6".to_string())),
+            "a herdr pane is a room and a pane, and that is unchanged",
+        );
+
+        // A stale WSP_SEAT_ID inside a herdr pane must be ignored, or the
+        // record names a pane that backend never listed.
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-stale");
+        assert_eq!(
+            room_and_pane(None, &herdr),
+            (Some("w1".to_string()), Some("w1:p6".to_string())),
+            "herdr's own variables outrank a WSP_SEAT_ID inherited from somewhere",
+        );
+        std::env::remove_var(crate::place::SEAT_ENV);
+
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-60");
+        assert_eq!(
+            room_and_pane(None, &nowhere),
+            (Some("cpd-60".to_string()), Some("cpd-60".to_string())),
+            "a compound seat names itself with one id, and it is both the room and the seat in it",
+        );
+        assert_eq!(
+            room_and_pane(Some("w9"), &nowhere),
+            (Some("w9".to_string()), None),
+            "`-w` still outranks the seat's own id: the person named the room",
+        );
+        drop(isolated);
     }
 
     /// The one caller that is genuinely asking about the *room* keeps the

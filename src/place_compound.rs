@@ -933,18 +933,39 @@ fn b64(data: &[u8]) -> String {
 /// leave rather than an EOF it has to notice on its own clock.
 fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
     let mut stream = dial(socket, DIAL_TIMEOUT)?;
-    send(&mut stream, json!({ "attach": {} })).map_err(|e| Refusal::Backend(e.to_string()))?;
-    match recv_line(&mut stream, DIAL_TIMEOUT) {
+    attach(&mut stream)?;
+    send(&mut stream, json!({ "input": { "bytes": b64(text.as_bytes()) } }))
+        .map_err(|e| Refusal::Backend(e.to_string()))?;
+    press_enter(&mut stream)?;
+    let _ = send(&mut stream, json!({ "detach": {} }));
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+/// Attach to a renderer, the three steps every exchange with one begins with.
+///
+/// Split out with [`press_enter`] because `nudge` is the same conversation
+/// with nothing typed in it, and a second copy of an attach that forgets its
+/// detach would leave a renderer holding a client.
+fn attach(stream: &mut UnixStream) -> Result<()> {
+    send(stream, json!({ "attach": {} })).map_err(|e| Refusal::Backend(e.to_string()))?;
+    match recv_line(stream, DIAL_TIMEOUT) {
         Some(v) if v.get("error").is_some() => {
             return Err(Refusal::Backend(str_of(&v["error"], "what")))
         }
         None => return Err(Refusal::Backend("no answer to attach".into())),
-        _ => {}
+        _ => Ok(()),
     }
-    send(&mut stream, json!({ "input": { "bytes": b64(text.as_bytes()) } }))
-        .map_err(|e| Refusal::Backend(e.to_string()))?;
+}
+
+/// The submit key, as the render wire names it.
+///
+/// One definition, because a work order that is typed and not submitted and a
+/// rescue press that presses a different key are the same defect wearing
+/// different clothes, and this file had the sequence inline once already.
+fn press_enter(stream: &mut UnixStream) -> Result<()> {
     send(
-        &mut stream,
+        stream,
         json!({ "key": { "event": {
             "action": "press",
             "key": "enter",
@@ -952,10 +973,7 @@ fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
             "unshifted_codepoint": 0,
         }}}),
     )
-    .map_err(|e| Refusal::Backend(e.to_string()))?;
-    let _ = send(&mut stream, json!({ "detach": {} }));
-    let _ = stream.shutdown(Shutdown::Both);
-    Ok(())
+    .map_err(|e| Refusal::Backend(e.to_string()))
 }
 
 impl Compound<'_> {
@@ -1171,6 +1189,34 @@ impl Place for Compound<'_> {
         // `place.rs` asks for from a backend that delivered without seeing
         // whether a turn started.
         Ok(Delivery::Unconfirmed)
+    }
+
+    /// Press submit on a seat whose composer is sitting on a work order.
+    ///
+    /// **The second half of `compound-174`, and it was not the same fault as
+    /// the first.** This backend had no `nudge` at all, so it took the trait's
+    /// default and answered `Unsupported` — and `hand_over` treats that as the
+    /// end of the rescue and fails the spawn with *"{seat} took the work order
+    /// and started nothing"*. So every `wsp spawn --agent` into a compound seat
+    /// reported a turn that had not started, on a seat where `tell` had already
+    /// typed **and** submitted the order.
+    ///
+    /// Implementing it is the right repair rather than teaching `hand_over` to
+    /// tolerate a missing press, because that loop's strictness is deliberate
+    /// and argued at length: a spawn wrongly called failed is recoverable, one
+    /// wrongly called succeeded is not. A backend that can be pressed should
+    /// be pressed, and the second Enter is exactly the rescue the loop wants to
+    /// try — a folder-trust modal holding the keyboard with the order unsent
+    /// behind it is the case it exists for, and on this backend it was
+    /// unreachable.
+    fn nudge(&self, seat: &Seat) -> Result<()> {
+        let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+        let mut stream = dial(&socket, DIAL_TIMEOUT)?;
+        attach(&mut stream)?;
+        press_enter(&mut stream)?;
+        let _ = send(&mut stream, json!({ "detach": {} }));
+        let _ = stream.shutdown(Shutdown::Both);
+        Ok(())
     }
 
     /// End the session and let the seat go. `SIGTERM` the group (which is
@@ -1842,6 +1888,77 @@ mod tests {
         assert!(text.contains("UNIQUE-COMPOUND-111-MARK"), "not what the shell printed: {text:?}");
         assert!(!text.contains('|'), "compound-sup's own line-number prefix leaked through: {text:?}");
         assert!(!text.lines().any(|l| l.starts_with("size ")), "the trailing `size WxH` line leaked through: {text:?}");
+
+        place.stop(&seat).expect("the seat was there");
+    }
+
+    /// `compound-174`'s second half, measured: **`nudge` presses submit, and
+    /// the thing it presses it for is a composer holding an order nobody sent.**
+    ///
+    /// The shape is `sh` rather than an agent, because this is about the wire
+    /// and not about an agent taking a turn. A shell reading its stdin echoes
+    /// every line it is given, so "was that line submitted" is a thing the
+    /// screen can answer — which is the only honest way to test a key press on
+    /// a backend whose whole fault was that nobody could press one.
+    ///
+    /// The text is typed by hand, over the render socket, WITHOUT the submit
+    /// that [`Compound::tell`] would have sent with it. That is the state
+    /// `hand_over`'s rescue loop exists for: an order delivered and unsent
+    /// behind whatever is holding the keyboard. `tell` cannot set it up — it
+    /// types and submits in one conversation — so the test talks to the
+    /// renderer the way the key path does, which is also why this proves the
+    /// key event is right rather than merely that the call returns `Ok`.
+    ///
+    /// Needs a real machine: `COMPOUND_SUP` at a built `compound-sup`, and the
+    /// `compound-render` beside it. Run it with
+    /// `cargo test --bin wsp -- --ignored a_nudge_presses_submit_on_a_real_renderer --nocapture`.
+    #[test]
+    #[ignore]
+    fn a_nudge_presses_submit_on_a_real_renderer() {
+        let Some(sup) = std::env::var_os("COMPOUND_SUP") else {
+            eprintln!("skipped: set COMPOUND_SUP to a built compound-sup to run this");
+            return;
+        };
+        assert!(PathBuf::from(&sup).is_file(), "COMPOUND_SUP is not a file");
+
+        let scratch = Scratch::new("nudge");
+        let place = scratch.place();
+        let seat = place
+            .open(&Order { label: "compound-174 nudge".into(), ..Order::default() })
+            .expect("a seat");
+        place
+            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "while read -r line; do printf 'GOT:%s\\n' \"$line\"; done".into()] })
+            .expect("compound-sup started");
+
+        assert!(until(|| place.socket_of(&seat).is_some_and(|s| s.exists())), "compound-sup never bound its socket");
+        assert!(
+            until(|| place.render_socket_of(&seat).is_some_and(|s| s.exists())),
+            "no renderer came up, so there is nothing for nudge to press"
+        );
+
+        // Type WITHOUT submitting: the unsent order, by hand.
+        let socket = place.render_socket_of(&seat).unwrap();
+        let mut stream = dial(&socket, DIAL_TIMEOUT).expect("dial the renderer");
+        attach(&mut stream).expect("attach");
+        send(&mut stream, json!({ "input": { "bytes": b64(b"COMPOUND-174-NUDGE") } }))
+            .expect("type the order");
+        let _ = send(&mut stream, json!({ "detach": {} }));
+        let _ = stream.shutdown(Shutdown::Both);
+        // The shell has not seen it: nothing was submitted, so `read` has not
+        // run and nothing is on the screen. If that is not true the test is
+        // measuring the wrong thing and says so rather than passing.
+        assert!(
+            !until_text(&place, &seat, "GOT:COMPOUND-174-NUDGE").contains("GOT:COMPOUND-174-NUDGE"),
+            "the line arrived without a nudge, so this proves nothing"
+        );
+
+        // Now the press, and the same assertion the other way round.
+        place.nudge(&seat).expect("nudge reached the renderer");
+        let echoed = until_text(&place, &seat, "GOT:COMPOUND-174-NUDGE");
+        assert!(
+            echoed.contains("GOT:COMPOUND-174-NUDGE"),
+            "nudge pressed nothing the shell could see: {echoed:?}"
+        );
 
         place.stop(&seat).expect("the seat was there");
     }
