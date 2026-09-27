@@ -989,15 +989,14 @@ fn config(brief: Option<&Path>, reach: &Reach) -> String {
     // Written only when there is something to write, so a seat with nothing to
     // reach for is byte-for-byte the config it had before this existed.
     //
-    // **The denies go last, and that is the whole of what they are for.**
-    // `Permission.evaluate` is a `findLast`, so a `deny` written before the
-    // allow it narrows is a rule that never applies. The one that exists is a
-    // project root's own `.worktrees`: a granted root that is this seat's own
-    // parent would otherwise hand the seat every sibling seat's uncommitted
-    // work, and the argument and the measurement are on
-    // [`crate::cmd_spawn::reach`]. Driven on 2026-09-27: with
-    // `{root/*:allow, root/.worktrees/*:deny}` a read in the trunk answered and
-    // a read of `root/.worktrees/seat-2/other.txt` was refused by that rule.
+    // **The denies go first, and every allow after them.** They are the
+    // project's own roots — the trunk and every sibling seat's tree, refused
+    // without asking; the argument is on [`crate::cmd_spawn::reach`] — and
+    // `Permission.evaluate` is a `findLast`, so an allow written after a deny
+    // is the one that answers inside it: a ref into a project's other root is
+    // the case that needs that. Driven on 2026-09-27: a deny covering the
+    // session's own directory did not refuse a read inside it, so the deny over
+    // the root the seat's tree sits in does not reach the tree.
     //
     // The brief's own directory is in here too, and it is this function's to
     // add rather than [`crate::cmd_spawn::reach`]'s: **a config may not name a
@@ -1021,10 +1020,10 @@ fn config(brief: Option<&Path>, reach: &Reach) -> String {
             let rule = |dir: &Path, action: &str| {
                 format!("{}:{}", Value::from(format!("{}/*", dir.display())), Value::from(action))
             };
-            let allows = reach.allow.iter().chain(named.iter()).map(|dir| rule(dir, "allow"));
-            // After every allow, because `findLast` — see above.
             let denies = reach.deny.iter().map(|dir| rule(dir, "deny"));
-            let rules = allows.chain(denies).collect::<Vec<_>>().join(",");
+            // After every deny, because `findLast` — see above.
+            let allows = reach.allow.iter().chain(named.iter()).map(|dir| rule(dir, "allow"));
+            let rules = denies.chain(allows).collect::<Vec<_>>().join(",");
             format!(r#","external_directory":{{{rules}}}"#)
         }
     };
@@ -2852,38 +2851,43 @@ mod tests {
         assert_eq!(v["permission"]["bash"]["wsp done*"], "deny");
     }
 
-    /// A deny is written after every allow, because `findLast` is what makes it
-    /// one.
+    /// Every deny is written before every allow, because `findLast` is what
+    /// decides between them.
     ///
-    /// The rule is `wsp-123`'s, and the deny is the project root's own
-    /// `.worktrees`: a seat may reach the root of the project it works in, which
-    /// is where its own tree lives, and must not reach the trees beside its own.
-    /// Asserted on the raw string, because a parsed `Value` is a `BTreeMap` and
-    /// the order under test is the one the text was written in — the same reason
+    /// The denies are `wsp-123`'s: the roots of the project the seat works in —
+    /// its trunk and every sibling seat's tree — refused without asking. An
+    /// allow after them is the only rule that can answer inside one, which is
+    /// what a ref into a project's *other* root needs (`compound` names
+    /// `~/claude/wsp` too), and a deny written after it would quietly take the
+    /// ref away. Asserted on the raw string, because a parsed `Value` is a
+    /// `BTreeMap` and the order under test is the one the text was written in —
+    /// the same reason
     /// [`the_catch_all_is_written_before_the_denies_that_have_to_beat_it`] reads
     /// the string.
     #[test]
-    fn a_deny_on_the_seats_own_projects_worktrees_is_written_after_the_allow_it_narrows() {
+    fn a_projects_roots_are_denied_before_any_allow_that_has_to_land_inside_them() {
         let env = of("opencode").env(
             None,
-            &reaching(&["/Users/somebody/compound"], &["/Users/somebody/compound/.worktrees"]),
+            &reaching(
+                &["/Users/somebody/wsp/docs"],
+                &["/Users/somebody/compound", "/Users/somebody/wsp"],
+            ),
         );
         let cfg = &env["OPENCODE_CONFIG_CONTENT"];
         let at = |needle: &str| cfg.find(needle).unwrap_or_else(|| panic!("no {needle} in {cfg}"));
         assert!(
-            at(r#""/Users/somebody/compound/*":"allow""#)
-                < at(r#""/Users/somebody/compound/.worktrees/*":"deny""#),
-            "a deny written first is a rule that never applies, and every other seat's \
-             uncommitted work is reachable through the file tools — {cfg}"
+            at(r#""/Users/somebody/wsp/*":"deny""#) < at(r#""/Users/somebody/wsp/docs/*":"allow""#),
+            "an allow written before the deny it sits inside is a rule that never applies — {cfg}"
+        );
+        assert!(
+            at(r#""/Users/somebody/compound/*":"deny""#)
+                < at(r#""/Users/somebody/wsp/docs/*":"allow""#),
+            "{cfg}"
         );
         // And it is a rule inside the one object rather than a key of its own:
         // `external_directory` takes a single map, and the order is inside it.
         let v: Value = serde_json::from_str(cfg).expect("valid config");
-        assert_eq!(
-            v["permission"]["external_directory"]["/Users/somebody/compound/.worktrees/*"],
-            "deny",
-            "{cfg}"
-        );
+        assert_eq!(v["permission"]["external_directory"]["/Users/somebody/compound/*"], "deny", "{cfg}");
     }
 
     /// A config may not name a file it forbids reaching.
@@ -2922,7 +2926,7 @@ mod tests {
         // brief's own directory as an allow beside it would put two rules for
         // one path in one map and leave the winner to be whichever opencode
         // evaluated last. (A deny over the brief's directory is not reachable in
-        // practice — it takes a state directory under a project's `.worktrees` —
+        // practice — it takes a state directory under a project's root —
         // so this asserts the rule and not a refusal: the seat is still built,
         // and what it may not do is read its own brief.)
         let env = of("opencode").env(

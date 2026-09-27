@@ -1097,17 +1097,15 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // anyone noticed. Every tracked file is already here, including the
     // `README.md` the handbook sends them to. Six words against that.
     //
-    // **It is also the only thing standing between an agent and the shared
-    // checkout now that `wsp-123` grants one**, which is a sentence to be
-    // uneasy about rather than a guardrail. The grant is a path rule and not an
-    // operation rule, so the trunk is writeable through the file tools and this
-    // is what says not to; the trees beside this one are denied by name, which
-    // is the half that is enforced. A dirty `git status` in the trunk is what a
-    // crossed line looks like, which is how `ui-001` was caught.
+    // **And it is enforced now, not only said** (`wsp-123`, Ed on review,
+    // 2026-09-27: the trunk is not writeable, permanently — work happens in
+    // worktrees). Every root of the project is an `external_directory` deny,
+    // so the trunk and the trees beside this one are refused without anybody
+    // being asked; the trunk is read from here, through git.
     if r.own_tree.is_some() {
         row(
             "tree",
-            p.dim("your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk")
+            p.dim("your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it")
                 .to_string(),
         );
     }
