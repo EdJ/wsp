@@ -221,8 +221,9 @@ fn brief_path(store: &Store, subject: &str) -> std::path::PathBuf {
 /// **And the root is where this seat's own tree lives**, which is the whole
 /// difficulty in it: `<checkout>/.worktrees/<task>` means a rule on the root
 /// covers every sibling tree — every other agent's uncommitted work — as well
-/// as the shared checkout. So a granted root that is an ancestor of this seat's
-/// tree also earns a **deny** on `<root>/.worktrees`, which opencode's
+/// as the shared checkout. So every granted root also earns a **deny** on
+/// `<root>/.worktrees` — the one the seat stands in and any other the project
+/// names, whose trees are some other project's seats — which opencode's
 /// `findLast` puts after the allow and which cannot reach the seat's own tree,
 /// because the boundary opencode draws is its own directory. Driven on
 /// 2026-09-27 rather than reasoned about: with `{root/*:allow,
@@ -323,15 +324,12 @@ pub(crate) fn reach(
         .iter()
         .map(|r| util::real(r))
         .collect();
-    // Where the seat's own tree stands, the worktrees under that root are every
-    // other seat's work and are refused by name. Only for a root the tree is
-    // inside: a root the seat is not standing in has no trees of ours under it,
-    // and a rule matching nothing is noise.
-    let deny: Vec<std::path::PathBuf> = roots
-        .iter()
-        .filter(|r| tree.as_ref().is_some_and(|t| t.starts_with(r)))
-        .map(|r| r.join(cmd_checkout::WORKTREES))
-        .collect();
+    // The worktrees under every granted root are other seats' work and are
+    // refused by name — not only under the root this seat stands in. A project
+    // of two roots (`compound` names `~/claude/wsp` too) would otherwise hand a
+    // compound seat every wsp seat's uncommitted tree through the second one.
+    let deny: Vec<std::path::PathBuf> =
+        roots.iter().map(|r| r.join(cmd_checkout::WORKTREES)).collect();
     dirs.extend(roots);
     dirs.sort();
     dirs.dedup();
@@ -3034,15 +3032,14 @@ mod tests {
             out.allow.contains(&home.join("wsp")),
             "and the project's other root, which `roots_of` names and `root_of` would not — {out:?}"
         );
-        assert_eq!(
-            out.deny,
-            vec![home.join("compound").join(cmd_checkout::WORKTREES)],
+        assert!(
+            out.deny.contains(&home.join("compound").join(cmd_checkout::WORKTREES)),
             "every other seat's uncommitted work, refused by name — {out:?}"
         );
         assert!(
-            !out.deny.contains(&home.join("wsp").join(cmd_checkout::WORKTREES)),
-            "a root this seat is not standing in has no trees of ours under it, and a rule \
-             matching nothing is noise — {out:?}"
+            out.deny.contains(&home.join("wsp").join(cmd_checkout::WORKTREES)),
+            "and under the root this seat is not standing in, whose trees are another \
+             project's seats — {out:?}"
         );
 
         // And the same project reached by name rather than through the row,
