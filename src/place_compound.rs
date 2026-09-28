@@ -83,8 +83,8 @@
 //! separate histories; there is no crate boundary to depend across even if
 //! one wanted to name a path across two checkouts nobody can promise sit
 //! beside each other. What is here instead is the handful of wire shapes
-//! [`Place::tell`] actually needs — an envelope, `Attach`, `Input`, `Key`,
-//! `Detach` — read against `crates/supervisor/src/proto.rs` VERSION 8 at the
+//! [`Place::tell`] actually needs — an envelope, `Input`, `Key` — read
+//! against `crates/supervisor/src/proto.rs` VERSION 8 at the
 //! time of writing and versioned the same way that file is: a refusal rather
 //! than a guess if the peer ever disagrees. **This is the one seam in this
 //! file that ages by hand** — a wire bump on the compound side is invisible
@@ -96,7 +96,7 @@
 //! answers only `DurableBody` — `Vitals` and `Close` — with no VT and no
 //! renderer required; `<name>.rsock`, served by the disposable
 //! `compound-render`, answers everything [`Place::tell`] hand-rolls a client
-//! for (`Attach`/`Input`/`Key`/`Detach`) plus `screen`/`state`, called as
+//! for (`Input`/`Key`) plus `screen`/`state`, called as
 //! subprocesses the same way `compound-sup screen`/`state` used to be. Both
 //! sockets share one version number; what differs by socket is which `Body`
 //! it accepts, not which wire it speaks.
@@ -943,34 +943,24 @@ fn b64(data: &[u8]) -> String {
 
 /// Type at a session and press Enter — [`Place::tell`], stripped of the
 /// hook-state bookkeeping so a test can drive it against a bare listener.
-/// `Attach` first, because the wire refuses any other frame from an
-/// unclaimed connection; `Detach` last, so the session sees this client
-/// leave rather than an EOF it has to notice on its own clock.
+///
+/// **No `Attach`, and that is the whole of `compound-229`.** Since
+/// `compound-117` the renderer answers `Input`, `Key`, `Mouse`, `Screen`
+/// and `ReadSelection` to *every* connection and refuses `Attach` to a
+/// second one — "busy: a client is already attached" — so a window holding
+/// the pane made every `wsp tell` fail, focused or not, and `wsp` was the
+/// one that could have been holding the lock out. The pre-117 comment here
+/// said the wire refuses any other frame from an unclaimed connection; that
+/// stopped being true at `compound-117` and this file kept the attach for
+/// months after it. Only the frame stream and `Resize` still want the
+/// attach, and this backend never reads frames or resizes anything.
 fn type_and_submit(socket: &PathBuf, text: &str) -> Result<()> {
     let mut stream = dial(socket, DIAL_TIMEOUT)?;
-    attach(&mut stream)?;
     send(&mut stream, json!({ "input": { "bytes": b64(text.as_bytes()) } }))
         .map_err(|e| Refusal::Backend(e.to_string()))?;
     press_enter(&mut stream)?;
-    let _ = send(&mut stream, json!({ "detach": {} }));
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
-}
-
-/// Attach to a renderer, the three steps every exchange with one begins with.
-///
-/// Split out with [`press_enter`] because `nudge` is the same conversation
-/// with nothing typed in it, and a second copy of an attach that forgets its
-/// detach would leave a renderer holding a client.
-fn attach(stream: &mut UnixStream) -> Result<()> {
-    send(stream, json!({ "attach": {} })).map_err(|e| Refusal::Backend(e.to_string()))?;
-    match recv_line(stream, DIAL_TIMEOUT) {
-        Some(v) if v.get("error").is_some() => {
-            return Err(Refusal::Backend(str_of(&v["error"], "what")))
-        }
-        None => return Err(Refusal::Backend("no answer to attach".into())),
-        _ => Ok(()),
-    }
 }
 
 /// The submit key, as the render wire names it.
@@ -1224,12 +1214,15 @@ impl Place for Compound<'_> {
     /// try — a folder-trust modal holding the keyboard with the order unsent
     /// behind it is the case it exists for, and on this backend it was
     /// unreachable.
+    ///
+    /// No `Attach`, for the same reason and by the same argument as
+    /// [`type_and_submit`] — this is the same conversation with nothing typed
+    /// in it, so it inherits the `compound-117` answer rather than keeping a
+    /// second copy of the attach the first one dropped.
     fn nudge(&self, seat: &Seat) -> Result<()> {
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         let mut stream = dial(&socket, DIAL_TIMEOUT)?;
-        attach(&mut stream)?;
         press_enter(&mut stream)?;
-        let _ = send(&mut stream, json!({ "detach": {} }));
         let _ = stream.shutdown(Shutdown::Both);
         Ok(())
     }
@@ -1951,13 +1944,14 @@ mod tests {
             "no renderer came up, so there is nothing for nudge to press"
         );
 
-        // Type WITHOUT submitting: the unsent order, by hand.
+        // Type WITHOUT submitting: the unsent order, by hand. No attach
+        // needed — this test types with one connection exactly as
+        // `type_and_submit` now does, so it doubles as the check that a bare
+        // typing connection is what the code under test sends too.
         let socket = place.render_socket_of(&seat).unwrap();
         let mut stream = dial(&socket, DIAL_TIMEOUT).expect("dial the renderer");
-        attach(&mut stream).expect("attach");
         send(&mut stream, json!({ "input": { "bytes": b64(b"COMPOUND-174-NUDGE") } }))
             .expect("type the order");
-        let _ = send(&mut stream, json!({ "detach": {} }));
         let _ = stream.shutdown(Shutdown::Both);
         // The shell has not seen it: nothing was submitted, so `read` has not
         // run and nothing is on the screen. If that is not true the test is
@@ -1976,6 +1970,115 @@ mod tests {
         );
 
         place.stop(&seat).expect("the seat was there");
+    }
+
+    /// `compound-229`: `tell` and `nudge` must work on a seat whose pane is
+    /// **open in a window**, because the renderer allows exactly one attached
+    /// client and the window is the one holding it.
+    ///
+    /// The whole bug lived in one frame. `type_and_submit` and `nudge` both
+    /// opened with `Attach`, so whenever any window had the pane open —
+    /// focused or not, looking or not — the renderer's gate answered them
+    /// "*busy: a client is already attached*" and `wsp tell` failed on the
+    /// seats most worth telling. `compound-117` had already made `Input` and
+    /// `Key` answerable from any connection, so the attach bought nothing
+    /// and cost the one thing that mattered.
+    ///
+    /// Both halves are here because the fix was two edits in two functions,
+    /// and one of them passing says nothing about the other.
+    ///
+    /// Needs a real machine: `COMPOUND_SUP` at a built `compound-sup`, and the
+    /// `compound-render` beside it. Run it with
+    /// `cargo test --bin wsp -- --ignored a_tell_and_a_nudge_arrive_while_another_client_holds_the_attach --nocapture`.
+    #[test]
+    #[ignore]
+    fn a_tell_and_a_nudge_arrive_while_another_client_holds_the_attach() {
+        let Some(sup) = std::env::var_os("COMPOUND_SUP") else {
+            eprintln!("skipped: set COMPOUND_SUP to a built compound-sup to run this");
+            return;
+        };
+        assert!(PathBuf::from(&sup).is_file(), "COMPOUND_SUP is not a file");
+
+        let scratch = Scratch::new("attach-busy");
+        // `insisting` only steps over the readiness gate: `sh` fires no hooks,
+        // so this seat never reads as one that will take a prompt, and the
+        // subject here is the attach and nothing else.
+        let place = scratch.place().insisting();
+        let seat = place
+            .open(&Order { label: "compound-229 busy".into(), ..Order::default() })
+            .expect("a seat");
+        place
+            .start(&seat, &Agent { kind: "sh".into(), name: "smoke".into(), args: vec!["-c".into(), "while read -r line; do printf 'GOT:%s\\n' \"$line\"; done".into()] })
+            .expect("compound-sup started");
+
+        assert!(until(|| place.socket_of(&seat).is_some_and(|s| s.exists())), "compound-sup never bound its socket");
+        assert!(
+            until(|| place.render_socket_of(&seat).is_some_and(|s| s.exists())),
+            "no renderer came up, so there is nothing to attach to"
+        );
+
+        // The window. Held open for the whole test, which is the point: not a
+        // window that opened and closed, but the pane a person is sitting in
+        // front of while something else tries to tell that agent something.
+        let socket = place.render_socket_of(&seat).unwrap();
+        let _window = window_attaches(&socket);
+
+        place
+            .tell(&seat, "COMPOUND-229-TELL")
+            .expect("delivered while the window holds the attach");
+        let echoed = until_text(&place, &seat, "GOT:COMPOUND-229-TELL");
+        assert!(echoed.contains("GOT:COMPOUND-229-TELL"), "tell typed nothing the shell could see: {echoed:?}");
+
+        // `nudge`, same attach still held: type the order unsent, then press.
+        let mut typing = dial(&socket, DIAL_TIMEOUT).expect("dial the renderer");
+        send(&mut typing, json!({ "input": { "bytes": b64(b"COMPOUND-229-NUDGE") } })).expect("type the order");
+        let _ = typing.shutdown(Shutdown::Both);
+        assert!(
+            !until_text(&place, &seat, "GOT:COMPOUND-229-NUDGE").contains("GOT:COMPOUND-229-NUDGE"),
+            "the line arrived without a nudge, so this proves nothing"
+        );
+
+        place
+            .nudge(&seat)
+            .expect("nudge reached the renderer while the window holds the attach");
+        let pressed = until_text(&place, &seat, "GOT:COMPOUND-229-NUDGE");
+        assert!(pressed.contains("GOT:COMPOUND-229-NUDGE"), "nudge pressed nothing the shell could see: {pressed:?}");
+
+        place.stop(&seat).expect("the seat was there");
+    }
+
+    /// Hold a renderer's attach the way a window with the pane open does, and
+    /// hand back the connection still holding it.
+    ///
+    /// A granted `Attach` is answered with a frame stream, not a reply — the
+    /// only thing the gate ever says in words is its refusal — so this
+    /// watches for the refusal and takes any first frame as the proof. A
+    /// window that never really got the attach would make
+    /// `a_tell_and_a_nudge_arrive_while_another_client_holds_the_attach`
+    /// pass for the wrong reason, which is the failure a test like this
+    /// cannot have.
+    fn window_attaches(render_socket: &PathBuf) -> UnixStream {
+        let mut stream = dial(render_socket, DIAL_TIMEOUT).expect("dial the renderer");
+        send(&mut stream, json!({ "attach": {} })).expect("send the window's attach");
+        // `screen` answers on every connection, attached or not, so it is the
+        // one frame that says this exchange reached a live renderer at all.
+        send(&mut stream, json!({ "screen": {} })).expect("ask the window's screen");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let waited = Instant::now();
+            if waited >= deadline {
+                panic!("the renderer answered the window's attach with nothing at all");
+            }
+            let Some(v) = recv_line(&mut stream, (deadline - waited).min(Duration::from_millis(200))) else {
+                continue;
+            };
+            assert!(
+                v.get("error").is_none(),
+                "the window's own attach was refused: {}",
+                str_of(&v["error"], "what")
+            );
+            return stream;
+        }
     }
 
     /// Poll [`Compound::read_screen`] until it contains `mark` or the guard
