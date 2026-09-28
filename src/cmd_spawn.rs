@@ -324,7 +324,96 @@ pub(crate) fn reach(
             kept.push(d);
         }
     }
-    Reach { allow: kept, deny }
+    // The machine's own, after everything about the row, and under the same
+    // disjointness rule: a scratch directory that holds the seat's tree is an
+    // ancestor of it like any other, and is dropped for the same reason.
+    // Compared resolved as well as written, since `scratch` holds both
+    // spellings of `/tmp` and a tree may be named by either. Resolved through
+    // its deepest ancestor that exists, because a tree about to be made does
+    // not canonicalize and `/tmp` above it still does.
+    let resolved = |t: &std::path::Path| {
+        t.ancestors()
+            .find_map(|a| {
+                std::fs::canonicalize(a).ok().map(|r| r.join(t.strip_prefix(a).unwrap_or(t)))
+            })
+            .unwrap_or_else(|| t.to_path_buf())
+    };
+    let trees: Vec<std::path::PathBuf> =
+        tree.iter().flat_map(|t| [t.clone(), resolved(t)]).collect();
+    let clear =
+        |d: &std::path::PathBuf| trees.iter().all(|t| !d.starts_with(t) && !t.starts_with(d));
+    let (read, scratch) = machine(store);
+    Reach {
+        allow: kept,
+        deny,
+        read: read.into_iter().filter(clear).collect(),
+        scratch: scratch.into_iter().filter(clear).collect(),
+        tree,
+    }
+}
+
+/// What every seat on this machine reads or scribbles in, whatever its row.
+///
+/// **`wsp-125`, and it is `wsp-123`'s shape with nothing about the project in
+/// it.** Within minutes of spawn a compound seat stopped on
+/// `~/.cargo/registry/src` wanting imgui's popup API, another on
+/// `<state>/warm/compound-0/tree` reading what `wsp verify` had just told it,
+/// and another on `/dev` and `/tmp`. None of those is a fact about the row, so
+/// none can come from `refs` or a project's roots, and each held a pane until
+/// a person walked past.
+///
+/// **Two lists, because they are two grants.** `read` is the source a build is
+/// made against — the registry, git dependencies, the toolchain's own `std` —
+/// and the warm tree `wsp verify` builds in: read, never written. An
+/// `external_directory` allow is a path rule and cannot say that (`wsp-123`
+/// found it and refused the trunk for it), so [`crate::agent_commands`] pairs
+/// each with an `edit` deny, which is an operation rule; driven on 2026-09-28,
+/// the read answered and the edit was refused. A patched registry crate is
+/// silently every project's on this machine, since cargo does not check an
+/// unpacked source again, so the file tools are exactly what to close. The
+/// shell is not closed, and is not claimed to be: `bash` is `allow`, and a
+/// `sed -i` on a path it may reach is not asked about twice.
+///
+/// `scratch` is `/dev` and `/tmp`, reached and written. `cat /dev/null` asks
+/// about `/dev/*`, since opencode only ever asks about a directory, and so does
+/// every `cp`, `rm` or `mkdir` on a temp path. A shell redirect to either is
+/// never asked about at all (opencode skips `redirection` nodes when it looks
+/// for paths), so the ask was never guarding the writes; it only stopped the
+/// file tools and a handful of verbs from doing what `>` already does.
+///
+/// **Every seat, not only a Rust one.** A grant on a directory a seat never
+/// reads costs it nothing, while deciding which seats are Rust fails in the one
+/// direction that matters: a seat it missed stalls. `compound` is two roots,
+/// and they need not share a language. Each directory is resolved the way a
+/// project's root is, and one that does not exist is left out, so a machine
+/// without rustup writes no rule about it.
+fn machine(store: &Store) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let home = |var: &str, default: &str| {
+        std::env::var(var).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
+    };
+    let cargo = home("CARGO_HOME", "~/.cargo");
+    let rustup = home("RUSTUP_HOME", "~/.rustup");
+    let read: Vec<std::path::PathBuf> = [
+        format!("{cargo}/registry/src"),
+        format!("{cargo}/git/checkouts"),
+        format!("{rustup}/toolchains"),
+        store.state.join("warm").display().to_string(),
+    ]
+    .iter()
+    .map(|d| util::real(d))
+    .filter(|d| d.is_dir())
+    .collect();
+    // Both spellings where they differ — `/tmp` is `/private/tmp` on macOS —
+    // since a shell argument is compared as written and a resolved one is not.
+    let mut scratch: Vec<std::path::PathBuf> = Vec::new();
+    for d in ["/dev", "/tmp"] {
+        for p in [std::path::PathBuf::from(d), util::real(d)] {
+            if p.is_dir() && !scratch.contains(&p) {
+                scratch.push(p);
+            }
+        }
+    }
+    (read, scratch)
 }
 
 /// What a seat may reach outside its own tree, in the two forms opencode reads.
@@ -334,10 +423,17 @@ pub(crate) fn reach(
 /// opencode evaluates the **last** matching rule, so the denies are written
 /// first and a ref into a project's other root, written after, is the one
 /// allow that can land inside a deny.
+///
+/// `read` and `scratch` are the machine's rather than the row's, and are on
+/// [`machine`]; `tree` is kept because an `edit` rule is matched against a path
+/// relative to it, which is how `read` is made read-only.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Reach {
     pub allow: Vec<std::path::PathBuf>,
     pub deny: Vec<std::path::PathBuf>,
+    pub read: Vec<std::path::PathBuf>,
+    pub scratch: Vec<std::path::PathBuf>,
+    pub tree: Option<std::path::PathBuf>,
 }
 
 /// Compose this seat's brief and write it where the agent will read it.
@@ -2894,10 +2990,46 @@ mod tests {
     #[test]
     fn every_seat_may_read_the_store_it_is_recorded_in() {
         let store = seat("reach-store");
+        let out = reach(&store, None, None, None);
         assert_eq!(
-            reach(&store, None, None, None),
-            Reach { allow: vec![store.root.clone()], deny: vec![] },
+            (out.allow, out.deny),
+            (vec![store.root.clone()], vec![]),
             "wsp knows where it keeps its own record; nothing here is guessed"
+        );
+    }
+
+    /// Every seat may read what it builds against and write where scratch
+    /// goes, and neither is a fact about its row.
+    ///
+    /// `wsp-125`: three compound seats in one evening stopped on
+    /// `~/.cargo/registry/src`, on `wsp verify`'s own warm tree, and on `/dev`
+    /// with `/tmp`. The registry and the toolchain are this machine's and are
+    /// only asserted when they exist; the warm tree and `/dev` are made certain
+    /// here. And a scratch directory that holds the tree is an ancestor of it,
+    /// refused for the reason every ancestor is: it covers the sibling trees.
+    #[test]
+    fn every_seat_may_read_what_it_builds_against_and_write_its_scratch() {
+        let store = seat("reach-machine");
+        std::fs::create_dir_all(store.state.join("warm/compound-0/tree")).unwrap();
+        let out = reach(&store, None, None, Some("/nowhere/near"));
+        assert!(
+            out.read.contains(&util::real(&store.state.join("warm").display().to_string())),
+            "`wsp verify` tells a seat where its results are; reading them is not a question — {out:?}"
+        );
+        assert!(out.scratch.contains(&"/dev".into()), "`cat /dev/null` asks about `/dev/*` — {out:?}");
+        assert!(
+            !out.read.iter().chain(out.allow.iter()).any(|d| d.starts_with("/dev")),
+            "/dev is scratch, reached and written, never a read-only reach — {out:?}"
+        );
+        let cargo = util::real("~/.cargo/registry/src");
+        if std::env::var_os("CARGO_HOME").is_none() && cargo.is_dir() {
+            assert!(out.read.contains(&cargo), "the source a Rust build is made from — {out:?}");
+        }
+
+        let under = reach(&store, None, None, Some("/tmp/wsp-reach-machine/.worktrees/t"));
+        assert!(
+            !under.scratch.iter().any(|d| d.ends_with("tmp")),
+            "a scratch directory above the tree covers every tree beside it — {under:?}"
         );
     }
 
@@ -2961,8 +3093,8 @@ mod tests {
 
         let out = reach(&store, Some("ui-010"), None, Some(&tree.display().to_string()));
         assert_eq!(
-            out,
-            Reach { allow: vec![store.root.clone()], deny: vec![] },
+            (&out.allow, &out.deny),
+            (&vec![store.root.clone()], &vec![]),
             "a rule on the parent covers every sibling tree under it — {out:?}"
         );
     }
@@ -3078,8 +3210,8 @@ mod tests {
 
         let out = reach(&store, Some("ui-011"), None, Some("/nowhere/near"));
         assert_eq!(
-            out,
-            Reach { allow: vec![store.root.clone()], deny: vec![] },
+            (&out.allow, &out.deny),
+            (&vec![store.root.clone()], &vec![]),
             "the store already answers for everything under it — {out:?}"
         );
     }

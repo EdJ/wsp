@@ -1012,23 +1012,49 @@ fn config(brief: Option<&Path>, reach: &Reach) -> String {
         .and_then(|b| b.parent())
         .map(|d| d.to_path_buf())
         .into_iter()
-        .filter(|d| !reach.allow.iter().chain(reach.deny.iter()).any(|r| d.starts_with(r)))
+        .filter(|d| {
+            let reached = [&reach.allow, &reach.deny, &reach.read, &reach.scratch];
+            !reached.iter().flat_map(|l| l.iter()).any(|r| d.starts_with(r))
+        })
         .collect();
-    let outside = match reach.allow.is_empty() && reach.deny.is_empty() && named.is_empty() {
+    // The machine's own directories go **before** the denies, where the row's
+    // allows go after them: a project root that happens to sit under `/tmp` is
+    // still refused, which is `findLast` doing the work the other way round.
+    let machine: Vec<&PathBuf> = reach.scratch.iter().chain(reach.read.iter()).collect();
+    let outside = match machine.is_empty()
+        && reach.allow.is_empty()
+        && reach.deny.is_empty()
+        && named.is_empty()
+    {
         true => String::new(),
         false => {
             let rule = |dir: &Path, action: &str| {
                 format!("{}:{}", Value::from(format!("{}/*", dir.display())), Value::from(action))
             };
+            let given = machine.iter().map(|dir| rule(dir, "allow"));
             let denies = reach.deny.iter().map(|dir| rule(dir, "deny"));
             // After every deny, because `findLast` — see above.
             let allows = reach.allow.iter().chain(named.iter()).map(|dir| rule(dir, "allow"));
-            let rules = denies.chain(allows).collect::<Vec<_>>().join(",");
+            let rules = given.chain(denies).chain(allows).collect::<Vec<_>>().join(",");
             format!(r#","external_directory":{{{rules}}}"#)
         }
     };
+    // `edit` is `allow`, except in what the seat may only read: the argument is
+    // on [`crate::cmd_spawn::reach`]'s `machine`. The plain string when there is
+    // nothing to refuse, so a seat with no read-only reach is the config it had.
+    let edit = match reach.read.is_empty() {
+        true => Value::from("allow").to_string(),
+        false => {
+            let denies = reach
+                .read
+                .iter()
+                .map(|dir| format!("{}:{}", Value::from(unwritable(reach.tree.as_deref(), dir)), Value::from("deny")));
+            let rules = std::iter::once(r#""*":"allow""#.to_string()).chain(denies);
+            format!("{{{}}}", rules.collect::<Vec<_>>().join(","))
+        }
+    };
     let mut cfg =
-        format!(r#"{{"permission":{{"bash":{{{bash}}},"edit":"allow"{outside}}}"#);
+        format!(r#"{{"permission":{{"bash":{{{bash}}},"edit":{edit}{outside}}}"#);
     // The brief, as a path opencode loads for itself. `core-032` d7, and the
     // reason it goes here rather than into the work order is on
     // [`Kind::brief_file`].
@@ -1049,6 +1075,22 @@ fn config(brief: Option<&Path>, reach: &Reach) -> String {
     }
     cfg.push('}');
     cfg
+}
+
+/// The `edit` pattern that refuses `dir` to a seat standing in `tree`.
+///
+/// opencode asks `edit` about the file's path **relative to the seat's tree**,
+/// not its absolute one — driven 2026-09-28, a write to a registry file from
+/// `.worktrees/seat` asked about `../../../cargo/registry/src/…/lib.rs`. So the
+/// rule is the part of `dir` below what it shares with the tree, behind a `*`
+/// that stands for however many `../` it takes to get there. With no tree the
+/// base is `/`, which is what opencode falls back to outside a repository.
+fn unwritable(tree: Option<&Path>, dir: &Path) -> String {
+    let base = tree.unwrap_or(Path::new("/"));
+    let shared: PathBuf =
+        base.components().zip(dir.components()).take_while(|(a, b)| a == b).map(|(a, _)| a).collect();
+    let below = dir.strip_prefix(&shared).unwrap_or(dir);
+    format!("*{}/*", below.display())
 }
 
 /// Where the model catalogue comes from, and the shape a model name has.
@@ -2399,6 +2441,7 @@ mod tests {
         Reach {
             allow: allow.iter().map(PathBuf::from).collect(),
             deny: deny.iter().map(PathBuf::from).collect(),
+            ..Reach::default()
         }
     }
 
@@ -2888,6 +2931,58 @@ mod tests {
         // `external_directory` takes a single map, and the order is inside it.
         let v: Value = serde_json::from_str(cfg).expect("valid config");
         assert_eq!(v["permission"]["external_directory"]["/Users/somebody/compound/*"], "deny", "{cfg}");
+    }
+
+    /// What a seat builds against is reached and not written, and its scratch
+    /// is reached and written.
+    ///
+    /// `wsp-125`. An `external_directory` allow is a path rule and cannot say
+    /// *read*, so the read-only half is an `edit` deny beside it, matched the
+    /// way opencode matches it: relative to the seat's tree. Driven 2026-09-28
+    /// from `.worktrees/seat`, a write to a registry file asked about
+    /// `../../../cargo/registry/src/crate-1.0/lib.rs` and a rule of this shape
+    /// refused it while the read went through. The machine's allows go before
+    /// a project's denies, so a root under `/tmp` is still refused.
+    #[test]
+    fn what_a_seat_builds_against_is_read_and_never_written_by_its_file_tools() {
+        let reach = Reach {
+            deny: vec!["/tmp/compound".into()],
+            read: vec!["/Users/somebody/.cargo/registry/src".into()],
+            scratch: vec!["/dev".into(), "/tmp".into()],
+            tree: Some("/Users/somebody/claude/compound/.worktrees/compound-159".into()),
+            ..Reach::default()
+        };
+        let env = of("opencode").env(None, &reach);
+        let cfg = &env["OPENCODE_CONFIG_CONTENT"];
+        let v: Value = serde_json::from_str(cfg).expect("valid config");
+        let out = &v["permission"]["external_directory"];
+        assert_eq!(out["/Users/somebody/.cargo/registry/src/*"], "allow", "{cfg}");
+        assert_eq!(out["/dev/*"], "allow", "`2>/dev/null`'s neighbour `cat /dev/null` — {cfg}");
+        let at = |needle: &str| cfg.find(needle).unwrap_or_else(|| panic!("no {needle} in {cfg}"));
+        assert!(
+            at(r#""/tmp/*":"allow""#) < at(r#""/tmp/compound/*":"deny""#),
+            "a machine-wide allow written after a root's deny reopens the trunk — {cfg}"
+        );
+
+        let edit = &v["permission"]["edit"];
+        assert_eq!(edit["*"], "allow", "the tree is still the seat's to write — {cfg}");
+        assert_eq!(edit["*.cargo/registry/src/*"], "deny", "{cfg}");
+        assert!(
+            at(r#""*":"allow""#) < at(r#""*.cargo/registry/src/*":"deny""#),
+            "`findLast`: the catch-all first, or the deny is decoration — {cfg}"
+        );
+        assert_eq!(
+            unwritable(
+                Some(Path::new("/p/root/.worktrees/seat")),
+                Path::new("/p/cargo/registry/src")
+            ),
+            "*cargo/registry/src/*",
+            "the driven case: `../../../cargo/registry/src/…` is what opencode asks about"
+        );
+        // And a seat with nothing it may only read keeps the plain string.
+        let plain: Value =
+            serde_json::from_str(&of("opencode").env(None, &Reach::default())["OPENCODE_CONFIG_CONTENT"]).unwrap();
+        assert_eq!(plain["permission"]["edit"], "allow");
     }
 
     /// A config may not name a file it forbids reaching.
