@@ -131,8 +131,8 @@ logs and decisions), seats a fresh custodian, and ends:
 ```sh
 wsp govern <slug> --rotate      # one verb, and the custodian's last act:
                                 #   seats the successor, waits until its first
-                                #   turn starts, moves the seat, and leaves your
-                                #   ending to it
+                                #   turn starts, moves the seat, and ends your
+                                #   pane itself once it exits
 ```
 
 Rotation is one verb rather than a three-step composition (`spawn --govern`,
@@ -146,15 +146,22 @@ move; failing any of that says what it found, exits non-zero, and degrades to
 *the predecessor is still seated*, which is the state before the attempt. The
 slot moves last also means there is no vacancy window and no restore path.
 
-The caller's own ending cannot be step four, because a verb that ends the pane
-it runs in cannot report what happened. So the ending is handed to the
-**successor**: the rotation writes a record through the store, the successor's
-brief carries it ("run `wsp despawn --pane …`"), and `despawn` consumes the
-record when the pane actually goes. The typed work order was the one piece of
-handover state that did not go through the store — which is exactly why it
-could be dropped at all, and why the death warrant for the caller's pane does
-not ride it. `wsp despawn --pane` is reused whole; nothing grew a second way to
-end an agent.
+The caller's own ending cannot be done inline, because a verb that ends the
+pane it runs in cannot report what happened. It used to be handed to the
+**successor**, whose brief said "run `wsp despawn --pane …`". On the first
+rotation onto a Claude Code seat in auto mode, the permission classifier refused
+that as one agent ending another's workload (`wsp-128`). It was right to: a line
+in a brief is not authority. So step four starts a detached `wsp govern <slug>
+--ending` from the caller's own pane, in a process group of its own. It waits
+for `--rotate` to exit and then ends the caller through `despawn`'s own path.
+That is the seat acting on itself. The rotation writes a handover record through
+the store, the successor's brief *reports* it (the ending is wsp's, not the
+successor's), and `despawn` consumes the record when the pane goes. If the
+ending fails, the record keeps the reason, the successor's brief says the
+predecessor is still running and that a person has to end it, and
+`handover.log` in the state directory holds what the helper printed. The typed
+work order is still the one piece of handover state that does not go through
+the store, which is why none of this rides it.
 
 `next` prints this at every group's own barrier (never at barrier zero or the
 last), and `--json` carries the same command as `reseat`. The verb refuses when
