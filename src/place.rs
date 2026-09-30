@@ -379,15 +379,35 @@ pub const CHILD_MARKER: &str = "CLAUDE_CODE_CHILD_SESSION";
 /// `CLAUDE_CODE_MESSAGING_SOCKET` and `..._TOKEN` are the caller's control
 /// channel and the credential for it, handed to an unrelated agent.
 ///
-/// `CLAUDE_PID` is named because the prefix misses it and it is the same fact:
-/// the control socket is `/tmp/cc-socks/<CLAUDE_PID>.sock`, so shedding the
-/// socket and keeping the pid that spells it is half a strip. The prefix stops
-/// at `CLAUDE_CODE_` rather than `CLAUDE_` for the opposite reason — a setting
-/// like `CLAUDE_CONFIG_DIR` says where this machine keeps its configuration and
-/// is *supposed* to be inherited. Identity is shed; preference is not.
+/// **Every `CLAUDE_` name is shed except the ones [`KEPT`] lists**, rather than
+/// the prefix plus whatever names somebody has found. The named list was
+/// always one release behind: `CLAUDE_PID` was added by name because the
+/// control socket is `/tmp/cc-socks/<CLAUDE_PID>.sock`, and then
+/// `CLAUDE_JOB_DIR` leaked for a day unnoticed (`wsp-130`). It names the
+/// caller's background job, so every seat a job-spawned governor opened showed
+/// that job's name in its status bar instead of its own `-n`, and recorded its
+/// exit in the dead governor's job. `CLAUDE_EFFORT` went the same way: it is the
+/// caller's live effort level, so a seat spawned without `--effort` ran at its
+/// spawner's rather than its settings' default.
+///
+/// The inversion is argued from which failure is worse. Every `CLAUDE_` name
+/// found in a spawning agent's environment (2026-09-30: `CLAUDECODE`,
+/// `CLAUDE_PID`, `CLAUDE_JOB_DIR`, `CLAUDE_EFFORT`, seven `CLAUDE_CODE_*`) was
+/// put there by the Claude Code that ran `wsp`, and describes that session. A
+/// leak is silent — the marker costs the transcript, the job dir costs the
+/// exit record, and nothing fails. Over-shedding a genuine preference empties
+/// it on the seat, which shows on the first spawn and is repaired by one name
+/// in [`KEPT`]. A setting like `CLAUDE_CONFIG_DIR` says where this machine
+/// keeps its configuration and is *supposed* to be inherited; that is what the
+/// list is for. Preferences are kept by name; everything else is identity.
 pub fn shed(key: &str) -> bool {
-    matches!(key, "CLAUDECODE" | "CLAUDE_PID") || key.starts_with("CLAUDE_CODE_")
+    (key == "CLAUDECODE" || key.starts_with("CLAUDE_")) && !KEPT.contains(&key)
 }
+
+/// The `CLAUDE_` names a seat inherits: preferences about this machine, not
+/// facts about the session that spawned it. [`shed`] says why it is this way
+/// round.
+pub const KEPT: &[&str] = &["CLAUDE_CONFIG_DIR"];
 
 /// The same rule against this process's environment: what a caller would have
 /// to `unset` before spawning by hand, which is the workaround this replaces.
@@ -1155,11 +1175,12 @@ mod tests {
 
     /// What a seat's occupant must not find, and where the line is drawn.
     ///
-    /// The rule is a prefix so that the name Claude Code adds next month is shed
-    /// without anybody noticing it exists — which is the whole defect, since
-    /// [`CHILD_MARKER`] was such a name until it cost a measurement its
-    /// transcript. It stops short of every `CLAUDE_` because a configuration
-    /// directory is a fact about the machine and is meant to be inherited.
+    /// The rule sheds every `CLAUDE_` name so that the one Claude Code adds next
+    /// month is shed without anybody noticing it exists — which is the whole
+    /// defect, twice: [`CHILD_MARKER`] cost a measurement its transcript, and
+    /// `CLAUDE_JOB_DIR` put a dead governor's job name on every seat's status
+    /// bar. A configuration directory is a fact about the machine and is kept by
+    /// name.
     #[test]
     fn a_new_session_does_not_inherit_the_one_that_spawned_it() {
         for key in [
@@ -1169,7 +1190,10 @@ mod tests {
             "CLAUDE_CODE_MESSAGING_SOCKET",
             "CLAUDE_CODE_MESSAGING_TOKEN",
             "CLAUDE_PID",
+            "CLAUDE_JOB_DIR",
+            "CLAUDE_EFFORT",
             "CLAUDE_CODE_SOMETHING_ADDED_LATER",
+            "CLAUDE_SOMETHING_ADDED_LATER",
         ] {
             assert!(shed(key), "{key} names the spawning session and would have reached the seat");
         }
