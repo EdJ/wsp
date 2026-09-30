@@ -457,6 +457,25 @@ pub(crate) fn full_name(
         .filter(|full| full != name)
 }
 
+/// The sentence a seat's agent last said about itself, while it is still
+/// about the work the seat holds.
+///
+/// Not [`full_name`], which answers *what is the whole of this label* and is
+/// invalidated by a rename. This answers *what did the agent say it is doing*,
+/// for a surface drawing no label of ours — a compound pane header, `wsp wip`
+/// — and what makes it stale is the seat's work changing under it: a sentence
+/// said on one task is not a statement about the next one, or about none. The
+/// task is compared rather than trusted to have been cleared, for the reason
+/// `full_name` compares the label: every claim, release and handoff would
+/// otherwise have to remember this record, and the one that forgot would put
+/// a sentence about old work over new work.
+pub(crate) fn sentence(said: &BTreeMap<String, Value>, pane: &str, held: Option<&str>) -> Option<String> {
+    let entry = said.get(pane)?;
+    let task = entry.get("task").and_then(|t| t.as_str());
+    let said = entry.get("said").and_then(|s| s.as_str()).filter(|s| !s.is_empty())?;
+    (task == held).then(|| said.to_string())
+}
+
 /// Put the task's name on the workspace and the pane that took it up. Returns
 /// the workspace's new label, if the workspace took it.
 ///
@@ -1760,15 +1779,20 @@ pub(crate) fn piped_message() -> Result<String, i32> {
 /// always a way home that does not need the agent to remember what it was
 /// called. A claim resets it too, which is why `claim` names the pane as well
 /// as the workspace rather than leaving it to this.
+///
+/// **The record is the act; the pane label is one drawing of it** (wsp-115).
+/// The sentence goes into `said.json` first and unconditionally, keyed on the
+/// seat [`my_pane`] resolved, and a surface with no label of ours to wear —
+/// `wsp wip`, a compound pane header — reads it back through [`sentence`].
+/// herdr's rename is decoration applied afterwards, and only to a seat herdr
+/// issued. This verb used to open on `herdr::available()` and return 1, which
+/// on a machine whose seats are all compound's was every call from every
+/// agent, and the one verb the brief tells them to use as they go.
 pub fn say(store: &Store, args: &Args) -> i32 {
     let Some(pane) = pane_id(args) else {
-        eprintln!("wsp: no pane to name — run this inside a herdr pane, or pass --pane");
+        eprintln!("wsp: no seat to name — run this inside a seat wsp spawned, or pass --pane");
         return 2;
     };
-    if !herdr::available() {
-        eprintln!("wsp: no herdr socket at {}", herdr::socket_path().display());
-        return 1;
-    }
 
     // A stream form, for the reason `note` has one: the handbook tells every
     // agent to give a wsp verb its prose through `-` or `--from`, and `say`
@@ -1819,30 +1843,46 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     };
     let label = full.as_deref().map(on_the_wire);
 
-    let r = match &label {
-        Some(l) => herdr::rename_pane(&pane, l),
-        None => herdr::call("pane.rename", json!({ "pane_id": pane, "label": null })).map(|_| ()),
-    };
-    if let Err(e) = r {
-        eprintln!("wsp: {e}");
-        return 1;
-    }
-
-    // Kept only once herdr has taken the name, and only when there is more of
-    // it than went over: what is stored is a statement about the label the pane
-    // is wearing, and a rename that failed leaves it wearing the old one.
-    // `set_said` keeps nothing when the two agree, so `--clear` on a short
-    // title and a pane whose label went away both end with no entry, which is
-    // the state that means "what is on the wire is the whole of it".
+    // The record first, and whatever happens to the rename after. `said` is
+    // the sentence the agent typed and `task` the work it was said about, so a
+    // reader can tell when it has gone stale without anybody clearing it. The
+    // `label`/`full` half is written unconditionally too: it is only read
+    // while the pane is wearing `label`, so a rename that failed, or a seat
+    // herdr never drew, leaves a half that matches nothing rather than one
+    // that lies. `--clear`, and a sentence [`plain_full`] withholds, take the
+    // whole entry away — the agent withdrew what it said.
+    let spoken = !(said.is_empty() || args.has("clear")) && full.is_some();
     match (&label, &full) {
-        (Some(l), Some(f)) => store.set_said(&pane, l, f),
+        (Some(l), Some(f)) if spoken => {
+            store.set_sentence(&pane, said, held.as_ref().map(|t| t.id.as_str()));
+            store.set_said(&pane, l, f);
+        }
+        (Some(l), Some(f)) => {
+            store.clear_said(&pane);
+            store.set_said(&pane, l, f);
+        }
         _ => {
             store.clear_said(&pane);
         }
     }
 
+    // Decoration, and only where herdr is the one drawing this seat. A failed
+    // rename there is still worth a line — on a herdr machine the sidebar is
+    // how a person reads this — but it no longer fails the verb: what the
+    // agent said is kept either way, and a status line that exits 1 teaches an
+    // agent to stop saying things.
+    if herdr_draws(&pane) {
+        let r = match &label {
+            Some(l) => herdr::rename_pane(&pane, l),
+            None => herdr::call("pane.rename", json!({ "pane_id": pane, "label": null })).map(|_| ()),
+        };
+        if let Err(e) = r {
+            eprintln!("wsp: kept, but herdr did not take the label: {e}");
+        }
+    }
+
     if args.json() {
-        println!("{}", json!({ "pane": pane, "label": label }));
+        println!("{}", json!({ "pane": pane, "label": label, "said": spoken.then_some(said) }));
     } else {
         let p = Paint::new();
         match &label {
@@ -1851,6 +1891,18 @@ pub fn say(store: &Store, args: &Args) -> i32 {
         }
     }
     0
+}
+
+/// Whether this seat is a herdr pane on a herdr that is up — the one case in
+/// which renaming it is a thing that can happen.
+///
+/// Read off the seat's spelling rather than asked of a census: herdr spells a
+/// seat `<workspace>:<pane>`, and a backend with no workspace of its own
+/// mints one with no `:` (`cpd-N`, `sup-N`) — the same reading [`wip_rows`]
+/// makes to find a workspace. Asking herdr to rename `cpd-142` on a machine
+/// running both would only produce an error about a pane herdr never had.
+fn herdr_draws(seat: &str) -> bool {
+    seat.contains(':') && herdr::available()
 }
 
 /// What a pane wears while its agent is looking for a task.
@@ -1892,12 +1944,19 @@ fn looking_label(project: Option<&str>, found: bool) -> String {
 ///
 /// Nothing here is worth failing a command over, so every failure is silent —
 /// the same bargain `claim`'s rename makes.
+///
+/// Said the way [`say`] says things, since wsp-115: into the record first, so
+/// a seat herdr does not draw still says it is looking, and onto herdr's label
+/// only where herdr draws. *An agent* is asked of the backend that seated it —
+/// a supervisor sets its seat variable only on a process it spawned as one,
+/// so a seat that arrived by that name is driven by construction, and a herdr
+/// pane is asked of herdr's own pane list as before.
 pub fn say_looking(store: &Store, panes: &[herdr::Pane], project: Option<&str>, found: bool) {
-    if !herdr::available() {
-        return;
-    }
-    let Some(pane) = herdr::Env::read().pane_id else { return };
-    let driven = panes.iter().any(|p| p.pane_id == pane && !p.agent.is_empty());
+    let Some(pane) = my_pane() else { return };
+    let driven = match crate::place::seat_from_env() {
+        Some(_) => true,
+        None => panes.iter().any(|p| p.pane_id == pane && !p.agent.is_empty()),
+    };
     if !driven {
         return;
     }
@@ -1910,7 +1969,11 @@ pub fn say_looking(store: &Store, panes: &[herdr::Pane], project: Option<&str>, 
     if holds {
         return;
     }
-    let _ = herdr::rename_pane(&pane, &looking_label(project, found));
+    let label = looking_label(project, found);
+    store.set_sentence(&pane, &label, None);
+    if herdr_draws(&pane) {
+        let _ = herdr::rename_pane(&pane, &label);
+    }
 }
 
 /// `Trance Video · 3h12m` — a claim as one line.
@@ -3612,6 +3675,10 @@ pub(crate) struct Wip {
     /// joins against it rather than asking the store again (`compound-106`,
     /// the same reason `governors` above is read once for every row).
     pub agents_held: std::collections::BTreeMap<String, serde_json::Value>,
+    /// `said.json`, for the sentence each agent last said about itself — see
+    /// [`sentence`]. A seat herdr does not draw has no label to read it off,
+    /// so this is where a compound seat's status line is seen at all.
+    pub said: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Wip {
@@ -3632,6 +3699,7 @@ impl Wip {
             governors: store.governors(),
             agents,
             agents_held: store.agents_held(),
+            said: store.said(),
         }
     }
 }
@@ -3668,6 +3736,10 @@ pub(crate) struct WipRow {
     /// The project this pane's workspace is the governor of, if any — which is
     /// no project for every ordinary agent, and that is nearly all of them.
     pub(crate) seat: Option<String>,
+    /// What the agent last said it was doing, while that is still about the
+    /// work its seat holds. Published as `said` for a reader that draws it —
+    /// compound's pane header reads exactly this key.
+    pub(crate) said: Option<String>,
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
@@ -3726,6 +3798,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             turning: a.state.turn_in_flight(),
             needs_you,
             seat: seat_of_project,
+            said: sentence(&w.said, seat, bound.map(|t| t.id.as_str())),
         });
     }
     rows.sort_by(|a, b| a.project.cmp(&b.project).then(a.pane.cmp(&b.pane)));
@@ -3750,6 +3823,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "project": r.project, "task": r.task, "task_id": r.task_id,
             "pane": r.pane, "workspace": r.workspace, "state": r.state,
             "turning": r.turning, "needs_you": r.needs_you, "seat": r.seat,
+            "said": r.said,
         })).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
@@ -3815,10 +3889,15 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
                 (None, true) => p.yellow("← needs you"),
                 (None, false) => String::new(),
             };
+            // What the agent said it is doing, in place of what the work is
+            // called, when it has said something about this work — the trade a
+            // herdr label has always made, and on a seat herdr does not draw
+            // this is the only place a person reading `wip` sees it.
+            let doing = r.said.as_deref().unwrap_or(&r.task);
             out.push(format!(
                 "{}  {}  {}  {} {}",
                 util::pad(&r.project, pw),
-                util::pad(&util::truncate(&r.task, tw), tw),
+                util::pad(&util::truncate(doing, tw), tw),
                 p.dim(&util::pad(&r.pane, 7)),
                 state,
                 flag
@@ -6777,6 +6856,121 @@ mod tests {
         }
     }
 
+    /// wsp-115's acceptance, on the seat it was filed from: a compound seat, on
+    /// a machine with no herdr, says something. It used to answer `no herdr
+    /// socket` and exit 1 before looking at the sentence; the exit code is
+    /// asserted as well as the record, because a version that wrote the record
+    /// and still refused would pass on the store alone.
+    ///
+    /// The sentence is short on purpose. `set_said` keeps nothing when the
+    /// label is already whole, so a record that lived only in that half would
+    /// hold nothing for exactly the sentences agents usually say.
+    #[test]
+    fn a_compound_seat_with_no_herdr_says_something_and_it_is_kept() {
+        let iso = util::isolated("say-no-herdr");
+        let store = Store::at(iso.home(), iso.state());
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("Say where you have got to", "wsp-900");
+        t.project = Some("wsp".into());
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-9", json!({ "task_id": "wsp-900", "pane_id": "cpd-9" }));
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-9");
+        assert!(!herdr::available_now(), "the case the row is about: nothing listening");
+
+        let code = say(&store, &Args::synth("say", &["running the suite"], &[]));
+        std::env::remove_var(crate::place::SEAT_ENV);
+        assert_eq!(code, 0, "no herdr is not a reason to refuse a status line");
+
+        let said = store.said();
+        assert_eq!(said["cpd-9"]["said"], "running the suite", "the sentence, as typed: {said:?}");
+        assert_eq!(said["cpd-9"]["task"], "wsp-900", "and the work it was about");
+        assert_eq!(sentence(&said, "cpd-9", Some("wsp-900")).as_deref(), Some("running the suite"));
+
+        // And a person reading `wip` sees it, which on this seat is the only
+        // place anybody can.
+        let w = Wip {
+            tasks: vec![t],
+            index: Index::new(vec![crate::model::Project::new("wsp")]),
+            bindings: store.bindings(),
+            claims: std::collections::BTreeMap::new(),
+            pins: std::collections::BTreeMap::new(),
+            governors: std::collections::BTreeMap::new(),
+            agents: vec![seated_agent("cpd-9", "working", "cpd-9")],
+            agents_held: std::collections::BTreeMap::new(),
+            said,
+        };
+        assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("running the suite"), "{text}");
+        drop(iso);
+    }
+
+    /// A sentence is about the work the seat held when it was said. Once the
+    /// seat holds other work, or none, it is not what the agent is doing — and
+    /// nobody has to have remembered to clear it for that to be true.
+    #[test]
+    fn a_sentence_said_about_one_task_is_not_read_as_the_next_ones() {
+        let mut said = BTreeMap::new();
+        said.insert("cpd-9".to_string(), json!({ "said": "bisecting the flake", "task": "wsp-900" }));
+        assert_eq!(sentence(&said, "cpd-9", Some("wsp-900")).as_deref(), Some("bisecting the flake"));
+        assert_eq!(sentence(&said, "cpd-9", Some("wsp-901")), None, "claimed something else since");
+        assert_eq!(sentence(&said, "cpd-9", None), None, "released since");
+        assert_eq!(sentence(&said, "cpd-8", Some("wsp-900")), None, "another seat's sentence");
+
+        // A seat that held nothing when it spoke is read while it still holds
+        // nothing, which is what `say_looking` is for.
+        said.insert("cpd-7".to_string(), json!({ "said": "looking for work" }));
+        assert_eq!(sentence(&said, "cpd-7", None).as_deref(), Some("looking for work"));
+        assert_eq!(sentence(&said, "cpd-7", Some("wsp-900")), None);
+
+        // The label half alone, which is all an entry from before wsp-115 has,
+        // is not a sentence.
+        said.insert("w1:p1".to_string(), json!({ "label": "wsp/900 · a…", "full": "wsp/900 · a b" }));
+        assert_eq!(sentence(&said, "w1:p1", None), None);
+    }
+
+    /// The two halves of an entry are two writers' facts, and neither takes
+    /// the other's with it. `reconcile` re-asserting a pane's name is not the
+    /// agent saying something else, and the agent saying something is not the
+    /// pane's long name going away.
+    #[test]
+    fn renaming_a_pane_keeps_what_its_agent_said_and_clear_takes_both() {
+        let iso = util::isolated("said-halves");
+        let store = Store::at(iso.home(), iso.state());
+        store.ensure_dirs().unwrap();
+        store.set_sentence("w1:p1", "running the suite", Some("wsp-900"));
+        store.set_said("w1:p1", "wsp/900 · running…", "wsp/900 · running the suite in full");
+        store.set_said("w1:p1", "wsp/900 · short", "wsp/900 · short");
+        let said = store.said();
+        assert_eq!(said["w1:p1"]["said"], "running the suite", "{said:?}");
+        assert!(said["w1:p1"].get("label").is_none(), "a whole label keeps no long form: {said:?}");
+
+        // With nothing said and a label that is whole, there is no entry at all.
+        store.set_said("w2:p1", "short", "short");
+        assert!(!store.said().contains_key("w2:p1"));
+
+        assert!(store.clear_said("w1:p1"));
+        assert!(store.said().is_empty());
+        drop(iso);
+    }
+
+    /// The minute an agent spends looking for work is visible on a compound
+    /// seat too. It used to return on `!herdr::available()` before reading
+    /// which seat it was in, so the one agent a person would most want to see
+    /// was looking read as the one that had done nothing.
+    #[test]
+    fn a_compound_seat_looking_for_work_says_so_with_no_herdr() {
+        let iso = util::isolated("looking-no-herdr");
+        let store = Store::at(iso.home(), iso.state());
+        store.ensure_dirs().unwrap();
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-9");
+        say_looking(&store, &[], Some("wsp"), true);
+        std::env::remove_var(crate::place::SEAT_ENV);
+        assert_eq!(sentence(&store.said(), "cpd-9", None).as_deref(), Some("looking for work in wsp"));
+        drop(iso);
+    }
+
     /// The refusal says what is owed, and the log is the only place that has
     /// ever recorded it. Anything that is not a `blocked:` line written by
     /// `Task::log` is somebody else's note and must not be read as the
@@ -6886,6 +7080,7 @@ mod tests {
                 seated_agent("w3:p1", "working", "reading the README"),
             ],
             agents_held: std::collections::BTreeMap::new(),
+            said: std::collections::BTreeMap::new(),
         }
     }
 

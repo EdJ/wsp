@@ -2224,6 +2224,7 @@ impl Source for Poll<'_> {
             pins: self.store.pins(),
             governors: self.store.governors(),
             agents_held: self.store.agents_held(),
+            said: self.store.said(),
             // The same rows (d) is about, with the empty ones dropped. One
             // reading, filtered twice, rather than two readings.
             agents: seats.iter().filter(|s| s.state != State::Empty).cloned().collect(),
@@ -4292,6 +4293,7 @@ mod tests {
             turning,
             needs_you: false,
             seat: None,
+            said: None,
         }
     }
 
@@ -5306,6 +5308,7 @@ mod tests {
             turning,
             needs_you: false,
             seat: seat.map(str::to_string),
+            said: None,
         }
     }
 

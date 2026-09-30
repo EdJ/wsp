@@ -1584,6 +1584,17 @@ is only used while the pane is still wearing that exact label — a rename by
 anyone, for any reason, falls back to what herdr says, and a short name is a far
 better answer than a long one that disagrees with the sidebar.
 
+The same entry keeps the sentence itself, as the agent typed it and with the
+task it was said about, and `wsp say` writes that before anything is renamed
+(wsp-115). The herdr label is one drawing of the record, applied afterwards and
+only to a pane herdr issued; a seat herdr does not draw — every compound seat —
+is read through `wsp wip`, whose `--json` carries it as `said` for compound's
+pane header. It goes stale when the seat's task changes rather than when the
+pane is renamed, so neither half's writer clears the other's. Keyed by seat and
+pruned by `sync` with the bindings; on a compound seat nothing ever renames it,
+so it outlives any label it was paired with, which is correct — it is the
+sentence, not the label.
+
 One sentence an agent does not have to remember to say: while it is looking for
 work, `wsp next` and `wsp brief` say it for it — `looking for work in render`,
 or `nothing actionable in render` when it asked and there was none. The claim is

@@ -2162,8 +2162,19 @@ impl Store {
     // another tool — invalidates this by construction rather than by our
     // having remembered to clear it. The failure is then a truncated name,
     // which is what every surface had before, rather than a wrong one.
+    //
+    // **And the sentence itself, which is not a statement about a label.**
+    // `said` is what the agent typed and `task` is the task its seat held when
+    // it did (absent when it held none). It used to be kept only once herdr
+    // had taken the name, which read the record as a reading of what one
+    // renderer drew — so on a seat no herdr names, which since `compound-112`
+    // is every seat on the ordinary machine, `wsp say` refused and the
+    // sentence went nowhere (wsp-115, wsp-122). The two halves are two facts
+    // with two invalidations, and neither writer touches the other's keys:
+    // `label`/`full` go stale when the pane is renamed, `said` goes stale
+    // when the seat's task changes, and a reader of each checks its own.
 
-    /// pane id -> `{ label, full }`
+    /// pane id -> `{ label?, full?, said?, task? }`
     pub fn said(&self) -> BTreeMap<String, Value> {
         match self.read_json("said.json") {
             Value::Object(m) => m.into_iter().collect(),
@@ -2173,14 +2184,45 @@ impl Store {
 
     /// Record what a pane's label was cut from. Nothing is stored when the
     /// label is already whole: an entry that says the same as the wire is one
-    /// more thing to keep in step for no reading.
+    /// more thing to keep in step for no reading. Leaves the sentence alone —
+    /// a rename is not the agent saying something else.
     pub fn set_said(&self, pane: &str, label: &str, full: &str) {
-        if label == full {
-            self.clear_said(pane);
-            return;
-        }
         self.update_json("said.json", |s| {
-            s.insert(pane.to_string(), json!({ "label": label, "full": full }));
+            let mut entry = match s.remove(pane) {
+                Some(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            match label == full {
+                true => {
+                    entry.remove("label");
+                    entry.remove("full");
+                }
+                false => {
+                    entry.insert("label".into(), json!(label));
+                    entry.insert("full".into(), json!(full));
+                }
+            }
+            if !entry.is_empty() {
+                s.insert(pane.to_string(), Value::Object(entry));
+            }
+        });
+    }
+
+    /// Record the sentence a seat's agent said, and the task it held when it
+    /// said it. Unconditional: no renderer has to have drawn it first, because
+    /// on a surface that cannot draw it this is the only copy there is.
+    pub fn set_sentence(&self, pane: &str, said: &str, task: Option<&str>) {
+        self.update_json("said.json", |s| {
+            let mut entry = match s.remove(pane) {
+                Some(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            entry.insert("said".into(), json!(said));
+            match task {
+                Some(t) => entry.insert("task".into(), json!(t)),
+                None => entry.remove("task"),
+            };
+            s.insert(pane.to_string(), Value::Object(entry));
         });
     }
 
