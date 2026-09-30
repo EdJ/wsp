@@ -977,6 +977,10 @@ where
         json!({ "id": t.id, "project": t.project, "status": t.status().as_str(), "title": t.title }),
     );
     store.git_commit(&format!("wsp: {verb} {} — {}", t.id, t.title));
+    // `wsp-134`: a review or a block may be the step a run was waiting on.
+    if matches!(verb, "review" | "blocked") {
+        crate::cycle::poke_task(store, &t.id, verb);
+    }
 
     if args.json() {
         println!("{}", t.json());

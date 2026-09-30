@@ -2101,6 +2101,9 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     // ready for the next commit or for the same task being picked up again next
     // week. `wsp checkout --rm` ends it when the work is genuinely over.
 
+    // `wsp-134`: a member reviewed before it landed is verified once it has.
+    crate::cycle::poke_task(store, &w.task, "land");
+
     if args.json() {
         println!(
             "{}",

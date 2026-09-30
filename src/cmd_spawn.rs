@@ -526,22 +526,29 @@ pub fn work_order(subject: &str, how: Handover) -> String {
         // carries its own failure mode in the sentence: nothing ends on a
         // promise, so a handover that cannot confirm the successor says so and
         // leaves the caller holding the seat.
+        // `wsp-134` rewrote the middle of this, and it is a change of job
+        // rather than of wording. Ed, 2026-09-30: wsp runs the steps, agents
+        // are for decisions and action, and the governor does no active work.
+        // So the order no longer tells the seat to sequence, review or
+        // rotate; it tells it which decisions reach it and that it may stop.
+        // Rotation stays only for a group run by hand.
         Handover::Custodian => format!(
             "You are the custodian of the {subject} project. You have not been claimed onto a \
              task and you should not claim one. Your brief is already above: what {subject} is \
-             for, what is open beneath it, and who else is standing in it. The job is to \
-             sequence what runs next and what waits, to write the direction an arriving agent \
-             needs and no more, to review finished work against the code rather than against \
-             the agent's report, and to hold the record: decisions, corrections, and what must \
-             not close with the task that found it. `wsp flag --seat` is your inbox and `wsp \
-             spawn` puts agents under you. You coordinate rather than authorise, so nothing \
-             waits on your permission. Say what you are doing with `wsp say`, and begin by \
-             reading what is open. Keep direction in task logs and decisions rather than in \
-             this conversation, so nothing lives only here; and when you pass a worklist \
-             barrier, rotate: write the verdict with `wsp worklist go`, then make `wsp govern \
-             {subject} --rotate` your last act. It seats your successor, waits until its first \
-             turn starts, moves the seat, and arranges your ending; if any of that fails it \
-             says so, exits non-zero, and you are still the seat."
+             for, what is open beneath it, and who else is standing in it. wsp runs the steps \
+             of a worklist group that has an `agent:` line: it spawns the members, a read-only \
+             verifier on each as it lands, and an agent that checks the barrier and passes or \
+             holds it; then it starts the next group and seats your successor. You are told \
+             when something needs a decision: a member or a verifier blocked, a barrier held, a \
+             barrier passed. Your job is those decisions and the record: answer what somebody \
+             is blocked on, write the direction an arriving agent needs and no more, and keep \
+             decisions and corrections on the rows rather than in this conversation. Do not \
+             review, rebase, test or land yourself; if that is needed, `wsp spawn` an agent for \
+             it. `wsp flag --seat` is your inbox. You coordinate rather than authorise, so \
+             nothing waits on your permission. Say what you are doing with `wsp say`, and when \
+             nothing needs you, stop: you are told when it does. A group with no `agent:` line \
+             is run by hand (`wsp worklist next` names what may start), and when you pass its \
+             barrier, make `wsp govern {subject} --rotate` your last act."
         ),
     }
 }
@@ -2247,6 +2254,87 @@ fn rotate_on(
     wait: &Patience,
     end: &dyn Fn(&str) -> Result<(), String>,
 ) -> i32 {
+    rotate_as(place, store, args, wait, end, None)
+}
+
+/// `wsp-134`: the rotation a run takes itself when its barrier is passed.
+///
+/// Ed, 2026-09-30: once the barrier agent passes a group, wsp moves on "to the
+/// next cycled governor and next group" — the steps are wsp's, and no agent
+/// coordinates them. So this is [`rotate`] with the one refusal it exists to
+/// make lifted: *rotation is the seat's own act*. That rule was against a
+/// peer handing a position away behind its holder's back; here the holder's
+/// replacement is the run's own step, decided in advance by the person the
+/// seat answers to, and the predecessor is the pane the record names.
+///
+/// Everything else is unchanged and every failure still degrades to *the
+/// predecessor is still seated*: the successor is confirmed before the slot
+/// moves. The ending differs in one way. [`rotate`]'s helper waits for the
+/// rotating process to exit, because that process *is* the seat; here the
+/// seat is somebody else, possibly mid-turn on something it was told, so the
+/// helper waits for it to stop turning — [`END_WHEN_IDLE`].
+pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
+    let governors = store.governors();
+    let Some(seat) = cmd_govern::seat_of_scope(scope, &governors) else {
+        println!("wsp: nobody holds the {scope} seat - nothing to rotate");
+        return 0;
+    };
+    let backends = local_backends();
+    let Some((_, found)) = cmd_govern::occupant(store, &backends, &seat) else {
+        println!("wsp: the {scope} seat is empty - nothing to rotate");
+        return 0;
+    };
+    let me = found.seat.as_str().to_string();
+    // The successor on the kind the seat is on now, so a run that is
+    // governed from opencode is not quietly moved onto claude. `rotate_as`
+    // refuses a kind whose order travels in argv, and says so.
+    let kind = governors
+        .get(scope)
+        .and_then(|r| r.get("kind"))
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+        .unwrap_or(DEFAULT_KIND)
+        .to_string();
+    let args = Args::synth("govern", &[scope], &[("rotate", "true"), ("kind", kind.as_str())]);
+    rotate_as(backend(&args).as_ref(), store, &args, &Patience::default(), &|scope| {
+        arrange_ending_when_idle(store, scope)
+    }, Some(me))
+}
+
+/// Set on the `--ending` helper [`rotate_on_behalf`] starts: wait until the
+/// predecessor is not mid-turn, rather than for a process to exit.
+const END_WHEN_IDLE: &str = "WSP_END_WHEN_IDLE";
+
+fn arrange_ending_when_idle(store: &Store, scope: &str) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.handover_log())
+        .map_err(|e| format!("{}: {e}", util::contract(&store.handover_log())))?;
+    let err = log.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["govern", scope, "--ending"])
+        .env(END_WHEN_IDLE, "1")
+        .env_remove(crate::place::SEAT_ENV)
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(err)
+        .process_group(0);
+    cmd.spawn().map(drop).map_err(|e| e.to_string())
+}
+
+fn rotate_as(
+    place: &dyn Place,
+    store: &Store,
+    args: &Args,
+    wait: &Patience,
+    end: &dyn Fn(&str) -> Result<(), String>,
+    on_behalf: Option<String>,
+) -> i32 {
     let p = Paint::new();
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp govern <project|worklist> --rotate");
@@ -2280,12 +2368,20 @@ fn rotate_on(
     // (`compound-105`): a compound-hosted agent has neither, only the seat
     // `my_pane()` already names, and `governs` matches an exact pane on its
     // own — no separate workspace to pass beside it (`compound-095`).
-    let Some(me) = crate::cmd_agent::my_pane() else {
-        eprintln!("wsp: {scope} is rotated by whoever holds its seat, from its own pane");
-        return 2;
+    let (me, held) = match on_behalf {
+        Some(me) => (me, true),
+        None => match crate::cmd_agent::my_pane() {
+            Some(me) => (me, false),
+            None => {
+                eprintln!("wsp: {scope} is rotated by whoever holds its seat, from its own pane");
+                return 2;
+            }
+        },
     };
     let governors = store.governors();
     match cmd_govern::governs(&governors, &crate::place::Seat::new(&me)) {
+        // The run's own rotation found the pane from the seat's record.
+        _ if held => {}
         Some(held) if held == scope => {}
         Some(other) => {
             eprintln!("wsp: this pane holds the {other} seat, not {scope}");
@@ -2556,12 +2652,37 @@ fn mark_ending_failed(store: &Store, scope: &str, why: &str) {
 ///
 /// Also runnable by hand from the pane being ended, which is the repair
 /// [`rotate`] prints when it could not start this.
+/// Hold an ending [`rotate_on_behalf`] arranged until the pane it ends is not
+/// mid-turn, for up to twenty minutes. A predecessor answering something it
+/// was told finishes the answer; one still turning after that is ended
+/// anyway, because a seat that has been replaced and never stops is the
+/// token cost this whole rotation exists to remove.
+fn wait_until_idle(store: &Store, scope: &str) {
+    let Some(from) = store.handovers().get(scope).and_then(|r| r.get("from")).and_then(Value::as_str).map(str::to_string)
+    else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(20 * 60);
+    let backends = local_backends();
+    while Instant::now() < deadline {
+        let turning = crate::cmd_agent::locate_seat(&backends, &from)
+            .is_some_and(|(_, row)| row.state.turn_in_flight());
+        if !turning {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(10));
+    }
+}
+
 pub fn carry_out_ending(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
     let Some(scope) = args.rest.first().and_then(|n| cmd_govern::scope_of(store, &index, n)) else {
         eprintln!("usage: wsp govern <project|worklist> --ending");
         return 2;
     };
+    if std::env::var_os(END_WHEN_IDLE).is_some() {
+        wait_until_idle(store, &scope);
+    }
     if let Some(pid) = std::env::var(ROTATED_BY).ok().and_then(|v| v.parse::<u32>().ok()) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while std::os::unix::process::parent_id() == pid && Instant::now() < deadline {
@@ -3919,12 +4040,18 @@ mod tests {
         assert!(text.contains("custodian of the robustness project"), "{text}");
         assert!(!text.starts_with("You have been claimed"), "that is the other job: {text}");
         assert!(text.contains("should not claim"), "and it has to be said: {text}");
-        // The four things the seat actually did, and the one it must not
-        // become. A gate is the failure mode with the widest blast radius —
-        // every agent under it waiting on a round-trip — so it is named.
-        for owed in ["sequence", "direction", "review", "record", "authorise"] {
+        // What the seat still does, and the one thing it must not become. A
+        // gate is the failure mode with the widest blast radius — every agent
+        // under it waiting on a round-trip — so it is named.
+        for owed in ["decision", "direction", "record", "authorise"] {
             assert!(text.contains(owed), "the work order drops `{owed}`: {text}");
         }
+        // `wsp-134`: the steps are wsp's and the seat does no active work, so
+        // the order says both — the seat that used to sequence and review is
+        // told who does it now, and that it may stop.
+        assert!(text.contains("wsp runs the steps"), "who sequences now: {text}");
+        assert!(text.contains("Do not review, rebase, test or land"), "no active work: {text}");
+        assert!(text.contains("you are told when it does"), "and that it may stop: {text}");
         // No fetch. `--govern` records the slot before the agent starts, so its
         // `SessionStart` hook has already run `wsp brief` with the slot in
         // place — asking again at request 1 is a whole context re-read.
@@ -3934,9 +4061,12 @@ mod tests {
         // the command is one an agent at 3am improvises around; and the
         // three-step composition it replaced is gone, not standing beside it —
         // its third step was the one that could be skipped.
-        for owed in ["worklist go", "govern robustness --rotate", "still the seat"] {
-            assert!(text.contains(owed), "the work order drops the rotation step `{owed}`: {text}");
-        }
+        // Only for a group run by hand, since `wsp-134`: a group with an
+        // `agent:` line is rotated by wsp when its barrier passes.
+        assert!(
+            text.contains("govern robustness --rotate"),
+            "the work order drops the rotation step: {text}"
+        );
         assert!(!text.contains("--govern"), "the old composition, still in prose beside the verb: {text}");
         assert!(!text.contains("end your session"), "an ending the agent must remember is an ending that gets skipped: {text}");
     }
@@ -5614,6 +5744,7 @@ mod tests {
                 stop: String::new(),
                 verdict: "2026-08-20T00:00:00Z clean".into(),
                 landed: Vec::new(),
+                agent: String::new(),
             }]);
             store.save_worklist(&w).unwrap();
             cmd_govern::take(&store, "batch", "w1", "w1:p9");
@@ -5663,6 +5794,7 @@ mod tests {
                 stop: String::new(),
                 verdict: "2026-08-20T00:00:00Z clean".into(),
                 landed: Vec::new(),
+                agent: String::new(),
             },
             Group {
                 members: vec!["t-2".into()],
@@ -5670,6 +5802,7 @@ mod tests {
                 stop: String::new(),
                 verdict: String::new(),
                 landed: Vec::new(),
+                agent: String::new(),
             },
         ]);
         store.save_worklist(&w).unwrap();

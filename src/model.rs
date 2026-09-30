@@ -1451,6 +1451,88 @@ pub struct Group {
     /// the group across renumbering, and a fact filed away from the group it
     /// belongs to is one a reader has to reassemble.
     pub landed: Vec<Landed>,
+    /// `agent:` — who runs this group, and whether wsp runs it at all. Empty
+    /// is a group run by hand, which is every group written before `wsp-134`;
+    /// otherwise a [`Policy`], and wsp itself spawns the members, a verifier
+    /// per member, and the agent that checks the barrier, all on this one
+    /// policy. See `crate::cycle`.
+    ///
+    /// One line for all three and not a verifier's line beside the members',
+    /// because the override it exists to carry is a floor on the whole group
+    /// — group 16 of ux-revamp ran on opencode *only* — and a floor written
+    /// twice is a floor one of whose copies is eventually forgotten.
+    ///
+    /// Set when the group is created (`wsp worklist add --agent`), and
+    /// inherited from the group before it when nothing is said, so a list
+    /// that runs on opencode goes on running on opencode.
+    pub agent: String,
+}
+
+/// Who a group runs on: the kind, and optionally the model and the effort,
+/// written `agent: <kind> [<model>] [<effort>]`.
+///
+/// `manual` is a policy that says *wsp does not run this group*, spelled out
+/// so a list can turn the loop off for one group without deleting the line
+/// the next group would otherwise inherit an automatic policy past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    pub kind: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// The word a group's `agent:` line uses to say wsp does not run it.
+pub const MANUAL: &str = "manual";
+
+/// What a new group is run on when nobody said and there is no group before
+/// it to inherit from: the default kind, on whatever model the spawn itself
+/// would choose. Written into the file rather than left implicit, so a reader
+/// of the list sees that the group is run by wsp.
+pub const DEFAULT_POLICY: &str = "claude";
+
+impl Policy {
+    /// The line as written, or `None` for a group wsp does not run: empty,
+    /// or [`MANUAL`].
+    ///
+    /// Effort is recognised by its word, and anything else after the kind is
+    /// the model — model names are open-ended (`opencode/…-free`, `opus[1m]`)
+    /// and the efforts are five words, so the closed set is the one to match.
+    pub fn parse(line: &str) -> Option<Policy> {
+        let mut toks = line.split_whitespace();
+        let kind = toks.next()?;
+        if kind == MANUAL {
+            return None;
+        }
+        let mut p = Policy { kind: kind.to_string(), model: None, effort: None };
+        for t in toks {
+            match t {
+                "low" | "medium" | "high" | "xhigh" | "max" => p.effort = Some(t.to_string()),
+                _ => p.model = Some(t.to_string()),
+            }
+        }
+        Some(p)
+    }
+
+    /// The flags `wsp spawn` takes for this policy, after `--agent`.
+    pub fn spawn_flags(&self) -> Vec<String> {
+        let mut out = vec!["--kind".to_string(), self.kind.clone()];
+        if let Some(m) = &self.model {
+            out.push("--model".into());
+            out.push(m.clone());
+        }
+        if let Some(e) = &self.effort {
+            out.push("--effort".into());
+            out.push(e.clone());
+        }
+        out
+    }
+}
+
+impl Group {
+    /// The policy wsp runs this group on, or `None` when it is run by hand.
+    pub fn policy(&self) -> Option<Policy> {
+        Policy::parse(&self.agent)
+    }
 }
 
 /// One member's landing, as [`Group::landed`] holds it.
@@ -1577,6 +1659,10 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         } else if let Some(rest) = trimmed.strip_prefix("verdict:") {
             last.verdict = rest.trim().to_string();
             cont = Cont::Verdict;
+        } else if let Some(rest) = trimmed.strip_prefix("agent:") {
+            // One line, never wrapped: a policy is three words.
+            last.agent = rest.trim().to_string();
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("landed:") {
             last.landed.clear();
             landed_push(&mut last.landed, rest);
@@ -1666,6 +1752,7 @@ pub fn render_groups(groups: &[Group]) -> String {
             out.push_str(m);
         }
         out.push('\n');
+        block(&mut out, "agent", &g.agent);
         block(&mut out, "stop", &g.stop);
         block(&mut out, "verdict", &g.verdict);
         block(&mut out, "landed", &landed_text(&g.landed));
@@ -2319,6 +2406,21 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
     }
 
     /// Seven ids do not always fit on a line, and somebody will wrap them.
+    /// `wsp-134`: a group's policy survives the file, and `manual` and no
+    /// line at all both mean a group wsp does not run.
+    #[test]
+    fn a_groups_agent_line_round_trips_and_reads_as_a_policy() {
+        let text = "- 1  a-1  a-2\n  agent: opencode some/model-free high\n  stop: look\n- 2  a-3\n  agent: manual\n- 3  a-4\n";
+        let groups = parse_groups(text);
+        assert_eq!(groups[0].agent, "opencode some/model-free high");
+        assert_eq!(groups[0].members, vec!["a-1", "a-2"], "the line is not a member");
+        assert_eq!(parse_groups(&render_groups(&groups)), groups);
+        let p = groups[0].policy().unwrap();
+        assert_eq!((p.kind.as_str(), p.model.as_deref(), p.effort.as_deref()), ("opencode", Some("some/model-free"), Some("high")));
+        assert_eq!(p.spawn_flags(), vec!["--kind", "opencode", "--model", "some/model-free", "--effort", "high"]);
+        assert!(groups[1].policy().is_none() && groups[2].policy().is_none());
+    }
+
     /// Members before a `stop:` continue; everything after it is the prose.
     #[test]
     fn a_hand_wrapped_group_is_read_as_the_one_group_it_looks_like() {

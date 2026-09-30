@@ -1412,7 +1412,7 @@ impl Store {
 
     // ---- ephemeral state ------------------------------------------------
 
-    fn state_file(&self, name: &str) -> PathBuf {
+    pub(crate) fn state_file(&self, name: &str) -> PathBuf {
         self.state.join(name)
     }
 

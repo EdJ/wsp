@@ -32,6 +32,7 @@ mod cmd_verify;
 mod cmd_watch;
 mod wake;
 mod cmd_worklist;
+mod cycle;
 mod daemon;
 mod detail;
 mod detect_override;
@@ -314,6 +315,8 @@ const VALUED_ON: &[(&str, &str)] = &[
     ("find", "status"),
     ("add", "status"),
     ("project", "status"),
+    // `spawn --agent` stands alone; on a worklist it names who runs a group.
+    ("worklist", "agent"),
 ];
 
 /// Whether this flag stands alone on this verb.
@@ -1765,7 +1768,10 @@ fn help_text() -> String {
                                     it references them, nothing moves
   wsp worklist add <slug> <task>…   one call, one group; its members run at
                                     the same time. --group N joins a group
-                                    that exists instead of making one
+                                    that exists instead of making one;
+                                    --agent "kind [model] [effort]" says who
+                                    runs a new group, and it is otherwise the
+                                    group before's, or claude
   wsp worklist add <slug> <parent> --sub   …or that parent's open sub-tasks as
                                     one group, resolved now and not live
   wsp worklist rm <slug> <task>… [-n]
@@ -1773,7 +1779,7 @@ fn help_text() -> String {
                                     and -n says which before anything moves
   wsp worklist mv <slug> <task> --group N   between groups, or --after N for a
                                     new one between two that exist
-  wsp worklist group <slug> N [--parallel N|none] [--stop "…"|-]
+  wsp worklist group <slug> N [--parallel N|none] [--agent "kind [model] [effort]"|manual] [--stop "…"|-]
                                     a cap on the work, and the prose read at
                                     the barrier after that group — `-` reads it
                                     from a stream and --stop --from FILE out of
@@ -1812,9 +1818,17 @@ fn help_text() -> String {
                                     already running is left to finish — work in
                                     flight cannot be unwound
   wsp worklist done <slug>          nothing left to want from it
+  wsp worklist advance [<slug>]     take the steps a run owes now: spawn its
+                                    members, a read-only verifier on each that
+                                    has landed, and an agent to check the
+                                    barrier. The verbs that make a step due run
+                                    it for you; by hand it repairs a lost one
   A barrier with prose at it will not pass until `go` is given a sentence, and
-  the sentence is dated onto the group. Nothing spawns: `next` names the members
-  and the governor runs `wsp spawn` per member.
+  the sentence is dated onto the group. A group with an `agent:` line — every new
+  one, set by `add --agent` or inherited from the group before — is run by wsp:
+  members, verifiers and the barrier check are spawned on it, a pass starts the
+  next group and rotates the seat, and the governor is told. `manual` or no line
+  is run by hand: `next` names the members and the governor spawns them.
   Every sentence here — a stop condition, a verdict, a reason to hold — takes
   `-` for a stream and `--from FILE` for a file, because a shell runs every
   backtick inside the double quotes a paragraph needs.

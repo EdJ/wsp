@@ -4228,6 +4228,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on — in a seat that can carry what their kind needs |
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
+| `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |

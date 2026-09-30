@@ -73,7 +73,7 @@ use serde_json::json;
 // be a divergence in what each section can hold. `worklist-045` made it
 // `pub(crate)` for its second caller; this is the third.
 use crate::cmd_task::fold;
-use crate::model::{Group, Landed, Worklist, WorklistStatus};
+use crate::model::{Group, Landed, Worklist, WorklistStatus, DEFAULT_POLICY, MANUAL};
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::worklist::{self, Landing, Position, Reading, Segment, Standing};
@@ -98,6 +98,9 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "go" | "start" => go(store, args),
         "hold" | "stop" => hold(store, args),
         "done" | "finish" => done(store, args),
+        // `wsp-134`: the steps wsp takes itself. Started by the verbs that
+        // make one due, and by hand to repair a trigger that was lost.
+        "advance" => crate::cycle::advance(store, args),
         other => {
             eprintln!("wsp worklist: unknown subcommand `{other}`");
             2
@@ -377,7 +380,11 @@ pub fn add(store: &Store, args: &Args) -> i32 {
 
     let new_group = ordinal > groups.len();
     if new_group {
-        groups.push(Group { members: members.clone(), ..Group::default() });
+        let agent = match agent_for_new(args, &groups, groups.len()) {
+            Ok(a) => a,
+            Err(code) => return code,
+        };
+        groups.push(Group { members: members.clone(), agent, ..Group::default() });
     } else {
         groups[ordinal - 1].members.extend(members.iter().cloned());
     }
@@ -409,8 +416,56 @@ pub fn add(store: &Store, args: &Args) -> i32 {
             w.id,
             w.groups().len()
         );
+        if new_group {
+            println!("  {}", Paint::new().dim(&agent_line(&groups[ordinal - 1])));
+        }
     }
     0
+}
+
+/// The `agent:` line a group created now is given — `wsp-134`, and Ed's
+/// "configured at the creation of the group, with a sensible default".
+///
+/// `--agent` when it is said. Otherwise the group before it, so a list
+/// running on opencode goes on running on opencode without anybody having to
+/// remember to say so each time; and only when there is no group before it,
+/// [`DEFAULT_POLICY`].
+///
+/// **A group before it with no line is inherited too, as no line.** That is a
+/// list composed before `wsp-134`, run by a governor spawning by hand under
+/// rules its prose carries and this file does not — ux-revamp's opencode-only
+/// floor was one. Defaulting its next group to `claude` would have wsp start
+/// claude agents in the middle of that run. Such a list turns wsp on with
+/// `--agent`, said once.
+fn agent_for_new(args: &Args, groups: &[Group], at: usize) -> Result<String, i32> {
+    if let Some(v) = args.get("agent") {
+        return policy_word(&v);
+    }
+    Ok(match at.checked_sub(1).and_then(|i| groups.get(i)) {
+        Some(g) => g.agent.trim().to_string(),
+        None => DEFAULT_POLICY.to_string(),
+    })
+}
+
+/// A typed `--agent`: `manual`, or a kind followed by a model and an effort
+/// in either order. The kind is not checked against a list here, for
+/// [`crate::agent_commands::of`]'s reason: the backend refuses an unknown kind
+/// with its whole catalogue, which is a better list than one kept in wsp.
+fn policy_word(v: &str) -> Result<String, i32> {
+    let v = v.trim();
+    if v.is_empty() || v == "true" {
+        eprintln!("wsp: --agent names who runs the group — `claude`, `opencode <model>`, `claude sonnet medium`, or `{MANUAL}`");
+        return Err(2);
+    }
+    Ok(v.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// What a reader is told about who runs a group, in one line.
+fn agent_line(g: &Group) -> String {
+    match g.policy() {
+        Some(_) => format!("agent: {} — wsp spawns its members, verifies each, and checks the barrier", g.agent),
+        None => "agent: manual — the governor spawns this group by hand".to_string(),
+    }
 }
 
 /// `--sub <parent>`: the parent's **open** sub-tasks, as they stand at the
@@ -703,7 +758,11 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     }
 
     if fresh {
-        groups.insert(at - 1, Group { members: vec![id.clone()], ..Group::default() });
+        let agent = match agent_for_new(args, &groups, at - 1) {
+            Ok(a) => a,
+            Err(code) => return code,
+        };
+        groups.insert(at - 1, Group { members: vec![id.clone()], agent, ..Group::default() });
     } else {
         groups[at - 1].members.push(id.clone());
     }
@@ -724,7 +783,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
 
 pub fn group(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
-        "usage: wsp worklist group <slug> N [--parallel N|none] [--stop \"…\"|-|--stop --from FILE]";
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -755,9 +814,9 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: --from is where a stop condition is read from — `wsp worklist group <slug> N --stop --from FILE`");
         return 2;
     }
-    if !args.has("parallel") && !args.has("stop") {
+    if !args.has("parallel") && !args.has("stop") && !args.has("agent") {
         eprintln!("{USAGE}");
-        eprintln!("       --parallel caps the work; --stop is the prose read at the barrier after it");
+        eprintln!("       --parallel caps the work; --agent says who runs it; --stop is the prose read at the barrier after it");
         return 2;
     }
 
@@ -794,6 +853,15 @@ pub fn group(store: &Store, args: &Args) -> i32 {
                     return 2;
                 }
             },
+        }
+    }
+    if let Some(v) = args.get("agent") {
+        match policy_word(&v) {
+            Ok(a) => {
+                said.push(format!("agent: {a}"));
+                groups[ordinal - 1].agent = a;
+            }
+            Err(code) => return code,
         }
     }
     if args.has("stop") {
@@ -1216,6 +1284,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 "groups": groups.iter().enumerate().map(|(i, g)| json!({
                     "ordinal": i + 1,
                     "parallel": g.cap,
+                    "agent": g.agent,
                     "stop": g.stop,
                     "verdict": g.verdict,
                     "members": g.members,
@@ -1328,6 +1397,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 }
             }
             let indent = " ".repeat(members_at);
+            // Only where it was written: a group from before `wsp-134` has no
+            // line, and saying `manual` under each of twenty of them is noise.
+            if !g.agent.trim().is_empty() {
+                println!("{indent}{}", p.dim(&agent_line(g)));
+            }
             // Wrapped against the column it starts in, so the whole block
             // sits inside 80 however deep the ordinals go.
             let width = prose_width(groups.len());
@@ -2571,6 +2645,7 @@ pub fn go(store: &Store, args: &Args) -> i32 {
             "worklist-go",
             json!({ "id": w.id, "passed": crossed, "started": starting, "verdict": said }),
         );
+        crate::cycle::poke_list(store, &w.id, "go", crossed);
     }
 
     // Read here rather than at the top, because `go` is what puts the list
@@ -2916,6 +2991,7 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         return code;
     }
     store.log_event("worklist-held", json!({ "id": w.id, "why": said }));
+    crate::cycle::poke_list(store, &w.id, "hold", None);
 
     if args.json() {
         println!(
@@ -3155,6 +3231,42 @@ mod tests {
     fn run(store: &Store, argv: &[&str]) -> i32 {
         let rest: Vec<&str> = argv.to_vec();
         dispatch(store, &Args::synth("worklist", &rest, &[]))
+    }
+
+    /// `wsp-134`, Ed: configured when the group is created, with a sensible
+    /// default. Said, it is taken; unsaid, the group before is inherited, so a
+    /// list on opencode stays on opencode; with nothing before, `claude`.
+    #[test]
+    fn a_new_group_is_given_a_policy_said_inherited_or_the_default() {
+        let store = scratch("policy");
+        for id in ["p-1", "p-2", "p-3"] {
+            task(&store, id, "todo");
+        }
+        assert_eq!(run(&store, &["new", "pol", "Policy"]), 0);
+        assert_eq!(run(&store, &["add", "pol", "p-1"]), 0);
+        assert_eq!(flagged(&store, &["add", "pol", "p-2"], &[("agent", "opencode  m/x ")]), 0);
+        assert_eq!(run(&store, &["add", "pol", "p-3"]), 0);
+        let g = store.worklist("pol").unwrap().groups();
+        assert_eq!(g[0].agent, DEFAULT_POLICY);
+        assert_eq!(g[1].agent, "opencode m/x", "said, and tidied");
+        assert_eq!(g[2].agent, "opencode m/x", "inherited from the group before");
+        assert_eq!(flagged(&store, &["group", "pol", "3"], &[("agent", MANUAL)]), 0);
+        assert!(store.worklist("pol").unwrap().groups()[2].policy().is_none(), "and turned off");
+    }
+
+    /// A list from before groups had a line stays run by hand when it grows,
+    /// because the rules it runs under live in its prose, not here.
+    #[test]
+    fn a_group_added_to_a_list_from_before_policies_stays_manual() {
+        let store = scratch("legacy");
+        for id in ["l-1", "l-2"] {
+            task(&store, id, "todo");
+        }
+        let mut w = Worklist::new("old", "Old");
+        w.set_groups(&[Group { members: vec!["l-1".into()], ..Group::default() }]);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(run(&store, &["add", "old", "l-2"]), 0);
+        assert_eq!(store.worklist("old").unwrap().groups()[1].agent, "", "no line, as before");
     }
 
     fn flagged(store: &Store, argv: &[&str], flags: &[(&str, &str)]) -> i32 {
