@@ -159,8 +159,9 @@ const BOOL_FLAGS: &[&str] = &[
     // And `govern`, whose positional is a project: `wsp spawn -p wsp --govern`
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it. `--rotate` is the same shape:
-    // `wsp govern core --rotate` names the scope after the verb.
-    "govern", "remove", "rotate",
+    // `wsp govern core --rotate` names the scope after the verb, and so does
+    // the `--ending` a rotation starts behind itself.
+    "govern", "remove", "rotate", "ending",
     // And `wsp watch <signal>…`, whose positionals are signal names.
     "now", "once", "status",
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
@@ -1652,8 +1653,12 @@ fn help_text() -> String {
   wsp govern <proj> --rotate        the handover as one verb, and a custodian's
                                     last act: seats the successor, waits until
                                     its first turn starts, moves the seat, and
-                                    leaves your ending to it. Failing says so,
-                                    exits non-zero, and you are still the seat
+                                    ends your pane itself once it exits — the
+                                    successor is never asked to. Failing says
+                                    so, exits non-zero, and you are still the seat
+  wsp govern <proj> --ending        end the pane a rotation replaced; --rotate
+                                    starts it for you, detached. By hand, only
+                                    from that pane, when --rotate said it failed
   wsp spawn -p <proj> --govern      fill an empty seat directly: a workspace on
                                     the project, an agent in it, the seat taken,
                                     and a custodial work order rather than a

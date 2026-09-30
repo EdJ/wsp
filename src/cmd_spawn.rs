@@ -451,13 +451,14 @@ pub(crate) struct Reach {
 /// answer to where a seat's brief lives, and [`despawn`] looks in exactly one
 /// place to take it away again.
 fn lay_brief(
+    place: &dyn Place,
     store: &Store,
     work: &Work,
     seat: &Seat,
     cwd: Option<&str>,
     path: &std::path::Path,
 ) -> Laid {
-    let ws = workspace_of(seat);
+    let ws = place.room(seat);
     let text = crate::cmd_brief::session_text(&crate::cmd_brief::Briefing::at(
         store,
         crate::cmd_brief::At {
@@ -1929,7 +1930,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         false => None,
     };
     if let Some(project) = &governing {
-        match workspace_of(&seat) {
+        match place.room(&seat) {
             Some(ws) => {
                 if let Some((_, room)) = cmd_govern::take(store, project, &ws, seat.as_str()) {
                     println!("  {}", p.dim(&format!("{project} seat taken from {room}")));
@@ -1978,7 +1979,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // first moment there is anything to say: the claim has landed, so the
         // brief is about this task rather than about an empty seat.
         let laid = match (&brief_at, work.task.is_some() || governing.is_some()) {
-            (Some(path), true) => lay_brief(store, &work, &seat, cwd.as_deref(), path),
+            (Some(path), true) => lay_brief(place, store, &work, &seat, cwd.as_deref(), path),
             _ => Laid::Elsewhere,
         };
         let order = match (&work.task, &governing) {
@@ -2188,43 +2189,64 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
 /// could only move the slot on a promise, which is the thing this verb refuses
 /// to do. Rotate with a kind wsp can hear from.
 ///
-/// # The ending rides the store, because the work order cannot be trusted with it
+/// # The ending is the predecessor's own act, carried out by wsp
 ///
 /// A verb that ends the pane it runs in cannot report what happened, so the
-/// caller's despawn is not step 4 here — it is handed to the successor, carried
-/// in the custodial brief rather than in the typed order. The typed order is
-/// the one piece of handover state that does not go through the store, which is
-/// why it can be dropped at all; putting the predecessor's death warrant in it
-/// would rebuild the exact half-success this verb exists to remove. The record
-/// ([`Store::set_handover`]) is written the moment the successor's seat exists,
-/// read by the brief ([`crate::cmd_govern::incoming`]), and cleared by
-/// [`despawn`] when the pane it names actually goes — one ending, the one
-/// `despawn` already has, reused rather than grown anew.
+/// caller's despawn is not done inline. Until `wsp-128` it was handed to the
+/// successor: its brief said `run wsp despawn --pane <from>`. On the first
+/// rotation onto a Claude Code seat in auto mode, the permission classifier
+/// refused that as one agent ending another's workload. From where it stands
+/// that is correct, because a line in a brief is not authority. The predecessor
+/// ran for another day.
 ///
-/// The brief also says *when*: the seat moves on your first turn, and only then
-/// is the ending yours to do. That sentence is not what enforces it. `despawn`
-/// refuses the predecessor while the record names the caller as successor and
-/// the slot has not moved ([`crate::cmd_govern::rotation_pending`]), because a
-/// successor acting on its session-start text without re-reading would kill
-/// this pane between step 2 and step 3 — a vacancy produced by the verb built
-/// to prevent one.
+/// So the ending leaves from this side. Once the slot has moved, step 4 starts
+/// a detached `wsp govern <scope> --ending` ([`arrange_ending`]) in a process
+/// group of its own, so the group signal that ends this seat does not reach it.
+/// It waits for this process to exit and then ends this pane through
+/// [`end_work`], the one ending `despawn` already has
+/// ([`carry_out_ending`]). The command that started it was typed by the seat
+/// being ended, so it is that seat acting on itself.
+///
+/// The record ([`Store::set_handover`]) still rides the store. It is written
+/// the moment the successor's seat exists, read by the brief
+/// ([`crate::cmd_govern::incoming`]), and cleared by `end_work` when the pane
+/// it names goes. If the ending fails, the record keeps the reason
+/// ([`crate::cmd_govern::ending_failed`]), and the successor's brief reports
+/// it as a fact for a person. It never asks the successor to act.
+///
+/// `despawn` still refuses the predecessor while the record names the caller
+/// as successor and the slot has not moved
+/// ([`crate::cmd_govern::rotation_pending`]). An agent that decides on its own
+/// to end the predecessor would kill this pane between step 2 and step 3,
+/// which is a vacancy produced by the verb built to prevent one.
+/// [`carry_out_ending`] makes the same check from its end.
 ///
 /// The write happens before the agent starts, because the brief is composed at
-/// start; if the rotation fails below, it is taken back — a stale record orders
-/// the death of a pane that is still the seated custodian, and that must only
+/// start; if the rotation fails below, it is taken back — a stale record names
+/// the ending of a pane that is still the seated custodian, and that must only
 /// ever exist while a confirmed successor stands ready to inherit.
 pub fn rotate(store: &Store, args: &Args) -> i32 {
     // The successor OPENS a seat, which is a spawn — so it opens wherever a
     // spawn would, through the same one-copy choice (`compound-091`). It used
     // to name herdr here, which meant `--compound` was honoured by every verb
     // that starts an agent except the one that replaces a custodian.
-    rotate_on(backend(args).as_ref(), store, args, &Patience::default())
+    rotate_on(backend(args).as_ref(), store, args, &Patience::default(), &|scope| {
+        arrange_ending(store, scope, args)
+    })
 }
 
 /// [`rotate`] against a stated backend and clock, which is the shape every test
 /// of it takes: a herdr that answers from a script, and waits measured on a
-/// dial rather than on the machine.
-fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> i32 {
+/// dial rather than on the machine. `end` is step 4, handed the scope: in a
+/// test it records that it was asked, where [`arrange_ending`] starts a
+/// process that would end the test runner's own seat.
+fn rotate_on(
+    place: &dyn Place,
+    store: &Store,
+    args: &Args,
+    wait: &Patience,
+    end: &dyn Fn(&str) -> Result<(), String>,
+) -> i32 {
     let p = Paint::new();
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp govern <project|worklist> --rotate");
@@ -2358,7 +2380,7 @@ fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> 
     store.set_handover(&scope, json!({ "from": me, "to": seat.as_str(), "since": util::now_iso() }));
 
     let laid = match &brief_at {
-        Some(path) => lay_brief(store, &work, &seat, cwd.as_deref(), path),
+        Some(path) => lay_brief(place, store, &work, &seat, cwd.as_deref(), path),
         None => Laid::Elsewhere,
     };
     let text = handover(&subject, Handover::Custodian, route(how, laid));
@@ -2405,21 +2427,34 @@ fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> 
     // Step 3. The slot moves last, now that it is earned. `take` says whom it
     // displaced — which is this pane, by construction — and renames both rooms
     // after the fact.
-    let Some(ws_new) = workspace_of(&seat) else {
-        // The port gap a first custodian's spawn also hits: the workspace id is
-        // herdr's word and the port has none for it. Nothing here may guess it,
-        // and the seat must not move onto a record that cannot name its room.
-        // The record stays, because the successor did take the handover and its
-        // brief does tell it to end this pane once it is the seat.
+    let Some(ws_new) = place.room(&seat) else {
+        // A backend with rooms that could not say which one this seat is in:
+        // herdr, with its listing unanswered. Nothing here may guess, and the
+        // seat must not move onto a record that cannot name its room. So this
+        // pane is still the seat, and nothing ends it. The record stays, so the
+        // successor's brief keeps saying the seat is on its way. Once the move
+        // is finished by hand, this pane's own `--ending` is the step that ends
+        // it; the successor never is.
         eprintln!(
             "wsp: {} took the handover, but its workspace could not be read - \
-             the seat has not moved",
+             the seat has not moved and this pane is still it",
             seat.as_str()
         );
         eprintln!("wsp: run `wsp govern {scope}` from {} to finish the move", seat.as_str());
+        eprintln!("wsp: then `wsp govern {scope} --ending` here ends this pane");
         return 1;
     };
     cmd_govern::take(store, &scope, &ws_new, seat.as_str());
+
+    // Step 4. This pane's own ending, now that somebody else holds the seat.
+    // Started before anything is printed: the process waits for this one to
+    // exit, so the lines below still reach whoever ran the verb. A failure is
+    // written onto the record, where the successor's brief reports it. The
+    // successor does not act on it.
+    let ending = end(&scope);
+    if let Err(why) = &ending {
+        mark_ending_failed(store, &scope, &format!("the ending could not be started: {why}"));
+    }
 
     if args.json() {
         println!(
@@ -2428,38 +2463,151 @@ fn rotate_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> 
                 "rotated": true,
                 "scope": scope,
                 "successor": seat.as_str(),
-                // The same answer the text gives as "your ending is arranged":
-                // which pane the successor has been handed the despawn of.
+                // The pane wsp is ending, which is this one.
                 "predecessor": me,
-                "told": true,
+                "ending": match &ending {
+                    Ok(()) => json!("arranged"),
+                    Err(why) => json!({ "failed": why }),
+                },
             })
         );
     } else {
         println!("{} {}", p.cyan("▣"), p.bold(&format!("{scope} rotated")));
         println!("  {}", p.dim(&format!("successor in {} - its first turn is running", seat.as_str())));
-        println!(
-            "  {}",
-            p.dim("your ending is arranged: the successor ends this pane. Nothing here is left to do")
-        );
+        match &ending {
+            Ok(()) => println!(
+                "  {}",
+                p.dim("your ending is arranged: wsp ends this pane once this command exits. Nothing here is left to do")
+            ),
+            Err(why) => {
+                eprintln!("wsp: the seat moved, but this pane's ending could not be started: {why}");
+                eprintln!("wsp: `wsp govern {scope} --ending` here tries again");
+            }
+        }
     }
-    0
+    match ending {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
-/// The workspace a pane is in, which is the id a slot is recorded against.
+/// The name under which [`arrange_ending`] tells its helper which process to
+/// outlive: the `--rotate` that started it.
+const ROTATED_BY: &str = "WSP_ROTATED_BY";
+
+/// Start `wsp govern <scope> --ending` detached, from the seat being ended.
 ///
-/// The one herdr-shaped question `spawn` asks outside the port. `place::Seat`
-/// is a string wsp is forbidden to parse — the whole point of the handle — and
-/// `place::Seated` has no word for a workspace, because starting and stopping
-/// work never needed one. A slot does: it is keyed on the workspace for the
-/// same reason a claim is, so that an agent cleared and restarted on a new pane
-/// is the same custodian rather than a vacancy.
-pub(crate) fn workspace_of(seat: &Seat) -> Option<String> {
-    crate::herdr::panes()
-        .ok()?
-        .into_iter()
-        .find(|p| p.pane_id == seat.as_str())
-        .map(|p| p.workspace_id)
-        .filter(|w| !w.is_empty())
+/// **In a process group of its own.** compound ends a seat by signalling
+/// compound-sup's group, and this process is in that group. A helper that
+/// stayed in it would be killed by the ending it was carrying out, partway
+/// through, before the claim was released or the record was cleared.
+///
+/// Its output is appended to `handover.log` in the state directory, because
+/// nobody is reading the pane it leaves. The reason a failure lands on the
+/// record names that file.
+///
+/// The seat variables are removed so the helper does not read itself as the
+/// pane it is ending. The backend flags this rotation was given are passed on,
+/// so the helper looks where the rotation looked.
+fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.handover_log())
+        .map_err(|e| format!("{}: {e}", util::contract(&store.handover_log())))?;
+    let err = log.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["govern", scope, "--ending"]);
+    for flag in ["herdr", "compound", "headless"] {
+        if args.has(flag) {
+            cmd.arg(format!("--{flag}"));
+        }
+    }
+    cmd.env(ROTATED_BY, std::process::id().to_string())
+        .env_remove(crate::place::SEAT_ENV)
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(err)
+        .process_group(0);
+    // Dropped rather than waited on: outliving this process is the point.
+    cmd.spawn().map(drop).map_err(|e| e.to_string())
+}
+
+/// Keep the record, and write down why its ending did not happen.
+fn mark_ending_failed(store: &Store, scope: &str, why: &str) {
+    if let Some(mut rec) = store.handovers().remove(scope) {
+        rec["failed"] = json!(why);
+        rec["failed_at"] = json!(util::now_iso());
+        store.set_handover(scope, rec);
+    }
+}
+
+/// `wsp govern <scope> --ending`: end the pane a handover record says was
+/// replaced, from that pane's own `--rotate`.
+///
+/// Waits first for the rotation that started it to exit, up to ten seconds, by
+/// watching its own parent change. Two reasons. The rotation's last lines then
+/// reach the pane before it closes. And an agent that cleans up its command's
+/// process tree on the way out has already let go of this one.
+///
+/// Also runnable by hand from the pane being ended, which is the repair
+/// [`rotate`] prints when it could not start this.
+pub fn carry_out_ending(store: &Store, args: &Args) -> i32 {
+    let index = Index::new(store.projects());
+    let Some(scope) = args.rest.first().and_then(|n| cmd_govern::scope_of(store, &index, n)) else {
+        eprintln!("usage: wsp govern <project|worklist> --ending");
+        return 2;
+    };
+    if let Some(pid) = std::env::var(ROTATED_BY).ok().and_then(|v| v.parse::<u32>().ok()) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::os::unix::process::parent_id() == pid && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let tidy = |seat: &Seat, task: Option<&str>, ws: Option<&str>| swept_up(store, seat, task, ws, false);
+    end_owed(backend(args).as_ref(), store, &scope, &tidy)
+}
+
+/// [`carry_out_ending`] after the wait: the part with an answer to assert.
+///
+/// Refuses while the slot is still the predecessor's. That is the case where
+/// the move did not happen, and ending the pane then would leave the seat
+/// with nobody in it.
+fn end_owed(
+    place: &dyn Place,
+    store: &Store,
+    scope: &str,
+    tidy: &dyn Fn(&Seat, Option<&str>, Option<&str>) -> Leftovers,
+) -> i32 {
+    let Some(rec) = store.handovers().remove(scope) else {
+        println!("wsp: no ending is owed on {scope}");
+        return 0;
+    };
+    let from = rec.get("from").and_then(Value::as_str).unwrap_or_default().to_string();
+    if from.is_empty() {
+        store.clear_handover(scope);
+        return 0;
+    }
+    if cmd_govern::governs(&store.governors(), &Seat::new(&from)).as_deref() == Some(scope) {
+        let why = format!("the slot never moved off {from}, so it is still the seat");
+        eprintln!("wsp: {why}");
+        mark_ending_failed(store, scope, &why);
+        return 1;
+    }
+    let despawn = Args::synth("despawn", &[], &[("pane", from.as_str())]);
+    let code = end_work(place, store, &despawn, Caller::default(), tidy);
+    if code != 0 {
+        let why = format!(
+            "`wsp despawn --pane {from}` exited {code} - see {}",
+            util::contract(&store.handover_log())
+        );
+        mark_ending_failed(store, scope, &why);
+    }
+    code
 }
 
 /// `wsp despawn` — end the agent on a piece of work, and put the work down.
@@ -2741,10 +2889,13 @@ fn end_work(
         return 2;
     }
 
-    // The ending a rotation hands you is owed, but not yet. `rotate` seats you,
-    // confirms your first turn, and only then moves the slot — and `confirm_turn`
-    // returns when the turn *starts*, so your first turn and its `take` are
-    // running at the same time. Ending the predecessor inside that window kills
+    // Not yours, and not yet. Since `wsp-128` the successor is never told to
+    // end its predecessor — `rotate` arranges that from the predecessor's own
+    // side — but an agent can still arrive here on its own initiative, and the
+    // window this guards is unchanged. `rotate` seats you, confirms your first
+    // turn, and only then moves the slot — and `confirm_turn` returns when the
+    // turn *starts*, so your first turn and its `take` are running at the same
+    // time. Ending the predecessor inside that window kills
     // the pane on its way to `take`: the slot never moves, the predecessor is
     // gone, and you are left holding a record naming a pane that no longer
     // exists. **A vacancy produced by the one verb built to prevent one.**
@@ -2767,7 +2918,7 @@ fn end_work(
         if let Some((scope, from)) = incoming.filter(|(_, from)| from == seat.as_str()) {
             eprintln!("{} {seat} is still the {scope} seat — the rotation has not landed", p.yellow("✗"));
             eprintln!("  {}", p.dim("it is running `wsp govern --rotate`, which moves the slot to you once your first turn is confirmed"));
-            eprintln!("  {}", p.dim(&format!("wait, then `wsp despawn --pane {from}` · if it has stopped, take the slot first: wsp govern {scope}")));
+            eprintln!("  {}", p.dim(&format!("and then ends {from} itself - it is not yours to end")));
             return 1;
         }
     }
@@ -2802,8 +2953,10 @@ fn end_work(
 
     // Asked before the seat is closed, because after it there is nothing left
     // to ask: the workspace is the id a build tree is keyed on, and a pane that
-    // has gone cannot say which one it was in.
-    let workspace = workspace_of(&seat);
+    // has gone cannot say which one it was in. herdr's room by name and not
+    // the target's: the tidy below releases a build tree only once herdr says
+    // the workspace has gone, which is a question about herdr's rooms alone.
+    let workspace = Herdr::new().room(&seat);
 
     // Which backend actually holds this seat, asked rather than guessed
     // (`compound-091`'s fold, over `local_backends()`, same as `wsp tell` and
@@ -5155,6 +5308,9 @@ mod tests {
         told: std::cell::RefCell<Vec<String>>,
         states: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<State>>>,
         last: crate::place::Result<State>,
+        /// herdr-shaped, with the seat in room `w9`; or compound-shaped, with
+        /// no room above the seat, which is the port's default answer.
+        rooms: bool,
     }
 
     impl Seats {
@@ -5165,7 +5321,11 @@ mod tests {
                 told: std::cell::RefCell::new(Vec::new()),
                 last: script.last().cloned().unwrap_or(Ok(State::Unknown)),
                 states: std::cell::RefCell::new(script.into()),
+                rooms: true,
             }
+        }
+        fn roomless(script: Vec<crate::place::Result<State>>) -> Seats {
+            Seats { rooms: false, ..Seats::of(script) }
         }
     }
 
@@ -5200,6 +5360,32 @@ mod tests {
         fn here(&self) -> Option<Seat> {
             panic!("rotation opens a seat rather than asking which one it is in")
         }
+        fn room(&self, seat: &Seat) -> Option<String> {
+            match self.rooms {
+                true => Some("w9".into()),
+                false => Some(seat.to_string()),
+            }
+        }
+    }
+
+    /// Step 4 as the tests see it: which scopes were handed their ending.
+    /// `arrange_ending` itself would start a process that ends the seat the
+    /// test runner is standing in.
+    #[derive(Default)]
+    struct Arranged(std::cell::RefCell<Vec<String>>);
+
+    impl Arranged {
+        fn f(&self) -> impl Fn(&str) -> Result<(), String> + '_ {
+            |scope: &str| {
+                self.0.borrow_mut().push(scope.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// For the rotations that must fail before step 4.
+    fn ends_nobody(scope: &str) -> Result<(), String> {
+        panic!("a rotation that did not move the {scope} seat arranged an ending")
     }
 
     /// The waits, on the tests' clock: nothing here sleeps. One poll of
@@ -5260,11 +5446,21 @@ mod tests {
         let dial = util::Dial::new();
         let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
         let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial));
+        // Step 4 is asked for only once the slot has moved: the closure reads
+        // the record at the moment it is called.
+        let moved_first = std::cell::Cell::new(false);
+        let arranged = Arranged::default();
+        let end = |scope: &str| {
+            moved_first.set(store.governors()[scope]["pane"] == "w9:p2");
+            arranged.f()(scope)
+        };
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &end);
         stop_being_a_seat();
 
         assert_eq!(code, 0);
         assert_eq!(place.started.get(), 1, "one successor");
+        assert_eq!(*arranged.0.borrow(), vec!["core".to_string()], "this pane's ending, arranged once");
+        assert!(moved_first.get(), "and only after the seat was the successor's");
 
         // The slot moved, and to whom: the record names the successor's room
         // and pane now, where before the verb ran it named the caller's.
@@ -5299,7 +5495,7 @@ mod tests {
         // Idle for ever: ready to be told, never taking.
         let place = Seats::of(vec![Ok(State::Idle)]);
         let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial));
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody);
         stop_being_a_seat();
 
         assert_eq!(code, 1, "an unconfirmed handover is not a successful one");
@@ -5342,7 +5538,7 @@ mod tests {
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 2);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 2);
             assert!(place.opened.borrow().is_empty(), "nothing was opened");
             assert!(cmd_govern::governs(&store.governors(), &cmd_govern::seat_query("w1", Some("w1:p9"))).is_some(),
                 "and the seat stayed where it was");
@@ -5357,7 +5553,7 @@ mod tests {
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 1);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 1);
             assert!(place.opened.borrow().is_empty());
             stop_being_a_seat();
             let _ = std::fs::remove_dir_all(&store.root);
@@ -5374,7 +5570,7 @@ mod tests {
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 1);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 1);
             assert!(place.opened.borrow().is_empty(), "{:?}", place.opened.borrow());
             assert!(store.handovers().is_empty());
             stop_being_a_seat();
@@ -5393,7 +5589,7 @@ mod tests {
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "opencode")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 2);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 2);
             assert!(place.opened.borrow().is_empty(), "no successor was seated");
             stop_being_a_seat();
             let _ = std::fs::remove_dir_all(&store.root);
@@ -5425,7 +5621,7 @@ mod tests {
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["batch"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial)), 1);
+            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 1);
             assert!(place.opened.borrow().is_empty(), "no successor was seated");
             assert_eq!(
                 cmd_govern::governs(&store.governors(), &cmd_govern::seat_query("w1", Some("w1:p9"))).as_deref(),
@@ -5482,10 +5678,12 @@ mod tests {
         let dial = util::Dial::new();
         let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
         let args = Args::synth("govern", &["batch"], &[("rotate", "true"), ("kind", "plain")]);
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial));
+        let arranged = Arranged::default();
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &arranged.f());
         stop_being_a_seat();
 
         assert_eq!(code, 0);
+        assert_eq!(arranged.0.borrow().len(), 1);
         let rec = &store.governors()["batch"];
         assert_eq!(rec["workspace"], "w9");
         assert_eq!(store.handovers()["batch"]["to"], "w9:p2");
@@ -5620,8 +5818,8 @@ mod tests {
         assert_eq!(end_work(&place, &store, &forced, early, &tidied.f()), 1);
         assert!(place.asked.borrow().is_empty(), "--force is not the way out of this one");
 
-        // Once the slot has moved, the ending is the successor's to do — this
-        // is the same call, one state later, and it goes through.
+        // Once the slot has moved the guard stands aside. That is the state
+        // `--ending` runs in, and a person's despawn after it goes through too.
         cmd_govern::take(&store, "core", "w9", "w9:p2");
         let now = Caller { pane: Some("w9:p2"), governs: Some("core") };
         assert_eq!(end_work(&place, &store, &ending, now, &tidied.f()), 0);
@@ -5631,4 +5829,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
+
+    /// **`wsp-128`, the seat half.** The successor was a compound seat, which
+    /// herdr cannot see and has no room above, on a machine with no herdr
+    /// socket at all. The rotation confirmed its turn and then refused to move
+    /// the slot, because the room was asked of herdr. The seat stayed with the
+    /// predecessor, the successor governed for a whole barrier believing it was
+    /// nobody's seat, and nobody could rotate the scope after the predecessor
+    /// was ended. The seat is now its own room, as `wsp govern` has always
+    /// recorded one from inside it.
+    #[test]
+    fn a_rotation_onto_a_seat_herdr_cannot_see_still_moves_the_seat() {
+        let (_env, store) = rotating_as("rotate-roomless", "cpd-1", "cpd-1");
+        std::env::set_var("HERDR_SOCKET_PATH", _env.path("no-herdr-here.sock"));
+        store.save_project(&Project::new("core")).unwrap();
+        cmd_govern::take(&store, "core", "cpd-1", "cpd-1");
+
+        let dial = util::Dial::new();
+        let place = Seats::roomless(vec![Ok(State::Idle), Ok(State::Working)]);
+        let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
+        let arranged = Arranged::default();
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &arranged.f());
+        stop_being_a_seat();
+
+        assert_eq!(code, 0);
+        let rec = &store.governors()["core"];
+        assert_eq!(rec["pane"], "w9:p2", "the seat is the successor's");
+        assert_eq!(rec["workspace"], "w9:p2", "and recorded under the seat itself");
+        assert_eq!(
+            cmd_govern::governs(&store.governors(), &Seat::new("cpd-1")),
+            None,
+            "the predecessor holds nothing, so ending it is not ending a seat"
+        );
+        assert_eq!(arranged.0.borrow().len(), 1, "and its ending is arranged");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **`wsp-128`, the ending half, as the record's state transitions.** The
+    /// successor never ends its predecessor, so a successor that cannot run
+    /// `despawn` changes nothing. A Claude Code seat in auto mode is one. What
+    /// ends the predecessor is `--ending`, started from the predecessor's own
+    /// `--rotate`. Every state the record can be in:
+    ///
+    /// - owed, slot not moved: refused. Ending it would leave the seat empty.
+    /// - owed, slot moved, the backend will not stop it: kept, with the reason.
+    /// - owed, slot moved, stopped: consumed, with the claim released.
+    /// - nothing owed: nothing done.
+    #[test]
+    fn the_ending_a_rotation_owes_is_carried_out_once_the_seat_has_moved_or_says_why_not() {
+        let _env = no_backend();
+        let store = seat("rotate-ending");
+        store.save_project(&Project::new("core")).unwrap();
+        working(&store, "t-260816-095", "w1:p1");
+        cmd_govern::take(&store, "core", "w1", "w1:p1");
+        store.set_handover("core", json!({ "from": "w1:p1", "to": "w9:p2", "since": "2026-09-30T00:00:00Z" }));
+        let tidied = Tidied::default();
+
+        // Owed, and the slot never moved: the predecessor is still the seat.
+        let place = Ends::ok();
+        assert_eq!(end_owed(&place, &store, "core", &tidied.f()), 1);
+        assert!(place.asked.borrow().is_empty(), "the seat was not ended");
+        let why = cmd_govern::ending_failed(&store.handovers(), "core").expect("a reason on the record");
+        assert!(why.contains("never moved"), "{why}");
+
+        // The slot moves. The backend refuses to stop the pane.
+        cmd_govern::take(&store, "core", "w9", "w9:p2");
+        let stuck = Ends::refusing(Refusal::Backend("the pty would not close".into()));
+        assert_eq!(end_owed(&stuck, &store, "core", &tidied.f()), 1);
+        assert_eq!(stuck.asked.borrow().len(), 1);
+        let why = cmd_govern::ending_failed(&store.handovers(), "core").expect("a reason on the record");
+        assert!(why.contains("w1:p1"), "the reason names the pane still running: {why}");
+        assert_eq!(store.handovers()["core"]["to"], "w9:p2", "and the successor's brief can still find it");
+
+        // Tried again, and the backend obliges: the record is consumed.
+        let place = Ends::ok();
+        assert_eq!(end_owed(&place, &store, "core", &tidied.f()), 0);
+        assert_eq!(*place.asked.borrow(), vec![Seat::new("w1:p1")], "exactly the predecessor");
+        assert!(!store.handovers().contains_key("core"), "{:?}", store.handovers());
+        assert!(store.claims().get("t-260816-095").is_none(), "its claim went with it");
+
+        // Nothing owed: nothing done.
+        let place = Ends::ok();
+        assert_eq!(end_owed(&place, &store, "core", &tidied.f()), 0);
+        assert!(place.asked.borrow().is_empty());
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
 }

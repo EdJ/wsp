@@ -1794,9 +1794,10 @@ impl Store {
     // State rather than store: a pane id is herdr's and dies with the session,
     // the same argument the seat record itself makes.
 
-    /// scope -> handover record: `{from, to, since}` — the pane to end, and the
-    /// pane the brief must say so to. One per scope; a new rotation overwrites
-    /// its predecessor's.
+    /// scope -> handover record: `{from, to, since}`, plus `{failed,
+    /// failed_at}` once wsp has tried to end `from` and could not. `from` is
+    /// the pane being ended and `to` is the successor whose brief reports it.
+    /// One per scope; a new rotation overwrites its predecessor's.
     pub fn handovers(&self) -> BTreeMap<String, Value> {
         match self.read_json("handovers.json") {
             Value::Object(m) => m.into_iter().collect(),
@@ -1814,6 +1815,12 @@ impl Store {
         let mut removed = false;
         self.update_json("handovers.json", |h| removed = h.remove(scope).is_some());
         removed
+    }
+
+    /// Where a rotation's detached ending writes what it did, since the pane it
+    /// ran from is gone by the time anybody would read it.
+    pub fn handover_log(&self) -> PathBuf {
+        self.state_file("handover.log")
     }
 
     // ---- raised hands, as they used to be kept --------------------------

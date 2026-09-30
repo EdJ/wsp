@@ -649,6 +649,17 @@ impl Place for Herdr<'_> {
         herdr::Env::read().pane_id.filter(|s| !s.is_empty()).map(Seat::new)
     }
 
+    /// The workspace the pane is in, out of the fanned-out listing, so a seat
+    /// on another machine is found as well as one here.
+    fn room(&self, seat: &Seat) -> Option<String> {
+        herdr::panes()
+            .ok()?
+            .into_iter()
+            .find(|p| p.pane_id == seat.as_str())
+            .map(|p| p.workspace_id)
+            .filter(|w| !w.is_empty())
+    }
+
     /// Returns when the agent exists, which herdr does not tell us and has to be
     /// waited for. Not when it will take a prompt: those are different moments,
     /// three seconds apart, and conflating them is the `agent_not_ready` bug.

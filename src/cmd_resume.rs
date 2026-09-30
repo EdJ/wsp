@@ -855,7 +855,7 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
                 return Err(format!("opened {seat}, but the claim on {task} was refused"));
             }
         }
-        (None, Some(project)) => match cmd_spawn::workspace_of(&seat) {
+        (None, Some(project)) => match place.room(&seat) {
             Some(ws) => {
                 cmd_govern::take(store, project, &ws, seat.as_str());
             }
@@ -912,7 +912,7 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
             store,
             ours.iter().map(|r| (r.seat.as_str(), r.session.as_str(), r.agent.kind.as_str())),
         );
-        if let (true, Some(ws)) = (t.seat_of.is_some(), cmd_spawn::workspace_of(&seat)) {
+        if let (true, Some(ws)) = (t.seat_of.is_some(), place.room(&seat)) {
             cmd_govern::learn_seats(
                 store,
                 ours.iter().map(|r| {

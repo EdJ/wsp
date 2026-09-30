@@ -879,6 +879,25 @@ pub fn incoming(
         .map(|(scope, rec)| (scope.clone(), str_at(rec, "from")))
 }
 
+/// Why the ending a handover record owes was not carried out, once
+/// `wsp govern <scope> --ending` has tried and failed. `None` while it is owed
+/// or running, and there is no record at all once it has succeeded, because
+/// `despawn` consumes it.
+///
+/// This is the record's one terminal state that stays on disk. It is kept so
+/// that the successor's brief can say its predecessor is still running, and
+/// why. It is not an instruction: the successor is never the one who ends it
+/// (`wsp-128`). The next rotation of the scope overwrites it, and a person's
+/// `wsp despawn --pane <from>` consumes it.
+pub fn ending_failed(handovers: &BTreeMap<String, Value>, scope: &str) -> Option<String> {
+    handovers
+        .get(scope)
+        .and_then(|rec| rec.get("failed"))
+        .and_then(Value::as_str)
+        .filter(|why| !why.is_empty())
+        .map(str::to_string)
+}
+
 /// Is a rotation into this pane still in flight — named successor, slot not yet
 /// moved?
 ///
@@ -1134,6 +1153,11 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     // verb a custodian types names this one. See [`crate::cmd_spawn::rotate`].
     if args.has("rotate") {
         return crate::cmd_spawn::rotate(store, args);
+    }
+    // The other half of a rotation, run by the pane being ended. `--rotate`
+    // starts it detached; see [`crate::cmd_spawn::carry_out_ending`].
+    if args.has("ending") {
+        return crate::cmd_spawn::carry_out_ending(store, args);
     }
     let p = Paint::new();
     let index = Index::new(store.projects());

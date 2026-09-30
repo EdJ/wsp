@@ -1048,6 +1048,24 @@ pub trait Place {
     /// runnable from a terminal that is nobody's seat.
     fn here(&self) -> Option<Seat>;
 
+    /// The room a seat is recorded under: the key a custodial slot is written
+    /// against ([`crate::cmd_govern::take`]), and a build tree after it.
+    ///
+    /// Defaulted to the seat itself, because only herdr has anything above a
+    /// seat. A supervisor's or compound's seat is its own room, and that is
+    /// what `wsp govern` has always recorded for one from inside it
+    /// (`cmd_govern::room_and_pane`). This used to be herdr's `pane.list`, asked
+    /// outside the port. It answered nothing for a `cpd-` seat, so a rotation
+    /// onto compound confirmed its successor's turn and then refused to move
+    /// the slot (`wsp-128`): the seat stayed with a pane that was about to be
+    /// ended.
+    ///
+    /// `None` means the backend has rooms and could not say which one this seat
+    /// is in. A caller must not guess one.
+    fn room(&self, seat: &Seat) -> Option<String> {
+        Some(seat.to_string())
+    }
+
     /// Start an agent in a seat.
     ///
     /// Returns when the agent exists, not when it will take a prompt — those

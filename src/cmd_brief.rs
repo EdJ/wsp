@@ -332,12 +332,15 @@ pub(crate) struct Briefing {
     pub pane: Option<String>,
     pub workspace: Option<String>,
     /// The rotation in flight that names this pane as its successor, as
-    /// `(scope, from)` — what it is about to hold, and whose pane to end once
+    /// `(scope, from)`: what it is about to hold, and the pane wsp ends once
     /// it does. Read rather than derived, because between the moment a rotation
     /// seats its successor and the moment the slot moves, nothing else in wsp
     /// says this pane is anything but a worker; see
     /// [`crate::cmd_govern::incoming`].
     pub incoming: Option<(String, String)>,
+    /// Why wsp could not end that pane, once it has tried.
+    /// [`crate::cmd_govern::ending_failed`].
+    pub ending_failed: Option<String>,
     /// This process's directory, contracted. herdr reports the shell's, which
     /// is stale the moment anyone `cd`s.
     pub cwd: Option<String>,
@@ -386,11 +389,11 @@ impl Briefing {
         // only once the successor's first turn is confirmed — so `governs`
         // answers nothing here, and without the record the successor's brief
         // would introduce it as a worker with a strange order to run.
-        let governed = seat
-            .workspace
-            .and_then(|ws| cmd_govern::governs(&governors, &cmd_govern::seat_query(ws, seat.pane)));
-        let incoming =
-            seat.pane.and_then(|pane| cmd_govern::incoming(&store.handovers(), Some(pane)));
+        let governed = held(&governors, seat.workspace, seat.pane);
+        let handovers = store.handovers();
+        let incoming = seat.pane.and_then(|pane| cmd_govern::incoming(&handovers, Some(pane)));
+        let ending_failed =
+            incoming.as_ref().and_then(|(scope, _)| cmd_govern::ending_failed(&handovers, scope));
         let seat_at = governed
             .clone()
             .or_else(|| incoming.as_ref().map(|(scope, _)| scope.clone()))
@@ -409,6 +412,7 @@ impl Briefing {
             pane: seat.pane.map(str::to_string),
             workspace: seat.workspace.map(str::to_string),
             incoming,
+            ending_failed,
             // Normalised rather than taken as given: the caller's path may be
             // absolute or already contracted, and `own_tree` expands whatever
             // is here before asking whether it is a checkout.
@@ -431,10 +435,11 @@ impl Briefing {
         // here too: this is a decision and not a display, so the port's own
         // answer to *where am I* is the one it is asked with.
         let pane = cmd_agent::my_pane();
-        let governed = pane
-            .as_deref()
-            .and_then(|p| cmd_govern::governs(&governors, &crate::place::Seat::new(p)));
-        let incoming = cmd_govern::incoming(&store.handovers(), pane.as_deref());
+        let governed = held(&governors, env.workspace_id.as_deref(), pane.as_deref());
+        let handovers = store.handovers();
+        let incoming = cmd_govern::incoming(&handovers, pane.as_deref());
+        let ending_failed =
+            incoming.as_ref().and_then(|(scope, _)| cmd_govern::ending_failed(&handovers, scope));
         let seat_at = governed
             .clone()
             .or_else(|| incoming.as_ref().map(|(scope, _)| scope.clone()))
@@ -456,10 +461,26 @@ impl Briefing {
             pane,
             workspace: env.workspace_id,
             incoming,
+            ending_failed,
             cwd: std::env::current_dir().ok().map(|c| util::contract(&c)),
             world,
         }
     }
+}
+
+/// The scope this pane holds the slot of: asked with the pane when there is
+/// one, and with the room only when there is not, which is
+/// [`cmd_govern::seat_query`]'s order.
+///
+/// Both readings used to ask only when there was a room, and a room here is
+/// `HERDR_WORKSPACE_ID`. A compound seat has none, so after a rotation the
+/// successor's brief said `coordinating here` while governors.json named it
+/// the seat, and `wsp govern` agreed with the file (`wsp-128`). One match, the
+/// same exact-pane one `govern` and `despawn` make, so the brief and the record
+/// cannot disagree.
+fn held(governors: &std::collections::BTreeMap<String, serde_json::Value>, workspace: Option<&str>, pane: Option<&str>) -> Option<String> {
+    let who = pane.filter(|p| !p.is_empty()).or(workspace)?;
+    cmd_govern::governs(governors, &crate::place::Seat::new(who))
 }
 
 /// The brief, composed: every decision made and nothing drawn yet.
@@ -537,17 +558,21 @@ pub(crate) struct Brief {
     /// project, which is every seat until a list is running.
     pub seat_at: Option<crate::worklist::Position>,
 
-    /// The pane this pane is to end, when a rotation named it successor and
-    /// that ending has not been consumed yet. One line, only while a rotation
-    /// is in flight for this pane — which is one pane on the machine for the
-    /// seconds a handover takes — and nothing at all otherwise. See
+    /// The pane this pane replaced, while the handover record that names both
+    /// is still standing: from the successor's seat opening until wsp has ended
+    /// the predecessor, or for good if it could not. One line, on one pane on
+    /// the machine, and nothing at all otherwise. See
     /// [`crate::cmd_spawn::rotate`] for why this rides the brief rather than
     /// the typed work order.
     pub succeeding: Option<String>,
 
-    /// Whether the slot has moved to this pane yet. The ending is owed either
-    /// way; what changes with it is how the seat line introduces the reader.
+    /// Whether the slot has moved to this pane yet. wsp carries out the ending
+    /// once it has; before that, the line says it will.
     pub rotation_pending: bool,
+
+    /// Why the predecessor is still running, when wsp tried to end it and
+    /// could not.
+    pub ending_failed: Option<String>,
 
     /// The `wsp checkout` tree this pane is standing in, when it is in one.
     ///
@@ -757,10 +782,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     // order neither had asked for, on a night nobody was reading. During a
     // rotation the record is what says the successor is the seat, because the
     // slot itself has not moved yet.
-    let governed = b
-        .workspace
-        .as_deref()
-        .and_then(|ws| cmd_govern::governs(&b.governors, &cmd_govern::seat_query(ws, b.pane.as_deref())));
+    let governed = held(&b.governors, b.workspace.as_deref(), b.pane.as_deref());
     let custodian = governed.clone().or_else(|| {
         b.incoming.as_ref().map(|(scope, _)| scope.clone())
     });
@@ -806,6 +828,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         custodian,
         succeeding: b.incoming.as_ref().map(|(_, from)| from.clone()),
         rotation_pending,
+        ending_failed: b.ending_failed.clone(),
         // A path rule rather than a question for git, so this stays free in the
         // one command a session-start hook runs.
         own_tree: b
@@ -876,6 +899,9 @@ fn brief_json(b: &Briefing, r: &Brief, depth: Depth) -> serde_json::Value {
     // rule `list` above follows.
     if let Some(from) = &r.succeeding {
         v["succeeds"] = json!({ "pane": from, "pending": r.rotation_pending });
+        if let Some(why) = &r.ending_failed {
+            v["succeeds"]["failed"] = json!(why);
+        }
     }
     // The same reckoning as the text, and gated the same way — a `--json`
     // caller that grew the payload without asking for it would be the mode
@@ -1168,24 +1194,27 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         );
     }
 
-    // The ending a rotation left in this pane's hands, and when to do it.
-    // Beside the seat line because it is the same fact read from the incoming
-    // end; drawn only while a handover record names this pane, which is one
-    // pane on the machine for as long as a handover takes. The instruction is
-    // spelled: an agent improvising around "end your predecessor" is how a
-    // second copy of despawn gets invented.
+    // The pane this one replaced, and what is becoming of it. Beside the seat
+    // line because it is the same fact read from the incoming end; drawn only
+    // while a handover record names this pane, which is one pane on the
+    // machine. **Every branch is a report, never an instruction.** It used to
+    // say `run wsp despawn --pane <from>`, and Claude Code's auto-mode
+    // classifier refused that as one agent ending another's workload. It was
+    // right to: a line in a brief is not authority (`wsp-128`). wsp ends the
+    // predecessor from the predecessor's own `--rotate`, and when that fails
+    // the reader is told so and who can act. It is not asked to act.
     if let Some(from) = &r.succeeding {
         row(
             "handover",
-            match r.rotation_pending {
-                true => format!(
+            match (r.rotation_pending, &r.ending_failed) {
+                (true, _) => p.dim(&format!(
+                    "the seat moves to you once your first turn starts · wsp then ends {from}, who you replaced - not yours to do"
+                )),
+                (false, None) => p.dim(&format!("wsp is ending {from}, who you replaced - not yours to do")),
+                (false, Some(why)) => format!(
                     "{}  {}",
-                    p.dim("the seat moves to you once your first turn starts ·"),
-                    p.dim(&format!("then run `wsp despawn --pane {from}` - that is who you replaced")),
-                ),
-                false => format!(
-                    "{}",
-                    p.dim(&format!("run `wsp despawn --pane {from}` - that is who you replaced"))
+                    p.yellow(&format!("{from}, who you replaced, is still running")),
+                    p.dim(&format!("wsp could not end it: {why} · a person has to")),
                 ),
             },
         );
@@ -1520,6 +1549,7 @@ mod tests {
             // No handover in flight. The ordinary state, and the baseline the
             // rotation tests below add a record to.
             incoming: None,
+            ending_failed: None,
             cwd: Some("/home/ed/claude/wsp".into()),
         }
     }
@@ -1669,18 +1699,16 @@ mod tests {
     }
 
     /// A rotation's successor is introduced by its brief as the seat it is
-    /// about to hold, and handed the ending it inherits — read off the store,
-    /// because the typed work order is the channel that can be dropped and
-    /// this is exactly the instruction that must not be.
+    /// about to hold, read off the store, because the typed work order is the
+    /// channel that can be dropped.
     ///
     /// Between the moment a rotation seats the successor and the moment the
     /// slot moves, nothing else in wsp says this pane is anything but a worker:
     /// `governs` answers for the predecessor. The record is what bridges that
-    /// window, which is why this test drives it through `Briefing.incoming` —
-    /// the same read a session-start hook makes live — and asserts both halves:
-    /// the framing, and the spelled command.
+    /// window, which is why this test drives it through `Briefing.incoming`,
+    /// the same read a session-start hook makes live.
     #[test]
-    fn a_rotation_names_the_successor_the_seat_and_hands_it_the_ending() {
+    fn a_rotation_names_the_successor_the_seat_before_the_slot_has_moved() {
         let mut b = briefing();
         b.governors.clear();
         b.incoming = Some(("batch".into(), "w8M:p1".into()));
@@ -1690,11 +1718,7 @@ mod tests {
         assert!(r.rotation_pending, "the slot has not moved yet - that is the whole window");
         assert_eq!(r.succeeding.as_deref(), Some("w8M:p1"));
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
-        assert!(
-            text.contains("despawn --pane w8M:p1"),
-            "the ending, spelled rather than described: {text}"
-        );
-        assert!(text.contains("once your first turn starts"), "and when to do it: {text}");
+        assert!(text.contains("once your first turn starts"), "{text}");
 
         // And with no rotation anywhere, none of it draws — the same bargain
         // the seat line makes, on an output paid for by every request.
@@ -1703,25 +1727,63 @@ mod tests {
         assert!(!brief_lines(&r, &plain(), Depth::Normal).join("\n").contains("handover"));
     }
 
-    /// Once the slot has moved, the successor reads as the custodian it now
-    /// is; what stays is only the ending, until the despawn consumes it.
+    /// **`wsp-128`.** The brief told the successor to `wsp despawn --pane` its
+    /// predecessor, and Claude Code's auto-mode classifier refused that as
+    /// interfering with another agent's workload. In every state the handover
+    /// record can be in, the brief now reports what wsp is doing about the
+    /// predecessor, and never asks the successor to end a pane.
     #[test]
-    fn a_successor_whose_seat_has_arrived_is_reminded_without_being_reintroduced() {
+    fn a_successors_brief_never_asks_it_to_end_another_pane() {
+        let moved = || {
+            let mut b = briefing();
+            b.governors.insert("batch".into(), json!({ "workspace": "w1", "host": util::hostname() }));
+            b
+        };
+        let mut pending = briefing();
+        pending.governors.clear();
+        let mut failed = moved();
+        failed.ending_failed = Some("`wsp despawn --pane w8M:p1` exited 1 - see handover.log".into());
+
+        for (state, mut b) in [("pending", pending), ("moved", moved()), ("failed", failed)] {
+            b.incoming = Some(("batch".into(), "w8M:p1".into()));
+            let r = compose(&b);
+            let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+            let handover = text.lines().find(|l| l.contains("handover")).unwrap_or_default().to_string();
+            assert!(handover.contains("w8M:p1"), "{state}: it says who: {text}");
+            assert!(!handover.contains("run `wsp despawn"), "{state}: {handover}");
+            assert!(
+                handover.contains("not yours to do") || handover.contains("a person has to"),
+                "{state}: it says whose it is: {handover}"
+            );
+        }
+
+        let mut b = moved();
+        b.incoming = Some(("batch".into(), "w8M:p1".into()));
+        b.ending_failed = Some("the pty would not close".into());
+        let r = compose(&b);
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("still running") && text.contains("the pty would not close"), "{text}");
+        assert!(!text.contains("once your first turn starts"), "that condition is behind it: {text}");
+    }
+
+    /// **`wsp-128`, the seat line.** A compound seat has no herdr workspace,
+    /// and the brief asked what a pane governs only when it had one. A
+    /// successor that governors.json named as the seat, and that `wsp govern`
+    /// agreed was the seat, read `compound · coordinating here` in its brief.
+    #[test]
+    fn a_seat_with_no_herdr_workspace_reads_as_the_seat_it_holds() {
         let mut b = briefing();
-        // The slot has moved to this pane: `governs` now answers normally, so
-        // the seat line needs no help from the record.
+        b.workspace = None;
+        b.pane = Some("cpd-106".into());
+        b.governors.clear();
         b.governors.insert(
             "batch".into(),
-            json!({ "workspace": "w1", "host": util::hostname() }),
+            json!({ "workspace": "cpd-106", "pane": "cpd-106", "host": util::hostname() }),
         );
-        b.incoming = Some(("batch".into(), "w8M:p1".into()));
         let r = compose(&b);
         assert_eq!(r.custodian.as_deref(), Some("batch"));
-        assert!(!r.rotation_pending, "it holds the seat now");
-        assert_eq!(r.succeeding.as_deref(), Some("w8M:p1"), "and still owes the ending");
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
-        assert!(text.contains("despawn --pane w8M:p1"), "{text}");
-        assert!(!text.contains("once your first turn starts"), "that condition is behind it: {text}");
+        assert!(text.contains("governor of batch"), "{text}");
     }
 
     /// The three facts a session cannot start without, in the order it needs
@@ -1854,6 +1916,7 @@ mod tests {
             pane: None,
             workspace: None,
             incoming: None,
+            ending_failed: None,
             cwd: None,
         };
         let r = compose(&b);
