@@ -2642,16 +2642,6 @@ fn mark_ending_failed(store: &Store, scope: &str, why: &str) {
     }
 }
 
-/// `wsp govern <scope> --ending`: end the pane a handover record says was
-/// replaced, from that pane's own `--rotate`.
-///
-/// Waits first for the rotation that started it to exit, up to ten seconds, by
-/// watching its own parent change. Two reasons. The rotation's last lines then
-/// reach the pane before it closes. And an agent that cleans up its command's
-/// process tree on the way out has already let go of this one.
-///
-/// Also runnable by hand from the pane being ended, which is the repair
-/// [`rotate`] prints when it could not start this.
 /// Hold an ending [`rotate_on_behalf`] arranged until the pane it ends is not
 /// mid-turn, for up to twenty minutes. A predecessor answering something it
 /// was told finishes the answer; one still turning after that is ended
@@ -2674,6 +2664,17 @@ fn wait_until_idle(store: &Store, scope: &str) {
     }
 }
 
+/// `wsp govern <scope> --ending`: end the pane a handover record says was
+/// replaced, from that pane's own `--rotate`, or
+/// from [`rotate_on_behalf`], which waits for it to stop turning instead.
+///
+/// Waits first for the rotation that started it to exit, up to ten seconds, by
+/// watching its own parent change. Two reasons. The rotation's last lines then
+/// reach the pane before it closes. And an agent that cleans up its command's
+/// process tree on the way out has already let go of this one.
+///
+/// Also runnable by hand from the pane being ended, which is the repair
+/// [`rotate`] prints when it could not start this.
 pub fn carry_out_ending(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
     let Some(scope) = args.rest.first().and_then(|n| cmd_govern::scope_of(store, &index, n)) else {

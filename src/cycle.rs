@@ -672,7 +672,12 @@ fn tell(store: &Store, w: &Worklist, text: &str) {
             return;
         }
     }
-    let Some(first) = w.groups().iter().flat_map(|g| g.members.clone()).next() else { return };
+    // On a member of the group the run stands at, where a person looking at
+    // the run is looking — not group 1's, long since finished.
+    let w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
+    let groups = w.groups();
+    let here = groups.iter().find(|g| g.verdict.trim().is_empty()).or_else(|| groups.last());
+    let Some(first) = here.and_then(|g| g.members.first()).cloned() else { return };
     let args = Args::synth("flag", &[first.as_str(), text], &[]);
     let _ = crate::cmd_agent::flag(store, &args);
 }
