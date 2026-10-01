@@ -441,7 +441,11 @@ fn agent_for_new(args: &Args, groups: &[Group], at: usize) -> Result<String, i32
     if let Some(v) = args.get("agent") {
         return policy_word(&v);
     }
-    Ok(match at.checked_sub(1).and_then(|i| groups.get(i)) {
+    // A group put in front of all the others (`mv --after 0`) has none before
+    // it, and takes the line of the group it now stands in front of: the list
+    // is the same list, and on one from before this that line is none.
+    let neighbour = at.checked_sub(1).and_then(|i| groups.get(i)).or_else(|| groups.get(at));
+    Ok(match neighbour {
         Some(g) => g.agent.trim().to_string(),
         None => DEFAULT_POLICY.to_string(),
     })
@@ -3267,6 +3271,13 @@ mod tests {
         store.save_worklist(&w).unwrap();
         assert_eq!(run(&store, &["add", "old", "l-2"]), 0);
         assert_eq!(store.worklist("old").unwrap().groups()[1].agent, "", "no line, as before");
+
+        // And in front of all of them: a new first group has nothing before
+        // it, and still is not handed `claude` on a list from before this.
+        assert_eq!(flagged(&store, &["mv", "old", "l-2"], &[("after", "0")]), 0);
+        let g = store.worklist("old").unwrap().groups();
+        assert_eq!(g[0].members, vec!["l-2"], "it moved to the front");
+        assert_eq!(g[0].agent, "", "and inherits manual from the list it joined");
     }
 
     fn flagged(store: &Store, argv: &[&str], flags: &[(&str, &str)]) -> i32 {

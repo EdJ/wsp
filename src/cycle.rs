@@ -151,11 +151,25 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
                     w.id, w.id, w.id
                 )),
                 "go" => {
+                    // Whose `go` this was decides what follows it. A group
+                    // run by hand was passed by its governor, who ends its
+                    // agents and rotates itself under the manual order — doing
+                    // either here as well is a double rotation on a live run
+                    // (wsp-135's FAIL, on ux-revamp held at barrier 16). The
+                    // step is still taken: a hand-run group may be followed
+                    // by one wsp runs.
+                    if !ran_by_wsp(&w, passed) {
+                        let _ = step(store, &w);
+                        return 0;
+                    }
                     // Rotate first, so what is told next reaches the successor
-                    // rather than a seat that is about to be ended.
+                    // rather than a seat that is about to be ended. Not on the
+                    // last pass: there is nothing left to govern.
                     if let Some(n) = passed {
                         end_behind(store, &w, n);
-                        rotate(store, &w);
+                        if n < w.groups().len() {
+                            rotate(store, &w);
+                        }
                     }
                     let _ = step(store, &w);
                     tell(store, &w, &passed_sentence(store, &w, passed));
@@ -174,6 +188,17 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
         let _ = step(store, w);
     }
     0
+}
+
+/// Whether the group a `go` concerns is one wsp runs: the group just passed,
+/// or on a start, the first group the run stands at.
+fn ran_by_wsp(w: &Worklist, passed: Option<usize>) -> bool {
+    let groups = w.groups();
+    let g = match passed {
+        Some(n) => groups.get(n - 1),
+        None => groups.iter().find(|g| g.verdict.trim().is_empty()),
+    };
+    g.is_some_and(|g| g.policy().is_some())
 }
 
 /// What the run looks like after a `go`, in the words a governor is told.
@@ -257,37 +282,31 @@ fn step(store: &Store, w: &Worklist) -> Vec<String> {
     let Some(g) = groups.get(at - 1) else { return started };
     let Some(policy) = g.policy() else { return started };
 
-    // 1. Members nobody has started, up to the cap.
-    let claims = store.claims();
-    let tasks = store.tasks();
-    let task = |id: &str| tasks.iter().find(|t| t.id == id);
-    let going = pos
-        .members
-        .iter()
-        .filter(|s| !s.settlement.settled())
-        .filter(|s| claims.contains_key(&s.id) || matches!(s.settlement, Settlement::Open(Status::Doing)))
-        .count();
-    let mut room = g.parallelism(None).map(|cap| cap.saturating_sub(going)).unwrap_or(usize::MAX);
+    // 1. Members nobody has started, up to the cap — counted again inside
+    // the lock by `take_member`, because the two advances a pass can start
+    // (the barrier agent's `go` and its own `review`) both read this list.
+    let cap = g.parallelism(None);
     for s in &pos.members {
-        if room == 0 {
-            break;
-        }
-        if !matches!(s.settlement, Settlement::Open(Status::Todo)) || claims.contains_key(&s.id) {
-            continue;
-        }
-        if take_member(store, &s.id, &w.id, at) {
-            room -= 1;
-            spawn(store, &s.id, &policy);
-            started.push(s.id.clone());
+        let Some(t) = store.find_task(&s.id) else { continue };
+        if let Some(why) = take_member(store, &t, &w.id, at, &g.members, cap) {
+            stamp(&format!("{} group {at}: starting {} ({why})", w.id, s.id));
+            if spawn(store, &s.id, &policy, Undo::Member) {
+                started.push(s.id.clone());
+            } else {
+                failed(store, &w, &s.id);
+            }
         }
     }
 
     // 2. A verifier for each member that is finished — reviewed and landed.
     for s in pos.members.iter().filter(|s| s.finished()) {
-        let Some(member) = task(&s.id) else { continue };
-        if let Some(v) = open_verifier(store, member, &w.id, at, g) {
-            spawn(store, &v, &policy);
-            started.push(v);
+        let Some(member) = store.find_task(&s.id) else { continue };
+        if let Some(v) = open_verifier(store, &member, &w.id, at, g) {
+            if spawn(store, &v, &policy, Undo::Row) {
+                started.push(v);
+            } else {
+                failed(store, &w, &v);
+            }
         }
     }
 
@@ -298,8 +317,11 @@ fn step(store: &Store, w: &Worklist) -> Vec<String> {
     };
     if pos.at_barrier() && pos.members.iter().all(|s| verified(&s.id)) {
         if let Some(b) = open_barrier(store, &w, at, g) {
-            spawn(store, &b, &policy);
-            started.push(b);
+            if spawn(store, &b, &policy, Undo::Row) {
+                started.push(b);
+            } else {
+                failed(store, &w, &b);
+            }
         }
     }
     if !started.is_empty() {
@@ -308,23 +330,66 @@ fn step(store: &Store, w: &Worklist) -> Vec<String> {
     started
 }
 
-/// Move a member to `doing` under the store lock, if it is still `todo` and
-/// unclaimed — the record that stops a second advance starting it again.
-fn take_member(store: &Store, id: &str, list: &str, at: usize) -> bool {
-    let taken = store.locked(|| {
-        let Some(mut t) = store.find_task(id) else { return false };
-        if t.status() != Status::Todo || store.claims().contains_key(id) {
-            return false;
+/// How long a start may take to show up as a claim before wsp reads it as
+/// one that never happened — an advance killed between its record and its
+/// spawn, or a spawn that died without saying so. `wsp spawn` claims within a
+/// minute when it works; ten leaves a slow one alone.
+const WEDGED_AFTER: i64 = 10 * 60;
+
+/// Unclaimed, and written long enough ago that a start in flight would have
+/// claimed it by now.
+fn wedged(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    !claims.contains_key(&t.id) && util::epoch_secs() - util::epoch_of(&t.updated) > WEDGED_AFTER
+}
+
+/// The line `take_member` writes, and how it recognises its own record.
+const STARTED_BY: &str = "started by wsp:";
+
+/// Move a member to `doing` under the store lock, if it may start now, and
+/// say why it may. `None` is "leave it".
+///
+/// It may when it is `todo` and unclaimed, or when it is a start of wsp's
+/// own that never took (`doing`, unclaimed, [`STARTED_BY`] its last word, and
+/// [`wedged`]). Either way **the cap is counted here, inside the lock**: two
+/// advances run at a pass, each with its own reading of the group, and only a
+/// count taken under the lock both of them write through can hold the cap.
+fn take_member(
+    store: &Store,
+    t: &Task,
+    list: &str,
+    at: usize,
+    members: &[String],
+    cap: Option<usize>,
+) -> Option<&'static str> {
+    let id = t.id.clone();
+    let why = store.locked(|| {
+        let t = store.find_task(&id)?;
+        let claims = store.claims();
+        let ours = t.section("Log").and_then(|l| l.lines().last().map(|x| x.contains(STARTED_BY))).unwrap_or(false);
+        let why = match t.status() {
+            Status::Todo if !claims.contains_key(&id) => "new",
+            Status::Doing if ours && wedged(&t, &claims) => "again: the last start never claimed it",
+            _ => return None,
+        };
+        let going = members
+            .iter()
+            .filter(|m| **m != id)
+            .filter_map(|m| store.find_task(m))
+            .filter(|m| !Settlement::of(m).settled())
+            .filter(|m| m.status() == Status::Doing || claims.contains_key(&m.id))
+            .count();
+        if cap.is_some_and(|c| going >= c) {
+            return None;
         }
+        let mut t = t;
         t.set_status(Status::Doing);
-        t.log(&format!("started by wsp: {list} group {at}"));
+        t.log(&format!("{STARTED_BY} {list} group {at}"));
         t.touch();
-        store.save_task(&t).is_ok()
-    });
-    if taken {
-        store.git_commit(&format!("wsp: {list} group {at} starts {id}"));
-    }
-    taken
+        store.save_task(&t).ok()?;
+        Some(why)
+    })?;
+    store.git_commit(&format!("wsp: {list} group {at} starts {id}"));
+    Some(why)
 }
 
 /// The newest verifier row under a member.
@@ -346,6 +411,9 @@ fn open_verifier(store: &Store, member: &Task, list: &str, at: usize, g: &Group)
         let tasks = store.tasks();
         let owed = match latest_verifier(&tasks, &member.id) {
             None => true,
+            Some(v) if v.status() == Status::Todo && wedged(v, &store.claims()) => {
+                return restart(store, v);
+            }
             Some(v) => v.status() == Status::Blocked && member.updated > v.updated,
         };
         if !owed {
@@ -365,6 +433,16 @@ fn open_verifier(store: &Store, member: &Task, list: &str, at: usize, g: &Group)
     Some(made)
 }
 
+/// A row wsp made whose agent never arrived, taken again: touched, so a
+/// second advance in the next ten minutes leaves it to this one.
+fn restart(store: &Store, t: &Task) -> Option<String> {
+    let mut t = t.clone();
+    t.log("wsp is starting an agent on this again: the last one never claimed it");
+    t.touch();
+    store.save_task(&t).ok()?;
+    Some(t.id)
+}
+
 /// How a barrier row's title starts; the list's slug follows it.
 const BARRIER_TITLE: &str = "Barrier: ";
 
@@ -377,8 +455,12 @@ fn open_barrier(store: &Store, w: &Worklist, at: usize, g: &Group) -> Option<Str
     let title = barrier_title(&w.id, at);
     let project = g.members.iter().find_map(|m| store.find_task(m)).and_then(|t| t.project);
     let made = store.locked(|| {
-        if store.tasks().iter().any(|t| t.title == title && t.tags.iter().any(|g| g == BARRIER_TAG)) {
-            return None;
+        let tasks = store.tasks();
+        if let Some(b) = tasks.iter().find(|t| t.title == title && t.tags.iter().any(|g| g == BARRIER_TAG)) {
+            return match b.status() == Status::Todo && wedged(b, &store.claims()) {
+                true => restart(store, b),
+                false => None,
+            };
         }
         let id = store.alloc_task_id(project.as_deref()).ok()?;
         let mut t = Task::new(&title, &id);
@@ -446,35 +528,71 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, me: &str) -> String {
     )
 }
 
-/// Start an agent on a row, and wait for `wsp spawn` to say how it went. A
-/// failure is written on the row, where a person looking at it finds it.
-fn spawn(store: &Store, id: &str, policy: &Policy) {
+/// What a failed start puts back.
+#[derive(Clone, Copy)]
+enum Undo {
+    /// A member wsp moved to `doing`: back to `todo`, so the next advance —
+    /// or a governor's own `wsp spawn` — finds it as it was.
+    Member,
+    /// A verifier or barrier row: left at `todo`, which the next advance
+    /// takes again once it is [`wedged`].
+    Row,
+}
+
+/// Start an agent on a row, and wait for `wsp spawn` to say how it went.
+/// A failure is written on the row and put back per [`Undo`]; the caller
+/// tells the seat. Never silent: a run that cannot start its next agent is
+/// a run that has stopped.
+fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo) -> bool {
+    let failed = start(id, policy);
+    let Some(why) = failed else { return true };
+    stamp(&format!("FAILED spawn {id}: {why}"));
+    let saved = store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return false };
+        t.log(&format!("wsp could not spawn an agent on this: {}", util::truncate(&why, 300)));
+        if matches!(undo, Undo::Member) && t.status() == Status::Doing {
+            t.set_status(Status::Todo);
+        }
+        t.touch();
+        store.save_task(&t).is_ok()
+    });
+    if saved {
+        store.git_commit(&format!("wsp: spawn failed on {id}"));
+    }
+    false
+}
+
+/// `wsp spawn <id> --agent …`, and its refusal if it refused.
+fn start(id: &str, policy: &Policy) -> Option<String> {
     // A test's binary is the harness: record what would have started instead.
     if cfg!(test) {
         #[cfg(test)]
-        tests::SPAWNED.with(|s| s.borrow_mut().push((id.to_string(), policy.kind.clone())));
-        return;
+        return tests::SPAWNED.with(|s| {
+            s.borrow_mut().push((id.to_string(), policy.kind.clone()));
+            tests::FAIL.with(|f| f.borrow().clone())
+        });
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return Some(e.to_string()),
+    };
     let mut argv: Vec<String> = vec!["spawn".into(), id.into(), "--agent".into()];
     argv.extend(policy.spawn_flags());
     stamp(&format!("spawn {}", argv[1..].join(" ")));
-    let out = Command::new(exe).args(&argv).stdin(Stdio::null()).output();
-    let failed = match out {
+    match Command::new(exe).args(&argv).stdin(Stdio::null()).output() {
         Ok(o) if o.status.success() => None,
         Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
         Err(e) => Some(e.to_string()),
-    };
-    if let Some(why) = failed {
-        stamp(&format!("spawn {id} failed: {why}"));
-        if let Some(mut t) = store.find_task(id) {
-            t.log(&format!("wsp could not spawn an agent on this: {}", util::truncate(&why, 300)));
-            t.touch();
-            if store.save_task(&t).is_ok() {
-                store.git_commit(&format!("wsp: spawn failed on {id}"));
-            }
-        }
     }
+}
+
+/// Tell the seat a start failed, so a stopped run is somebody's to see.
+fn failed(store: &Store, w: &Worklist, id: &str) {
+    tell(store, w, &format!(
+        "wsp could not start an agent on {id} in the {} run, so the run is waiting there. \
+         `wsp show {id}` has the reason; `wsp worklist advance {}` tries again.",
+        w.id, w.id
+    ));
 }
 
 /// End the agents a passed group no longer needs: its members, their
@@ -542,6 +660,11 @@ fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
 /// as a hand on the run's first member instead, where a person's panel draws
 /// it — Ed, 2026-09-30: "assuming a governor is in place".
 fn tell(store: &Store, w: &Worklist, text: &str) {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
+        return;
+    }
     stamp(&format!("tell {}: {}", w.id, util::truncate(text, 120)));
     if let Some(scope) = governing_scope(store, w) {
         let args = Args::synth("govern", &[scope.as_str()], &[("tell", text)]);
@@ -557,6 +680,11 @@ fn tell(store: &Store, w: &Worklist, text: &str) {
 /// A pass hands the governing seat to a fresh successor, on wsp's own
 /// initiative: `cmd_spawn::rotate_on_behalf` carries the argument.
 fn rotate(store: &Store, w: &Worklist) {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::ROTATED.with(|s| s.borrow_mut().push(w.id.clone()));
+        return;
+    }
     let Some(scope) = governing_scope(store, w) else { return };
     let code = crate::cmd_spawn::rotate_on_behalf(store, &scope);
     stamp(&format!("rotate {scope}: exit {code}"));
@@ -579,6 +707,10 @@ mod tests {
     thread_local! {
         pub(super) static SPAWNED: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
         pub(super) static ENDED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        pub(super) static TOLD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        pub(super) static ROTATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// Set, and every start in this thread fails with it.
+        pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     fn spawned() -> Vec<(String, String)> {
@@ -749,6 +881,122 @@ mod tests {
         end_behind(&store, &w, 2);
         let ended = ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
         assert_eq!(ended, vec!["m-2", "v-1", "b-1"]);
+    }
+
+    fn drained<T>(k: &'static std::thread::LocalKey<RefCell<Vec<T>>>) -> Vec<T> {
+        k.with(|s| s.borrow_mut().drain(..).collect())
+    }
+
+    fn go(store: &Store, passed: usize) {
+        let args = Args::synth("worklist", &["advance", "run"], &[("event", "go"), ("passed", &passed.to_string())]);
+        assert_eq!(advance(store, &args), 0);
+    }
+
+    /// wsp-135's FAIL: ux-revamp is a hand-run list, and its governor's own
+    /// `go` must not have wsp end its members and rotate it on top of its own
+    /// `--rotate`.
+    #[test]
+    fn a_go_on_a_hand_run_group_ends_nothing_rotates_nothing_and_tells_nobody() {
+        for agent in ["", "manual"] {
+            let (_env, store) = scratch(&format!("handgo{}", agent.len()));
+            task(&store, "m-1", Status::Review);
+            task(&store, "m-2", Status::Todo);
+            let mut w = list(&store, &[(&["m-1"], agent), (&["m-2"], agent)]);
+            let mut g = w.groups();
+            g[0].verdict = "passed by hand".into();
+            w.set_groups(&g);
+            store.save_worklist(&w).unwrap();
+            store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+            go(&store, 1);
+            assert!(drained(&ENDED).is_empty(), "`{agent}`: nothing ended");
+            assert!(drained(&ROTATED).is_empty(), "`{agent}`: nobody rotated");
+            assert!(drained(&TOLD).is_empty(), "`{agent}`: the governor passed it and needs no telling");
+            assert!(spawned().is_empty(), "`{agent}`: and the next hand-run group is not started");
+        }
+    }
+
+    /// The other half: a group wsp runs is tidied, the seat moves on, and the
+    /// next group starts — and on the last pass, nobody is rotated onto a run
+    /// with nothing left in it.
+    #[test]
+    fn a_go_on_a_group_wsp_runs_ends_its_agents_rotates_and_starts_the_next() {
+        let (_env, store) = scratch("autogo");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Todo);
+        let mut w = list(&store, &[(&["m-1"], "claude"), (&["m-2"], "claude")]);
+        let mut g = w.groups();
+        g[0].verdict = "passed".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        go(&store, 1);
+        assert_eq!(drained(&ENDED), vec!["m-1"]);
+        assert_eq!(drained(&ROTATED), vec!["run"]);
+        assert_eq!(drained(&TOLD).len(), 1);
+        assert_eq!(spawned(), vec![("m-2".into(), "claude".into())]);
+
+        let mut g = w.groups();
+        g[1].verdict = "passed".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        go(&store, 2);
+        assert!(drained(&ROTATED).is_empty(), "the last pass has nothing left to govern");
+        let _ = (drained(&ENDED), drained(&TOLD));
+    }
+
+    /// The count is taken under the lock, so an advance holding a stale
+    /// reading of the group cannot start past the cap.
+    #[test]
+    fn a_start_is_refused_under_the_lock_once_the_cap_is_full() {
+        let (_env, store) = scratch("lockcap");
+        task(&store, "m-1", Status::Doing);
+        task(&store, "m-2", Status::Todo);
+        let members = vec!["m-1".to_string(), "m-2".to_string()];
+        let m2 = store.find_task("m-2").unwrap();
+        assert_eq!(take_member(&store, &m2, "run", 1, &members, Some(1)), None, "one going, cap one");
+        assert_eq!(take_member(&store, &m2, "run", 1, &members, Some(2)), Some("new"));
+        assert_eq!(take_member(&store, &m2, "run", 1, &members, Some(2)), None, "taken already");
+    }
+
+    /// A start that fails puts the member back and says so; one that never
+    /// arrived is taken again once it has had its ten minutes.
+    #[test]
+    fn a_failed_or_lost_start_is_put_back_told_and_taken_again() {
+        let (_env, store) = scratch("wedge");
+        task(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        FAIL.with(|f| *f.borrow_mut() = Some("no compound session".into()));
+        step(&store, &w);
+        FAIL.with(|f| *f.borrow_mut() = None);
+        let _ = spawned();
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Todo, "put back, so nothing is wedged at doing");
+        assert!(t.section("Log").unwrap().contains("no compound session"), "and the reason is on the row");
+        assert_eq!(drained(&TOLD).len(), 1, "and the seat is told");
+
+        // Lost: `doing`, unclaimed, wsp's own start its last word, long ago.
+        step(&store, &w);
+        assert_eq!(spawned().len(), 1);
+        step(&store, &w);
+        assert!(spawned().is_empty(), "a start in flight is left alone");
+        let mut t = store.find_task("m-1").unwrap();
+        t.updated = "2026-01-01T00:00:00Z".into();
+        store.save_task(&t).unwrap();
+        step(&store, &w);
+        assert_eq!(spawned().len(), 1, "a start that never claimed it is taken again");
+
+        // And a verifier row whose agent never came.
+        set(&store, "m-1", Status::Review);
+        step(&store, &w);
+        let _ = spawned();
+        let mut v = tagged(&store, VERIFY_TAG).remove(0);
+        step(&store, &w);
+        assert!(spawned().is_empty());
+        v.updated = "2026-01-01T00:00:00Z".into();
+        store.save_task(&v).unwrap();
+        step(&store, &w);
+        assert_eq!(spawned(), vec![(v.id.clone(), "claude".into())], "the same row, started again");
+        assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "and not a second one");
     }
 
     #[test]
