@@ -67,6 +67,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::model::{Group, Policy, Status, Task, Worklist, WorklistStatus};
+use crate::place::{Seat, State};
 use crate::store::Store;
 use crate::util;
 use crate::worklist::{self, Reading, Settlement};
@@ -80,6 +81,109 @@ pub(crate) const BARRIER_TAG: &str = "barrier";
 /// Set in the environment of anything [`poke`] starts, and read by nothing but
 /// a test or a person who wants a verb to leave the run alone.
 const OFF: &str = "WSP_NO_CYCLE";
+
+/// Where a seat's state is read from.
+///
+/// **A parameter and not built here, which is the whole of what makes this
+/// drivable without a terminal.** The same shape as [`crate::attention`]'s
+/// `Source` and for the same reason: `wsp verify` runs on a machine where no
+/// compound seat exists, and a test that needed one real seat to prove a
+/// member's agent had died would not be a test.
+pub(crate) trait Seats {
+    /// What the seat named is doing, or `None` where nobody can say.
+    ///
+    /// **`None` is not [`State::Gone`] and is never treated as it.** It is what
+    /// a machine with no backend answering returns, and a reconciler that read
+    /// it as "gone" would kill every seat on that machine exactly when it can
+    /// least see — the repair firing hardest where it knows least.
+    fn state(&self, seat: &str) -> Option<State>;
+}
+
+/// The real reading, over the backends wsp can spawn onto — with opencode's
+/// own database overruling a screen that has stopped repainting. `wsp-160`.
+///
+/// Herdr first because it watches a pty and can answer about *now*;
+/// `Refusal::NoSeat` is its "not mine", so a compound seat falls through to the
+/// second. One list, from [`crate::cmd_spawn`], rather than a second copy here.
+///
+/// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
+/// and the argument is the cost: that function is called from `survey`, from
+/// `wsp wip`, and from a panel four times a second, and the overrule shells to
+/// `opencode db`. A reader that fires it on every call would run a process per
+/// opencode seat per panel frame. The reconciler runs it once a minute, on the
+/// seats it is already asking about, and can say in `cycle.log` that it did —
+/// which is what `wsp-160` asks for ("log the repair beside it") and what a
+/// function returning a [`State`] has nowhere to put.
+pub(crate) struct Fleet;
+
+impl Seats for Fleet {
+    fn state(&self, seat: &str) -> Option<State> {
+        let seat_id = Seat::new(seat);
+        let compound = crate::place_compound::Compound::new();
+        let raw = crate::cmd_spawn::local_backends().iter().find_map(|b| b.state(&seat_id).ok())?;
+        Some(self.overrule_frozen_opencode(&compound, seat, raw))
+    }
+}
+
+impl Fleet {
+    /// A compound opencode seat reading `Working` that opencode's own database
+    /// says finished with, more than a minute ago.
+    ///
+    /// **Only that one state, and only for opencode.** The frozen screen has
+    /// been seen to lie in exactly one direction — `working` for ever, on a
+    /// busy frame it never repainted — and `idle` is the safe direction to be
+    /// wrong in: a seat wrongly called idle gets a sentence typed at it, and a
+    /// seat wrongly called working waits for ever.
+    ///
+    /// **A live turn still reads `working`,** which is the half of the test that
+    /// keeps this honest: `opencode_settled` requires a *completed* turn older
+    /// than the threshold, so a session mid-stream is untouched whatever the
+    /// screen says.
+    ///
+    /// Said every pass rather than once per seat, and that is deliberate here
+    /// where it is not for the others: the repair is the reconciler's *finding*,
+    /// and a governor reading `cycle.log` after a frozen seat has been sitting
+    /// there for an hour wants to see it said for the whole hour. It costs one
+    /// line a minute on a seat that is broken, which is nothing against a run
+    /// that has stalled on it.
+    fn overrule_frozen_opencode(
+        &self,
+        compound: &crate::place_compound::Compound,
+        seat: &str,
+        raw: State,
+    ) -> State {
+        if raw != State::Working {
+            return raw;
+        }
+        let session = compound.session_of(&Seat::new(seat));
+        if session.is_empty() {
+            return raw;
+        }
+        let Some(finished) = crate::agent_commands::opencode_finished_at(&session) else { return raw };
+        if !crate::agent_commands::opencode_settled(&session, util::epoch_secs()) {
+            return raw;
+        }
+        stamp(&format!(
+            "{seat}: the screen says working and opencode finished this session at {finished} — reading it idle"
+        ));
+        State::Idle
+    }
+}
+
+/// The half of [`Fleet::overrule_frozen_opencode`] that decides, split out so a
+/// test can drive it without an opencode, a database and a frozen TUI.
+///
+/// **`finished` is the session's last completed turn in seconds, and `None` is
+/// "we do not know"** rather than "still working". That distinction is the whole
+/// safety of the repair: a reader that treated an unreadable database as a
+/// running turn would be right, and one that treated it as a finished one would
+/// end agents on a machine where opencode simply could not be asked.
+fn overrule(raw: State, finished: Option<i64>, at: i64) -> State {
+    match (raw, finished) {
+        (State::Working, Some(f)) if f + crate::agent_commands::SETTLED_AFTER <= at => State::Idle,
+        _ => raw,
+    }
+}
 
 /// After a status verb: start the steps this may have made due.
 ///
@@ -162,7 +266,7 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
                     // step is still taken: a hand-run group may be followed
                     // by one wsp runs.
                     if !ran_by_wsp(&w, passed) {
-                        let _ = step(store, &w);
+                        let _ = step(store, &w, &Fleet);
                         return 0;
                     }
                     // Rotate first, so what is told next reaches the successor
@@ -174,7 +278,7 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
                             rotate(store, &w);
                         }
                     }
-                    let _ = step(store, &w);
+                    let _ = step(store, &w, &Fleet);
                     tell(store, &w, &passed_sentence(store, &w, passed));
                     return 0;
                 }
@@ -188,7 +292,7 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
         None => store.worklists(),
     };
     for w in lists.iter().filter(|w| w.status() == WorklistStatus::Running) {
-        let _ = step(store, w);
+        let _ = step(store, w, &Fleet);
     }
     0
 }
@@ -310,7 +414,7 @@ fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
 /// list: one code path means the tick and the verb cannot come to disagree
 /// about what is owed, and the tick has to reach them without a process per
 /// running list every minute.
-pub(crate) fn step(store: &Store, w: &Worklist) -> Vec<String> {
+pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String> {
     let mut started = Vec::new();
     let w = match store.worklist(&w.id) {
         Some(w) => w,
@@ -364,14 +468,25 @@ pub(crate) fn step(store: &Store, w: &Worklist) -> Vec<String> {
         stamp(&format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
     }
 
-    // 3. The barrier, once every member is landed and every verdict is in.
+    // 3. The barrier, once every member is landed, every verdict is in, and
+    // every member has stopped working. `wsp-164`.
     let tasks = store.tasks();
     if pos.at_barrier() && pos.members.iter().all(|s| verified(&tasks, &s.id)) {
-        if let Some(b) = open_barrier(store, &w, at, g) {
-            if spawn(store, &b, &policy, Undo::Row) {
-                started.push(b);
-            } else {
-                failed(store, &w, &b);
+        match holding_barrier(store, seats, &w, &pos) {
+            None => {
+                if let Some(b) = open_barrier(store, &w, at, g) {
+                    if spawn(store, &b, &policy, Undo::Row) {
+                        started.push(b);
+                    } else {
+                        failed(store, &w, &b);
+                    }
+                }
+            }
+            Some(waiting) => {
+                // Said every pass, never silently. `wsp-142`'s lesson is that a
+                // no-op which writes nothing is indistinguishable from a stall
+                // with no cause, and the cause here is a fact about a pane.
+                stamp(&format!("{} group {at}: barrier waits: {}", w.id, waiting.join("; ")));
             }
         }
     }
@@ -379,6 +494,106 @@ pub(crate) fn step(store: &Store, w: &Worklist) -> Vec<String> {
         stamp(&format!("{} group {at}: started {}", w.id, started.join(" ")));
     }
     started
+}
+
+/// How long a member may read `working` with its group otherwise finished
+/// before the run stops waiting and says so to the seat. `wsp-164`.
+const OVERWORKED_AFTER: i64 = 30 * 60;
+
+/// The members whose pane is still working, and are holding the barrier.
+///
+/// **The backstop for `wsp-163`'s case where nothing was reopened.** A member
+/// can be working on more with its row at `review` — it picked something up
+/// itself, or a person typed to it — and every other reading says the group is
+/// finished. Opening a barrier over a member that is mid-turn hands the group to
+/// a fresh agent while one of its own is still writing to the trunk, which is
+/// the failure `wsp-146`'s pass already had to reason about and is worse here
+/// because nothing in the store records it happening.
+///
+/// **Read through [`Seats`], the same reading the reconciler uses** — which is
+/// the whole point of it being one thing. A member with no claim, or a claim
+/// with no pane bound to it, does not hold the barrier: there is no agent there
+/// to be working. `None` from a reader means nobody can say, and that never
+/// holds a barrier — the failure of holding for ever is the one that needs no
+/// verb to fix.
+///
+/// **Bounded, and the bound reports rather than proceeds.** A member still
+/// working half an hour after everything else is in is not going to be waited
+/// on for ever, and it is not passed over either: the seat is told which member
+/// and what its screen says, which is the question a governor has and cannot
+/// answer from the panel. Proceeding past it would be the run racing a member;
+/// the sentence is what makes waiting a decision rather than a hang.
+fn holding_barrier(
+    store: &Store,
+    seats: &dyn Seats,
+    w: &Worklist,
+    pos: &worklist::Position,
+) -> Option<Vec<String>> {
+    let mut waiting = Vec::new();
+    let mut long = Vec::new();
+    for s in &pos.members {
+        let Some(seat) = bound_seat(store, &s.id) else { continue };
+        match seats.state(&seat) {
+            Some(State::Working) => {
+                let said = format!("{seat} reads working");
+                let over = store
+                    .find_task(&s.id)
+                    .and_then(|t| {
+                        t.section("Log")
+                            .and_then(|l| l.lines().filter(|l| l.contains(BUSY_SINCE)).last().map(|x| x.to_string()))
+                    })
+                    .and_then(|l| l.split_whitespace().nth(1).map(util::epoch_of))
+                    .map(|since| since + OVERWORKED_AFTER <= util::epoch_secs())
+                    .unwrap_or(false);
+                // First sighting records the clock, so "half an hour" is
+                // measured from when the run noticed rather than from when the
+                // member last wrote to its row.
+                if !over {
+                    let id = s.id.clone();
+                    store.locked(|| {
+                        let Some(mut t) = store.find_task(&id) else { return false };
+                        if t.section("Log").is_some_and(|l| l.contains(BUSY_SINCE)) {
+                            return false;
+                        }
+                        t.log(&format!("{BUSY_SINCE} {} — the barrier is waiting on it", util::now_iso()));
+                        t.touch();
+                        store.save_task(&t).is_ok()
+                    });
+                }
+                waiting.push(if over { format!("{seat} has been working past {OVERWORKED_AFTER}s") } else { said });
+                if over {
+                    long.push(format!("{seat} ({})", s.id));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !long.is_empty() {
+        tell(store, w, &format!(
+            "The {} run's barrier has been waiting on {} — their panes read working with everything else in. \
+             `wsp peek` shows what is on the screen; if they are stuck, `wsp reopen <id> \"what is owed\"` \
+             moves the row and tells the pane.",
+            w.id,
+            long.join(" ")
+        ));
+    }
+    (!waiting.is_empty()).then_some(waiting)
+}
+
+/// The marker in a member's `## Log` for "the barrier has been waiting on this
+/// pane since".
+const BUSY_SINCE: &str = "wsp: its pane has been working since";
+
+/// The pane a member's agent is in, or `None` where there is no agent to hold a
+/// barrier.
+///
+/// **A claim is not enough and a binding is.** A claim outlives its pane by
+/// design ([`crate::store`]'s own argument) and a binding is the only record
+/// that names a seat — so a member whose pane has gone and whose claim stands
+/// reads as "no seat", which is correct: there is nobody working.
+fn bound_seat(store: &Store, member: &str) -> Option<String> {
+    let seat = store.panes_for_task(member).into_iter().next()?;
+    store.claims().contains_key(member).then_some(seat)
 }
 
 /// How long a start may take to show up as a claim before wsp reads it as
@@ -944,8 +1159,15 @@ fn rotate(store: &Store, w: &Worklist) {
 ///
 /// **`pub(crate)` since `wsp-147`**: the reconciler logs through this rather
 /// than opening the file itself, so a repair's lines and the run steps' lines
-/// are in one file in one order with one format.
+/// are in one file in one order with one format — and the record the barrier's
+/// wait keeps under `cfg(test)` is here for the same reason the reconciler's is:
+/// a step whose contract is "says why" cannot be tested by reading a file the
+/// code deliberately does not write with no terminal to write it to.
 pub(crate) fn stamp(line: &str) {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
+    }
     if cfg!(test) {
         return;
     }
@@ -958,6 +1180,36 @@ pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// No backend answers for any seat.
+    ///
+    /// **The right answer for most of these tests, not a dodge.** A store with
+    /// no project has no member with a seat, and `state_of_a_seat_nobody_can
+    /// answer_for` must not hold a barrier — so a test about the *chain* wants
+    /// a reader that says nothing rather than one that happens to say idle. The
+    /// tests that are about the gate name the seats they need.
+    pub(super) struct Blind;
+
+    impl Seats for Blind {
+        fn state(&self, _seat: &str) -> Option<State> {
+            None
+        }
+    }
+
+    /// The seats a test says something about, everything else unknown.
+    pub(super) struct Fixed(std::collections::BTreeMap<String, State>);
+
+    impl Fixed {
+        pub(super) fn new(pairs: &[(&str, State)]) -> Fixed {
+            Fixed(pairs.iter().map(|(s, v)| (s.to_string(), *v)).collect())
+        }
+    }
+
+    impl Seats for Fixed {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.get(seat).copied()
+        }
+    }
+
     thread_local! {
         pub(crate) static SPAWNED: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
         pub(crate) static ENDED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -965,6 +1217,8 @@ pub(crate) mod tests {
         pub(crate) static ROTATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// What `cycle.log` was told this thread, in order.
+        pub(crate) static SAID: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).
         /// Distinct from `TOLD`, which is the run's *governing* seat: a repair
         /// tells both and they are answers to different questions.
@@ -1026,41 +1280,41 @@ pub(crate) mod tests {
         task(&store, "m-2", Status::Todo);
         let w = list(&store, &[(&["m-1", "m-2"], "opencode some/model")]);
 
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(
             spawned(),
             vec![("m-1".into(), "opencode".into()), ("m-2".into(), "opencode".into())],
             "both members start, on the group's policy"
         );
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "the record that stops a second start");
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "a second advance starts nothing twice");
 
         set(&store, "m-1", Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let v = tagged(&store, VERIFY_TAG);
         assert_eq!(v.len(), 1, "one verifier, for the member that finished");
         assert_eq!(v[0].parent.as_deref(), Some("m-1"));
         assert!(v[0].section("Overview").unwrap().contains("read-only"), "its order is its overview");
         assert_eq!(spawned(), vec![(v[0].id.clone(), "opencode".into())], "on the same policy: the floor holds");
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty() && tagged(&store, VERIFY_TAG).len() == 1, "and only once");
 
         set(&store, "m-2", Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let _ = spawned();
         assert!(tagged(&store, BARRIER_TAG).is_empty(), "no barrier check while a verdict is outstanding");
 
         for v in tagged(&store, VERIFY_TAG) {
             set(&store, &v.id, Status::Review);
         }
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let b = tagged(&store, BARRIER_TAG);
         assert_eq!(b.len(), 1, "every member verified: one barrier check");
         assert_eq!(b[0].title, "Barrier: run group 1");
         assert!(b[0].section("Overview").unwrap().contains("wsp worklist go run --from FILE"));
         assert_eq!(spawned().len(), 1);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "the barrier row is the key; nothing starts twice");
     }
 
@@ -1078,7 +1332,7 @@ pub(crate) mod tests {
         w.set_groups(&g);
         store.save_worklist(&w).unwrap();
 
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(
             spawned(),
             vec![("m-1".into(), "opencode".into()), ("m-2".into(), "claude".into())],
@@ -1087,7 +1341,7 @@ pub(crate) mod tests {
 
         set(&store, "m-1", Status::Review);
         set(&store, "m-2", Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let by_parent: Vec<(String, String)> = spawned()
             .into_iter()
             .map(|(id, kind)| (store.find_task(&id).unwrap().parent.unwrap(), kind))
@@ -1101,7 +1355,7 @@ pub(crate) mod tests {
         for v in tagged(&store, VERIFY_TAG) {
             set(&store, &v.id, Status::Review);
         }
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(
             spawned(),
             vec![(tagged(&store, BARRIER_TAG)[0].id.clone(), "opencode".into())],
@@ -1116,17 +1370,206 @@ pub(crate) mod tests {
         let (_env, store) = scratch("again");
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let first = tagged(&store, VERIFY_TAG).remove(0);
         set(&store, &first.id, Status::Blocked);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "blocked, and nothing new until the member moves");
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         set(&store, "m-1", Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(tagged(&store, VERIFY_TAG).len(), 2, "the fix is verified again");
         let _ = spawned();
+    }
+
+// ---- 5. a screen that has stopped telling the truth (wsp-160) --------
+
+/// An opencode seat whose TUI stopped painting at the end of a turn reads
+/// `working` for ever, and since opencode fires none of the hooks compound
+/// listens for that screen is its *only* source. So every downstream
+/// reading believed it: `wsp tell` refused, anything held for idle waited
+/// for ever, and the run saw no landing.
+///
+/// A completed turn the database knows about and the screen does not is
+/// `idle`, and the repair says so in `cycle.log` beside the rest.
+#[test]
+fn a_frozen_opencode_screen_is_overruled_by_the_database() {
+    let now = 1_800_000_000;
+    let ago = now - crate::agent_commands::SETTLED_AFTER - 1;
+    assert_eq!(
+        overrule(State::Working, Some(ago), now),
+        State::Idle,
+        "the screen says working and the session finished a minute ago: a frozen screen"
+    );
+    // And the frozen screen is the only thing overruled: an agent genuinely
+    // mid-turn must read `working`.
+    assert_eq!(
+        overrule(State::Working, Some(now - 5), now),
+        State::Working,
+        "a turn that finished five seconds ago is a turn that just ended, not a frozen screen"
+    );
+    assert_eq!(
+        overrule(State::Working, None, now),
+        State::Working,
+        "a database that could not be read is not a finished session — overrule on a guess is how this would break a live run"
+    );
+}
+
+/// Every other state is left exactly as the screen read it. The repair has
+/// been seen to lie in one direction only, and `idle` is the safe direction
+/// to be wrong in: a seat wrongly called idle has a sentence typed at it,
+/// and a seat wrongly called working waits for ever.
+#[test]
+fn only_a_working_screen_is_ever_overruled() {
+    let now = 1_800_000_000;
+    let long = now - crate::agent_commands::SETTLED_AFTER - 1;
+    for read in [State::Idle, State::Starting, State::Blocked, State::Empty, State::Gone, State::Unknown] {
+        assert_eq!(overrule(read, Some(long), now), read, "{read:?} is not this repair's to overrule");
+    }
+}
+
+    /// `wsp-164`. Every member landed and verified is not the same as every
+    /// member *finished*: one can be mid-turn on more work with its row at
+    /// `review`, because it picked something up itself or a person typed to it.
+    /// Opening a barrier over that hands the group to a fresh agent while one of
+    /// its own is still writing to the trunk.
+    ///
+    /// So the barrier waits, **and says so**: a no-op which writes nothing is
+    /// indistinguishable from a stall with no cause, which is `wsp-142`'s
+    /// lesson.
+    #[test]
+    fn a_barrier_waits_for_a_member_whose_pane_reads_working_and_says_why() {
+        let (_env, store) = scratch("busybarrier");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Review);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        let _ = spawned();
+        for m in ["m-1", "m-2"] {
+            store.set_claim(m, serde_json::json!({ "workspace": "w" }));
+        }
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        store.set_binding("cpd-2", serde_json::json!({ "task_id": "m-2" }));
+
+        // One member's seat is mid-turn; the other is idle at a prompt.
+        let seats = Fixed::new(&[("cpd-1", State::Working), ("cpd-2", State::Idle)]);
+        step(&store, &w, &seats);
+        assert!(tagged(&store, BARRIER_TAG).is_empty(), "no barrier over a member that is still working");
+        assert!(tests::SAID.with(|s| s.borrow().iter().any(|l: &String| l.contains("cpd-1 reads working"))));
+
+        // And it opens on the tick after that seat falls idle.
+        let idle = Fixed::new(&[("cpd-1", State::Idle), ("cpd-2", State::Idle)]);
+        step(&store, &w, &idle);
+        assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "a tick later, and it opens");
+    }
+
+    /// **The dependency `wsp-164` names**, and the reason `wsp-160` had to land
+    /// first. A frozen opencode screen reads `working` for ever; without the
+    /// database overruling it this gate would hold every barrier in the fleet
+    /// for ever, and the fix would have been a way of passing them.
+    #[test]
+    fn a_frozen_opencode_seat_does_not_hold_the_barrier_because_the_database_says_it_finished() {
+        let (_env, store) = scratch("frozenbarrier");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        let _ = spawned();
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+
+        // What `Fleet` reports for a screen frozen on its busy frame: the
+        // screen says working, the session finished a minute ago.
+        struct Frozen;
+        impl Seats for Frozen {
+            fn state(&self, _seat: &str) -> Option<State> {
+                Some(overrule(State::Working, Some(util::epoch_secs() - crate::agent_commands::SETTLED_AFTER - 1), util::epoch_secs()))
+            }
+        }
+        step(&store, &w, &Frozen);
+        assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "a frozen screen is not a turn in flight");
+    }
+
+    /// `wsp-164`'s bound. A member still working half an hour after everything
+    /// else is in is not waited on for ever and is not passed over either: the
+    /// seat is told which member and what its screen says. Proceeding would race
+    /// it, and silence would make the waiting look like a hang.
+    #[test]
+    fn a_member_working_past_the_bound_is_reported_to_the_seat_rather_than_waited_on_silently() {
+        let (_env, store) = scratch("overworked");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        let _ = spawned();
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        let seats = Fixed::new(&[("cpd-1", State::Working)]);
+
+        step(&store, &w, &seats);
+        assert!(tagged(&store, BARRIER_TAG).is_empty(), "not passed over");
+        assert!(drained(&TOLD).is_empty(), "and not reported yet: the clock starts now");
+
+        age_the_wait(&store, "m-1");
+        step(&store, &w, &seats);
+        assert!(
+            drained(&TOLD).iter().any(|t| t.contains("cpd-1") && t.contains("wsp reopen")),
+            "half an hour on, the seat is told which member and what its screen says"
+        );
+    }
+
+    /// A member with a claim and no pane bound to it has no agent that could be
+    /// working, so it does not hold a barrier — and neither does a member whose
+    /// claim has gone. Holding for a seat that is not there would need a verb to
+    /// fix, and that is the failure mode this gate exists to avoid.
+    #[test]
+    fn a_member_with_no_seat_or_no_claim_does_not_hold_the_barrier() {
+        for (tag, claim, bound) in [("nopane", true, false), ("noclaim", false, true)] {
+            let (_env, store) = scratch(tag);
+            task(&store, "m-1", Status::Review);
+            let w = list(&store, &[(&["m-1"], "claude")]);
+            step(&store, &w, &Blind);
+            for v in tagged(&store, VERIFY_TAG) {
+                set(&store, &v.id, Status::Review);
+            }
+            let _ = spawned();
+            if claim {
+                store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+            }
+            if bound {
+                store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+            }
+            let seats = Fixed::new(&[("cpd-1", State::Working)]);
+            step(&store, &w, &seats);
+            assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "`{tag}`: there is nobody there to hold it");
+        }
+    }
+
+    /// Backdate the note that starts the barrier's wait on a pane.
+    fn age_the_wait(store: &Store, id: &str) {
+        let mut t = store.find_task(id).unwrap();
+        let log = t.section("Log").unwrap_or_default();
+        let aged: Vec<String> = log
+            .lines()
+            .map(|l| {
+                if l.contains(BUSY_SINCE) {
+                    format!("- 2026-01-01T00:00:00Z{}", &l[10..])
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        let body = format!("## Log\n\n{}\n", aged.join("\n"));
+        crate::model::set_section_in(&mut t.body, "Log", &body);
+        store.save_task(&t).unwrap();
     }
 
     /// `wsp-136` item 1. A note on a member is somebody **saying** something
@@ -1144,17 +1587,17 @@ pub(crate) mod tests {
         m.log(&format!("{} abc1234 on master", crate::repair::LANDED));
         store.save_task(&m).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let first = tagged(&store, VERIFY_TAG).remove(0);
         assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "the first verifier, which read abc1234");
         set(&store, &first.id, Status::Blocked);
 
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let mut m = store.find_task("m-1").unwrap();
         m.log("the verifier is right about the second half");
         m.touch();
         store.save_task(&m).unwrap();
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(
             tagged(&store, VERIFY_TAG).len(),
             1,
@@ -1166,7 +1609,7 @@ pub(crate) mod tests {
         let mut m = store.find_task("m-1").unwrap();
         m.log(&format!("{} def5678 on master", crate::repair::LANDED));
         store.save_task(&m).unwrap();
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(
             tagged(&store, VERIFY_TAG).len(),
             2,
@@ -1188,21 +1631,21 @@ pub(crate) mod tests {
         let (_env, store) = scratch("recheck");
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         // A barrier opens on every member's *verdict*, so settle this one first
         // — the group is otherwise still waiting on the verifier, not on the
         // barrier, and this test is about the barrier.
         set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "the first check");
         let first = tagged(&store, BARRIER_TAG).remove(0);
         let _ = spawned();
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "and one check is enough while it stands");
 
         // Held: the agent holds and then reviews its own row.
         set(&store, &first.id, Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let _ = spawned();
         let second: Vec<Task> = tagged(&store, BARRIER_TAG).into_iter().filter(|t| t.id != first.id).collect();
         assert_eq!(second.len(), 1, "a resume is a fresh check, not the old row");
@@ -1215,7 +1658,7 @@ pub(crate) mod tests {
 
         // And once that one has held too, a third.
         set(&store, &second[0].id, Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let _ = spawned();
         assert_eq!(tagged(&store, BARRIER_TAG).len(), 3, "each hold is its own check");
 
@@ -1231,15 +1674,15 @@ pub(crate) mod tests {
         let (_env, store) = scratch("recheckwedge");
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let only = tagged(&store, BARRIER_TAG).remove(0);
         let _ = spawned();
         let mut b = store.find_task(&only.id).unwrap();
         b.updated = "2026-01-01T00:00:00Z".into();
         store.save_task(&b).unwrap();
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(
             tagged(&store, BARRIER_TAG).len(),
             1,
@@ -1259,22 +1702,13 @@ pub(crate) mod tests {
     /// would kill an agent that is about to be asked something.
     #[test]
     fn the_last_barriers_agent_is_ended_by_a_tick_once_the_run_has_nothing_left() {
-        use crate::repair::{Pass, Seats};
-        /// Nobody answers for any seat, which is a store with no backend — the
-        /// tick still has to end what the run is finished with.
-        struct Blind;
-        impl Seats for Blind {
-            fn state(&self, _seat: &str) -> Option<crate::place::State> {
-                None
-            }
-        }
-
+        use crate::repair::Pass;
         let (_env, store) = scratch("lastbarrier");
         task(&store, "m-1", Status::Review);
         let mut w = list(&store, &[(&["m-1"], "claude")]);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let check = tagged(&store, BARRIER_TAG).remove(0);
         let _ = spawned();
         set(&store, &check.id, Status::Review);
@@ -1321,7 +1755,7 @@ pub(crate) mod tests {
             let (_env, store) = scratch(&format!("hand{}", agent.len()));
             task(&store, "m-1", Status::Todo);
             let w = list(&store, &[(&["m-1"], agent)]);
-            step(&store, &w);
+            step(&store, &w, &Blind);
             assert!(spawned().is_empty(), "`{agent}` is run by hand");
             assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo);
         }
@@ -1339,9 +1773,9 @@ pub(crate) mod tests {
         g[0].cap = Some(2);
         w.set_groups(&g);
         store.save_worklist(&w).unwrap();
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(spawned().len(), 2);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "two are going, and the cap is two");
     }
 
@@ -1455,7 +1889,7 @@ pub(crate) mod tests {
         task(&store, "m-1", Status::Todo);
         let w = list(&store, &[(&["m-1"], "claude")]);
         FAIL.with(|f| *f.borrow_mut() = Some("no compound session".into()));
-        step(&store, &w);
+        step(&store, &w, &Blind);
         FAIL.with(|f| *f.borrow_mut() = None);
         let _ = spawned();
         let t = store.find_task("m-1").unwrap();
@@ -1464,26 +1898,26 @@ pub(crate) mod tests {
         assert_eq!(drained(&TOLD).len(), 1, "and the seat is told");
 
         // Lost: `doing`, unclaimed, wsp's own start its last word, long ago.
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(spawned().len(), 1);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "a start in flight is left alone");
         let mut t = store.find_task("m-1").unwrap();
         t.updated = "2026-01-01T00:00:00Z".into();
         store.save_task(&t).unwrap();
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(spawned().len(), 1, "a start that never claimed it is taken again");
 
         // And a verifier row whose agent never came.
         set(&store, "m-1", Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let _ = spawned();
         let mut v = tagged(&store, VERIFY_TAG).remove(0);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty());
         v.updated = "2026-01-01T00:00:00Z".into();
         store.save_task(&v).unwrap();
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(spawned(), vec![(v.id.clone(), "claude".into())], "the same row, started again");
         assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "and not a second one");
     }
@@ -1493,11 +1927,11 @@ pub(crate) mod tests {
         let (_env, store) = scratch("belong");
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let v = tagged(&store, VERIFY_TAG).remove(0);
         assert_eq!(list_of(&store, &v).map(|w| w.id), Some("run".into()));
         set(&store, &v.id, Status::Review);
-        step(&store, &w);
+        step(&store, &w, &Blind);
         let b = tagged(&store, BARRIER_TAG).remove(0);
         assert_eq!(list_of(&store, &b).map(|w| w.id), Some("run".into()));
         let _ = spawned();
@@ -1541,7 +1975,7 @@ pub(crate) mod tests {
         let w = list(&store, &[(&["m-1"], "claude")]);
 
         told_about_task(&store, "m-1", "review");
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert!(spawned().is_empty() && tagged(&store, VERIFY_TAG).is_empty(), "no verifier on unlanded work");
         let told = drained(&TOLD);
         assert_eq!(told.len(), 1, "{told:?}");
@@ -1550,7 +1984,7 @@ pub(crate) mod tests {
 
         git(&["merge", "--ff-only", "--quiet", "m-1"]);
         told_about_task(&store, "m-1", "review");
-        step(&store, &w);
+        step(&store, &w, &Blind);
         assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "landed: the verifier starts");
         assert!(drained(&TOLD).is_empty(), "and a landed review is the next step, not news");
         let _ = spawned();

@@ -48,7 +48,8 @@
 //! members would be a second governor nobody asked for.
 
 use crate::model::{Status, Task, Worklist};
-use crate::place::{Seat, State};
+use crate::cycle::Seats;
+use crate::place::State;
 use crate::store::Store;
 use crate::util;
 use crate::worklist::{self, Position, Reading};
@@ -91,109 +92,6 @@ pub(crate) const LANDED: &str = "wsp: landed";
 /// this row's commit?" — has one answer whichever of the two rows carries it.
 pub(crate) const READING: &str = "wsp: reading";
 
-/// Where a seat's state is read from.
-///
-/// **A parameter and not built here, which is the whole of what makes this
-/// drivable without a terminal.** The same shape as [`crate::attention`]'s
-/// `Source` and for the same reason: `wsp verify` runs on a machine where no
-/// compound seat exists, and a test that needed one real seat to prove a
-/// member's agent had died would not be a test.
-pub(crate) trait Seats {
-    /// What the seat named is doing, or `None` where nobody can say.
-    ///
-    /// **`None` is not [`State::Gone`] and is never treated as it.** It is what
-    /// a machine with no backend answering returns, and a reconciler that read
-    /// it as "gone" would kill every seat on that machine exactly when it can
-    /// least see — the repair firing hardest where it knows least.
-    fn state(&self, seat: &str) -> Option<State>;
-}
-
-/// The real reading, over the backends wsp can spawn onto — with opencode's
-/// own database overruling a screen that has stopped repainting. `wsp-160`.
-///
-/// Herdr first because it watches a pty and can answer about *now*;
-/// `Refusal::NoSeat` is its "not mine", so a compound seat falls through to the
-/// second. One list, from [`crate::cmd_spawn`], rather than a second copy here.
-///
-/// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
-/// and the argument is the cost: that function is called from `survey`, from
-/// `wsp wip`, and from a panel four times a second, and the overrule shells to
-/// `opencode db`. A reader that fires it on every call would run a process per
-/// opencode seat per panel frame. The reconciler runs it once a minute, on the
-/// seats it is already asking about, and can say in `cycle.log` that it did —
-/// which is what `wsp-160` asks for ("log the repair beside it") and what a
-/// function returning a [`State`] has nowhere to put.
-pub(crate) struct Fleet;
-
-impl Seats for Fleet {
-    fn state(&self, seat: &str) -> Option<State> {
-        let seat_id = Seat::new(seat);
-        let compound = crate::place_compound::Compound::new();
-        let raw = crate::cmd_spawn::local_backends().iter().find_map(|b| b.state(&seat_id).ok())?;
-        Some(self.overrule_frozen_opencode(&compound, seat, raw))
-    }
-}
-
-impl Fleet {
-    /// A compound opencode seat reading `Working` that opencode's own database
-    /// says finished with, more than a minute ago.
-    ///
-    /// **Only that one state, and only for opencode.** The frozen screen has
-    /// been seen to lie in exactly one direction — `working` for ever, on a
-    /// busy frame it never repainted — and `idle` is the safe direction to be
-    /// wrong in: a seat wrongly called idle gets a sentence typed at it, and a
-    /// seat wrongly called working waits for ever.
-    ///
-    /// **A live turn still reads `working`,** which is the half of the test that
-    /// keeps this honest: `opencode_settled` requires a *completed* turn older
-    /// than the threshold, so a session mid-stream is untouched whatever the
-    /// screen says.
-    ///
-    /// Said every pass rather than once per seat, and that is deliberate here
-    /// where it is not for the others: the repair is the reconciler's *finding*,
-    /// and a governor reading `cycle.log` after a frozen seat has been sitting
-    /// there for an hour wants to see it said for the whole hour. It costs one
-    /// line a minute on a seat that is broken, which is nothing against a run
-    /// that has stalled on it.
-    fn overrule_frozen_opencode(
-        &self,
-        compound: &crate::place_compound::Compound,
-        seat: &str,
-        raw: State,
-    ) -> State {
-        if raw != State::Working {
-            return raw;
-        }
-        let session = compound.session_of(&Seat::new(seat));
-        if session.is_empty() {
-            return raw;
-        }
-        let Some(finished) = crate::agent_commands::opencode_finished_at(&session) else { return raw };
-        if !crate::agent_commands::opencode_settled(&session, util::epoch_secs()) {
-            return raw;
-        }
-        stamp(&format!(
-            "{seat}: the screen says working and opencode finished this session at {finished} — reading it idle"
-        ));
-        State::Idle
-    }
-}
-
-/// The half of [`Fleet::overrule_frozen_opencode`] that decides, split out so a
-/// test can drive it without an opencode, a database and a frozen TUI.
-///
-/// **`finished` is the session's last completed turn in seconds, and `None` is
-/// "we do not know"** rather than "still working". That distinction is the whole
-/// safety of the repair: a reader that treated an unreadable database as a
-/// running turn would be right, and one that treated it as a finished one would
-/// end agents on a machine where opencode simply could not be asked.
-fn overrule(raw: State, finished: Option<i64>, at: i64) -> State {
-    match (raw, finished) {
-        (State::Working, Some(f)) if f + crate::agent_commands::SETTLED_AFTER <= at => State::Idle,
-        _ => raw,
-    }
-}
-
 /// How long between passes. A minute, and the same interval as
 /// [`crate::attention`]'s for a reason worth stating rather than inheriting:
 /// every threshold this module compares against is minutes long, so a shorter
@@ -227,6 +125,7 @@ impl Pass {
     }
 }
 
+
 /// One tick: the run's own steps, then these repairs, for every running list.
 ///
 /// Idempotent by the property at the top of the module, which is what lets this
@@ -235,7 +134,7 @@ impl Pass {
 pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     pass.last = Some(util::epoch_secs());
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
-        let _ = crate::cycle::step(store, &w);
+        let _ = crate::cycle::step(store, &w, seats);
         let pos = worklist::position(store, &w, Reading::Landed);
         let Some(at) = pos.at else { continue };
         let groups = w.groups();
@@ -297,7 +196,7 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             // `wsp reconcile` to rebuild the binding — reported and never
             // respawned on, because there is no seat to end and the tree may be
             // somebody's.
-            stamp(&format!(
+            crate::cycle::stamp(&format!(
                 "{} group {at}: {} is held but no seat is bound to it — `wsp reconcile` rebuilds that from the claim",
                 w.id, t.id
             ));
@@ -327,7 +226,7 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         if already.is_some_and(|since| since + STALLED_AFTER <= util::epoch_secs()) {
             // Told once, still not working. End it and let the run start it
             // again — the same branch, the same tree, a fresh agent.
-            stamp(&format!(
+            crate::cycle::stamp(&format!(
                 "{} group {at}: {} was told to finish or say why and its seat still reads {word} — ending it, and the run starts it again",
                 w.id, t.id
             ));
@@ -352,7 +251,7 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         if !wrote {
             continue;
         }
-        stamp(&format!("{} group {at}: {} reads {word} ({seat}) with nothing working on it — telling it", w.id, id));
+        crate::cycle::stamp(&format!("{} group {at}: {} reads {word} ({seat}) with nothing working on it — telling it", w.id, id));
         tell_member(&id, &format!(
             "wsp noticed that {id} is at doing with nothing working on it. If your work is finished, \
              land it and run `wsp review {id}`; if it is not, say what is left. Nobody else is \
@@ -404,7 +303,7 @@ fn tell_member(id: &str, text: &str) {
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            stamp(&format!("tell {id}: could not run `wsp tell` ({e})"));
+            crate::cycle::stamp(&format!("tell {id}: could not run `wsp tell` ({e})"));
             return;
         }
     };
@@ -413,12 +312,12 @@ fn tell_member(id: &str, text: &str) {
         let _ = writeln!(to, "{text}");
     }
     match child.wait_with_output() {
-        Ok(o) if o.status.success() => stamp(&format!("told {id}: it has the sentence")),
-        Ok(o) => stamp(&format!(
+        Ok(o) if o.status.success() => crate::cycle::stamp(&format!("told {id}: it has the sentence")),
+        Ok(o) => crate::cycle::stamp(&format!(
             "told {id}: not delivered — {}",
             util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
         )),
-        Err(e) => stamp(&format!("told {id}: not delivered — {e}")),
+        Err(e) => crate::cycle::stamp(&format!("told {id}: not delivered — {e}")),
     }
 }
 
@@ -464,7 +363,7 @@ fn unrecorded_landing(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             continue;
         }
         store.git_commit(&format!("wsp: recorded a landing of {id}"));
-        stamp(&format!(
+        crate::cycle::stamp(&format!(
             "{} group {at}: {id} is on {trunk} at {sha} and no land was recorded — recording it, and the verifier starts on it",
             w.id
         ));
@@ -540,7 +439,7 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };
-        stamp(&format!(
+        crate::cycle::stamp(&format!(
             "{} group {at}: {} is at {} and nothing was started for it — {why}. `wsp land {}` puts it on \
              the trunk, and its verifier starts on that.",
             w.id,
@@ -572,7 +471,7 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             .map(|s| s.id.as_str())
             .collect();
         if !waiting.is_empty() {
-            stamp(&format!(
+            crate::cycle::stamp(&format!(
                 "{} group {at}: every member has landed and the barrier still waits on {} — no verifier has recorded a verdict.",
                 w.id,
                 waiting.join(" ")
@@ -614,13 +513,7 @@ fn told_once(store: &Store, id: &str, said: &str) -> bool {
 /// repair whose whole contract is "says why, in a file" cannot be tested by
 /// reading a file the code path deliberately does not write when there is no
 /// terminal to write it to.
-fn stamp(line: &str) {
-    if cfg!(test) {
-        #[cfg(test)]
-        tests::STAMPED.with(|s| s.borrow_mut().push(line.to_string()));
-    }
-    crate::cycle::stamp(line);
-}
+
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -630,10 +523,6 @@ pub(crate) mod tests {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-
-    thread_local! {
-        pub(super) static STAMPED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    }
 
     /// The seats a fake answers for. `None` in the map is a seat nobody can say
     /// anything about, which is deliberately not the same as one reading `Gone`.
@@ -655,8 +544,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// What `cycle.log` was told, on either path.
+    ///
+    /// **One record and not two.** `cycle::stamp` is the only writer — the
+    /// reconciler logs through it rather than opening the file itself — so a
+    /// repair's lines and the run steps' lines come out of one list in one
+    /// order, and a test reading "what did the run say" reads both.
     fn stamped() -> Vec<String> {
-        STAMPED.with(|s| s.borrow_mut().drain(..).collect())
+        crate::cycle::tests::SAID.with(|s| s.borrow_mut().drain(..).collect())
     }
 
     fn member_told() -> Vec<(String, String)> {
@@ -933,53 +828,7 @@ pub(crate) mod tests {
         assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())]);
     }
 
-    // ---- 5. a screen that has stopped telling the truth (wsp-160) --------
-
-    /// An opencode seat whose TUI stopped painting at the end of a turn reads
-    /// `working` for ever, and since opencode fires none of the hooks compound
-    /// listens for that screen is its *only* source. So every downstream
-    /// reading believed it: `wsp tell` refused, anything held for idle waited
-    /// for ever, and the run saw no landing.
-    ///
-    /// A completed turn the database knows about and the screen does not is
-    /// `idle`, and the repair says so in `cycle.log` beside the rest.
-    #[test]
-    fn a_frozen_opencode_screen_is_overruled_by_the_database() {
-        let now = 1_800_000_000;
-        let ago = now - crate::agent_commands::SETTLED_AFTER - 1;
-        assert_eq!(
-            overrule(State::Working, Some(ago), now),
-            State::Idle,
-            "the screen says working and the session finished a minute ago: a frozen screen"
-        );
-        // And the frozen screen is the only thing overruled: an agent genuinely
-        // mid-turn must read `working`.
-        assert_eq!(
-            overrule(State::Working, Some(now - 5), now),
-            State::Working,
-            "a turn that finished five seconds ago is a turn that just ended, not a frozen screen"
-        );
-        assert_eq!(
-            overrule(State::Working, None, now),
-            State::Working,
-            "a database that could not be read is not a finished session — overrule on a guess is how this would break a live run"
-        );
-    }
-
-    /// Every other state is left exactly as the screen read it. The repair has
-    /// been seen to lie in one direction only, and `idle` is the safe direction
-    /// to be wrong in: a seat wrongly called idle has a sentence typed at it,
-    /// and a seat wrongly called working waits for ever.
-    #[test]
-    fn only_a_working_screen_is_ever_overruled() {
-        let now = 1_800_000_000;
-        let long = now - crate::agent_commands::SETTLED_AFTER - 1;
-        for read in [State::Idle, State::Starting, State::Blocked, State::Empty, State::Gone, State::Unknown] {
-            assert_eq!(overrule(read, Some(long), now), read, "{read:?} is not this repair's to overrule");
-        }
-    }
-
-    // ---- 2. a start that never claimed ------------------------------------
+        // ---- 2. a start that never claimed ------------------------------------
 
     /// A start that claimed nothing is taken again once it has had ten minutes,
     /// on the tick rather than on the next event. `wsp-134`'s retake ran only

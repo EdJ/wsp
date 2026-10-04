@@ -888,7 +888,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // daemon stderr line nobody has attached to would be a second place to
         // look for the same answer.
         if repair_pass.due(now) {
-            crate::repair::tick(store, &crate::repair::Fleet, &mut repair_pass);
+            crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass);
         }
 
         let fingerprint = store.fingerprint();
