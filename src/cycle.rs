@@ -1535,11 +1535,10 @@ pub(crate) fn log_line(store: &Store, line: &str) {
     // a record the same function produced proves nothing about the file. The
     // isolated store a test uses is a throwaway directory, so writing it costs
     // nothing and keeps this assertion honest.
-    if cfg!(test) {
-        tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
-    } else {
-        stamp(line);
-    }
+    #[cfg(test)]
+    tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
+    #[cfg(not(test))]
+    stamp(line);
     let at = util::now_iso();
     let Ok(mut out) = std::fs::OpenOptions::new()
         .create(true)
