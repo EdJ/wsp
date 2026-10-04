@@ -1618,6 +1618,9 @@ fn help_text() -> String {
                                     machine, --full to start it with sub-agents,
                                     workflows and the MCP servers it is
                                     otherwise spawned without.
+                                    -p beside an id says where that work sits
+                                    rather than replacing it, and the two may
+                                    not disagree
                                     --subagents keeps just the Agent tool, for
                                     exploration-heavy work whose searching would
                                     otherwise pile up in the session's own

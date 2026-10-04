@@ -1520,45 +1520,42 @@ struct Work {
 
 /// A task, or a project, or nothing that resolves.
 ///
-/// `-p` forces the project reading. Without it a task is tried first and a
-/// project second, which is the order the ids themselves suggest: `wsp-014`
-/// can only be a task, and a project slug can only be a project, so the two
-/// collide solely on a title substring — where the task is what was meant, that
-/// being the thing you were just reading.
+/// **A positional is an answer; `-p` is a claim about where it sits.** It used
+/// to be the other way round, and `-p` returned before the id was even looked
+/// at — so `wsp spawn <id> -p <project> --agent`, which is what the usage line
+/// has printed for as long as `-p` was optional, opened a *project* seat: no
+/// claim, no brief, no tree of its own, the trunk as the working directory, and
+/// a line saying it had opened `claude`. Nothing in that output was false and
+/// the whole of the command had been dropped on the way in (`wsp-143`).
+///
+/// So the needle is resolved first, always, and `-p` beside it is checked
+/// against the answer rather than preferred to it. Agreeing is silence, because
+/// it is the redundant spelling of something already true; disagreeing is
+/// refused, because that is the near miss that costs — a task claimed in one
+/// project's root, briefed about another, and branched in neither.
+///
+/// A task is tried before a project on the needle alone too, which is the order
+/// the ids themselves suggest: `wsp-014` can only be a task, and a project slug
+/// can only be a project, so the two collide solely on a title substring —
+/// where the task is what was meant, that being the thing you were just reading.
 fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
-    if let Some(p) = args.get("project") {
-        // A worklist, but only for `--govern`. A list is a thing to *run*, not
-        // a place to work: it has no root to stand in and no backlog to claim
-        // out of, so `-p <slug>` on its own would open a workspace that could
-        // not answer the first question asked of it. Under `--govern` it is the
-        // obvious thing and needs no flag of its own — the seat's key is a
-        // scope, so this is the same command it always was pointed at the other
-        // half of one key space.
-        if args.has("govern") {
-            if let Some(w) = store.worklist(&p) {
-                return Ok(Work {
-                    task: None,
-                    project: None,
-                    label: crate::cmd_govern::governor_of(&w.id),
-                    list: Some(w.id),
-                });
-            }
+    if let Some(needle) = args.rest.first().cloned() {
+        if let Some(w) = resolve_needle(store, args, &needle, index) {
+            return w;
         }
-        let proj = index.find(&p).ok_or_else(|| format!("no project matching `{p}`"))?;
-        return Ok(Work {
-            task: None,
-            project: Some(proj.id.clone()),
-            label: proj.name.clone(),
-            list: None,
-        });
     }
-    let needle = args
-        .rest
-        .first()
-        .cloned()
+    let p = args
+        .get("project")
         .ok_or_else(|| "usage: wsp spawn <task|-p project> [--agent]".to_string())?;
+    // A worklist, but only for `--govern`. A list is a thing to *run*, not
+    // a place to work: it has no root to stand in and no backlog to claim
+    // out of, so `-p <slug>` on its own would open a workspace that could
+    // not answer the first question asked of it. Under `--govern` it is the
+    // obvious thing and needs no flag of its own — the seat's key is a
+    // scope, so this is the same command it always was pointed at the other
+    // half of one key space.
     if args.has("govern") {
-        if let Some(w) = store.worklist(&needle) {
+        if let Some(w) = store.worklist(&p) {
             return Ok(Work {
                 task: None,
                 project: None,
@@ -1567,22 +1564,83 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
             });
         }
     }
-    if let Some(t) = store.find_task(&needle) {
-        return Ok(Work {
-            project: t.project.clone(),
+    let proj = index.find(&p).ok_or_else(|| format!("no project matching `{p}`"))?;
+    Ok(Work {
+        task: None,
+        project: Some(proj.id.clone()),
+        label: proj.name.clone(),
+        list: None,
+    })
+}
+
+/// What the positional names, or `None` when it names nothing this verb can
+/// spawn on — so that `resolve` can fall through to `-p` rather than refuse.
+fn resolve_needle(
+    store: &Store,
+    args: &Args,
+    needle: &str,
+    index: &Index,
+) -> Option<Result<Work, String>> {
+    if args.has("govern") {
+        if let Some(w) = store.worklist(needle) {
+            return Some(Ok(Work {
+                task: None,
+                project: None,
+                label: crate::cmd_govern::governor_of(&w.id),
+                list: Some(w.id),
+            }));
+        }
+    }
+    if let Some(t) = store.find_task(needle) {
+        let project = match agrees(args, index, t.project.as_deref(), needle) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(Work {
+            project,
             label: cmd_agent::task_label(&t).unwrap_or_else(|| t.title.clone()),
             task: Some(t.id),
             list: None,
-        });
+        }));
     }
-    match index.find(&needle) {
-        Some(proj) => Ok(Work {
+    index.find(needle).map(|proj| {
+        Ok(Work {
             task: None,
             project: Some(proj.id.clone()),
             label: proj.name.clone(),
             list: None,
-        }),
-        None => Err(format!("no task or project matching `{needle}`")),
+        })
+    })
+}
+
+/// Where the work this needle names actually sits, once `-p` has had its say.
+///
+/// `None` here means the project was left as it was found: a task carrying no
+/// project of its own has nothing for `-p` to disagree with, so a project named
+/// beside it is the only thing that has ever located it. Every other case
+/// resolves the name to an id first, because the whole point is comparing two
+/// projects and aliases make that comparison a string comparison.
+fn agrees(
+    args: &Args,
+    index: &Index,
+    project: Option<&str>,
+    needle: &str,
+) -> Result<Option<String>, String> {
+    let Some(p) = args.get("project") else {
+        return Ok(project.map(str::to_string));
+    };
+    let named = index
+        .find(&p)
+        .ok_or_else(|| format!("no project matching `{p}`"))?
+        .id
+        .clone();
+    match project {
+        // Nothing to contradict.
+        None => Ok(Some(named)),
+        Some(here) if here == named => Ok(Some(here.to_string())),
+        Some(here) => Err(format!(
+            "`{needle}` is a task in {here}, not in {p} — drop the -p, or name a task of {p}"
+        )),
     }
 }
 
@@ -3761,6 +3819,71 @@ mod tests {
             assert_eq!(w.project.as_deref(), Some("robustness"));
             assert_eq!(w.list, None);
         }
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `-p` beside an id does not get to be the answer, and the cost of
+    /// letting it be is the whole of `wsp-143`.
+    ///
+    /// `wsp spawn <id> -p <project> --agent` is not a shape anybody invented:
+    /// it is what the usage line has printed since `-p` was optional, and on
+    /// 2026-10-04 a governor typed it and got a pane with no claim, no brief
+    /// and no tree of its own — a project seat, standing in the trunk, holding
+    /// nothing, saying it had opened `claude`. Nothing in the output was
+    /// false, and everything the command was for had been dropped on the way
+    /// in. So the positional is resolved first, always, and `-p` beside it is
+    /// an assertion about where that work sits rather than a second answer.
+    ///
+    /// The two are not allowed to disagree, because the disagreement is the
+    /// near miss that costs: a task claimed in one project's root, briefed
+    /// about another, and branched in neither.
+    #[test]
+    fn a_task_named_beside_its_project_is_still_a_task() {
+        let store = seat("needle");
+        let mut hub = Project::new("tokenhub");
+        hub.roots = vec!["/tmp/tokenhub".into()];
+        store.save_project(&hub).unwrap();
+        store.save_project(&Project::new("other")).unwrap();
+        let mut t = Task::new("open the pane", "tokenhub-009");
+        t.project = Some("tokenhub".into());
+        store.save_task(&t).unwrap();
+
+        let index = Index::new(store.projects());
+        let w = resolve(
+            &store,
+            &Args::synth("spawn", &["tokenhub-009"], &[("project", "tokenhub")]),
+            &index,
+        )
+        .expect("the task, not the project it sits in");
+        assert_eq!(w.task.as_deref(), Some("tokenhub-009"), "the id that was named");
+        assert_eq!(w.project.as_deref(), Some("tokenhub"), "and the project it is in");
+
+        // An alias names the same project and is still the same project.
+        let w = resolve(
+            &store,
+            &Args::synth("spawn", &["tokenhub-009"], &[("project", "token")]),
+            &index,
+        )
+        .expect("an alias for its own project");
+        assert_eq!(w.task.as_deref(), Some("tokenhub-009"));
+
+        // Disagreement is refused before anything is opened, and names both
+        // sides, because one of them is what the person meant.
+        let err = resolve(
+            &store,
+            &Args::synth("spawn", &["tokenhub-009"], &[("project", "other")]),
+            &index,
+        )
+        .err()
+        .expect("a task cannot be spawned in another project's root");
+        assert!(err.contains("tokenhub-009") && err.contains("other"), "{err}");
+
+        // And `-p` on its own is untouched: a project seat is still a project.
+        let w = resolve(&store, &Args::synth("spawn", &[], &[("project", "other")]), &index)
+            .expect("a project is a place to work");
+        assert_eq!(w.project.as_deref(), Some("other"));
+        assert_eq!(w.task, None);
 
         let _ = std::fs::remove_dir_all(&store.root);
     }

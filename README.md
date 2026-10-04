@@ -2966,6 +2966,19 @@ and `wsp/data` are two halves of one checkout and neither has a `roots` of its
 own, and reading only a project's own roots put the agent wherever the caller
 happened to be standing.
 
+**A positional is an answer; `-p` is a claim about where it sits.** It was the
+other way round, and `-p` returned before the id was looked at — so
+`wsp spawn <id> -p <project> --agent`, which is the shape the usage line itself
+prints, opened a *project* seat: no claim, no brief, no tree of its own, the
+trunk as the working directory, and a line saying it had opened `claude`.
+Nothing in that output was false and the whole of the command had been dropped
+on the way in — measured on 2026-10-04, when `wsp-143` was filed against it.
+The id is resolved first now, always; `-p` beside it is checked against the
+answer rather than preferred to it. Agreeing is silence, because it is the
+redundant spelling of something already true. Disagreeing is refused, because
+that is the near miss worth naming: a task claimed in one project's root,
+briefed about another, and branched in neither.
+
 ### What "started" means, and what it does not
 
 `spawn` says `open`, `start`, then `tell`, and it says them to a *backend* —
