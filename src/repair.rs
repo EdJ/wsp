@@ -133,6 +133,7 @@ impl Pass {
 /// and starts nothing twice.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     pass.last = Some(util::epoch_secs());
+    say_frozen_screens(store, seats);
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         let _ = crate::cycle::step(store, &w, seats);
         let pos = worklist::position(store, &w, Reading::Landed);
@@ -162,7 +163,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // left sitting in its seat holding a claim for the rest of the night.
     let verdicts = crate::cycle::verdicts_recorded(store);
     if !verdicts.is_empty() {
-        crate::cycle::stamp(&format!(
+        stamp(store, &format!(
             "{} recorded a verdict and {} nothing left to do — ending {}",
             verdicts.len(),
             if verdicts.len() == 1 { "has" } else { "have" },
@@ -170,6 +171,61 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         ));
     }
     crate::cycle::end_all(store, verdicts);
+}
+
+/// One dated line in `cycle.log`, through the daemon's own file handle.
+///
+/// **The store is a parameter and not taken from here**, because this runs inside
+/// the daemon where the store already exists, and because a repair's lines and
+/// the run steps' have to land in the *same file*: the reconciler's stdout is
+/// launchd's `daemon.log`, so "through stdout" would have put them in a file
+/// nobody reads for a run. See [`crate::cycle::log_line`].
+fn stamp(store: &Store, line: &str) {
+    crate::cycle::log_line(store, line);
+}
+
+/// Every seat whose screen this pass overruled, said once each.
+///
+/// **Said here rather than inside the reading that overrules it.** [`Fleet`] is
+/// what turns a frozen opencode screen into `Idle`, and it is deliberately a
+/// cheap function on a port that a panel calls four times a second — it has no
+/// store, no file and no place to put a sentence. This has all three, and a
+/// governor reading `cycle.log` after a seat has been frozen for an hour wants
+/// to see it said for that hour rather than once, which is the difference
+/// between this and a note in the seat's own record.
+///
+/// **A cross-check on the reading rather than a duplicate of it.** The decision
+/// is `crate::overrule`, called once in both places; this re-asks the same
+/// question so the *report* exists, and a disagreement between them would be a
+/// bug worth seeing rather than a silent one.
+fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
+    let compound = crate::place_compound::Compound::new();
+    let tasks = store.tasks();
+    for t in tasks {
+        if !matches!(t.status(), Status::Review | Status::Done) {
+            continue;
+        }
+        for seat in store.panes_for_task(&t.id) {
+            if seats.state(&seat) != Some(State::Working) {
+                continue;
+            }
+            let session = compound.session_of(&crate::place::Seat::new(&seat));
+            let Some(finished) = (!session.is_empty())
+                .then(|| crate::agent_commands::opencode_finished_at(&session))
+                .flatten()
+            else {
+                continue;
+            };
+            if crate::cycle::overrule(State::Working, Some(finished), util::epoch_secs()) != State::Working {
+                stamp(
+                    store,
+                    &format!(
+                        "{seat}: the screen says working and opencode finished this session at {finished} — read as idle"
+                    ),
+                );
+            }
+        }
+    }
 }
 
 // ---- a member whose agent is not working on it ----------------------------
@@ -209,7 +265,7 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             // `wsp reconcile` to rebuild the binding — reported and never
             // respawned on, because there is no seat to end and the tree may be
             // somebody's.
-            crate::cycle::stamp(&format!(
+            stamp(store, &format!(
                 "{} group {at}: {} is held but no seat is bound to it — `wsp reconcile` rebuilds that from the claim",
                 w.id, t.id
             ));
@@ -248,7 +304,7 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             // at `doing` is a row nothing can start, and the reconciler has
             // replaced a stalled agent with a stalled row. It is the same move
             // `cycle::spawn` makes for a start that failed.
-            crate::cycle::stamp(&format!(
+            stamp(store, &format!(
                 "{} group {at}: {} was told to finish or say why and its seat still reads {word} — ending it, and the run starts it again",
                 w.id, t.id
             ));
@@ -274,8 +330,8 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         if !wrote {
             continue;
         }
-        crate::cycle::stamp(&format!("{} group {at}: {} reads {word} ({seat}) with nothing working on it — telling it", w.id, id));
-        tell_member(&id, &format!(
+        stamp(store, &format!("{} group {at}: {} reads {word} ({seat}) with nothing working on it — telling it", w.id, id));
+        tell_member(store, &id, &format!(
             "wsp noticed that {id} is at doing with nothing working on it. If your work is finished, \
              land it and run `wsp review {id}`; if it is not, say what is left. Nobody else is \
              waiting on this row."
@@ -331,7 +387,7 @@ fn noticed(t: &Task) -> Option<i64> {
 /// **A refusal is stamped, never retried.** A member whose agent has exited is
 /// the case this exists for and `wsp tell` refuses it for exactly that reason;
 /// the respawn is the fallback, on a later tick.
-fn tell_member(id: &str, text: &str) {
+fn tell_member(store: &Store, id: &str, text: &str) {
     if cfg!(test) {
         #[cfg(test)]
         return crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), text.to_string())));
@@ -346,7 +402,7 @@ fn tell_member(id: &str, text: &str) {
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            crate::cycle::stamp(&format!("tell {id}: could not run `wsp tell` ({e})"));
+            stamp(store, &format!("tell {id}: could not run `wsp tell` ({e})"));
             return;
         }
     };
@@ -355,12 +411,12 @@ fn tell_member(id: &str, text: &str) {
         let _ = writeln!(to, "{text}");
     }
     match child.wait_with_output() {
-        Ok(o) if o.status.success() => crate::cycle::stamp(&format!("told {id}: it has the sentence")),
-        Ok(o) => crate::cycle::stamp(&format!(
+        Ok(o) if o.status.success() => stamp(store, &format!("told {id}: it has the sentence")),
+        Ok(o) => stamp(store, &format!(
             "told {id}: not delivered — {}",
             util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
         )),
-        Err(e) => crate::cycle::stamp(&format!("told {id}: not delivered — {e}")),
+        Err(e) => stamp(store, &format!("told {id}: not delivered — {e}")),
     }
 }
 
@@ -406,7 +462,7 @@ fn unrecorded_landing(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             continue;
         }
         store.git_commit(&format!("wsp: recorded a landing of {id}"));
-        crate::cycle::stamp(&format!(
+        stamp(store, &format!(
             "{} group {at}: {id} is on {trunk} at {sha} and no land was recorded — recording it, and the verifier starts on it",
             w.id
         ));
@@ -482,7 +538,7 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };
-        crate::cycle::stamp(&format!(
+        stamp(store, &format!(
             "{} group {at}: {} is at {} and nothing was started for it — {why}. `wsp land {}` puts it on \
              the trunk, and its verifier starts on that.",
             w.id,
@@ -514,7 +570,7 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             .map(|s| s.id.as_str())
             .collect();
         if !waiting.is_empty() {
-            crate::cycle::stamp(&format!(
+            stamp(store, &format!(
                 "{} group {at}: every member has landed and the barrier still waits on {} — no verifier has recorded a verdict.",
                 w.id,
                 waiting.join(" ")
@@ -1006,6 +1062,33 @@ pub(crate) mod tests {
             stamped().iter().any(|l| l.contains("the barrier still waits on m-1")),
             "{:?}",
             stamped()
+        );
+    }
+
+    /// **The reconciler's lines go in `cycle.log`, and that is not the same as
+    /// "through stdout".** Found by reading `daemon.log` after installing: every
+    /// repair was logging into launchd's file, so a governor opening
+    /// `cycle.log` after an agent died saw nothing and the reconciler read as
+    /// silent — which is the whole failure this row was filed for, in the place
+    /// it was least wanted.
+    ///
+    /// Asserted against the file rather than against the in-memory record,
+    /// because the in-memory record is written by both paths and cannot tell
+    /// them apart.
+    #[test]
+    fn a_repair_lands_in_cycle_log_itself_and_not_only_on_stdout() {
+        let (_env, store) = scratch("cyclelog");
+        member(&store, "m-1", Status::Doing);
+        list(&store, &["m-1"], "claude");
+        store.set_claim("m-1", serde_json::json!({ "workspace": "cpd-1" }));
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]), &mut Pass::new());
+
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(
+            log.contains("nothing working on it"),
+            "the file a governor reads for a run's history has to carry it: {log:?}"
         );
     }
 

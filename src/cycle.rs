@@ -140,6 +140,12 @@ pub(crate) trait Seats {
 pub(crate) struct Fleet;
 
 impl Seats for Fleet {
+    /// **The store is not a parameter**, and that is the one thing here worth
+    /// stating: this overrule logs, and logging means naming the store whose
+    /// `cycle.log` the line goes in. [`Seats::state`] carries only the seat, so
+    /// the line goes through [`stamp`] — stdout — which for the daemon is
+    /// launchd's log. The overrule's own line is therefore said by
+    /// [`crate::repair`], which has the store and says it once per pass anyway.
     fn state(&self, seat: &str) -> Option<State> {
         let seat_id = Seat::new(seat);
         let compound = crate::place_compound::Compound::new();
@@ -182,15 +188,7 @@ impl Fleet {
         let finished = (!session.is_empty())
             .then(|| crate::agent_commands::opencode_finished_at(&session))
             .flatten();
-        let read = overrule(raw, finished, util::epoch_secs());
-        if read == raw {
-            return raw;
-        }
-        stamp(&format!(
-            "{seat}: the screen says working and opencode finished this session at {} — reading it idle",
-            finished.unwrap_or_default()
-        ));
-        read
+        overrule(raw, finished, util::epoch_secs())
     }
 }
 
@@ -1515,6 +1513,43 @@ pub(crate) fn stamp(line: &str) {
     }
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{} {line}", util::now_iso());
+}
+
+/// One dated line in `cycle.log`, **appended to the file**.
+///
+/// **Not [`stamp`], and the difference is where this process's stdout goes.** A
+/// run step is taken by a `wsp worklist advance` this module starts, and that
+/// child's stdout *is* `cycle.log` — see [`launch`]. The reconciler is not: it
+/// runs inside the daemon, whose stdout is launchd's `daemon.log`. So the first
+/// version of this row logged every repair to a file nobody reads for a run: the
+/// lines were there, in the wrong place, which is nearly the same as not being
+/// there, and it read as "the reconciler is silent" to anybody who went looking
+/// for exactly that.
+///
+/// Same format and the same prefix as [`stamp`], so the two interleave into one
+/// readable file in the order they happened rather than needing a reader to know
+/// which process wrote which.
+pub(crate) fn log_line(store: &Store, line: &str) {
+    // The in-memory record goes through `stamp` so the tests can read what was
+    // said; the file is written whatever that says, because a test asserting on
+    // a record the same function produced proves nothing about the file. The
+    // isolated store a test uses is a throwaway directory, so writing it costs
+    // nothing and keeps this assertion honest.
+    if cfg!(test) {
+        tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
+    } else {
+        stamp(line);
+    }
+    let at = util::now_iso();
+    let Ok(mut out) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.state_file("cycle.log"))
+    else {
+        return;
+    };
+    use std::io::Write;
+    let _ = writeln!(out, "{at} {line}");
 }
 
 #[cfg(test)]
