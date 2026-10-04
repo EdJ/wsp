@@ -703,6 +703,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // in the store and not in this variable, so the `exec` below costs it
     // nothing; see `attention::load`.
     let mut pass = attention::Pass::new();
+    // The reconciler's own clock, and separate from the attention pass's for the
+    // reason the daemon's own comment above the loop gives: this one exists for
+    // conditions that raise no event, and sharing a gate with a pass that *does*
+    // would tie "somebody woke us" to "a member's agent exited".
+    let mut repair_pass = crate::repair::Pass::new();
     // What we are executing, so we can notice an `install` landing underneath
     // us. See `reload` at the top of the loop for why the daemon needs this at
     // all when herdr restarts it.
@@ -865,6 +870,25 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
                     );
                 }
             }
+        }
+
+        // **The run's own steps, and the repairs, on the same timer** — `wsp-147`.
+        //
+        // Above the gate below for the reason the attention pass is: a member
+        // whose agent exited raises no event this daemon subscribes to and
+        // writes no record, so a pass that ran only when something woke us would
+        // be a pass that never ran on the one condition it exists to notice. It
+        // runs in this process rather than as a `wsp worklist advance` per list
+        // because that would be a process per running list every minute, and
+        // because `cycle::step` is idempotent: a tick racing a verb's own
+        // advance finds the records and starts nothing twice.
+        //
+        // Silent about its own failures. `repair::tick` writes what it did to
+        // `cycle.log`, which is where the run's history is read from, and a
+        // daemon stderr line nobody has attached to would be a second place to
+        // look for the same answer.
+        if repair_pass.due(now) {
+            crate::repair::tick(store, &crate::repair::Fleet, &mut repair_pass);
         }
 
         let fingerprint = store.fingerprint();

@@ -2101,6 +2101,27 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     // ready for the next commit or for the same task being picked up again next
     // week. `wsp checkout --rm` ends it when the work is genuinely over.
 
+    // The landing, on the task. `wsp land` wrote nothing at all until `wsp-147`,
+    // so a branch reaching the trunk was invisible to everything in wsp that
+    // does not read a reflog — and the verifier is keyed on this line, so a
+    // member with no landing recorded falls back to `updated` and a governor's
+    // note buys it a fresh verifier. The trunk's value, not the branch's: they
+    // are the same commit here by construction, since the merge above was
+    // `--ff-only`, and naming the trunk is what a reader checking the claim
+    // will compare against.
+    if let Some(sha) = git(&w.trunk, &["rev-parse", &on]) {
+        let mut t = store.find_task(&w.task);
+        if let Some(t) = t.as_mut() {
+            let line =
+                format!("{} {sha} on {on}", crate::repair::LANDED);
+            if !t.section("Log").is_some_and(|l| l.contains(&line)) {
+                t.log(&line);
+                t.touch();
+                let _ = store.save_task(t);
+            }
+        }
+    }
+
     // `wsp-134`: a member reviewed before it landed is verified once it has.
     crate::cycle::poke_task(store, &w.task, "land");
 

@@ -1236,6 +1236,41 @@ fn landing(repos: &mut Repos, t: &Task) -> Landing {
     }
 }
 
+/// The commit a member's work is on the trunk at, and the trunk it is on, for
+/// a member named by the worklist's own text — or `None` while any of it is
+/// still outstanding.
+///
+/// **The branch's own tip, not the trunk's.** `wsp land` fast-forwards, so on
+/// every landing `wsp` performs the two are the same value; on a landing
+/// performed by anything else the branch's tip is still the right answer,
+/// because it is the commit *this member* reached the trunk with. Reading the
+/// trunk instead names whatever reached it last, which on a busy run is another
+/// member's work — and a re-verify keyed on that would fire on somebody else's
+/// commit.
+///
+/// Through `Store::task_now` for the reason `touched` is: expanding a
+/// renumbering needs the *current* id, and the worklist's older name expands to
+/// nothing and would answer about a repository the work is not in.
+pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
+    let mut repos = Repos::new(store);
+    let task = store.task_now(&repos.renamed, id)?;
+    let trunks = task.project.as_deref().map(|p| repos.of(p)).unwrap_or_default();
+    for trunk in trunks {
+        for branch in repos.branches(&task.id) {
+            let spec = format!("refs/heads/{branch}");
+            if git(&trunk.dir, &["rev-parse", "--verify", "--quiet", &spec]).is_none() {
+                continue;
+            }
+            if !cmd_checkout::ahead(&trunk.dir, &trunk.branch, &branch).is_empty() {
+                continue;
+            }
+            let tip = git(&trunk.dir, &["rev-parse", &spec])?;
+            return Some((tip.trim().to_string(), trunk.branch.clone()));
+        }
+    }
+    None
+}
+
 // ---- where a task sits in a run -----------------------------------------
 //
 // Membership rather than progress, and the routing step in front of

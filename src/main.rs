@@ -53,6 +53,7 @@ mod place;
 mod place_compound;
 mod place_herdr;
 mod place_super;
+mod repair;
 mod resolve;
 mod sharing;
 mod story;

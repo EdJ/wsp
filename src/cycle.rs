@@ -304,7 +304,13 @@ fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
 
 /// Everything the current group owes, taken in order. Returns what it started,
 /// for the log.
-fn step(store: &Store, w: &Worklist) -> Vec<String> {
+///
+/// **`pub(crate)` and not private since `wsp-147`**, because the daemon's tick
+/// takes these steps itself rather than starting a `wsp worklist advance` per
+/// list: one code path means the tick and the verb cannot come to disagree
+/// about what is owed, and the tick has to reach them without a process per
+/// running list every minute.
+pub(crate) fn step(store: &Store, w: &Worklist) -> Vec<String> {
     let mut started = Vec::new();
     let w = match store.worklist(&w.id) {
         Some(w) => w,
@@ -360,10 +366,7 @@ fn step(store: &Store, w: &Worklist) -> Vec<String> {
 
     // 3. The barrier, once every member is landed and every verdict is in.
     let tasks = store.tasks();
-    let verified = |id: &str| {
-        latest_verifier(&tasks, id).is_some_and(|v| matches!(v.status(), Status::Review | Status::Done))
-    };
-    if pos.at_barrier() && pos.members.iter().all(|s| verified(&s.id)) {
+    if pos.at_barrier() && pos.members.iter().all(|s| verified(&tasks, &s.id)) {
         if let Some(b) = open_barrier(store, &w, at, g) {
             if spawn(store, &b, &policy, Undo::Row) {
                 started.push(b);
@@ -458,13 +461,42 @@ fn latest_verifier<'a>(tasks: &'a [Task], member: &str) -> Option<&'a Task> {
         .max_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)))
 }
 
+/// Whether a member's latest verifier has recorded a verdict.
+///
+/// The predicate the barrier is gated on, and `wsp-147`'s third repair reads it
+/// to say *which* members the barrier is waiting on — a count is the question a
+/// reader has and cannot act on, a list of ids is both.
+pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
+    latest_verifier(tasks, member).is_some_and(|v| matches!(v.status(), Status::Review | Status::Done))
+}
+
 /// Create the verifier row for a member, if one is owed, and hand back its id.
 ///
 /// Owed when there is none, or when the last one blocked — found a problem —
-/// and the member has been touched since: that is the member coming back
-/// with a fix, and it is verified again by a fresh agent rather than by the
-/// one that already made up its mind.
+/// and **the member's work has moved since it was read**: that is the member
+/// coming back with a fix, and it is verified again by a fresh agent rather
+/// than by the one that already made up its mind.
+///
+/// # Keyed on the landing, not on `updated` (`wsp-136` item 1)
+///
+/// This compared `member.updated > v.updated`, and **any write moves
+/// `updated`** — a governor's `wsp note`, an edit to the overview, a `wsp mv`.
+/// So saying one sentence about a member bought a whole new verifier agent: a
+/// fresh context, a fresh read of the tree, and a verdict about code nobody had
+/// touched. Three lines of note was enough, and nothing said so.
+///
+/// The key is [`crate::repair::landed`] — the commit the member's own `## Log`
+/// records its work as landed on — read off the member when the verifier row
+/// is created and off the verifier when the question is asked again. A fix
+/// changes it; a note does not.
+///
+/// **A member with no landing recorded falls back to `updated`**, and that is
+/// deliberate rather than a gap: design-only work has no repository and never
+/// will, so it has no commit to key on, and a member whose fix is prose has
+/// genuinely changed when it is touched. The landing exists wherever there is
+/// somewhere to put it.
 fn open_verifier(store: &Store, member: &Task, list: &str, at: usize, g: &Group) -> Option<String> {
+    let now_landing = crate::repair::landed(member);
     let made = store.locked(|| {
         let tasks = store.tasks();
         let owed = match latest_verifier(&tasks, &member.id) {
@@ -472,7 +504,7 @@ fn open_verifier(store: &Store, member: &Task, list: &str, at: usize, g: &Group)
             Some(v) if v.status() == Status::Todo && wedged(v, &store.claims()) => {
                 return restart(store, v);
             }
-            Some(v) => v.status() == Status::Blocked && member.updated > v.updated,
+            Some(v) => v.status() == Status::Blocked && moved_since(&now_landing, &member.updated, v),
         };
         if !owed {
             return None;
@@ -484,11 +516,36 @@ fn open_verifier(store: &Store, member: &Task, list: &str, at: usize, g: &Group)
         t.tags = vec![VERIFY_TAG.to_string()];
         t.status_raw = Status::Todo.as_str().to_string();
         crate::model::set_section_in(&mut t.body, "Overview", &verifier_order(member, list, at, g, &id));
+        // The commit this verifier is being asked to read, on the verifier's
+        // own row: it is what the next comparison asks against, and it is what
+        // makes the key survive the member being edited.
+        if let Some(sha) = &now_landing {
+            t.log(&format!("{} {sha}", crate::repair::READING));
+        }
         store.save_task(&t).ok()?;
         Some(id)
     })?;
     store.git_commit(&format!("wsp: verify {} for {list} group {at}", member.id));
     Some(made)
+}
+
+/// Whether the member's work has moved since this verifier read it.
+///
+/// **The landing when the member records one, and `updated` when it does
+/// not.** Design-only work has no repository and never will, so there is no
+/// commit to compare and a member whose fix is prose has genuinely changed when
+/// it is touched — which is what the old predicate was right about, and the
+/// only case it was right about.
+///
+/// **Both sides need a landing.** A verifier created before `wsp land` wrote
+/// one records no commit, so there is nothing to compare against; the fallback
+/// is the old predicate rather than `true`, so the first landing after it does
+/// not itself buy a verifier for code that was never re-read.
+fn moved_since(now_landing: &Option<String>, member_updated: &str, verifier: &Task) -> bool {
+    match (now_landing, crate::repair::landed(verifier)) {
+        (Some(now), Some(then)) => now != &then,
+        _ => member_updated > verifier.updated.as_str(),
+    }
 }
 
 /// A row wsp made whose agent never arrived, taken again: touched, so a
@@ -508,18 +565,59 @@ fn barrier_title(list: &str, at: usize) -> String {
     format!("{BARRIER_TITLE}{list} group {at}")
 }
 
-/// Create the barrier row, if nobody has, and hand back its id.
+/// Whether a title is this group's barrier, whatever serial a re-check carries.
+///
+/// **A prefix test and not `==`, and the serial is why.** A held barrier is
+/// checked again by a fresh agent (`open_barrier` below), so a group can hold
+/// twice and its rows are then `Barrier: run group 2` and `Barrier: run group 2
+/// (recheck 2)`. Three readers used to compare the whole title — `open_barrier`
+/// finding the row to restart, `end_behind` finding the previous barrier's
+/// check, and [`list_of`] finding the run a barrier row belongs to — and each
+/// would quietly stop finding the re-check. Naming the serial once, here, is
+/// what keeps one spelling of the question.
+fn is_barrier(t: &Task, list: &str, at: usize) -> bool {
+    t.tags.iter().any(|g| g == BARRIER_TAG) && t.title.starts_with(&barrier_title(list, at))
+}
+
+/// Create the barrier row, if one is owed, and hand back its id.
+///
+/// # A held barrier is checked again (`wsp-136` item 2)
+///
+/// The row's title is the idempotence key, and for as long as the barrier has
+/// never been held that is exactly right: one row per group, and a second
+/// advance finds it. But a `hold` leaves that row **settled** — the barrier
+/// agent reviewed its own row and the group carries no verdict — so a resume
+/// found the old row, started nothing, and the run stood still with every
+/// member verified and nothing said.
+///
+/// So the key is the row **while it is open**, and a settled row is a barrier
+/// that has already had its one check: the resume is a new check, on a new row,
+/// with the number of prior checks in the title so a reader can tell which is
+/// which and so [`is_barrier`] still finds them all. The resumer's `go` does
+/// not pass the barrier itself; a fresh agent reads the group again, which is
+/// what the barrier is for.
+///
+/// A `todo` row nobody claimed is still retaken rather than superseded — that
+/// is a start that never arrived, not a check that finished.
 fn open_barrier(store: &Store, w: &Worklist, at: usize, g: &Group) -> Option<String> {
-    let title = barrier_title(&w.id, at);
     let project = g.members.iter().find_map(|m| store.find_task(m)).and_then(|t| t.project);
     let made = store.locked(|| {
         let tasks = store.tasks();
-        if let Some(b) = tasks.iter().find(|t| t.title == title && t.tags.iter().any(|g| g == BARRIER_TAG)) {
-            return match b.status() == Status::Todo && wedged(b, &store.claims()) {
-                true => restart(store, b),
-                false => None,
-            };
+        let mut prior: Vec<&Task> = tasks.iter().filter(|t| is_barrier(t, &w.id, at)).collect();
+        prior.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+        if let Some(b) = prior.last() {
+            // `review` or `done`: the agent that ran this check has finished it.
+            if !matches!(b.status(), Status::Review | Status::Done) {
+                return match b.status() == Status::Todo && wedged(b, &store.claims()) {
+                    true => restart(store, b).map(|id| (id, b.title.clone())),
+                    false => None,
+                };
+            }
         }
+        let title = match prior.len() {
+            0 => barrier_title(&w.id, at),
+            n => format!("{} (recheck {n})", barrier_title(&w.id, at)),
+        };
         let id = store.alloc_task_id(project.as_deref()).ok()?;
         let mut t = Task::new(&title, &id);
         t.project = project.clone();
@@ -527,10 +625,11 @@ fn open_barrier(store: &Store, w: &Worklist, at: usize, g: &Group) -> Option<Str
         t.status_raw = Status::Todo.as_str().to_string();
         crate::model::set_section_in(&mut t.body, "Overview", &barrier_order(w, at, g, &id));
         store.save_task(&t).ok()?;
-        Some(id)
+        Some((id, title))
     })?;
+    let (id, title) = made;
     store.git_commit(&format!("wsp: {title}"));
-    Some(made)
+    Some(id)
 }
 
 /// A verifier's work order, which is its row's overview: the brief every
@@ -674,16 +773,66 @@ fn end_behind(store: &Store, w: &Worklist, passed: usize) {
             .map(|t| t.id.clone()),
     );
     if passed > 1 {
-        let before = barrier_title(&w.id, passed - 1);
-        ids.extend(tasks.iter().filter(|t| t.title == before).map(|t| t.id.clone()));
+        // **Every row of the previous barrier, not the one with the bare
+        // title.** A group that held twice has two barrier rows (`wsp-136`
+        // item 2), and a re-check is an agent like any other — leaving the
+        // held one standing is exactly the leak this row exists to close.
+        ids.extend(tasks.iter().filter(|t| is_barrier(t, &w.id, passed - 1)).map(|t| t.id.clone()));
     }
+    end_all(store, ids);
+}
+
+/// End every row in `ids` that still holds a claim, through `wsp despawn`.
+///
+/// **Split out because the last pass needs it and `end_behind` cannot reach
+/// it.** The pass at the *end* of a run has no next pass, so `end_behind`'s
+/// "the previous barrier, ended at the next pass" has no second call to arrive
+/// at — and the last barrier's agent, the one whose `go` finished the run, was
+/// left holding a claim for ever (`wsp-136` item 3). Ending it from inside the
+/// `go` is not available either: that is the turn in which it reviews its own
+/// row. So it is ended on the tick *after* the run has nothing left to govern,
+/// which is [`crate::repair`]'s call and the only place where "the last barrier
+/// is finished" is knowable without cutting a turn short.
+///
+/// **The claim is the test, and `wsp despawn` is the whole ending**: agent,
+/// claim and tree, keeping the tree when it has uncommitted work in it, which
+/// it says in `cycle.log` rather than leaving silent.
+pub(crate) fn end_all(store: &Store, ids: Vec<String>) {
     let claims = store.claims();
     for id in ids.iter().filter(|id| claims.contains_key(*id)) {
         despawn(id);
     }
 }
 
-fn despawn(id: &str) {
+/// The barrier checks of a run that has nothing left in it, whose agents are
+/// still holding claims.
+///
+/// Called by the reconciler on every tick, and keyed on the claims rather than
+/// on a record, because there is nothing to write: an ended agent leaves no
+/// claim, so the second tick finds nothing and a tick while the run is still
+/// running finds no finished barrier. `wsp-136` item 3.
+pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<String> {
+    let pos = worklist::position(store, w, worklist::Reading::Settled);
+    if !pos.finished() {
+        return Vec::new();
+    }
+    let tasks = store.tasks();
+    let claims = store.claims();
+    let standing: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.tags.iter().any(|g| g == BARRIER_TAG))
+        .filter(|t| matches!(t.status(), Status::Review | Status::Done))
+        .filter(|t| list_of(store, t).map(|l| l.id == w.id).unwrap_or(false))
+        .filter(|t| claims.contains_key(&t.id))
+        .map(|t| t.id.clone())
+        .collect();
+    if !standing.is_empty() {
+        stamp(&format!("{}: the run has nothing left in it, and {} finished", w.id, standing.join(" ")));
+    }
+    standing
+}
+
+pub(crate) fn despawn(id: &str) {
     if cfg!(test) {
         #[cfg(test)]
         tests::ENDED.with(|s| s.borrow_mut().push(id.to_string()));
@@ -729,7 +878,7 @@ fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
 /// Now busy means later, and [`crate::wake::say`] is the only thing this calls:
 /// the words go in the seat's spool inside the lock, the same gate the daemon
 /// asks before typing, and it is cleared only when a turn comes of it.
-fn tell(store: &Store, w: &Worklist, text: &str) {
+pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
     if cfg!(test) {
         #[cfg(test)]
         tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
@@ -792,7 +941,11 @@ fn rotate(store: &Store, w: &Worklist) {
 }
 
 /// One dated line in `cycle.log`, which is this process's stdout.
-fn stamp(line: &str) {
+///
+/// **`pub(crate)` since `wsp-147`**: the reconciler logs through this rather
+/// than opening the file itself, so a repair's lines and the run steps' lines
+/// are in one file in one order with one format.
+pub(crate) fn stamp(line: &str) {
     if cfg!(test) {
         return;
     }
@@ -801,17 +954,21 @@ fn stamp(line: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
 
     thread_local! {
-        pub(super) static SPAWNED: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-        pub(super) static ENDED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        pub(super) static TOLD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        pub(super) static ROTATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        pub(crate) static SPAWNED: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+        pub(crate) static ENDED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        pub(crate) static TOLD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        pub(crate) static ROTATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).
+        /// Distinct from `TOLD`, which is the run's *governing* seat: a repair
+        /// tells both and they are answers to different questions.
+        pub(crate) static MEMBER_TOLD: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     }
 
     fn spawned() -> Vec<(String, String)> {
@@ -970,6 +1127,190 @@ mod tests {
         step(&store, &w);
         assert_eq!(tagged(&store, VERIFY_TAG).len(), 2, "the fix is verified again");
         let _ = spawned();
+    }
+
+    /// `wsp-136` item 1. A note on a member is somebody **saying** something
+    /// about it, and it used to buy a whole fresh verifier agent: a new
+    /// context, a new read of the tree, and a verdict about code nobody had
+    /// touched. Three lines of note was enough and nothing said so.
+    ///
+    /// The fix keys the re-verify on the commit the member's work is on. This
+    /// test runs both halves: a note changes nothing, a new landing does.
+    #[test]
+    fn a_note_on_a_member_does_not_buy_a_fresh_verifier_and_a_new_landing_does() {
+        let (_env, store) = scratch("note");
+        task(&store, "m-1", Status::Review);
+        let mut m = store.find_task("m-1").unwrap();
+        m.log(&format!("{} abc1234 on master", crate::repair::LANDED));
+        store.save_task(&m).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w);
+        let first = tagged(&store, VERIFY_TAG).remove(0);
+        assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "the first verifier, which read abc1234");
+        set(&store, &first.id, Status::Blocked);
+
+        step(&store, &w);
+        let mut m = store.find_task("m-1").unwrap();
+        m.log("the verifier is right about the second half");
+        m.touch();
+        store.save_task(&m).unwrap();
+        step(&store, &w);
+        assert_eq!(
+            tagged(&store, VERIFY_TAG).len(),
+            1,
+            "a note moved `updated` and nothing else: still the same work, still one verifier"
+        );
+
+        // The member comes back with a fix, which is a new commit on the trunk.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut m = store.find_task("m-1").unwrap();
+        m.log(&format!("{} def5678 on master", crate::repair::LANDED));
+        store.save_task(&m).unwrap();
+        step(&store, &w);
+        assert_eq!(
+            tagged(&store, VERIFY_TAG).len(),
+            2,
+            "a new landing is new work, and a fresh agent reads it"
+        );
+        let _ = spawned();
+    }
+
+    /// `wsp-136` item 2. A `hold` leaves the barrier row **settled** — the
+    /// agent reviewed its own row — and the title was the idempotence key, so a
+    /// resume found the old row, started nothing, and stood there: every member
+    /// landed and verified, with nothing said.
+    ///
+    /// The check is what the resumer's `go` is for, so a resume is a *new*
+    /// check on a new row. A row nobody claimed is still retaken rather than
+    /// superseded, which is the second half of this test.
+    #[test]
+    fn a_held_barrier_is_checked_again_on_a_resume_and_an_unclaimed_row_is_still_retaken() {
+        let (_env, store) = scratch("recheck");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w);
+        // A barrier opens on every member's *verdict*, so settle this one first
+        // — the group is otherwise still waiting on the verifier, not on the
+        // barrier, and this test is about the barrier.
+        set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
+        step(&store, &w);
+        assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "the first check");
+        let first = tagged(&store, BARRIER_TAG).remove(0);
+        let _ = spawned();
+        step(&store, &w);
+        assert!(spawned().is_empty(), "and one check is enough while it stands");
+
+        // Held: the agent holds and then reviews its own row.
+        set(&store, &first.id, Status::Review);
+        step(&store, &w);
+        let _ = spawned();
+        let second: Vec<Task> = tagged(&store, BARRIER_TAG).into_iter().filter(|t| t.id != first.id).collect();
+        assert_eq!(second.len(), 1, "a resume is a fresh check, not the old row");
+        assert!(
+            second[0].title.starts_with(&barrier_title("run", 1)) && second[0].title != first.title,
+            "and it says which check it is: {}",
+            second[0].title
+        );
+        assert_eq!(list_of(&store, &second[0]).map(|w| w.id), Some("run".into()), "and still finds its run");
+
+        // And once that one has held too, a third.
+        set(&store, &second[0].id, Status::Review);
+        step(&store, &w);
+        let _ = spawned();
+        assert_eq!(tagged(&store, BARRIER_TAG).len(), 3, "each hold is its own check");
+
+    }
+
+    /// The other half of that, and the reason the retake arm is still there: a
+    /// barrier row whose agent never arrived is **not** a check that finished.
+    /// Treating it as one would supersede a row whose agent might be a minute
+    /// out, and the run would accumulate barrier checks for a barrier nobody
+    /// read.
+    #[test]
+    fn a_barrier_row_whose_agent_never_arrived_is_retaken_rather_than_superseded() {
+        let (_env, store) = scratch("recheckwedge");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w);
+        set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
+        step(&store, &w);
+        let only = tagged(&store, BARRIER_TAG).remove(0);
+        let _ = spawned();
+        let mut b = store.find_task(&only.id).unwrap();
+        b.updated = "2026-01-01T00:00:00Z".into();
+        store.save_task(&b).unwrap();
+        step(&store, &w);
+        assert_eq!(
+            tagged(&store, BARRIER_TAG).len(),
+            1,
+            "the same row, started again — a start that never arrived is not a check that finished"
+        );
+        assert_eq!(spawned(), vec![(only.id, "claude".into())]);
+    }
+
+    /// `wsp-136` item 3. `end_behind` ends the check on the barrier *before* the
+    /// one just passed, so the check whose `go` finished the run was left
+    /// holding a claim for ever — there being no next pass to reach it from, and
+    /// no way to end it inside the `go` without cutting the turn in which it
+    /// reviews its own row.
+    ///
+    /// So the reconciler ends it on a tick, and only once the run has nothing
+    /// left to govern: ending a check while the run still has groups to come
+    /// would kill an agent that is about to be asked something.
+    #[test]
+    fn the_last_barriers_agent_is_ended_by_a_tick_once_the_run_has_nothing_left() {
+        use crate::repair::{Pass, Seats};
+        /// Nobody answers for any seat, which is a store with no backend — the
+        /// tick still has to end what the run is finished with.
+        struct Blind;
+        impl Seats for Blind {
+            fn state(&self, _seat: &str) -> Option<crate::place::State> {
+                None
+            }
+        }
+
+        let (_env, store) = scratch("lastbarrier");
+        task(&store, "m-1", Status::Review);
+        let mut w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w);
+        set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
+        step(&store, &w);
+        let check = tagged(&store, BARRIER_TAG).remove(0);
+        let _ = spawned();
+        set(&store, &check.id, Status::Review);
+        store.set_claim(&check.id, serde_json::json!({ "workspace": "w" }));
+
+        // The run is still standing at group 1, so nothing is ended: the check
+        // is not finished work, it is a barrier somebody may still pass.
+        let mut g = w.groups();
+        g[0].verdict = String::new();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert!(
+            tests::ENDED.with(|e| e.borrow().is_empty()),
+            "a barrier the run is still standing at is nobody's to end"
+        );
+
+        // With the verdict written the run has nothing left to govern.
+        let mut g = store.worklist("run").unwrap().groups();
+        g[0].verdict = "passed".into();
+        let mut w = store.worklist("run").unwrap();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert_eq!(
+            tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
+            vec![check.id.clone()],
+            "and the run's last barrier check is ended, which nothing else could reach"
+        );
+
+        // And once, because the claim is the record. `despawn` is stubbed
+        // above, so the release `wsp despawn` does is done here — it is the
+        // half of the ending the next tick keys on.
+        store.clear_claim(&check.id);
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert!(tests::ENDED.with(|e| e.borrow().is_empty()), "an ended agent leaves no claim to find");
     }
 
     /// Everything written before `wsp-134`, and a group somebody turned off,
