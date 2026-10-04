@@ -241,7 +241,7 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
     // Nothing new and nothing held is nothing to do. Said here rather than at
     // the caller because the caller visits every seat with a record, and a seat
     // at rest must not cost a store write every twenty seconds for ever.
-    if emits.is_empty() && load(store, &key).depth() == 0 {
+    if emits.is_empty() && owed_to_a_seat(store, &key) == 0 {
         return Report::at_rest();
     }
 
@@ -258,6 +258,11 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
         s
     });
 
+    // **`wsp-166`: a governor is typed decisions and nothing else.** What is
+    // withheld stays in the record, so `wsp watch --drain` still reads it and
+    // the logs still say it, and it is neither typed nor counted as owed.
+    spool.withhold_for_a_seat(store);
+
     // Nothing is offered as *hot*: everything this pass produced is already in
     // the spool by the line above, so the only question left is whether that
     // spool owes somebody a context read. `Stream::tick` answers it with the
@@ -265,9 +270,10 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
     // which is empty unless the sink took it.
     // Taken before the flush, because a flush empties the copy in hand and the
     // number is what says *everything up to here has gone*.
-    let watermark = Spool::watermark(&spool.held);
     let mut tell = Tell::new(store, scope);
-    let written = Stream::new(&spec, &mut tell).tick(at, &mut spool).len();
+    let sent: Vec<u64> =
+        Stream::new(&spec, &mut tell).tick(at, &mut spool).iter().map(|h| h.seq).collect();
+    let written = sent.len();
     // What is left is read out of the record *inside* the write that settles it,
     // rather than by a second read of `watches.json` after it: the pass asks
     // this question for every seat with anything held, every tick, and the
@@ -282,13 +288,16 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
         // it yet* — so it is stamped rather than cleared, and the stamp is what
         // stops the next tick typing it again. See the module docs.
         if written > 0 {
-            Spool::settle(rec, watermark);
+            Spool::settle_these(rec, &sent);
         } else if tell.typed {
             Spool::stamp_typed(rec, at);
         }
         let now = Spool::of_json(rec.get("spool").unwrap_or(&serde_json::Value::Null));
         stamp(rec, scope, delivered + written, tell.why, &now);
-        (now.depth(), tell.why)
+        // What is *owed* is what a seat would be typed, not everything held.
+        let mut owed = now.clone();
+        owed.withhold_for_a_seat(store);
+        (owed.depth(), tell.why)
     });
     Report { scope: scope.to_string(), settled: written, held: left, typed_at: tell.typed_at, why }
 }
@@ -713,6 +722,13 @@ fn record(store: &Store, key: &str) -> (usize, Value) {
     let rec = store.watches().get(key).cloned().unwrap_or(Value::Null);
     let n = rec.get("delivered").and_then(Value::as_u64).unwrap_or(0) as usize;
     (n, rec)
+}
+
+/// How many entries in this seat's spool it would be typed.
+fn owed_to_a_seat(store: &Store, key: &str) -> usize {
+    let mut spool = load(store, key);
+    spool.withhold_for_a_seat(store);
+    spool.depth()
 }
 
 fn load(store: &Store, key: &str) -> Spool {
@@ -1220,6 +1236,52 @@ mod tests {
         assert!(said[0].contains("wsp answer m-"), "and it says how to answer it: {}", said[0]);
         assert_eq!(spool_of(&store, "demo").depth(), 0, "a turn started, so both are delivered");
         assert_eq!(delivered_to(&store, "demo"), 2, "and the count says what the seat did, not what wsp sent");
+    }
+
+    /// **`wsp-166` point 2: a governor is typed decisions and nothing else.**
+    ///
+    /// A member at review inside a running list, a question that was answered, a
+    /// row handed to another seat — each was typed at a governor and each cost a
+    /// context read to learn nothing. They stay in the spool, so the drain and
+    /// the logs still have them; the seat hears the hold, and what is blocked.
+    #[test]
+    fn a_governor_is_typed_the_hold_and_the_blocked_and_not_what_a_run_or_an_answer_already_settled() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-decisions", State::Idle);
+        let mut w = crate::model::Worklist::new("run", "tonight's run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group {
+            members: vec!["wsp-146".into()],
+            ..crate::model::Group::default()
+        }]);
+        store.save_worklist(&w).unwrap();
+
+        let mut answered = emit(Kind::Unanswered, "demo", "wsp-146");
+        answered.edge = Edge::Down;
+        let mut handed = emit(Kind::Blocked, "demo", "wsp-146");
+        handed.edge = Edge::Left;
+        let now = util::epoch_secs();
+        wake(&store, &[emit(Kind::Review, "demo", "wsp-146"), answered, handed], now);
+
+        assert!(told_to(&fake).is_empty(), "a member's review, an answer and a hand-off type nothing: {:?}", told_to(&fake));
+        assert_eq!(spool_of(&store, "demo").depth(), 3, "and all three are still there for the drain");
+        assert_eq!(owed_to_a_seat(&store, &key_for("demo")), 0, "none of them is owed");
+
+        let held = say(&store, "demo", "group 1 is at its barrier — hold", None).expect("a seat");
+        assert!(held.arrived(), "the hold went: {held:?}");
+        let said = told_to(&fake);
+        assert_eq!(said.len(), 1, "one typing: {said:?}");
+        assert!(said[0].contains("hold"), "{}", said[0]);
+        assert!(!said[0].contains("review") && !said[0].contains("cleared"), "and nothing the run settled rode along: {}", said[0]);
+        assert_eq!(spool_of(&store, "demo").depth(), 3, "the withheld three outlive the typing");
+
+        // And a review outside any run is still the governor's own work.
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
+        wake(&store, &[emit(Kind::Review, "demo", "loose-1"), emit(Kind::Blocked, "demo", "wsp-146")], now + 1);
+        let said = told_to(&fake);
+        assert_eq!(said.len(), 2, "one more typing: {said:?}");
+        assert!(said[1].contains("loose-1") && said[1].contains("blocked"), "{}", said[1]);
     }
 
     /// **A type that starts no turn is still owed, and it is not typed again.**

@@ -787,6 +787,26 @@ impl Spooled {
         }
     }
 
+    /// **`wsp-166`: whether a *governor seat* is to be typed this one.** A
+    /// narrower question than [`Spooled::wakes`], asked only on the daemon's
+    /// path to an agent; a person's panel and a bare watch keep the table.
+    ///
+    /// The seat brief promises a governor three things — a member or verifier
+    /// blocked, a barrier held, a barrier passed — plus the questions and flags
+    /// sent to it, and the last three arrive as messages, which always count.
+    /// What the table wakes beyond that and is not a decision: a `review` of a
+    /// member whose list is running, which is the run's business and its
+    /// barrier will judge it anyway. Down and moved edges are already `Spool`
+    /// in the table; this is what stops them riding along typed.
+    pub(crate) fn is_a_decision(&self, running: &crate::worklist::Running) -> bool {
+        match &self.line {
+            Some(Line::News(e)) if e.signal.kind == Kind::Review => {
+                self.wakes() && running.list_of(&e.signal.subject).is_none()
+            }
+            _ => self.wakes(),
+        }
+    }
+
     /// Whether the table judged this one worth a context read.
     ///
     /// An entry this build cannot read counts as one: the safe half of an
@@ -891,6 +911,35 @@ impl Spool {
         if let Some(o) = rec.as_object_mut() {
             o.insert("spool".into(), spool.json());
         }
+    }
+
+    /// Remove these entries by identity and nothing else — what a delivery that
+    /// typed only *some* of what is held clears, where [`Spool::settle`]'s
+    /// watermark would take the withheld ones lower down with it.
+    pub(crate) fn settle_these(rec: &mut Value, seqs: &[u64]) {
+        if !rec.is_object() {
+            *rec = json!({});
+        }
+        let mut spool = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        spool.held.retain(|h| !seqs.contains(&h.seq));
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("spool".into(), spool.json());
+        }
+    }
+
+    /// Take out of this spool what a governor seat is not to be typed, and hand
+    /// it back. See [`Spooled::is_a_decision`].
+    pub(crate) fn withhold_for_a_seat(&mut self, store: &Store) -> Vec<Spooled> {
+        // Read only when something here asks it: nearly every tick has no
+        // `review` in its spool, and a list read is a directory walk.
+        let running = match self.held.iter().any(|h| matches!(&h.line, Some(Line::News(e)) if e.signal.kind == Kind::Review)) {
+            true => crate::worklist::Running::read(store),
+            false => crate::worklist::Running::default(),
+        };
+        let (typed, withheld): (Vec<Spooled>, Vec<Spooled>) =
+            self.held.drain(..).partition(|h| h.is_a_decision(&running));
+        self.held = typed;
+        withheld
     }
 
     /// The highest identity in a batch, which is what [`Spool::settle`] takes.
