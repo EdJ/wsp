@@ -561,9 +561,8 @@ fn told_once(store: &Store, id: &str, said: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::cycle::tests::{ENDED, MEMBER_TOLD, ROTATED, SPAWNED, TOLD};
+    use crate::cycle::tests::{ENDED, MEMBER_TOLD, SPAWNED, TOLD};
     use crate::model::{Group, WorklistStatus};
-    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -1002,7 +1001,6 @@ pub(crate) mod tests {
             "{:?}",
             stamped()
         );
-        let _ = ROTATED.with(|r| r.borrow_mut().clear());
     }
 
 // ---- the whole thing, end to end ------------------------------------

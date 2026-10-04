@@ -179,17 +179,18 @@ impl Fleet {
             return raw;
         }
         let session = compound.session_of(&Seat::new(seat));
-        if session.is_empty() {
-            return raw;
-        }
-        let Some(finished) = crate::agent_commands::opencode_finished_at(&session) else { return raw };
-        if !crate::agent_commands::opencode_settled(&session, util::epoch_secs()) {
+        let finished = (!session.is_empty())
+            .then(|| crate::agent_commands::opencode_finished_at(&session))
+            .flatten();
+        let read = overrule(raw, finished, util::epoch_secs());
+        if read == raw {
             return raw;
         }
         stamp(&format!(
-            "{seat}: the screen says working and opencode finished this session at {finished} — reading it idle"
+            "{seat}: the screen says working and opencode finished this session at {} — reading it idle",
+            finished.unwrap_or_default()
         ));
-        State::Idle
+        read
     }
 }
 
@@ -200,8 +201,10 @@ impl Fleet {
 /// "we do not know"** rather than "still working". That distinction is the whole
 /// safety of the repair: a reader that treated an unreadable database as a
 /// running turn would be right, and one that treated it as a finished one would
-/// end agents on a machine where opencode simply could not be asked.
-fn overrule(raw: State, finished: Option<i64>, at: i64) -> State {
+/// end agents on a machine where opencode simply could not be asked. Every other
+/// state is returned as it was read, because a screen has been seen to lie in
+/// one direction only.
+pub(crate) fn overrule(raw: State, finished: Option<i64>, at: i64) -> State {
     match (raw, finished) {
         (State::Working, Some(f)) if f + crate::agent_commands::SETTLED_AFTER <= at => State::Idle,
         _ => raw,

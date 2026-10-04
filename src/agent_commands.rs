@@ -1622,30 +1622,21 @@ fn opencode_rows(session: &str) -> Option<Vec<Value>> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
-/// Whether an opencode session has said for long enough that a screen still
-/// reading `Working` is a frozen screen rather than a turn in flight.
-///
-/// **Sixty seconds, and the threshold is not arbitrary.** A turn that has just
-/// ended leaves the screen reading `Working` for as long as the TUI takes to
-/// repaint, which is normally under a second; a session that finished longer
-/// ago than that and is *still* reading `Working` is a seat whose screen has
-/// stopped telling us anything. Without a threshold this would contradict the
-/// screen on every turn boundary, and a reader that overrides its most direct
-/// witness on every tick is a reader nobody would believe.
-///
-/// **`at` is a parameter, not `now`.** The test drives this across the
-/// threshold without waiting a minute for it, which is the same bargain
-/// [`crate::repair::Pass::due`] makes.
-pub fn opencode_settled(session: &str, at: i64) -> bool {
-    opencode_finished_at(session).is_some_and(|finished| finished + SETTLED_AFTER <= at)
-}
-
 /// How long a completed turn has to have been over before a screen still
-/// reading `Working` is overruled. See [`opencode_settled`].
+/// reading `Working` is overruled, in seconds.
 ///
-/// **`pub(crate)` so the decision itself can be tested** without an opencode, a
-/// database and a frozen TUI: [`crate::repair::overrule`] is the same
-/// comparison, and this is the number it compares against.
+/// **The threshold is not arbitrary.** A turn that has just ended leaves the
+/// screen reading `Working` for as long as the TUI takes to repaint, which is
+/// normally under a second; a session that finished longer ago than that and is
+/// *still* reading `Working` is a seat whose screen has stopped telling us
+/// anything. Without a threshold the reader contradicts the screen on every turn
+/// boundary, and one that overrides its most direct witness on every tick is a
+/// reader nobody would believe.
+///
+/// **It lives here and the comparison lives in [`crate::cycle::overrule`],
+/// which is what makes both testable**: a test can cross the threshold in
+/// microseconds against a supplied clock and no opencode, a database or a
+/// frozen TUI, which is the same bargain [`crate::repair::Pass::due`] makes.
 pub(crate) const SETTLED_AFTER: i64 = 60;
 
 /// Claude Code.
@@ -3903,16 +3894,29 @@ mod tests {
     #[test]
     fn a_turn_that_just_ended_has_not_settled_and_a_seat_reading_working_stays_working() {
         let finished = 1_800_000_000;
-        assert!(
-            !opencode_settled_at(Some(finished), finished + SETTLED_AFTER - 1),
+        assert_eq!(
+            crate::cycle::overrule(
+                crate::place::State::Working,
+                Some(finished),
+                finished + SETTLED_AFTER - 1
+            ),
+            crate::place::State::Working,
             "a second short of the threshold is a turn that just ended"
         );
-        assert!(opencode_settled_at(Some(finished), finished + SETTLED_AFTER), "and a minute on, it has");
-        assert!(!opencode_settled_at(None, i64::MAX), "an unreadable database settles nothing");
-    }
-
-    fn opencode_settled_at(finished: Option<i64>, at: i64) -> bool {
-        finished.is_some_and(|f| f + SETTLED_AFTER <= at)
+        assert_eq!(
+            crate::cycle::overrule(
+                crate::place::State::Working,
+                Some(finished),
+                finished + SETTLED_AFTER
+            ),
+            crate::place::State::Idle,
+            "and a minute on, it has"
+        );
+        assert_eq!(
+            crate::cycle::overrule(crate::place::State::Working, None, i64::MAX),
+            crate::place::State::Working,
+            "an unreadable database settles nothing, however long we wait"
+        );
     }
 
     /// opencode's export, as opencode 1.18.21 writes it — the fields this
