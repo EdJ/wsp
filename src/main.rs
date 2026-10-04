@@ -1053,7 +1053,8 @@ fn main() {
         "block" => cmd_task::block(&store, &args),
         "park" | "pause" => cmd_task::park(&store, &args),
         "review" => cmd_task::review(&store, &args),
-        "reopen" | "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
+        "reopen" => cmd_task::reopen(&store, &args),
+        "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
         "tag" => cmd_task::tag(&store, &args),
         "ref" => cmd_task::reference(&store, &args),
@@ -1514,7 +1515,11 @@ fn help_text() -> String {
                                     the last few entries and says how many
                                     earlier ones it did not print; --log for
                                     all of them
-  wsp start|review|reopen <id>      move through the workflow
+  wsp start|review <id>           move through the workflow
+  wsp reopen|todo <id> "what is owed"
+                                send work back: moves the row, tells
+                                its pane, and stops the run reading it as
+                                finished (`todo` sets the status and takes no prose)
   wsp done <id> [--force]           complete; --force over open sub-tasks
   wsp block <id> "reason"           stop it: somebody owes you an answer
   wsp park <id> "reason"            not yet, deliberately — say what brings

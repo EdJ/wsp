@@ -1051,6 +1051,107 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     })
 }
 
+/// `wsp reopen <id> "what is owed"` — sending work back, as one act.
+///
+/// **Sending work back and reopening the row were two acts, and only one of
+/// them moved the run.** `wsp-142` again, from the other side: on 2026-10-04 a
+/// member landed and reviewed, its verifier found the work wanted installing
+/// and driving live, the governor `wsp tell`'d it that — and a tell does not
+/// touch status. So the row stayed at `review`, every member read as settled,
+/// and `cycle.rs` opened a barrier at 16:51 with cpd-244 still holding work
+/// outstanding.
+///
+/// **The predicate was already right.** `Standing::finished` reads
+/// `settled()`, so a member back at `doing` holds the group and `at_barrier`
+/// would have been false. The governor could have prevented all of it with
+/// this verb. What was missing is that the verb did not exist and sending work
+/// back was a thing you typed into a pane — a conversation, which may be a
+/// question, a thanks, or a status change, and nothing downstream can tell the
+/// difference.
+///
+/// **A reason is required, not optional.** It goes on the row, and it is the
+/// sentence delivered to the member's pane. A reopen with no reason would put
+/// work back into a group with nothing to act on and nothing to read at the
+/// other end — which is the state this verb exists to end.
+///
+/// **Not this row:** inferring a reopen from a bare `wsp tell`. The row's own
+/// decision stands, and it is the right one: a status change has to be stated,
+/// because a tell is prose and prose is ambiguous.
+pub fn reopen(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "wsp reopen <id> \"what is owed\"   (or `-` to read it from stdin)";
+    let (reason, _) = match prose_payload(args, USAGE) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let code = mutate_saying(store, args, "reopen", Some(&reason), |t| {
+        t.set_status(Status::Doing);
+        t.log(&format!("sent back: {}", reason.trim()));
+    });
+    if code == 0 {
+        deliver_the_reason(store, args, reason.trim());
+    }
+    code
+}
+
+/// Put the reason in the member's own pane, through the one delivery path.
+///
+/// **A refusal is said, not hidden, and does not undo the move.** The row is at
+/// `doing` now whatever the pane can take — that is the record the run reads,
+/// and leaving it at `review` because a sentence would not type is the failure
+/// this verb was filed for. So the move stands, the reason is on the row, and
+/// the governor is told the pane did not get it.
+///
+/// `wsp tell` is run as a process rather than called, because its refusals are
+/// the answer worth having — "it is stopped on a prompt only a person can
+/// answer", "it cannot say whether it is at a prompt" — and reimplementing them
+/// here would be a second answer that could disagree with the verb an agent
+/// would otherwise have run.
+fn deliver_the_reason(store: &Store, args: &Args, reason: &str) {
+    let Some(needle) = args.rest.first().cloned() else { return };
+    let Some(id) = store.task(&needle).map(|t| t.id) else { return };
+    // Nothing to tell: a row nobody is holding has no pane, and saying so
+    // would be noise on every reopen of finished work.
+    if store.panes_for_task(&id).is_empty() {
+        return;
+    }
+    if cfg!(test) {
+        #[cfg(test)]
+        crate::cycle::tests::MEMBER_TOLD.with(|t| {
+            t.borrow_mut().push((id.clone(), format!("sent back: {reason}")))
+        });
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut child = match std::process::Command::new(exe)
+        .args(["tell", &id, "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            crate::cycle::stamp(&format!("tell {id}: could not run `wsp tell` ({e})"));
+            return;
+        }
+    };
+    if let Some(mut to) = child.stdin.take() {
+        use std::io::Write;
+        let _ = writeln!(to, "wsp sent {id} back: {reason}");
+    }
+    let said = match child.wait_with_output() {
+        Ok(o) if o.status.success() => "it has the sentence".to_string(),
+        Ok(o) => format!("not delivered — {}", util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)),
+        Err(e) => format!("not delivered — {e}"),
+    };
+    crate::cycle::stamp(&format!("tell {id}: {said}"));
+    if said.starts_with("not delivered") {
+        crate::cycle::stamp(&format!(
+            "{id} is at doing with the reason on its row, but its pane did not get it — `wsp tell {id} --anyway -` retries"
+        ));
+    }
+}
+
 /// Reads its prose the same way `note` does — see [`payload_source`].
 ///
 /// The reason a block wants a stream is not length, it is that the sentence is
@@ -3627,5 +3728,61 @@ mod tests {
     fn text_before_the_first_bullet_is_an_entry_of_its_own() {
         let log = "a line somebody wrote without a bullet\n- 2026-08-19 filed\n";
         assert_eq!(log_entries(log).len(), 2, "counted, so `--log` is what prints it");
+    }
+
+    /// `wsp-163`, and the whole of it in one verb. Sending work back and moving
+    /// the row were two acts, and a `wsp tell` is the one nobody remembers: the
+    /// member landed, its verifier was told to install and drive delivery live,
+    /// the row stayed at `review`, and the run read the group as finished and
+    /// opened a barrier over outstanding work.
+    #[test]
+    fn sending_work_back_moves_the_row_records_the_reason_and_tells_the_pane() {
+        let store = scratch("reopenverb");
+        let mut t = Task::new("m-1", "m-1");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+
+        let args = Args::synth("reopen", &["m-1", "install and drive delivery live"], &[]);
+        assert_eq!(reopen(&store, &args), 0);
+
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Doing, "the row moved, which is what the run reads");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("install and drive delivery live"), "{log}");
+        let told = crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(told.len(), 1, "and the reason reached the pane: {told:?}");
+        assert_eq!(told[0].0, "m-1");
+        assert!(told[0].1.contains("install and drive delivery live"), "{}", told[0].1);
+    }
+
+    /// A reopen with no reason would put work back into a group with nothing to
+    /// act on and nothing to read at the other end — which is the state this
+    /// verb exists to end. It is refused rather than defaulted.
+    #[test]
+    fn sending_work_back_with_no_reason_is_refused_and_moves_nothing() {
+        let store = scratch("reopennoreason");
+        let mut t = Task::new("m-1", "m-1");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+
+        let args = Args::synth("reopen", &["m-1"], &[]);
+        assert_eq!(reopen(&store, &args), 2, "usage, and the row is where it was");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Review);
+    }
+
+    /// A row nobody is holding has no pane, and saying so on every reopen of
+    /// finished work would be noise.
+    #[test]
+    fn a_reopen_of_a_row_with_no_pane_moves_the_row_and_says_nothing_to_anyone() {
+        let store = scratch("reopennopane");
+        let mut t = Task::new("m-1", "m-1");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+
+        let args = Args::synth("reopen", &["m-1", "not finished after all"], &[]);
+        assert_eq!(reopen(&store, &args), 0);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
+        assert!(crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow().is_empty()));
     }
 }

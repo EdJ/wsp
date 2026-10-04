@@ -559,7 +559,11 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              is blocked on, write the direction an arriving agent needs and no more, and keep \
              decisions and corrections on the rows rather than in this conversation. Do not \
              review, rebase, test or land yourself; if that is needed, `wsp spawn` an agent for \
-             it. `wsp flag --seat` is your inbox, and `wsp ask <id> \"...\"` is how anything reaches \
+             it. Sending work back is `wsp reopen <id> \"what is owed\"`, which moves the row, \
+             tells that agent's pane and stops the run reading the group as finished; a plain \
+             `wsp tell <id>` is a conversation and moves nothing, so use it for a question or a \
+             correction and `wsp reopen` when the answer is more work. \
+             `wsp flag --seat` is your inbox, and `wsp ask <id> \"...\"` is how anything reaches \
              you: answer one with `wsp answer <id> \"...\"`, which closes the question and \
              lands on the asker's row. You coordinate rather than authorise, so \
              nothing waits on your permission. Say what you are doing with `wsp say`, and when \

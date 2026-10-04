@@ -490,10 +490,128 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
             }
         }
     }
+    // 3a. And the one `wsp-164`'s gate cannot reach: **a barrier that already
+    // opened**, before the member was sent back. `wsp-163` found the gap — a
+    // governor `wsp tell`ed its verifier to install and drive delivery live, the
+    // row stayed at `review` because a tell does not touch status, and the
+    // barrier opened over work still outstanding. `wsp reopen` makes the send
+    // back one act, and this is the other half of it: a check that is already
+    // reading a group must be told that the group changed under it.
+    //
+    // **Told, not stopped.** The barrier agent is not killed and its row is not
+    // moved — it is mid-check and the run owns that turn. `wsp worklist go`
+    // refuses while a member holds, so the race cannot be lost; what this
+    // prevents is the check *finishing* on a group it was not given.
+    sent_back_holding(store, &w, at, g);
     if !started.is_empty() {
         stamp(&format!("{} group {at}: started {}", w.id, started.join(" ")));
     }
     started
+}
+
+/// The open barrier check of a group with a member that is no longer settled,
+/// told what changed. `wsp-163`.
+///
+/// **Only a check an agent actually holds** — `doing` or `blocked`, not `todo`
+/// and not settled. A check still sitting at `todo` was never given the group,
+/// so it starts with the group as it stands and there is nothing to correct; a
+/// `todo` row that has been wedged long enough gets taken again a moment later
+/// and reads the group then. And only a member at `doing` or worse: one at
+/// `review` or `done` is settled and holds nothing.
+fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
+    let tasks = store.tasks();
+    let Some(check) = tasks
+        .iter()
+        .filter(|t| is_barrier(t, &w.id, at))
+        .filter(|t| matches!(t.status(), Status::Doing | Status::Blocked))
+        .max_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)))
+    else {
+        return;
+    };
+    let holding: Vec<Task> = tasks
+        .iter()
+        .filter(|t| g.members.contains(&t.id))
+        .filter(|t| !matches!(t.status(), Status::Review | Status::Done))
+        .cloned()
+        .collect();
+    if holding.is_empty() {
+        return;
+    }
+    let names: Vec<String> = holding
+        .iter()
+        .map(|t| {
+            let why = t
+                .section("Log")
+                .and_then(|l| l.lines().filter(|l| l.contains(SENT_BACK)).last().map(|x| x.to_string()))
+                .map(|l| l.split(SENT_BACK).nth(1).unwrap_or_default().trim().to_string())
+                .unwrap_or_default();
+            if why.is_empty() {
+                t.id.clone()
+            } else {
+                format!("{} ({})", t.id, util::truncate(&why, 80))
+            }
+        })
+        .collect();
+    stamp(&format!(
+        "{} group {at}: {} was opened before {} was sent back — the check is told",
+        w.id,
+        check.id,
+        names.join(", ")
+    ));
+    tell_barrier(w, &check.id, &names);
+}
+
+/// The marker a reopened row carries, so the check can be told what changed
+/// rather than only that something did. `wsp-163`.
+pub(crate) const SENT_BACK: &str = "sent back:";
+
+/// Say to a barrier check's own pane that its group moved under it.
+///
+/// **`wsp tell` run as a process, for [`crate::cmd_task::reopen`]'s reason**:
+/// its refusals are the answer worth having, and a second implementation here
+/// would be a second answer that could disagree with the verb.
+fn tell_barrier(w: &Worklist, check: &str, members: &[String]) {
+    let text = format!(
+        "The {} run sent {} back after your barrier check {} opened, so the group is not the one you \
+         were given. Read `wsp worklist next {}` again before deciding, and if it already holds, \
+         `wsp worklist hold {} \"what has to happen\"`.",
+        w.id,
+        members.join(" and "),
+        check,
+        w.id,
+        w.id
+    );
+    if cfg!(test) {
+        #[cfg(test)]
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text)));
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut child = match std::process::Command::new(exe)
+        .args(["tell", check, "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            stamp(&format!("tell {check}: could not run `wsp tell` ({e})"));
+            return;
+        }
+    };
+    if let Some(mut to) = child.stdin.take() {
+        use std::io::Write;
+        let _ = writeln!(to, "{text}");
+    }
+    match child.wait_with_output() {
+        Ok(o) if o.status.success() => stamp(&format!("told {check}: the group moved under it")),
+        Ok(o) => stamp(&format!(
+            "told {check}: not delivered — {}",
+            util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
+        )),
+        Err(e) => stamp(&format!("told {check}: not delivered — {e}")),
+    }
 }
 
 /// How long a member may read `working` with its group otherwise finished
@@ -1572,6 +1690,106 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&t).unwrap();
     }
 
+    /// `wsp-163`, item 2. **A reopen before the barrier opens** stops the barrier:
+    /// `Standing::finished` reads `settled()`, so a member back at `doing` holds
+    /// the group and `at_barrier` is false — the predicate was already right,
+    /// which is why the governor could have prevented the whole thing with
+    /// `wsp reopen`.
+    #[test]
+    fn a_member_reopened_before_the_barrier_opens_stops_it_being_opened() {
+        let (_env, store) = scratch("reopenbefore");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        let _ = spawned();
+
+        // Sent back after its verdict was in, before the barrier opened.
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Doing);
+        t.log("sent back: install and drive delivery live");
+        store.save_task(&t).unwrap();
+
+        step(&store, &w, &Blind);
+        assert!(tagged(&store, BARRIER_TAG).is_empty(), "no barrier over a member holding work");
+    }
+
+    /// `wsp-163`, item 2, second half. **A reopen after the barrier opened**
+    /// cannot un-open it — the check is mid-turn and the run owns that — so the
+    /// check is *told* what changed, in `cycle.log` and on its own pane. `wsp
+    /// worklist go` refuses while a member holds, so the race cannot be lost;
+    /// what this prevents is the check finishing on a group it was not given.
+    #[test]
+    fn a_member_reopened_after_the_barrier_opened_tells_the_check_which_member_and_why() {
+        let (_env, store) = scratch("reopenafter");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        step(&store, &w, &Blind);
+        let check = tagged(&store, BARRIER_TAG).remove(0);
+        let _ = spawned();
+        // Its agent has claimed it, which is what `todo` → `doing` records: the
+        // check is mid-read, and a group that changes now is a group it was not
+        // given.
+        set(&store, &check.id, Status::Doing);
+
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Doing);
+        t.log("sent back: install and drive delivery live");
+        store.save_task(&t).unwrap();
+
+        step(&store, &w, &Blind);
+        assert!(
+            drained(&SAID).iter().any(|l| l.contains(&check.id) && l.contains("sent back")),
+            "the log names the check and says the group changed under it"
+        );
+        let told = MEMBER_TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0].0, check.id, "the check's own seat, not the governor's");
+        assert!(told[0].1.contains("m-1"), "{}", told[0].1);
+        assert!(
+            told[0].1.contains("install and drive delivery live"),
+            "and what is owed, so it can read the row or not: {}",
+            told[0].1
+        );
+
+    }
+
+    /// The other side of that, and the reason the check is only told when it is
+    /// open: a check still sitting at `todo` was never given the group, so it
+    /// starts with the group as it stands and there is nothing to correct.
+    #[test]
+    fn a_check_that_has_not_started_is_not_told_about_a_reopen() {
+        let (_env, store) = scratch("reopentodo");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        let _ = spawned();
+        // Written by hand rather than by a step, because the reopen stops the
+        // barrier from opening — which is the point being tested on the other
+        // side of it.
+        let mut pending = Task::new(&barrier_title("run", 1), "b-1");
+        pending.tags = vec![BARRIER_TAG.into()];
+        pending.set_status(Status::Todo);
+        store.save_task(&pending).unwrap();
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        assert!(
+            !MEMBER_TOLD.with(|t| t.borrow().iter().any(|(id, _)| *id == pending.id)),
+            "a check that has not started reads the group as it stands"
+        );
+    }
+
     /// `wsp-136` item 1. A note on a member is somebody **saying** something
     /// about it, and it used to buy a whole fresh verifier agent: a new
     /// context, a new read of the tree, and a verdict about code nobody had
@@ -1711,6 +1929,10 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         let check = tagged(&store, BARRIER_TAG).remove(0);
         let _ = spawned();
+        // Its agent has claimed it, which is what `todo` → `doing` records: the
+        // check is mid-read, and a group that changes now is a group it was not
+        // given.
+        set(&store, &check.id, Status::Doing);
         set(&store, &check.id, Status::Review);
         store.set_claim(&check.id, serde_json::json!({ "workspace": "w" }));
 

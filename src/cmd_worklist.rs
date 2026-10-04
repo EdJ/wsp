@@ -2716,7 +2716,55 @@ pub fn go(store: &Store, args: &Args) -> i32 {
         // wrong and wants to know where it is, which is what `next` says. No
         // evidence block here: no barrier is shut, so no group stands behind
         // one to have touched anything — `next` is where that is read.
-        println!("{}", Paint::new().dim("no barrier is shut — nothing to pass"));
+        //
+        // **Except when a member is what is holding it.** `wsp-163`: a
+        // governor told a member's pane that more was owed, the row moved to
+        // `doing`, and the barrier it had already opened went on reading as shut
+        // — so `go` refused, correctly, with a sentence that named nothing and
+        // read as "you already did this". `at_barrier` was the right predicate
+        // all along; the message is what did not say so. A barrier that has
+        // already opened is named here too, because that is the case where the
+        // governor most needs to know a check is running on a group that moved.
+        let held: Vec<&Standing> = pos.holding();
+        if held.is_empty() {
+            println!("{}", Paint::new().dim("no barrier is shut — nothing to pass"));
+        } else {
+            println!(
+                "{}",
+                Paint::new().yellow(&format!(
+                    "nothing to pass: {} is still holding group {}",
+                    held.iter().map(|s| format!("{} ({})", s.id, s.settlement.word())).collect::<Vec<_>>().join(", "),
+                    pos.at.unwrap_or(1)
+                ))
+            );
+            for s in &held {
+                println!("  {}  {}", s.id, Paint::new().dim(&s.note()));
+            }
+            if let Some(at) = pos.at {
+                let tasks = store.tasks();
+                let open: Vec<&str> = tasks
+                    .iter()
+                    .filter(|t| t.title.starts_with(&format!("Barrier: {} group {at}", w.id)))
+                    .filter(|t| matches!(t.status(), crate::model::Status::Doing))
+                    .map(|t| t.id.as_str())
+                    .collect();
+                if !open.is_empty() {
+                    println!(
+                        "  {}",
+                        Paint::new().dim(&format!(
+                            "{} opened before this — its agent has been told what changed",
+                            open.join(" ")
+                        ))
+                    );
+                }
+            }
+            println!(
+                "{}",
+                Paint::new().dim(&format!(
+                    "`wsp reopen <id> \"what is owed\"` is how work is sent back; it moves the row and tells the pane"
+                ))
+            );
+        }
         report(&w, &pos, &st, &worklist::dangling(store, &w), seat, None);
         return 0;
     }
