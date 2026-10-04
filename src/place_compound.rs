@@ -643,6 +643,20 @@ impl Compound<'_> {
         self.vitals_osc_title(seat).and_then(|t| title_state(&kind, &t))
     }
 
+    /// The session id on this seat's record, for a reader that has a question
+    /// the screen cannot answer.
+    ///
+    /// **`pub(crate)` because `wsp-160`'s override lives in the reconciler
+    /// rather than here**, and the argument is worth leaving written down:
+    /// [`Self::detected_state`] is called from `survey`, `wsp wip` and a panel
+    /// at 250ms, so an override in it would run `opencode db` on every one of
+    /// those. The reconciler runs it once a minute, on one seat at a time, and
+    /// can say what it did in `cycle.log` — which a function returning a
+    /// `State` cannot.
+    pub(crate) fn session_of(&self, seat: &Seat) -> String {
+        str_of(&self.said(seat), "session_id")
+    }
+
     /// Shells to `compound-render state <render-socket> <kind>` —
     /// `compound-109`'s verb, wrapping the ported half of herdr's
     /// agent-detection engine — exactly as [`Compound::read_screen`] shells

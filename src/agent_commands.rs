@@ -1521,6 +1521,133 @@ fn read_export(src: &[u8], since: i64) -> Option<Ran> {
     Some(ran)
 }
 
+/// When an opencode session last finished a turn, in seconds — `wsp-160`.
+///
+/// opencode's TUI stopped painting at the end of a turn on 2026-10-04, leaving
+/// a seat frozen on its busy frame while the session itself was long done:
+/// `time.completed` set on the last assistant message, `exiting loop` in the
+/// log, the process idle in kevent with no thread blocked on a write. Since a
+/// compound-hosted opencode fires **none** of the hooks `Compound::heard`
+/// listens for, that seat's `state()` is entirely `detected_state` over the
+/// screen — so a frozen frame reads `Working` for ever. Everything downstream
+/// believed it: `wsp tell` refused ("cannot say whether it is at a prompt"),
+/// anything held for idle waited indefinitely, and the run saw no landing.
+///
+/// So the session's own database is the second witness, and it is a good one:
+/// opencode writes every message there whether or not its TUI is painting.
+/// `Some` is "the last assistant message completed at this many seconds"; `None`
+/// is **we do not know**, and is never read as "still working" — see
+/// [`finished`].
+///
+/// **`opencode db` and not a sqlite crate.** `serde_json` is the whole of this
+/// tree's dependency list and it stays that way, and opencode ships the reader:
+/// `opencode db <query> --format json` prints rows as JSON, so the query is
+/// `select` over the `message` table with `json_extract` on the `data` column
+/// rather than a schema this repository has to know the shape of.
+///
+/// **The id is checked before it reaches a command line**, for
+/// [`export`]'s reason: it arrives from a claim, which the agent behind it
+/// wrote. opencode spells a session id `ses_` and alphanumerics; anything else
+/// is refused before a shell is anywhere near it.
+pub fn opencode_finished_at(session: &str) -> Option<i64> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rows = opencode_rows(session)?;
+    newest_finished(&rows)
+}
+
+/// The rows [`opencode_finished_at`] reads, in opencode's own spelling — the
+/// `message` table's three columns extracted out of its JSON `data`, newest
+/// first, with the session id already bound.
+///
+/// **A parameter and not built inside, so the whole rule is testable against a
+/// hand-written table.** The query is the only part that needs an opencode, and
+/// it is a string; everything that decides what those rows *mean* is here, where
+/// a test can drive the cases that matter — a session still streaming, one the
+/// user has just typed into, one that finished — without a database anywhere.
+fn newest_finished(rows: &[Value]) -> Option<i64> {
+    // Newest first, and **both roles**, because "completed" is only a question
+    // about the *last* message. A session whose newest message is a user turn
+    // has work outstanding; one whose newest is a completed assistant turn does
+    // not. Asking for the assistant's last completion alone would answer yes for
+    // a session the user has just typed into — which on a frozen screen is the
+    // difference between a repair and an outage.
+    let newest = rows.first()?;
+    if newest.get("role")?.as_str()? != "assistant" {
+        return None;
+    }
+    // A completion never stamped is a turn in flight: opencode leaves
+    // `time.completed` null while a message streams, and a part still running
+    // is the same fact one level down.
+    let completed = newest.get("completed").and_then(Value::as_i64)?;
+    if rows
+        .get(1)
+        .and_then(|prev| prev.get("created").and_then(Value::as_i64))
+        .is_some_and(|prev| prev > completed)
+    {
+        return None;
+    }
+    // Milliseconds in the database, seconds in the store — opencode's own unit
+    // boundary, and `read_export` makes the same crossing.
+    Some(completed / 1_000)
+}
+
+/// `opencode db`'s rows for one session, newest first.
+///
+/// **`opencode db` and not a sqlite crate.** `serde_json` is the whole of this
+/// tree's dependency list and it stays that way, and opencode ships the reader:
+/// `opencode db <query> --format json` prints rows as JSON, so the query is
+/// `select` over the `message` table with `json_extract` on the `data` column
+/// rather than a schema this repository has to be right about.
+fn opencode_rows(session: &str) -> Option<Vec<Value>> {
+    let out = Command::new(opencode_bin())
+        .args([
+            "db",
+            &format!(
+                "select json_extract(data,'$.role') as role, \
+                 json_extract(data,'$.time.created') as created, \
+                 json_extract(data,'$.time.completed') as completed \
+                 from message where session_id = '{session}' order by time_created desc limit 2"
+            ),
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Whether an opencode session has said for long enough that a screen still
+/// reading `Working` is a frozen screen rather than a turn in flight.
+///
+/// **Sixty seconds, and the threshold is not arbitrary.** A turn that has just
+/// ended leaves the screen reading `Working` for as long as the TUI takes to
+/// repaint, which is normally under a second; a session that finished longer
+/// ago than that and is *still* reading `Working` is a seat whose screen has
+/// stopped telling us anything. Without a threshold this would contradict the
+/// screen on every turn boundary, and a reader that overrides its most direct
+/// witness on every tick is a reader nobody would believe.
+///
+/// **`at` is a parameter, not `now`.** The test drives this across the
+/// threshold without waiting a minute for it, which is the same bargain
+/// [`crate::repair::Pass::due`] makes.
+pub fn opencode_settled(session: &str, at: i64) -> bool {
+    opencode_finished_at(session).is_some_and(|finished| finished + SETTLED_AFTER <= at)
+}
+
+/// How long a completed turn has to have been over before a screen still
+/// reading `Working` is overruled. See [`opencode_settled`].
+///
+/// **`pub(crate)` so the decision itself can be tested** without an opencode, a
+/// database and a frozen TUI: [`crate::repair::overrule`] is the same
+/// comparison, and this is the number it compares against.
+pub(crate) const SETTLED_AFTER: i64 = 60;
+
 /// Claude Code.
 pub struct Claude;
 
@@ -3721,6 +3848,71 @@ mod tests {
         )
         .expect("undated is not undone");
         assert_eq!(ran.turns, 1);
+    }
+
+    /// `wsp-160`'s half of the reading, driven against a hand-written table
+    /// rather than a live opencode: the rule is "the newest message is an
+    /// assistant turn and it completed", and every case below is one where
+    /// getting it wrong is an outage or a false alarm.
+    ///
+    /// The `time.completed` values are the real ones from a live session
+    /// (2026-10-04), which is why they are in milliseconds: a reader that
+    /// divided them would answer "finished in 1970" and quietly overrule every
+    /// seat.
+    #[test]
+    fn an_opencode_session_is_finished_only_when_its_newest_message_is_a_completed_assistant_turn() {
+        let rows = |json: &str| -> Vec<Value> { serde_json::from_str(json).unwrap() };
+        let at = |ms: i64| serde_json::json!({ "role": "assistant", "created": ms, "completed": ms + 20_000 });
+
+        assert_eq!(
+            newest_finished(&rows(&format!("[{}]", at(1_790_977_430_173)))),
+            Some(1_790_977_450),
+            "a completed assistant turn: the session is done"
+        );
+        assert_eq!(
+            newest_finished(&rows(r#"[{"role":"assistant","created":1790977450000}]"#)),
+            None,
+            "no completion stamped is a turn still streaming — `time.completed` is null while a message runs"
+        );
+        assert_eq!(
+            newest_finished(&rows(r#"[{"role":"user","created":1790977460000,"completed":null}]"#)),
+            None,
+            "a user turn is the newest message: work is outstanding, however long ago the assistant finished"
+        );
+        assert_eq!(
+            newest_finished(&rows(r#"[{"role":"assistant","created":1,"completed":null}]"#)),
+            None,
+            "an empty session, which is what a database that could not be read looks like"
+        );
+        assert_eq!(
+            newest_finished(&rows(&format!("[{},{}]", at(1_790_977_430_173), at(1_790_977_380_000)))),
+            Some(1_790_977_450),
+            "two completed turns, the newer one wins"
+        );
+        assert_eq!(
+            newest_finished(&[]),
+            None,
+            "a session opencode has never heard of"
+        );
+    }
+
+    /// The threshold is what keeps this from contradicting the screen on every
+    /// turn boundary. A turn that ended a moment ago still reads `working`, and
+    /// a reader that overruled its most direct witness on every tick is a reader
+    /// nobody would believe.
+    #[test]
+    fn a_turn_that_just_ended_has_not_settled_and_a_seat_reading_working_stays_working() {
+        let finished = 1_800_000_000;
+        assert!(
+            !opencode_settled_at(Some(finished), finished + SETTLED_AFTER - 1),
+            "a second short of the threshold is a turn that just ended"
+        );
+        assert!(opencode_settled_at(Some(finished), finished + SETTLED_AFTER), "and a minute on, it has");
+        assert!(!opencode_settled_at(None, i64::MAX), "an unreadable database settles nothing");
+    }
+
+    fn opencode_settled_at(finished: Option<i64>, at: i64) -> bool {
+        finished.is_some_and(|f| f + SETTLED_AFTER <= at)
     }
 
     /// opencode's export, as opencode 1.18.21 writes it — the fields this

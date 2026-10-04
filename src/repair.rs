@@ -108,17 +108,89 @@ pub(crate) trait Seats {
     fn state(&self, seat: &str) -> Option<State>;
 }
 
-/// The real reading, over the backends wsp can spawn onto.
+/// The real reading, over the backends wsp can spawn onto — with opencode's
+/// own database overruling a screen that has stopped repainting. `wsp-160`.
 ///
 /// Herdr first because it watches a pty and can answer about *now*;
 /// `Refusal::NoSeat` is its "not mine", so a compound seat falls through to the
 /// second. One list, from [`crate::cmd_spawn`], rather than a second copy here.
+///
+/// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
+/// and the argument is the cost: that function is called from `survey`, from
+/// `wsp wip`, and from a panel four times a second, and the overrule shells to
+/// `opencode db`. A reader that fires it on every call would run a process per
+/// opencode seat per panel frame. The reconciler runs it once a minute, on the
+/// seats it is already asking about, and can say in `cycle.log` that it did —
+/// which is what `wsp-160` asks for ("log the repair beside it") and what a
+/// function returning a [`State`] has nowhere to put.
 pub(crate) struct Fleet;
 
 impl Seats for Fleet {
     fn state(&self, seat: &str) -> Option<State> {
-        let seat = Seat::new(seat);
-        crate::cmd_spawn::local_backends().iter().find_map(|b| b.state(&seat).ok())
+        let seat_id = Seat::new(seat);
+        let compound = crate::place_compound::Compound::new();
+        let raw = crate::cmd_spawn::local_backends().iter().find_map(|b| b.state(&seat_id).ok())?;
+        Some(self.overrule_frozen_opencode(&compound, seat, raw))
+    }
+}
+
+impl Fleet {
+    /// A compound opencode seat reading `Working` that opencode's own database
+    /// says finished with, more than a minute ago.
+    ///
+    /// **Only that one state, and only for opencode.** The frozen screen has
+    /// been seen to lie in exactly one direction — `working` for ever, on a
+    /// busy frame it never repainted — and `idle` is the safe direction to be
+    /// wrong in: a seat wrongly called idle gets a sentence typed at it, and a
+    /// seat wrongly called working waits for ever.
+    ///
+    /// **A live turn still reads `working`,** which is the half of the test that
+    /// keeps this honest: `opencode_settled` requires a *completed* turn older
+    /// than the threshold, so a session mid-stream is untouched whatever the
+    /// screen says.
+    ///
+    /// Said every pass rather than once per seat, and that is deliberate here
+    /// where it is not for the others: the repair is the reconciler's *finding*,
+    /// and a governor reading `cycle.log` after a frozen seat has been sitting
+    /// there for an hour wants to see it said for the whole hour. It costs one
+    /// line a minute on a seat that is broken, which is nothing against a run
+    /// that has stalled on it.
+    fn overrule_frozen_opencode(
+        &self,
+        compound: &crate::place_compound::Compound,
+        seat: &str,
+        raw: State,
+    ) -> State {
+        if raw != State::Working {
+            return raw;
+        }
+        let session = compound.session_of(&Seat::new(seat));
+        if session.is_empty() {
+            return raw;
+        }
+        let Some(finished) = crate::agent_commands::opencode_finished_at(&session) else { return raw };
+        if !crate::agent_commands::opencode_settled(&session, util::epoch_secs()) {
+            return raw;
+        }
+        stamp(&format!(
+            "{seat}: the screen says working and opencode finished this session at {finished} — reading it idle"
+        ));
+        State::Idle
+    }
+}
+
+/// The half of [`Fleet::overrule_frozen_opencode`] that decides, split out so a
+/// test can drive it without an opencode, a database and a frozen TUI.
+///
+/// **`finished` is the session's last completed turn in seconds, and `None` is
+/// "we do not know"** rather than "still working". That distinction is the whole
+/// safety of the repair: a reader that treated an unreadable database as a
+/// running turn would be right, and one that treated it as a finished one would
+/// end agents on a machine where opencode simply could not be asked.
+fn overrule(raw: State, finished: Option<i64>, at: i64) -> State {
+    match (raw, finished) {
+        (State::Working, Some(f)) if f + crate::agent_commands::SETTLED_AFTER <= at => State::Idle,
+        _ => raw,
     }
 }
 
@@ -859,6 +931,52 @@ pub(crate) mod tests {
 
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())]);
+    }
+
+    // ---- 5. a screen that has stopped telling the truth (wsp-160) --------
+
+    /// An opencode seat whose TUI stopped painting at the end of a turn reads
+    /// `working` for ever, and since opencode fires none of the hooks compound
+    /// listens for that screen is its *only* source. So every downstream
+    /// reading believed it: `wsp tell` refused, anything held for idle waited
+    /// for ever, and the run saw no landing.
+    ///
+    /// A completed turn the database knows about and the screen does not is
+    /// `idle`, and the repair says so in `cycle.log` beside the rest.
+    #[test]
+    fn a_frozen_opencode_screen_is_overruled_by_the_database() {
+        let now = 1_800_000_000;
+        let ago = now - crate::agent_commands::SETTLED_AFTER - 1;
+        assert_eq!(
+            overrule(State::Working, Some(ago), now),
+            State::Idle,
+            "the screen says working and the session finished a minute ago: a frozen screen"
+        );
+        // And the frozen screen is the only thing overruled: an agent genuinely
+        // mid-turn must read `working`.
+        assert_eq!(
+            overrule(State::Working, Some(now - 5), now),
+            State::Working,
+            "a turn that finished five seconds ago is a turn that just ended, not a frozen screen"
+        );
+        assert_eq!(
+            overrule(State::Working, None, now),
+            State::Working,
+            "a database that could not be read is not a finished session — overrule on a guess is how this would break a live run"
+        );
+    }
+
+    /// Every other state is left exactly as the screen read it. The repair has
+    /// been seen to lie in one direction only, and `idle` is the safe direction
+    /// to be wrong in: a seat wrongly called idle has a sentence typed at it,
+    /// and a seat wrongly called working waits for ever.
+    #[test]
+    fn only_a_working_screen_is_ever_overruled() {
+        let now = 1_800_000_000;
+        let long = now - crate::agent_commands::SETTLED_AFTER - 1;
+        for read in [State::Idle, State::Starting, State::Blocked, State::Empty, State::Gone, State::Unknown] {
+            assert_eq!(overrule(read, Some(long), now), read, "{read:?} is not this repair's to overrule");
+        }
     }
 
     // ---- 2. a start that never claimed ------------------------------------
