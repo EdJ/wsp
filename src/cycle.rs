@@ -934,8 +934,23 @@ fn barrier_title(list: &str, at: usize) -> String {
 /// check, and [`list_of`] finding the run a barrier row belongs to — and each
 /// would quietly stop finding the re-check. Naming the serial once, here, is
 /// what keeps one spelling of the question.
-fn is_barrier(t: &Task, list: &str, at: usize) -> bool {
-    t.tags.iter().any(|g| g == BARRIER_TAG) && t.title.starts_with(&barrier_title(list, at))
+pub(crate) fn is_barrier(t: &Task, list: &str, at: usize) -> bool {
+    if !t.tags.iter().any(|g| g == BARRIER_TAG) {
+        return false;
+    }
+    let title = barrier_title(list, at);
+    // **The exact title, or the exact title and a serial.** A bare
+    // `starts_with` answers true for "Barrier: run group 11" when asked about
+    // group 1, because "group 1" is a prefix of "group 11" — found by wsp-167,
+    // and unreachable today only because the run walks its groups in order. It
+    // would bite the first eleven-group list, in `open_barrier` (which would
+    // find group 11's check as group 1's), in `end_group` (which would end
+    // group 11's check when group 1 passes) and in `sent_back_holding`.
+    //
+    // The serial is the only thing a re-check's title carries, and it is
+    // written by this module — so the whole set of spellings a barrier row can
+    // have is the one word here.
+    t.title == title || t.title.starts_with(&format!("{title} (recheck"))
 }
 
 /// Create the barrier row, if one is owed, and hand back its id.
@@ -1997,6 +2012,32 @@ fn only_a_working_screen_is_ever_overruled() {
             !MEMBER_TOLD.with(|t| t.borrow().iter().any(|(id, _)| *id == pending.id)),
             "a check that has not started reads the group as it stands"
         );
+    }
+
+    /// A barrier row of one group is not a barrier row of another, whatever the
+    /// ordinals look like. Found by `wsp-167`: `starts_with` answered true for
+    /// "Barrier: run group 11" when asked about group 1, and three callers
+    /// would have believed it.
+    #[test]
+    fn a_barrier_of_one_group_is_never_a_barrier_of_another() {
+        for (list, at, title, want) in [
+            ("run", 1, "Barrier: run group 1", true),
+            ("run", 1, "Barrier: run group 1 (recheck 2)", true),
+            ("run", 1, "Barrier: run group 11", false),
+            ("run", 11, "Barrier: run group 11", true),
+            ("run", 11, "Barrier: run group 1", false),
+            ("run", 1, "Barrier: other group 1", false),
+            ("run", 2, "Barrier: run group 2 (recheck 3)", true),
+            ("run", 1, "Barrier: run group 1 reviewed", false),
+        ] {
+            let mut t = Task::new(title, "b-1");
+            t.tags = vec![BARRIER_TAG.into()];
+            assert_eq!(is_barrier(&t, list, at), want, "{title:?} at group {at} of {list}");
+        }
+        // And an untagged row with the right title is not a barrier: the tag is
+        // what a reader finds it by, and a task someone happened to name that.
+        let mut t = Task::new("Barrier: run group 1", "b-1");
+        assert!(!is_barrier(&t, "run", 1), "the title alone is not a barrier");
     }
 
     /// `wsp-158` item 1, and the commonest of the four leaks. A verifier's turn

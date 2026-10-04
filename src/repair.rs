@@ -448,26 +448,26 @@ pub(crate) fn landed(t: &Task) -> Option<String> {
 
 // ---- a member `advance` skipped ------------------------------------------
 
-/// Every member of the current group that is settled and got nothing started
-/// for it, and why.
+/// Tell the seat about every member of the current group that is settled and
+/// got nothing started for it.
 ///
 /// `wsp-142`: the member went to `review`, `advance` ran, spawned no verifier
-/// and **wrote nothing**, so `worklist next` read `somewhere it did not record`
+/// and **said nothing**, so `worklist next` read `somewhere it did not record`
 /// and the governor went looking for the cause in the wrong record. The stall
 /// was real; the silence was the defect.
 ///
-/// **Every pass, not once.** A line written only on the first pass is a line
-/// easy to miss above a busy log, which is the same failure with better
-/// manners. This cannot grow without bound either: the run's own steps resolve
-/// what it describes, so a member that lands gets its verifier on the next
-/// pass and stops being reported.
+/// **The log line is not written here.** [`crate::cycle::step`] already stamps
+/// it — `unlanded`, with the same reading and the same clock — and a second
+/// writer for one fact doubles a line per member per minute in the file a
+/// governor reads to find out what the run is doing. That was a finding on
+/// `wsp-167` and it is right: the log half of this repair existed before it,
+/// and only the **seat** half is new. The barrier's own no-op below has no such
+/// twin in `step`, so it does log.
 ///
-/// Only where a member is *waiting*. A member at `doing` with a live agent is
-/// not a no-op and gets no line, or `cycle.log` would carry a line per member
-/// per minute for a run that is working.
-/// Only where a member is *waiting*. A member at `doing` with a live agent is
-/// not a no-op and gets no line, or `cycle.log` would carry a line per member
-/// per minute for a run that is working.
+/// **Told once per reason, and the reason is on the member's row.** A governor
+/// told "it has not landed" ten minutes ago and told nothing since has learned
+/// that something changed; a governor told the same sentence every minute has
+/// learned nothing and paid a context read for it.
 ///
 /// **Stamped every pass, told once per reason.** The two differ deliberately.
 /// `cycle.log` is how a governor reads what the run has been doing, and a
@@ -966,8 +966,14 @@ pub(crate) mod tests {
         landed_member(&env, &store, true);
 
         tick(&store, &Fake::empty(), &mut Pass::new());
-        let lines = stamped();
-        assert!(lines.iter().any(|l| l.contains("m-1 is at review and nothing was started for it")), "{lines:?}");
+        // The line in `cycle.log` comes from `cycle::step`, which already said
+        // this before the reconciler existed; what is asserted here is that the
+        // *seat* is told, once.
+        assert!(
+            stamped().iter().any(|l| l.contains("m-1 is at review with 1 commit not on master")),
+            "the log half is `cycle`'s, not a second writer here: {:?}",
+            stamped()
+        );
         let gov = governed();
         assert_eq!(gov.len(), 1, "and told: {gov:?}");
         assert!(gov[0].contains("wsp land m-1"), "{}", gov[0]);
@@ -976,7 +982,7 @@ pub(crate) mod tests {
         // queue an agent reads with a whole context behind it.
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert!(
-            stamped().iter().any(|l| l.contains("nothing was started for it")),
+            stamped().iter().any(|l| l.contains("m-1 is at review with 1 commit not on master")),
             "the log says it on every pass: a member still waiting has not stopped waiting"
         );
         assert!(governed().is_empty(), "and the seat is not handed the same sentence twice");

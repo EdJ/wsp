@@ -2744,7 +2744,7 @@ pub fn go(store: &Store, args: &Args) -> i32 {
                 let tasks = store.tasks();
                 let open: Vec<&str> = tasks
                     .iter()
-                    .filter(|t| t.title.starts_with(&format!("Barrier: {} group {at}", w.id)))
+                    .filter(|t| crate::cycle::is_barrier(t, &w.id, at))
                     .filter(|t| matches!(t.status(), crate::model::Status::Doing))
                     .map(|t| t.id.as_str())
                     .collect();
