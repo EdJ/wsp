@@ -344,6 +344,17 @@ pub(crate) struct Briefing {
     /// This process's directory, contracted. herdr reports the shell's, which
     /// is stale the moment anyone `cd`s.
     pub cwd: Option<String>,
+    /// The machine's daemon, when it has none — [`crate::daemon::loud`]'s one
+    /// sentence, read here because `compose` is pure over this struct and the
+    /// `ps` it costs does not belong in a function that draws.
+    ///
+    /// Drawn on the **seat** line and nowhere else (`wsp-145`). The brief is
+    /// re-read on every request of every session, so an ordinary agent must
+    /// still pay nothing for a fact that never concerns it — and a seat is the
+    /// one reader for whom "nothing is going to wake me" is a fact about its
+    /// own job. Six days of a dead daemon on a machine that looked busy are
+    /// what this is for; see [`crate::launchd`].
+    pub daemon: Option<String>,
 }
 
 /// Where a brief is *for*, when that is not where the process is.
@@ -417,6 +428,7 @@ impl Briefing {
             // absolute or already contracted, and `own_tree` expands whatever
             // is here before asking whether it is a checkout.
             cwd: seat.cwd.map(|c| util::contract(&util::expand(c))),
+            daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered()),
             world,
         }
     }
@@ -463,6 +475,7 @@ impl Briefing {
             incoming,
             ending_failed,
             cwd: std::env::current_dir().ok().map(|c| util::contract(&c)),
+            daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered()),
             world,
         }
     }
@@ -557,6 +570,10 @@ pub(crate) struct Brief {
     /// the whole state of the thing it is holding. `None` when the seat is on a
     /// project, which is every seat until a list is running.
     pub seat_at: Option<crate::worklist::Position>,
+
+    /// The machine's daemon, when it has none — see [`Briefing::daemon`], which
+    /// is where the argument for reading it is.
+    pub daemon: Option<String>,
 
     /// The pane this pane replaced, while the handover record that names both
     /// is still standing: from the successor's seat opening until wsp has ended
@@ -824,6 +841,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
             (s, mine)
         }),
         list: mine.and_then(|t| b.lists.of(&t.id)).cloned(),
+        daemon: b.daemon.clone(),
         seat_at: b.seat_at.clone(),
         custodian,
         succeeding: b.incoming.as_ref().map(|(_, from)| from.clone()),
@@ -1158,6 +1176,15 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     // workspace holds, where the seat line can only name the nearest, which for
     // an agent answering for `wsp` while standing in `robustness` is the wrong
     // half of its job.
+    //
+    // And, on the same line and only on it, whether anything on this machine is
+    // going to wake this seat. `wsp-145`: a governor's job is mostly waiting to
+    // be handed something, and the thing that hands it something is a daemon
+    // that had stopped six days earlier while every reading of the machine went
+    // on saying it was busy. An ordinary agent is told nothing — this line
+    // draws only under a seat, and the brief is re-read on every request of
+    // every session.
+    let awake = r.daemon.as_ref().map(|d| format!("  {}", p.yellow(d)));
     if let Some(scope) = &r.custodian {
         // A seat on a worklist says where the run is, because for the agent
         // holding it that *is* the position: which group is being waited on is
@@ -1172,25 +1199,32 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             "seat",
             match &at {
                 Some(at) => format!(
-                    "{}  {}  {}",
+                    "{}  {}  {}{}",
                     p.bold(&format!("governor of {scope}")),
                     p.dim(at),
                     p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
+                    awake.clone().unwrap_or_default(),
                 ),
                 None => format!(
-                    "{}  {}",
+                    "{}  {}{}",
                     p.bold(&format!("governor of {scope}")),
                     p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
+                    awake.clone().unwrap_or_default(),
                 ),
             },
         );
     } else if let Some((s, mine)) = &r.seat {
         row(
             "seat",
-            match mine {
-                true => format!("{}  {}", p.bold(&s.scope), p.dim("yours — wsp flag --seat is your inbox")),
-                false => format!("{}  {}", p.bold(&s.scope), p.dim("coordinating here · wsp flag <id> reaches it")),
-            },
+            format!(
+                "{}  {}{}",
+                p.bold(&s.scope),
+                match mine {
+                    true => p.dim("yours — wsp flag --seat is your inbox"),
+                    false => p.dim("coordinating here · wsp flag <id> reaches it"),
+                },
+                awake.unwrap_or_default(),
+            ),
         );
     }
 
@@ -1538,6 +1572,7 @@ mod tests {
             // measured against.
             lists: crate::worklist::Running::default(),
             seat_at: None,
+            daemon: None,
             // Nobody coordinating. The ordinary state, and the baseline the
             // seat tests below add a seat to: the brief has to be identical
             // without one.
@@ -1636,6 +1671,51 @@ mod tests {
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("governor of batch"), "{text}");
         assert!(!text.contains("group"), "{text}");
+    }
+
+    /// `wsp-145`. A governor's job is mostly waiting to be handed something, and
+    /// what hands it something is the daemon's unattended pass — which had been
+    /// gone for six days while every reading of the machine said it was busy,
+    /// and which nothing on this output said. On the seat line, because a seat
+    /// is the one reader for whom it is a fact about its own job.
+    ///
+    /// And *only* on the seat line: the brief is re-read on every request of
+    /// every session, so an ordinary agent must still pay nothing for a fact
+    /// that never concerns it. Both halves are asserted, because a change that
+    /// drew it everywhere would be just as wrong as one that drew it nowhere.
+    #[test]
+    fn a_seat_is_told_when_nothing_on_this_machine_is_going_to_wake_it() {
+        let dead = crate::daemon::loud(Some(&[]), true).expect("a machine with a backend and no daemon");
+
+        let mut b = briefing();
+        b.daemon = Some(dead.clone());
+        let mut r = compose(&b);
+
+        // A custodian, which is the reading whose seat line is the longest, so
+        // it is where an appended clause is most likely to be dropped.
+        r.custodian = Some("batch".into());
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("no wsp daemon"), "the custodian's seat line lost it: {text}");
+        assert!(
+            text.contains("yours to sequence, direct, review"),
+            "the clause was put on instead of beside: {text}"
+        );
+
+        // A seat above this pane rather than holding the slot itself.
+        r.custodian = None;
+        b.governors.insert("wsp".into(), json!({ "workspace": "w9", "host": util::hostname() }));
+        let r = compose(&b);
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("no wsp daemon"), "the seat line above this pane lost it: {text}");
+
+        // And an ordinary agent — no seat anywhere above it — is told nothing.
+        let mut plain_b = briefing();
+        plain_b.governors.clear();
+        plain_b.daemon = Some(dead);
+        let r = compose(&plain_b);
+        assert!(r.seat.is_none() && r.custodian.is_none(), "the fixture has a seat on it");
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(!text.contains("no wsp daemon"), "an ordinary agent is paying for a seat\'s fact: {text}");
     }
 
     /// And when there is one, it is one line naming the project rather than the
@@ -1909,6 +1989,7 @@ mod tests {
             },
             mandate: None,
             lists: crate::worklist::Running::default(),
+            daemon: None,
             seat_at: None,
             governors: std::collections::BTreeMap::new(),
             rules: None,

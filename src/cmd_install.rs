@@ -10,7 +10,17 @@
 //! -m 755` ran second, and the agent whose work it reverted goes on believing
 //! its change is in, which is how five hours went on 2026-08-16.
 //!
-//! Three things, in the order they matter:
+//! Four things, in the order they matter, and the fourth is newer than the
+//! other three:
+//!
+//! - **The daemon is covered.** The copy installs a *binary*; nothing told the
+//!   machine to run the daemon that uses it. That used to be herdr's
+//!   `[[startup]]`, so the daemon's lifetime was tied to a terminal emulator's,
+//!   and when herdr stopped being on this machine the daemon stopped with it —
+//!   silently, because nothing in wsp said *why* the unattended pass had
+//!   stopped. `wsp install` now writes and loads a launchd user agent; see
+//!   [`crate::launchd`] for the plist and [`launcher`] for the four ways it
+//!   declines to.
 //!
 //! - **The copy is exclusive.** A lock beside the destination, taken across the
 //!   copy and nothing else. `Store::locked` gives up after two seconds and
@@ -1097,16 +1107,26 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     }
 
     if same {
+        if !json_out {
+            println!("{} {}", p.green("✓"), "already live — byte for byte what you built");
+        }
+        let agent = launcher(store, &dst, dry, json_out, &p);
         if json_out {
             println!(
                 "{}",
                 json!({"ok": true, "installed": false, "reason": "already live",
                        "source": util::contract(&src), "dest": util::contract(&dst),
-                       "commit": ours.commit, "commit_from": ours.commit_from()})
+                       "commit": ours.commit, "commit_from": ours.commit_from(),
+                       "daemon": agent})
             );
-        } else {
-            println!("{} {}", p.green("✓"), "already live — byte for byte what you built");
         }
+        // The daemon is loaded even when the copy was a no-op. `wsp install`
+        // now means *this machine is covered*, and the two halves fail
+        // separately: a binary that is already live on a machine nobody ever ran
+        // `wsp install` on is the state this task was filed about, and it is
+        // byte-for-byte identical to the state where the daemon is loaded. So
+        // the launcher runs on this path too, and "already live" is not a
+        // reason to skip the other half of the verb.
         return 0;
     }
 
@@ -1137,6 +1157,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     }
 
     if dry {
+        let agent = launcher(store, &dst, true, json_out, &p);
         if json_out {
             println!(
                 "{}",
@@ -1145,6 +1166,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                        "commit": ours.commit, "commit_from": ours.commit_from(),
                        "dirty": ours.dirty, "dirty_files": ours.dirty_files,
                        "stale": ours.left_behind(),
+                       "daemon": agent,
                        "lock": holder(&lock_path(&dst)).map(|h| h.line())})
             );
         } else {
@@ -1215,6 +1237,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
     drop(lock);
 
     if json_out {
+        let agent = launcher(store, &dst, false, true, &p);
         println!(
             "{}",
             json!({
@@ -1229,6 +1252,7 @@ pub fn install(store: &Store, args: &Args) -> i32 {
                 "bytes": size,
                 "who": rec.who,
                 "why": why,
+                "daemon": agent,
                 // The same answer the printed line gives, for the reader that
                 // is a script. Absent from neither: a caller parsing this is
                 // exactly the caller that will not see a yellow line go past.
@@ -1256,7 +1280,91 @@ pub fn install(store: &Store, args: &Args) -> i32 {
         p.dim("panels, detail panes and the daemon re-exec into it within a tick — `wsp peek` to look at one")
     );
     keeps_the_old_one(store, &ours, &p);
+    launcher(store, &dst, false, json_out, &p);
     0
+}
+
+/// Write and load the launchd agent that keeps `wsp daemon` alive.
+///
+/// **A second job this verb does not have a flag for**, and every choice below
+/// follows from that. `wsp-145` replaced herdr's `[[startup]]` — a machine whose
+/// herdr had gone had no daemon at all, silently, for a week — and an install is
+/// the one moment on this machine where somebody has said out loud that what is
+/// on disk is what they want running. A flag would make the half that matters
+/// optional, and the failure it prevents is invisible: `wsp watch --status`
+/// reading `ticked 6d23h ago` is the symptom, and a week of wake spools holding
+/// is what it costs.
+///
+/// Four guards, each for a way the obvious thing is wrong:
+///
+/// - **Not a sandbox.** `WSP_HOME`/`WSP_STATE` make a complete wsp instance and
+///   nothing else; the daemon this would start would be pointed at the live
+///   store and the live herdr, and would sync and reap against both. Same
+///   refusal as the copy above it, same reason, and it is the same check
+///   `crate::launchd::sandboxed` makes for everything else that must not reach
+///   out of one.
+/// - **Only the real destination.** `--to` exists so this command can be
+///   exercised without replacing the binary every live pane is running, and an
+///   install of a test binary must not also take over the machine's daemon.
+/// - **Never fails the install.** The binary is already on disk and every pane
+///   has re-exec'd into it whatever launchd does. A launchctl that will not
+///   answer is a note under a `✓`, not a red line over a good install.
+/// - **Nothing when there is nothing to do.** A plist already byte-for-byte
+///   what this machine wants, with the job already loaded, is left alone — and
+///   not merely for tidiness: the `launchctl` verb that would "refresh" it waits
+///   out the job's `ThrottleInterval` first, which is half a minute of an
+///   install standing still. See [`crate::launchd`]'s header.
+///
+/// Returns what happened for `--json` to fold into its one body, and prints
+/// nothing under `--json` for the same reason every other `--json` on this verb
+/// is a single object: a second one on the same stdout breaks every reader.
+fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::util::Paint) -> Value {
+    let nothing = json!({"installed": false, "reason": "not this machine's daemon"});
+    if dst != default_dest() || crate::launchd::sandboxed() {
+        return nothing;
+    }
+    let path = crate::launchd::plist_path();
+    let var = crate::launchd::path_for(std::env::var_os("PATH").as_deref());
+    let change = match crate::launchd::plan(&crate::launchd::plist(dst, &store.state, &var), &path) {
+        crate::launchd::Plan::Unchanged => "unchanged",
+        crate::launchd::Plan::Write => "would write",
+    };
+    if dry {
+        if !json_out {
+            println!(
+                "{} {} · {} — `wsp install` loads it, and the daemon comes back on its own",
+                p.dim("daemon"),
+                p.dim(&util::contract(&path)),
+                p.dim(change)
+            );
+        }
+        return json!({"installed": false, "label": crate::launchd::LABEL,
+                      "path": util::contract(&path), "plist": change});
+    }
+    let done = crate::launchd::ensure(dst, &store.state, &var);
+    if !json_out {
+        match &done {
+            Ok(d) => println!("{} {}", p.green("✓"), d.line()),
+            // Under the ✓ and not over it: the copy happened and every pane on
+            // the machine is already running it. This is a note about the
+            // machine, not a failure of the install, and printing it as one
+            // would train people to read the red line as "nothing was
+            // installed".
+            Err(why) => println!(
+                "{} {}",
+                p.yellow("!"),
+                p.dim(&format!("the daemon is not installed as a launchd agent — {why}"))
+            ),
+        }
+    }
+    match done {
+        Ok(d) => json!({"installed": true, "label": crate::launchd::LABEL,
+                        "path": util::contract(&d.path),
+                        "plist": if d.wrote { "written" } else { "unchanged" },
+                        "loaded": d.loaded}),
+        Err(why) => json!({"installed": false, "label": crate::launchd::LABEL,
+                           "path": util::contract(&path), "error": why}),
+    }
 }
 
 /// Name the long-lived processes that will **not** pick this up.

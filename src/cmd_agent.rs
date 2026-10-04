@@ -3631,14 +3631,25 @@ pub(crate) struct Wip {
     /// [`sentence`]. A seat herdr does not draw has no label to read it off,
     /// so this is where a compound seat's status line is seen at all.
     pub said: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The machine's daemon, when it has none — [`crate::daemon::loud`]'s one
+    /// sentence, read once here because it costs a `ps` and `wip` is asked by a
+    /// person looking for work, not by a loop.
+    ///
+    /// `wsp-145`. This heading is the first line of the answer to "is anything
+    /// happening on this machine", and a machine full of agents whose
+    /// unattended pass is not running is the machine where the *wake* spools
+    /// are all holding — six days of it, read as busy the whole time.
+    pub daemon: Option<String>,
 }
 
 impl Wip {
     pub(crate) fn live(store: &Store) -> Wip {
         let backends = crate::cmd_spawn::local_backends();
         let mut agents = Vec::new();
+        let mut heard = false;
         for backend in &backends {
             if let Ok(census) = backend.census() {
+                heard = true;
                 agents.extend(census.seats().filter(|s| s.state != State::Empty).cloned());
             }
         }
@@ -3652,6 +3663,7 @@ impl Wip {
             agents,
             agents_held: store.agents_held(),
             said: store.said(),
+            daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
         }
     }
 }
@@ -3779,6 +3791,10 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
+        // The sentence, not a boolean: `doctor`'s is the only other place it is
+        // said, and a caller that has to ask "no daemon, or a daemon whose `ps`
+        // would not answer?" cannot tell those apart from a flag either.
+        "daemon": w.daemon,
         "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
         "inbox": inbox,
@@ -3793,6 +3809,9 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
 
     if rows.is_empty() {
         out.push(p.dim("no agents running"));
+        if let Some(d) = &w.daemon {
+            out.push(p.red(d));
+        }
     } else {
         // Not `all busy`, which is what this said and was the same sentence
         // `doctor`'s `herdr up, 12 agents` was saying on the night seven of
@@ -3817,6 +3836,19 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             head.push_str(&format!("  ·  {}", p.yellow(&format!("{needs} need you"))));
         }
         out.push(head);
+        // The machine's daemon, and what its absence costs. `wsp-145`: a heading
+        // saying six agents, five running, is a true sentence about work and
+        // says nothing about the pass that decides whether a seat is ever woken
+        // at all — which is the half that was missing for six days on a machine
+        // that looked busy the entire time, and nobody asked why every wake
+        // spool was still holding.
+        //
+        // Its own line rather than another `·` clause on the heading: it is a
+        // fault and the heading is a census, and a heading that goes yellow
+        // every hour trains its reader past the yellow.
+        if let Some(d) = &w.daemon {
+            out.push(p.red(d));
+        }
         out.push(String::new());
         let pw = rows.iter().map(|r| r.project.chars().count()).max().unwrap_or(7).max(7);
         let tw = 46;
@@ -5224,14 +5256,18 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
-    // Whether the machine has the one daemon it should have. The probe is passed
-    // because a machine with no herdr on it wants no daemon either, and a check
-    // that said "no daemon running" there is a check that gets ignored along
-    // with the ones that mean something.
+    // Whether the machine has the one daemon it should have, said in the same
+    // words as `wip`, a brief's seat line and `wsp watch --status` say it —
+    // through `a_backend_answered`, which used to be herdr's census alone.
+    // That was right while herdr was the only backend and wrong on this
+    // machine, which runs compound and has no herdr on it: `doctor` said
+    // nothing about a daemon that had been gone for a week, and the three
+    // surfaces a person actually reads said it every time. A gate that is
+    // asked two ways is a gate that is really two gates.
     crate::daemon::health(
         store.daemon_holder().map(|(pid, _)| pid),
         crate::daemon::running(&store.state).as_deref(),
-        matches!(probe, Probe::Up { .. }),
+        crate::daemon::a_backend_answered(),
         &mut problems,
         &mut notes,
     );
@@ -6851,6 +6887,7 @@ mod tests {
             agents: vec![seated_agent("cpd-9", "working", "cpd-9")],
             agents_held: std::collections::BTreeMap::new(),
             said,
+            daemon: None,
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -7033,7 +7070,52 @@ mod tests {
             ],
             agents_held: std::collections::BTreeMap::new(),
             said: std::collections::BTreeMap::new(),
+            daemon: None,
         }
+    }
+
+    /// `wsp-145`. The heading counts agents and turns, which is a true
+    /// sentence about *work* and says nothing about the pass that decides
+    /// whether a seat is ever woken at all. Six days of a dead daemon on a
+    /// machine that read `3 agents · 2 running a turn` the entire time is the
+    /// cost, and the whole of the cost was that nothing here said so.
+    ///
+    /// Asserted on both shapes it can be in — with agents and with none — since
+    /// the empty machine is the one where `wip` is the first thing anybody runs.
+    #[test]
+    fn a_machine_whose_daemon_is_gone_says_so_at_the_top_of_the_answer() {
+        let mut w = wip_world();
+        assert!(
+            !wip_lines(&w, &Paint::new(), false).join("\n").contains("no wsp daemon"),
+            "said it when the machine has a daemon"
+        );
+
+        w.daemon = crate::daemon::loud(Some(&[]), true);
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("no wsp daemon"), "{text}");
+        // Above the rows and above the queues: this is the state of the machine,
+        // not a line about one agent, and it is what a person came here to read.
+        assert!(
+            text.lines().position(|l| l.contains("no wsp daemon"))
+                < text.lines().position(|l| l.contains("PROJECT")),
+            "it was drawn underneath the table: {text}"
+        );
+        // And on the empty machine too, where `wip` is the first thing run.
+        let mut bare = wip_world();
+        bare.agents.clear();
+        assert!(
+            wip_lines(&bare, &Paint::new(), false).join("\n").contains("no agents running"),
+            "the fixture does not reach the empty branch"
+        );
+        bare.daemon = crate::daemon::loud(Some(&[]), true);
+        assert!(
+            wip_lines(&bare, &Paint::new(), false).join("\n").contains("no wsp daemon"),
+            "an empty machine is not a machine that does not need a daemon"
+        );
+        // Published for a reader that does not draw: `doctor` is the only other
+        // place this is said, and a script cannot ask whether *it* would have
+        // seen a daemon.
+        assert!(wip_json(&w)["daemon"].as_str().unwrap().contains("no wsp daemon"));
     }
 
     /// An idle agent on a task that is still `doing` is a person being the

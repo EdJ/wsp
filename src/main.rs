@@ -44,6 +44,7 @@ mod herdr;
 mod input;
 mod kanban;
 mod live;
+mod launchd;
 mod message;
 mod model;
 mod overlap;
@@ -1587,6 +1588,13 @@ fn help_text() -> String {
                                     install at a time — the one file nothing can
                                     isolate; defaults to your verify tree's
                                     release build, -n to look without touching it
+  wsp install → ~/Library/LaunchAgents/com.wsp.daemon.plist
+                                    …and writes and loads the launchd agent that
+                                    keeps `wsp daemon` alive, so it comes back
+                                    after a crash and at every login. An install
+                                    that finds it already right leaves it alone,
+                                    -n says which it would do, and --to and a
+                                    sandbox never touch it
   wsp install --why - | --why --from FILE
                                     …with the reason read from a stream or a
                                     file, where a shell never sees it — it is

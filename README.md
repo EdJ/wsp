@@ -18,12 +18,41 @@ wsp init                       # creates ~/wsp (git) and ~/.local/state/wsp
 herdr plugin link "$PWD/herdr-plugin"
 ```
 
-The plugin's `[[startup]]` launches `wsp daemon` on the next herdr start. To run
-it in an already-live session:
+`wsp daemon` is what keeps the sidebar tokens, the TTLs and the unattended
+pass alive, and `wsp install` writes it a launchd user agent: `RunAtLoad`,
+`KeepAlive`, logs in `~/.local/state/wsp/daemon.log`, pointing at
+`~/.local/bin/wsp` — the same file the daemon already re-`exec`s itself out of,
+so a reinstall is picked up by the mechanism every pane uses. It is idempotent,
+`-n` says what it would write, and a sandbox (`WSP_HOME`/`WSP_STATE` set) writes
+and loads nothing at all.
+
+An install that finds the plist already right and the job already loaded leaves
+both alone and says so — deliberately, because `launchctl kickstart` waits out
+the job's throttle interval first, which is half a minute of an install standing
+still for nothing. A plist that *has* changed is booted out and loaded again,
+because a loaded job never reads the file that was just written.
 
 ```sh
-nohup wsp daemon > ~/.local/state/wsp/daemon.log 2>&1 &
+wsp install -n                  # what it would write
+launchctl print gui/$(id -u)/com.wsp.daemon
 ```
+
+That is a change of dependency, and it is worth saying why the old one was
+dropped rather than kept alongside: `wsp daemon` used to be started by the
+plugin's `[[startup]]`, so a machine without herdr had no daemon at all — and
+said nothing, because nothing in wsp said *why* the pass had stopped. A
+`[[startup]]` entry in a plugin for a terminal emulator is a load-bearing
+dependency on the emulator being up, which is not a property anybody would
+notice losing. The plugin still carries the entry, as the fallback for a machine
+that has not run `wsp install`: when both try, `daemon`'s one-per-store rule
+turns the second one away by name and pid, which is the whole of
+`herdr-plugin/herdr-plugin.toml`'s remaining job here.
+
+Four surfaces say so when the daemon is gone rather than when it is stale:
+`wsp doctor`, the heading of `wsp wip`, the **seat line** of a brief and
+(`wsp-145`) the first line of `wsp watch --status`. The brief's is on the seat
+line alone — it is re-read on every request of every session, and an ordinary
+agent must still pay nothing for a governor's problem.
 
 Sidebar rows go in `~/.config/herdr/config.toml` — see `[ui.sidebar.spaces]` and
 `[ui.sidebar.agents]` there; `$proj`, `$todo`, `$doing`, `$blocked`, `$task` and
@@ -3873,8 +3902,9 @@ true of `pane.list` and false of `agent.list`, which carries the same record
 
 This was got wrong first, and the way it was got wrong is worth more than the
 fix. `plugins.json` is one file for the whole machine, not one per session, and
-`edjames.wsp` has a `[[startup]]` entry that runs `wsp daemon`. A headless
-session server **does** load it. The first live run left a daemon holding that
+`edjames.wsp` has a `[[startup]]` entry that runs `wsp daemon` — a fallback
+now that `wsp install` owns one (`wsp-145`), and a hazard all the same. A
+headless session server **does** load it. The first live run left a daemon holding that
 session's socket and — having been told nothing else — `~/wsp` and
 `~/.local/state/wsp`: a process the sandbox created, writing to the live store,
 outliving the sandbox, reparented to launchd. Compose that with a `sync` that
@@ -4217,6 +4247,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/fake.rs` | a backend that answers that socket out of a state we choose — `wsp sandbox --fake` |
 | `src/sync.rs` | tasks + panes → metadata tokens |
 | `src/daemon.rs` | event subscription, debounce, TTL refresh, and the pass that looks when nobody asked |
+| `src/launchd.rs` | the daemon's launcher: the plist `wsp install` writes and loads, so a dead daemon is a `kill -9` away from a fresh tick |
 | `src/attention.rs` | that pass: the level set derived on a timer, the ledger that survives the process, who each level is addressed to, and the three edges that leave it — `hooks/on-attention-{raised,cleared,moved}` |
 | `src/wake.rs` | the pass's third audience: which levels are worth re-invoking a governor for, the spool that holds the rest, the states a wake may be typed into, and the sentence that tells a governor nobody typed it |
 | `src/input.rs` | terminal bytes → keys: the escape-sequence parser |

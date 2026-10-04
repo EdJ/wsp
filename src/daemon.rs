@@ -492,6 +492,60 @@ fn pane_of(rest: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Has anything on this machine that wants a daemon answered?
+///
+/// The gate on [`loud`], and one function rather than four ad-hoc readings of
+/// "is this machine doing anything".
+///
+/// It used to be `herdr`'s own census, which was the right question on a
+/// machine where herdr was the only backend and the wrong one here: this
+/// machine runs compound, herdr is not on it, and `doctor` therefore said
+/// nothing about a daemon that had been gone for a week while `wip`, a brief's
+/// seat line and `wsp watch --status` all said it loudly. One predicate, four
+/// call sites — and four call sites that had drifted into three answers is the
+/// failure the doc on [`loud`] claims not to have.
+pub(crate) fn a_backend_answered() -> bool {
+    crate::cmd_spawn::local_backends().iter().any(|b| b.census().is_ok())
+}
+
+/// The one sentence four surfaces show when this machine has no daemon.
+///
+/// **`wsp-145`, and why it is a function and not a paragraph.** The daemon was
+/// started by herdr's `[[startup]]` and herdr stopped being on this machine, so
+/// nothing was starting it — and the one surface that *did* notice was
+/// `wsp doctor`, which nobody runs unless something is already wrong. For six
+/// days the symptom was silence from a watchdog, and `wsp watch --status` said
+/// `ticked 6d23h ago, the process is gone` without saying anything about *why*
+/// the process was gone, which was the only question anybody had.
+///
+/// Four call sites, one predicate, and none of them is free of context cost,
+/// so the reading is *narrow on purpose*:
+///
+/// - [`health`] is the report, and says it when a machine has a daemon to miss.
+/// - `wip`'s heading is what a person reads first on a machine that looks
+///   busy, which is precisely the machine whose wake spools are all holding.
+/// - a brief's **seat** line, and only that line: the brief is re-read on every
+///   request of every session, so an ordinary agent must still pay nothing.
+///   A seat is the one reader for whom "nothing will wake me" is a fact about
+///   its own job.
+/// - the first line of `wsp watch --status`, which is the thing a governor runs
+///   when it has noticed a silence and is deciding what the silence means.
+///
+/// `None` for `running` says nothing, for [`health`]'s reason: a `ps` that will
+/// not answer is not an empty machine, and "no daemon running" would send
+/// somebody to start a second one. `backend_up` is `health`'s own gate — a
+/// machine with no herdr and nothing to spawn onto wants no daemon, and is told
+/// nothing.
+pub(crate) fn loud(running: Option<&[u32]>, backend_up: bool) -> Option<String> {
+    match running {
+        Some([]) if backend_up => Some(
+            "no wsp daemon — tokens, TTLs and the unattended pass are all off, and nothing will wake a seat (`wsp install` loads one)"
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
 /// What `doctor` says about the daemon: that there is one, that there are two,
 /// or that there is none.
 ///
@@ -516,14 +570,12 @@ pub(crate) fn health(
     };
     match running {
         [] => {
-            // Only where it means something is missing. A machine with no herdr
-            // is a machine wsp works on and does not need a daemon for, and
-            // `cmd_agent::seat_health` has already said so in its own words.
-            if herdr_up {
-                notes.push(
-                    "no wsp daemon running — tokens and TTLs will not refresh (`wsp daemon`)".into(),
-                );
-            }
+            // Only where it means something is missing, and in the one sentence
+            // `wip`, a brief's seat line and `wsp watch --status` also use — so
+            // a person who is told it in one place and finds it missing in the
+            // next is not being given two truths, and `wsp-145` is not paid for
+            // four times in wording.
+            notes.extend(loud(Some(running), herdr_up));
         }
         [one] => match holder == Some(*one) {
             true => notes.push(format!("daemon up, pid {one}")),
@@ -991,6 +1043,23 @@ mod tests {
             Claim::Take(Some(22121)),
             "refused on a marker nothing could confirm, leaving the store with no daemon"
         );
+    }
+
+    /// `wsp-145`, and the whole of what the one sentence is for: a machine whose
+    /// backend is up and which has no daemon, said out loud.
+    ///
+    /// Both exclusions are load-bearing rather than politeness. A machine with
+    /// no herdr and nothing to spawn onto does not need a daemon, and telling
+    /// it one is missing is a line in the most expensive output wsp has, on a
+    /// machine where it is false. And a `ps` that would not answer is not an
+    /// empty machine — `health` has always refused to read it that way, because
+    /// the sentence it produces sends somebody to start a *second* daemon.
+    #[test]
+    fn a_missing_daemon_is_only_ever_said_where_there_is_something_to_miss_it() {
+        assert!(loud(Some(&[]), true).is_some(), "the machine that started this row");
+        assert!(loud(Some(&[]), false).is_none(), "a machine with no backend needs no daemon");
+        assert!(loud(Some(&[42]), true).is_none(), "there is a daemon");
+        assert!(loud(None, true).is_none(), "a ps that would not answer is not an empty machine");
     }
 
     /// The one case that is a real contest, and the house answer to it. The

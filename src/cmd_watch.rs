@@ -2228,6 +2228,12 @@ impl Source for Poll<'_> {
             // The same rows (d) is about, with the empty ones dropped. One
             // reading, filtered twice, rather than two readings.
             agents: seats.iter().filter(|s| s.state != State::Empty).cloned().collect(),
+            // `None`, and deliberately: this `Wip` exists to be turned into
+            // rows, and the daemon line is drawn by `wip`'s own heading and by
+            // `--status`, neither of which goes through here. Reading it would
+            // cost a `ps -E` on every tick of every watch to fill a field
+            // nobody in this function looks at.
+            daemon: None,
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -2733,7 +2739,7 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
         // which is a distinct failure, because `Store::run_hook` waits for its
         // child and a hook that blocks wedges the loop without killing it.
         let repair = match w.daemon {
-            true => "`wsp doctor` names the daemon below; `kill` it and herdr restarts it, or run `wsp daemon` yourself".to_string(),
+            true => "`wsp doctor` says whether it is there at all; `wsp install` loads one, and from then on `kill -9` is not the end of it".to_string(),
             false => format!("`wsp watch --forget {}` clears the record; `wsp watch` starts one again", w.key),
         };
         let what = match w.daemon {
@@ -4030,7 +4036,26 @@ fn held(w: &Registered) -> String {
 
 fn status(store: &Store, args: &Args) -> i32 {
     let watches = registered(store);
+    // The machine's daemon, and what its absence costs — read once here rather
+    // than out of each row, because it is one fact about the machine and this
+    // is the command a governor runs when it has noticed a silence. `wsp-145`:
+    // for six days this screen said `ticked 6d23h ago, the process is gone`
+    // without saying anything about *why* the process was gone, and the answer
+    // was that herdr had gone with it and nothing was starting the daemon
+    // again. Silence from a watchdog is the one silence nobody investigates, so
+    // the cause goes above the table rather than below it.
+    let loud = crate::daemon::loud(
+        crate::daemon::running(&store.state).as_deref(),
+        crate::daemon::a_backend_answered(),
+    );
     if args.json() {
+        // Left as the bare array it has always been. A `daemon` key would mean
+        // wrapping it in an object, and every reader of this output outside
+        // this tree indexes it as a list — a shape change to add a field is
+        // the same class of fault as `worklist-042`'s, where one reading fed
+        // seven outputs and the shortest hash went unexamined. `wsp wip --json`
+        // is the surface that carries it, and it is a surface whose keys were
+        // already an object.
         println!(
             "{}",
             serde_json::to_string_pretty(&watches
@@ -4044,6 +4069,9 @@ fn status(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     let p = Paint::new();
+    if let Some(d) = &loud {
+        println!("{}", p.red(d));
+    }
     if watches.is_empty() {
         println!("{}", p.dim("nobody is watching · `wsp watch` starts one"));
         return 0;
