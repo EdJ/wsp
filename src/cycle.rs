@@ -229,13 +229,17 @@ fn passed_sentence(store: &Store, w: &Worklist, passed: Option<usize>) -> String
 
 /// A block on anything in a run is a decision somebody owes, so the seat
 /// governing the run is told. A review is not: it is the next step, and wsp
-/// takes it.
+/// takes it — unless the member's work is not on the trunk, when there is no
+/// step wsp can take and nobody else will notice.
 fn told_about_task(store: &Store, id: &str, verb: &str) {
+    let Some(t) = store.find_task(id) else { return };
+    let Some(w) = list_of(store, &t) else { return };
+    if verb == "review" {
+        return told_unlanded(store, &w, &t);
+    }
     if verb != "blocked" {
         return;
     }
-    let Some(t) = store.find_task(id) else { return };
-    let Some(w) = list_of(store, &t) else { return };
     let what = if t.tags.iter().any(|g| g == VERIFY_TAG) {
         "A verifier found a problem"
     } else if t.tags.iter().any(|g| g == BARRIER_TAG) {
@@ -248,6 +252,36 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
          The run waits here until it is unblocked.",
         w.id, t.id, util::truncate(&t.title, 60), t.id
     ));
+}
+
+/// A member that reached `review` with commits its trunk has not got.
+///
+/// `review` is an agent's terminal verb — it lands first — so a member that
+/// did not land has stopped, and its verifier is keyed on the landing. Only a
+/// group wsp runs: by hand, the governor is the one reading reviews.
+fn told_unlanded(store: &Store, w: &Worklist, t: &Task) {
+    if t.tags.iter().any(|g| g == VERIFY_TAG || g == BARRIER_TAG) {
+        return;
+    }
+    let pos = worklist::position(store, w, Reading::Landed);
+    let Some(g) = pos.at.and_then(|at| w.groups().get(at - 1).cloned()) else { return };
+    if g.policy().is_none() {
+        return;
+    }
+    let Some(s) = pos.members.iter().find(|s| s.id == t.id) else { return };
+    if s.finished() || !s.settlement.settled() {
+        return;
+    }
+    tell(store, w, &format!("In the {} run, {}", w.id, unlanded(&s.id, &s.note())));
+}
+
+/// The sentence for a reviewed member that has not landed, in the log and
+/// to the seat alike.
+fn unlanded(id: &str, note: &str) -> String {
+    format!(
+        "{id} is at review with {note}, so it has no verifier yet. \
+         `wsp land {id}` puts it there, and wsp starts the verifier on the land."
+    )
 }
 
 /// The running list a row belongs to: itself a member, a verifier under one,
@@ -308,6 +342,14 @@ fn step(store: &Store, w: &Worklist) -> Vec<String> {
                 failed(store, &w, &v);
             }
         }
+    }
+
+    // 2a. And one that is reviewed and *not* landed gets nothing, which the
+    // log has to say: tokenhub-003 went to review with its commit still on
+    // its branch, this started nothing and wrote nothing, and its governor
+    // went looking for the cause in the wrong record (`wsp-142`).
+    for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.finished()) {
+        stamp(&format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
     }
 
     // 3. The barrier, once every member is landed and every verdict is in.
@@ -1016,6 +1058,59 @@ mod tests {
         step(&store, &w);
         let b = tagged(&store, BARRIER_TAG).remove(0);
         assert_eq!(list_of(&store, &b).map(|w| w.id), Some("run".into()));
+        let _ = spawned();
+    }
+
+    /// `wsp-142`: tokenhub-003 went to review with its commit on its branch,
+    /// the advance its review started did nothing and said nothing, and the
+    /// governor went looking for a cause in the claim. The verifier is keyed
+    /// on the landing, so the seat is told the member is waiting on one.
+    #[test]
+    fn a_member_reviewed_without_landing_gets_no_verifier_and_the_seat_is_told_why() {
+        let (env, store) = scratch("unlanded");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "--quiet", "-b", "master"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        git(&["checkout", "--quiet", "-b", "m-1"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "the member's work"]);
+        git(&["checkout", "--quiet", "master"]);
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut t = Task::new("m-1", "m-1");
+        t.project = Some("p".into());
+        t.status_raw = Status::Review.as_str().into();
+        store.save_task(&t).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+
+        told_about_task(&store, "m-1", "review");
+        step(&store, &w);
+        assert!(spawned().is_empty() && tagged(&store, VERIFY_TAG).is_empty(), "no verifier on unlanded work");
+        let told = drained(&TOLD);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("m-1 is at review with 1 commit not on master"), "{}", told[0]);
+        assert!(told[0].contains("`wsp land m-1`"), "{}", told[0]);
+
+        git(&["merge", "--ff-only", "--quiet", "m-1"]);
+        told_about_task(&store, "m-1", "review");
+        step(&store, &w);
+        assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "landed: the verifier starts");
+        assert!(drained(&TOLD).is_empty(), "and a landed review is the next step, not news");
         let _ = spawned();
     }
 }

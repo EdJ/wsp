@@ -1897,6 +1897,20 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             // is `cmd_agent`'s vocabulary and migrating it is its own task; the
             // string is the same string either way.
             let mut flags: Vec<(&str, &str)> = vec![("pane", seat.as_str())];
+            // Where the seat was put, said by the one party that knows. The
+            // claim asks herdr otherwise, and a seat herdr does not draw came
+            // back as no room and the tree the caller stood in — on a worklist
+            // spawn, the previous member's (`wsp-142`).
+            let room = place.room(&seat);
+            if let Some(r) = &room {
+                flags.push(("workspace", r));
+            }
+            if let Some(c) = &cwd {
+                flags.push(("cwd", c));
+            }
+            if will_start {
+                flags.push(("kind", &kind));
+            }
             // The tier travels with the claim, because the claim is what
             // writes the attempt down. `spawn` is the only caller that knows
             // it — an agent claiming at its own shell has no flag to pass and
@@ -5003,6 +5017,34 @@ mod tests {
             Leftovers { tree: Tree::Absent, builds: Vec::new() }
         }), 0);
         assert!(!std::path::Path::new(&named).exists(), "the brief outlived the seat: {named}");
+    }
+
+    /// `wsp-142`: a worklist spawn on a seat herdr does not draw claimed with
+    /// no room, no kind, and the tree the detached `worklist advance` stood in
+    /// — the previous member's. The spawn knows all three, so the claim says
+    /// them; this process standing somewhere else is the case that failed.
+    #[test]
+    fn a_spawns_claim_records_the_seat_the_tree_and_the_kind_it_opened_and_not_where_the_caller_stood() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("claim-where");
+        let tree = store.root.join("elsewhere");
+        std::fs::create_dir_all(&tree).unwrap();
+        let mut t = crate::model::Task::new("a member", "t-1");
+        t.project = Some("core".into());
+        store.save_task(&t).unwrap();
+
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let dir = tree.display().to_string();
+        let flags = [("agent", "true"), ("kind", "opencode"), ("no-tree", "true"), ("cwd", dir.as_str())];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags)), 0);
+
+        let claim = store.claims().get("t-1").cloned().expect("no claim");
+        assert_eq!(claim["cwd"], json!(util::contract(&tree)), "the caller's directory, not the seat's");
+        assert_eq!(claim["workspace_id"], json!("w9:p1"), "no room, so `worklist next` says it did not record");
+        assert_eq!(claim["agent_kind"], json!("opencode"), "the kind waited on a census that never comes");
+        assert_eq!(store.bindings()["w9:p1"]["agent_kind"], json!("opencode"));
     }
 
     /// The whole of robustness-010, at the one line where it happens.

@@ -2278,10 +2278,18 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // can later resolve.
     let panes_now = herdr::panes().unwrap_or_default();
     let target = panes_now.iter().find(|p| p.pane_id == pane).cloned();
+    //
+    // herdr is only one of the backends a seat can be in, though, and a seat
+    // it does not draw is not on that list at all. `spawn` knows where it put
+    // the seat, so it says (`--workspace`, `--cwd`); without that, a worklist
+    // spawn on compound recorded the room as nothing and the tree as wherever
+    // the detached `worklist advance` happened to be standing — the previous
+    // member's tree, or the trunk (`wsp-142`).
     let workspace = target
         .as_ref()
         .map(|p| p.workspace_id.clone())
         .filter(|w| !w.is_empty())
+        .or_else(|| args.get("workspace").filter(|w| !w.is_empty()))
         .or_else(|| env.workspace_id.clone())
         .unwrap_or_default();
 
@@ -2298,10 +2306,18 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // before it starts the agent, so at this instant the seat is usually still
     // a shell. [`learn_sessions`] is what fills it once there is a session.
     let session = target.as_ref().map(|p| p.session_id.clone()).unwrap_or_default();
-    let cwd = match &target {
-        Some(p) if !p.cwd.is_empty() => p.cwd.clone(),
+    // The tree a spawn opened wins over herdr's reading of the pane: the two
+    // agree on herdr, and where they could not — a seat herdr does not draw —
+    // the caller's own directory is the one answer certain to be wrong.
+    let cwd = match (args.get("cwd").filter(|c| !c.is_empty()), &target) {
+        (Some(c), _) => util::contract(&util::expand(&c)),
+        (None, Some(p)) if !p.cwd.is_empty() => p.cwd.clone(),
         _ => std::env::current_dir().map(|c| util::contract(&c)).unwrap_or_default(),
     };
+    // What `spawn` is about to start in the seat, so the record says it from
+    // the first moment rather than whenever a backend's census next reports
+    // it — which on a seat herdr does not draw is never.
+    let kind = args.get("kind").filter(|k| !k.trim().is_empty());
 
     // The other direction: a task taken off another agent. Two panes bound to
     // one task is not a state anything downstream can read — the tree hangs a
@@ -2478,17 +2494,18 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
                 "started": util::now_iso(),
             }),
         );
-        store.set_binding(
-            &pane,
-            json!({
-                "task_id": t.id,
-                "pane_id": pane,
-                "workspace_id": workspace,
-                "agent_session_id": session,
-                "cwd": cwd,
-                "started_at": util::now_iso(),
-            }),
-        );
+        let mut binding = json!({
+            "task_id": t.id,
+            "pane_id": pane,
+            "workspace_id": workspace,
+            "agent_session_id": session,
+            "cwd": cwd,
+            "started_at": util::now_iso(),
+        });
+        if let Some(k) = &kind {
+            binding["agent_kind"] = json!(k);
+        }
+        store.set_binding(&pane, binding);
 
         // The durable half. A pane id is worthless the moment the pane dies, so
         // record the workspace instead — by id, and by the label and cwd herdr
@@ -2498,36 +2515,37 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         // this claim meant from the one that took its name, and the label and
         // cwd are what can. The label is looked up before the lock: asking herdr
         // is a socket round-trip, and nothing else should wait on it.
-        store.set_claim(
-            &t.id,
-            json!({
-                // The identity that replaces the three below it
-                // (`compound-092`). Written now and read by nothing yet: the
-                // store is durable, so the id has to exist on records for a
-                // while before anything is allowed to depend on it.
-                "agent_id": agent_id,
-                "workspace_id": workspace,
-                "workspace_label": named.clone().unwrap_or_else(|| ws_label.clone()),
-                "cwd": cwd,
-                // The same session the binding above gets, on the record that
-                // outlives the pane. A binding is per-seat and is cleared the
-                // moment an agent lets go — `release_pane` and `done` both drop
-                // it *before* the claim ends — so a reader that only had the
-                // binding could not answer what had just been running at the one
-                // moment anybody asks: the end of the attempt. See `ran_at`.
-                //
-                // Usually empty here and filled by `learn_sessions`, because
-                // `spawn` claims before it starts the agent. Not always: a claim
-                // made in a pane that already holds one — the panel's `c`, an
-                // agent claiming at its own shell — reads it off the pane row
-                // right here, and that path writes no `session-learned` event at
-                // all, which is how the event log turned out not to be a
-                // fallback worth having.
-                "agent_session_id": session,
-                "host": util::hostname(),
-                "claimed_at": util::now_iso(),
-            }),
-        );
+        let mut claim = json!({
+            // The identity that replaces the three below it
+            // (`compound-092`). Written now and read by nothing yet: the
+            // store is durable, so the id has to exist on records for a
+            // while before anything is allowed to depend on it.
+            "agent_id": agent_id,
+            "workspace_id": workspace,
+            "workspace_label": named.clone().unwrap_or_else(|| ws_label.clone()),
+            "cwd": cwd,
+            // The same session the binding above gets, on the record that
+            // outlives the pane. A binding is per-seat and is cleared the
+            // moment an agent lets go — `release_pane` and `done` both drop
+            // it *before* the claim ends — so a reader that only had the
+            // binding could not answer what had just been running at the one
+            // moment anybody asks: the end of the attempt. See `ran_at`.
+            //
+            // Usually empty here and filled by `learn_sessions`, because
+            // `spawn` claims before it starts the agent. Not always: a claim
+            // made in a pane that already holds one — the panel's `c`, an
+            // agent claiming at its own shell — reads it off the pane row
+            // right here, and that path writes no `session-learned` event at
+            // all, which is how the event log turned out not to be a
+            // fallback worth having.
+            "agent_session_id": session,
+            "host": util::hostname(),
+            "claimed_at": util::now_iso(),
+        });
+        if let Some(k) = &kind {
+            claim["agent_kind"] = json!(k);
+        }
+        store.set_claim(&t.id, claim);
 
         // A hand raised about this task has been answered by somebody taking
         // it. That is the rule the card's `y` is built on: it runs a plain

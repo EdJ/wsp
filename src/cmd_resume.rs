@@ -782,8 +782,8 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
             .and_then(|task| crate::cmd_agent::task_label(&task))
             .unwrap_or_else(|| t.what.clone()),
     };
-    let seat = match somewhere_to_stand(t) {
-        Some(seat) => seat,
+    let (seat, opened) = match somewhere_to_stand(t) {
+        Some(seat) => (seat, false),
         None => {
             let order = Order {
                 label,
@@ -838,7 +838,7 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
                 on: herdr::host_of(&t.workspace).map(|m| m.to_string()),
                 show: false,
             };
-            place.open(&order).map_err(|e| e.to_string())?
+            (place.open(&order).map_err(|e| e.to_string())?, true)
         }
     };
 
@@ -849,9 +849,21 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
             // agent's own name, and refusing to take work back from a process
             // that no longer exists would make the verb unusable exactly when
             // it is needed.
-            if cmd_spawn::cmd_agent_claim(store, task, &[("pane", seat.as_str()), ("force", "true")])
-                != 0
-            {
+            //
+            // And with where the seat is, for `spawn`'s reason (`wsp-142`): a
+            // seat herdr does not draw is not on herdr's list, and the claim
+            // would otherwise record no room and this process's directory. The
+            // tree only where this opened the seat in it — a seat stood in
+            // already is on herdr's list, which knows better than the thread.
+            let room = place.room(&seat);
+            let mut flags = vec![("pane", seat.as_str()), ("force", "true"), ("kind", kind.as_str())];
+            if let Some(r) = &room {
+                flags.push(("workspace", r));
+            }
+            if opened && !t.cwd.is_empty() {
+                flags.push(("cwd", &t.cwd));
+            }
+            if cmd_spawn::cmd_agent_claim(store, task, &flags) != 0 {
                 return Err(format!("opened {seat}, but the claim on {task} was refused"));
             }
         }

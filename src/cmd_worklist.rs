@@ -1991,7 +1991,14 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing]) -> Front {
     let mut waiting: Vec<(Standing, String)> = Vec::new();
     for s in members.iter().filter(|s| !s.finished()) {
         if let Some(c) = claims.get(&s.id) {
-            waiting.push((s.clone(), crate::cmd_agent::claim_where(c)));
+            // Except that a member already reviewed is waiting on its landing,
+            // not on its agent, and naming where the agent was sent a governor
+            // after the claim when the work was sitting unlanded (`wsp-142`).
+            let why = match s.settlement.settled() {
+                true => s.note(),
+                false => crate::cmd_agent::claim_where(c),
+            };
+            waiting.push((s.clone(), why));
         } else if matches!(
             s.landing,
             None | Some(Landing::Nothing | Landing::NoBranch | Landing::NoRepo)
