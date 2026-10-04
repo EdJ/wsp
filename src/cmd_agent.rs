@@ -476,43 +476,6 @@ pub(crate) fn sentence(said: &BTreeMap<String, Value>, pane: &str, held: Option<
     (task == held).then(|| said.to_string())
 }
 
-/// Put the task's name on the workspace and the pane that took it up. Returns
-/// the workspace's new label, if the workspace took it.
-///
-/// herdr has no name of its own for a workspace nobody named — `workspace.list`
-/// answers with the agent standing in it, or the folder leaf — so three agents
-/// in one tree all read as `claude`, which is the one thing about them you
-/// already knew. A claim is the moment wsp knows better.
-///
-/// It renames over a name typed by hand, by decision on wsp-016, and the
-/// claim prints what it overwrote so `herdr workspace rename` can put it back.
-/// It used to cost `resolve` its last resort — a workspace whose project was
-/// inferred from a label like `Trance Video` lost that inference the moment the
-/// label became a task title — and the scope on the front hands it back: the
-/// label now leads with the project's own id, which is the first thing
-/// [`Index::project_for_label`] looks for.
-///
-/// The one name it will not write over is a seat's. A workspace holding a
-/// custodial slot is named after the position — see
-/// [`cmd_govern::governor_of`] — and a custodian that claims a task to read it
-/// would otherwise rename its own room after the task and leave the sidebar
-/// saying what robustness-048 was filed about: `robustness/078`, with nothing
-/// anywhere saying seat. The pane still takes the task's name, because a pane
-/// answers "what is happening in there now" and that is what is happening.
-fn name_after_task(pane: &str, workspace: &str, task: &Task, ws_label: &str) -> Option<String> {
-    let label = task_label(task)?;
-    if !herdr::available() {
-        return None;
-    }
-    if !pane.is_empty() {
-        let _ = herdr::rename_pane(pane, &label);
-    }
-    if workspace.is_empty() || cmd_govern::is_governor_label(ws_label) {
-        return None;
-    }
-    herdr::rename_workspace(workspace, &label).ok().map(|_| label)
-}
-
 /// Whether a name is one this task's claim put there.
 ///
 /// Two shapes wear the same scope and only one of them is the title. `claim`
@@ -2255,7 +2218,7 @@ fn done_reason(t: &Task) -> String {
 
 pub fn claim(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp claim <id>   (inside a herdr pane)");
+        eprintln!("usage: wsp claim <id>   (inside a seat)");
         return 2;
     };
     let t = match store.task_or_why(&needle) {
@@ -2266,57 +2229,53 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         }
     };
     let Some(pane) = pane_id(args) else {
-        eprintln!("wsp: no pane to bind — run this inside a herdr pane, or pass --pane");
+        eprintln!("wsp: no seat to bind — run this inside one, or pass --pane");
         return 2;
     };
 
-    let env = herdr::Env::read();
-
-    // Claiming on behalf of another pane — from the panel, say — means the
-    // environment describes the caller, not the target. Ask herdr what that
-    // pane actually belongs to, or the claim records a workspace that nothing
-    // can later resolve.
-    let panes_now = herdr::panes().unwrap_or_default();
-    let target = panes_now.iter().find(|p| p.pane_id == pane).cloned();
+    // What is in the seat, from wsp's own port — compound unless `--herdr`
+    // asks for the other one. Never herdr by default: the fleet is on
+    // compound, and a seat herdr does not draw is not on its list, so a
+    // worklist spawn's claim came back with no room, no session and the tree
+    // the detached `worklist advance` happened to be standing in — the
+    // previous member's, or the trunk (`wsp-142`).
     //
-    // herdr is only one of the backends a seat can be in, though, and a seat
-    // it does not draw is not on that list at all. `spawn` knows where it put
-    // the seat, so it says (`--workspace`, `--cwd`); without that, a worklist
-    // spawn on compound recorded the room as nothing and the tree as wherever
-    // the detached `worklist advance` happened to be standing — the previous
-    // member's tree, or the trunk (`wsp-142`).
-    let workspace = target
-        .as_ref()
-        .map(|p| p.workspace_id.clone())
+    // Claiming on behalf of another seat — from the panel, say — means this
+    // process's environment describes the caller, not the target, which is
+    // why the target is looked up rather than read off `env`.
+    let place = crate::cmd_spawn::backend(args);
+    let seats: Vec<crate::place::Seated> =
+        place.census().map(|c| c.seats().cloned().collect()).unwrap_or_default();
+    let target = seats.iter().find(|r| r.seat.as_str() == pane).cloned();
+    // `spawn` knows where it put the seat and says so; otherwise the port's
+    // room for it, which on compound is the seat itself.
+    let workspace = args
+        .get("workspace")
         .filter(|w| !w.is_empty())
-        .or_else(|| args.get("workspace").filter(|w| !w.is_empty()))
-        .or_else(|| env.workspace_id.clone())
+        .or_else(|| place.room(&crate::place::Seat::new(&pane)))
         .unwrap_or_default();
 
     // The session in the seat, from the party that knows. This read
     // `CLAUDE_SESSION_ID` out of the caller's own environment until 2026-08-17,
     // and Claude Code does not set that variable — so every binding this store
     // had ever written carried `""`, and nothing noticed because nothing read
-    // it. The same objection as the workspace above applies twice over: a claim
-    // made from the panel would have recorded the *panel's* session for
-    // somebody else's seat. herdr reports `agent_session` on a `pane.list` row
-    // (recorded against 0.7.5, protocol 17), so the answer is already in hand.
+    // it. A claim made from the panel would also have recorded the *panel's*
+    // session for somebody else's seat.
     //
     // Empty here is the honest answer and the ordinary one: `spawn` claims
     // before it starts the agent, so at this instant the seat is usually still
     // a shell. [`learn_sessions`] is what fills it once there is a session.
-    let session = target.as_ref().map(|p| p.session_id.clone()).unwrap_or_default();
-    // The tree a spawn opened wins over herdr's reading of the pane: the two
-    // agree on herdr, and where they could not — a seat herdr does not draw —
-    // the caller's own directory is the one answer certain to be wrong.
+    let session = target.as_ref().map(|r| r.session.clone()).unwrap_or_default();
+    // The tree a spawn opened, then the port's reading of the seat, and this
+    // process's own directory last — right for an agent claiming at its own
+    // shell, and the answer that was wrong for every spawn.
     let cwd = match (args.get("cwd").filter(|c| !c.is_empty()), &target) {
         (Some(c), _) => util::contract(&util::expand(&c)),
-        (None, Some(p)) if !p.cwd.is_empty() => p.cwd.clone(),
+        (None, Some(r)) if !r.cwd.is_empty() => util::contract(&util::expand(&r.cwd)),
         _ => std::env::current_dir().map(|c| util::contract(&c)).unwrap_or_default(),
     };
     // What `spawn` is about to start in the seat, so the record says it from
-    // the first moment rather than whenever a backend's census next reports
-    // it — which on a seat herdr does not draw is never.
+    // the first moment rather than whenever a census next reports it.
     let kind = args.get("kind").filter(|k| !k.trim().is_empty());
 
     // The other direction: a task taken off another agent. Two panes bound to
@@ -2384,7 +2343,18 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     //
     // Refused before anything is written, so a refusal costs nothing: this
     // agent has not yet let go of whatever it was holding.
-    let held_by = live_holders(&bindings_now, &panes_now, &t.id, Some(&pane));
+    //
+    // Read off the same census as the target. It was herdr's pane list, on
+    // which no compound seat appears, so under compound this never refused.
+    let held_by: Vec<&crate::place::Seated> = seats
+        .iter()
+        .filter(|r| !r.agent.kind.is_empty() && r.state.is_running())
+        .filter(|r| r.seat.as_str() != pane)
+        .filter(|r| {
+            bindings_now.get(r.seat.as_str()).and_then(|b| b.get("task_id")).and_then(|x| x.as_str())
+                == Some(t.id.as_str())
+        })
+        .collect();
     if !held_by.is_empty() && !args.has("force") {
         let held = store
             .claims()
@@ -2402,9 +2372,9 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
                 .map(|h| {
                     format!(
                         "{} in {} · {}{}",
-                        if h.agent.is_empty() { "a shell".into() } else { h.agent.clone() },
-                        h.pane_id,
-                        h.agent_status,
+                        h.agent.kind,
+                        h.seat,
+                        h.state.as_str(),
                         if held.is_empty() { String::new() } else { format!(" · {held}") },
                     )
                 })
@@ -2415,8 +2385,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
                     "error": "held",
                     "task": t.id,
                     "reason": format!("held — {}", who.join("; ")),
-                    "held_by": held_by.iter().map(|p| json!({
-                        "pane": p.pane_id, "agent": p.agent, "state": p.agent_status,
+                    "held_by": held_by.iter().map(|r| json!({
+                        "pane": r.seat.as_str(), "agent": r.agent.kind, "state": r.state.as_str(),
                     })).collect::<Vec<_>>(),
                     "held_for": held,
                 })
@@ -2429,9 +2399,9 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
                     "  {}",
                     p.dim(&format!(
                         "held by {} in {} · {}{}",
-                        if h.agent.is_empty() { "a shell" } else { &h.agent },
-                        h.pane_id,
-                        h.agent_status,
+                        h.agent.kind,
+                        h.seat,
+                        h.state.as_str(),
                         if held.is_empty() { String::new() } else { format!(" · {held}") }
                     ))
                 );
@@ -2448,18 +2418,10 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         hand_off(store, task, Some(&t.id), "handoff");
     }
 
-    let ws_label = herdr::workspaces()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|w| w.id == workspace)
-        .map(|w| w.label)
-        .unwrap_or_default();
-
-    // Name the workspace and the pane after the work, before the claim is
-    // written: the claim records the label the workspace is to be *found* by
-    // when its id is gone, so it has to record the name it is about to have and
-    // not the one it is losing.
-    let named = name_after_task(&pane, &workspace, &t, &ws_label);
+    // The seat's own label, as the port reports it. herdr's workspace was
+    // renamed after the task here so a restart could find it by name; a seat
+    // wsp opens is named by wsp and found by its id.
+    let ws_label = target.as_ref().map(|r| r.label.clone()).unwrap_or_default();
 
     // One lock around the state files a claim touches, so a claim
     // arriving in the middle of this one cannot read a half-made state: a
@@ -2507,14 +2469,8 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         }
         store.set_binding(&pane, binding);
 
-        // The durable half. A pane id is worthless the moment the pane dies, so
-        // record the workspace instead — by id, and by the label and cwd herdr
-        // keeps in its own session file. Those two are not decoration: a
-        // workspace id above the one that survived a restart is handed out
-        // again (`robustness-084`), so the id alone cannot tell the workspace
-        // this claim meant from the one that took its name, and the label and
-        // cwd are what can. The label is looked up before the lock: asking herdr
-        // is a socket round-trip, and nothing else should wait on it.
+        // The durable half: the binding goes when the seat does, and this is
+        // what is left saying which room and which tree the work was in.
         let mut claim = json!({
             // The identity that replaces the three below it
             // (`compound-092`). Written now and read by nothing yet: the
@@ -2522,7 +2478,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
             // while before anything is allowed to depend on it.
             "agent_id": agent_id,
             "workspace_id": workspace,
-            "workspace_label": named.clone().unwrap_or_else(|| ws_label.clone()),
+            "workspace_label": ws_label,
             "cwd": cwd,
             // The same session the binding above gets, on the record that
             // outlives the pane. A binding is per-seat and is cleared the
@@ -2560,18 +2516,6 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         store.clear_flag(&t.id);
     });
 
-    // The panes this claim displaced lose the name along with the binding.
-    // What displaced them is that they were bound to *this* task, so the name
-    // they are wearing is this task's and comes off by the same rule `release`
-    // uses. Their workspace keeps its name if the claiming pane is standing in
-    // it, because the binding written just above is one that counts.
-    //
-    // Outside the lock: this is socket round-trips, and the next claim in
-    // should not be made to wait on a rename any more than on a commit.
-    for other in &displaced {
-        unname_after_task(store, other, &t.id);
-    }
-
     // `hand_off` wrote to the tasks it released, and one of them may be this
     // one — a re-claim of work the same agent put down. Re-read rather than
     // saving the copy taken before all that.
@@ -2606,22 +2550,12 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
                 "pane": pane,
                 "from": left,
                 "took_over": displaced,
-                "named": named,
-                "was": ws_label,
             })
         );
     } else {
         let p = Paint::new();
         println!("{} {}  {}", p.cyan("▸"), p.bold(&t.id), t.title);
         println!("  {}", p.dim(&format!("bound to {pane}")));
-        // A rename is not free to the person who typed the old name, so say
-        // what it was: that line is the whole of the undo.
-        match &named {
-            Some(l) if *l == ws_label => {}
-            Some(_) if ws_label.is_empty() => println!("  {}", p.dim(&format!("named {workspace}"))),
-            Some(_) => println!("  {}", p.dim(&format!("named {workspace} · was {ws_label}"))),
-            None => {}
-        }
         // Naming what was put down is the whole point of a migration being one
         // command: the agent moved, and you can see what it moved off.
         for prev in &left {
