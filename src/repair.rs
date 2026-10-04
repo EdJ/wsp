@@ -237,12 +237,22 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         let word = state.as_str();
         let already = noticed(&t);
         if already.is_some_and(|since| since + STALLED_AFTER <= util::epoch_secs()) {
-            // Told once, still not working. End it and let the run start it
-            // again — the same branch, the same tree, a fresh agent.
+            // Told once, still not working. End it, put the row back where a
+            // start can take it, and let the run start it again — the same
+            // branch, the same tree, a fresh agent.
+            //
+            // **The status moves back to `todo` and not left at `doing`,** and
+            // that is not tidiness. `cycle::take_member` may take a `doing` row
+            // again only while `started by wsp:` is its last word, and the
+            // notice line this repair wrote is now the last word — so leaving it
+            // at `doing` is a row nothing can start, and the reconciler has
+            // replaced a stalled agent with a stalled row. It is the same move
+            // `cycle::spawn` makes for a start that failed.
             crate::cycle::stamp(&format!(
                 "{} group {at}: {} was told to finish or say why and its seat still reads {word} — ending it, and the run starts it again",
                 w.id, t.id
             ));
+            put_back(store, &t.id);
             crate::cycle::despawn(&t.id);
             return;
         }
@@ -276,6 +286,26 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             id, w.id, id
         ));
     }
+}
+
+/// Put a member back where a start can take it, and say why on its row.
+///
+/// **The same move [`crate::cycle::spawn`] makes when a start fails**, and for
+/// the same reason: `take_member` recognises its own start by the last word of
+/// the log, and anything written after it — a notice, a note, a governor's
+/// correction — means the next advance reads the row as somebody else's.
+fn put_back(store: &Store, id: &str) {
+    let id = id.to_string();
+    store.locked(|| {
+        let Some(mut t) = store.find_task(&id) else { return false };
+        if t.status() == Status::Todo {
+            return false;
+        }
+        t.set_status(Status::Todo);
+        t.log("wsp put this back: the agent it was started on is gone, and the run will start it again");
+        t.touch();
+        store.save_task(&t).is_ok()
+    });
 }
 
 /// When this member was last told its agent was not working on it, read back
@@ -973,6 +1003,125 @@ pub(crate) mod tests {
             stamped()
         );
         let _ = ROTATED.with(|r| r.borrow_mut().clear());
+    }
+
+// ---- the whole thing, end to end ------------------------------------
+
+    /// The row's done-when, as a test: **a member's agent is killed mid-group
+    /// and the run reaches its barrier anyway**, with no verb anywhere.
+    ///
+    /// Not the four repairs tested separately — the claim this row makes is that
+    /// together they move a run that would otherwise have stood still. Nothing
+    /// between the kill and the barrier is a person: every step below is one
+    /// tick, and the only thing a person did was kill the process.
+    #[test]
+    fn a_run_whose_member_agent_is_killed_mid_group_reaches_its_barrier_without_a_verb() {
+        let (env, store) = scratch("endtoend");
+        let repo = repo(&env, &store);
+        git_in(&repo, &["init", "--quiet", "-b", "master"]);
+        git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        member(&store, "m-1", Status::Todo);
+        member(&store, "m-2", Status::Todo);
+        list(&store, &["m-1", "m-2"], "claude");
+
+        // Group 1 starts. Both members claim, both seats are working.
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(spawned().len(), 2, "wsp runs the group");
+        claim(&store, "m-1", "cpd-1");
+        claim(&store, "m-2", "cpd-2");
+
+        // **m-1's agent is killed.** Its seat still holds the claim, its row
+        // still says `doing`, and every reading of the run agrees it is going.
+        let going = Fake::new(&[("cpd-1", Some(State::Gone)), ("cpd-2", Some(State::Working))]);
+        tick(&store, &going, &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "the dead member is told first, once");
+        assert!(barriers(&store).is_empty(), "and nothing is passed over it");
+
+        // Told once and still gone: the agent is ended and the claim released,
+        // and the run takes the member again on the same branch and tree.
+        age_the_notice(&store, "m-1");
+        tick(&store, &going, &mut Pass::new());
+        assert_eq!(
+            crate::cycle::tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
+            vec!["m-1".to_string()],
+            "the agent that exited is ended"
+        );
+        store.clear_claim("m-1");
+        store.clear_binding("cpd-1");
+        let _ = spawned();
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert!(
+            crate::cycle::tests::SPAWNED.with(|s| s.borrow().iter().any(|(id, _)| id == "m-1")),
+            "and the member starts again, on the branch and tree named after it"
+        );
+
+        // Both finish and land. Nobody runs `wsp land` on either: the landing is
+        // recorded by the repair that notices the branch reached the trunk, and
+        // the verifier starts on that recording.
+        for m in ["m-1", "m-2"] {
+            git_in(&repo, &["checkout", "--quiet", "-b", m]);
+            git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "work"]);
+            git_in(&repo, &["checkout", "--quiet", "master"]);
+            git_in(&repo, &["merge", "--ff-only", "--quiet", m]);
+            set_status(&store, m, Status::Review);
+        }
+        let _ = spawned();
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(verifiers(&store).len(), 2, "each member gets its verifier, on the recorded landing");
+        for v in verifiers(&store) {
+            set_status(&store, &v, Status::Review);
+        }
+        let _ = spawned();
+
+        // The barrier opens — but not while a member's seat still reads working,
+        // which is the condition wsp-164 exists for.
+        tick(&store, &Fake::new(&[("cpd-2", Some(State::Working))]), &mut Pass::new());
+        assert!(barriers(&store).is_empty(), "a member still working holds the barrier");
+
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(barriers(&store).len(), 1, "and it opens once every pane is quiet");
+
+        // And the pass ends what the group opened. The claims put back above
+        // stand for agents this run started; after it, none of them is standing.
+        let mut w = store.worklist("run").unwrap();
+        let mut g = w.groups();
+        g[0].verdict = "passed".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        claim(&store, "m-1", "cpd-1");
+        claim(&store, "m-2", "cpd-2");
+        let _ = crate::cycle::tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
+        crate::cycle::end_group(&store, &w, 1);
+        let standing = crate::cycle::tests::ENDED.with(|e| e.borrow().clone());
+        assert!(
+            standing.contains(&"m-1".to_string()) && standing.contains(&"m-2".to_string()),
+            "the pass ends the group's own agents: {standing:?}"
+        );
+    }
+
+    fn verifiers(store: &Store) -> Vec<String> {
+        store
+            .tasks()
+            .into_iter()
+            .filter(|t| t.tags.iter().any(|g| g == crate::cycle::VERIFY_TAG))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    fn barriers(store: &Store) -> Vec<String> {
+        store
+            .tasks()
+            .into_iter()
+            .filter(|t| t.tags.iter().any(|g| g == crate::cycle::BARRIER_TAG))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    fn set_status(store: &Store, id: &str, status: Status) {
+        let mut t = store.find_task(id).unwrap();
+        t.set_status(status);
+        t.touch();
+        store.save_task(&t).unwrap();
     }
 
     // ---- the gate the daemon asks ----------------------------------------
