@@ -13,10 +13,23 @@ Design rationale and the full spec: `../wsp-spec.md`.
 
 ```sh
 cargo build --release
-install -m 755 target/release/wsp ~/.local/bin/wsp   # the first one; after that, `wsp install`
 wsp init                       # creates ~/wsp (git) and ~/.local/state/wsp
+wsp install                    # the release build into ~/.local/bin/wsp, and the launchd agent
 herdr plugin link "$PWD/herdr-plugin"
 ```
+
+`wsp install` and not `install -m 755`, even the first time. The copy is only
+half of what this verb is for: it also writes and loads the launchd agent that
+runs `wsp daemon`, and a binary put there by hand leaves the machine with no
+daemon and nothing that will ever start one. (`wsp install <path>` installs a
+named binary, so the first line is `wsp install target/release/wsp` if that is
+where you built it.)
+
+One thing to know about the install that puts the launcher in place: **the
+binary doing the installing is the old one.** The first `wsp install` after a
+build that adds this prints no `daemon` line, because the copy happens and the
+process doing it exits before it would have loaded anything. Run it a second
+time — it takes about a fifth of a second and says what it did.
 
 `wsp daemon` is what keeps the sidebar tokens, the TTLs and the unattended
 pass alive, and `wsp install` writes it a launchd user agent: `RunAtLoad`,
