@@ -47,7 +47,7 @@
 //! its own reviews by eye is not a wedged run, and a tick that respawned its
 //! members would be a second governor nobody asked for.
 
-use crate::model::{Status, Task, Worklist};
+use crate::model::{Status, Task, Worklist, WorklistStatus};
 use crate::cycle::Seats;
 use crate::place::State;
 use crate::store::Store;
@@ -155,7 +155,18 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // the one agent `end_behind` could never reach, because ending it at the
     // pass is ending the turn in which it reviews its own row, and there is no
     // next pass to reach it from.
-    for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
+    //
+    // **Running *and* held**, and the `held` half is here because the first
+    // version of this loop filtered to running lists alone — so the predicate
+    // below was widened and then never reached. Found by installing and looking
+    // at `wsp wip` for twenty minutes afterwards: `wsp-process` is held, its
+    // finished barrier check was still standing, and the reading that should
+    // have found it was never asked about that list at all.
+    for w in store
+        .worklists()
+        .into_iter()
+        .filter(|w| matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held))
+    {
         crate::cycle::end_all(store, crate::cycle::last_barrier_left_behind(store, &w));
     }
     // And every verifier whose verdict is recorded, whichever group it read.
@@ -1089,6 +1100,43 @@ pub(crate) mod tests {
         assert!(
             log.contains("nothing working on it"),
             "the file a governor reads for a run's history has to carry it: {log:?}"
+        );
+    }
+
+    /// The reconciler's second loop reaches a **held** list. This is the shape
+    /// of the bug installing found: `last_barrier_left_behind` was widened to
+    /// end a check behind a held run's position, and the loop that calls it
+    /// still filtered to running lists, so the widened half was never asked.
+    ///
+    /// A predicate nothing calls is not a predicate, and a caller that silently
+    /// narrows its callee's scope is worse than one that does not — the second
+    /// is a bug in one place and the first reads as done.
+    #[test]
+    fn a_held_lists_finished_barrier_check_is_ended_by_a_tick() {
+        let (_env, store) = scratch("heldcheck");
+        member(&store, "m-1", Status::Review);
+        member(&store, "m-2", Status::Review);
+        let mut w = list(&store, &["m-1", "m-2"], "claude");
+        let mut g = w.groups();
+        g[0].verdict = "passed".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        let mut check = Task::new("Barrier: run group 1", "b-1");
+        check.tags = vec![crate::cycle::BARRIER_TAG.into()];
+        check.set_status(Status::Review);
+        store.save_task(&check).unwrap();
+        store.set_claim("b-1", serde_json::json!({ "workspace": "w" }));
+        // Held at group 2's barrier: nothing more starts, and group 1's check
+        // has run and been passed.
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Held);
+        store.save_worklist(&w).unwrap();
+
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(
+            crate::cycle::tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
+            vec!["b-1".to_string()],
+            "a held run's finished barrier check is ended, not left standing"
         );
     }
 
