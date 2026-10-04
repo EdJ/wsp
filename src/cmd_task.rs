@@ -2625,6 +2625,15 @@ mod tests {
     /// from the code alone.
     #[test]
     fn review_refuses_a_row_with_no_account_and_leaves_it_where_it_was() {
+        // **Held for the whole test, and that is the fix rather than tidiness.**
+        // `review`'s no-account branch lists what this row has outstanding, and
+        // that walk reaches `cmd_checkout::former_ids`, which opens the store
+        // from the environment rather than the one it was handed — so the
+        // `Store::open()` guard fires unless an isolation is alive. Which made
+        // this test pass or fail depending on whether some *other* test happened
+        // to be holding one on the same thread, and it failed that way on
+        // `wsp-146` the first time the suite ran with any change in it.
+        let _iso = crate::util::isolated("review-no-account");
         let store = scratch("review-no-account");
         let mut t = Task::new("wsp review looks like the last step", "wsp-101");
         t.status_raw = "doing".into();
@@ -2640,6 +2649,12 @@ mod tests {
     /// in the log, so there is nothing left to disagree about.
     #[test]
     fn the_account_it_takes_is_written_into_the_log_a_barrier_reads() {
+        // An isolation for the whole test, for
+        // [`review_refuses_a_row_with_no_account_and_leaves_it_where_it_was`]'s
+        // reason: `review` reaches `cmd_checkout::former_ids`, which opens the
+        // store from the environment. All three `review` tests need it and all
+        // three are the same shape.
+        let _iso = crate::util::isolated("review-account");
         let store = scratch("review-account");
         let mut t = Task::new("wsp review looks like the last step", "wsp-101");
         t.status_raw = "doing".into();
@@ -2668,6 +2683,8 @@ mod tests {
     /// whether or not there is a commit anywhere.
     #[test]
     fn a_row_that_correctly_produced_no_diff_owes_the_same_account() {
+        // The isolation, again for the same reason as the two tests above it.
+        let _iso = crate::util::isolated("review-no-diff");
         let store = scratch("review-no-diff");
         let mut t = Task::new("the worklists zones prove their fit", "ui-007");
         t.status_raw = "doing".into();

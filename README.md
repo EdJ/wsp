@@ -4262,7 +4262,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/daemon.rs` | event subscription, debounce, TTL refresh, and the pass that looks when nobody asked |
 | `src/launchd.rs` | the daemon's launcher: the plist `wsp install` writes and loads, so a dead daemon is a `kill -9` away from a fresh tick |
 | `src/attention.rs` | that pass: the level set derived on a timer, the ledger that survives the process, who each level is addressed to, and the three edges that leave it — `hooks/on-attention-{raised,cleared,moved}` |
-| `src/wake.rs` | the pass's third audience: which levels are worth re-invoking a governor for, the spool that holds the rest, the states a wake may be typed into, and the sentence that tells a governor nobody typed it |
+| `src/wake.rs` | the pass's third audience: which levels are worth re-invoking a governor for, the spool that holds the rest, the states a wake may be typed into, and the sentence that tells a governor nobody typed it — and, since `wsp-146`, **the one way anything reaches a seat**: a message goes in that seat's spool first and clears only when a turn comes of it |
 | `src/input.rs` | terminal bytes → keys: the escape-sequence parser |
 | `src/panel/rows.rs` | what is in the tree, and how each row draws |
 | `src/panel/render.rs` | `Line`/`Style`, the frame, and the ansi + html backends |

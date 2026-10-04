@@ -717,6 +717,18 @@ fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
 /// Tell whoever governs this run. With nobody seated, the sentence is raised
 /// as a hand on the run's first member instead, where a person's panel draws
 /// it — Ed, 2026-09-30: "assuming a governor is in place".
+///
+/// **The spool, and the daemon, since `wsp-146`.** This used to run
+/// `wsp govern --tell`, which types at the seat's pane and **refuses a governor
+/// mid-turn** — and a verdict at a barrier is the sentence a governor is
+/// mid-turn for exactly when it is wanted. Its fallback is below, and it was
+/// firing for the wrong reason: a governor that was mid-turn got its run's
+/// verdict raised on a *member*, so the governor was told about its own barrier
+/// on a row it does not own.
+///
+/// Now busy means later, and [`crate::wake::say`] is the only thing this calls:
+/// the words go in the seat's spool inside the lock, the same gate the daemon
+/// asks before typing, and it is cleared only when a turn comes of it.
 fn tell(store: &Store, w: &Worklist, text: &str) {
     if cfg!(test) {
         #[cfg(test)]
@@ -724,11 +736,8 @@ fn tell(store: &Store, w: &Worklist, text: &str) {
         return;
     }
     stamp(&format!("tell {}: {}", w.id, util::truncate(text, 120)));
-    if let Some(scope) = governing_scope(store, w) {
-        let args = Args::synth("govern", &[scope.as_str()], &[("tell", text)]);
-        if crate::cmd_govern::govern(store, &args) == 0 {
-            return;
-        }
+    if hand_it_to_the_governor(store, w, text) {
+        return;
     }
     // On a member of the group the run stands at, where a person looking at
     // the run is looking — not group 1's, long since finished.
@@ -738,6 +747,35 @@ fn tell(store: &Store, w: &Worklist, text: &str) {
     let Some(first) = here.and_then(|g| g.members.first()).cloned() else { return };
     let args = Args::synth("flag", &[first.as_str(), text], &[]);
     let _ = crate::cmd_agent::flag(store, &args);
+}
+
+/// The half of [`tell`] that decides where a verdict goes, and whether a post
+/// took it.
+///
+/// **Split out so it can be driven.** `tell` records what it said and stops
+/// there under `cfg(test)`, because a cycle test asserts on the sentences and
+/// not on where they land — which is right for them and useless for this row:
+/// `wsp-146` is about *where*, and a test that cannot reach the half that
+/// decides would not notice that half being deleted.
+///
+/// Returns whether a seat on the scope holds it, and `false` is the caller
+/// falling back to a hand on the run's first member.
+pub(crate) fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -> bool {
+    let Some(scope) = governing_scope(store, w) else { return false };
+    match crate::wake::say(store, &scope, text, None) {
+        // Said as well as returned, because `cycle.log` is how a governor reads
+        // what the run has been doing, and *the seat is mid-turn* is the answer
+        // to "why has nobody started my next group" that used to be missing from
+        // it — the refusal this row removed was reported as a hand on a member.
+        Some(report) => {
+            stamp(&format!("told {scope}: {} · {} held", report.why, report.held));
+            true
+        }
+        None => {
+            stamp(&format!("told {scope}: no seat on the scope"));
+            false
+        }
+    }
 }
 
 /// A pass hands the governing seat to a fresh successor, on wsp's own

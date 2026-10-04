@@ -189,11 +189,32 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
+    // **The seat, now, and not on the next pass.** `wsp-146`: the record being
+    // open was never the same thing as the governor having the question. The
+    // attention pass derives `unanswered` for it within a minute and the wake
+    // path delivers it, which is the whole mechanism — but it meant the words
+    // sat in a file for up to a tick before they were anywhere, and this verb
+    // is the one thing in the system whose entire purpose is getting a sentence
+    // to a governor. So the question goes into that seat's spool here, inside
+    // the lock, and the same [`crate::wake`] delivery the daemon uses is asked
+    // once before the verb returns.
+    //
+    // With no seat above the task there is nobody to hold it and the receipt
+    // says so, which is the one case where *asked of every panel* is the whole
+    // answer — nothing is lost, because a level nobody is addressee of is the
+    // hook's audience and every panel draws it.
+    let seat = crate::cmd_govern::answering_seat(store, &subject);
+    let report = seat.as_ref().and_then(|s| {
+        crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
+    });
+
     let home = message::homes_to(store, &q).unwrap_or_default();
     if args.json() {
         println!(
             "{}",
-            json!({ "id": q.id, "about": subject.id, "waiting": held, "pane": pane, "lands_on": home })
+            json!({ "id": q.id, "about": subject.id, "waiting": held, "pane": pane, "lands_on": home,
+                    "seat": seat.as_ref().map(|s| &s.scope),
+                    "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why) })
         );
         return 0;
     }
@@ -202,7 +223,41 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     println!("  {}", p.dim(&format!("about {} · answered onto {home}", subject.id)));
     println!("  {}", p.dim(&addressed(store, &subject)));
     println!("  {}", p.dim(&format!("wsp answer {} \"…\" closes it and comes back here", q.id)));
+    // Where it went, and when it will arrive — `wsp-146`'s receipt. A verb whose
+    // whole effect is on somebody else's screen has to name the screen; the part
+    // that is new here is the *when*, because for the first time the honest
+    // answer is sometimes "later", and an agent that cannot tell later from
+    // never is how a question sits open for a night.
+    if let Some(r) = &report {
+        println!("  {}", r.said(&format!("the {} seat", r.scope), &p));
+    }
     0
+}
+
+/// The question as it goes to the seat, and the return path with it.
+///
+/// **Composed here rather than left to the wake's own rendering**, because the
+/// governor's line is the only place the answer will ever be offered from: an
+/// `unanswered` level names `wsp answer <id>` in its detail, which is right for
+/// a reader reading a column and is useless to an agent deciding whether it can
+/// act in the next thirty seconds. So: who sent it, what it wants, and the two
+/// commands that finish it.
+///
+/// **`wsp ask` and not `wsp flag` is named in the last line**, and that is the
+/// row's third requirement — one verb, chosen out of what exists because it is
+/// the one with a return path. Every other spelling still works and lands in the
+/// same spool; this line is what a governor reads to learn which one to reach for.
+fn for_a_governor(q: &Message) -> String {
+    let about = q.about.task().unwrap_or("this work");
+    format!(
+        "{by} asked about {about}:\n\n{body}\n\n\
+         answer with `wsp answer {id} \"…\"` — it lands on the asker's task and closes this\n\
+         `wsp ask` with no id lists every question still open · `wsp watch --drain` shows what \
+         this seat is owed",
+        by = q.from.byline(),
+        body = q.title(),
+        id = q.id,
+    )
 }
 
 /// `wsp answer <message-id> "the sentence"` — close a question, on the record
@@ -570,10 +625,8 @@ fn whose(closed: &message::Closed) -> String {
 /// closing clause is not — the routing is one rule and what may close a record
 /// is a property of its shape.
 fn addressed(store: &Store, task: &crate::model::Task) -> String {
-    let index = crate::resolve::Index::new(store.projects());
-    let lists = crate::worklist::Running::read(store);
     let governors = store.governors();
-    match crate::cmd_govern::seat_for(&governors, &index, lists.list_of(&task.id), task.project.as_deref()) {
+    match crate::cmd_govern::answering_seat(store, task) {
         Some(s) => format!(
             "asked of the {} governor · {}",
             s.scope,

@@ -359,6 +359,27 @@ pub fn seat_for(
         .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
 }
 
+/// The seat that answers for one task, asked once.
+///
+/// **The walk [`seat_for`] makes, with the store reads that feed it, and it
+/// exists because two receipts were each spelling it out.** `wsp flag` says
+/// *raised to the … governor* and `wsp ask` says *asked of the … governor*, and
+/// `wsp-146` needed the seat itself out of the second one — so the two walks
+/// were about to become three. Three definitions of *who answers for this* is
+/// how the seat exception gets lost, and `cmd_govern::needs_a_person` has already
+/// lost it once.
+///
+/// The list first, because a member of tonight's run is answered for by whoever
+/// is running it rather than by whoever governs the project it happens to live
+/// in — which is the same sentence [`seat_for`]'s own docs give, and is why
+/// neither receipt writes it again.
+pub fn answering_seat(store: &Store, task: &crate::model::Task) -> Option<Seat> {
+    let index = Index::new(store.projects());
+    let lists = crate::worklist::Running::read(store);
+    let governors = store.governors();
+    seat_for(&governors, &index, lists.list_of(&task.id), task.project.as_deref())
+}
+
 /// The same walk, started **one step past** a scope that cannot answer for
 /// itself.
 ///
@@ -1347,18 +1368,17 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
         eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} fills it");
         return 1;
     };
-    let backends = crate::cmd_spawn::local_backends();
-    let Some((place, found)) = occupant(store, &backends, &seat) else {
-        eprintln!("wsp: the {scope} seat is empty — nobody is in {} to tell", room_of(governors, scope));
-        return 1;
-    };
-
-    let how = crate::agent_commands::of(&found.agent.kind);
+    // The retry refusal, and it stays. **This is a person at a keyboard, and
+    // this verb has never refused to deliver** — it is the other three verbs
+    // `wsp-146` moved, and what it changed about this one is where the words go,
+    // not whether a deliberate repeat is honoured. `wake::Tell` bypasses
+    // `already_sent` for the opposite reason: a level re-raising is ordinary and
+    // a retry is not.
     let sent = crate::cmd_agent::Sent::new(
         scope,
         &format!("the {scope} seat"),
-        found.seat.as_str(),
-        found.seat.as_str(),
+        seat.pane.as_str(),
+        seat.pane.as_str(),
         text,
         args,
     );
@@ -1367,7 +1387,26 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
             return crate::cmd_agent::twice(&sent, ago, &Paint::new());
         }
     }
-    crate::cmd_agent::delivered(store, how.tell(place.as_ref(), &found.seat, text), &sent)
+    // **The spool first, and the daemon delivers it** — `wsp-146`. This used to
+    // resolve the occupant and type at the pane here, which meant a governor in
+    // the middle of a turn was told *not ready — working* and the sentence was
+    // lost. "Busy" now means later and the record is the seat's spool; the gate,
+    // the acknowledgement and the retry are `crate::wake`'s, one implementation,
+    // and the receipt below is the same report it prints for anybody else.
+    let Some(report) = crate::wake::say(store, scope, text, None) else {
+        eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} fills it");
+        return 1;
+    };
+    if args.json() {
+        println!(
+            "{}",
+            json!({ "target": scope, "pane": seat.pane, "id": sent.id, "told": report.arrived(),
+                    "held": report.held, "why": report.why })
+        );
+    } else {
+        println!("{}", report.said(&format!("the {scope} seat"), &Paint::new()));
+    }
+    0
 }
 
 /// `wsp govern --clear [<project>]` — this workspace stops being the seat.
@@ -1863,6 +1902,55 @@ mod tests {
         let backends = crate::cmd_spawn::local_backends();
         let (_, found) = occupant(&store, &backends, &seat).expect("the room names the seat");
         assert_eq!(found.seat.as_str(), "cpd-60", "found through the room, and by exact match");
+    }
+
+    /// **`wsp govern --tell` no longer refuses a busy governor, and this is the
+    /// sentence that used to.**
+    ///
+    /// It used to resolve the occupant and type at the pane, so a governor
+    /// mid-turn was answered *"not ready — working"* and the sentence was gone;
+    /// `cycle.rs` was hitting it on every verdict at a barrier. Now the words go
+    /// into that seat's spool and the receipt says the seat is owed them, which
+    /// is the first honest answer this verb has ever given about a busy seat.
+    ///
+    /// Driven over a socket rather than asserted on the record, because the
+    /// refusal was a refusal *to type*: a fake at `Working` is the only way to
+    /// see that nothing was typed and that exit code is still zero.
+    #[test]
+    fn a_tell_to_a_governor_mid_turn_is_held_rather_than_refused() {
+        use crate::fake::{Fake, Spot, Stage};
+        use crate::place::State;
+
+        let (env, store) = store("tell-busy");
+        take(&store, "wsp", "w1", "w1:p1");
+        let mut stage = Stage::new();
+        stage.put(Spot::agent("w1:p1", "claude", "wsp", State::Working));
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+
+        let args = Args::parse(vec![
+            "wsp".into(),
+            "wsp".into(),
+            "--tell".into(),
+            "go on to group 2".into(),
+        ]);
+        let governors = store.governors();
+        assert_eq!(tell(&store, &governors, "wsp", "go on to group 2", &args), 0, "busy is not a failure");
+
+        let typed: Vec<_> = fake
+            .asked()
+            .into_iter()
+            .filter(|a| a.verb == crate::fake::Verb::Tell)
+            .collect();
+        assert!(typed.is_empty(), "a mid-turn governor is not typed at: {typed:?}");
+
+        // The record, which is what the daemon reads and what a person runs
+        // `wsp watch --drain` to see.
+        let spool = crate::cmd_watch::Spool::of_json(
+            &store.watches().get(&crate::wake::key_for("wsp")).and_then(|v| v.get("spool")).cloned().unwrap_or(serde_json::Value::Null),
+        );
+        assert_eq!(spool.depth(), 1, "and it is owed, which is the whole of the change");
     }
 
     /// **And the half that decides whether the fix above is safe.** A herdr

@@ -494,13 +494,28 @@ fn lay_brief(
 /// is the whole of what the new edge comes to.
 pub fn work_order(subject: &str, how: Handover) -> String {
     match how {
+        // `wsp-146`'s third requirement, and it is here as well as in the brief
+        // because this is read **once** — at spawn — where the brief is injected
+        // into every request of every session. Naming the verb where it is
+        // cheapest to name it is the whole of that half of the requirement; the
+        // other half is the brief's own seat line.
+        //
+        // What the sentence buys is not the verb, which an agent could find in
+        // `wsp --help`, but the two facts that were missing from every one of the
+        // four verbs it had: **this is the one with a return path**, and **a busy
+        // seat is later, not a refusal**. Both were learned the expensive way —
+        // `worklist-013` cost 2h14m of a hand that stayed up after the seat had
+        // answered down a channel with no memory.
         Handover::Spawned => format!(
             "You have been claimed onto {subject}. Your brief is already above: the task, \
-             what binds it, and what to read. Begin work when you're ready."
+             what binds it, and what to read. Begin work when you're ready. Something you need \
+             decided? `wsp ask {subject} \"...\"` reaches whoever coordinates this, is held \
+             until their seat is free, and comes back here answered."
         ),
         Handover::Running => format!(
             "You have been claimed onto {subject}. Please run `wsp brief --session`, then begin \
-             work on the task when you're ready."
+             work on the task when you're ready. `wsp ask {subject} \"...\"` reaches whoever \
+             coordinates it."
         ),
         // The four things the seat did on the night this was written from, in
         // the order they were done, and the one thing it must not become. No
@@ -544,7 +559,9 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              is blocked on, write the direction an arriving agent needs and no more, and keep \
              decisions and corrections on the rows rather than in this conversation. Do not \
              review, rebase, test or land yourself; if that is needed, `wsp spawn` an agent for \
-             it. `wsp flag --seat` is your inbox. You coordinate rather than authorise, so \
+             it. `wsp flag --seat` is your inbox, and `wsp ask <id> \"...\"` is how anything reaches \
+             you: answer one with `wsp answer <id> \"...\"`, which closes the question and \
+             lands on the asker's row. You coordinate rather than authorise, so \
              nothing waits on your permission. Say what you are doing with `wsp say`, and when \
              nothing needs you, stop: you are told when it does. A group with no `agent:` line \
              is run by hand (`wsp worklist next` names what may start), and when you pass its \

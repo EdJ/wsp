@@ -911,6 +911,21 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
+    // **Into the seat's spool, now, and `wsp-146`'s second half of it.** A hand
+    // used to reach a governor only as a `flag` *level*, which
+    // `Line::disposition` spools rather than wakes — on purpose, because
+    // `hooks/on-attention-raised` already reaches a person for free and a flag
+    // is not worth 208k on its own. That reasoning is about a person with a
+    // panel in front of them, and this row's finding is that an agent raising a
+    // hand to its governor is addressing a *seat*, and the seat was not on the
+    // hook. So the words go in the spool directly, where
+    // `Class::Message` dispositions them to a wake, and the flag level still
+    // goes everywhere else it always did.
+    let seat = cmd_govern::answering_seat(store, &task);
+    let report = seat.as_ref().and_then(|s| {
+        crate::wake::say(store, &s.scope, &for_a_governor(&raised, &task), Some(&raised.id))
+    });
+
     if args.json() {
         println!(
             "{}",
@@ -932,8 +947,35 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
         // Say where it went. A command whose whole effect is on somebody else's
         // screen has to name the screen, or it reads as having done nothing.
         println!("  {}", p.dim(&addressed(store, &task)));
+        // …and whether the seat has it yet, because `wsp-146` made *later* an
+        // honest answer for the first time and an agent that cannot tell later
+        // from never is how a hand stays up for a night. Nothing when there is
+        // no seat: the line above already said *every panel*, and that is the
+        // whole of where it went.
+        if let Some(r) = &report {
+            println!("  {}", r.said(&format!("the {} seat", r.scope), &p));
+        }
     }
     0
+}
+
+/// The hand as it goes to the seat, in the words its reader has to act on.
+///
+/// **The same shape [`crate::cmd_message::ask`] sends, and the difference is the
+/// last line.** An ask is owed an answer and says so by naming `wsp answer`; a
+/// notification is not, and claiming otherwise would put a governor in a seat
+/// expecting to reply. What is owed — a disposition — is named instead, so the
+/// sentence reads the same and the obligation is not a guess.
+fn for_a_governor(m: &Message, task: &Task) -> String {
+    format!(
+        "{by} raised a hand on {task} ({id}):\n\n{body}\n\n\
+         nothing is owed back — `wsp flag {task} --seen` marks it read, `--clear` takes it down\n\
+         if it was already seen · `wsp ask {task} \"…\"` is the same thing with a return path",
+        by = m.from.byline(),
+        task = task.id,
+        id = m.id,
+        body = m.title(),
+    )
 }
 
 /// `--seen` and `--clear`: the two things you can do to a raised hand without
@@ -1140,13 +1182,11 @@ fn hand_aside(
 /// hand went up still answers for it, and a seat that stands down hands its
 /// flags to whoever is above it without touching a single flag record.
 fn addressed(store: &Store, task: &Task) -> String {
-    let index = Index::new(store.projects());
-    // The list first, and this is the whole of what a worklist changes about a
-    // raised hand: a member of tonight's run is answered for by whoever is
-    // running it, not by whoever governs the project it happens to live in.
-    let lists = crate::worklist::Running::read(store);
     let governors = store.governors();
-    match cmd_govern::seat_for(&governors, &index, lists.list_of(&task.id), task.project.as_deref()) {
+    // The walk, asked of one function — [`crate::cmd_govern::answering_seat`]'s
+    // reason. It used to be spelled here as well, and this receipt and
+    // `cmd_message`'s were already two of them.
+    match cmd_govern::answering_seat(store, task) {
         Some(s) => format!(
             "raised to the {} governor · {} · x there lowers it",
             s.scope,
@@ -1305,6 +1345,16 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
 /// Three phrases *executed* instead of being delivered, and the message arrived
 /// fluent with the load-bearing nouns missing — silent at the receiving end,
 /// which is worse than an error.
+///
+/// **And it is not how a governor is reached, which `wsp-146` had to make
+/// explicit.** This verb addresses a *task* and types at the pane that task is
+/// held in, and a seat holds no task — so there is nothing here for it to reach
+/// a governor with, and the reason it keeps its own delivery rather than
+/// [`crate::wake`]'s is not sentiment: `twice` and
+/// [`crate::place::Refusal::NotTaken`] are a contract with the person at the
+/// keyboard (*you have it and you did not submit it*), and a governor is not
+/// standing at one. `wsp ask <id> "…"` is the verb that reaches one — it is named
+/// in the brief's seat line and in the work order.
 pub fn tell(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
     let Some(needle) = args.rest.first().cloned() else {
@@ -5594,6 +5644,59 @@ mod tests {
 
     fn raise_one(store: &Store, args: &[&str], flags: &[(&str, &str)]) -> i32 {
         flag(store, &Args::synth("flag", args, flags))
+    }
+
+    /// **A raised hand goes into the seat's spool, and that is the second of the
+    /// two verbs `wsp-146` moved.**
+    ///
+    /// A hand used to reach a governor only as a `flag` **level**, which
+    /// `Line::disposition` spools rather than wakes — deliberately, because
+    /// `hooks/on-attention-raised` already reaches a person for free and a hand
+    /// is not worth 208k on its own. That argument is about a person with a panel
+    /// in front of them, and an agent raising a hand to its governor is
+    /// addressing a *seat*, which was never on the hook. So `wsp flag` writes
+    /// into the spool itself, where `Class::Message` dispositions it to a wake,
+    /// and the level still goes everywhere else it always did.
+    ///
+    /// Asserted on the record rather than on a receipt: what matters is that the
+    /// words are *owed* by a post, which is a fact about the store, and that the
+    /// record says the seat was handed it — which is what stops the pass
+    /// announcing the same hand to the same seat a minute later.
+    #[test]
+    fn a_hand_raised_under_a_seat_is_owed_by_that_seat_rather_than_only_drawn() {
+        let (_env, store) = scratch("flag-to-seat");
+        a_task(&store, "wsp-001");
+        // The governor record written directly rather than through `take`, and
+        // the reason is `herdr::available`'s process-wide cache: `take` renames
+        // the seat's workspace, which asks herdr, and this test stands up no
+        // fake — so it would be the first caller in the binary to latch that
+        // answer `false` and every later test that wants a census would inherit
+        // it. Found by running the suite, which is the only place this is
+        // visible; `cmd_watch`'s tests are sorted after these and would have
+        // failed first.
+        store.set_governor(
+            "wsp",
+            json!({ "workspace": "w1", "pane": "w1:p1", "host": util::hostname(), "since": util::iso_at(1_000) }),
+        );
+
+        assert_eq!(raise_one(&store, &["wsp-001", "the store is corrupt"], &[]), 0);
+
+        let watches = store.watches();
+        let rec = watches.get(&crate::wake::key_for("wsp")).expect("the seat has a spool");
+        let spool = crate::cmd_watch::Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        assert_eq!(spool.depth(), 1, "the hand is owed by the seat, not only drawn on a panel");
+        // The rendered words, read off the record rather than through
+        // `Spooled`'s own fields: what is owed is a line a governor will read in
+        // a composer, and this is that line.
+        let said = rec["spool"][0]["text"].as_str().unwrap_or_default().to_string();
+        assert!(
+            said.contains("the store is corrupt"),
+            "and it carries the words, because the level only ever carried the title: {said}"
+        );
+        assert!(
+            crate::message::raised(&store)[0].handed_to("wsp"),
+            "and the record knows the seat was handed it, so the pass does not announce it twice"
+        );
     }
 
     /// **The fault this whole change exists for**, driven through the verb

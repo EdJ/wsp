@@ -486,6 +486,26 @@ pub(crate) enum Class {
     Replaced,
     /// The stream ending, and why.
     Over,
+    /// **A sentence somebody wrote, addressed to this seat**, and the class
+    /// exists because of the sentence in [`Line::disposition`] that says it is
+    /// always a wake.
+    ///
+    /// The five above are the stream talking about itself — its own start, its
+    /// own liveness, its own ending — and every one of them is a decision made
+    /// by a reader about its own reporting. This one is *content*: a member's
+    /// question, a verdict at a barrier, a governor's own `--tell`, put in the
+    /// spool by whoever had it in hand rather than derived by the pass that
+    /// decides what a seat is worth waking for. `wsp-146`: an agent had four
+    /// verbs for reaching its governor and every one of them asked the pane
+    /// directly, so a governor mid-turn refused a question that had already been
+    /// written down — *"not ready — working"* is what `cycle.rs` was told, and
+    /// its answer was to raise a hand on a member instead.
+    ///
+    /// It is a class and not a [`Kind`] because the difference is authorship,
+    /// not urgency: a level is a reading of state and has nobody to reply to,
+    /// and this has both. Rendering is the same column as every other line, so
+    /// `--drain` and a governor's composer read one shape.
+    Message,
 }
 
 impl Class {
@@ -497,6 +517,7 @@ impl Class {
             Class::Beat => "beat",
             Class::Replaced => "replaced",
             Class::Over => "over",
+            Class::Message => "message",
         }
     }
 
@@ -507,8 +528,8 @@ impl Class {
 
     /// The whole vocabulary, so a reader can be handed it and a test can assert
     /// it is closed.
-    pub(crate) fn every() -> [Class; 5] {
-        [Class::Open, Class::News, Class::Beat, Class::Replaced, Class::Over]
+    pub(crate) fn every() -> [Class; 6] {
+        [Class::Open, Class::News, Class::Beat, Class::Replaced, Class::Over, Class::Message]
     }
 
     /// The JSON form of a line that is **not** news.
@@ -623,6 +644,16 @@ impl Line {
             // a panic in the disposition path would be the seventh way to be
             // silent, and this is the safe half of an asymmetric choice.
             Line::Note(Class::News, _) => Wake,
+            // **A sentence somebody wrote to this seat is never held back**, and
+            // that is the one entry in this table which is about the *author*
+            // rather than about the fact. Everything above is a reading of
+            // state, and a reading can be re-derived on any tick — which is
+            // exactly why they are worth triaging. A message cannot: the moment
+            // it stops being owed it is gone, so `Spool` here would mean *not
+            // for four hours*, and `core-017`'s whole argument is that the table
+            // exists to stop a fact nobody asked for waking a 208k context.
+            // The cost here is paid for by somebody who typed the sentence.
+            Line::Note(Class::Message, _) => Wake,
             Line::News(e) => match e.edge {
                 // It went away, or somebody else answers for it now. There is
                 // nothing for this reader to do about either, and `worklist-039`
@@ -701,6 +732,23 @@ pub(crate) struct Spooled {
     text: String,
     /// The class word as it was written, for the same reason.
     class: String,
+    /// Epoch seconds of the last time this entry's text was typed at the seat,
+    /// or zero if it never has been.
+    ///
+    /// **The half of `wsp-146`'s "delivered is acknowledged by a turn" that has
+    /// to survive the process.** A type that starts no turn is `robustness-093`
+    /// — the keystrokes are in the composer and nobody pressed return — and the
+    /// two facts a retry has to tell apart are *never typed* and *typed once*,
+    /// and only this one says which. Without it a retry is indistinguishable
+    /// from a first attempt and re-types a paragraph that is already sitting
+    /// there, which is `worklist-010`'s harm arriving by the retry the fix for
+    /// it invited.
+    ///
+    /// It is on the entry rather than on the record because a flush takes a
+    /// whole batch: every entry in one typing got the same answer, and a
+    /// confirmation covers all of them together. `wsp-146` d2, and its own
+    /// cost is one integer per held line.
+    pub(crate) typed: i64,
 }
 
 /// What is being held for the next wake.
@@ -735,6 +783,7 @@ impl Spooled {
             },
             class: line.class().word().to_string(),
             line: Some(line),
+            typed: 0,
         }
     }
 
@@ -849,6 +898,52 @@ impl Spool {
         of.iter().map(|h| h.seq).max().unwrap_or(0)
     }
 
+    /// When this spool's text last went to the seat and no turn came of it.
+    ///
+    /// The newest of the stamps rather than the oldest, because the question a
+    /// retry asks is *how long has this been sitting in a composer* and the
+    /// newest entry is the one whose text is in there now. `None` when nothing
+    /// here has ever been typed, which is the state that means *go ahead*.
+    ///
+    /// **Any rather than all**, deliberately, and it is the mixed batch that
+    /// says why. An entry typed at tick 1 and one raised at tick 2 are in one
+    /// flush; treating the batch as never typed would re-type the first
+    /// paragraph on tick 2, which is the harm [`Spooled::typed`] exists to
+    /// prevent.
+    ///
+    /// **One stamp for the whole spool, so at most one typing per seat per
+    /// window** — and that includes a sentence raised *after* the last type, so
+    /// a fresh message behind a stale stamp waits for the window rather than
+    /// typing into the composer the stale text is already in. Driven live on
+    /// 2026-10-04: a question asked while the seat was free but carrying a stamp
+    /// from 61 seconds earlier was held, said so on its receipt, and went out on
+    /// the next tick with everything else. Erring towards *later* is this row's
+    /// whole bargain; splitting the batch by seq would buy that one sentence a
+    /// minute earlier at the price of the duplicate [`RETYPED`] exists to stop.
+    ///
+    /// [`RETYPED`]: crate::wake::RETYPED
+    pub(crate) fn typed_at(&self) -> Option<i64> {
+        self.held.iter().filter(|h| h.typed > 0).map(|h| h.typed).max()
+    }
+
+    /// Say that everything held has now been at the seat, whatever came of it.
+    ///
+    /// Inside the caller's lock and it writes back only this field, for
+    /// [`Spool::append`]'s reason: the two writers are a flush and a `--drain`,
+    /// and neither may write back a list it did not read.
+    pub(crate) fn stamp_typed(rec: &mut Value, at: i64) {
+        if !rec.is_object() {
+            *rec = json!({});
+        }
+        let mut spool = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        for h in spool.held.iter_mut() {
+            h.typed = at;
+        }
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("spool".into(), spool.json());
+        }
+    }
+
     /// Everything held, in the order it happened — **taken, not copied**.
     ///
     /// The caller is expected to fail to deliver it and put it back. See
@@ -870,6 +965,15 @@ impl Spool {
                 .iter()
                 .map(|h| {
                     let mut v = json!({ "seq": h.seq, "at": h.at, "class": h.class, "text": h.text });
+                    // Zero is omitted rather than written, so a record written
+                    // before `wsp-146` reads back byte-for-byte as itself and the
+                    // field means one thing when it is there: this text has been
+                    // at the seat.
+                    if h.typed > 0 {
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("typed".into(), json!(h.typed));
+                        }
+                    }
                     if let (Some(Line::News(e)), Some(o)) = (&h.line, v.as_object_mut()) {
                         o.insert("edge".into(), json!(e.edge.word()));
                         o.insert("held".into(), json!(e.held));
@@ -889,6 +993,7 @@ impl Spool {
             let at = rec.get("at").and_then(Value::as_i64).unwrap_or(0);
             let class = rec.get("class").and_then(Value::as_str).unwrap_or_default().to_string();
             let text = rec.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            let typed = rec.get("typed").and_then(Value::as_i64).unwrap_or(0);
             // `None` here is not a drop. The entry keeps its words and is
             // printed as them — see [`Spooled::text`].
             let line = match Class::parse(&class) {
@@ -907,7 +1012,7 @@ impl Spool {
                 Some(c) => Some(Line::Note(c, text.clone())),
                 None => None,
             };
-            held.push(Spooled { seq, at, line, text, class });
+            held.push(Spooled { seq, at, line, text, class, typed });
         }
         Spool { held }
     }
@@ -5649,7 +5754,12 @@ mod tests {
             assert_eq!(v["class"], class.word(), "{class:?} did not name itself");
             seen.push(v["class"].as_str().expect("a class is a word").to_string());
         }
-        assert_eq!(seen, vec!["open", "news", "beat", "replaced", "over"], "the vocabulary is these five");
+        assert_eq!(
+            seen,
+            vec!["open", "news", "beat", "replaced", "over", "message"],
+            "the vocabulary is these six, and `message` is `wsp-146`'s: the five others are the \
+             stream talking about itself and it is content somebody wrote"
+        );
     }
 
     /// **Failure 1, on the path that did not have it.** A `--json` watcher

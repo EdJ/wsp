@@ -179,9 +179,9 @@ impl Shape {
     pub fn may(&self, act: Act) -> bool {
         match (self, act) {
             (Shape::Signal, _) => false,
-            (Shape::Notification, Act::Acknowledged | Act::Noted | Act::Escalated) => true,
+            (Shape::Notification, Act::Acknowledged | Act::Noted | Act::Escalated | Act::Sent) => true,
             (Shape::Notification, _) => false,
-            (Shape::Question, Act::Answered | Act::Abandoned | Act::Noted | Act::Escalated) => true,
+            (Shape::Question, Act::Answered | Act::Abandoned | Act::Noted | Act::Escalated | Act::Sent) => true,
             (Shape::Question, _) => false,
         }
     }
@@ -359,6 +359,24 @@ pub enum Act {
     Noted,
     /// Could not answer it; passed it up. The record stays open.
     Escalated,
+    /// **The seat that answers for this was handed the record**, and the record
+    /// stays open because the seat may not have read it yet.
+    ///
+    /// `wsp-146`, and it is not a disposition — it is the handover itself, which
+    /// is why it needs a word of its own rather than borrowing
+    /// [`Act::Escalated`]. Escalation says *I could not answer this and passed it
+    /// on*; this says *somebody who can answer it now has it in front of them*,
+    /// which is a fact about the delivery and not about the reader's ability.
+    ///
+    /// It carries one consequence outside this module, and it is the reason the
+    /// hop exists: **the attention pass does not re-announce to a seat that was
+    /// already handed the record.** `wsp ask` puts the question in the seat's
+    /// spool itself, and a minute later the pass derives `unanswered` for the
+    /// same record — so without this the governor is told twice, and every wake
+    /// costs it 208k. What the pass still does is put the level everywhere else:
+    /// hooks, panels, and *a different seat*, which is the case that matters when
+    /// this one stands down and the routing walks up a level.
+    Sent,
     Acknowledged,
     Answered,
     Abandoned,
@@ -369,6 +387,7 @@ impl Act {
         match s.trim().to_ascii_lowercase().as_str() {
             "noted" | "note" => Some(Act::Noted),
             "escalated" => Some(Act::Escalated),
+            "sent" => Some(Act::Sent),
             "acknowledged" | "ack" => Some(Act::Acknowledged),
             "answered" => Some(Act::Answered),
             "abandoned" => Some(Act::Abandoned),
@@ -379,6 +398,7 @@ impl Act {
         match self {
             Act::Noted => "noted",
             Act::Escalated => "escalated",
+            Act::Sent => "sent",
             Act::Acknowledged => "acknowledged",
             Act::Answered => "answered",
             Act::Abandoned => "abandoned",
@@ -387,7 +407,7 @@ impl Act {
     /// Does this end the record, or leave it open at the next level?
     pub fn closes(&self) -> Option<State> {
         match self {
-            Act::Noted | Act::Escalated => None,
+            Act::Noted | Act::Escalated | Act::Sent => None,
             Act::Acknowledged => Some(State::Acknowledged),
             Act::Answered => Some(State::Answered),
             Act::Abandoned => Some(State::Abandoned),
@@ -514,6 +534,20 @@ impl Party {
     pub fn workspace(&self) -> Option<&str> {
         match self {
             Party::Pane { workspace, .. } if !workspace.is_empty() => Some(workspace),
+            _ => None,
+        }
+    }
+
+    /// The post this party holds, if it is one.
+    ///
+    /// **Not a general accessor and not derived from a pane.** A hop by an agent
+    /// says who looked at a record; a hop by a *seat* says which post was handed
+    /// it, and that is the join [`Message::handed_to`] needs and nothing else
+    /// needs — a pane is not a post, and the routing that would turn one into
+    /// the other moves underneath the record.
+    pub fn scope(&self) -> Option<&str> {
+        match self {
+            Party::Seat(scope) => Some(scope),
             _ => None,
         }
     }
@@ -857,6 +891,23 @@ impl Message {
                 || self.state().is_none())
     }
 
+    /// Has the seat for `scope` already been handed this record?
+    ///
+    /// **Whether the words have arrived somewhere, not whether anybody read
+    /// them** — that is the whole distinction, and it is why this asks about an
+    /// [`Act::Sent`] hop and not about the state. A handed-over question is
+    /// still open and still owed an answer; it is only the *announcement* that
+    /// is spent, and that is what [`crate::wake::already_handed`] asks it.
+    ///
+    /// Keyed on [`Party::seat`] and on nothing else, because a hop by a *pane*
+    /// is a person having looked at it — which says nothing about which post is
+    /// holding the words now.
+    pub fn handed_to(&self, scope: &str) -> bool {
+        self.via
+            .iter()
+            .any(|h| h.act == Act::Sent && h.by.scope() == Some(scope))
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "id": self.id,
@@ -1094,6 +1145,34 @@ pub fn note(store: &Store, id: &str, by: &Party, note: &str) -> Result<Message, 
 /// simply does not stop at a level that has nobody in it.
 pub fn escalate(store: &Store, id: &str, by: &Party, note: &str) -> Result<Message, Refused> {
     hop(store, id, by, Act::Escalated, note)
+}
+
+/// The seat that answers for this was handed the record, and it is still open.
+///
+/// **A hop rather than a disposition, and the reason is that the sentence has
+/// arrived somewhere rather than been understood.** Whoever reads it may answer
+/// it, note it, or let it stand; nothing about the record has changed, so this
+/// closes nothing — which is why it shares [`escalate`]'s table entry and not
+/// [`answer`]'s.
+///
+/// `wsp ask` and `wsp flag` call this from inside [`crate::wake::say`], after the
+/// words are in the seat's spool. The hop's whole job is one line elsewhere:
+/// [`crate::wake::already_handed`] asks it, so the attention pass does not derive
+/// `unanswered` for a record this seat is already holding. That is the difference
+/// between one wake at 208k and two, and the two are the same sentence.
+///
+/// Written after the spool rather than before, because a record that says it was
+/// handed over while the words are still in a process would be the worse lie —
+/// and the refusal is not fatal to the caller for the same reason: the words are
+/// already owed whatever this hop says.
+pub fn sent(store: &Store, id: &str, scope: &str) -> Result<Message, Refused> {
+    hop(
+        store,
+        id,
+        &Party::seat(scope),
+        Act::Sent,
+        &format!("handed to the seat for {scope}"),
+    )
 }
 
 /// *I have this and I am not passing it on.* A notification's disposition, and

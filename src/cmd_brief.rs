@@ -1221,7 +1221,17 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                 p.bold(&s.scope),
                 match mine {
                     true => p.dim("yours — wsp flag --seat is your inbox"),
-                    false => p.dim("coordinating here · wsp flag <id> reaches it"),
+                    // `wsp-146`'s third requirement, and the member's half of it:
+                    // the verb that reaches a governor, named where a member
+                    // reads it and in the two words that were missing from all
+                    // four it had — **this one is answered back**, and **a busy
+                    // seat is later**. Both are paid for on every request of
+                    // every session under a seat, which is why it is one clause
+                    // and not a paragraph; the work order says the same thing
+                    // once, at spawn.
+                    false => p.dim(
+                        "coordinating here · wsp ask <id> \"…\" reaches it — busy is later, never lost",
+                    ),
                 },
                 awake.unwrap_or_default(),
             ),
@@ -1731,7 +1741,13 @@ mod tests {
         let r = compose(&b);
         assert_eq!(r.seat.as_ref().map(|(s, mine)| (s.scope.as_str(), *mine)), Some(("wsp", false)));
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
-        assert!(text.contains("wsp flag <id> reaches it"), "{text}");
+        // `wsp ask` and not `wsp flag`, and the two facts that came with it
+        // (`wsp-146`): the verb has a return path, and a busy seat is told later
+        // rather than refusing. This line is in the brief of every session under
+        // a seat, so the assertion is on the whole clause — a member that reads
+        // only this sentence should not still be reaching for `wsp flag` and
+        // wondering why nobody came back.
+        assert!(text.contains(r#"wsp ask <id> "…" reaches it — busy is later, never lost"#), "{text}");
     }
 
     /// The seat reading its own brief is told it is the seat, and told where

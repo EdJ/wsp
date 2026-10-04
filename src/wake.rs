@@ -77,6 +77,54 @@
 //! silently outlived `--defer-max` behind it is a `wsp doctor` problem — see
 //! [`crate::cmd_watch::health`], which is the seventh guard against a silence
 //! nobody can see in a file that already carried six.
+//!
+//! # `wsp-146`: one way in, and a turn is the receipt
+//!
+//! This module was already the path everything a governor is told arrives by,
+//! and four verbs did not use it. `cycle.rs` asked `cmd_govern::govern`, which
+//! types at a pane through [`crate::agent_commands::Kind::tell`] and **refuses a
+//! seat that is `Working`** — *"not ready — working"* — and a run's verdict is
+//! exactly the sentence a governor is mid-turn when it matters most. Its answer
+//! was to raise a hand on a member of the run instead, so the governor was told
+//! about its own barrier on a row it did not own. `wsp ask`, `wsp flag` and
+//! `wsp govern --tell` each wrote somewhere of their own, and nothing in wsp
+//! could say where a sentence it had accepted had got to.
+//!
+//! Two changes, and they are the two halves of the row.
+//!
+//! **One way in: [`say`].** Every sentence wsp or an agent sends to a seat is
+//! put in that seat's spool and nothing else is attempted from a verb. The
+//! spool is written inside the lock and the verb then calls the *same*
+//! [`deliver_to`] this pass calls, so "delivered now" and "delivered on the next
+//! tick" are the same code with the same gate — [`crate::place::State::will_take_a_prompt`],
+//! asked once, here. **Nothing is refused because a governor is busy: busy means
+//! later, and the spool is the record of the waiting.** With no seat on the
+//! scope there is no spool and no post, so the caller does what it did before —
+//! `cycle.rs` raises the hand on the run's first member, where a person looking
+//! at the run is looking.
+//!
+//! **A turn is the receipt.** `Delivery::Unconfirmed` used to be the end of the
+//! story: the text was typed, nothing moved, the entry cleared, and the line
+//! said so in a way nobody read — *delivered, no turn seen*, printed by
+//! [`crate::cmd_agent::delivered`] to a sender who had no way to act on it. An
+//! entry now clears only on [`crate::place::Delivery::Started`], or on a turn
+//! observed on a later tick at the same seat: the gate means the seat was
+//! [`crate::place::State::Idle`] at the moment of the type, so a turn in flight
+//! now started after it, and that is the confirmation. A type that starts
+//! nothing stays owed and is stamped ([`crate::cmd_watch::Spooled::typed`]),
+//! and is not typed again inside [`RETYPED`]. So the sentence that was sitting in
+//! a composer is not typed twice, the record still says the governor has not
+//! read it, and `--status` names the state in the words [`Tell::why`] prints.
+//!
+//! **The pass does not re-announce what it has already handed over.** A record
+//! put in a seat's spool by `wsp ask` is a level the pass will derive a minute
+//! later — [`crate::cmd_watch::Kind::Unanswered`] — and two lines about one
+//! question in one composer is how a governor learns to skim its inbox. So
+//! `wsp ask` and `wsp flag` record the handover on the message itself (a
+//! [`crate::message::Act::Sent`] hop), and [`already_handed`] skips the edge for
+//! a record this seat was given. The level still goes everywhere else: a hook,
+//! a panel, and a seat that was *not* the one handed it — which is the case that
+//! matters when the addressee stands down and the routing walks up a level.
 
 use crate::agent_commands;
 use crate::cmd_govern;
@@ -86,6 +134,22 @@ use crate::store::Store;
 use crate::util;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+
+/// How long a typed-but-unanswered line waits before it is typed again.
+///
+/// **Two minutes, and it is `cmd_agent::SAME_BREATH`'s number for the same
+/// reason.** That constant exists because a governor retried a message that had
+/// arrived and sent one paragraph three times; this exists because a type that
+/// starts no turn has left its text in a composer, and a second type inside the
+/// window appends to what is already there. `robustness-093` measured the other
+/// half of it — fifteen of Ed's own instructions sat unsubmitted for three days
+/// — so "still owed" cannot mean "type it again now", and two minutes is the
+/// window `worklist-010` measured the retry inside.
+///
+/// What happens after it is a fresh type, which is right rather than cautious:
+/// the text was not taken and nothing has been confirmed about it, and the spool
+/// is still the record of the fact either way.
+const RETYPED: i64 = 120;
 
 /// How a seat's wake spool is named in the register.
 ///
@@ -128,6 +192,14 @@ pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
         if e.to == EVERYONE || e.to.is_empty() {
             continue;
         }
+        // And the level this seat was handed the record for *before* the pass
+        // ever saw it. See the module docs: `wsp ask` and `wsp flag` put the
+        // record in the spool themselves, so without this the question arrives
+        // twice — once as the message, once as `unanswered` — and a governor
+        // paying 208k a wake is the one reader who cannot afford the pair.
+        if already_handed(store, e) {
+            continue;
+        }
         mine.entry(e.to.clone()).or_default().push(e);
     }
     for (scope, theirs) in mine {
@@ -135,9 +207,34 @@ pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
     }
 }
 
+/// Whether this seat has already been given the record this edge is about.
+///
+/// **An `Up` edge only, and the other direction is the reason.** The handover is
+/// a fact about the past — the seat has the words in front of it — so it
+/// suppresses the news that it arrived and nothing else: the level going *down*
+/// when the question is answered is the governor's cue to stop watching for it,
+/// and suppressing that would strand the answer.
+///
+/// The reads are two and both are bounded: an edge with no record is skipped
+/// without touching the store, which is every derived level and the great
+/// majority of a tick, and the records are read once for the whole pass rather
+/// than once per edge.
+fn already_handed(store: &Store, e: &Emit) -> bool {
+    if e.edge != crate::cmd_watch::Edge::Up {
+        return false;
+    }
+    let Some(record) = e.signal.record.as_deref() else { return false };
+    crate::message::raised(store)
+        .iter()
+        .any(|m| m.id == record && m.handed_to(&e.to))
+}
+
 /// One seat's turn: spool everything, write it down, then see whether it is
 /// owed a wake.
-fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) {
+///
+/// Returns what happened, because [`say`] has to tell a caller where its
+/// sentence went and this is the only place that knows. The pass throws it away.
+fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
     let key = key_for(scope);
     let spec = Spec::for_wake(scope);
     let delivered = record(store, &key).0;
@@ -145,7 +242,7 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) {
     // the caller because the caller visits every seat with a record, and a seat
     // at rest must not cost a store write every twenty seconds for ever.
     if emits.is_empty() && load(store, &key).depth() == 0 {
-        return;
+        return Report::at_rest();
     }
 
     // **Appended inside the lock, and what comes back is the record as it
@@ -171,15 +268,151 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) {
     let watermark = Spool::watermark(&spool.held);
     let mut tell = Tell::new(store, scope);
     let written = Stream::new(&spec, &mut tell).tick(at, &mut spool).len();
-    store.update_watch(&key, |rec| {
+    // What is left is read out of the record *inside* the write that settles it,
+    // rather than by a second read of `watches.json` after it: the pass asks
+    // this question for every seat with anything held, every tick, and the
+    // record is already open.
+    let (left, why) = store.update_watch(&key, |rec| {
         // Delivered, so gone — by identity, so a drain that took them first is
         // not undone and anything appended since is not swept away with them.
+        //
+        // **Only when a turn came of it.** `Stream::tick` hands the batch back
+        // when the sink says nothing arrived, and for a seat the honest reading
+        // of `Delivery::Unconfirmed` is *the text is there and nothing has read
+        // it yet* — so it is stamped rather than cleared, and the stamp is what
+        // stops the next tick typing it again. See the module docs.
         if written > 0 {
             Spool::settle(rec, watermark);
+        } else if tell.typed {
+            Spool::stamp_typed(rec, at);
         }
         let now = Spool::of_json(rec.get("spool").unwrap_or(&serde_json::Value::Null));
         stamp(rec, scope, delivered + written, tell.why, &now);
+        (now.depth(), tell.why)
     });
+    Report { scope: scope.to_string(), settled: written, held: left, typed_at: tell.typed_at, why }
+}
+
+/// What happened to a seat's spool, in the words a receipt prints.
+///
+/// **`wsp-146`'s answer to "where did my sentence go"**, and the reason a verb
+/// can hand a sentence over and still say something true about it. A caller
+/// that used to type at a pane and print `delivered, no turn seen` has one of
+/// three things to report and this is the type that says which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Report {
+    /// The scope whose seat this was.
+    pub(crate) scope: String,
+    /// How many entries cleared, which is zero on every tick that merely held.
+    pub(crate) settled: usize,
+    /// How many this seat is still owed.
+    pub(crate) held: usize,
+    /// When its text last went to the seat and no turn came of it, or `None`
+    /// if it never has been.
+    pub(crate) typed_at: Option<i64>,
+    /// Why it is still holding, in the words `--status` prints.
+    pub(crate) why: &'static str,
+}
+
+impl Report {
+    fn at_rest() -> Report {
+        Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET }
+    }
+
+    /// Whether the seat has it now — a turn, not a send. See [`Delivery`].
+    ///
+    /// [`Delivery`]: crate::place::Delivery
+    pub(crate) fn arrived(&self) -> bool {
+        self.settled > 0
+    }
+
+    /// One line, for a caller that has to say where a sentence went.
+    ///
+    /// **Both halves are load-bearing and the second one is the brief's.** A
+    /// receipt that only says *delivered* leaves the sender unable to tell a
+    /// governor that is busy from a governor that has stopped answering, and a
+    /// receipt that only says *held* teaches an agent to stop trusting the
+    /// channel. So it names the post, says whether the seat has it or is owed
+    /// it, says why in the same words `doctor` would, and points at the drain.
+    pub(crate) fn said(&self, what: &str, p: &util::Paint) -> String {
+        if self.arrived() {
+            return format!("{} {} · the seat has it", p.dim("→"), p.bold(&self.scope));
+        }
+        let held = match self.held {
+            0 => String::new(),
+            n => format!(" · {n} still owed"),
+        };
+        let typed = match self.typed_at {
+            Some(at) => format!(" · typed {}s ago", (util::epoch_secs() - at).max(0)),
+            None => String::new(),
+        };
+        format!(
+            "{} {}{held}{typed} · {} · `wsp watch --drain` shows what is held",
+            p.dim("→"),
+            p.bold(what),
+            self.why
+        )
+    }
+}
+
+/// Put a sentence in a seat's spool and try to deliver it once.
+///
+/// **The one way anything reaches a governor, and the reason a verb may not grow
+/// a second one.** `wsp-146` found four verbs with four answers and no way for an
+/// agent to tell which one arrives; the fault was not that they differed but
+/// that three of them typed at a pane themselves, so *busy* came back as a
+/// refusal on a sentence that was already written down.
+///
+/// So: the spool first, inside the lock, and then the very same
+/// [`deliver_to`] the daemon's pass calls — which means the gate, the retry
+/// refusal, the preamble and the acknowledgement are all shared, and "the daemon
+/// will get there" is not a hope but the code path just taken.
+///
+/// `None` when there is no post on the scope at all — the one case this cannot
+/// serve, and the caller does what it did before. The distinction is deliberate
+/// rather than an oversight: a post that has been **stood down from** keeps its
+/// record with no workspace in it, so it is not a seat and its spool does not
+/// exist; a seat whose occupant has died is a post with nobody in it, and the
+/// whole row is that one of those *holds* what it is sent.
+///
+/// The hop on the record is what stops the attention pass announcing the same
+/// thing again a minute later; see [`already_handed`].
+///
+/// # What does *not* come through here, and why
+///
+/// The brief lists four senders and this is four of the five callers. The two
+/// that are deliberately not here are named because "one path" is only
+/// believable if the exceptions are written down:
+///
+/// - **`wsp tell <task>`.** It addresses an *agent's* pane by way of the task it
+///   holds, and a governor holds no task — so it cannot reach a seat at all, and
+///   the row that wants a governor is asking it for the wrong reason. It keeps
+///   its own `Sent`/`twice`/`Refusal::NotTaken` handling, which is a contract
+///   with the person at the keyboard: *I have it and you did not submit it* is a
+///   rescue, and there is nobody to hand a rescue to here.
+/// - **`wsp block`.** It was never refused by anybody: it records the question on
+///   the task and the status, and [`crate::cmd_watch::Kind::Blocked`] takes it from
+///   the store, spools it and wakes the seat. A second line for the same fact
+///   would cost a second context read — measured at 208k — for the sentence, which
+///   the level's own line already points at with `wsp show <id>`. What a block
+///   lacked was the acknowledgement, and that is item 2, which is this module.
+pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) -> Option<Report> {
+    let governors = store.governors();
+    cmd_govern::seat_of_scope(scope, &governors)?;
+    let at = util::epoch_secs();
+    let key = key_for(scope);
+    // Written before anything is attempted, and the durability is the reason
+    // this is inside the lock rather than after the send: a sentence that has
+    // been accepted and lost between the two is the one loss nothing can detect.
+    store.update_watch(&key, |rec| {
+        Spool::append(rec, vec![Spooled::of(at, Line::Note(crate::cmd_watch::Class::Message, text.to_string()))]);
+    });
+    if let Some(id) = record {
+        // Best effort, and deliberately not fatal: the sentence is in the spool
+        // either way, and the only thing this hop suppresses is the duplicate.
+        let _ = crate::message::sent(store, id, scope);
+    }
+    Some(deliver_to(store, scope, &[], at))
 }
 
 /// A wake, told.
@@ -202,19 +435,39 @@ pub(crate) struct Tell<'a> {
     /// driving this row, a wake sat at `0 delivered · holding 2` and the record
     /// could not say whether nobody held the seat, the agent was mid-turn, or
     /// the table simply had not judged anything worth a wake. Those want three
-    /// different repairs and the first two are faults.
+    /// different repairs and the first two are faults. A fourth joined them in
+    /// `wsp-146`: the text was at the seat and nothing had read it, which is
+    /// [`UNREAD`] and looks exactly like the three.
     why: &'static str,
+    /// The text went in and no turn came of it — set only when this attempt
+    /// typed, and read by [`deliver_to`] to stamp the batch it typed. The
+    /// distinction matters because *typed* is the one state that must not be
+    /// typed again straight away.
+    pub(crate) typed: bool,
+    /// When that happened, carried out of the sink so a receipt can say how long
+    /// the seat has been sitting on it.
+    pub(crate) typed_at: Option<i64>,
 }
 
 impl<'a> Tell<'a> {
     fn new(store: &'a Store, scope: &str) -> Tell<'a> {
-        Tell { store, scope: scope.to_string(), why: NOT_YET }
+        Tell { store, scope: scope.to_string(), why: NOT_YET, typed: false, typed_at: None }
     }
 }
 
 /// Nothing here is worth a context read on its own. The ordinary state, and
 /// not a fault: it is what `core-017`'s table is for.
 const NOT_YET: &str = "nothing worth a wake yet";
+
+/// The text is at the seat and no turn has started on it.
+///
+/// **The seventh state, and it is the one `wsp-146` had to add a word for.**
+/// `cmd_agent::delivered` had been printing *"delivered, no turn seen"* for
+/// years, and it was true — but it was said to a sender as though it were the
+/// end of the matter, when for this path the matter is that the governor has
+/// not read the sentence and the spool still owes it. The type stays owed, the
+/// stamp says when it was last typed, and the retry waits [`RETYPED`].
+const UNREAD: &str = "typed at the seat — no turn seen yet, and still owed";
 
 /// Why a pane would not take a wake, in the words `--status` and `doctor`
 /// print.
@@ -341,20 +594,102 @@ impl Sink for Tell<'_> {
         // costs nothing this path was not already paying, because refusing is
         // the ordinary answer here.
         let addressee: Pane = found.seat.clone();
+        // Read once and used three times, which is the shape `wsp-146` needs:
+        // whether to type at all, whether a turn confirms a batch typed on an
+        // earlier tick, and the sentence `--status` prints. One reading of one
+        // fact, because the three can disagree if they are taken separately and
+        // the record then says a seat is mid-turn on the tick it started a turn.
+        let state = place.state(&addressee).unwrap_or_default();
+
+        // **The acknowledgement, and it is asked before the gate.**
+        //
+        // This batch has already been at the seat and no turn came of it, so
+        // there are two questions and only one of them may be answered by typing
+        // again. A turn in flight *now* is that answer: the gate below refuses
+        // anything but an `Idle` seat, so the seat was idle when the text went
+        // in, and a turn in flight since then started after it — which is the
+        // confirmation `Delivery::Started` would have given and could not give
+        // across a tick boundary.
+        //
+        // **First, deliberately.** A governor that read the sentence is by
+        // definition mid-turn, so the gate would refuse exactly the state that
+        // ends the wait, and the entry would sit owed until the seat fell idle
+        // again — reporting a governor that has read the message as one that has
+        // not. `wsp-146` d2, and the reason `delivered, no turn seen` is no
+        // longer a place a sentence comes to rest.
+        if let Some(at) = load(self.store, &key_for(&self.scope)).typed_at() {
+            if state.turn_in_flight() {
+                self.why = NOT_YET;
+                return true;
+            }
+            if util::epoch_secs() - at < RETYPED {
+                self.why = UNREAD;
+                self.typed_at = Some(at);
+                return false;
+            }
+        }
+
+        // The gate, asked only when the answer is *not* already known and the
+        // only thing left to do is type. [`agent_commands::Kind::queue_is_the_agents`]
+        // is that transport named — its docs open on `Place::tell`, herdr typing
+        // — so a kind carrying a queue of its own pays for neither question.
+        //
+        // **Mid-turn is the durability half.** `core-021` d2: not corruption —
+        // Claude Code queues a mid-turn prompt and answers it at the boundary —
+        // but durability, because that queue is the agent's and dies with it
+        // while the spool does not.
+        //
+        // **Asked of `agent.get` and not of the census row `occupant` hands
+        // back.** `herdr::panes` is `pane.list`, and the whole reason
+        // `Herdr::census` makes two calls is that `pane.list` alone cannot tell
+        // a starting agent from an idle one — so a status read off that row is
+        // not a reading of whether a turn is in flight. Driven 2026-08-21: with
+        // the row's status the gate never fired once, and four wakes were
+        // delivered into an agent that `agent.get` reported as `working`
+        // throughout. `place_herdr::turning` carries the same warning for the
+        // same reason.
+        //
+        // **And where the keystrokes land is the other half**, which
+        // [`crate::place::State::turn_in_flight`] does not answer: it is
+        // `Working` and nothing else, so this path would type into a permission
+        // dialog, into an agent still coming up, and into a pane herdr could
+        // not be asked about — the three `cmd_agent::tell` has refused since
+        // robustness-083. The module docs carry it; the question is
+        // [`crate::place::State::will_take_a_prompt`], and asking the wider one
+        // costs nothing this path was not already paying, because refusing is
+        // the ordinary answer here.
         if how.queue_is_the_agents() {
             // `State::Unknown` when herdr could not be asked, which
             // [`held_because`] refuses — an absence is not a fact, least of all
             // the fact that somebody is there to read this.
-            let state = place.state(&addressee).unwrap_or_default();
             if let Some(why) = held_because(state) {
                 self.why = why;
                 return false;
             }
         }
+
         let text = format!("{}\n{}", preamble(&self.scope), said.join("\n"));
         // No `Sent`, no `already_sent`, no `twice` — see this type's docs.
+        //
+        // **Three answers and the middle one is the row.** `Started` is a turn
+        // and clears the batch. `Unconfirmed` is *delivered, no turn claimed* —
+        // and `NotTaken` is the same fact said by a backend that watched: the
+        // sentence arrived and the agent did nothing, which is
+        // `robustness-093`'s fifteen instructions sitting unsubmitted and, for a
+        // wake, a governor that has not read the sentence wsp has already counted
+        // as delivered. Both leave the entry owed and stamp the batch.
         match how.tell(place.as_ref(), &addressee, &text) {
-            Ok(_) => true,
+            Ok(crate::place::Delivery::Started) => true,
+            Ok(crate::place::Delivery::Unconfirmed) | Err(crate::place::Refusal::NotTaken) => {
+                // Typed, and nothing read it. Returning false puts the whole
+                // batch back, and the stamp is what tells the next tick to look
+                // for a turn rather than to type again.
+                self.why = UNREAD;
+                self.typed = true;
+                let now = util::epoch_secs();
+                self.typed_at = Some(now);
+                false
+            }
             Err(_) => {
                 self.why = "the seat would not take it";
                 false
@@ -412,6 +747,7 @@ fn stamp(rec: &mut Value, scope: &str, delivered: usize, why: &str, spool: &Spoo
 mod tests {
     use super::*;
     use crate::cmd_watch::{Edge, Kind, Signal};
+    use crate::Args;
 
     fn emit(kind: Kind, to: &str, subject: &str) -> Emit {
         Emit {
@@ -748,5 +1084,330 @@ mod tests {
             wake(&store, &[], tick * 60);
         }
         assert_eq!(spool_of(&store, "core").depth(), 1, "one fact, however many ticks failed to deliver it");
+    }
+
+    // ---- one path to a governor, and a turn for a receipt --------------------
+
+    /// A store with one task in one project and a seat on that project, and the
+    /// fake herdr behind it.
+    ///
+    /// **The project is what the seat is taken on and not the worklist**, because
+    /// `cycle`'s walk falls back to the first member's project and that is the
+    /// case worth driving: a run whose governor is the one above its work rather
+    /// than its own.
+    fn a_governor(tag: &str, state: crate::place::State) -> (util::Isolated, Store, crate::fake::Fake) {
+        use crate::fake::{Fake, Spot, Stage};
+        let env = util::isolated(tag);
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let mut t = crate::model::Task::new("wsp-146 one path to a governor", "wsp-146");
+        t.project = Some("demo".into());
+        store.save_task(&t).unwrap();
+        // The asker is an agent, not a person at a shell, and the pane it is in
+        // is named rather than left to the environment: `wsp ask` refuses a
+        // question that does not say who is waiting on it, and `my_pane()` reads
+        // `HERDR_PANE_ID`, which every other test in this binary also writes.
+        // A member holding the task is the whole of what makes this a member's
+        // question — an answer goes home to the asker's task, so this is what
+        // the return path is built on.
+        std::env::set_var("HERDR_PANE_ID", "w1:p2");
+        store.set_binding("w1:p2", json!({ "pane": "w1:p2", "task_id": "wsp-146" }));
+
+        let mut spot = Spot::agent("w1:p1", "claude", "demo", state);
+        spot.space = "w1".into();
+        let mut stage = Stage::new();
+        stage.put(spot);
+        cmd_govern::take(&store, "demo", "w1", "w1:p1");
+        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let (k, v) = fake.socket_env();
+        std::env::set_var(k, v);
+        (env, store, fake)
+    }
+
+    fn told_to(fake: &crate::fake::Fake) -> Vec<String> {
+        fake.asked()
+            .into_iter()
+            .filter(|a| a.verb == crate::fake::Verb::Tell)
+            .map(|a| a.said)
+            .collect()
+    }
+
+    fn told_count(fake: &crate::fake::Fake) -> usize {
+        fake.asked().iter().filter(|a| a.verb == crate::fake::Verb::Tell).count()
+    }
+
+    fn delivered_to(store: &Store, scope: &str) -> usize {
+        store
+            .watches()
+            .get(&key_for(scope))
+            .and_then(|v| v.get("delivered"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize
+    }
+
+    /// **The row's whole claim, in one drive.** A governor mid-turn, a member
+    /// asking it a question, a run telling it a verdict — and nothing refused,
+    /// nothing lost and nothing counted as arrived.
+    ///
+    /// This is the acceptance test `wsp-146` names, and every word in it is a
+    /// failure that used to happen: `wsp ask` reached the seat by asking the
+    /// attention pass to derive `unanswered` a minute later, `cycle`'s verdict
+    /// went through `govern --tell`, which **refuses a `Working` seat** — so the
+    /// verdict came back as a hand raised on a member of the run — and the
+    /// entry that reached a seat cleared on the *send* rather than on anything
+    /// the seat did.
+    #[test]
+    fn a_question_and_a_verdict_reach_a_busy_governor_on_its_next_idle_and_only_a_turn_closes_them() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-asked", State::Working);
+
+        // The member's question, through the verb an agent is told to use.
+        let asked = Args::parse(vec![
+            "wsp".into(),
+            "wsp-146".into(),
+            "may I land this, or does the barrier want a verifier first?".into(),
+        ]);
+        assert_eq!(crate::cmd_message::ask(&store, &asked), 0, "the question is raised");
+
+        // The run's verdict, through the half of `cycle::tell` that decides
+        // where a verdict goes — a two-line wrapper the test cannot reach
+        // through `tell` itself, which stops at recording the sentence.
+        let mut w = crate::model::Worklist::new("run", "tonight's run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group {
+            members: vec!["wsp-146".into()],
+            ..crate::model::Group::default()
+        }]);
+        store.save_worklist(&w).unwrap();
+        assert!(
+            crate::cycle::hand_it_to_the_governor(&store, &w, "group 1 is at its barrier — go on or hold"),
+            "the run's own governor took the verdict, having found the seat above its project"
+        );
+
+        // **Nothing was refused and nothing was typed.** The seat is mid-turn,
+        // and mid-turn is the state this row exists for: `cycle` used to be told
+        // *not ready — working* here and answered by raising a hand on `wsp-146`.
+        assert!(told_to(&fake).is_empty(), "a busy seat is not typed at");
+        assert_eq!(spool_of(&store, "demo").depth(), 2, "both sentences are owed, and the record is the record");
+        assert_eq!(delivered_to(&store, "demo"), 0, "and nothing has arrived");
+        assert_eq!(
+            crate::message::raised(&store).len(),
+            1,
+            "one record: the question. The verdict has no record and is not owed an answer"
+        );
+
+        // The seat comes free. The next pass is what delivers, and it delivers
+        // both in one typing — the flush is a batch, and a governor is not made
+        // to pay two context reads for one barrier.
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
+        wake(&store, &[], util::epoch_secs());
+
+        let said = told_to(&fake);
+        assert_eq!(said.len(), 1, "one typing, carrying everything held: {said:?}");
+        assert!(said[0].contains("may I land this"), "the question is in it: {}", said[0]);
+        assert!(said[0].contains("at its barrier"), "and so is the verdict: {}", said[0]);
+        // The return path rides the message rather than being something the
+        // governor has to know by convention — `worklist-013` cost 2h14m for
+        // exactly that omission.
+        assert!(said[0].contains("wsp answer m-"), "and it says how to answer it: {}", said[0]);
+        assert_eq!(spool_of(&store, "demo").depth(), 0, "a turn started, so both are delivered");
+        assert_eq!(delivered_to(&store, "demo"), 2, "and the count says what the seat did, not what wsp sent");
+    }
+
+    /// **A type that starts no turn is still owed, and it is not typed again.**
+    ///
+    /// The `robustness-093` case — the text is in the composer and nobody pressed
+    /// return — which for this path used to be the end of the story: the entry
+    /// cleared, the line said *delivered, no turn seen*, and a governor that had
+    /// read nothing was counted as having been told. `takes = false` on the fake
+    /// is herdr's `agent_prompt_stalled`, which is the only answer a backend that
+    /// watched can give about it.
+    #[test]
+    fn a_type_that_starts_no_turn_is_still_owed_and_is_not_typed_again_inside_the_window() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-unread", State::Idle);
+        // The seat takes the sentence and does nothing with it.
+        let mut next = fake.stage();
+        next.takes = false;
+        fake.restage(next);
+
+        let report = say(&store, "demo", "the barrier is open — start group 2", None).expect("a seat on the scope");
+        assert!(!report.arrived(), "nothing read it, so nothing arrived: {report:?}");
+        assert_eq!(report.held, 1, "and it is still owed");
+        assert!(told_count(&fake) == 1, "it was typed once");
+
+        // Two more ticks, seconds apart. Each one *could* type it again, and each
+        // one must not: the text is sitting in a composer, and typing at it again
+        // appends to what is there. That is `worklist-010`'s harm — one
+        // paragraph, delivered three times — arriving through the retry this row
+        // introduced.
+        for tick in 1..3 {
+            wake(&store, &[], util::epoch_secs() + tick);
+        }
+        assert_eq!(told_count(&fake), 1, "one typing, however many ticks have gone by");
+        assert_eq!(spool_of(&store, "demo").depth(), 1, "still owed");
+        assert_eq!(delivered_to(&store, "demo"), 0, "and nothing has been counted as delivered");
+        assert!(holding(&store, "demo") == UNREAD, "and the record says which state it is in: {}", holding(&store, "demo"));
+
+        // A turn at last. It confirms the sentence that is already there, so it
+        // clears the entry **without typing anything**.
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
+        wake(&store, &[], util::epoch_secs() + 10);
+
+        assert_eq!(told_count(&fake), 1, "a turn is not a second sentence");
+        assert_eq!(spool_of(&store, "demo").depth(), 0, "and the governor has it");
+        assert_eq!(delivered_to(&store, "demo"), 1, "delivered, on the turn and not on the type");
+    }
+
+    /// **The daemon may die between the type and the turn, and the sentence goes
+    /// out once.**
+    ///
+    /// The brief's live case, as a test: the only thing that crosses a restart is
+    /// the record, so what matters is that the record says *typed, no turn yet* and
+    /// that the next process reads it rather than typing again. The second
+    /// `Store` is the restarted daemon — same directory, no memory of the type.
+    #[test]
+    fn a_daemon_that_dies_between_the_type_and_the_turn_does_not_send_the_sentence_twice() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-restart", State::Idle);
+        let mut next = fake.stage();
+        next.takes = false;
+        fake.restage(next);
+
+        say(&store, "demo", "group 1 is at its barrier", None);
+        assert_eq!(told_count(&fake), 1);
+        fake.forget();
+
+        // The process goes. Nothing but `watches.json` survives.
+        let restarted = Store::at(_env.home(), _env.state());
+        assert_eq!(spool_of(&restarted, "demo").depth(), 1, "the sentence is on disk, owed");
+        wake(&restarted, &[], util::epoch_secs());
+        assert_eq!(told_count(&fake), 0, "nothing re-typed: the record said it was already at the seat");
+
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
+        wake(&restarted, &[], util::epoch_secs());
+        assert_eq!(told_count(&fake), 0, "and the turn confirmed it rather than repeating it");
+        assert_eq!(spool_of(&restarted, "demo").depth(), 0, "delivered exactly once, to a seat that read it");
+        assert_eq!(delivered_to(&restarted, "demo"), 1);
+    }
+
+    /// **The pass does not announce to a seat that was already handed the
+    /// record.**
+    ///
+    /// `wsp ask` puts the question in the seat's spool itself; the attention pass
+    /// derives `unanswered` for the same record a minute later. Without this the
+    /// governor is told twice, and every wake costs it 208k — measured on the seat
+    /// that filed `core-014`, for the same price as a question from Ed. The second
+    /// half is the half that matters most: the level still goes to a seat that was
+    /// *not* handed it, which is what happens when the addressee stands down and
+    /// the routing walks up a level.
+    #[test]
+    fn a_record_the_seat_was_handed_is_not_announced_to_it_again_but_still_goes_to_whoever_else() {
+        use crate::fake::Spot;
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-handed", State::Working);
+        // A second post, and a second seat, so "where else it still goes" is one
+        // assertion rather than an argument.
+        let mut other = Spot::agent("w2:p1", "claude", "other", State::Working);
+        other.space = "w2".into();
+        let mut stage = fake.stage();
+        stage.put(other);
+        fake.restage(stage);
+        cmd_govern::take(&store, "other", "w2", "w2:p1");
+
+        let asked = Args::parse(vec!["wsp".into(), "wsp-146".into(), "which one?".into()]);
+        assert_eq!(crate::cmd_message::ask(&store, &asked), 0);
+        let record = crate::message::raised(&store)
+            .into_iter()
+            .find(|m| m.handed_to("demo"))
+            .expect("the record remembers the seat it was handed to")
+            .id;
+        assert_eq!(spool_of(&store, "demo").depth(), 1, "the question itself");
+
+        // The pass, a minute later, deriving the level for the same record — to
+        // the seat that was handed it, and to one that was not.
+        let level = crate::cmd_watch::Signal::new(Kind::Unanswered, "wsp-146", "w1:p1 waiting").of(&record);
+        let mine = Emit { edge: crate::cmd_watch::Edge::Up, signal: level.clone(), held: 0, to: "demo".into() };
+        let theirs = Emit { edge: crate::cmd_watch::Edge::Up, signal: level, held: 0, to: "other".into() };
+        wake(&store, &[mine, theirs], util::epoch_secs());
+
+        assert_eq!(spool_of(&store, "demo").depth(), 1, "the seat that has it is not told again");
+        assert_eq!(spool_of(&store, "other").depth(), 1, "and the level still reaches everybody else");
+        // And the edge that *goes down* is not suppressed: the governor's cue to
+        // stop watching for the question is worth more than the saving.
+        let down = Emit {
+            edge: crate::cmd_watch::Edge::Down,
+            signal: crate::cmd_watch::Signal::new(Kind::Unanswered, "wsp-146", "answered").of(&record),
+            held: 30,
+            to: "demo".into(),
+        };
+        wake(&store, &[down], util::epoch_secs() + 60);
+        assert_eq!(spool_of(&store, "demo").depth(), 2, "the question closing is still news");
+    }
+
+    /// **With no seat on the scope there is no spool, and the caller keeps its own
+    /// way.**
+    ///
+    /// The brief's fourth item, and the reason `say` returns an `Option`: a run
+    /// with nobody governing it must still put its verdict where a person will
+    /// see it, and that is a hand on the run's first member — which is what
+    /// `cycle::tell` has always done and what it fell back to *for the wrong
+    /// reason* before this row.
+    #[test]
+    fn with_no_post_on_the_scope_there_is_no_spool_to_write_to() {
+        let env = util::isolated("wake-nopost");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+
+        assert!(say(&store, "nobody", "a verdict", None).is_none(), "no post, no spool");
+        assert!(!store.watches().contains_key(&key_for("nobody")), "and no record invented for one");
+
+        // The run's own answer, which is the one the brief keeps: the hand on
+        // the member a person looking at the run is looking at.
+        let mut t = crate::model::Task::new("a member", "m-1");
+        t.project = Some("demo".into());
+        store.save_task(&t).unwrap();
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..crate::model::Group::default() }]);
+        store.save_worklist(&w).unwrap();
+        assert!(
+            !crate::cycle::hand_it_to_the_governor(&store, &w, "group 1 is at its barrier"),
+            "so the caller is told to find its own way, and does"
+        );
+    }
+
+    /// **What a verb is told, and what `wsp-146` made it say.**
+    ///
+    /// Two things a receipt has never had to carry. *Where it went* — a verb
+    /// whose whole effect is on somebody else's screen must name the screen. And
+    /// *when it will arrive*, which for the first time can honestly be "later":
+    /// an agent that cannot tell later from never is how a question sits open for
+    /// a night, and `worklist-013`'s 2h14m is the measurement of what that costs.
+    #[test]
+    fn a_receipt_names_the_post_and_says_whether_the_seat_has_it_yet() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-receipt", State::Working);
+        let report = say(&store, "demo", "a question for you", None).expect("a seat on the scope");
+
+        let busy = report.said("the demo seat", &util::Paint::plain());
+        assert!(busy.contains("the demo seat"), "it names the post: {busy}");
+        assert!(busy.contains("1 still owed"), "and how much: {busy}");
+        assert!(busy.contains("mid-turn"), "and why not yet, in the words doctor prints: {busy}");
+        assert!(busy.contains("wsp watch --drain"), "and what else is held for it: {busy}");
+
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
+        let mut next = fake.stage();
+        next.takes = false;
+        fake.restage(next);
+        let report = say(&store, "demo", "and another", None).expect("a seat on the scope");
+        let typed = report.said("the demo seat", &util::Paint::plain());
+        assert!(typed.contains("typed"), "a seat that took it and read nothing says so: {typed}");
+        assert!(!typed.contains("still owed 0"), "and it is still owed: {typed}");
     }
 }
