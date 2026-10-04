@@ -1263,6 +1263,23 @@ impl Place for Compound<'_> {
         Ok(self.state_of(seat, &rec, &alive(&pids)))
     }
 
+    fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {
+        let dir = self.dir_of(seat).ok()?;
+        // No log is *cannot say*, not *no turn*: a seat that predates the file.
+        let log = fs::read_to_string(dir.join(HOOKS_FILE)).ok()?;
+        // Newest first, and out as soon as a line is older than the question.
+        for line in log.lines().rev() {
+            let Ok(h) = serde_json::from_str::<Value>(line) else { continue };
+            if util::epoch_of(&str_of(&h, "at")) < since {
+                return Some(false);
+            }
+            if str_of(&h, "hook") == "UserPromptSubmit" {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     fn census(&self) -> Result<Census> {
         // One machine, and it is this one — a compound session is a local
         // pty and there is no fan-out here for `Census` to speak for.
@@ -1514,6 +1531,37 @@ mod tests {
         place.heard(&seat, "PermissionRequest", said_by("PermissionRequest").unwrap(), &json!({}));
         assert_eq!(place.state(&seat).unwrap(), State::Working);
         assert!(!place.state(&seat).unwrap().will_take_a_prompt(), "a sentence would land in the dialog");
+    }
+
+    /// **`wsp-166`: a turn that starts and ends between two samples is still a
+    /// turn.** The seat goes idle, working, idle inside one tick, so every
+    /// reading of `state` says `Idle` — and the log is what says it happened.
+    #[test]
+    fn a_turn_shorter_than_a_tick_is_found_in_the_log_though_no_sample_saw_it() {
+        let scratch = Scratch::new("turn-since");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let dir = place.dir_of(&seat).unwrap();
+        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
+        let _ = write_atomic(
+            &dir.join(SEAT_FILE),
+            &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
+                .to_string(),
+        );
+        place.heard(&seat, "SessionStart", said_by("SessionStart").unwrap(), &json!({}));
+        let typed = util::epoch_secs();
+        assert_eq!(place.turn_began_since(&seat, typed), Some(false), "nothing since the type");
+
+        for hook in ["UserPromptSubmit", "Stop"] {
+            place.heard(&seat, hook, said_by(hook).unwrap(), &json!({}));
+        }
+        assert_eq!(place.state(&seat).unwrap(), State::Idle, "every sample reads idle");
+        assert_eq!(place.turn_began_since(&seat, typed), Some(true), "and a turn began");
+        assert_eq!(
+            place.turn_began_since(&seat, util::epoch_secs() + 5),
+            Some(false),
+            "a turn before the type is not an answer to it"
+        );
     }
 
     /// **`compound-107`: `said.json` cannot tell "one hook ever fired" from

@@ -1163,6 +1163,21 @@ pub trait Place {
     /// `place_herdr`.
     fn state(&self, seat: &Seat) -> Result<State>;
 
+    /// Whether a turn *began* at this seat at or after `since` (epoch seconds),
+    /// for a backend that keeps a record of turns rather than only a present
+    /// tense. `None` is *this backend cannot say*, and the caller falls back to
+    /// sampling [`Place::state`].
+    ///
+    /// **Why a sample is not enough.** `wsp-166`: a governor's reply to a typed
+    /// batch is one to two seconds long, the pass samples every twenty, and a
+    /// turn that starts and ends between two samples is never seen — so the
+    /// batch it answered stayed owed and was typed again every `RETYPED` for
+    /// a night. A compound seat's hooks write down every turn start, so the
+    /// question has an exact answer there.
+    fn turn_began_since(&self, _seat: &Seat, _since: i64) -> Option<bool> {
+        None
+    }
+
     /// Every seat this backend has, and what is in it.
     ///
     /// The one read that stays on this side of the line: what a backend is

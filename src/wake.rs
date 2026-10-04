@@ -618,7 +618,11 @@ impl Sink for Tell<'_> {
         // not. `wsp-146` d2, and the reason `delivered, no turn seen` is no
         // longer a place a sentence comes to rest.
         if let Some(at) = load(self.store, &key_for(&self.scope)).typed_at() {
-            if state.turn_in_flight() {
+            // **Or a turn that began and ended since the type**, which a sample
+            // cannot see: `wsp-166` measured cpd-250's replies at one to two
+            // seconds against a twenty-second tick, so most were never seen
+            // and the batch was typed again every [`RETYPED`] all night.
+            if state.turn_in_flight() || place.turn_began_since(&addressee, at) == Some(true) {
                 self.why = NOT_YET;
                 return true;
             }
@@ -678,6 +682,10 @@ impl Sink for Tell<'_> {
         // `robustness-093`'s fifteen instructions sitting unsubmitted and, for a
         // wake, a governor that has not read the sentence wsp has already counted
         // as delivered. Both leave the entry owed and stamp the batch.
+        // Taken *before* the type: a turn's start is stamped by its seat in
+        // whole seconds while the type is still returning, so a stamp taken
+        // after would postdate the very turn it is waiting for.
+        let before = util::epoch_secs();
         match how.tell(place.as_ref(), &addressee, &text) {
             Ok(crate::place::Delivery::Started) => true,
             Ok(crate::place::Delivery::Unconfirmed) | Err(crate::place::Refusal::NotTaken) => {
@@ -686,8 +694,7 @@ impl Sink for Tell<'_> {
                 // for a turn rather than to type again.
                 self.why = UNREAD;
                 self.typed = true;
-                let now = util::epoch_secs();
-                self.typed_at = Some(now);
+                self.typed_at = Some(before);
                 false
             }
             Err(_) => {
