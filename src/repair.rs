@@ -157,6 +157,19 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         crate::cycle::end_all(store, crate::cycle::last_barrier_left_behind(store, &w));
     }
+    // And every verifier whose verdict is recorded, whichever group it read.
+    // `wsp-158` — a verifier's turn ends with its own verdict and it was then
+    // left sitting in its seat holding a claim for the rest of the night.
+    let verdicts = crate::cycle::verdicts_recorded(store);
+    if !verdicts.is_empty() {
+        crate::cycle::stamp(&format!(
+            "{} recorded a verdict and {} nothing left to do — ending {}",
+            verdicts.len(),
+            if verdicts.len() == 1 { "has" } else { "have" },
+            verdicts.join(" ")
+        ));
+    }
+    crate::cycle::end_all(store, verdicts);
 }
 
 // ---- a member whose agent is not working on it ----------------------------

@@ -73,6 +73,29 @@ use crate::util;
 use crate::worklist::{self, Reading, Settlement};
 use crate::Args;
 
+/// The run a start belongs to, handed to `wsp spawn` in its environment so the
+/// row records its owner. `wsp-158`.
+///
+/// **A recorded fact and not a guess from titles.** A governor's helper — the
+/// agent spawned to install a binary mid-group — is a member of nothing and a
+/// verifier of nothing, and the only way wsp ends it at the pass is to have
+/// written down that this run opened it. The environment is the seam: the
+/// spawn is already a process this module starts, and a row that names its own
+/// owner survives a daemon restart, a rename and a machine moving.
+pub(crate) const OWNED_LIST: &str = "WSP_RUN_LIST";
+/// The group within it, 1-based — see [`OWNED_LIST`].
+pub(crate) const OWNED_GROUP: &str = "WSP_RUN_GROUP";
+
+/// The marker a row carries for "this run opened me", written by `wsp spawn`
+/// from [`OWNED_LIST`]. `wsp-158`.
+///
+/// **In the `## Log` and not in the tags**, because tags are what `wsp ls -t`
+/// and `wsp project show` are for: a governance fact about which run happened
+/// to start a row is not a thing anybody filters work by. The log is a store
+/// record that survives everything, which is what a pass needs to find the
+/// owner of a helper months later.
+pub(crate) const OWNED: &str = "wsp: started by this run";
+
 /// The tag on a verifier's row. Its parent is the member it verifies.
 pub(crate) const VERIFY_TAG: &str = "verify";
 /// The tag on the row of the agent that checks a barrier.
@@ -437,7 +460,7 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
         let Some(t) = store.find_task(&s.id) else { continue };
         if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap) {
             stamp(&format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
-            if spawn(store, &s.id, &own, Undo::Member) {
+            if spawn(store, &s.id, &own, Undo::Member, (&w.id, &at.to_string())) {
                 started.push(s.id.clone());
             } else {
                 failed(store, &w, &s.id);
@@ -452,7 +475,7 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
             // On the kind the work ran on — `wsp-134` d1 (C) — which in a
             // mixed group is the member's own line and not the group's.
             let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
-            if spawn(store, &v, &on, Undo::Row) {
+            if spawn(store, &v, &on, Undo::Row, (&w.id, &at.to_string())) {
                 started.push(v);
             } else {
                 failed(store, &w, &v);
@@ -475,7 +498,7 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
         match holding_barrier(store, seats, &w, &pos) {
             None => {
                 if let Some(b) = open_barrier(store, &w, at, g) {
-                    if spawn(store, &b, &policy, Undo::Row) {
+                    if spawn(store, &b, &policy, Undo::Row, (&w.id, &at.to_string())) {
                         started.push(b);
                     } else {
                         failed(store, &w, &b);
@@ -1033,8 +1056,8 @@ enum Undo {
 /// A failure is written on the row and put back per [`Undo`]; the caller
 /// tells the seat. Never silent: a run that cannot start its next agent is
 /// a run that has stopped.
-fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo) -> bool {
-    let failed = start(id, policy);
+fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &str)) -> bool {
+    let failed = start(id, policy, owned);
     let Some(why) = failed else { return true };
     stamp(&format!("FAILED spawn {id}: {why}"));
     let saved = store.locked(|| {
@@ -1053,7 +1076,7 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo) -> bool {
 }
 
 /// `wsp spawn <id> --agent …`, and its refusal if it refused.
-fn start(id: &str, policy: &Policy) -> Option<String> {
+fn start(id: &str, policy: &Policy, owned: (&str, &str)) -> Option<String> {
     // A test's binary is the harness: record what would have started instead.
     if cfg!(test) {
         #[cfg(test)]
@@ -1069,7 +1092,15 @@ fn start(id: &str, policy: &Policy) -> Option<String> {
     let mut argv: Vec<String> = vec!["spawn".into(), id.into(), "--agent".into()];
     argv.extend(policy.spawn_flags());
     stamp(&format!("spawn {}", argv[1..].join(" ")));
-    match Command::new(exe).args(&argv).stdin(Stdio::null()).output() {
+    let child = Command::new(exe)
+        .args(&argv)
+        .stdin(Stdio::null())
+        // The run this start belongs to, so the row records its owner and a
+        // later pass can end everything the group opened. `wsp-158`.
+        .env(crate::cycle::OWNED_LIST, owned.0)
+        .env(crate::cycle::OWNED_GROUP, owned.1)
+        .output();
+    match child {
         Ok(o) if o.status.success() => None,
         Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
         Err(e) => Some(e.to_string()),
@@ -1094,6 +1125,35 @@ fn failed(store: &Store, w: &Worklist, id: &str) {
 /// The governor used to do all of this by hand, and a run wsp starts has to be
 /// a run wsp tidies, or every group leaves its agents standing.
 fn end_behind(store: &Store, w: &Worklist, passed: usize) {
+    end_group(store, w, passed);
+}
+
+/// Every row a passed group opened, ended. `wsp-158`.
+///
+/// **Four kinds, and the fourth is the point.** A group's members and their
+/// verifiers were named by the group text, so they were always findable. The
+/// barrier check is named by a title. But a governor will spawn a helper — the
+/// agent that installs a binary, or drives a delivery live — and that row is a
+/// member of nothing and a verifier of nothing, so nothing could find it and
+/// every group left one more seat standing. Measured on `wsp-process` with
+/// group 1 passed and group 2 running: wsp-153 (the barrier check, idle and
+/// holding its claim), wsp-154 (a helper, idle at review) and wsp-157 (a
+/// verifier that had recorded its verdict and had nothing left to do).
+///
+/// So ownership is a fact written when the spawn is issued rather than a guess
+/// made when the pass runs — [`OWNED`], on the row's log. A helper that was
+/// never claimed as a run row is a helper this cannot end, and the honest
+/// thing for that is a report rather than a guess from a title.
+///
+/// **The barrier check behind the pass, not the one in front of it.** The check
+/// in front is running the `go` that got us here, and ending it now would cut
+/// the turn in which it reviews its own row. [`crate::repair`] ends that one a
+/// tick later, when it has long been idle.
+///
+/// Every row of the previous barrier, not the one with the bare title: a group
+/// that held twice has two rows (`wsp-136` item 2), and a re-check is an agent
+/// like any other.
+pub(crate) fn end_group(store: &Store, w: &Worklist, passed: usize) {
     let groups = w.groups();
     let Some(g) = groups.get(passed - 1) else { return };
     let tasks = store.tasks();
@@ -1106,13 +1166,27 @@ fn end_behind(store: &Store, w: &Worklist, passed: usize) {
             .map(|t| t.id.clone()),
     );
     if passed > 1 {
-        // **Every row of the previous barrier, not the one with the bare
-        // title.** A group that held twice has two barrier rows (`wsp-136`
-        // item 2), and a re-check is an agent like any other — leaving the
-        // held one standing is exactly the leak this row exists to close.
         ids.extend(tasks.iter().filter(|t| is_barrier(t, &w.id, passed - 1)).map(|t| t.id.clone()));
     }
+    ids.extend(owned_by(tasks.iter(), &w.id, passed));
+    ids.sort();
+    ids.dedup();
     end_all(store, ids);
+}
+
+/// The rows the run opened that the group text does not name: a governor's
+/// helper, and anything else spawned while the group was going.
+///
+/// **Matched on the marker and the two values beside it**, so a helper of group
+/// 3 is not ended when group 2 passes. A marker alone would do that, and a run
+/// whose groups pass out of order — which a `hold` and a resume can produce —
+/// would end work that is still in front of it.
+fn owned_by<'a>(tasks: impl Iterator<Item = &'a Task>, list: &str, group: usize) -> Vec<String> {
+    let want = format!("{OWNED} {list} group {group}");
+    tasks
+        .filter(|t| t.section("Log").is_some_and(|l| l.lines().any(|x| x.contains(&want))))
+        .map(|t| t.id.clone())
+        .collect()
 }
 
 /// End every row in `ids` that still holds a claim, through `wsp despawn`.
@@ -1165,6 +1239,130 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
     standing
 }
 
+/// Everything a run opened, ended at a closing that is not a pass: `hold` and
+/// `done`. `wsp-158`.
+///
+/// **Why these two and not only a pass.** A barrier that closes is a barrier
+/// that closes — `wsp-158`'s own heading is "a closed barrier leaves nothing
+/// open", and a `done` and a `hold` are how a run ends when the plan was wrong
+/// or the work is over early. Ending only at a `go` leaves the commonest ending
+/// tidied by hand, which is the state this row was written about.
+///
+/// **`at` is the group the run stands at, and `None` means every group.** A
+/// `done` on a list with a group still open is the case the row calls out, so
+/// every group is closed over rather than only the last one passed — and the
+/// verdict is `wsp despawn`'s own, which keeps a tree with uncommitted work and
+/// says so.
+///
+/// **Said, not done quietly.** The seat is told, because ending an agent on work
+/// somebody may have meant to return to is not a thing to do without a record,
+/// and `cycle.log` is where the record of a run is read.
+pub(crate) fn end_what_the_run_opened(store: &Store, list: &str, at: Option<usize>) {
+    let Some(w) = store.worklist(list) else { return };
+    let tasks = store.tasks();
+    let mut ids: Vec<String> = Vec::new();
+    match at {
+        // Every barrier of the list, and every verifier under a member of it:
+        // nothing the run opened is still doing what it was opened for.
+        None => {
+            ids.extend(tasks.iter().filter(|t| t.tags.iter().any(|g| g == BARRIER_TAG)).map(|t| t.id.clone()));
+            ids.extend(
+                tasks
+                    .iter()
+                    .filter(|t| t.tags.iter().any(|g| g == VERIFY_TAG))
+                    .filter(|t| {
+                        t.parent.as_deref().and_then(|p| store.find_task(p)).is_some_and(|m| {
+                            w.groups().iter().any(|g| g.members.contains(&m.id))
+                        })
+                    })
+                    .map(|t| t.id.clone()),
+            );
+            for (i, _) in w.groups().iter().enumerate() {
+                ids.extend(owned_by(tasks.iter(), list, i + 1));
+            }
+        }
+        Some(at) => {
+            let groups = w.groups();
+            let Some(g) = groups.get(at - 1) else { return };
+            ids.extend(g.members.clone());
+            ids.extend(
+                tasks
+                    .iter()
+                    .filter(|t| t.tags.iter().any(|x| x == VERIFY_TAG))
+                    .filter(|t| t.parent.as_ref().is_some_and(|p| g.members.contains(p)))
+                    .map(|t| t.id.clone()),
+            );
+            ids.extend(tasks.iter().filter(|t| is_barrier(t, list, at)).map(|t| t.id.clone()));
+            ids.extend(owned_by(tasks.iter(), list, at));
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    let claims = store.claims();
+    let standing: Vec<String> = ids.iter().filter(|id| claims.contains_key(*id)).cloned().collect();
+    if standing.is_empty() {
+        return;
+    }
+    stamp(&format!(
+        "{list} is closing over {} that the run opened and left standing — ending {}",
+        standing.len(),
+        standing.join(" ")
+    ));
+    if let Some(w) = store.worklist(list) {
+        tell(store, &w, &format!(
+            "The {list} run is closing, and these agents it opened had nothing left to do: {}. \
+             `wsp wip` shows anything that stayed standing.",
+            standing.join(" ")
+        ));
+    }
+    end_all(store, standing);
+}
+
+/// Every agent this run opened that has nothing left to do, and holds a claim.
+///
+/// **Three kinds, and the first is the commonest leak.** A verifier ends its
+/// turn by reviewing or blocking its own row, which is the last thing it is
+/// asked to do — and it was then left sitting there holding a claim for ever.
+/// Measured on `wsp-process`: wsp-157 idle at review in cpd-246, hours after
+/// its verdict was on the member. A re-verify is a fresh agent anyway
+/// (`wsp-136` item 1), so nothing is lost by ending it and a whole context is
+/// saved.
+///
+/// **A blocker is ended too.** A verifier that blocked has said what has to
+/// change; its job is finished either way, and the member's agent is who does
+/// the changing.
+///
+/// **Ended on a tick rather than on the verdict**, and that is the same ordering
+/// [`last_barrier_left_behind`] argues: the verb that records the verdict is the
+/// agent's own last turn, and ending it inside that turn cuts it short. A tick
+/// later it has long been idle and the claim is the record that it has not been
+/// ended yet.
+///
+/// **Only rows of a *running* list**, and only rows whose list is named on them
+/// — a verifier's parent chain says which member, and the member says which
+/// list. A verifier belonging to a draft or a held list is a governor's to
+/// finish.
+pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
+    let tasks = store.tasks();
+    let claims = store.claims();
+    tasks
+        .iter()
+        .filter(|t| t.tags.iter().any(|g| g == VERIFY_TAG))
+        .filter(|t| matches!(t.status(), Status::Review | Status::Done | Status::Blocked))
+        .filter(|t| claims.contains_key(&t.id))
+        .filter(|t| {
+            // The list is reached through the member, and through the *running*
+            // lists only — a verifier under work in a draft is not this run's.
+            let member = t.parent.as_deref().and_then(|p| store.find_task(p));
+            member.is_some_and(|m| worklist::Running::read(store).list_of(&m.id).is_some())
+        })
+        .map(|t| t.id.clone())
+        .collect()
+}
+
+/// `wsp despawn <id>`, as a process, for the same reason every other spawn is:
+/// the ending is a verb's whole behaviour and reimplementing it here would be a
+/// second answer that could disagree with it.
 pub(crate) fn despawn(id: &str) {
     if cfg!(test) {
         #[cfg(test)]
@@ -1178,7 +1376,15 @@ pub(crate) fn despawn(id: &str) {
         Ok(o) => format!("not ended: {}", String::from_utf8_lossy(&o.stderr).trim()),
         Err(e) => format!("not ended: {e}"),
     };
+    // **`wsp despawn` says whether it kept a tree, and so do we.** Ending is the
+    // whole of `despawn` — agent, claim, tree — and the tree is kept whenever it
+    // has uncommitted work or somebody is standing in it. That is the right
+    // behaviour and it is invisible from here unless it is carried: a run that
+    // closed its group leaving five trees behind is a state a governor has to be
+    // able to find, and `cycle.log` is where the run's history is read.
+    let kept = said.contains("kept") || said.contains("uncommitted");
     stamp(&format!("despawn {id}: {said}"));
+    kept.then(|| stamp(&format!("despawn {id}: its tree was kept — `wsp wip` shows what is standing in it")));
 }
 
 /// The seat that answers for a run: the list's own, when somebody holds it,
@@ -1790,6 +1996,136 @@ fn only_a_working_screen_is_ever_overruled() {
         );
     }
 
+    /// `wsp-158` item 1, and the commonest of the four leaks. A verifier's turn
+    /// ends with its own verdict — a note on the member and then a review of its
+    /// own row — and it was then left sitting there holding a claim for the rest
+    /// of the night. Measured on `wsp-process`: wsp-157 idle at review in
+    /// cpd-246, hours after recording it.
+    ///
+    /// **Ended on a tick rather than on the verdict**, because the verb recording
+    /// the verdict *is* the agent's last turn and ending it inside that turn cuts
+    /// it short. A re-verify is a fresh agent anyway, so nothing is lost.
+    #[test]
+    fn a_verifier_whose_verdict_is_recorded_is_ended_by_a_tick() {
+        use crate::repair::Pass;
+
+        let (_env, store) = scratch("verdicted");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        let v = tagged(&store, VERIFY_TAG).remove(0);
+        let _ = spawned();
+
+        set(&store, &v.id, Status::Review);
+        store.set_claim(&v.id, serde_json::json!({ "workspace": "w" }));
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert_eq!(
+            tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
+            vec![v.id.clone()],
+            "a verdict is the last thing a verifier is asked for"
+        );
+
+    }
+
+    /// The other verdict. A verifier that blocked has said what has to change;
+    /// its job is finished either way, and it is the member's agent who does the
+    /// changing.
+    #[test]
+    fn a_verifier_that_blocked_is_ended_by_a_tick_too() {
+        use crate::repair::Pass;
+
+        let (_env, store) = scratch("verdictblocked");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        let b = tagged(&store, VERIFY_TAG).remove(0);
+        let _ = spawned();
+        set(&store, &b.id, Status::Blocked);
+        store.set_claim(&b.id, serde_json::json!({ "workspace": "w" }));
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert_eq!(
+            tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
+            vec![b.id],
+            "having said what has to change is the end of its job"
+        );
+    }
+
+    /// `wsp-158` item 2, and the one nothing could find. A governor spawns a
+    /// helper — the agent that installs a binary mid-group — and that row is a
+    /// member of nothing and a verifier of nothing, so every group left one more
+    /// seat standing.
+    ///
+    /// **Ownership is a fact written when the spawn is issued**, carried in the
+    /// spawn's environment and put on the row's log. A pass reads it back rather
+    /// than guessing from a title, and the test writes the marker the way the
+    /// claim does so it is asserting the reader and not a fiction.
+    #[test]
+    fn a_pass_ends_a_helper_the_run_opened_which_no_group_text_names() {
+        let (_env, store) = scratch("helper");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        let _ = spawned();
+        // The helper, spawned while group 1 was going and never named by it.
+        let mut helper = Task::new("Install master and drive delivery live", "h-1");
+        helper.log(&format!("{} run group 1", OWNED));
+        store.save_task(&helper).unwrap();
+        store.set_claim("h-1", serde_json::json!({ "workspace": "w" }));
+        // And a helper of another group, which this pass must not touch.
+        let mut other = Task::new("Something else entirely", "h-2");
+        other.log(&format!("{} run group 2", OWNED));
+        store.save_task(&other).unwrap();
+        store.set_claim("h-2", serde_json::json!({ "workspace": "w2" }));
+
+        end_group(&store, &w, 1);
+        let mut was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
+        was.sort();
+        assert_eq!(
+            was,
+            vec!["h-1".to_string()],
+            "the helper of the group that passed — and not the one two groups on"
+        );
+    }
+
+    /// `wsp-158` item 3. A barrier that closes leaves nothing open, and a `hold`
+    /// and a `done` are how a run closes when the plan was wrong or the work is
+    /// over early — so both end what the run opened, rather than leaving the
+    /// commonest ending tidied by hand.
+    #[test]
+    fn closing_a_list_over_what_the_run_opened_ends_it_and_says_so() {
+        let (_env, store) = scratch("closed");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        let v = tagged(&store, VERIFY_TAG).remove(0);
+        let _ = spawned();
+        let mut check = Task::new(&barrier_title("run", 1), "b-1");
+        check.tags = vec![BARRIER_TAG.into()];
+        check.set_status(Status::Doing);
+        store.save_task(&check).unwrap();
+        let mut helper = Task::new("Install master", "h-1");
+        helper.log(&format!("{} run group 1", OWNED));
+        store.save_task(&helper).unwrap();
+        for id in ["m-1", &v.id, &check.id, "h-1"] {
+            store.set_claim(id, serde_json::json!({ "workspace": "w" }));
+        }
+        let _ = drained(&TOLD);
+
+        end_what_the_run_opened(&store, "run", Some(1));
+        let mut was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
+        was.sort();
+        let mut expected = vec!["b-1".to_string(), "h-1".to_string(), "m-1".to_string(), v.id];
+        expected.sort();
+        assert_eq!(was, expected, "a member, a verifier, the barrier check and a helper: nothing the group opened");
+        assert!(
+            drained(&TOLD).iter().any(|t| t.contains("had nothing left to do")),
+            "and the seat is told, because ending an agent on work somebody may return to is not done quietly"
+        );
+    }
+
     /// `wsp-136` item 1. A note on a member is somebody **saying** something
     /// about it, and it used to buy a whole fresh verifier agent: a new
     /// context, a new read of the tree, and a verdict about code nobody had
@@ -2022,8 +2358,11 @@ fn only_a_working_screen_is_ever_overruled() {
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
         end_behind(&store, &w, 2);
-        let ended = ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
-        assert_eq!(ended, vec!["m-2", "v-1", "b-1"]);
+        let mut ended = ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
+        // Sorted, because the list is built from several walks and the order it
+        // comes out in is not a fact anybody should be asserting.
+        ended.sort();
+        assert_eq!(ended, vec!["b-1", "m-2", "v-1"]);
     }
 
     fn drained<T>(k: &'static std::thread::LocalKey<RefCell<Vec<T>>>) -> Vec<T> {

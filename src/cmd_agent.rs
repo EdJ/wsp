@@ -1313,6 +1313,21 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// The log line naming the run a start belongs to, or `None` when nobody is
+/// running this row.
+///
+/// **Read from the environment rather than from the store**, because the run is
+/// known at the moment the spawn is issued and nowhere else: the claim records
+/// *who* holds a task, not which group of which list asked for the agent on it.
+/// `cycle::start` sets both variables and `cycle::owned_rows` reads the marker
+/// this writes, so the two halves are named once each and cannot disagree.
+fn run_owner() -> Option<String> {
+    let list = std::env::var(crate::cycle::OWNED_LIST).ok()?;
+    let group = std::env::var(crate::cycle::OWNED_GROUP).ok()?;
+    (!list.is_empty() && !group.is_empty())
+        .then(|| format!("{} {} group {group}", crate::cycle::OWNED, list))
+}
+
 /// `wsp tell <id> "…"` — say something to an agent without ending it.
 ///
 /// **The verb that was missing, and the reason a stalled agent was expensive
@@ -2580,6 +2595,15 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     match left.first() {
         Some(prev) => t.log(&format!("claimed by pane {pane}, taken up from {prev}{asked}")),
         None => t.log(&format!("claimed by pane {pane}{asked}")),
+    }
+    // **Which run opened this, when one did.** `wsp-158`: a helper a governor
+    // spawned mid-group is a member of nothing and a verifier of nothing, and
+    // the only way a pass ends it is to have written down that the run is what
+    // put it there. Taken from the environment `cycle::start` sets, so it costs
+    // a spawn nothing and is written on the same line as the claim it belongs
+    // with — the one place a row's history is assembled.
+    if let Some(owner) = run_owner() {
+        t.log(&owner);
     }
     let _ = store.save_task(&t);
     store.log_event(
