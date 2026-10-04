@@ -90,6 +90,7 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "rm" | "remove" => rm(store, args),
         "mv" | "move" => mv(store, args),
         "group" => group(store, args),
+        "member" => member(store, args),
         "edit" => edit(store, args),
         "ls" | "list" => list(store, args),
         "show" | "get" => show(store, args),
@@ -327,7 +328,7 @@ pub fn new(store: &Store, args: &Args) -> i32 {
 // ---- add --------------------------------------------------------------
 
 pub fn add(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "usage: wsp worklist add <slug> <task>… [--group N]\n       wsp worklist add <slug> <parent> --sub";
+    const USAGE: &str = "usage: wsp worklist add <slug> <task>… [--group N] [--agent \"kind [model] [effort]\"]\n       wsp worklist add <slug> <parent> --sub";
     let Some(needle) = args.rest.get(1).cloned() else {
         eprintln!("{USAGE}");
         eprintln!("       (`wsp worklist new <slug> \"title\"` makes the list itself)");
@@ -387,6 +388,18 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         groups.push(Group { members: members.clone(), agent, ..Group::default() });
     } else {
         groups[ordinal - 1].members.extend(members.iter().cloned());
+        // Joining a group, `--agent` is who runs what was just added — its
+        // members' own lines, `wsp-150` — since the group already has one.
+        if let Some(v) = args.get("agent") {
+            match policy_word(&v) {
+                Ok(a) if a == MANUAL => {
+                    eprintln!("wsp: a member is not run by hand on its own — whether wsp runs a group is the group's line: `wsp worklist group {} {ordinal} --agent {MANUAL}`", w.id);
+                    return 2;
+                }
+                Ok(a) => join_with_agent(&mut groups[ordinal - 1], &members, &a),
+                Err(code) => return code,
+            }
+        }
     }
 
     // The log names the members and the ordinal names itself. Ordinals are
@@ -464,9 +477,28 @@ fn policy_word(v: &str) -> Result<String, i32> {
     Ok(v.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+/// A group's member ids, each with its own agent line beside it where it has
+/// one — `wsp-150`. Beside the id rather than on a line of its own, because
+/// the override is a fact about that member and a reader scanning the group
+/// for who runs on what is reading the ids.
+fn member_ids(p: &Paint, g: &Group) -> String {
+    g.members
+        .iter()
+        .map(|m| match g.member_agents.get(m) {
+            Some(a) => format!("{m} {}", p.dim(&format!("({a})"))),
+            None => m.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
 /// What a reader is told about who runs a group, in one line.
 fn agent_line(g: &Group) -> String {
     match g.policy() {
+        Some(_) if !g.member_agents.is_empty() => format!(
+            "agent: {} — wsp spawns its members, verifies each on the kind it ran on, and checks the barrier; a member marked beside its id runs on its own",
+            g.agent
+        ),
         Some(_) => format!("agent: {} — wsp spawns its members, verifies each, and checks the barrier", g.agent),
         None => "agent: manual — the governor spawns this group by hand".to_string(),
     }
@@ -620,6 +652,7 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
             return win.refuse(gi + 1, "will not remove from");
         }
         groups[gi].members.retain(|m| m != &id);
+        groups[gi].member_agents.remove(&id);
         // A group emptied by hand is a barrier that opens on the first look,
         // which is a group that no longer means anything. It goes, and it is
         // said so rather than left as a numbered blank.
@@ -748,6 +781,9 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     }
 
     groups[from].members.retain(|m| m != &id);
+    // A member's own line goes where it goes: it is about the member, and the
+    // group it lands in has no opinion on it.
+    let own = groups[from].member_agents.remove(&id);
     // The source emptying shifts everything after it up one, including the
     // destination that was just named. Corrected here rather than by refusing
     // the move: a group with one member in it is the ordinary case for the
@@ -769,6 +805,9 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         groups.insert(at - 1, Group { members: vec![id.clone()], agent, ..Group::default() });
     } else {
         groups[at - 1].members.push(id.clone());
+    }
+    if let Some(a) = own.filter(|a| *a != groups[at - 1].agent.trim()) {
+        groups[at - 1].member_agents.insert(id.clone(), a);
     }
 
     w.log(&format!("{id} → group {at}{}", if fresh { " (new)" } else { "" }));
@@ -891,6 +930,163 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         println!("{} group {ordinal}: {}", w.id, said.join(" · "));
     }
     0
+}
+
+// ---- member -----------------------------------------------------------
+
+/// `wsp worklist member <slug> <task> --agent "kind [model] [effort]"|none`:
+/// who runs one member, where that is not the group's line. `wsp-150`.
+///
+/// **Its window is the member's, not the group's.** A group's line is frozen
+/// with its membership once the run reaches it, because the barrier and every
+/// member still to start run on it. A member's line is about one spawn and
+/// its verifier, and nothing has read it until that spawn: so it may change
+/// inside the group being run, for a member still at `todo` that nobody has
+/// claimed. That is the edit `wsp-runs-itself` needed on 2026-10-04, and the
+/// only way to it was to retire the list. A member that has started is
+/// refused, because its agent is already running on the line it started with
+/// and its verifier is chosen by that line — changing it would make the record
+/// say one kind ran and start the verifier on another.
+///
+/// The check and the write are under the store lock, which is the lock
+/// `cycle::take_member` reads the line under when it starts the member: the
+/// two are ordered, so an edit that is accepted is the line that runs.
+///
+/// `none` takes the member's line away, and it runs on the group's again.
+/// `manual` is refused: whether wsp runs a group is the group's line, and a
+/// member wsp skipped would be a barrier waiting on something nobody starts.
+pub fn member(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "usage: wsp worklist member <slug> <task> --agent \"kind [model] [effort]\"|none";
+    let (Some(needle), Some(who), Some(raw)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned(), args.get("agent"))
+    else {
+        eprintln!("{USAGE}");
+        eprintln!("       a member's own line overrides its group's for its spawn and its verifier; none takes it away");
+        return 2;
+    };
+    let line = match raw.trim() {
+        "none" | "-" => None,
+        MANUAL => {
+            eprintln!("wsp: a member is not run by hand on its own — whether wsp runs a group is the group's line: `wsp worklist group <slug> N --agent {MANUAL}`");
+            return 2;
+        }
+        _ => match policy_word(&raw) {
+            Ok(a) => Some(a),
+            Err(code) => return code,
+        },
+    };
+    let w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let Some((_, id)) = member_named(&w.groups(), &who, store) else {
+        eprintln!("wsp: `{who}` is not in `{}` — wsp worklist show {}", w.id, w.id);
+        return 1;
+    };
+
+    let outcome = store.locked(|| -> Result<(Worklist, usize, Option<String>, bool), i32> {
+        // Read again inside the lock: the list, the window and the member's
+        // standing are all things a start in another process may have changed.
+        let mut w = store.worklist(&w.id).ok_or(1)?;
+        let mut groups = w.groups();
+        let Some(gi) = groups.iter().position(|g| g.members.contains(&id)) else {
+            eprintln!("wsp: `{id}` is no longer in `{}` — wsp worklist show {}", w.id, w.id);
+            return Err(1);
+        };
+        let win = window(store, &w);
+        if win.started {
+            if win.at.map_or(true, |at| gi + 1 < at) {
+                return Err(win.refuse(gi + 1, &format!("will not change {id}'s agent line in")));
+            }
+            if let Some(why) = member_started(store, &id) {
+                eprintln!("wsp: will not change {id}'s agent line — it has started ({why}), and runs on the line it started with");
+                eprintln!("     its verifier follows that line too; a member still at todo with no claim may change");
+                return Err(1);
+            }
+        }
+        let was = groups[gi].member_agents.get(&id).cloned();
+        match &line {
+            // The group's own line said again is no override, and storing it
+            // as one would keep this member on it after the group's changes.
+            Some(a) if *a != groups[gi].agent.trim() => {
+                groups[gi].member_agents.insert(id.clone(), a.clone());
+            }
+            _ => {
+                groups[gi].member_agents.remove(&id);
+            }
+        }
+        if groups[gi].member_agents.get(&id) == was.as_ref() {
+            return Ok((w, gi + 1, was, false));
+        }
+        let said = groups[gi].member_agents.get(&id).cloned().unwrap_or_else(|| "the group's".into());
+        w.log(&format!("{id} runs on {said}"));
+        // Written in the lock and committed outside it, as `take_member` does:
+        // the lock orders the edit against a start, and a commit is seconds
+        // nobody else should wait behind.
+        w.set_groups(&groups);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return Err(1);
+        }
+        Ok((w, gi + 1, groups[gi].member_agents.get(&id).cloned(), true))
+    });
+    let (w, ordinal, now, changed) = match outcome {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    if changed {
+        store.log_event("worklist-edited", json!({ "id": w.id, "what": "member" }));
+        let said = now.as_deref().unwrap_or("the group's");
+        store.git_commit(&format!("wsp: worklist {} member {id} agent {said}", w.id));
+    }
+
+    if args.json() {
+        println!("{}", worklist_json(store, &w));
+    } else {
+        let g = &w.groups()[ordinal - 1];
+        match now {
+            Some(a) => println!("{id} in {} group {ordinal}: agent {a}", w.id),
+            None => println!("{id} in {} group {ordinal}: the group's agent, {}", w.id, group_agent_word(g)),
+        }
+        if g.policy().is_none() {
+            println!("  {}", Paint::new().dim("the group is run by hand, so nothing starts on it until the group has an agent: line"));
+        }
+    }
+    0
+}
+
+/// Whether a member has started, and the words for how, or `None` when it is
+/// still a `todo` nobody has claimed — the one standing in which its line has
+/// not been read yet.
+fn member_started(store: &Store, id: &str) -> Option<String> {
+    let t = store.find_task(id)?;
+    let claim = store.claims().get(id).map(crate::cmd_agent::claim_where);
+    match (t.status(), claim) {
+        (crate::model::Status::Todo, None) => None,
+        (s, None) => Some(s.as_str().to_string()),
+        (s, Some(c)) => Some(format!("{} · claimed in {c}", s.as_str())),
+    }
+}
+
+/// A group's line as a word, `manual` when there is none.
+fn group_agent_word(g: &Group) -> String {
+    match g.agent.trim() {
+        "" => MANUAL.to_string(),
+        a => a.to_string(),
+    }
+}
+
+/// `--agent` on `add` into a group that exists: the members' own lines.
+/// Nothing when it names the group's line, which is what they run on anyway.
+fn join_with_agent(g: &mut Group, members: &[String], line: &str) {
+    if line == g.agent.trim() {
+        return;
+    }
+    for m in members {
+        g.member_agents.insert(m.clone(), line.to_string());
+    }
 }
 
 /// The prose read at a barrier: the text as typed, the stream, or the file
@@ -1289,6 +1485,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                     "ordinal": i + 1,
                     "parallel": g.cap,
                     "agent": g.agent,
+                    "member_agents": g.member_agents,
                     "stop": g.stop,
                     "verdict": g.verdict,
                     "members": g.members,
@@ -1389,7 +1586,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
                 "{mark}  {}  {}  {}",
                 util::pad(&ordinal.to_string(), w_ord),
                 util::pad(&cap, 2),
-                g.members.join("  ")
+                member_ids(&p, g)
             );
             // Only the group being waited on gets its members named again with
             // a word each, because that is the only group anybody is standing
@@ -3432,6 +3629,55 @@ mod tests {
         assert_eq!(flagged(&store, &["rm", "batch", "wl-404"], dry), 1, "not a member of this list");
         assert_eq!(flagged(&store, &["rm", "batch", "wl-003"], dry), 0, "ahead of the work, and open");
         assert_eq!(groups_of(&store, "batch").len(), 3, "a refused dry run moved something");
+    }
+
+    /// `wsp-150`: inside the group being run, a member's own line may change
+    /// until that member starts — and only until. The run is a real one here:
+    /// group 1 is wsp's, one member is at `doing` and another is claimed while
+    /// still at `todo`, and the third has not been touched.
+    #[test]
+    fn a_member_not_yet_started_takes_a_new_agent_line_in_the_running_group_and_one_that_has_started_is_refused() {
+        let (_env, store) = running("member-line");
+        for (id, status) in [("ml-1", "doing"), ("ml-2", "todo"), ("ml-3", "todo"), ("ml-4", "todo")] {
+            task(&store, id, status);
+        }
+        run(&store, &["new", "mix", "m"]);
+        assert_eq!(flagged(&store, &["add", "mix", "ml-1", "ml-2", "ml-3"], &[("agent", "opencode m-free")]), 0);
+        run(&store, &["add", "mix", "ml-4"]);
+        started(&store, "mix");
+        store.set_claim("ml-2", json!({ "workspace_id": "cpd-9" }));
+
+        // The group's own line is frozen with its membership, as before.
+        assert_eq!(flagged(&store, &["group", "mix", "1"], &[("agent", "claude")]), 1);
+
+        assert_eq!(flagged(&store, &["member", "mix", "ml-3"], &[("agent", "claude opus high")]), 0, "not started: open");
+        assert_eq!(groups_of(&store, "mix")[0].member_agents.get("ml-3").map(String::as_str), Some("claude opus high"));
+        assert_eq!(groups_of(&store, "mix")[0].policy_for("ml-3").unwrap().kind, "claude", "and it is what the spawn reads");
+
+        assert_eq!(flagged(&store, &["member", "mix", "ml-1"], &[("agent", "claude")]), 1, "doing: refused");
+        assert_eq!(member_started(&store, "ml-1").as_deref(), Some("doing"), "and the reason names how it started");
+        assert_eq!(flagged(&store, &["member", "mix", "ml-2"], &[("agent", "claude")]), 1, "claimed at todo: refused");
+        assert_eq!(member_started(&store, "ml-2").as_deref(), Some("todo · claimed in cpd-9"));
+        let g = &groups_of(&store, "mix")[0];
+        assert!(!g.member_agents.contains_key("ml-1") && !g.member_agents.contains_key("ml-2"), "a refusal writes nothing");
+
+        assert_eq!(flagged(&store, &["member", "mix", "ml-3"], &[("agent", "none")]), 0, "none puts it back on the group's");
+        assert!(groups_of(&store, "mix")[0].member_agents.is_empty());
+        assert_eq!(flagged(&store, &["member", "mix", "ml-3"], &[("agent", MANUAL)]), 2, "a member is not run by hand alone");
+
+        // A group ahead of the work takes a member's line too, and so does
+        // `add` joining a group: there it is the joining members' own line.
+        assert_eq!(flagged(&store, &["member", "mix", "ml-4"], &[("agent", "claude")]), 0);
+        task(&store, "ml-5", "todo");
+        assert_eq!(flagged(&store, &["add", "mix", "ml-5"], &[("group", "2"), ("agent", "opencode m-free")]), 0);
+        let g = &groups_of(&store, "mix")[1];
+        assert_eq!(g.agent, "opencode m-free", "inherited by the new group");
+        assert_eq!(g.member_agents.get("ml-4").map(String::as_str), Some("claude"));
+        assert!(!g.member_agents.contains_key("ml-5"), "the group's own line said again is no override");
+
+        // And it travels with the member.
+        assert_eq!(flagged(&store, &["mv", "mix", "ml-4"], &[("after", "2")]), 0);
+        assert_eq!(groups_of(&store, "mix")[2].member_agents.get("ml-4").map(String::as_str), Some("claude"));
     }
 
     /// The rule the whole verb set is built on: a group at or behind the

@@ -1771,7 +1771,8 @@ fn help_text() -> String {
                                     that exists instead of making one;
                                     --agent "kind [model] [effort]" says who
                                     runs a new group, and it is otherwise the
-                                    group before's, or claude
+                                    group before's, or claude. Joining one,
+                                    it is those members' own line instead
   wsp worklist add <slug> <parent> --sub   …or that parent's open sub-tasks as
                                     one group, resolved now and not live
   wsp worklist rm <slug> <task>… [-n]
@@ -1784,6 +1785,11 @@ fn help_text() -> String {
                                     the barrier after that group — `-` reads it
                                     from a stream and --stop --from FILE out of
                                     a file, where a shell never sees it
+  wsp worklist member <slug> <task> --agent "kind [model] [effort]"|none
+                                    one member on its own line beside the
+                                    group's — its spawn and its verifier run
+                                    on it. Editable until that member starts,
+                                    even in the group being run
   wsp worklist edit <slug> --overview -    what has to be true before group 1
                                     starts — there is no barrier in front of it
                                     to carry a stop condition, so the list does
@@ -1802,7 +1808,9 @@ fn help_text() -> String {
                                     barrier always reads whole; --stops draws
                                     every block back
   Editing is write-ahead-only: a group at or behind where the list is up to has
-  either run or is running, and is refused with what may be edited instead.
+  either run or is running, and is refused with what may be edited instead. A
+  member's own agent line is the exception: it may change until that member
+  starts.
 
   wsp worklist next [<slug>]        what may start now, what is holding it, or
                                     the prose to read at a barrier — with what

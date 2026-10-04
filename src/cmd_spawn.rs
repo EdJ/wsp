@@ -5788,6 +5788,7 @@ mod tests {
                 verdict: "2026-08-20T00:00:00Z clean".into(),
                 landed: Vec::new(),
                 agent: String::new(),
+                member_agents: Default::default(),
             }]);
             store.save_worklist(&w).unwrap();
             cmd_govern::take(&store, "batch", "w1", "w1:p9");
@@ -5838,6 +5839,7 @@ mod tests {
                 verdict: "2026-08-20T00:00:00Z clean".into(),
                 landed: Vec::new(),
                 agent: String::new(),
+                member_agents: Default::default(),
             },
             Group {
                 members: vec!["t-2".into()],
@@ -5846,6 +5848,7 @@ mod tests {
                 verdict: String::new(),
                 landed: Vec::new(),
                 agent: String::new(),
+                member_agents: Default::default(),
             },
         ]);
         store.save_worklist(&w).unwrap();

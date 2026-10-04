@@ -1,6 +1,8 @@
 //! The durable entities. Everything here round-trips through Markdown +
 //! frontmatter, so field names are the on-disk contract.
 
+use std::collections::BTreeMap;
+
 use crate::fm::{self, Doc, Val};
 use crate::util;
 
@@ -1466,6 +1468,28 @@ pub struct Group {
     /// inherited from the group before it when nothing is said, so a list
     /// that runs on opencode goes on running on opencode.
     pub agent: String,
+    /// `agent <member>: …` — a member that runs on something other than the
+    /// group's line, keyed by member id. `wsp-150`.
+    ///
+    /// The group's line stays the default and the floor this carries is an
+    /// exception to it, not a second floor: one claude member beside opencode
+    /// ones used to need a group of its own, which cost a barrier and made two
+    /// pieces of work that touch nothing in common wait on each other. The
+    /// member's verifier runs on the member's line too — `wsp-134` d1 (C), a
+    /// verifier on the kind the work ran on — and the barrier check, which
+    /// reads the group as a whole, on the group's.
+    ///
+    /// Whether wsp runs the group at all is still the group's line alone: a
+    /// member's line under a `manual` group is kept and does nothing until the
+    /// group is turned on.
+    ///
+    /// **A wsp from before this reads these lines as more members**, since
+    /// every line it does not know folds into whatever block it is in, and no
+    /// spelling escapes that. Seen on 2026-10-04: an old binary took
+    /// `demo-002:` for a member, title-matched it to that member's verifier,
+    /// and started a verifier on the verifier. `wsp install` after the land is
+    /// what makes a list carrying one safe to run.
+    pub member_agents: BTreeMap<String, String>,
 }
 
 /// Who a group runs on: the kind, and optionally the model and the effort,
@@ -1532,6 +1556,17 @@ impl Group {
     /// The policy wsp runs this group on, or `None` when it is run by hand.
     pub fn policy(&self) -> Option<Policy> {
         Policy::parse(&self.agent)
+    }
+
+    /// The policy wsp starts `member` on, and verifies it on: its own line
+    /// where it has one, the group's otherwise, and `None` when the group is
+    /// run by hand. A member's line that reads as no policy — `manual`
+    /// written by hand — falls back to the group's rather than leaving a hole
+    /// in a group wsp is running, since nothing would ever spawn it and the
+    /// barrier behind it would wait for ever.
+    pub fn policy_for(&self, member: &str) -> Option<Policy> {
+        let group = self.policy()?;
+        Some(self.member_agents.get(member).and_then(|a| Policy::parse(a)).unwrap_or(group))
     }
 }
 
@@ -1663,6 +1698,9 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             // One line, never wrapped: a policy is three words.
             last.agent = rest.trim().to_string();
             cont = Cont::Members;
+        } else if let Some((member, line)) = member_agent(trimmed, &last.members) {
+            last.member_agents.insert(member, line);
+            cont = Cont::Members;
         } else if let Some(rest) = trimmed.strip_prefix("landed:") {
             last.landed.clear();
             landed_push(&mut last.landed, rest);
@@ -1679,6 +1717,19 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         }
     }
     out
+}
+
+/// `agent <member>: <policy>`, when `<member>` is one of the group's.
+///
+/// The membership check is what keeps this from eating prose: a wrapped stop
+/// condition can start a line with the word "agent" and carry a colon later,
+/// and only a line naming an id already in the group's member list is read as
+/// a member's line. Member lines are always above it, so the list is complete
+/// by the time one is read.
+fn member_agent(line: &str, members: &[String]) -> Option<(String, String)> {
+    let (member, policy) = line.strip_prefix("agent ")?.split_once(':')?;
+    let member = member.trim();
+    members.iter().any(|m| m == member).then(|| (member.to_string(), policy.trim().to_string()))
 }
 
 /// One token stream of a `landed:` block, folded into entries already read.
@@ -1753,6 +1804,15 @@ pub fn render_groups(groups: &[Group]) -> String {
         }
         out.push('\n');
         block(&mut out, "agent", &g.agent);
+        // In member order, and only for members still in the group: a line
+        // left behind by a member that was removed is dropped on the next
+        // write rather than kept for an id nothing will start. Never wrapped,
+        // because a continuation of it would be read back as more members.
+        for m in &g.members {
+            if let Some(a) = g.member_agents.get(m).filter(|a| !a.trim().is_empty()) {
+                out.push_str(&format!("  agent {m}: {}\n", a.trim()));
+            }
+        }
         block(&mut out, "stop", &g.stop);
         block(&mut out, "verdict", &g.verdict);
         block(&mut out, "landed", &landed_text(&g.landed));
@@ -2419,6 +2479,44 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!((p.kind.as_str(), p.model.as_deref(), p.effort.as_deref()), ("opencode", Some("some/model-free"), Some("high")));
         assert_eq!(p.spawn_flags(), vec!["--kind", "opencode", "--model", "some/model-free", "--effort", "high"]);
         assert!(groups[1].policy().is_none() && groups[2].policy().is_none());
+    }
+
+    /// `wsp-150`: one member on claude beside opencode ones, in one group.
+    #[test]
+    fn a_members_own_agent_line_overrides_the_groups_for_that_member_alone() {
+        let text = "- 1  a-1  a-2\n  agent: opencode m-free\n  agent a-2: claude opus high\n  stop: look\n";
+        let groups = parse_groups(text);
+        let g = &groups[0];
+        assert_eq!(g.members, vec!["a-1", "a-2"], "the member's line is not a member");
+        assert_eq!(render_groups(&groups), text, "and it round-trips where it was written");
+        assert_eq!(g.policy_for("a-1").unwrap().kind, "opencode", "a member with no line runs on the group's");
+        let own = g.policy_for("a-2").unwrap();
+        assert_eq!((own.kind.as_str(), own.model.as_deref()), ("claude", Some("opus")));
+        assert_eq!(g.policy().unwrap().kind, "opencode", "the group's line is untouched by it");
+
+        let mut manual = g.clone();
+        manual.agent = MANUAL.into();
+        assert!(manual.policy_for("a-2").is_none(), "whether wsp runs the group at all is the group's line");
+    }
+
+    /// Prose that happens to begin with the word is prose: only a line naming
+    /// one of the group's own members is a member's line.
+    #[test]
+    fn a_stop_line_that_begins_with_agent_is_not_read_as_a_members_line() {
+        let text = "- 1  a-1\n  stop: if the\n  agent that ran a-9: stalls, flag it\n";
+        let g = &parse_groups(text)[0];
+        assert!(g.member_agents.is_empty());
+        assert_eq!(g.stop, "if the agent that ran a-9: stalls, flag it");
+        assert_eq!(g.members, vec!["a-1"]);
+    }
+
+    /// A removed member's line goes with it on the next write rather than
+    /// waiting for an id nothing will start.
+    #[test]
+    fn a_member_line_for_an_id_no_longer_in_the_group_is_not_written() {
+        let mut g = parse_groups("- 1  a-1  a-2\n  agent: claude\n  agent a-2: opencode\n").remove(0);
+        g.members.retain(|m| m != "a-2");
+        assert_eq!(render_groups(&[g]), "- 1  a-1\n  agent: claude\n");
     }
 
     /// Members before a `stop:` continue; everything after it is the prose.

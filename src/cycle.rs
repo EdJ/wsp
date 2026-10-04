@@ -28,13 +28,16 @@
 //!
 //! For a running list whose current group carries a [`Policy`]:
 //!
-//! 1. Members not yet started are spawned, up to the group's cap.
+//! 1. Members not yet started are spawned, up to the group's cap, each on its
+//!    own `agent <id>:` line where it has one and the group's otherwise
+//!    ([`Group::policy_for`], `wsp-150`).
 //! 2. A member that has reached `review` **and landed** gets a read-only
-//!    verifier: a child row tagged [`VERIFY_TAG`] whose overview is its work
-//!    order. It notes its verdict on the member and reviews its own row, or
-//!    blocks it.
+//!    verifier, on the member's policy: a child row tagged [`VERIFY_TAG`]
+//!    whose overview is its work order. It notes its verdict on the member and
+//!    reviews its own row, or blocks it.
 //! 3. When every member is landed and every verifier is at `review`, one agent
-//!    checks the barrier — a row tagged [`BARRIER_TAG`] — and ends it with
+//!    checks the barrier — a row tagged [`BARRIER_TAG`] — on the group's own
+//!    line, since it reads the group as a whole, and ends it with
 //!    `wsp worklist go` or `hold`.
 //! 4. A pass rotates the governing seat onto a fresh successor and starts the
 //!    next group (step 1 again). A governor is *told* what happened at each
@@ -322,9 +325,9 @@ fn step(store: &Store, w: &Worklist) -> Vec<String> {
     let cap = g.parallelism(None);
     for s in &pos.members {
         let Some(t) = store.find_task(&s.id) else { continue };
-        if let Some(why) = take_member(store, &t, &w.id, at, &g.members, cap) {
-            stamp(&format!("{} group {at}: starting {} ({why})", w.id, s.id));
-            if spawn(store, &s.id, &policy, Undo::Member) {
+        if let Some((why, own)) = take_member(store, &t, &w.id, at, &g.members, cap) {
+            stamp(&format!("{} group {at}: starting {} on {} ({why})", w.id, s.id, own.kind));
+            if spawn(store, &s.id, &own, Undo::Member) {
                 started.push(s.id.clone());
             } else {
                 failed(store, &w, &s.id);
@@ -336,7 +339,10 @@ fn step(store: &Store, w: &Worklist) -> Vec<String> {
     for s in pos.members.iter().filter(|s| s.finished()) {
         let Some(member) = store.find_task(&s.id) else { continue };
         if let Some(v) = open_verifier(store, &member, &w.id, at, g) {
-            if spawn(store, &v, &policy, Undo::Row) {
+            // On the kind the work ran on — `wsp-134` d1 (C) — which in a
+            // mixed group is the member's own line and not the group's.
+            let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
+            if spawn(store, &v, &on, Undo::Row) {
                 started.push(v);
             } else {
                 failed(store, &w, &v);
@@ -388,7 +394,16 @@ fn wedged(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Valu
 const STARTED_BY: &str = "started by wsp:";
 
 /// Move a member to `doing` under the store lock, if it may start now, and
-/// say why it may. `None` is "leave it".
+/// say why it may and what it starts on. `None` is "leave it".
+///
+/// **The policy is read inside the lock too**, from the list as it stands
+/// then, and not off the group [`step`] read before it. A member's line is
+/// editable until the member starts (`wsp worklist member`, which writes
+/// under the same lock and refuses once the member is `doing`), so the start
+/// and the edit are ordered by the lock: an edit that lands first is the line
+/// the member starts on, and one that comes after finds it started and is
+/// refused. Read outside, an edit in between would be accepted and then
+/// silently not be what ran.
 ///
 /// It may when it is `todo` and unclaimed, or when it is a start of wsp's
 /// own that never took (`doing`, unclaimed, [`STARTED_BY`] its last word, and
@@ -402,9 +417,9 @@ fn take_member(
     at: usize,
     members: &[String],
     cap: Option<usize>,
-) -> Option<&'static str> {
+) -> Option<(&'static str, Policy)> {
     let id = t.id.clone();
-    let why = store.locked(|| {
+    let took = store.locked(|| {
         let t = store.find_task(&id)?;
         let claims = store.claims();
         let ours = t.section("Log").and_then(|l| l.lines().last().map(|x| x.contains(STARTED_BY))).unwrap_or(false);
@@ -423,15 +438,16 @@ fn take_member(
         if cap.is_some_and(|c| going >= c) {
             return None;
         }
+        let policy = store.worklist(list)?.groups().get(at - 1)?.policy_for(&id)?;
         let mut t = t;
         t.set_status(Status::Doing);
         t.log(&format!("{STARTED_BY} {list} group {at}"));
         t.touch();
         store.save_task(&t).ok()?;
-        Some(why)
+        Some((why, policy))
     })?;
     store.git_commit(&format!("wsp: {list} group {at} starts {id}"));
-    Some(why)
+    Some(took)
 }
 
 /// The newest verifier row under a member.
@@ -853,6 +869,51 @@ mod tests {
         assert!(spawned().is_empty(), "the barrier row is the key; nothing starts twice");
     }
 
+    /// `wsp-150`: one claude member beside an opencode one, in one group and
+    /// behind one barrier. Each starts on its own kind, each verifier on the
+    /// kind its member ran on, and the barrier check on the group's line.
+    #[test]
+    fn a_mixed_group_starts_and_verifies_each_member_on_its_own_kind() {
+        let (_env, store) = scratch("mixed");
+        task(&store, "m-1", Status::Todo);
+        task(&store, "m-2", Status::Todo);
+        let mut w = list(&store, &[(&["m-1", "m-2"], "opencode some/model-free")]);
+        let mut g = w.groups();
+        g[0].member_agents.insert("m-2".into(), "claude opus high".into());
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+
+        step(&store, &w);
+        assert_eq!(
+            spawned(),
+            vec![("m-1".into(), "opencode".into()), ("m-2".into(), "claude".into())],
+            "the member with a line of its own starts on it, and the other on the group's"
+        );
+
+        set(&store, "m-1", Status::Review);
+        set(&store, "m-2", Status::Review);
+        step(&store, &w);
+        let by_parent: Vec<(String, String)> = spawned()
+            .into_iter()
+            .map(|(id, kind)| (store.find_task(&id).unwrap().parent.unwrap(), kind))
+            .collect();
+        assert_eq!(
+            by_parent,
+            vec![("m-1".into(), "opencode".into()), ("m-2".into(), "claude".into())],
+            "a verifier runs on the kind its member's work ran on"
+        );
+
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        step(&store, &w);
+        assert_eq!(
+            spawned(),
+            vec![(tagged(&store, BARRIER_TAG)[0].id.clone(), "opencode".into())],
+            "the barrier reads the group as a whole, on the group's line"
+        );
+    }
+
     /// A verifier that found a problem blocks, the member comes back with a
     /// fix, and it is read again by a fresh agent.
     #[test]
@@ -998,11 +1059,13 @@ mod tests {
         let (_env, store) = scratch("lockcap");
         task(&store, "m-1", Status::Doing);
         task(&store, "m-2", Status::Todo);
+        list(&store, &[(&["m-1", "m-2"], "claude")]);
         let members = vec!["m-1".to_string(), "m-2".to_string()];
         let m2 = store.find_task("m-2").unwrap();
-        assert_eq!(take_member(&store, &m2, "run", 1, &members, Some(1)), None, "one going, cap one");
-        assert_eq!(take_member(&store, &m2, "run", 1, &members, Some(2)), Some("new"));
-        assert_eq!(take_member(&store, &m2, "run", 1, &members, Some(2)), None, "taken already");
+        let took = |cap| take_member(&store, &m2, "run", 1, &members, cap).map(|(why, _)| why);
+        assert_eq!(took(Some(1)), None, "one going, cap one");
+        assert_eq!(took(Some(2)), Some("new"));
+        assert_eq!(took(Some(2)), None, "taken already");
     }
 
     /// A start that fails puts the member back and says so; one that never
