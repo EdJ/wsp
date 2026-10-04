@@ -1236,9 +1236,19 @@ pub(crate) fn end_all(store: &Store, ids: Vec<String>) {
 /// running finds no finished barrier. `wsp-136` item 3.
 pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<String> {
     let pos = worklist::position(store, w, worklist::Reading::Settled);
-    if !pos.finished() {
+    // **A barrier behind the position, or a run with nothing left to govern.**
+    // These are different questions with one answer, and the original form
+    // answered only the second: a list held at group 3's barrier has two
+    // finished checks behind it and `pos.finished()` is false, so neither was
+    // ended — which is what installing and looking found.
+    //
+    // A check behind the position has run and been passed. A check in front of
+    // it has not, and ending that one would cut the turn it is in.
+    if !pos.finished() && !(w.status() == WorklistStatus::Held) {
         return Vec::new();
     }
+    let behind = pos.at.unwrap_or(usize::MAX);
+    let settled = w.status() == WorklistStatus::Held && !pos.finished();
     let tasks = store.tasks();
     let claims = store.claims();
     let standing: Vec<String> = tasks
@@ -1247,12 +1257,29 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
         .filter(|t| matches!(t.status(), Status::Review | Status::Done))
         .filter(|t| list_of(store, t).map(|l| l.id == w.id).unwrap_or(false))
         .filter(|t| claims.contains_key(&t.id))
+        // Behind the position, or anywhere at all once the run is over.
+        .filter(|t| !settled || group_of(t, &w.id).is_some_and(|at| at < behind))
         .map(|t| t.id.clone())
         .collect();
     if !standing.is_empty() {
-        stamp(&format!("{}: the run has nothing left in it, and {} finished", w.id, standing.join(" ")));
+        stamp(&format!(
+            "{}: {} and nothing left for them to decide — ending {}",
+            w.id,
+            if settled { "has finished barriers behind it" } else { "has nothing left in it" },
+            standing.join(" ")
+        ));
     }
     standing
+}
+
+/// Which group a barrier row belongs to, read off its own title.
+///
+/// **The title and not a search over the groups**, for the reason
+/// [`is_barrier`] exists: a group number is a position in the text, so it is
+/// parsed once here and nowhere else.
+fn group_of(t: &Task, list: &str) -> Option<usize> {
+    let after = t.title.strip_prefix(&format!("{BARRIER_TITLE}{list} group "))?;
+    after.split(['(', ' ']).next()?.parse().ok()
 }
 
 /// Everything a run opened, ended at a closing that is not a pass: `hold` and
@@ -1354,24 +1381,32 @@ pub(crate) fn end_what_the_run_opened(store: &Store, list: &str, at: Option<usiz
 /// later it has long been idle and the claim is the record that it has not been
 /// ended yet.
 ///
-/// **Only rows of a *running* list**, and only rows whose list is named on them
-/// — a verifier's parent chain says which member, and the member says which
-/// list. A verifier belonging to a draft or a held list is a governor's to
-/// finish.
+/// **Running *and* held lists, which is what the running-list reading missed.**
+/// Found by installing and looking: `wsp-process` was held at its barrier with
+/// two agents from it still standing — a barrier check and a verifier that had
+/// recorded its verdict. A hold stops nothing already in flight and says so,
+/// and it stops nothing that has *finished* either; `Running::read` answers for
+/// running lists alone, so a held run's finished agents were nobody's.
+///
+/// A verifier's parent chain says which member, and the member says which list;
+/// a draft's is not this run's, because a plan is not a run and its agents are
+/// a governor's to finish.
 pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
     let tasks = store.tasks();
     let claims = store.claims();
+    let lists = store.worklists();
+    let open = |id: &str| {
+        lists.iter().any(|w| {
+            matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held)
+                && w.groups().iter().any(|g| g.members.contains(&id.to_string()))
+        })
+    };
     tasks
         .iter()
         .filter(|t| t.tags.iter().any(|g| g == VERIFY_TAG))
         .filter(|t| matches!(t.status(), Status::Review | Status::Done | Status::Blocked))
         .filter(|t| claims.contains_key(&t.id))
-        .filter(|t| {
-            // The list is reached through the member, and through the *running*
-            // lists only — a verifier under work in a draft is not this run's.
-            let member = t.parent.as_deref().and_then(|p| store.find_task(p));
-            member.is_some_and(|m| worklist::Running::read(store).list_of(&m.id).is_some())
-        })
+        .filter(|t| t.parent.as_deref().and_then(|p| store.find_task(p)).is_some_and(|m| open(&m.id)))
         .map(|t| t.id.clone())
         .collect()
 }
@@ -2072,6 +2107,51 @@ fn only_a_working_screen_is_ever_overruled() {
         // what a reader finds it by, and a task someone happened to name that.
         let mut t = Task::new("Barrier: run group 1", "b-1");
         assert!(!is_barrier(&t, "run", 1), "the title alone is not a barrier");
+    }
+
+    /// Both of the gaps installing and looking found, in one shape: **a held
+    /// run's finished agents are nobody's.** `wsp-process` was held at its
+    /// barrier with a barrier check and a verdict-recorded verifier still
+    /// standing — `Running::read` answers for running lists alone, so a hold
+    /// put both out of reach of everything that ends agents.
+    ///
+    /// A hold stops nothing already in flight and says so; it stops nothing that
+    /// has *finished* either, which is the same fact about a different agent.
+    #[test]
+    fn a_held_runs_finished_agents_are_ended_and_its_standing_barrier_is_not() {
+        let (_env, store) = scratch("heldagents");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Review);
+        let mut w = list(&store, &[(&["m-1"], "claude"), (&["m-2"], "claude")]);
+        let mut g = w.groups();
+        g[0].verdict = "passed".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        let mut check1 = Task::new(&barrier_title("run", 1), "b-1");
+        check1.tags = vec![BARRIER_TAG.into()];
+        check1.set_status(Status::Review);
+        store.save_task(&check1).unwrap();
+        let mut check2 = Task::new(&barrier_title("run", 2), "b-2");
+        check2.tags = vec![BARRIER_TAG.into()];
+        check2.set_status(Status::Doing);
+        store.save_task(&check2).unwrap();
+        let mut v = Task::new("Verify m-2", "v-1");
+        v.parent = Some("m-2".into());
+        v.tags = vec![VERIFY_TAG.into()];
+        v.set_status(Status::Review);
+        store.save_task(&v).unwrap();
+        store.set_claim("b-1", serde_json::json!({ "workspace": "w" }));
+        store.set_claim("b-2", serde_json::json!({ "workspace": "w" }));
+        store.set_claim("v-1", serde_json::json!({ "workspace": "w" }));
+        // Held at group 2's barrier, with group 2's check mid-read.
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Held);
+        store.save_worklist(&w).unwrap();
+
+        let checks = last_barrier_left_behind(&store, &w);
+        assert_eq!(checks, vec!["b-1".to_string()], "the check behind the position, and not the one in front");
+        let verdicts = verdicts_recorded(&store);
+        assert_eq!(verdicts, vec!["v-1".to_string()], "and the verifier that has nothing left to do");
     }
 
     /// `wsp-158` item 1, and the commonest of the four leaks. A verifier's turn
