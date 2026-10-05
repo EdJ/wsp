@@ -204,7 +204,9 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     // answer — nothing is lost, because a level nobody is addressee of is the
     // hook's audience and every panel draws it.
     let seat = crate::cmd_govern::answering_seat(store, &subject);
-    let report = seat.as_ref().and_then(|s| {
+    // `map`, not `and_then`: `wake::say` no longer answers "is there a seat
+    // here" — it spools and reports, because a vacancy is later, not nowhere.
+    let report = seat.as_ref().map(|s| {
         crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
     });
 

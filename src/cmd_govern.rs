@@ -1787,7 +1787,14 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
         eprintln!("wsp: nothing to say");
         return 2;
     }
-    let Some(seat) = governors.get(scope).and_then(|rec| seat_of(scope, rec)) else {
+    // **`seat_held`, the shared reader, and this was the third one to get it
+    // wrong** — `wsp govern --tell` on a scope `reconcile` vacated used to say
+    // *"no seat on `scope`"* and drop the sentence, while `wsp-148`'s own
+    // reconciler counted that same record's emptiness and went looking for a
+    // successor. `wsp-174` named `ask`, `flag` and `--tell` as the three verbs
+    // affected; the first two reach this through `wake::say` and this is the
+    // third.
+    let Some(seat) = seat_held(scope, governors) else {
         eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} fills it");
         return 1;
     };
@@ -1816,10 +1823,7 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
     // lost. "Busy" now means later and the record is the seat's spool; the gate,
     // the acknowledgement and the retry are `crate::wake`'s, one implementation,
     // and the receipt below is the same report it prints for anybody else.
-    let Some(report) = crate::wake::say(store, scope, text, None) else {
-        eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} fills it");
-        return 1;
-    };
+    let report = crate::wake::say(store, scope, text, None);
     if args.json() {
         println!(
             "{}",

@@ -922,7 +922,9 @@ pub fn flag(store: &Store, args: &Args) -> i32 {
     // `Class::Message` dispositions them to a wake, and the flag level still
     // goes everywhere else it always did.
     let seat = cmd_govern::answering_seat(store, &task);
-    let report = seat.as_ref().and_then(|s| {
+    // `map`, not `and_then`: `wake::say` no longer answers "is there a seat
+    // here" — it spools and reports, because a vacancy is later, not nowhere.
+    let report = seat.as_ref().map(|s| {
         crate::wake::say(store, &s.scope, &for_a_governor(&raised, &task), Some(&raised.id))
     });
 

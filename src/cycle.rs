@@ -1589,22 +1589,23 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
 ///
 /// Returns whether a seat on the scope holds it, and `false` is the caller
 /// falling back to a hand on the run's first member.
+///
+/// **The `false` is [`governing_scope`]'s answer and not `say`'s.** `say` spools
+/// whatever it is given and reports, so it no longer says "there was nowhere to
+/// put this" — and it should not, because a vacancy is later rather than nowhere.
+/// Whether a run has a governor to hand a barrier to is a different question, and
+/// it is the older one: a scope a person stood down has none, and a hand on a
+/// member is exactly right there.
 pub(crate) fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -> bool {
     let Some(scope) = governing_scope(store, w) else { return false };
-    match crate::wake::say(store, &scope, text, None) {
-        // Said as well as returned, because `cycle.log` is how a governor reads
-        // what the run has been doing, and *the seat is mid-turn* is the answer
-        // to "why has nobody started my next group" that used to be missing from
-        // it — the refusal this row removed was reported as a hand on a member.
-        Some(report) => {
-            stamp(&format!("told {scope}: {} · {} held", report.why, report.held));
-            true
-        }
-        None => {
-            stamp(&format!("told {scope}: no seat on the scope"));
-            false
-        }
-    }
+    let report = crate::wake::say(store, &scope, text, None);
+    // Said as well as returned, because `cycle.log` is how a governor reads what
+    // the run has been doing, and *the seat is mid-turn* is the answer to "why
+    // has nobody started my next group" that used to be missing from it. The
+    // reason rides in `report.why` now, so a scope with no seat still says so
+    // here — it used to be a second, hand-written copy of that sentence.
+    stamp(&format!("told {scope}: {} · {} held", report.why, report.held));
+    true
 }
 
 /// A pass hands the governing seat to a fresh successor, on wsp's own

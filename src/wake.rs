@@ -430,9 +430,26 @@ impl Report {
 ///   would cost a second context read — measured at 208k — for the sentence, which
 ///   the level's own line already points at with `wsp show <id>`. What a block
 ///   lacked was the acknowledgement, and that is item 2, which is this module.
-pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) -> Option<Report> {
-    let governors = store.governors();
-    cmd_govern::seat_of_scope(scope, &governors)?;
+/// **The spool first, the seat second, and always a [`Report`] — all three,
+/// and the third is the one this row's verifier found.** `say` used to ask
+/// whether the scope had a seat *before* writing anything and returned `None` if
+/// it did not, so a sentence addressed to a scope whose governor had died was
+/// dropped on the floor rather than held: `wsp ask`, `wsp flag` and
+/// `wsp govern --tell` all reached this, and all of them lost. It also asked with
+/// [`cmd_govern::seat_of_scope`], which stops at the top level of a record — so a
+/// record `reconcile` vacated reads as *no seat at all* rather than as a seat
+/// with nobody in it. Live on the trunk: `tokenhub-spec-sync` reading `no seat
+/// on this scope` while `governors.json` for the same scope carried
+/// `unseated: 156` and a live claim.
+///
+/// **A vacancy is later, not nowhere.** That is what the spool is *for*: the
+/// whole of `wsp-146` is that a sentence held for a busy seat clears on a turn,
+/// and a seat filled tomorrow morning is told what it missed. There is no
+/// reading under which a dead governor's scope is a place sentences go to die.
+/// The addressee is [`crate::repair::reading`]'s question now, asked once in
+/// [`Tell::deliver`] — the same question the reconciler asks, which is the sixth
+/// instance of this row's own lesson about two readers of one record.
+pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) -> Report {
     let at = util::epoch_secs();
     let key = key_for(scope);
     // Written before anything is attempted, and the durability is the reason
@@ -446,7 +463,7 @@ pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) 
         // either way, and the only thing this hop suppresses is the duplicate.
         let _ = crate::message::sent(store, id, scope);
     }
-    Some(deliver_to(store, scope, &[], at))
+    deliver_to(store, scope, &[], at)
 }
 
 /// A wake, told.
@@ -631,11 +648,19 @@ impl Sink for Tell<'_> {
             return true;
         }
         let governors = self.store.governors();
-        let Some(seat) = cmd_govern::seat_of_scope(&self.scope, &governors) else {
-            // Nobody holds the post. Not a failure and not a drop: the spool
-            // keeps it, and a seat filled tomorrow morning is told what it
-            // missed. A wake with no addressee is the one case where holding
-            // is obviously right.
+        // **`seat_held`, not `seat_of_scope`, and this is the reader the
+        // reconciler uses.** The difference is a record `reconcile` vacated: its
+        // pane is under `last`, so `seat_of_scope` says there is no post here and
+        // the sentence was held as *nowhere*, while `seat_vacant` on the same
+        // record counted the emptiness and went looking for a successor. Two
+        // readers, one record, opposite answers — and the one that said "nowhere"
+        // was the one that loses sentences.
+        let Some(seat) = cmd_govern::seat_held(&self.scope, &governors) else {
+            // No post has ever existed on this scope. Not a failure and not a
+            // drop: the spool keeps it, and a seat created tomorrow morning is
+            // told what it missed. This is now the one case where there is
+            // genuinely no addressee, because a record nobody has written is a
+            // thing the reconciler will not fill either.
             self.why = "no seat on this scope".into();
             return false;
         };
@@ -1091,6 +1116,61 @@ mod tests {
         );
     }
 
+    /// **The shape no fixture in this file supplies: a record carrying only `last`.**
+///
+/// Every test here writes a *filled* record, which is why this reached the trunk.
+/// `wsp-174` found it live — `tokenhub-spec-sync` reading `no seat on this scope`
+/// while `governors.json` for the same scope carried `unseated: 156` and a live
+/// claim — and this is the third time across `wsp-148` that a fixture has supplied
+/// its own `State` and hidden the real one.
+///
+/// **The record is written by [`crate::cmd_govern::vacate`] and not by hand**,
+/// because the hand-written version is exactly what the other fixtures do wrong:
+/// a real vacate moves the pane under `last` and leaves nothing at the top level,
+/// and that is the whole fact under test.
+///
+/// **Both halves, because the drop and the reading are separable.** `say`
+/// returning `None` lost the sentence; `say` returning a report that says `no seat
+/// on this scope` keeps it and lies about it. A test that only checked the depth
+/// would pass against the second.
+#[test]
+fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
+    let env = util::isolated("wake-vacated");
+    let store = Store::at(env.home(), env.state());
+    store.ensure_dirs().unwrap();
+
+    // A seat somebody was in, then gone — so the record is `last` and nothing else.
+    store.set_governor(
+        "core",
+        json!({ "workspace": "w9", "pane": "cpd-9", "host": util::hostname(), "kind": "claude" }),
+    );
+    assert!(crate::cmd_govern::vacate(&store, "core"));
+    let rec = &store.governors()["core"];
+    assert!(
+        rec.get("workspace").is_none() && rec["last"]["pane"] == "cpd-9",
+        "the record really is only `last`: {rec}"
+    );
+
+    let report = say(&store, "core", "somebody needs an answer", None);
+    assert_eq!(
+        spool_of(&store, "core").depth(),
+        1,
+        "a vacancy is later, not nowhere: the sentence is owed"
+    );
+    assert!(
+        report.why.contains("unseated"),
+        "and it says the seat is standing empty rather than that there is nowhere to put it: {}",
+        report.why
+    );
+    assert!(
+        holding(&store, "core").contains("unseated"),
+        "which is what `wsp watch --status` prints: {}",
+        holding(&store, "core")
+    );
+
+    let _ = std::fs::remove_dir_all(&env.state());
+}
+
     /// **The two readings `wsp-148` did not ask for and `wsp-148` caused.**
     /// `reseating` and `daemon down` were true of the two states its first
     /// version could produce, and untrue of the other two: a claim whose holder
@@ -1106,11 +1186,16 @@ mod tests {
         // Something owed, so the scope is one `unseated` is ever read for, and a
         // governor record so `seat_held` has something to read: a workspace and
         // an empty pane, which is `tooling`'s live shape.
-        store.set_governor("core", json!({ "workspace": "w9", "pane": "", "host": util::hostname() }));
+        // A real pane, because `seat_held` refuses an empty one — and the point of
+        // this test is the reading *past* that refusal.
+        store.set_governor(
+            "core",
+            json!({ "workspace": "w9", "pane": "cpd-9", "host": util::hostname() }),
+        );
         // Said through the real path rather than by stamping the field, because
         // what is under test is the sentence a reader gets.
         let why = |store: &Store| {
-            say(store, "core", "owed", None).map(|r| r.why).unwrap_or_default()
+            say(store, "core", "owed", None).why
         };
         assert_eq!(
             crate::cmd_govern::vacancy(&store.governors(), "core").reseating,
@@ -1408,7 +1493,7 @@ mod tests {
         assert_eq!(spool_of(&store, "demo").depth(), 3, "and all three are still there for the drain");
         assert_eq!(owed_to_a_seat(&store, &key_for("demo")), 0, "none of them is owed");
 
-        let held = say(&store, "demo", "group 1 is at its barrier — hold", None).expect("a seat");
+        let held = say(&store, "demo", "group 1 is at its barrier — hold", None);
         assert!(held.arrived(), "the hold went: {held:?}");
         let said = told_to(&fake);
         assert_eq!(said.len(), 1, "one typing: {said:?}");
@@ -1442,7 +1527,7 @@ mod tests {
         next.takes = false;
         fake.restage(next);
 
-        let report = say(&store, "demo", "the barrier is open — start group 2", None).expect("a seat on the scope");
+        let report = say(&store, "demo", "the barrier is open — start group 2", None);
         assert!(!report.arrived(), "nothing read it, so nothing arrived: {report:?}");
         assert_eq!(report.held, 1, "and it is still owed");
         assert!(told_count(&fake) == 1, "it was typed once");
@@ -1572,8 +1657,18 @@ mod tests {
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
 
-        assert!(say(&store, "nobody", "a verdict", None).is_none(), "no post, no spool");
-        assert!(!store.watches().contains_key(&key_for("nobody")), "and no record invented for one");
+        // **No post is not no spool any more**, and this is the sentence that has
+        // to say so. `wsp-174`'s item 2: a scope nobody has a seat on is a place
+        // sentences are held, because a post created tonight is told what it
+        // missed. What it is *not* is a seat somebody is in.
+        let report = say(&store, "nobody", "a verdict", None);
+        assert_eq!(spool_of(&store, "nobody").depth(), 1, "held, not dropped");
+        assert!(report.why.contains("no seat on this scope"), "{}", report.why);
+        assert!(
+            !store.governors().contains_key("nobody"),
+            "and still no governor invented for one: {:?}",
+            store.governors()
+        );
 
         // The run's own answer, which is the one the brief keeps: the hand on
         // the member a person looking at the run is looking at.
@@ -1602,7 +1697,7 @@ mod tests {
         use crate::place::State;
 
         let (_env, store, fake) = a_governor("wake-receipt", State::Working);
-        let report = say(&store, "demo", "a question for you", None).expect("a seat on the scope");
+        let report = say(&store, "demo", "a question for you", None);
 
         let busy = report.said("the demo seat", &util::Paint::plain());
         assert!(busy.contains("the demo seat"), "it names the post: {busy}");
@@ -1614,7 +1709,7 @@ mod tests {
         let mut next = fake.stage();
         next.takes = false;
         fake.restage(next);
-        let report = say(&store, "demo", "and another", None).expect("a seat on the scope");
+        let report = say(&store, "demo", "and another", None);
         let typed = report.said("the demo seat", &util::Paint::plain());
         assert!(typed.contains("typed"), "a seat that took it and read nothing says so: {typed}");
         assert!(!typed.contains("still owed 0"), "and it is still owed: {typed}");

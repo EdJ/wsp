@@ -224,8 +224,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // counted it twice and seated on the first tick — the two ticks `wsp-148`
     // asks for were spent by one pass. Found by running it, in a sandbox, and the
     // two log lines carried the same second on them.
-    for scope in seat_scopes(store) {
-        seat_vacant(store, seats, &scope);
+    for (scope, trigger) in seat_scopes(store) {
+        seat_vacant(store, seats, &scope, trigger);
     }
 }
 
@@ -251,27 +251,41 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
 /// **Ordered, and deduped as it is built** — a set in insertion order, so the
 /// seat a running list governs is examined as that list's own and the backlog
 /// contributes nothing new for it.
-fn seat_scopes(store: &Store) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let add = |scope: String, out: &mut Vec<String>| {
-        if !out.contains(&scope) {
-            out.push(scope);
+fn seat_scopes(store: &Store) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let add = |scope: String, trigger: &'static str, out: &mut Vec<(String, &'static str)>| {
+        // First one wins, so the seat a running list governs is reported as that
+        // list's — the more specific of the two reasons.
+        if !out.iter().any(|(s, _)| *s == scope) {
+            out.push((scope, trigger));
         }
     };
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         add(
             crate::cycle::governing_post(store, &w).unwrap_or_else(|| w.id.clone()),
+            RUNNING,
             &mut out,
         );
     }
     let governors = store.governors();
     for scope in crate::wake::scopes_holding(store) {
         if governors.contains_key(&scope) {
-            add(scope, &mut out);
+            add(scope, OWES, &mut out);
         }
     }
     out
 }
+
+/// **Why this pass is looking at this seat — two words, not a new field.** The
+/// same sentence served both triggers, and `wsp-174` caught it on the trunk:
+/// `tokenhub-spec-sync` is a `done` list and `cycle.log` said *this list is
+/// running* on 149 lines about it. Its own note on this — "worth a word on the
+/// third reader rather than a new field" — is the right call: a trigger belongs
+/// in the sentence that reports it, and a second field on the governor record
+/// would be one more thing for every writer that replaces the whole value to
+/// remember.
+const RUNNING: &str = "this list is running";
+const OWES: &str = "it owes an answer and nothing is answering it";
 
 /// One dated line in `cycle.log`, through the daemon's own file handle.
 ///
@@ -354,7 +368,7 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
 /// and no agent that could still be coming up, so there is nothing to wait for
 /// and a run that starts tonight starts with somebody; the second has a pane,
 /// and a pane is `Empty` between agents.
-fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str) {
+fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     let governors = store.governors();
     let scope = scope.to_string();
     // **A seat a person stood down stays down, and this is the whole reason the
@@ -387,7 +401,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str) {
         // Said once, on the way out — the pass that noticed is the interesting
         // one, and the next one is already counting.
         if here.unseated == 1 {
-            stamp(store, &format!("{}: the seat reads {word} and this list is running", scope));
+            stamp(store, &format!("{}: the seat reads {word} and {trigger}", scope));
         }
         return;
     }
@@ -397,9 +411,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str) {
     if !cmd_govern::claim_seat(store, &scope) {
         return;
     }
-    stamp(store, &format!(
-        "{scope}: the seat reads {word} and this list is running — seating a successor"
-    ));
+    stamp(store, &format!("{scope}: the seat reads {word} and {trigger} — seating a successor"));
     if cfg!(test) {
         #[cfg(test)]
         crate::cycle::tests::RESEATED.with(|s| s.borrow_mut().push(scope.clone()));
