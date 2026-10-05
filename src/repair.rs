@@ -418,13 +418,15 @@ fn how_it_reads(
     // the top level, and the pane that died is the one whose reading would say
     // the post is empty — which is the finding, and is what keeps a vacated seat
     // from looking like a healthy one that simply has no agents to report.
-    let seat = cmd_govern::seat_of_scope(scope, governors)
-        .or_else(|| cmd_govern::last_seat(governors, scope));
+    // `seat_held` rather than `seat_of_scope(..).or(last_seat(..))`: a record with
+    // a workspace and an empty `pane` is a slot nobody is in, and the verb that
+    // does the seating has to read it the same way or it will refuse the process
+    // this pass launched. One definition, in `cmd_govern`, for both.
+    let seat = cmd_govern::seat_held(scope, governors);
     let word = match &seat {
         // Nothing to read: a post that was never filled, or one whose pane the
         // backend that answered for it cannot name.
         None => "unseated",
-        Some(s) if s.pane.is_empty() => "unseated",
         Some(s) => match seats.state(&s.pane) {
             // **`None` is one answer and this is where the two live.** A backend
             // that could not be reached answers `None`, and a backend that has
@@ -1457,6 +1459,68 @@ impl Seats for Absent {
 
         a_pass(&store, &gone);
         assert_eq!(reseated(), vec!["run".to_string()], "and that is the second tick");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **The verb and the pass have to answer "is anybody in this seat?" the same
+    /// way, and on 2026-10-05 they did not.** `tooling`'s record reads
+    /// `workspace: compound, pane: ""`: a workspace with nobody in it. The
+    /// reconciler counted that as a vacancy and launched `govern --reseat`, and
+    /// the verb — asking [`crate::cmd_govern::seat_of_scope`], which stops at the
+    /// workspace — refused it. The claim was left on a post nobody was ever
+    /// going to fill, for twenty minutes, while the seat stayed empty.
+    ///
+    /// Asserted as the agreement itself rather than as either reader, because
+    /// one reader cannot catch a disagreement with the other.
+    #[test]
+    fn the_repair_and_the_verb_read_the_same_record_as_the_same_vacancy() {
+        let (_env, store) = in_flight("seat-agree");
+        // A workspace and an empty pane: exactly `tooling`'s shape.
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "workspace": "compound", "pane": "", "host": util::hostname(),
+                "since": "2026-10-02T14:58:04Z", "kind": "",
+            }),
+        );
+        let gone = Fake::empty();
+
+        a_pass(&store, &gone);
+        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 1, "counted as empty");
+        a_pass(&store, &gone);
+        assert_eq!(
+            reseated(),
+            vec!["run".to_string()],
+            "and the verb must accept what this pass offered it"
+        );
+        // **The agreement itself, and the launch is a no-op under `cfg(test)`**
+        // — so the seat is still vacant here and the record still says so. What
+        // is asserted is the guard's answer on that same record: the verb refuses
+        // a scope only when this returns `Some`, and it returns `None`.
+        assert!(
+            cmd_govern::seat_held("run", &store.governors()).is_none(),
+            "which is what stops the verb refusing the process this pass just launched: {:?}",
+            store.governors()["run"]
+        );
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **The other side of the same agreement, and the case that would be
+    /// expensive to get wrong the other way**: a record with a real pane *is*
+    /// occupied, by both readers, so the verb still refuses and this pass still
+    /// leaves it alone.
+    #[test]
+    fn a_record_naming_a_pane_is_a_seat_and_neither_reader_disagrees() {
+        let (_env, store) = in_flight("seat-pane");
+        seated(&store, "run", "compound", "cpd-9", "", "");
+        assert!(cmd_govern::seat_held("run", &store.governors()).is_some());
+
+        a_pass(&store, &Fake::empty());
+        assert!(
+            !reseated().contains(&"run".to_string()),
+            "a pane with nobody answering it is not vacant: {:?}",
+            reseated()
+        );
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

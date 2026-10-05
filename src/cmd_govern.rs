@@ -892,6 +892,41 @@ pub fn last_seat(governors: &BTreeMap<String, Value>, scope: &str) -> Option<Sea
     of(rec).or_else(|| rec.get("last").and_then(of))
 }
 
+/// The seat this scope's slot is for — filled, or remembered by a vacated
+/// record — and `None` where **nobody is in it**.
+///
+/// **One definition of that question, and `wsp-148` is why there is one.**
+/// Two readers disagreed about it: this verb's `--reseat` guard asked
+/// [`seat_of_scope`] and read a record with a workspace and an *empty* `pane`
+/// as occupied, while the reconciler asked the same record and read it as
+/// unseated. So the daemon would count a vacancy twice, claim the record, launch
+/// this verb — and be told *"the seat has somebody in it - nothing to reseat"*,
+/// leaving the claim on a post nobody was ever going to fill for the next
+/// twenty minutes. Found live on 2026-10-05, on `tooling`, whose record reads
+/// `workspace: compound, pane: ""`.
+///
+/// **The empty pane is the whole of it.** [`seat_of`] stops at the workspace,
+/// because a workspace names a seat and a pane names an *occupant*; two records
+/// in this store write the first and not the second, and this is the reader that
+/// has to notice. Live first, the way back second — [`last_seat`] is not an
+/// alternative here, it is the same seat at a different age.
+pub fn seat_held(scope: &str, governors: &BTreeMap<String, Value>) -> Option<Seat> {
+    let seat = seat_of_scope(scope, governors).or_else(|| last_seat(governors, scope))?;
+    (!seat.pane.is_empty()).then_some(seat)
+}
+
+/// The claim, given back by the verb that refused to act under it.
+///
+/// **Only on the refusal path**, because it is the only one where this process
+/// does not end up replacing the record: the success path and the reseat's own
+/// failure path both write it, and both write it without the claim.
+pub fn release_seat(store: &Store, scope: &str) {
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.remove("reseating").is_some()
+    });
+}
+
 /// The host a slot was last held from — a live occupancy's, or a vacated
 /// record's memory of one. Empty where nothing has ever sat here.
 pub fn host_of(governors: &BTreeMap<String, Value>, project: &str) -> String {
@@ -1435,8 +1470,16 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: no such project or worklist `{needle}`");
             return 1;
         };
-        if seat_of_scope(&scope, &store.governors()).is_some() {
+        if seat_held(&scope, &store.governors()).is_some() {
             eprintln!("wsp: the {scope} seat has somebody in it - nothing to reseat");
+            // **The claim goes back on the way out, and this is the only place
+            // the verb can leave one.** The reconciler takes it before it
+            // launches this process, so a refusal here is a disagreement between
+            // two readers of the same record — and the seat is still empty
+            // while the record says a reseat is under way, which is the state
+            // `wsp-148` exists to end. Holding it for `SEAT_CLAIMED_FOR` is the
+            // backstop, not the design.
+            release_seat(store, &scope);
             return 1;
         }
         return crate::cmd_spawn::reseat(store, &scope);
