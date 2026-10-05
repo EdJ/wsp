@@ -2911,16 +2911,21 @@ fn rotate_as(
 /// empty one, because a post somebody never created is not the same fact as a
 /// post somebody vacated.
 ///
-/// **The claim comes off, and that is the one part of the record that is not
-/// put back exactly as found.** The reconciler claims the seat before it starts
-/// this process, so `was` — read here, after that claim — carries
-/// `reseating`, and restoring it verbatim hands a dead process's claim back to a
-/// slot nothing is coming to fill for [`crate::cmd_govern::SEAT_CLAIMED_FOR`].
-/// `wsp-148` asks for a successor within two ticks and would be quietly getting
-/// twenty minutes; and `wsp watch --status` would read `reseating` for all of
-/// them, which is the one sentence here a reader is entitled to rely on. The
-/// count under `unseated` stays, because the seat *is* still empty and the next
-/// pass counting from where this one got to is the point of keeping it.
+/// **The claim stays, and the failure is recorded against it.** The reconciler
+/// claims the seat before it starts this process, and releasing that claim on
+/// the way out meant the very next pass tried again — right for a momentary
+/// failure, and a spawn a minute for ever for a structural one.
+/// `tokenhub-spec-sync` did exactly that on 2026-10-05: each attempt opened a
+/// compound agent whose renderer never came up, and the seat was empty at the
+/// end of all of them. The claim is the bound on that,
+/// [`crate::cmd_govern::SEAT_CLAIMED_FOR`] between attempts, and `reseat_failed`
+/// is what lets `wsp watch --status` say `retrying` rather than `reseating` for
+/// the twenty minutes in between — a claim held by a process that has already
+/// given up is not a governor on its way.
+///
+/// The count under `unseated` is put back exactly as found, because the seat
+/// *is* still empty and the next pass counting from where this one got to is the
+/// point of keeping it.
 ///
 /// **Best effort on all three, and silent about the parts that fail.** The caller
 /// is already printing why the reseat failed and the reconciler will come back
@@ -2935,15 +2940,20 @@ fn put_back(
     brief_at: &Option<std::path::PathBuf>,
 ) {
     match was {
-        Some(Some(rec)) => store.set_governor(scope, without_the_claim(rec)),
+        // Verbatim, claim and all: the record goes back as it was found, which
+        // is what `wsp-114`'s three governors for one run was about.
+        Some(Some(rec)) => store.set_governor(scope, rec.clone()),
         // The seat was filled for the first time by this reseat, and there was
-        // no record to put back. Deleting the record takes the claim with it,
-        // which is why the claim is dropped inside the restore rather than by a
-        // second write afterwards.
+        // no record to put back. Deleting it takes the claim with it.
         Some(None) | None => {
             store.clear_governor(scope);
         }
     }
+    // And then written onto whichever record survived — after the restore rather
+    // than inside it, because a scope with no record at all is not one the
+    // reconciler will ask about again until a running list or a backlog brings
+    // it back, and a claim nobody reads bounds nothing.
+    cmd_govern::reseat_failed(store, scope);
     // The port that opened it, and not a lookup for which one that was: this
     // function is only ever called on a seat `rotate_as` opened itself two lines
     // ago, so the backend is a value already in hand — and `end_work`'s fan-out
@@ -2953,21 +2963,6 @@ fn put_back(
     if let Some(path) = brief_at {
         let _ = std::fs::remove_file(path);
     }
-}
-
-/// A record as it was, with the claim taken off it — see [`put_back`], which is
-/// the only caller and the argument for it.
-///
-/// **Copies, and does not mutate what it was handed.** `was` is the reconciler's
-/// own read of the record and `store.governors()` may hand out a fresh parse
-/// each time, but a function that reached into a value another frame is holding
-/// would make `put_back`'s "exactly as it found it" depend on argument order.
-fn without_the_claim(rec: &Value) -> Value {
-    let mut back = rec.clone();
-    if let Some(o) = back.as_object_mut() {
-        o.remove("reseating");
-    }
-    back
 }
 
 /// What a successor seated into a vacancy is told about what it walked into.
@@ -6317,20 +6312,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// **The claim is the reconciler's, and a reseat that failed gives it back.**
-    /// `repair::seat_kept` claims the record *before* it launches this verb, so
-    /// the record `put_back` restores carries a claim held by a process that has
-    /// just told us it failed. Restored verbatim it would hold the seat empty for
-    /// [`crate::cmd_govern::SEAT_CLAIMED_FOR`] — twenty minutes where `wsp-148`
-    /// asks for two ticks — and `wsp watch --status` would read `reseating` for
-    /// every one of them, which is the one sentence in the reading a person is
-    /// entitled to rely on.
+    /// **A reseat that failed keeps the claim and records why, and the keeping is
+    /// the point.** The reconciler claims the seat before it launches this verb,
+    /// and the first version handed the claim straight back on failure. That is
+    /// right for a failure that was a moment's bad luck and a spawn a minute for
+    /// ever for a failure that is structural — which is what `tokenhub-spec-sync`
+    /// did on 2026-10-05, opening a compound agent per tick whose renderer never
+    /// came up, with the seat empty at the end of every one.
     ///
-    /// Asserted by **taking the claim again** rather than by reading the field:
-    /// whether `reseating` is absent and whether the next pass can act on it are
-    /// the same question, and only the second one is the requirement.
+    /// **Asserted as the bound and not as the field**, because the field is what
+    /// the fix deliberately stopped changing. The claim is still held — so the
+    /// next pass cannot claim it — and the failure is on the record, so
+    /// `wsp watch --status` says `retrying` rather than `reseating` for the
+    /// twenty minutes until it goes stale.
     #[test]
-    fn a_reseat_that_fails_gives_the_reconcilers_claim_back() {
+    fn a_reseat_that_fails_holds_the_claim_and_says_why() {
         let (_env, store) = vacated_seat("reseat-claim", "opus", "high");
         assert!(cmd_govern::claim_seat(&store, "core"), "the reconciler claims before it spawns");
         let dial = util::Dial::new();
@@ -6341,9 +6337,15 @@ mod tests {
         stop_being_a_seat();
 
         assert_eq!(code, 1, "which is the state this is about");
+        let v = cmd_govern::vacancy(&store.governors(), "core");
         assert!(
-            cmd_govern::claim_seat(&store, "core"),
-            "so the next pass can seat a successor rather than waiting out the claim of a process that is gone"
+            v.reseating.is_some(),
+            "the claim is held, so the next pass cannot open a second pane: {v:?}"
+        );
+        assert!(v.failed.is_some(), "and the failure is on it, so `retrying` is honest: {v:?}");
+        assert!(
+            !cmd_govern::claim_seat(&store, "core"),
+            "which is the bound: the next attempt waits for SEAT_CLAIMED_FOR, not one tick"
         );
         let _ = std::fs::remove_dir_all(&store.root);
     }

@@ -557,14 +557,27 @@ pub(crate) fn held_because(state: crate::place::State) -> Option<&'static str> {
 /// `Spool::depth` over the same record.
 fn unseated(store: &Store, scope: &str) -> String {
     let held = load(store, &key_for(scope)).depth();
-    let running = store
+    let v = cmd_govern::vacancy(&store.governors(), scope);
+    let up = store
         .daemon_holder()
         .map(|(pid, _)| pid)
         .is_some_and(|pid| crate::place_super::alive(&[pid]).contains(&pid));
-    format!(
-        "unseated · {held} held · {}",
-        if running { "reseating" } else { "daemon down" }
-    )
+    // **Four readings and not two, and each is one a reader can act on
+    // differently.** `reseating` and `daemon down` were the two `wsp-148` asked
+    // for; the other two are the states that arrived with it and that those two
+    // cannot honestly cover. A claim whose holder has already failed is not
+    // `reseating` — nothing is on its way, and the next attempt is up to
+    // `SEAT_CLAIMED_FOR` away. And a seat with no claim on a live daemon is
+    // *counting*, not reseating: the threshold has not been reached and there is
+    // nothing in flight. Calling that `reseating` told a reader to wait for a
+    // governor that was never going to be launched this tick.
+    let tail = match (v.reseating, v.failed, up) {
+        (Some(_), Some(_), _) => "retrying".to_string(),
+        (Some(_), None, _) => "reseating".to_string(),
+        (None, _, false) => "daemon down".to_string(),
+        (None, _, true) => "counting".to_string(),
+    };
+    format!("unseated · {held} held · {tail}")
 }
 
 /// What a governor is told about the thing that just typed at it.
@@ -1076,6 +1089,48 @@ mod tests {
             "with no daemon running, nothing is coming to fill it — which is the one a person can act on: {}",
             holding(&store, "s-gone")
         );
+    }
+
+    /// **The two readings `wsp-148` did not ask for and `wsp-148` caused.**
+    /// `reseating` and `daemon down` were true of the two states its first
+    /// version could produce, and untrue of the other two: a claim whose holder
+    /// has already failed, and a seat with no claim on a live daemon whose count
+    /// has not reached the threshold. The second of those told a reader to wait
+    /// for a governor that was not going to be launched on that tick.
+    #[test]
+    fn a_seat_with_nothing_in_flight_says_counting_and_not_reseating() {
+        let env = util::isolated("wakes-unseated");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+
+        // Something owed, so the scope is one `unseated` is ever read for, and a
+        // governor record so `seat_held` has something to read: a workspace and
+        // an empty pane, which is `tooling`'s live shape.
+        store.set_governor("core", json!({ "workspace": "w9", "pane": "", "host": util::hostname() }));
+        // Said through the real path rather than by stamping the field, because
+        // what is under test is the sentence a reader gets.
+        let why = |store: &Store| {
+            say(store, "core", "owed", None).map(|r| r.why).unwrap_or_default()
+        };
+        assert_eq!(
+            crate::cmd_govern::vacancy(&store.governors(), "core").reseating,
+            None,
+            "no claim: nothing is in flight"
+        );
+        assert!(
+            why(&store).ends_with("daemon down") || why(&store).ends_with("counting"),
+            "a live daemon with no claim is counting towards a threshold it has not reached — not waiting for a governor that is not coming this tick: {}",
+            why(&store)
+        );
+
+        // Claimed, and the reseat under it failed: nothing is on its way, and
+        // the next attempt is up to SEAT_CLAIMED_FOR away.
+        crate::cmd_govern::claim_seat(&store, "core");
+        assert!(why(&store).ends_with("reseating"), "{}", why(&store));
+        crate::cmd_govern::reseat_failed(&store, "core");
+        assert!(why(&store).ends_with("retrying"), "{}", why(&store));
+
+        let _ = std::fs::remove_dir_all(&env.state());
     }
 
     /// **The gate is not "is a turn in flight", and this is the state that

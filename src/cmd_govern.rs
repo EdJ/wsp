@@ -927,18 +927,6 @@ pub fn seat_held(scope: &str, governors: &BTreeMap<String, Value>) -> Option<Sea
     (!seat.pane.is_empty()).then_some(seat)
 }
 
-/// The claim, given back by the verb that refused to act under it.
-///
-/// **Only on the refusal path**, because it is the only one where this process
-/// does not end up replacing the record: the success path and the reseat's own
-/// failure path both write it, and both write it without the claim.
-pub fn release_seat(store: &Store, scope: &str) {
-    store.edit_governor(scope, |rec| {
-        let Some(o) = rec.as_object_mut() else { return false };
-        o.remove("reseating").is_some()
-    });
-}
-
 /// The host a slot was last held from — a live occupancy's, or a vacated
 /// record's memory of one. Empty where nothing has ever sat here.
 pub fn host_of(governors: &BTreeMap<String, Value>, project: &str) -> String {
@@ -1198,12 +1186,28 @@ pub fn note_tier(store: &Store, scope: &str, model: Option<&str>, effort: Option
 /// mid-reseat — and the failure this row was pointed at by name is a rotate that
 /// left a successor nobody could reach behind. A claim is taken back when the
 /// reseat finishes, and an abandoned one is only honoured for this long.
+/// When a reseat of this seat failed, if one did.
+///
+/// **A second field beside the claim, and the reason the claim is not simply
+/// given back on failure.** Giving it back made the very next pass try again,
+/// which is right for a failure that was a moment's bad luck and catastrophic
+/// for one that is structural: on 2026-10-05 `tokenhub-spec-sync` was reseated
+/// once a minute for ever, each attempt opening a compound agent whose renderer
+/// never came up, and the seat empty at the end of every one. The claim is the
+/// bound on that — [`SEAT_CLAIMED_FOR`] between attempts — so a failure has to
+/// *keep* it and say why, and this is the why.
+///
+/// `wsp watch --status` reads it too, because the alternative was a sentence
+/// claiming a governor was on its way for twenty minutes after the process that
+/// was going to seat it had already said it could not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Vacancy {
     /// Consecutive passes that have read this seat `Empty` or `Gone`.
     pub unseated: u64,
     /// When a reseat was claimed, if one is in flight.
     pub reseating: Option<i64>,
+    /// When the reseat under way last failed, if it did.
+    pub failed: Option<i64>,
 }
 
 /// How long a claim on a reseat is honoured before the next pass takes it back.
@@ -1215,22 +1219,19 @@ pub struct Vacancy {
 /// unseated for the rest of the night.
 pub const SEAT_CLAIMED_FOR: i64 = 20 * 60;
 
-/// Read the two markers off a record.
+/// Read the three markers off a record.
 pub fn vacancy(governors: &BTreeMap<String, Value>, scope: &str) -> Vacancy {
     governors.get(scope).map(Vacancy::of).unwrap_or_default()
 }
 
 impl Vacancy {
-    /// The two markers as one record carries them. `None` is a record with
-    /// neither, which is every record written before `wsp-148`.
+    /// The markers as one record carries them. `None` is a record with none of
+    /// them, which is every record written before `wsp-148`.
     fn of(rec: &Value) -> Vacancy {
         Vacancy {
             unseated: rec.get("unseated").and_then(Value::as_u64).unwrap_or(0),
-            reseating: rec
-                .get("reseating")
-                .and_then(Value::as_str)
-                .map(util::epoch_of)
-                .filter(|at| *at > 0),
+            reseating: at_of(rec, "reseating"),
+            failed: at_of(rec, "reseating_failed"),
         }
     }
 
@@ -1322,6 +1323,31 @@ pub fn claim_seat(store: &Store, scope: &str) -> bool {
     })
 }
 
+/// A reseat was attempted under a claim and did not produce a seat.
+///
+/// **The claim is kept and the failure is recorded against it, and both halves
+/// are load-bearing.** The claim is what stops the next pass trying again
+/// immediately, which is the whole difference between a momentary failure being
+/// retried in a minute and a structural one being retried every minute for
+/// ever — `tokenhub-spec-sync` on 2026-10-05, each attempt opening a compound
+/// agent whose renderer never came up. The record of the failure is what lets
+/// [`crate::wake`] say `retrying` rather than `reseating` for the twenty minutes
+/// in between.
+///
+/// **Kept for a refusal as well as a broken agent**, and for the same reason: a
+/// refusal the reconciler keeps making is a refusal it will keep making, and a
+/// verb that released the claim on its way out turned one into a spawn a minute.
+pub fn reseat_failed(store: &Store, scope: &str) {
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert("reseating_failed".into(), json!(util::now_iso()));
+        // A claim that was never taken is not invented here: this records that
+        // an attempt happened, and the reconciler is what decides whether a
+        // *next* one may.
+        true
+    });
+}
+
 /// When a person stood this seat down, if they did.
 ///
 /// **The marker that makes `--clear` mean something to the reconciler, and it is
@@ -1351,6 +1377,18 @@ pub fn stood_at(governors: &BTreeMap<String, Value>, scope: &str) -> Option<i64>
 /// than inlined because three files now read or write it and a typo in a record
 /// is silent — the reconciler would simply never see the decision.
 pub const STOOD_DOWN: &str = "stood_down";
+
+/// One ISO timestamp off a record, as an epoch — and `None` for a key that is
+/// absent, empty or unparseable, which are the same answer.
+///
+/// **Shared because three markers now carry dates and a reader that accepted a
+/// different subset of those three would be a reader whose idea of "claimed" is
+/// not the reconciler's.** A hand-edited `0` and a hand-edited `"soon"` both mean
+/// nothing here, and both mean the claim is not held.
+fn at_of(rec: &Value, key: &str) -> Option<i64> {
+    let at = util::epoch_of(&str_at(rec, key));
+    (at > 0).then_some(at)
+}
 
 /// Record that a person stood this seat down, and that it is to stay down.
 ///
@@ -1534,7 +1572,6 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         if stood_at(&store.governors(), &scope).is_some() {
             eprintln!("wsp: the {scope} seat was stood down - leaving it down");
             eprintln!("wsp: `wsp spawn -p <project> --govern` fills it if that changes");
-            release_seat(store, &scope);
             return 1;
         }
         // **Refuses what the reconciler would not have asked about, and that is the
@@ -1552,12 +1589,11 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             crate::repair::Occupancy::Occupied
         ) {
             eprintln!("wsp: the {scope} seat has somebody in it - nothing to reseat");
-            // **The claim goes back on the way out.** The reconciler takes it
-            // before it launches this process, so a refusal here is a
-            // disagreement between two readers of the same record — and the seat
-            // is still empty while the record says a reseat is under way, which
-            // is the state `wsp-148` exists to end.
-            release_seat(store, &scope);
+            // **The claim stays, and the refusal is recorded against it.** The
+            // reconciler takes it before it launches this process, so giving it
+            // back here meant the very next pass tried again — and a refusal
+            // this verb keeps making is one it will keep making.
+            reseat_failed(store, &scope);
             return 1;
         }
         return crate::cmd_spawn::reseat(store, &scope);
