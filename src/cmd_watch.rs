@@ -800,8 +800,12 @@ impl Spooled {
     /// in the table; this is what stops them riding along typed.
     pub(crate) fn is_a_decision(&self, running: &crate::worklist::Running) -> bool {
         match &self.line {
-            Some(Line::News(e)) if e.signal.kind == Kind::Review => {
-                self.wakes() && running.list_of(&e.signal.subject).is_none()
+            // A level going up is somebody's to read — a flag included, which
+            // the table spools so that it never *causes* a wake but which a
+            // seat is typed when one is going or escalation arrives. Going
+            // down or moving on is not.
+            Some(Line::News(e)) => {
+                e.edge == Edge::Up && (e.signal.kind != Kind::Review || running.list_of(&e.signal.subject).is_none())
             }
             _ => self.wakes(),
         }
