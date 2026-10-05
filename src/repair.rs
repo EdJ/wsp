@@ -171,10 +171,6 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     say_frozen_screens(store, seats);
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         let _ = crate::cycle::step(store, &w, seats);
-        // Before every `continue` below, because a seat is not a group's: a run
-        // with no group at a barrier still has work in flight, and one that has
-        // passed its last barrier still has a slot to fill. See `seat_kept`.
-        seat_kept(store, seats, &w);
         let pos = worklist::position(store, &w, Reading::Landed);
         let Some(at) = pos.at else { continue };
         let groups = w.groups();
@@ -221,35 +217,60 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         ));
     }
     crate::cycle::end_all(store, verdicts);
-    seat_holding(store, seats);
+    // **Collected first and then visited once each**, which is the whole of the
+    // second trigger and the reason it is here rather than in the loop above.
+    // A scope on a running list and a scope with a backlog are the same seat, and
+    // running the loop above and this one over the same scope in the same pass
+    // counted it twice and seated on the first tick — the two ticks `wsp-148`
+    // asks for were spent by one pass. Found by running it, in a sandbox, and the
+    // two log lines carried the same second on them.
+    for scope in seat_scopes(store) {
+        seat_vacant(store, seats, &scope);
+    }
 }
 
-/// **The half of `wsp-148`'s trigger that is not a running list, and it is here
-/// rather than inside the loop above for the same reason `seat_kept` is called
-/// before every `continue`.** A list that has finished, and a project that was
-/// never a list, still owe somebody an answer — `wsp ask` writes to it, and
-/// nothing clears it but a governor, and the only thing that puts a governor
-/// anywhere is the loop above. So a scope's backlog would sit held for ever on
-/// exactly the scopes where nobody is looking, and `wsp watch --status` would go
-/// on reading `unseated · 2 held · reseating` for them: which says a governor is
-/// on its way, and is `wsp-148`'s sentence about a governor nothing had been
-/// sent to seat.
+/// Every scope this pass will look at a seat for, each one once.
 ///
-/// **A scope with no governor record is not one of these.** `wake` reads it as
-/// `no seat on this scope`, which is true and is a person's decision — somebody
-/// addressed a project that has no governor, and answering that by spawning one
-/// for every scope anybody has ever sent a message to is not what this row is
-/// about. What is here is a post that exists and is empty, which is the same
-/// vacancy as a dead governor and is `wsp-148`'s to fill either way.
+/// **Two sources and one list.** The first is a running list's own seat — see
+/// [`seat_kept`], which is where the chain is walked. The second is a scope
+/// that owes somebody an answer: a list that has finished, and a project that
+/// was never a list, both hold their backlog for ever without it, because
+/// nothing but a governor clears a spool and the only thing that put a governor
+/// anywhere was the first source. `wsp watch --status` would go on reading
+/// `unseated · 2 held · reseating` for exactly those scopes, which says a
+/// governor is on its way and is a sentence about a governor nothing was sent to
+/// seat.
 ///
-/// The scopes themselves are the register's own, so the trigger and the sentence
-/// are read from one place: [`crate::wake::scopes_holding`].
-fn seat_holding(store: &Store, seats: &dyn Seats) {
+/// **A scope with no governor record is not in the second list.** `wake` reads it
+/// as `no seat on this scope`, which is true and is a person's decision —
+/// somebody addressed a project that has no governor, and seating one for every
+/// scope anybody has ever sent a message to is a different feature. What belongs
+/// here is a post that exists and is empty, which is the same vacancy as a dead
+/// governor either way.
+///
+/// **Ordered, and deduped as it is built** — a set in insertion order, so the
+/// seat a running list governs is examined as that list's own and the backlog
+/// contributes nothing new for it.
+fn seat_scopes(store: &Store) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let add = |scope: String, out: &mut Vec<String>| {
+        if !out.contains(&scope) {
+            out.push(scope);
+        }
+    };
+    for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
+        add(
+            crate::cycle::governing_post(store, &w).unwrap_or_else(|| w.id.clone()),
+            &mut out,
+        );
+    }
+    let governors = store.governors();
     for scope in crate::wake::scopes_holding(store) {
-        if store.governors().contains_key(&scope) {
-            seat_vacant(store, seats, &scope);
+        if governors.contains_key(&scope) {
+            add(scope, &mut out);
         }
     }
+    out
 }
 
 /// One dated line in `cycle.log`, through the daemon's own file handle.
@@ -308,15 +329,6 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
 }
 
 // ---- a governor seat nobody is in -----------------------------------------
-
-/// The scope a running list's seat belongs on, and the check itself.
-///
-/// [`crate::cycle::governing_post`] rather than `governing_scope`, and the
-/// difference is the whole of `wsp-148`'s second half — see [`seat_vacant`].
-fn seat_kept(store: &Store, seats: &dyn Seats, w: &Worklist) {
-    let scope = crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone());
-    seat_vacant(store, seats, &scope);
-}
 
 /// A run whose governor seat is standing empty, and whether it is time to fill
 /// it.
@@ -414,7 +426,17 @@ fn how_it_reads(
         None => "unseated",
         Some(s) if s.pane.is_empty() => "unseated",
         Some(s) => match seats.state(&s.pane) {
-            None => return None,
+            // **`None` is one answer and this is where the two live.** A backend
+            // that could not be reached answers `None`, and a backend that has
+            // never heard of the pane answers `None` too — `Refusal::NoSeat` is
+            // its "not mine". The second is the case this whole row is about: a
+            // governor pane that was closed answers it for ever, and a repair
+            // that refused to act on it would have found the one dead seat it
+            // exists to replace. [`Seats::absent`] is the question that tells
+            // them apart, and a `false` from it means somebody could not be
+            // asked, which stays the refusal.
+            None if !seats.absent(&s.pane) => return None,
+            None => "gone",
             Some(State::Empty) => "empty",
             Some(State::Gone) => "gone",
             Some(_) => {
@@ -784,22 +806,49 @@ const WHY_NOT: &str = "wsp: this member is waiting because";
 /// Whether the seat still has to be told this, and records that it has.
 ///
 /// **A marker holding the reason, not a bare flag.** `false` only when the last
-/// line is this exact sentence — so a member that lands and then waits on
+/// line says this exact sentence — so a member that lands and then waits on
 /// something else is told again, because a governor told "it has not landed"
 /// ten minutes ago and now told nothing has learned that something changed.
+///
+/// **The comparison reads the sentence and not the line, and the timestamp is the
+/// reason that is worth saying.** `## Log` entries are dated by `append_dated`,
+/// and this used to build the same `- <now> <said>` to compare against, so "the
+/// seat has already been told this" was true only when the two passes fell in the
+/// same wall-clock second. Two passes a minute apart — which is what
+/// [`EVERY`] means — never are, so the marker never matched and this always
+/// returned `true`. Nothing showed, because the wake spool dedupes the sentence
+/// and the seat heard it once either way; the function was inert and its own test
+/// was a clock. A test that asserts a sentence is told once passed about one run
+/// in four, which is the rate the two ticks happen to straddle a second.
 fn told_once(store: &Store, id: &str, said: &str) -> bool {
-    let line = format!("- {} {said}", util::now_iso());
     store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return false };
-        if t.section("Log").and_then(|l| l.lines().last().map(|x| x.trim().to_string())).as_deref()
-            == Some(line.as_str())
-        {
+        let last = t
+            .section("Log")
+            .and_then(|l| l.lines().last().map(|x| x.trim().to_string()))
+            .unwrap_or_default();
+        if undated(&last) == said {
             return false;
         }
         t.log(said);
         t.touch();
         store.save_task(&t).is_ok()
     })
+}
+
+/// One `## Log` line with its date taken off, which is what a reader compares.
+///
+/// **The date is decoration and the sentence is the content**, so a comparison
+/// that kept the date would be asking whether it is the same *instant* rather than
+/// the same *sentence*. A stamp that is not a stamp is left alone rather than
+/// stripped blindly, so a hand-written line beginning with a word that happens to
+/// look like a date cannot have its first word eaten.
+fn undated(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix("- ") else { return line };
+    match rest.split_once(' ') {
+        Some((stamp, said)) if util::is_stamp(stamp) => said,
+        _ => rest,
+    }
 }
 
 /// One dated line in `cycle.log`.
@@ -838,7 +887,37 @@ pub(crate) mod tests {
         fn state(&self, seat: &str) -> Option<State> {
             self.0.get(seat).copied().flatten()
         }
+
+        /// **The `Fake`'s own reading is that an unlisted seat is *not* absent.**
+        /// `state` answers `None` for every seat it was not scripted for, which is
+        /// also what it answers for a machine that could not be asked, and the
+        /// default keeps that meaning. A test that wants the other answer names
+        /// the seat in [`absent`], which is the point of it being separate.
+        fn absent(&self, _seat: &str) -> bool {
+            false
+        }
     }
+
+    /// A [`Fake`] that also says which seats are **positively** not there — every
+    /// backend has answered and none has them.
+    ///
+    /// The state a closed governor pane reads: `state` says nothing about it and
+    /// `absent` says yes. Without this the fixture could not express the case
+    /// `wsp-148` is about, which is why the defect it found was found by running
+    /// wsp rather than by testing it.
+    /// The seat a fake can answer about *and* report gone: `state` is `None` and
+/// `absent` is true, which is what a closed pane is.
+#[derive(Default)]
+struct Absent(Vec<String>);
+
+impl Seats for Absent {
+    fn state(&self, _seat: &str) -> Option<State> {
+        None
+    }
+    fn absent(&self, seat: &str) -> bool {
+        self.0.iter().any(|s| s == seat)
+    }
+}
 
     /// What `cycle.log` was told, on either path.
     ///
@@ -1239,6 +1318,145 @@ pub(crate) mod tests {
             "a post nobody created is not a vacancy: {:?}",
             reseated()
         );
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **The one this row is about, and the reading it could not express until the
+/// rehearsal.** A governor pane that was *closed* is not `Empty` and not `Gone`:
+    /// it is a pane no backend has, which `Seats::state` answers `None` for
+    /// exactly as it answers `None` for a machine that cannot be reached. Found
+    /// by running wsp against a sandbox on 2026-10-05 — the row's whole subject
+    /// was invisible to it, and every other reading of a dead seat has a `State`.
+    ///
+    /// **The two ticks are still two.** Only the reading changed: `absent` is a
+    /// fact and can be acted on at once, and the count is not removed, because
+    /// this is still a pane a reading had to be asked about twice.
+    #[test]
+    fn a_governor_pane_that_was_closed_is_reseated_after_two_ticks() {
+        let (_env, store) = in_flight("seat-closed");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        let closed = Absent(vec!["cpd-1".to_string()]);
+
+        a_pass(&store, &closed);
+        assert!(reseated().is_empty(), "one tick is not two: {:?}", reseated());
+        assert_eq!(
+            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            1,
+            "and a closed pane is counted like any other emptiness"
+        );
+        a_pass(&store, &closed);
+        assert_eq!(reseated(), vec!["run".to_string()], "which is the case that was invisible");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **And a machine that cannot be asked is still nothing to act on**, which
+    /// is the refusal [`Seats::absent`] exists to keep beside that one. Both
+    /// answer `None`; only this one is silent rather than empty, and a repair
+    /// that treated silence as absence would seat a successor for every running
+    /// list at the moment the terminal server is restarting.
+    #[test]
+    fn a_seat_nobody_can_reach_and_nobody_has_is_still_left_alone() {
+        let (_env, store) = in_flight("seat-vanished");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        // A fake that cannot see the seat and cannot say it is not there.
+        a_pass(&store, &Fake::new(&[("cpd-1", None)]));
+        a_pass(&store, &Fake::new(&[("cpd-1", None)]));
+
+        assert!(reseated().is_empty(), "silence is not absence: {:?}", reseated());
+        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 0);
+    }
+
+    /// **A seat that reads `gone`, in the shape `reconcile` leaves behind.** Found
+    /// by running wsp in a sandbox on 2026-10-05: the rehearsal's governor was
+    /// vacated rather than removed, so its record carries `host`, `pane` and
+    /// `kind` under `last` and nothing at the top — the shape every other reader
+    /// here is tested against is a *live* one, and this is the one the row is
+    /// about. The host is the machine's own, so the refusal for another machine's
+    /// seat is not what stops it.
+    #[test]
+    fn a_vacated_seat_on_this_machine_is_reseated_and_not_mistaken_for_a_remote_one() {
+        let (_env, store) = in_flight("seat-vacated");
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "last": {
+                    "pane": "cpd-5", "workspace": "cpd-5", "kind": "claude",
+                    "host": util::hostname(), "since": "2026-10-05T08:52:47Z",
+                },
+                "vacated": "2026-10-05T08:54:12Z",
+            }),
+        );
+        let closed = Absent(vec!["cpd-5".to_string()]);
+
+        a_pass(&store, &closed);
+        assert_eq!(
+            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            1,
+            "a vacated seat is read through `last` and counted like any other"
+        );
+        a_pass(&store, &closed);
+
+        assert_eq!(reseated(), vec!["run".to_string()], "{:?}", reseated());
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **And the same record on another machine is left there**, which is the
+    /// refusal above and the reason the host is read rather than assumed. A
+    /// vacated record has its host under `last`, so a reader that only asked the
+    /// top level would see no host at all — and "no host" is not another
+    /// machine, it is a seat this one should fill.
+    #[test]
+    fn a_vacated_seat_held_elsewhere_is_left_to_that_host() {
+        let (_env, store) = in_flight("seat-vacated-remote");
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "last": {
+                    "pane": "w9:p1", "workspace": "w9", "kind": "claude",
+                    "host": "somebody-elses-machine", "since": "2026-10-05T08:52:47Z",
+                },
+                "vacated": "2026-10-05T08:54:12Z",
+            }),
+        );
+        let closed = Absent(vec!["w9:p1".to_string()]);
+        a_pass(&store, &closed);
+        a_pass(&store, &closed);
+
+        assert!(reseated().is_empty(), "{:?}", reseated());
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **One pass counts a seat once, whatever asked for it.** A scope on a running
+    /// list and a scope with a backlog are the same seat, and the first version
+    /// of `wsp-148` asked twice — once in the loop over running lists and once
+    /// over [`crate::wake::scopes_holding`] — so the two ticks this row buys were
+    /// spent by a single pass and the log carried both lines on the same second.
+    /// Found by running it in a sandbox on 2026-10-05; every test above passes
+    /// against it, because each drives only one of the two triggers.
+    #[test]
+    fn a_pass_says_the_same_thing_twice_but_counts_it_once() {
+        let (_env, store) = in_flight("seat-twice");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        // The backlog trigger, pointed at the seat the list already governs.
+        held_for(&store, "run", 2);
+        let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+
+        a_pass(&store, &gone);
+        let said = stamped();
+        assert_eq!(
+            said.iter().filter(|l| l.contains("the seat reads gone")).count(),
+            1,
+            "one pass, one notice: {said:?}"
+        );
+        assert_eq!(
+            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            1,
+            "and one pass is one tick however many triggers named it"
+        );
+        assert!(reseated().is_empty(), "so the second tick is still owed: {:?}", reseated());
+
+        a_pass(&store, &gone);
+        assert_eq!(reseated(), vec!["run".to_string()], "and that is the second tick");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

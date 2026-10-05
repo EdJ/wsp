@@ -119,7 +119,35 @@ pub(crate) trait Seats {
     /// a machine with no backend answering returns, and a reconciler that read
     /// it as "gone" would kill every seat on that machine exactly when it can
     /// least see — the repair firing hardest where it knows least.
+    ///
+    /// **A pane that is not there at all reads `None` here too**, because
+    /// `Refusal::NoSeat` is a backend saying "not mine" and this port has no way
+    /// to tell that from a backend that could not be reached — see
+    /// [`Seats::absent`], which is the one question that does tell them apart.
+    /// The two were one answer until `wsp-148`, and the row is about a governor
+    /// pane that died: found by running it, because every other reading of a
+    /// dead seat has a `State` and this one does not.
     fn state(&self, seat: &str) -> Option<State>;
+
+    /// Whether this seat is **positively** not there — every backend has
+    /// answered and none of them has it — as against the `None` above, which a
+    /// backend that could not be reached also returns.
+    ///
+    /// **A question of its own and not an inference from `state`, because the
+    /// answer is not in `state`.** `Refusal::NoSeat` is how a backend says "this
+    /// is not my seat", so a fan-out over every backend that ends in `NoSeat`
+    /// everywhere is a fact: the seat is on none of them. One that ended in a
+    /// socket error is not — that is the machine that cannot be seen.
+    ///
+    /// **Defaults to `false`, and the default is the safe answer rather than the
+    /// convenient one.** Every implementation of this port that is not the real
+    /// one is a test, and a test fake that answers `true` would be seating
+    /// governors out of a fixture rather than out of a reading. A caller that
+    /// gets `false` where it wanted `true` does nothing, and a caller that gets
+    /// it wrong the other way starts agents.
+    fn absent(&self, _seat: &str) -> bool {
+        false
+    }
 }
 
 /// The real reading, over the backends wsp can spawn onto — with opencode's
@@ -151,6 +179,24 @@ impl Seats for Fleet {
         let compound = crate::place_compound::Compound::new();
         let raw = crate::cmd_spawn::local_backends().iter().find_map(|b| b.state(&seat_id).ok())?;
         Some(self.overrule_frozen_opencode(&compound, seat, raw))
+    }
+
+    /// **`false` the moment any backend answers with anything but
+    /// [`crate::place::Refusal::NoSeat`]**, which is the whole of it: a fan-out
+    /// that ends in `NoSeat` on every backend is a fact about the seat, and one
+    /// that ends in an error on any backend is a fact about a machine.
+    ///
+    /// **Two calls where [`Fleet::state`] makes one, and not an optimisation to
+    /// make later.** This runs once a minute, on the one seat the reconciler is
+    /// asking about, and only on the passes where `state` answered `None` — so
+    /// the cost is a second look on a seat that is already unreadable, and the
+    /// saving would be to fold two different questions into one answer, which is
+    /// what [`Seats::state`]'s `None` was.
+    fn absent(&self, seat: &str) -> bool {
+        let seat_id = Seat::new(seat);
+        crate::cmd_spawn::local_backends()
+            .iter()
+            .all(|b| matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_))))
     }
 }
 
