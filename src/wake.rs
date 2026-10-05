@@ -579,20 +579,26 @@ fn unseated(store: &Store, scope: &str) -> String {
         .daemon_holder()
         .map(|(pid, _)| pid)
         .is_some_and(|pid| crate::place_super::alive(&[pid]).contains(&pid));
-    // **Four readings and not two, and each is one a reader can act on
+    // **Five readings and not two, and each is one a reader can act on
     // differently.** `reseating` and `daemon down` were the two `wsp-148` asked
-    // for; the other two are the states that arrived with it and that those two
-    // cannot honestly cover. A claim whose holder has already failed is not
-    // `reseating` — nothing is on its way, and the next attempt is up to
-    // `SEAT_CLAIMED_FOR` away. And a seat with no claim on a live daemon is
-    // *counting*, not reseating: the threshold has not been reached and there is
-    // nothing in flight. Calling that `reseating` told a reader to wait for a
-    // governor that was never going to be launched this tick.
+    // for; the other three are states that arrived with it and that those two
+    // cannot honestly cover.
+    //
+    // `stood down` is first because it is a decision and everything else is a
+    // measurement — a seat somebody closed is not a seat the machine is counting
+    // towards filling, and `wsp-148`'s `stood_down` marker made that true in the
+    // store while this sentence went on saying `counting` for 201 held items on
+    // `tooling`. Found by reading this output after landing the marker, which is
+    // the usual way: the fix and the sentence it made untrue were the same row.
     let tail = match (v.reseating, v.failed, up) {
         (Some(_), Some(_), _) => "retrying".to_string(),
         (Some(_), None, _) => "reseating".to_string(),
         (None, _, false) => "daemon down".to_string(),
         (None, _, true) => "counting".to_string(),
+    };
+    let tail = match cmd_govern::stood_at(&store.governors(), scope) {
+        Some(at) => format!("stood down at {}", util::local_hm(at)),
+        None => tail,
     };
     format!("unseated · {held} held · {tail}")
 }
@@ -1214,6 +1220,18 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert!(why(&store).ends_with("reseating"), "{}", why(&store));
         crate::cmd_govern::reseat_failed(&store, "core");
         assert!(why(&store).ends_with("retrying"), "{}", why(&store));
+
+        // **And a seat somebody closed is a decision, not a measurement.** The
+        // marker made it true in the store while this sentence went on saying
+        // `counting` — 201 held items on `tooling`, read as a seat the machine
+        // was working towards filling.
+        crate::cmd_govern::mark_stood_down(&store, "core");
+        assert!(why(&store).contains("stood down at"), "{}", why(&store));
+        assert!(
+            !why(&store).ends_with("counting"),
+            "and never both: {}",
+            why(&store)
+        );
 
         let _ = std::fs::remove_dir_all(&env.state());
     }
