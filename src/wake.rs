@@ -160,28 +160,46 @@ pub(crate) fn key_for(scope: &str) -> String {
     format!("wake:{scope}")
 }
 
-/// Every scope currently owed something — a spool with a line in it.
+/// Every scope that currently owes a seat something — **the question the
+/// delivery path asks, and not the one a spool's depth answers**.
 ///
-/// **The scopes in the register, in the register's order, and no argument.** The
-/// reconciler walks this to find a seat standing empty on a scope that owes
-/// somebody an answer, which is the second half of `wsp-148`'s trigger: a list
-/// that has finished, or a project that was never a list, holds its backlog for
-/// ever because nothing else ever looks at a scope that is not on a running list.
-/// `wsp-148`'s own sentence — "`reseating` says a governor is on its way" — is
-/// only true of the scopes this covers.
+/// `wsp-178` found this live: `tokenhub-spec-sync` is a `done` list, all three of
+/// its spool entries are `edge: left`, and `wsp-166` withholds those from a seat
+/// — so it owes nothing and is owed nothing, while `depth() > 0` says it is
+/// holding three. The reconciler's second trigger walked
+/// a spool's depth, and so read it as a scope owing an answer, and reseated it
+/// every twenty minutes for hours on a compound agent that never comes up
+/// (`unseated: 250`). **Held is not owed**, and since `wsp-166` those have been
+/// different things on purpose.
 ///
-/// **The spool's own depth, and not the `wake` record's existence**, because a
-/// record is written the moment anything is addressed and is kept after it
-/// clears: `wake:core` with an empty array is a scope with nothing owed, and a
-/// scope whose line arrived and was delivered is the same.
-pub(crate) fn scopes_holding(store: &Store) -> Vec<String> {
+/// This is the eighth instance of this row's own lesson — two readers of one
+/// record — and the second where the narrower question was the right one and the
+/// wider was the guess. It is also the one where the cost was a whole scope being
+/// reseated rather than a sentence being dropped, which is the more expensive of
+/// the two mistakes to make silently.
+/// **A record's existence is not this either**, and never was: `wake:core` is
+/// written the moment anything is addressed and kept after it clears, so an empty
+/// array is a scope with nothing owed and a scope whose line was delivered is the
+/// same. The spool's *depth* was the second wrong answer — see below.
+///
+/// **The count is returned beside the scope, and that is the third of
+/// `wsp-178`'s items rather than a convenience.** The reconciler logs a sentence
+/// saying this scope owes an answer, and a sentence that asserts a reason should
+/// carry the number the reason was counted from — so `cycle.log` reads `it owes 3`
+/// or `it owes 96`, and a scope that owes none cannot be described in those words
+/// at all. The alternative was a fixed string and a trust that the walk had asked
+/// the right question, which is precisely the trust that was misplaced twice on
+/// this row.
+pub(crate) fn scopes_owed(store: &Store) -> Vec<(String, usize)> {
     let prefix = "wake:";
-    let watches = store.watches();
-    watches
-        .iter()
-        .filter(|(k, _)| k.starts_with(prefix))
-        .filter(|(_, rec)| Spool::of_json(rec.get("spool").unwrap_or(&Value::Null)).depth() > 0)
-        .map(|(k, _)| k[prefix.len()..].to_string())
+    store
+        .watches()
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .filter_map(|k| {
+            let owed = owed_to_a_seat(store, k);
+            (owed > 0).then(|| (k[prefix.len()..].to_string(), owed))
+        })
         .collect()
 }
 

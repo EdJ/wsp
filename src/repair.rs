@@ -225,7 +225,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // asks for were spent by one pass. Found by running it, in a sandbox, and the
     // two log lines carried the same second on them.
     for (scope, trigger) in seat_scopes(store) {
-        seat_vacant(store, seats, &scope, trigger);
+        seat_vacant(store, seats, &scope, &trigger);
     }
 }
 
@@ -251,9 +251,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
 /// **Ordered, and deduped as it is built** — a set in insertion order, so the
 /// seat a running list governs is examined as that list's own and the backlog
 /// contributes nothing new for it.
-fn seat_scopes(store: &Store) -> Vec<(String, &'static str)> {
-    let mut out: Vec<(String, &'static str)> = Vec::new();
-    let add = |scope: String, trigger: &'static str, out: &mut Vec<(String, &'static str)>| {
+fn seat_scopes(store: &Store) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let add = |scope: String, trigger: String, out: &mut Vec<(String, String)>| {
         // First one wins, so the seat a running list governs is reported as that
         // list's — the more specific of the two reasons.
         if !out.iter().any(|(s, _)| *s == scope) {
@@ -263,14 +263,21 @@ fn seat_scopes(store: &Store) -> Vec<(String, &'static str)> {
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         add(
             crate::cycle::governing_post(store, &w).unwrap_or_else(|| w.id.clone()),
-            RUNNING,
+            RUNNING.to_string(),
             &mut out,
         );
     }
     let governors = store.governors();
-    for scope in crate::wake::scopes_holding(store) {
+    // **`scopes_owed`, which is `wsp-178`'s question** — held is not owed:
+    // `wsp-166` withholds a governor's non-decisions from its seat, and a scope
+    // whose whole spool is withheld owes nothing while `depth() > 0` says it is
+    // holding something. `tokenhub-spec-sync` is the live case — three entries,
+    // all `edge: left`, reseated every twenty minutes for hours.
+    for (scope, owed) in crate::wake::scopes_owed(store) {
         if governors.contains_key(&scope) {
-            add(scope, OWES, &mut out);
+            // The count in the sentence is the count this walk counted, so the
+            // line cannot claim a scope owes an answer without a number behind it.
+            add(scope, format!("it owes {owed} and nothing is answering it"), &mut out);
         }
     }
     out
@@ -284,8 +291,13 @@ fn seat_scopes(store: &Store) -> Vec<(String, &'static str)> {
 /// in the sentence that reports it, and a second field on the governor record
 /// would be one more thing for every writer that replaces the whole value to
 /// remember.
+/// **`RUNNING` is a constant and the other trigger is not**, because only one of
+/// them can be asserted from what the walk knows. "This list is running" is a
+/// fact about a worklist the walk has in hand. "It owes an answer" is a fact
+/// about a count, and `wsp-178`'s third item is that the sentence must stop
+/// claiming it for a scope that owes none — so the sentence carries the number
+/// the count was read at, and there is no way to say it without one.
 const RUNNING: &str = "this list is running";
-const OWES: &str = "it owes an answer and nothing is answering it";
 
 /// One dated line in `cycle.log`, through the daemon's own file handle.
 ///
@@ -1491,7 +1503,7 @@ impl Seats for Absent {
     /// **One pass counts a seat once, whatever asked for it.** A scope on a running
     /// list and a scope with a backlog are the same seat, and the first version
     /// of `wsp-148` asked twice — once in the loop over running lists and once
-    /// over [`crate::wake::scopes_holding`] — so the two ticks this row buys were
+    /// over [`crate::wake::scopes_owed`] — so the two ticks this row buys were
     /// spent by a single pass and the log carried both lines on the same second.
     /// Found by running it in a sandbox on 2026-10-05; every test above passes
     /// against it, because each drives only one of the two triggers.
@@ -1747,6 +1759,104 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
     let silent = Fake::new(&[("cpd-1", None)]);
 
     assert_eq!(reading(&store, &silent, "run"), Occupancy::Unreadable);
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **A scope that holds three lines and owes a seat none of them.**
+///
+/// `wsp-178`'s live case: `tokenhub-spec-sync` is a `done` list, all three of its
+/// spool entries are `edge: left`, and `wsp-166` withholds those from a governor
+/// seat — so it owes nothing, while the spool's depth says it is holding three.
+/// `wsp-148`'s second trigger asked about depth and read that as a scope owing an
+/// answer, and reseated it every twenty minutes for hours on a compound agent
+/// that never comes up (`unseated: 250`).
+///
+/// **Built with `edge: left` and not with `held_for`.** The helper appends a
+/// `Class::Message`, and a message always counts as owed — so a fixture written
+/// with it passes against the bug, which is the fourth time on this row that a
+/// fixture's own convenience was the thing hiding the defect. This is
+/// `tokenhub-spec-sync`'s shape exactly: a level that moved on, whose lines stay
+/// in the record and are not typed.
+#[test]
+fn a_scope_holding_only_withheld_lines_owes_nothing_and_is_never_reseated() {
+    let (_env, store) = in_flight("seat-withheld");
+    seated(&store, "run", "w1", "cpd-1", "", "");
+    // The other half of `tokenhub-spec-sync`: a `done` list, so nothing in this
+    // scope can arrive by the running-list trigger either.
+    let mut w = store.worklist("run").unwrap();
+    w.set_status(crate::model::WorklistStatus::Done);
+    store.save_worklist(&w).unwrap();
+
+    store.update_watch(&crate::wake::key_for("run"), |rec| {
+        crate::cmd_watch::Spool::append(
+            rec,
+            (0..3)
+                .map(|i| {
+                    let mut e = crate::cmd_watch::Emit {
+                        edge: crate::cmd_watch::Edge::Left,
+                        signal: crate::cmd_watch::Signal::new(
+                            crate::cmd_watch::Kind::Review,
+                            "m-1",
+                            "the level moved on",
+                        )
+                        .to("run"),
+                        held: 0,
+                        to: "run".into(),
+                    };
+                    e.held = i;
+                    crate::cmd_watch::Spooled::of(0, crate::cmd_watch::Line::News(e))
+                })
+                .collect(),
+        );
+    });
+
+    let held = store
+        .watches()
+        .get(&crate::wake::key_for("run"))
+        .and_then(|v| v.get("spool"))
+        .and_then(|s| s.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    assert_eq!(held, 3, "the spool really is holding three: the fixture has to be this shape");
+    assert!(
+        !crate::wake::scopes_owed(&store).iter().any(|(s, _)| s == "run"),
+        "and it owes a seat none of them: {:?}",
+        crate::wake::scopes_owed(&store)
+    );
+
+    let gone = Absent(vec!["cpd-1".to_string()]);
+    for _ in 0..(EMPTY_TICKS + 3) {
+        a_pass(&store, &gone);
+    }
+
+    assert!(
+        reseated().is_empty(),
+        "a scope nobody is owed anything to is not a vacancy: {:?}",
+        reseated()
+    );
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **And the other side of the same line, so the fixture cannot be satisfied by a
+/// trigger that never fires.** One `edge: up` on a running list is owed, and a
+/// scope owing something with an empty seat is exactly what the second trigger is
+/// for — asserted here because the test above passes against a trigger that
+/// returns nothing at all, which is the same way the withholding fix could have
+/// been shipped broken.
+#[test]
+fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
+    let (_env, store) = in_flight("seat-owed");
+    seated(&store, "run", "w1", "cpd-1", "", "");
+    held_for(&store, "run", 1);
+    assert!(
+        crate::wake::scopes_owed(&store).iter().any(|(s, _)| s == "run"),
+        "a message counts as owed, which is the half the other test cannot see"
+    );
+
+    let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+    a_pass(&store, &gone);
+    a_pass(&store, &gone);
+    assert_eq!(reseated(), vec!["run".to_string()], "so the trigger is still live");
     let _ = std::fs::remove_dir_all(&store.root);
 }
 
