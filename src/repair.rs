@@ -357,6 +357,22 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
 fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str) {
     let governors = store.governors();
     let scope = scope.to_string();
+    // **A seat a person stood down stays down, and this is the whole reason the
+    // decision is recorded rather than inferred.** `vacate` was `reconcile`'s as
+    // well as `--clear`'s, and the two left the same record, so a governor that
+    // had died and a position somebody had deliberately left empty read the
+    // same. On 2026-10-05 that put `cpd-275` back into a `tooling` seat Ed had
+    // closed by hand, two ticks after the close — and `--clear` could not close a
+    // seat at all, which is the more serious half: a person had no way to say
+    // "nobody governs this" and the reconciler kept spending money to disagree.
+    //
+    // **Before everything else, including the count.** A seat that is not going
+    // to be filled must not be counted towards a threshold that will not be
+    // crossed, and must not stamp a line into `cycle.log` claiming a governor is
+    // on its way. Silence is the correct report for a decision somebody made.
+    if cmd_govern::stood_at(&governors, &scope).is_some() {
+        return;
+    }
     // Somebody else's machine is somebody else's seat. Absent record is ours.
     if governors.contains_key(&scope) && cmd_govern::host_of(&governors, &scope) != util::hostname() {
         return;
@@ -1524,7 +1540,104 @@ impl Seats for Absent {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    // ---- 1. a member that is gone ----------------------------------------
+    /// **A seat a person stood down stays down, and the test is the one the row was
+/// closed over.** Ed decided on 2026-10-05 that `tooling` should be closed, the
+/// governor ran `wsp govern tooling --clear`, and the reconciler put `cpd-275`
+/// back two ticks later — because `--clear` and `reconcile`'s own vacate left the
+/// *same record*, so a position somebody had deliberately left empty read exactly
+/// like a governor that had died.
+///
+/// A scope with **held items** and no running list, because that is `tooling`'s
+/// shape and it is the trigger the first version leaned on hardest: the backlog
+/// alone was enough to bring the seat back.
+#[test]
+fn a_seat_a_person_stood_down_is_never_reseated_however_much_is_held_for_it() {
+    let (_env, store) = in_flight("seat-stood");
+    seated(&store, "run", "w1", "cpd-1", "", "");
+    held_for(&store, "run", 7);
+    // What `--clear` leaves: the occupancy dropped, the way back kept, and now the
+    // sentence that says a person meant it.
+    cmd_govern::vacate(&store, "run");
+    cmd_govern::mark_stood_down(&store, "run");
+
+    let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+    for _ in 0..(EMPTY_TICKS + 2) {
+        a_pass(&store, &gone);
+    }
+
+    assert!(reseated().is_empty(), "a decision is not a vacancy to be repaired: {:?}", reseated());
+    let rec = &store.governors()["run"];
+    assert_eq!(
+        cmd_govern::vacancy(&store.governors(), "run").unseated,
+        0,
+        "and it is not counted towards a threshold it will never cross: {rec}"
+    );
+    assert!(
+        !stamped().iter().any(|l| l.contains("the seat reads")),
+        "and cycle.log says nothing, because silence is the correct report for it: {:?}",
+        stamped()
+    );
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **A stand-down survives `reconcile`, which vacates the same record.** Without
+/// this the decision lasts until the next dead pane, which on this machine is
+/// not long: `vacate` is what the reaper calls on a slot whose workspace herdr
+/// has closed, so any unrelated project losing its governor would have quietly
+/// unseated every stood-down scope in the store on the same pass.
+#[test]
+fn a_seat_stays_stood_down_through_a_reconcile_that_vacates_it_again() {
+    let (_env, store) = in_flight("seat-stood-reap");
+    seated(&store, "run", "w1", "cpd-1", "", "");
+    cmd_govern::mark_stood_down(&store, "run");
+    // The reconciler's own empty-the-occupancy, on a record somebody closed.
+    cmd_govern::vacate(&store, "run");
+    assert!(
+        cmd_govern::stood_at(&store.governors(), "run").is_some(),
+        "a vacating that did not fill the seat did not lift the decision: {:?}",
+        store.governors()["run"]
+    );
+
+    // `Absent`, not `Fake::empty()`: a fake that cannot see the seat declines to
+    // act whatever the record says, so this test would pass without the fix and
+    // test nothing. The point is that the *record* is what stops it.
+    held_for(&store, "run", 3);
+    let gone = Absent(vec!["cpd-1".to_string()]);
+    for _ in 0..(EMPTY_TICKS + 2) {
+        a_pass(&store, &gone);
+    }
+    assert!(reseated().is_empty(), "{:?}", reseated());
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **And filling the seat is what lifts it**, which is the only undo there is and
+/// the reason the marker lives on the record rather than in a file of decisions:
+/// a seat somebody is *in* has already answered the question, so `take` replacing
+/// the record drops the sentence, and the next death is an ordinary vacancy.
+#[test]
+fn taking_a_stood_down_seat_lifts_the_decision_so_the_next_death_is_ordinary() {
+    let (_env, store) = in_flight("seat-stood-retake");
+    seated(&store, "run", "w1", "cpd-1", "", "");
+    cmd_govern::mark_stood_down(&store, "run");
+    assert!(cmd_govern::stood_at(&store.governors(), "run").is_some());
+
+    // A person filling it by hand, which is `wsp govern` in the seat's own pane.
+    cmd_govern::take(&store, "run", "w1", "cpd-1");
+    assert!(
+        cmd_govern::stood_at(&store.governors(), "run").is_none(),
+        "a seat somebody is in is not a stood-down seat: {:?}",
+        store.governors()["run"]
+    );
+
+    cmd_govern::vacate(&store, "run");
+    let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+    a_pass(&store, &gone);
+    a_pass(&store, &gone);
+    assert_eq!(reseated(), vec!["run".to_string()], "so a dead governor is repaired again");
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+// ---- 1. a member that is gone ----------------------------------------
 
     /// A member whose agent has exited: the claim is held, the row is at
     /// `doing`, and nothing in the run would ever say so again. **No verb runs

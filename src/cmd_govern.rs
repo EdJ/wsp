@@ -753,6 +753,12 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
 /// that somebody is sitting here. The nesting is the whole of the guarantee:
 /// one key nobody had reason to look in before, so a slot cannot be brought
 /// back to life by a field left behind.
+/// kept and what is dropped, and then the `stood_down` sentence rides along if it
+/// was there — because this function is `reconcile`'s as well as `--clear`'s, and
+/// a reconciler that dropped the sentence would undo a person's decision on its
+/// next visit. **The one thing that clears a stand-down is filling the seat**
+/// ([`take`]), which is the point: the decision is about an empty seat, so an
+/// empty seat cannot revoke it and an occupied one has already answered it.
 pub fn vacate(store: &Store, project: &str) -> bool {
     let governors = store.governors();
     let Some(rec) = governors.get(project) else { return false };
@@ -762,7 +768,13 @@ pub fn vacate(store: &Store, project: &str) -> bool {
         return false;
     }
     let was = rec.get("workspace").and_then(Value::as_str).unwrap_or_default().to_string();
-    store.set_governor(project, json!({ "vacated": util::now_iso(), "last": stood_down(rec) }));
+    let mut left = json!({ "vacated": util::now_iso(), "last": stood_down(rec) });
+    if let Some(at) = str_at(rec, STOOD_DOWN).into() {
+        if let Some(o) = left.as_object_mut() {
+            o.insert(STOOD_DOWN.into(), json!(at));
+        }
+    }
+    store.set_governor(project, left);
     store.log_event("governor-vacated", json!({ "project": project }));
     // The room keeps the name of whatever it still answers for, and gets its
     // own back when that is nothing.
@@ -1310,6 +1322,50 @@ pub fn claim_seat(store: &Store, scope: &str) -> bool {
     })
 }
 
+/// When a person stood this seat down, if they did.
+///
+/// **The marker that makes `--clear` mean something to the reconciler, and it is
+/// one field because `vacate` used to carry two meanings at once.** `--clear`
+/// and `reconcile` both emptied the record, and the record they left was
+/// *identical*, so the reconciler could not tell a governor that had died — which
+/// is the one it is there to replace — from a governor a person had deliberately
+/// stood down. It read the second as the first and refilled it. On 2026-10-05
+/// that put `cpd-275` back into a `tooling` seat Ed had closed by hand twenty
+/// minutes earlier, two ticks after the close.
+///
+/// **Absent is the ordinary case and is not a default to fill in.** A record
+/// without the key is a seat nobody has ever stood down, which is every record
+/// written before this and every seat taken since — so a store full of them is
+/// unaffected and the reconciler keeps doing its job.
+///
+/// A date and not a boolean, because the roster has to say *which* — a seat
+/// nobody is in is either a governor that died or a position somebody decided to
+/// leave empty, and those are different sentences to a person reading it.
+pub fn stood_at(governors: &BTreeMap<String, Value>, scope: &str) -> Option<i64> {
+    let at = str_at(governors.get(scope)?, STOOD_DOWN);
+    let at = util::epoch_of(&at);
+    (at > 0).then_some(at)
+}
+
+/// The key a stand-down is recorded under. `STOOD_DOWN` is spelled here rather
+/// than inlined because three files now read or write it and a typo in a record
+/// is silent — the reconciler would simply never see the decision.
+pub const STOOD_DOWN: &str = "stood_down";
+
+/// Record that a person stood this seat down, and that it is to stay down.
+///
+/// **Written after the vacate rather than inside it, because `vacate` is also
+/// what `reconcile` calls** and the two must not converge again. `vacate`'s own
+/// record is what a dead governor leaves; this is the extra sentence on it that
+/// says somebody meant it.
+pub fn mark_stood_down(store: &Store, scope: &str) -> bool {
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert(STOOD_DOWN.into(), json!(util::now_iso()));
+        true
+    })
+}
+
 /// The seat's agent, resolved through the port — as it is *now*, which is not
 /// necessarily the pane it started in.
 ///
@@ -1470,6 +1526,17 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             eprintln!("wsp: no such project or worklist `{needle}`");
             return 1;
         };
+        // **Refuses a stand-down as firmly as it refuses an occupied seat, and
+        // for the same reason: this verb is how the reconciler asks, so honouring
+        // the decision here is what keeps it — a person who ran `--clear` and
+        // watched a governor come up anyway would be right to say the flag does
+        // nothing.**
+        if stood_at(&store.governors(), &scope).is_some() {
+            eprintln!("wsp: the {scope} seat was stood down - leaving it down");
+            eprintln!("wsp: `wsp spawn -p <project> --govern` fills it if that changes");
+            release_seat(store, &scope);
+            return 1;
+        }
         if seat_held(&scope, &store.governors()).is_some() {
             eprintln!("wsp: the {scope} seat has somebody in it - nothing to reseat");
             // **The claim goes back on the way out, and this is the only place
@@ -1769,6 +1836,17 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
         },
     };
 
+    // **The stand-down is recorded on both branches, and unconditionally on this
+    // one.** `vacate` answers whether it emptied anything, and the commonest use
+    // of `--clear` is sealing a seat that is *already* empty — which is exactly
+    // the case where there is nothing to vacate and the most need to say so. A
+    // person who has just watched a seat refuse to stay closed is not helped by
+    // being told the record was already fine.
+    //
+    // `--remove` leaves the sentence instead of nothing for the same reason: it
+    // used to delete the record, and a deleted record reads to the reconciler as
+    // a post nobody has ever filled — which is the case it seats at once. That
+    // made the stronger of the two flags no stronger at all.
     let cleared = held.filter(|proj| match remove {
         true => {
             let gone = store.clear_governor(proj);
@@ -1776,9 +1854,14 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
                 store.log_event("governor-cleared", json!({ "project": proj }));
                 rename_seat(store, workspace.unwrap_or_default());
             }
-            gone
+            mark_stood_down(store, proj);
+            true
         }
-        false => vacate(store, proj),
+        false => {
+            vacate(store, proj);
+            mark_stood_down(store, proj);
+            true
+        }
     });
 
     if args.json() {
@@ -1786,8 +1869,14 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
     } else {
         match (&cleared, remove) {
             (None, _) => println!("{}", p.dim("this workspace is nobody's seat")),
-            (Some(proj), true) => println!("{} {}", p.dim("no seat any more on —"), proj),
-            (Some(proj), false) => println!("{} {}", p.dim("stood down, seat left open —"), proj),
+            (Some(proj), true) => {
+                println!("{} {}", p.dim("no seat any more on —"), proj);
+                println!("  {}", p.dim("recorded as stood down; wsp will not fill it"));
+            }
+            (Some(proj), false) => {
+                println!("{} {}", p.dim("stood down, seat left open —"), proj);
+                println!("  {}", p.dim("wsp will not fill it; `wsp spawn -p <project> --govern` if that changes"));
+            }
         }
     }
     0
@@ -1845,14 +1934,30 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
                 // what the machine now does on its own — and would say nothing
                 // about the case that matters, which is whether the daemon is the
                 // thing that is going to fill it.
-                let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
-                // **A claim in flight outranks both sentences**, because it is the
-                // one that changes what a reader should do: a claim means wsp has
-                // already opened the successor and a person running `wsp govern
-                // <scope> --reseat` here would be opening a second one — which is
-                // `wsp-114`'s three governors for one run. It says so rather than
-                // reporting an emptiness that is already being dealt with.
-                if vacancy(&governors, &s.scope).reseating.is_some() {
+let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
+                // **A stand-down outranks every other sentence here**, including
+                // the one the daemon is about to make true. `wsp-148` gave the
+                // reconciler the job of filling a vacancy on a running list, and
+                // until this branch existed a seat Ed had closed by hand still
+                // read `the daemon seats this one` — so the roster instructed the
+                // reader to wait for exactly the thing the person had just
+                // refused. The date is on it because *which* is the question: a
+                // governor that died is worth chasing, a position somebody left
+                // empty is not.
+                let down = stood_at(&governors, &s.scope).map(util::local_hm).unwrap_or_default();
+                if !down.is_empty() {
+                    format!(
+                        "stood down at {down} · wsp will not fill it — \
+                         `wsp spawn -p <project> --govern` if that changes"
+                    )
+                } else if vacancy(&governors, &s.scope).reseating.is_some() {
+                    // **A claim in flight outranks the daemon's own sentence**,
+                    // because it changes what a reader should do: a claim means
+                    // wsp has already opened the successor, so a person running
+                    // `wsp govern <scope> --reseat` here would be opening a
+                    // second one — which is `wsp-114`'s three governors for one
+                    // run. It says so rather than reporting an emptiness that is
+                    // already being dealt with.
                     "empty · a successor is being seated - do not reseat by hand".to_string()
                 } else if auto {
                     "empty · the daemon seats this one".to_string()
