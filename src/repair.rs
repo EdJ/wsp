@@ -380,7 +380,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str) {
     let never_filled = !governors.contains_key(&scope);
     // `None` is every reading that means somebody is there, and the one that
     // means nobody can be asked; see `how_it_reads`.
-    let Some(word) = how_it_reads(store, seats, &governors, &scope) else { return };
+    let Some(word) = how_it_reads(store, seats, &scope) else { return };
     // This pass's own count, and the record's reading of it, from one write.
     let here = cmd_govern::count_unseated(store, &scope);
     if !never_filled && !here.overdue(EMPTY_TICKS) {
@@ -407,63 +407,95 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str) {
     crate::cycle::launch_out(store, &["govern", &scope, "--reseat"]);
 }
 
+/// What is in a scope's seat: somebody, nobody, or a reading nobody can give.
+///
+/// Named `Occupancy` rather than `Reading` because `worklist::Reading` is
+/// already the name of a different question in this file — and two readings of
+/// two records, one of which had already been spelled wrongly once, is not a
+/// thing to make easier.
+///
+/// **`Vacant` carries the word the reconciler logs** because the two readers that
+/// need this question need it for different sentences — one writes to
+/// `cycle.log`, the other decides whether to open a pane — and one answer with
+/// two renderings is one thing to keep right. See [`reading`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Occupancy {
+    /// A pane with an agent in it. Somebody is here and nothing is to be done.
+    Occupied,
+    /// Nobody — never filled, no pane recorded, a pane with nothing in it, or a
+    /// pane that has exited or closed.
+    Vacant(&'static str),
+    /// No backend can be asked. **Never `Vacant`**, and never read as it: this is
+    /// a machine that cannot be seen, and a repair that acted on it would fire
+    /// hardest where it knows least.
+    Unreadable,
+}
+
+/// Whether this scope's seat has somebody in it right now — the one question the
+/// reconciler and `wsp govern --reseat` have to answer identically.
+///
+/// **They did not, and the disagreement was permanent rather than intermittent.**
+/// The guard asked whether the *record* names a pane and the reconciler asked
+/// whether anything is *in* it. A record naming a pane that has since died
+/// answers the first and not the second — which is the original shape of this
+/// whole row — so the daemon counted the vacancy, launched the verb, and was
+/// refused with *"the seat has somebody in it"*, once a minute, for ever. Live on
+/// `tokenhub-spec-sync` at 12:35, whose count reached 54 without the seat ever
+/// being filled.
+///
+/// **The guard refuses exactly what the reconciler would not have asked about**,
+/// which is the invariant worth having: `Vacant` is the only answer that lets a
+/// pane be opened, so a scope where the two ever part company strands the post
+/// rather than double-seating it. `how_it_reads` is this same answer read for the
+/// log line, not a second opinion about it.
+pub(crate) fn reading(store: &Store, seats: &dyn Seats, scope: &str) -> Occupancy {
+    // `seat_held` rather than `seat_of_scope(..).or(last_seat(..))`: a record
+    // with a workspace and an empty `pane` is a slot nobody is in, and it was
+    // `tooling`'s live shape on 2026-10-05.
+    let Some(seat) = cmd_govern::seat_held(scope, &store.governors()) else {
+        return Occupancy::Vacant("unseated");
+    };
+    match seats.state(&seat.pane) {
+        // **`None` is one answer and this is where the two live.** A backend that
+        // could not be reached answers `None`, and a backend that has never heard
+        // of the pane answers `None` too — `Refusal::NoSeat` is its "not mine".
+        // The second is the case this whole row is about: a governor pane that
+        // was closed answers it for ever, and a repair that refused to act on it
+        // would never have found the one dead seat it exists to replace.
+        // [`crate::cycle::Seats::absent`] is the question that tells them apart.
+        None if !seats.absent(&seat.pane) => Occupancy::Unreadable,
+        None => Occupancy::Vacant("gone"),
+        Some(State::Empty) => Occupancy::Vacant("empty"),
+        Some(State::Gone) => Occupancy::Vacant("gone"),
+        Some(_) => Occupancy::Occupied,
+    }
+}
+
 /// How a seat reads, when the answer is one this pass acts on — `None` for every
 /// state that means somebody is there, and for the one reading that means nobody
 /// can ask.
 ///
-/// **`None` is "leave it alone", and it is the reading this most needs to get
-/// right.** [`Seats::state`] answers `None` on a machine where no backend can be
-/// asked, and this is the repair that starts agents: a reconciler that read an
-/// absence as a death would seat a successor for every running list on a machine
-/// whose terminal server is restarting — the same reasoning as [`Fleet`]'s own
-/// docs, and the same failure it names. `Idle` is somebody at a prompt and is not
-/// this repair's business; only `Empty` and `Gone` are.
+/// **A projection of [`reading`], and the reason it is one rather than a second
+/// implementation is the failure this row has now produced twice**: two functions
+/// answering "is this seat empty" from one record, disagreeing, and the
+/// disagreement costing either a governor that was never replaced or a seat that
+/// could not be closed. `Idle` is somebody at a prompt and is not this repair's
+/// business.
 ///
 /// **A live seat clears the count and nothing else.** Not the claim — a claim is
 /// held by a reseat that is running, and the pass that finds the seat filled is
 /// the only evidence there will be that it worked. Clearing it would be clearing
 /// the receipt and would let a second successor into a slot that has just proved
 /// it can hold one.
-fn how_it_reads(
-    store: &Store,
-    seats: &dyn Seats,
-    governors: &std::collections::BTreeMap<String, serde_json::Value>,
-    scope: &str,
-) -> Option<&'static str> {
-    // `last_seat` rather than `seat_of_scope`: a vacated record has no pane at
-    // the top level, and the pane that died is the one whose reading would say
-    // the post is empty — which is the finding, and is what keeps a vacated seat
-    // from looking like a healthy one that simply has no agents to report.
-    // `seat_held` rather than `seat_of_scope(..).or(last_seat(..))`: a record with
-    // a workspace and an empty `pane` is a slot nobody is in, and the verb that
-    // does the seating has to read it the same way or it will refuse the process
-    // this pass launched. One definition, in `cmd_govern`, for both.
-    let seat = cmd_govern::seat_held(scope, governors);
-    let word = match &seat {
-        // Nothing to read: a post that was never filled, or one whose pane the
-        // backend that answered for it cannot name.
-        None => "unseated",
-        Some(s) => match seats.state(&s.pane) {
-            // **`None` is one answer and this is where the two live.** A backend
-            // that could not be reached answers `None`, and a backend that has
-            // never heard of the pane answers `None` too — `Refusal::NoSeat` is
-            // its "not mine". The second is the case this whole row is about: a
-            // governor pane that was closed answers it for ever, and a repair
-            // that refused to act on it would have found the one dead seat it
-            // exists to replace. [`Seats::absent`] is the question that tells
-            // them apart, and a `false` from it means somebody could not be
-            // asked, which stays the refusal.
-            None if !seats.absent(&s.pane) => return None,
-            None => "gone",
-            Some(State::Empty) => "empty",
-            Some(State::Gone) => "gone",
-            Some(_) => {
-                cmd_govern::forget_unseated(store, scope);
-                return None;
-            }
-        },
-    };
-    Some(word)
+fn how_it_reads(store: &Store, seats: &dyn Seats, scope: &str) -> Option<&'static str> {
+    match reading(store, seats, scope) {
+        Occupancy::Vacant(word) => Some(word),
+        Occupancy::Occupied => {
+            cmd_govern::forget_unseated(store, scope);
+            None
+        }
+        Occupancy::Unreadable => None,
+    }
 }
 
 // ---- a member whose agent is not working on it ----------------------------
@@ -1634,6 +1666,75 @@ fn taking_a_stood_down_seat_lifts_the_decision_so_the_next_death_is_ordinary() {
     a_pass(&store, &gone);
     a_pass(&store, &gone);
     assert_eq!(reseated(), vec!["run".to_string()], "so a dead governor is repaired again");
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **The third disagreement between these two readers, and the one that loops.**
+/// `tokenhub-spec-sync` at 12:35 on 2026-10-05: its record names `cpd-272` under
+/// `last`, that pane is gone, and the daemon counted the vacancy and launched
+/// `govern --reseat` — which asked whether the *record* names a pane, said yes,
+/// and refused. Once a minute, for ever, with the count climbing to 54 and the
+/// seat never filled.
+///
+/// A record naming a pane that has since died is the **ordinary** shape of the
+/// vacancy this row repairs, so a guard that refuses on it refuses on nearly
+/// everything. Asserted through the guard's own function rather than through the
+/// verb, which needs a backend.
+#[test]
+fn a_seat_whose_recorded_pane_has_died_is_a_vacancy_the_guard_agrees_with() {
+    let (_env, store) = in_flight("seat-died-pane");
+    store.set_governor(
+        "run",
+        serde_json::json!({
+            "last": {
+                "pane": "cpd-272", "workspace": "cpd-272", "kind": "claude",
+                "host": util::hostname(), "since": "2026-10-05T10:09:55Z",
+            },
+            "vacated": "2026-10-05T10:28:01Z",
+        }),
+    );
+    // The pane it names has gone, which is what `last` is normally for.
+    let gone = Fake::new(&[("cpd-272", Some(State::Gone))]);
+
+    a_pass(&store, &gone);
+    a_pass(&store, &gone);
+    assert_eq!(reseated(), vec!["run".to_string()], "the vacancy is real");
+
+    // And the guard's question, on the record it is about to be handed.
+    assert_eq!(
+        reading(&store, &gone, "run"),
+        Occupancy::Vacant("gone"),
+        "so `govern --reseat` opens a pane rather than refusing this post for ever"
+    );
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **The other end, and the reason the guard is not simply deleted**: a seat with
+/// somebody in it is still refused, so a person running the verb by hand cannot
+/// open a second governor behind a live one.
+#[test]
+fn a_seat_with_somebody_in_it_is_still_refused_by_the_guard() {
+    let (_env, store) = in_flight("seat-busy");
+    seated(&store, "run", "w1", "cpd-1", "", "");
+    let busy = Fake::new(&[("cpd-1", Some(State::Working))]);
+
+    assert_eq!(reading(&store, &busy, "run"), Occupancy::Occupied);
+    a_pass(&store, &busy);
+    assert!(reseated().is_empty(), "{:?}", reseated());
+    let _ = std::fs::remove_dir_all(&store.root);
+}
+
+/// **And a machine nobody can be asked about is neither**, which is the refusal
+/// the guard inherits from the reconciler for free: opening a pane on a scope
+/// whose occupancy is unknown would be a second governor on a run that may well
+/// have one.
+#[test]
+fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
+    let (_env, store) = in_flight("seat-unaskable-guard");
+    seated(&store, "run", "w1", "cpd-1", "", "");
+    let silent = Fake::new(&[("cpd-1", None)]);
+
+    assert_eq!(reading(&store, &silent, "run"), Occupancy::Unreadable);
     let _ = std::fs::remove_dir_all(&store.root);
 }
 

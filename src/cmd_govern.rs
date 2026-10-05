@@ -1537,15 +1537,26 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             release_seat(store, &scope);
             return 1;
         }
-        if seat_held(&scope, &store.governors()).is_some() {
+        // **Refuses what the reconciler would not have asked about, and that is the
+        // whole of it.** Asking "does the record name a pane" instead strands
+        // every scope whose recorded pane has since died — which is the ordinary
+        // shape of the thing this row exists to repair, so the daemon would count
+        // the vacancy, launch this verb, and be refused once a minute for ever.
+        // Live on `tokenhub-spec-sync`, whose count reached 54.
+        //
+        // One question, one function: [`crate::repair::reading`]. The cost is a
+        // reading of the backend on a path that already opens panes, and the
+        // alternative is a second opinion to keep in step with the first.
+        if matches!(
+            crate::repair::reading(store, &crate::cycle::Fleet, &scope),
+            crate::repair::Occupancy::Occupied
+        ) {
             eprintln!("wsp: the {scope} seat has somebody in it - nothing to reseat");
-            // **The claim goes back on the way out, and this is the only place
-            // the verb can leave one.** The reconciler takes it before it
-            // launches this process, so a refusal here is a disagreement between
-            // two readers of the same record — and the seat is still empty
-            // while the record says a reseat is under way, which is the state
-            // `wsp-148` exists to end. Holding it for `SEAT_CLAIMED_FOR` is the
-            // backstop, not the design.
+            // **The claim goes back on the way out.** The reconciler takes it
+            // before it launches this process, so a refusal here is a
+            // disagreement between two readers of the same record — and the seat
+            // is still empty while the record says a reseat is under way, which
+            // is the state `wsp-148` exists to end.
             release_seat(store, &scope);
             return 1;
         }
