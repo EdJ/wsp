@@ -1780,6 +1780,40 @@ impl Store {
         removed
     }
 
+    /// Change one governor record in place, under the lock, and say whether it
+    /// changed.
+    ///
+    /// **A compare-and-set and not a setter, and the reason is that two writers
+    /// now read the same record.** `set_governor` replaces the whole value, so
+    /// every writer that read the record first and wrote it back whole was
+    /// already a lost-update race against `learn_seats`; `wsp-148` adds a second
+    /// such writer — the reconciler counting an empty seat and claiming the
+    /// reseat that follows — and a lost update between them is a duplicate seat,
+    /// which is the one thing this row exists to make impossible. So the record
+    /// is re-read *inside* the lock, `f` is what decides, and a scope with no
+    /// record arrives as an empty object rather than as nothing: a post that has
+    /// never been written is still a post.
+    ///
+    /// `f` returning `false` writes nothing at all — not even the record back —
+    /// which is what lets a caller re-decide under the lock without a second
+    /// round trip.
+    pub fn edit_governor(&self, project: &str, f: impl FnOnce(&mut Value) -> bool) -> bool {
+        let project = project.to_string();
+        self.locked(|| {
+            let mut g = match self.read_json("governors.json") {
+                Value::Object(m) => m,
+                _ => Default::default(),
+            };
+            let mut rec = g.remove(&project).unwrap_or_else(|| json!({}));
+            if !f(&mut rec) {
+                return false;
+            }
+            g.insert(project, rec);
+            self.write_json("governors.json", &Value::Object(g));
+            true
+        })
+    }
+
     // ---- handovers --------------------------------------------------------
     //
     // The one fact a rotation must carry through the store rather than through

@@ -692,7 +692,15 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
         .governors()
         .get(project)
         .filter(|rec| str_at(rec, "workspace") == workspace)
-        .map(|rec| (str_at(rec, "session"), str_at(rec, "cwd"), str_at(rec, "kind")))
+        .map(|rec| {
+            (
+                str_at(rec, "session"),
+                str_at(rec, "cwd"),
+                str_at(rec, "kind"),
+                str_at(rec, "model"),
+                str_at(rec, "effort"),
+            )
+        })
         .unwrap_or_default();
     store.set_governor(
         project,
@@ -707,6 +715,15 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
             // answer: an id nobody can say which binary to hand it to is not a
             // thread anybody can pick up.
             "kind": kept.2,
+            // The tier, for the same reason and one step further: a seat is the
+            // most expensive agent in a run, and a successor handed "whatever
+            // the settings say now" is a rotation that quietly changes cost.
+            // `wsp-117`, and `note_tier` is what puts the real answer here — a
+            // `wsp govern` typed by a person takes over an agent that is already
+            // running and must not restate its tier, which is why these are kept
+            // rather than cleared here.
+            "model": kept.3,
+            "effort": kept.4,
         }),
     );
     store.log_event("governor-set", json!({ "project": project, "workspace": workspace }));
@@ -838,6 +855,14 @@ fn stood_down(rec: &Value) -> Value {
         "session": str_at(rec, "session"),
         "cwd": str_at(rec, "cwd"),
         "kind": str_at(rec, "kind"),
+        // The tier, and **this is the field that made the omission matter.**
+        // `wsp-148` reads it back off `last` to seat a successor, because a
+        // governor whose pane died is vacated before the reconciler looks — so
+        // without these two the one record a reseat has to read is the one that
+        // did not carry them, and a run's most expensive seat was replaced at the
+        // runtime default every time it was replaced.
+        "model": str_at(rec, "model"),
+        "effort": str_at(rec, "effort"),
         "since": str_at(rec, "since"),
     })
 }
@@ -1030,6 +1055,226 @@ pub fn learn_seats<'a>(
     learned.len()
 }
 
+// ---- what a seat is, and what is wrong with it ----------------------------
+//
+// Three facts about a seat that are not "who is in it", added by `wsp-148`
+// because the reconciler has to decide *whether to replace* an occupant and so
+// has to know how the last one was started, and because "empty" has to survive
+// being counted.
+//
+// They live on the governor record rather than in a file of their own for the
+// reason `repair`'s module docs give for a member's `## Log`: whatever state
+// this is, it is a property of *this seat* and every verb that moves a seat
+// already rewrites the whole record — `take`, `vacate`, `learn_seats` — so a
+// second file is a second thing to keep in step with them, and the day one
+// forgets is the day the reconciler reseats a seat that is working.
+
+/// The tier the seat's agent is running at, off the record.
+///
+/// **`None` means "the settings tier", and it is not a failure.** A governor is
+/// deliberately not given the governed default — `cmd_spawn::governed` returns
+/// nothing for `--govern`, and `a_govern_spawn_onto_the_same_scope_keeps_the
+/// _settings_tier` holds that line on purpose — so a seat whose settings file
+/// states nothing records nothing and is handed back as `(None, None)`, which
+/// is exactly what the spawn that filled it used. That is the whole of what this
+/// reader buys: the successor of a seat is started the way that seat was, and
+/// not the way the settings file happens to read at the moment it is replaced.
+///
+/// `wsp-117`. The row also asks for a *bounded* default for the most expensive
+/// seat in a run, and this is deliberately not that: bounding a governor is a
+/// decision about what tier a governor should be, and reversing a tested one is
+/// not a side effect of recording one.
+pub fn tier_of(governors: &BTreeMap<String, Value>, scope: &str) -> (Option<String>, Option<String>) {
+    let Some(rec) = governors.get(scope) else { return (None, None) };
+    let read = |k: &str| {
+        rec.get(k)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let live = (read("model"), read("effort"));
+    // **Under `last` as well, and a live record's top level is usually empty of
+    // both.** A governor whose pane died is *vacated* before the reconciler
+    // looks, and vacating moves the whole of the seat under `last` — so the
+    // reading a reseat does is nearly always this one, and a reader that only
+    // looked at the top level would find the tier on exactly the records nobody
+    // needs it on. Mirrors [`room_of`]: live first, the way back second.
+    if live.0.is_some() || live.1.is_some() {
+        return live;
+    }
+    let Some(last) = rec.get("last") else { return live };
+    let read = |k: &str| {
+        last.get(k)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    (read("model"), read("effort"))
+}
+
+/// Put the tier a seat was actually started at on its record.
+///
+/// **Written by the two callers that start an agent, after they have resolved
+/// it, and by nobody else.** `wsp spawn --govern` knows what it passed;
+/// `rotate_as` knows what it passed. `take` runs before either, and clearing
+/// the field there instead would throw away the tier of a seat a person is
+/// taking over — which is the case where the agent in the room is not being
+/// replaced and its cost is not being changed.
+pub fn note_tier(store: &Store, scope: &str, model: Option<&str>, effort: Option<&str>) -> bool {
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert("model".into(), json!(model.unwrap_or_default()));
+        o.insert("effort".into(), json!(effort.unwrap_or_default()));
+        true
+    })
+}
+
+/// How long this seat has been standing empty, in ticks, and whether a reseat
+/// is already under way.
+///
+/// **Two fields and not one, because they answer two different questions.** The
+/// count is the reconciler's evidence — a seat that reads `Empty` on one pass is
+/// a pane between states, and one that reads it on three is a dead governor on a
+/// running list. The claim is the guard: `wsp-148` requires the record to be
+/// written *before* the spawn so a repeated tick cannot seat a second successor,
+/// and a record that only counted would say `2` again on the tick after the
+/// spawn as readily as on the tick before it.
+///
+/// The count is on the record and not in [`crate::repair::Pass`] because that
+/// struct is in memory: the daemon `exec`s itself when an install lands
+/// underneath it (`daemon::reload`), which throws the count away at exactly the
+/// moment a person is most likely to be installing — mid-run, with a governor
+/// dead. A counter that resets would never reach two ticks.
+///
+/// The claim is dated and read back through [`SEAT_CLAIMED_FOR`] rather than
+/// being a bare boolean, because a bare one survives a process that was killed
+/// mid-reseat — and the failure this row was pointed at by name is a rotate that
+/// left a successor nobody could reach behind. A claim is taken back when the
+/// reseat finishes, and an abandoned one is only honoured for this long.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Vacancy {
+    /// Consecutive passes that have read this seat `Empty` or `Gone`.
+    pub unseated: u64,
+    /// When a reseat was claimed, if one is in flight.
+    pub reseating: Option<i64>,
+}
+
+/// How long a claim on a reseat is honoured before the next pass takes it back.
+///
+/// Twenty minutes, and it is a bound on a *dead* process rather than a wait: a
+/// reseat that is running holds this for as long as the spawn takes, and one
+/// that was killed holding it holds it for ever. Both are answered by a number
+/// that is long past any real spawn and short enough that a run does not sit
+/// unseated for the rest of the night.
+pub const SEAT_CLAIMED_FOR: i64 = 20 * 60;
+
+/// Read the two markers off a record.
+pub fn vacancy(governors: &BTreeMap<String, Value>, scope: &str) -> Vacancy {
+    governors.get(scope).map(Vacancy::of).unwrap_or_default()
+}
+
+impl Vacancy {
+    /// The two markers as one record carries them. `None` is a record with
+    /// neither, which is every record written before `wsp-148`.
+    fn of(rec: &Value) -> Vacancy {
+        Vacancy {
+            unseated: rec.get("unseated").and_then(Value::as_u64).unwrap_or(0),
+            reseating: rec
+                .get("reseating")
+                .and_then(Value::as_str)
+                .map(util::epoch_of)
+                .filter(|at| *at > 0),
+        }
+    }
+
+    /// Whether the claim, if there is one, has gone stale.
+    pub fn claim_stale(&self, at: i64) -> bool {
+        self.reseating.is_some_and(|since| since + SEAT_CLAIMED_FOR <= at)
+    }
+
+    /// Whether a reseat may be claimed now — nothing is claimed, or what is was
+    /// claimed long enough ago that whatever took it is gone.
+    pub fn claim_free(&self, at: i64) -> bool {
+        self.reseating.is_none_or(|_| self.claim_stale(at))
+    }
+
+    /// Whether this seat has been empty long enough to replace. `n` ticks, which
+    /// is the whole of the delay this row buys and the reason it is not zero: a
+    /// pane reads `Empty` for a moment every time an agent is cleared and
+    /// restarted, and a successor seated into that window is two governors for
+    /// one run.
+    pub fn overdue(&self, n: u64) -> bool {
+        self.unseated >= n
+    }
+}
+
+/// One more pass has found this seat empty, and how this seat now reads.
+///
+/// **The whole record and not just the count, and the reason is that the caller
+/// decides on one and writes the other.** The reconciler asks "is this seat
+/// overdue?" — [`Vacancy::overdue`] — and this is the only reading that can
+/// answer it, so returning the pair rather than the number means the predicate
+/// that fires and the marker that recorded it are the same read of the same
+/// value. Returning the count alone would put `EMPTY_TICKS` and the record's own
+/// `unseated` field on either side of a write that a concurrent `learn_seats`
+/// can interleave with.
+///
+/// Under the lock and re-read inside it, so two passes racing cannot both decide
+/// they are the first.
+pub fn count_unseated(store: &Store, scope: &str) -> Vacancy {
+    let mut now = Vacancy::default();
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert(
+            "unseated".into(),
+            json!(o.get("unseated").and_then(Value::as_u64).unwrap_or(0) + 1),
+        );
+        now = Vacancy::of(rec);
+        true
+    });
+    now
+}
+
+/// Forget that this seat was ever empty — a pass that found somebody in it.
+///
+/// **Clears the count and never the claim.** A live seat is the one reading that
+/// proves the reseat worked, and it is the only evidence there will ever be that
+/// it did; clearing a claim on it would be clearing the receipt.
+pub fn forget_unseated(store: &Store, scope: &str) {
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        if o.remove("unseated").is_none() {
+            return false;
+        }
+        true
+    });
+}
+
+/// Take the claim that stops a second pass seating a second successor.
+///
+/// **The record before the spawn, which is the whole of the ordering.** It is
+/// written by whoever is about to open a seat and started, so a pass that finds
+/// it does nothing at all — not a second seat, and not a second sentence to the
+/// spool. The alternative, deciding on a field that is only written once the
+/// successor is up, leaves the window that `wsp-114` was filed about open for the
+/// whole length of a spawn.
+///
+/// A stale claim is taken back rather than refused, and refusing it is the
+/// obvious thing to write: an abandoned claim would then hold a dead governor's
+/// post empty until a person noticed it, which is the failure this row exists to
+/// end.
+pub fn claim_seat(store: &Store, scope: &str) -> bool {
+    let at = util::epoch_secs();
+    store.edit_governor(scope, |rec| {
+        if !Vacancy::of(rec).claim_free(at) {
+            return false;
+        }
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert("reseating".into(), json!(util::now_iso()));
+        true
+    })
+}
+
 /// The seat's agent, resolved through the port — as it is *now*, which is not
 /// necessarily the pane it started in.
 ///
@@ -1165,8 +1410,8 @@ pub(crate) fn scope_of(store: &Store, index: &Index, needle: &str) -> Option<Str
     }
 }
 
-/// `wsp govern [<scope>] [--clear|--remove|--tell "…"]`, and the one flag that
-/// is a whole other verb: `--rotate`.
+/// `wsp govern [<scope>] [--clear|--remove|--tell "…"]`, and the two flags that
+/// are whole other verbs: `--rotate` and `--reseat`.
 pub fn govern(store: &Store, args: &Args) -> i32 {
     // Rotation is not an edit to this seat — it ends it, by handing it to
     // somebody else. It lives with the placement machinery in `cmd_spawn`,
@@ -1174,6 +1419,27 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     // verb a custodian types names this one. See [`crate::cmd_spawn::rotate`].
     if args.has("rotate") {
         return crate::cmd_spawn::rotate(store, args);
+    }
+    // Filling a slot nobody is in, which is the same machinery and the same
+    // successor with no predecessor. Routed here for the same reason and because
+    // the reconciler runs it as this verb — `wsp-148`. A person can run it too,
+    // which is the point: the daemon filling a seat and a person filling it are
+    // one verb, so a "wsp will do it" is not a different action from doing it.
+    if args.has("reseat") {
+        let index = Index::new(store.projects());
+        let Some(needle) = args.rest.first() else {
+            eprintln!("usage: wsp govern <project|worklist> --reseat");
+            return 2;
+        };
+        let Some(scope) = scope_of(store, &index, needle) else {
+            eprintln!("wsp: no such project or worklist `{needle}`");
+            return 1;
+        };
+        if seat_of_scope(&scope, &store.governors()).is_some() {
+            eprintln!("wsp: the {scope} seat has somebody in it - nothing to reseat");
+            return 1;
+        }
+        return crate::cmd_spawn::reseat(store, &scope);
     }
     // The other half of a rotation, run by the pane being ended. `--rotate`
     // starts it detached; see [`crate::cmd_spawn::carry_out_ending`].
@@ -1528,7 +1794,29 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
             (Some(o), _) if o.pane.is_empty() => room_of(&governors, &s.scope),
             (Some(o), _) => format!("{} · {}", room_of(&governors, &s.scope), o.pane),
             (None, true) => format!("on {}", s.host),
-            (None, false) => "empty · wsp spawn -p <project> --govern fills it".to_string(),
+            (None, false) => {
+                // **Both the door and the fact that wsp opens it by itself.**
+                // `wsp-148` gave the daemon the job of filling a vacancy on a
+                // running list, and a roster that still says only `wsp spawn ...
+                // --govern fills it` would be teaching a reader to do by hand
+                // what the machine now does on its own — and would say nothing
+                // about the case that matters, which is whether the daemon is the
+                // thing that is going to fill it.
+                let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
+                // **A claim in flight outranks both sentences**, because it is the
+                // one that changes what a reader should do: a claim means wsp has
+                // already opened the successor and a person running `wsp govern
+                // <scope> --reseat` here would be opening a second one — which is
+                // `wsp-114`'s three governors for one run. It says so rather than
+                // reporting an emptiness that is already being dealt with.
+                if vacancy(&governors, &s.scope).reseating.is_some() {
+                    "empty · a successor is being seated - do not reseat by hand".to_string()
+                } else if auto {
+                    "empty · the daemon seats this one".to_string()
+                } else {
+                    "empty · wsp spawn -p <project> --govern fills it".to_string()
+                }
+            }
         };
         println!("{} {}  {}", mark, p.bold(&s.scope), p.dim(&who));
     }

@@ -2347,7 +2347,7 @@ fn rotate_on(
     wait: &Patience,
     end: &dyn Fn(&str) -> Result<(), String>,
 ) -> i32 {
-    rotate_as(place, store, args, wait, end, None)
+    rotate_as(place, store, args, wait, end, Hand::Own)
 }
 
 /// `wsp-134`: the rotation a run takes itself when its barrier is passed.
@@ -2388,10 +2388,25 @@ pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
         .filter(|k| !k.is_empty())
         .unwrap_or(DEFAULT_KIND)
         .to_string();
-    let args = Args::synth("govern", &[scope], &[("rotate", "true"), ("kind", kind.as_str())]);
+    // And on the tier it is on now, for `wsp-117`'s reason: this is the rotation
+    // that runs at every barrier, so leaving the tier to the settings file made
+    // what a run cost depend on which half of the night it passed a barrier in.
+    // `rotate_as` reads the same field off the same record, and this only spells
+    // out what it is for.
+    let (model, effort) = cmd_govern::tier_of(&governors, scope);
+    let args = Args::synth(
+        "govern",
+        &[scope],
+        &[
+            ("rotate", "true"),
+            ("kind", kind.as_str()),
+            ("model", model.as_deref().unwrap_or_default()),
+            ("effort", effort.as_deref().unwrap_or_default()),
+        ],
+    );
     rotate_as(backend(&args).as_ref(), store, &args, &Patience::default(), &|scope| {
         arrange_ending_when_idle(store, scope)
-    }, Some(me))
+    }, Hand::Predecessor(me))
 }
 
 /// Set on the `--ending` helper [`rotate_on_behalf`] starts: wait until the
@@ -2420,13 +2435,113 @@ fn arrange_ending_when_idle(store: &Store, scope: &str) -> Result<(), String> {
     cmd.spawn().map(drop).map_err(|e| e.to_string())
 }
 
+/// Who is replacing a seat, and whose act it is.
+///
+/// **`rotate_as` took this as `Option<String>` and the third case is what made it
+/// wrong.** Two of the three are a rotation — a predecessor is there to be moved
+/// away from, and everything the function does is arranged around that one fact:
+/// the slot moves *last*, after a successor's first turn is confirmed, so the
+/// predecessor is still seated until its replacement has proved itself; a
+/// handover record names it so its ending can be carried out from its own side;
+/// and `despawn` refuses to end it while the rotation is in flight. A vacancy
+/// has no predecessor, and every one of those three arrangements is either
+/// meaningless or actively harmful — a handover record naming a pane that is
+/// already gone, and a successor whose brief spends its first turn on a handover
+/// from nobody.
+///
+/// So the third case is named rather than spelled by an empty string, because
+/// **the ordering inverts for it.** There is nothing to protect, so the seat
+/// record is written *before* the spawn: the successor's brief is composed at
+/// start and has to find the slot already naming it, and — the reason `wsp-148`
+/// asks for it — a reconciler that finds the slot filled does not open a second
+/// one. If the successor never comes up that record is put back, because a seat
+/// record naming a pane with nobody in it is how `wsp-114`'s three governors for
+/// one run started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Hand {
+    /// `wsp govern <scope> --rotate`, typed in the seat's own pane. The pane must
+    /// hold the seat; see [`rotate_as`].
+    Own,
+    /// The run's own rotation at a passed barrier (`wsp-134`). The predecessor is
+    /// the pane the record names, and ending it waits for it to stop turning
+    /// rather than for the rotating process to exit.
+    Predecessor(String),
+    /// `wsp-148`: the slot is standing empty — never filled, or vacated — and
+    /// nobody is being moved aside.
+    Vacant,
+}
+
+/// `wsp govern <scope> --reseat`: fill a slot nobody is sitting in.
+///
+/// **The rotate path with no predecessor, and it is [`rotate_as`] rather than a
+/// second spawn because everything about the *seat* is already right there.**
+/// A successor has to be opened where a spawn would open it, briefed, started,
+/// confirmed and recorded as the scope's custodian, and the argument for each of
+/// those living in one function is `rotate`'s own: two copies of "seat a
+/// governor" is two copies of a bug, and this one already had one.
+///
+/// What it reads off the record rather than off its arguments, because the point
+/// is to be *the seat again*:
+///
+/// - the **kind**, so a run governed from opencode is not moved onto claude;
+/// - the **tier** (`wsp-117`), so a successor of an expensive governor is not
+///   quietly started at whatever the settings file says today.
+///
+/// What it does not read: the spool. A seat filled into a vacancy has missed
+/// whatever was held, and `unheld` says how much and where to find it rather
+/// than pasting it — a successor handed four backlogged sentences has no way to
+/// tell them from its own work order, and the whole of `wsp-146` is that they
+/// clear on a turn rather than on a read.
+pub(crate) fn reseat(store: &Store, scope: &str) -> i32 {
+    let args = reseat_args(&store.governors(), scope);
+    reseat_on(backend(&args).as_ref(), store, &args, &Patience::default())
+}
+
+/// What the reseat is asked for, read off the seat's own record.
+///
+/// **Split out because it is the half that can be wrong without a terminal.**
+/// Both fields come from `governors.json` and both default rather than fail: a
+/// record written before this row existed has no tier, and a successor started
+/// at `None` is a successor started exactly as the spawn that filled the seat
+/// was — so an absent field is the old behaviour, not a lost one.
+fn reseat_args(governors: &BTreeMap<String, Value>, scope: &str) -> Args {
+    let kind = governors
+        .get(scope)
+        .and_then(|r| r.get("kind"))
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+        .unwrap_or(DEFAULT_KIND)
+        .to_string();
+    let (model, effort) = cmd_govern::tier_of(governors, scope);
+    Args::synth(
+        "govern",
+        &[scope],
+        &[
+            ("reseat", "true"),
+            ("kind", kind.as_str()),
+            ("model", model.as_deref().unwrap_or_default()),
+            ("effort", effort.as_deref().unwrap_or_default()),
+        ],
+    )
+}
+
+/// [`reseat`] against a stated backend and clock, which is the shape every test
+/// of it takes — and a function rather than an inline block for the same reason
+/// [`rotate_on`] is one.
+fn reseat_on(place: &dyn Place, store: &Store, args: &Args, wait: &Patience) -> i32 {
+    // Nothing to hand over from, so nothing to end. A closure rather than a
+    // second code path through `rotate_as`, because a step that is "end
+    // somebody" has to be a step somebody asked for.
+    rotate_as(place, store, args, wait, &|_| Ok(()), Hand::Vacant)
+}
+
 fn rotate_as(
     place: &dyn Place,
     store: &Store,
     args: &Args,
     wait: &Patience,
     end: &dyn Fn(&str) -> Result<(), String>,
-    on_behalf: Option<String>,
+    turn: Hand,
 ) -> i32 {
     let p = Paint::new();
     let Some(needle) = args.rest.first().cloned() else {
@@ -2445,12 +2560,23 @@ fn rotate_as(
     // the end of a run seats an agent with nothing left to sequence. A project
     // scope has no run to consult, and a list that is held or not yet started
     // has groups still owed, so both rotate as usual.
-    if store.worklist(&scope).is_some() {
-        let over = crate::worklist::running_position(store, &scope).is_some_and(|pos| pos.finished());
-        if over {
-            eprintln!("wsp: the {scope} run is finished - there is no group left to sequence");
-            eprintln!("wsp: stand down instead: wsp govern {scope} --clear");
-            return 1;
+    //
+    // **Not for a vacancy, and the arithmetic is different rather than laxer.**
+    // The refusal is about spending a seat's whole context on sequencing work
+    // that does not exist. The alternative to seating one is not the money, it
+    // is nobody at all for ever on a list whose own row still says `running` —
+    // so a finished run whose seat has died is more in need of a reader, not
+    // less, and `wsp-148`'s other half is exactly this case.
+    let vacant = turn == Hand::Vacant;
+    if !vacant {
+        if store.worklist(&scope).is_some() {
+            let over =
+                crate::worklist::running_position(store, &scope).is_some_and(|pos| pos.finished());
+            if over {
+                eprintln!("wsp: the {scope} run is finished - there is no group left to sequence");
+                eprintln!("wsp: stand down instead: wsp govern {scope} --clear");
+                return 1;
+            }
         }
     }
 
@@ -2461,9 +2587,13 @@ fn rotate_as(
     // (`compound-105`): a compound-hosted agent has neither, only the seat
     // `my_pane()` already names, and `governs` matches an exact pane on its
     // own — no separate workspace to pass beside it (`compound-095`).
-    let (me, held) = match on_behalf {
-        Some(me) => (me, true),
-        None => match crate::cmd_agent::my_pane() {
+    let (me, held) = match turn {
+        // The run's own rotation found the pane from the seat's record.
+        Hand::Predecessor(me) => (me, true),
+        // Nobody holds this slot and nobody is being moved out of it, so there
+        // is no caller's standing to check and no predecessor to name.
+        Hand::Vacant => (String::new(), true),
+        Hand::Own => match crate::cmd_agent::my_pane() {
             Some(me) => (me, false),
             None => {
                 eprintln!("wsp: {scope} is rotated by whoever holds its seat, from its own pane");
@@ -2472,27 +2602,32 @@ fn rotate_as(
         },
     };
     let governors = store.governors();
-    match cmd_govern::governs(&governors, &crate::place::Seat::new(&me)) {
-        // The run's own rotation found the pane from the seat's record.
-        _ if held => {}
-        Some(held) if held == scope => {}
-        Some(other) => {
-            eprintln!("wsp: this pane holds the {other} seat, not {scope}");
-            return 1;
-        }
-        // Not the seat, said precisely: named who has it when there is one to
-        // name, and where an empty seat is filled from when there is not.
-        // Either way this pane does not hold what it is trying to hand over,
-        // and every branch here stops before anything is opened.
-        None => {
-            match cmd_govern::seat_of_scope(&scope, &governors) {
-                Some(_) => eprintln!(
-                    "wsp: the {scope} seat is held by {} - only that pane can rotate it",
-                    cmd_govern::room_of(&governors, &scope)
-                ),
-                None => eprintln!("wsp: nobody holds the {scope} seat - wsp spawn fills an empty one"),
+    // Checked only for `Hand::Own` — the one case where a caller could be
+    // something other than the seat. `Predecessor` named its pane off the record
+    // that says which scope it governs, and `Vacant` has no caller: the
+    // reconciler holds no seat and is asking precisely because nobody does, so
+    // there is no standing to check and nothing above to protect.
+    if !held && !vacant {
+        match cmd_govern::governs(&governors, &crate::place::Seat::new(&me)) {
+            Some(held) if held == scope => {}
+            Some(other) => {
+                eprintln!("wsp: this pane holds the {other} seat, not {scope}");
+                return 1;
             }
-            return 1;
+            // Not the seat, said precisely: named who has it when there is one to
+            // name, and where an empty seat is filled from when there is not.
+            // Either way this pane does not hold what it is trying to hand over,
+            // and every branch here stops before anything is opened.
+            None => {
+                match cmd_govern::seat_of_scope(&scope, &governors) {
+                    Some(_) => eprintln!(
+                        "wsp: the {scope} seat is held by {} - only that pane can rotate it",
+                        cmd_govern::room_of(&governors, &scope)
+                    ),
+                    None => eprintln!("wsp: nobody holds the {scope} seat - `wsp govern {scope} --reseat` fills it"),
+                }
+                return 1;
+            }
         }
     }
 
@@ -2524,6 +2659,19 @@ fn rotate_as(
         }
     };
     let kind = asked_kind.unwrap_or_else(|| DEFAULT_KIND.to_string());
+    // The tier, off the record of the seat being replaced and not off the
+    // settings file. **This is `wsp-117`'s half that is not a re-opened
+    // decision**: a governor is the most expensive seat in a run, its cost grows
+    // with the fleet rather than with its own work, and a rotation that handed
+    // the successor "whatever the settings read now" made the cost of a run
+    // depend on when in the night it was rotated. What a caller typed still wins,
+    // and a record written before this field existed answers `None`, which is
+    // exactly what the spawn that filled it used — so the fallback is the
+    // behaviour this has always had and not a new one.
+    let (model, effort) = (
+        args.get("model").filter(|m| !m.is_empty()),
+        args.get("effort").filter(|e| !e.is_empty()),
+    );
     // Before anything is opened, like every other refusal here. The evidence
     // step two turns on is a turn wsp can see; a kind whose order goes out on
     // the command line gives none, ever.
@@ -2561,26 +2709,59 @@ fn rotate_as(
         }
     };
 
-    // The record goes down before the agent starts, because the successor's
-    // brief is composed at start and the ending has to already be in it. Taken
-    // back on every failure below: between this line and a confirmed turn, the
-    // record is a promise, and a promise wsp failed to keep must not survive
-    // as somebody's standing instruction to end a seated custodian's pane.
-    store.set_handover(&scope, json!({ "from": me, "to": seat.as_str(), "since": util::now_iso() }));
+    // For a vacancy the slot moves *here* rather than at step 3, and the reason
+    // is the two things the other two cases have and this one does not: no
+    // predecessor to keep seated, and a brief composed at start that has to find
+    // the record already naming this pane.
+    //
+    // **It is also the guard `wsp-148` asks for.** The reconciler claims the
+    // record before it starts this process, and a claim alone is not enough —
+    // the claim expires, and the pass after that would find a slot naming a pane
+    // with no agent in it and seat a second successor. Writing the record first
+    // means the second pass finds a filled slot and does nothing.
+    //
+    // **And it is put back on every way out.** `wsp-114` is three governors for
+    // one run, and the shape it happened in is a spawn that opened a pane whose
+    // agent never came up while the record went on naming the pane before it. A
+    // record restored to what it was says "still empty", which is the truth and
+    // is what the next pass acts on; a record left naming a dead pane reads as
+    // filled to every surface that cannot ask the backend.
+    let vacated = vacant.then(|| store.governors().get(&scope).cloned());
+    if vacant {
+        let Some(ws_new) = place.room(&seat) else {
+            eprintln!("wsp: {} opened but its workspace could not be read - nothing was recorded", seat.as_str());
+            return 1;
+        };
+        cmd_govern::take(store, &scope, &ws_new, seat.as_str());
+        cmd_govern::note_tier(store, &scope, model.as_deref(), effort.as_deref());
+    } else {
+        // The record goes down before the agent starts, because the successor's
+        // brief is composed at start and the ending has to already be in it. Taken
+        // back on every failure below: between this line and a confirmed turn, the
+        // record is a promise, and a promise wsp failed to keep must not survive
+        // as somebody's standing instruction to end a seated custodian's pane.
+        store.set_handover(&scope, json!({ "from": me, "to": seat.as_str(), "since": util::now_iso() }));
+    }
 
     let laid = match &brief_at {
         Some(path) => lay_brief(place, store, &work, &seat, cwd.as_deref(), path),
         None => Laid::Elsewhere,
     };
-    let text = handover(&subject, Handover::Custodian, route(how, laid));
+    let order_text = handover(&subject, Handover::Custodian, route(how, laid));
+    // A seat seated into a vacancy is also told what it missed, and told the
+    // *size* of it rather than the contents. See `unheld`.
+    let text = match vacant {
+        true => format!("{order_text}\n\n{}", unheld(store, &scope)),
+        false => order_text,
+    };
     let in_args = how.order_in_args();
     let spawn = agent_commands::Spawn {
         full: false,
         subagents: false,
         name: &subject,
         seat: &seat,
-        model: None,
-        effort: None,
+        model: model.as_deref(),
+        effort: effort.as_deref(),
         order: match in_args {
             true => Some(text.as_str()),
             false => None,
@@ -2593,53 +2774,76 @@ fn rotate_as(
     // that the handover was taken, and everything after this point depends on
     // it having been.
     if let Err(e) = start_agent(place, how, &spawn, &agent, &kind, wait) {
-        store.clear_handover(&scope);
+        if vacant {
+            put_back(store, place, &scope, &seat, vacated.as_ref(), &brief_at);
+        } else {
+            store.clear_handover(&scope);
+        }
         eprintln!("wsp: {kind} did not start in {seat}: {e}");
         unreached(how, place, &spawn);
-        eprintln!("wsp: nothing moved - the {scope} seat is still yours");
+        if vacant {
+            eprintln!("wsp: the {scope} seat is standing empty again");
+        } else {
+            eprintln!("wsp: nothing moved - the {scope} seat is still yours");
+        }
         return 1;
     }
     if !in_args {
         if let Err(e) = confirm_turn(place, how, &spawn, &text, wait) {
-            store.clear_handover(&scope);
+            if vacant {
+                put_back(store, place, &scope, &seat, vacated.as_ref(), &brief_at);
+            } else {
+                store.clear_handover(&scope);
+            }
             eprintln!("wsp: agent started but not working on it: {e}");
             eprintln!("wsp: send the order again with `wsp tell {} -`", seat.as_str());
             unreached(how, place, &spawn);
-            eprintln!(
-                "wsp: nothing moved - the {scope} seat is still yours, and {} sits idle",
-                seat.as_str()
-            );
+            if vacant {
+                eprintln!(
+                    "wsp: the {scope} seat is standing empty again, and {} has the order in its composer",
+                    seat.as_str()
+                );
+            } else {
+                eprintln!(
+                    "wsp: nothing moved - the {scope} seat is still yours, and {} sits idle",
+                    seat.as_str()
+                );
+            }
             return 1;
         }
     }
 
-    // Step 3. The slot moves last, now that it is earned. `take` says whom it
-    // displaced — which is this pane, by construction — and renames both rooms
-    // after the fact.
-    let Some(ws_new) = place.room(&seat) else {
-        // A backend with rooms that could not say which one this seat is in:
-        // herdr, with its listing unanswered. Nothing here may guess, and the
-        // seat must not move onto a record that cannot name its room. So this
-        // pane is still the seat, and nothing ends it. The record stays, so the
-        // successor's brief keeps saying the seat is on its way. Once the move
-        // is finished by hand, this pane's own `--ending` is the step that ends
-        // it; the successor never is.
-        eprintln!(
-            "wsp: {} took the handover, but its workspace could not be read - \
-             the seat has not moved and this pane is still it",
-            seat.as_str()
-        );
-        eprintln!("wsp: run `wsp govern {scope}` from {} to finish the move", seat.as_str());
-        eprintln!("wsp: then `wsp govern {scope} --ending` here ends this pane");
-        return 1;
-    };
-    cmd_govern::take(store, &scope, &ws_new, seat.as_str());
+    // Step 3. The slot moves last, now that it is earned — for the two cases
+    // that have a predecessor to keep seated. `take` says whom it displaced,
+    // which is this pane by construction, and renames both rooms after the fact.
+    if !vacant {
+        let Some(ws_new) = place.room(&seat) else {
+            // A backend with rooms that could not say which one this seat is in:
+            // herdr, with its listing unanswered. Nothing here may guess, and the
+            // seat must not move onto a record that cannot name its room. So this
+            // pane is still the seat, and nothing ends it. The record stays, so the
+            // successor's brief keeps saying the seat is on its way. Once the move
+            // is finished by hand, this pane's own `--ending` is the step that ends
+            // it; the successor never is.
+            eprintln!(
+                "wsp: {} took the handover, but its workspace could not be read - \
+                 the seat has not moved and this pane is still it",
+                seat.as_str()
+            );
+            eprintln!("wsp: run `wsp govern {scope}` from {} to finish the move", seat.as_str());
+            eprintln!("wsp: then `wsp govern {scope} --ending` here ends this pane");
+            return 1;
+        };
+        cmd_govern::take(store, &scope, &ws_new, seat.as_str());
+        cmd_govern::note_tier(store, &scope, model.as_deref(), effort.as_deref());
+    }
 
     // Step 4. This pane's own ending, now that somebody else holds the seat.
     // Started before anything is printed: the process waits for this one to
     // exit, so the lines below still reach whoever ran the verb. A failure is
     // written onto the record, where the successor's brief reports it. The
-    // successor does not act on it.
+    // successor does not act on it. A vacancy has no predecessor, so its
+    // closure above is the no-op it is and there is nothing to arrange.
     let ending = end(&scope);
     if let Err(why) = &ending {
         mark_ending_failed(store, &scope, &format!("the ending could not be started: {why}"));
@@ -2649,21 +2853,33 @@ fn rotate_as(
         println!(
             "{}",
             json!({
-                "rotated": true,
+                "rotated": !vacant,
+                "reseated": vacant,
                 "scope": scope,
                 "successor": seat.as_str(),
-                // The pane wsp is ending, which is this one.
-                "predecessor": me,
+                "tier": { "model": model, "effort": effort },
+                // The pane wsp is ending, which is this one — and there is no
+                // such pane when the slot was standing empty.
+                "predecessor": if me.is_empty() { Value::Null } else { json!(me) },
                 "ending": match &ending {
+                    Ok(()) if vacant => json!("none"),
                     Ok(()) => json!("arranged"),
                     Err(why) => json!({ "failed": why }),
                 },
             })
         );
     } else {
-        println!("{} {}", p.cyan("▣"), p.bold(&format!("{scope} rotated")));
+        println!(
+            "{} {}",
+            p.cyan("▣"),
+            p.bold(&format!("{scope} {}", if vacant { "reseated" } else { "rotated" }))
+        );
         println!("  {}", p.dim(&format!("successor in {} - its first turn is running", seat.as_str())));
+        if let (true, (Some(model), Some(effort))) = (vacant, (model, effort)) {
+            println!("  {}", p.dim(&format!("on the tier the seat was running at: {model}, {effort} effort")));
+        }
         match &ending {
+            Ok(()) if vacant => {}
             Ok(()) => println!(
                 "  {}",
                 p.dim("your ending is arranged: wsp ends this pane once this command exits. Nothing here is left to do")
@@ -2678,6 +2894,126 @@ fn rotate_as(
         Ok(()) => 0,
         Err(_) => 1,
     }
+}
+
+/// Undo a vacancy reseat that did not produce a seat, so the next pass sees a
+/// slot that is honestly empty rather than one naming a dead pane.
+///
+/// **The record, the pane, and the brief — all three, and in that order.** The
+/// record first, because until it is back every reader agrees the slot is
+/// filled; then the pane, because a pane with no agent in it is the `gone`
+/// governor row `wsp wip` was already listing five of on 2026-10-04, and the
+/// reseat is the one verb that just created another; then the brief, which is
+/// named for the scope and would be handed to whoever is seated next.
+///
+/// `was` is what the record said before the reseat took it, `None` for a scope
+/// that had no record at all — which is written back as *no record*, not as an
+/// empty one, because a post somebody never created is not the same fact as a
+/// post somebody vacated.
+///
+/// **The claim comes off, and that is the one part of the record that is not
+/// put back exactly as found.** The reconciler claims the seat before it starts
+/// this process, so `was` — read here, after that claim — carries
+/// `reseating`, and restoring it verbatim hands a dead process's claim back to a
+/// slot nothing is coming to fill for [`crate::cmd_govern::SEAT_CLAIMED_FOR`].
+/// `wsp-148` asks for a successor within two ticks and would be quietly getting
+/// twenty minutes; and `wsp watch --status` would read `reseating` for all of
+/// them, which is the one sentence here a reader is entitled to rely on. The
+/// count under `unseated` stays, because the seat *is* still empty and the next
+/// pass counting from where this one got to is the point of keeping it.
+///
+/// **Best effort on all three, and silent about the parts that fail.** The caller
+/// is already printing why the reseat failed and the reconciler will come back
+/// on the next tick; a half-completed tidy that turned into a refusal would stop
+/// the record being restored, which is the one part that has to happen.
+fn put_back(
+    store: &Store,
+    place: &dyn Place,
+    scope: &str,
+    seat: &Seat,
+    was: Option<&Option<Value>>,
+    brief_at: &Option<std::path::PathBuf>,
+) {
+    match was {
+        Some(Some(rec)) => store.set_governor(scope, without_the_claim(rec)),
+        // The seat was filled for the first time by this reseat, and there was
+        // no record to put back. Deleting the record takes the claim with it,
+        // which is why the claim is dropped inside the restore rather than by a
+        // second write afterwards.
+        Some(None) | None => {
+            store.clear_governor(scope);
+        }
+    }
+    // The port that opened it, and not a lookup for which one that was: this
+    // function is only ever called on a seat `rotate_as` opened itself two lines
+    // ago, so the backend is a value already in hand — and `end_work`'s fan-out
+    // over `local_backends()` is for a person pointing `despawn` at an arbitrary
+    // seat, which is a different question and costs a census per call.
+    let _ = place.stop(seat);
+    if let Some(path) = brief_at {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A record as it was, with the claim taken off it — see [`put_back`], which is
+/// the only caller and the argument for it.
+///
+/// **Copies, and does not mutate what it was handed.** `was` is the reconciler's
+/// own read of the record and `store.governors()` may hand out a fresh parse
+/// each time, but a function that reached into a value another frame is holding
+/// would make `put_back`'s "exactly as it found it" depend on argument order.
+fn without_the_claim(rec: &Value) -> Value {
+    let mut back = rec.clone();
+    if let Some(o) = back.as_object_mut() {
+        o.remove("reseating");
+    }
+    back
+}
+
+/// What a successor seated into a vacancy is told about what it walked into.
+///
+/// **A count and where to find it, and never the spool itself.** The brief
+/// `wsp-134` §6 asks for is "the level read now plus the count held", and the
+/// reason is that a seat filled into an emptiness has missed an unknown amount
+/// of other people's business: pasting it in would spend a fresh context on
+/// sentences whose authors are not in the room and cannot be asked what they
+/// meant, while naming the size of it tells the successor that the backlog is
+/// there and that `wsp watch --drain` is how to read it.
+///
+/// The two readings are cheap and both already exist: the wake record's own
+/// counters, and the run's position. The position is there because "the level
+/// read now" for a run is not a count of messages, it is which group the run
+/// stands at — a successor that starts by reading that is not re-deriving it.
+fn unheld(store: &Store, scope: &str) -> String {
+    let watches = store.watches();
+    let rec = watches.get(&crate::wake::key_for(scope));
+    let held = rec
+        .and_then(|r| r.get("spool"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let delivered = rec.and_then(|r| r.get("delivered")).and_then(Value::as_u64).unwrap_or(0);
+    let at = rec
+        .and_then(|r| r.get("tick"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let where_ = match crate::worklist::running_position(store, scope) {
+        Some(pos) => match (pos.at, pos.of) {
+            (Some(n), of) => format!("The {scope} run stands at group {n} of {of}."),
+            // `finished()` with nobody seated: the last barrier was passed and
+            // nobody is left to read it.
+            (None, of) => format!("The {scope} run has passed its last group of {of}."),
+        },
+        None => String::new(),
+    };
+    format!(
+        "wsp seated you here because nobody was in the {scope} seat. \
+         {held} line(s) are held for it and are deliberately not repeated here — \
+         `wsp watch --drain` shows them and they clear when a turn comes of them, not when you read them. \
+         {delivered} have already been delivered to it, the last at {at}. {where_}\n\
+         You are told when something needs a decision, exactly as any custodian is."
+    )
 }
 
 /// The name under which [`arrange_ending`] tells its helper which process to
@@ -5622,6 +5958,19 @@ mod tests {
     struct Seats {
         opened: std::cell::RefCell<Vec<Order>>,
         started: std::cell::Cell<u32>,
+        /// Panes closed. `wsp-148`'s reseat is the one caller that stops a seat
+        /// it opened itself — every other verb that closes one does so through
+        /// `despawn`, which has its own test — so the counter exists for it.
+        stopped: std::cell::Cell<u32>,
+        /// Asked at the moment an agent is started. This is how the record-
+        /// before-the-spawn ordering is *observed* rather than assumed: a test
+        /// that only asserted the record afterwards would pass against a
+        /// `rotate_as` that moved the slot at the end, which is exactly what the
+        /// two rotations are for.
+        at_start: Option<std::rc::Rc<dyn Fn()>>,
+        /// The argv each agent was started on. `wsp-117` is a claim about this
+        /// and not about a struct field, so the test that pins it reads here.
+        agents: std::cell::RefCell<Vec<String>>,
         told: std::cell::RefCell<Vec<String>>,
         states: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<State>>>,
         last: crate::place::Result<State>,
@@ -5635,6 +5984,9 @@ mod tests {
             Seats {
                 opened: std::cell::RefCell::new(Vec::new()),
                 started: std::cell::Cell::new(0),
+                stopped: std::cell::Cell::new(0),
+                at_start: None,
+                agents: std::cell::RefCell::new(Vec::new()),
                 told: std::cell::RefCell::new(Vec::new()),
                 last: script.last().cloned().unwrap_or(Ok(State::Unknown)),
                 states: std::cell::RefCell::new(script.into()),
@@ -5644,6 +5996,11 @@ mod tests {
         fn roomless(script: Vec<crate::place::Result<State>>) -> Seats {
             Seats { rooms: false, ..Seats::of(script) }
         }
+        /// Ask `f` every time an agent is started.
+        fn watching(mut self, f: std::rc::Rc<dyn Fn()>) -> Seats {
+            self.at_start = Some(f);
+            self
+        }
     }
 
     impl Place for Seats {
@@ -5651,7 +6008,11 @@ mod tests {
             self.opened.borrow_mut().push(order.clone());
             Ok(Seat::new("w9:p2"))
         }
-        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+        fn start(&self, _: &Seat, agent: &Agent) -> crate::place::Result<()> {
+            self.agents.borrow_mut().push(agent.args.join(" "));
+            if let Some(f) = &self.at_start {
+                f();
+            }
             self.started.set(self.started.get() + 1);
             Ok(())
         }
@@ -5666,10 +6027,16 @@ mod tests {
             }
         }
         fn stop(&self, _: &Seat) -> crate::place::Result<()> {
-            panic!("rotation does not end seats")
+            self.stopped.set(self.stopped.get() + 1);
+            Ok(())
         }
         fn census(&self) -> crate::place::Result<crate::place::Census> {
-            panic!("rotation is about one seat")
+            // Empty rather than a panic, and `wsp-148` is why it is now reachable:
+            // a reseat asks how to reach the agent it could not start, which is
+            // `unreached` and which reads the census to name a handle. A rotation
+            // never got here — nothing it does reports a seat it failed to fill,
+            // because a seat it failed to fill is the caller's own.
+            Ok(crate::place::Census::heard("", Vec::new()))
         }
         fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
             panic!("rotation does not subscribe")
@@ -5799,9 +6166,225 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
+    // ---- a vacancy: the rotate path with no predecessor ----------------------
+
+    /// A vacated slot on `core`, with the kind and tier the seat was running at.
+    ///
+    /// **A vacated record and not a filled one**, because that is what the
+    /// reconciler finds: `reconcile` empties the occupancy of a governor whose
+    /// pane is gone and leaves the way back under `last`. The reseat has to read
+    /// its tier from *there*, which is the whole of `wsp-117`'s half that is not
+    /// a re-opened decision.
+    fn vacated_seat(tag: &str, model: &str, effort: &str) -> (util::Isolated, Store) {
+        let (env, store) = rotating_as(tag, "w1", "w1:p9");
+        store.save_project(&Project::new("core")).unwrap();
+        cmd_govern::take(&store, "core", "w1", "w1:p9");
+        cmd_govern::note_tier(&store, "core", Some(model), Some(effort));
+        cmd_govern::vacate(&store, "core");
+        stop_being_a_seat();
+        (env, store)
+    }
+
+    /// **The ordering inverts, and this is what it buys.** A rotation writes the
+    /// slot last, so a predecessor stays seated until its replacement has proved
+    /// itself; a vacancy has no predecessor to protect, so the slot is written
+    /// *before* the agent starts — the brief is composed at start and has to find
+    /// the record naming this pane, and a reconciler that passes in the middle of
+    /// the spawn has to find a filled slot rather than an empty post.
+    #[test]
+    fn a_reseat_writes_the_slot_before_the_agent_starts_and_ends_nobody() {
+        let (env, store) = vacated_seat("reseat-ok", "opus", "high");
+        let sock = env.path("herdr.sock");
+        herdr_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+
+        // What the record said at the moment the agent was started, which is the
+        // moment a reconciler passing alongside would look at it.
+        let at_start = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = at_start.clone();
+        // Off the path rather than the `Store`, which the closure would otherwise
+        // take by move: what is being read is the file on disk, which is the
+        // point — a reconciler racing this pass reads that file, not this handle.
+        let record = store.state_file("governors.json");
+        let watcher: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+            let said = std::fs::read_to_string(&record)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v["core"]["pane"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            probe.borrow_mut().push(said);
+        });
+        let dial = util::Dial::new();
+        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]).watching(watcher);
+        let args = reseat_args(&store.governors(), "core");
+        let code = reseat_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 0, "a filled seat is a successful one");
+        assert_eq!(place.started.get(), 1, "one successor");
+        assert_eq!(
+            *at_start.borrow(),
+            vec!["w9:p2".to_string()],
+            "the slot named the successor before its agent was started"
+        );
+        assert!(store.handovers().is_empty(), "there is no predecessor to end: {:?}", store.handovers());
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **`wsp-117`, and the half of it that is not a re-opened decision.** A
+    /// governor is the most expensive seat in a run and its cost grows with the
+    /// fleet; handing the successor whatever the settings file happens to read at
+    /// the moment of the reseat made what a run cost depend on when in the night
+    /// it lost its governor.
+    #[test]
+    fn a_reseat_starts_the_successor_on_the_tier_the_seat_was_running_at() {
+        let (env, store) = vacated_seat("reseat-tier", "opus", "high");
+        let sock = env.path("herdr.sock");
+        herdr_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+
+        let dial = util::Dial::new();
+        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+        let args = reseat_args(&store.governors(), "core");
+        let code = reseat_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 0);
+        // **The argv, because that is what the row is about.** `wsp-117`'s
+        // evidence was two command lines side by side: a work row carrying
+        // `--model opus --effort high` and a governor carrying neither. A test
+        // on a struct field would pass against a fix that never reached the
+        // process, which is the shape the defect had.
+        let started = place.agents.borrow()[0].clone();
+        assert!(started.contains("--model opus"), "on the tier the seat was running at: {started}");
+        assert!(started.contains("--effort high"), "{started}");
+        let rec = &store.governors()["core"];
+        assert_eq!(rec["model"], "opus", "and it is recorded again for the next one");
+        assert_eq!(rec["effort"], "high");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A record written before this row existed has no tier, and the successor
+    /// must start the way that seat's own spawn did — which is `None`, the
+    /// settings tier. **A missing field is the old behaviour, not a lost one.**
+    #[test]
+    fn a_reseat_of_a_seat_with_no_recorded_tier_starts_on_the_settings_tier() {
+        let (env, store) = rotating_as("reseat-no-tier", "w1", "w1:p9");
+        let sock = env.path("herdr.sock");
+        herdr_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+        store.save_project(&Project::new("core")).unwrap();
+        cmd_govern::vacate(&store, "core");
+        stop_being_a_seat();
+
+        let dial = util::Dial::new();
+        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+        let args = reseat_args(&store.governors(), "core");
+        assert_eq!(reseat_on(&place, &store, &args, &handover_wait(&dial)), 0);
+
+        let started = place.agents.borrow()[0].clone();
+        assert!(!started.contains("--model"), "the record never said: {started}");
+        assert!(!started.contains("--effort"), "{started}");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **The failure the row was pointed at by name, and the one thing this path
+    /// cannot leave behind.** On 2026-10-04 a rotate opened `cpd-255`, its
+    /// renderer socket never existed, and the pass was left with a `gone`
+    /// governor row in `wsp wip` while the record went on naming the pane that
+    /// had just failed. So: a reseat whose successor never takes the order puts
+    /// the record back exactly as it found it, closes the pane it opened, and
+    /// leaves the slot reading empty — which is the state the next pass acts on.
+    #[test]
+    fn a_reseat_whose_successor_never_came_up_leaves_the_slot_as_it_found_it() {
+        let (_env, store) = vacated_seat("reseat-stall", "opus", "high");
+        let dial = util::Dial::new();
+        // Idle for ever: ready to be told, never taking.
+        let place = Seats::of(vec![Ok(State::Idle)]);
+        let args = reseat_args(&store.governors(), "core");
+        let code = reseat_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 1, "an unconfirmed seat is not a filled one");
+        assert_eq!(place.stopped.get(), 1, "and the pane it opened is not left behind");
+        let rec = &store.governors()["core"];
+        assert!(
+            rec.get("workspace").is_none(),
+            "the record is the way it was found — a vacancy, not a seat on a dead pane: {rec}"
+        );
+        assert_eq!(rec["last"]["pane"], "w1:p9", "and the way back is still on it");
+        assert_eq!(rec["last"]["model"], "opus", "the tier survived, so the next attempt is not a guess");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **The claim is the reconciler's, and a reseat that failed gives it back.**
+    /// `repair::seat_kept` claims the record *before* it launches this verb, so
+    /// the record `put_back` restores carries a claim held by a process that has
+    /// just told us it failed. Restored verbatim it would hold the seat empty for
+    /// [`crate::cmd_govern::SEAT_CLAIMED_FOR`] — twenty minutes where `wsp-148`
+    /// asks for two ticks — and `wsp watch --status` would read `reseating` for
+    /// every one of them, which is the one sentence in the reading a person is
+    /// entitled to rely on.
+    ///
+    /// Asserted by **taking the claim again** rather than by reading the field:
+    /// whether `reseating` is absent and whether the next pass can act on it are
+    /// the same question, and only the second one is the requirement.
+    #[test]
+    fn a_reseat_that_fails_gives_the_reconcilers_claim_back() {
+        let (_env, store) = vacated_seat("reseat-claim", "opus", "high");
+        assert!(cmd_govern::claim_seat(&store, "core"), "the reconciler claims before it spawns");
+        let dial = util::Dial::new();
+        // Idle for ever: ready to be told, never taking.
+        let place = Seats::of(vec![Ok(State::Idle)]);
+        let args = reseat_args(&store.governors(), "core");
+        let code = reseat_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 1, "which is the state this is about");
+        assert!(
+            cmd_govern::claim_seat(&store, "core"),
+            "so the next pass can seat a successor rather than waiting out the claim of a process that is gone"
+        );
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// What a successor is told about the emptiness it was seated into: the
+    /// count, where to find the rest, and **not the spool**. A seat filled into a
+    /// vacancy has missed an unknown amount of other people's business, and
+    /// pasting it in would spend a fresh context on sentences whose authors are
+    /// not in the room.
+    #[test]
+    fn a_reseat_says_how_much_was_held_and_never_replays_it() {
+        let (_env, store) = vacated_seat("reseat-unheld", "", "");
+        store.update_watch(&crate::wake::key_for("core"), |rec| {
+            crate::cmd_watch::Spool::append(
+                rec,
+                (0..3)
+                    .map(|n| {
+                        crate::cmd_watch::Spooled::of(
+                            0,
+                            crate::cmd_watch::Line::Note(crate::cmd_watch::Class::Message, format!("backlog {n}")),
+                        )
+                    })
+                    .collect(),
+            );
+        });
+
+        let said = unheld(&store, "core");
+        assert!(said.contains("3 line(s) are held"), "{said}");
+        assert!(said.contains("wsp watch --drain"), "and where the rest is: {said}");
+        assert!(!said.contains("backlog 0"), "and none of it is in here: {said}");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     /// **The failure the verb exists for, degrading the way it was designed
     /// to:** the successor started but never took the handover, so nothing is
     /// ended, the record is taken back, and the caller is still the seat.
+    ///
+    /// **The record is taken back rather than left naming the predecessor**,
+    /// which is the safest of the states available and is what this asserts: the
+    /// slot never moved, so failing at step two is the predecessor still seated,
+    /// which is the state before the attempt and the safest one.
     #[test]
     fn a_rotation_that_never_starts_a_turn_ends_nothing_and_leaves_the_caller_seated() {
         let (_env, store) = rotating_as("rotate-stall", "w1", "w1:p9");

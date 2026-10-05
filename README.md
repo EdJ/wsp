@@ -4281,12 +4281,12 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_govern.rs` | the custodial slot on a project or a worklist: who answers for its raised hands, and how you talk to them |
 | `src/cmd_message.rs` | the return path: a question raised with somewhere for the answer to land, and an answer that reaches the record and the asker |
 | `src/cmd_watch.rs` | how a governor asks to be told: the named predicates, the level read under them, who each one is addressed to, and the six ways silence lies |
-| `src/cmd_spawn.rs` | a workspace on a task, an agent started in it and both ended again — and `govern --rotate`, the custodial handover as one verb |
+| `src/cmd_spawn.rs` | a workspace on a task, an agent started in it and both ended again — and `govern --rotate`/`--reseat`, the custodial handover as one verb and the same verb with no predecessor to hand over from |
 | `src/cmd_resume.rs` | the agents a restart interrupted, offered back, and put on the session they were on — in a seat that can carry what their kind needs |
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor |
-| `src/repair.rs` | the same steps on the daemon's tick, plus the four states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, and a member `advance` skipped. Each is keyed on a line in the member's own `## Log`, and each says why in `cycle.log` and to the seat |
+| `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |

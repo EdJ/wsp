@@ -214,7 +214,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
             "{}",
             json!({ "id": q.id, "about": subject.id, "waiting": held, "pane": pane, "lands_on": home,
                     "seat": seat.as_ref().map(|s| &s.scope),
-                    "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why) })
+                    "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()) })
         );
         return 0;
     }

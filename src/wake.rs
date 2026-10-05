@@ -160,6 +160,31 @@ pub(crate) fn key_for(scope: &str) -> String {
     format!("wake:{scope}")
 }
 
+/// Every scope currently owed something — a spool with a line in it.
+///
+/// **The scopes in the register, in the register's order, and no argument.** The
+/// reconciler walks this to find a seat standing empty on a scope that owes
+/// somebody an answer, which is the second half of `wsp-148`'s trigger: a list
+/// that has finished, or a project that was never a list, holds its backlog for
+/// ever because nothing else ever looks at a scope that is not on a running list.
+/// `wsp-148`'s own sentence — "`reseating` says a governor is on its way" — is
+/// only true of the scopes this covers.
+///
+/// **The spool's own depth, and not the `wake` record's existence**, because a
+/// record is written the moment anything is addressed and is kept after it
+/// clears: `wake:core` with an empty array is a scope with nothing owed, and a
+/// scope whose line arrived and was delivered is the same.
+pub(crate) fn scopes_holding(store: &Store) -> Vec<String> {
+    let prefix = "wake:";
+    let watches = store.watches();
+    watches
+        .iter()
+        .filter(|(k, _)| k.starts_with(prefix))
+        .filter(|(_, rec)| Spool::of_json(rec.get("spool").unwrap_or(&Value::Null)).depth() > 0)
+        .map(|(k, _)| k[prefix.len()..].to_string())
+        .collect()
+}
+
 /// The pass's third audience: what each governor is owed, and whether now is
 /// the moment to say it.
 ///
@@ -293,7 +318,7 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
             Spool::stamp_typed(rec, at);
         }
         let now = Spool::of_json(rec.get("spool").unwrap_or(&serde_json::Value::Null));
-        stamp(rec, scope, delivered + written, tell.why, &now);
+stamp(rec, scope, delivered + written, &tell.why, &now);
         // What is *owed* is what a seat would be typed, not everything held.
         let mut owed = now.clone();
         owed.withhold_for_a_seat(store);
@@ -320,12 +345,12 @@ pub(crate) struct Report {
     /// if it never has been.
     pub(crate) typed_at: Option<i64>,
     /// Why it is still holding, in the words `--status` prints.
-    pub(crate) why: &'static str,
+    pub(crate) why: String,
 }
 
 impl Report {
     fn at_rest() -> Report {
-        Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET }
+        Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET.into() }
     }
 
     /// Whether the seat has it now — a turn, not a send. See [`Delivery`].
@@ -447,7 +472,7 @@ pub(crate) struct Tell<'a> {
     /// different repairs and the first two are faults. A fourth joined them in
     /// `wsp-146`: the text was at the seat and nothing had read it, which is
     /// [`UNREAD`] and looks exactly like the three.
-    why: &'static str,
+    why: String,
     /// The text went in and no turn came of it — set only when this attempt
     /// typed, and read by [`deliver_to`] to stamp the batch it typed. The
     /// distinction matters because *typed* is the one state that must not be
@@ -460,7 +485,7 @@ pub(crate) struct Tell<'a> {
 
 impl<'a> Tell<'a> {
     fn new(store: &'a Store, scope: &str) -> Tell<'a> {
-        Tell { store, scope: scope.to_string(), why: NOT_YET, typed: false, typed_at: None }
+        Tell { store, scope: scope.to_string(), why: NOT_YET.into(), typed: false, typed_at: None }
     }
 }
 
@@ -505,6 +530,41 @@ pub(crate) fn held_because(state: crate::place::State) -> Option<&'static str> {
         State::Empty | State::Gone => Some("the seat is empty"),
         State::Unknown => Some("herdr cannot say what the seat is doing"),
     }
+}
+
+/// What a scope with nobody in its seat reads as `holding`, and why it is not
+/// the seat's state.
+///
+/// **`the seat is empty` was three faults wearing one sentence, and `wsp-148` is
+/// the one that made them expensive.** It was the answer for a pane with nobody
+/// in it, for an agent that exited, and for a slot that has been standing empty
+/// for a month — and a reader could not tell them apart, so the one case that
+/// was a *stuck run* read exactly like the one that was a seat somebody had
+/// chosen to leave. Now that wsp fills a vacancy on its own ([`crate::repair::
+/// seat_kept`]) the difference is worth money: `reseating` says a governor is on
+/// its way and there is nothing for a person to do, and `daemon down` says the
+/// thing that will fix it is not running, which is the one of the two a person
+/// can act on tonight.
+///
+/// **`daemon down` is a reading of the marker, not a guess.** `Store::
+/// daemon_holder` is the pid that last claimed this store and the one-daemon-
+/// per-store rule keeps it honest, so `alive` on that pid is whether a
+/// reconciler will act on this vacancy. An absent marker is down — a store that
+/// has never had a daemon has nothing running the pass, whatever else is true.
+///
+/// **The count is the spool's own depth**, read here rather than carried in, so
+/// the sentence cannot disagree with `wsp watch --status`: both are
+/// `Spool::depth` over the same record.
+fn unseated(store: &Store, scope: &str) -> String {
+    let held = load(store, &key_for(scope)).depth();
+    let running = store
+        .daemon_holder()
+        .map(|(pid, _)| pid)
+        .is_some_and(|pid| crate::place_super::alive(&[pid]).contains(&pid));
+    format!(
+        "unseated · {held} held · {}",
+        if running { "reseating" } else { "daemon down" }
+    )
 }
 
 /// What a governor is told about the thing that just typed at it.
@@ -563,12 +623,12 @@ impl Sink for Tell<'_> {
             // keeps it, and a seat filled tomorrow morning is told what it
             // missed. A wake with no addressee is the one case where holding
             // is obviously right.
-            self.why = "no seat on this scope";
+            self.why = "no seat on this scope".into();
             return false;
         };
         let backends = crate::cmd_spawn::local_backends();
         let Some((place, found)) = cmd_govern::occupant(self.store, &backends, &seat) else {
-            self.why = "the seat is empty";
+            self.why = unseated(self.store, &self.scope);
             return false;
         };
         let how = agent_commands::of(&found.agent.kind);
@@ -627,16 +687,16 @@ impl Sink for Tell<'_> {
         // not. `wsp-146` d2, and the reason `delivered, no turn seen` is no
         // longer a place a sentence comes to rest.
         if let Some(at) = load(self.store, &key_for(&self.scope)).typed_at() {
-            // **Or a turn that began and ended since the type**, which a sample
+// **Or a turn that began and ended since the type**, which a sample
             // cannot see: `wsp-166` measured cpd-250's replies at one to two
             // seconds against a twenty-second tick, so most were never seen
             // and the batch was typed again every [`RETYPED`] all night.
             if state.turn_in_flight() || place.turn_began_since(&addressee, at) == Some(true) {
-                self.why = NOT_YET;
+                self.why = NOT_YET.into();
                 return true;
             }
             if util::epoch_secs() - at < RETYPED {
-                self.why = UNREAD;
+                self.why = UNREAD.into();
                 self.typed_at = Some(at);
                 return false;
             }
@@ -675,8 +735,16 @@ impl Sink for Tell<'_> {
             // `State::Unknown` when herdr could not be asked, which
             // [`held_because`] refuses — an absence is not a fact, least of all
             // the fact that somebody is there to read this.
+            // `Empty` and `Gone` are one sentence and it is not the state's
+            // name: a seat nobody is in is a seat wsp is replacing, and `wsp-148`
+            // asks the holding to say so rather than leave `empty` reading as a
+            // fact about a pane. See `unseated`.
+            if matches!(state, crate::place::State::Empty | crate::place::State::Gone) {
+                self.why = unseated(self.store, &self.scope);
+                return false;
+            }
             if let Some(why) = held_because(state) {
-                self.why = why;
+                self.why = why.into();
                 return false;
             }
         }
@@ -701,13 +769,13 @@ impl Sink for Tell<'_> {
                 // Typed, and nothing read it. Returning false puts the whole
                 // batch back, and the stamp is what tells the next tick to look
                 // for a turn rather than to type again.
-                self.why = UNREAD;
+                self.why = UNREAD.into();
                 self.typed = true;
                 self.typed_at = Some(before);
                 false
             }
             Err(_) => {
-                self.why = "the seat would not take it";
+                self.why = "the seat would not take it".into();
                 false
             }
         }
@@ -983,14 +1051,31 @@ mod tests {
 
         // And the five that were held say which of the five reasons it was, so
         // `--status` and `doctor` can tell a fault from the design.
+        //
+        // **`Gone` is not one of the five, and `wsp-148` is why.** A pane that
+        // has gone is not a fact about a pane any more — it is a seat nobody is
+        // in, and the reconciler is putting somebody in it. So it says the count
+        // and whether the daemon is the thing that will do it, and the other four
+        // keep their own sentences, because they are all about a seat that *is*
+        // there.
         for (state, scope) in states.iter().skip(1) {
             assert_eq!(spool_of(&store, scope).depth(), 1, "{scope} is still owed it");
-            assert_eq!(
-                holding(&store, scope),
-                held_because(*state).expect("a refusal has a sentence"),
-                "{scope} says why",
-            );
+            let want = match state {
+                State::Gone | State::Empty => unseated(&store, scope),
+                other => held_because(*other).expect("a refusal has a sentence").to_string(),
+            };
+            assert_eq!(holding(&store, scope), want, "{scope} says why");
         }
+        assert!(
+            holding(&store, "s-gone").contains("unseated · 1 held ·"),
+            "and the unseated reading counts what is held for it: {}",
+            holding(&store, "s-gone")
+        );
+        assert!(
+            holding(&store, "s-gone").ends_with("daemon down"),
+            "with no daemon running, nothing is coming to fill it — which is the one a person can act on: {}",
+            holding(&store, "s-gone")
+        );
     }
 
     /// **The gate is not "is a turn in flight", and this is the state that

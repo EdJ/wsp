@@ -260,6 +260,15 @@ fn launch(store: &Store, argv: &[&str]) {
     let _ = cmd.spawn();
 }
 
+/// [`launch`], for a verb that is not a run step — [`crate::repair`]'s reseat is
+/// the only caller, and it is here rather than duplicated because the four
+/// things `launch` does are four things that have to be true of any process the
+/// run starts: its stdout is `cycle.log`, it inherits nobody's seat, it holds
+/// no terminal, and it outlives the tick that asked for it.
+pub(crate) fn launch_out(store: &Store, argv: &[&str]) {
+    launch(store, argv)
+}
+
 /// `wsp worklist advance [<slug>] [--task ID --verb V] [--event go|hold --passed N]`
 ///
 /// Take every step the store says is owed, on one list or on every running
@@ -1442,15 +1451,50 @@ pub(crate) fn despawn(id: &str) {
 /// and otherwise the seat routing reaches for its first member.
 fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
     let governors = store.governors();
-    if crate::cmd_govern::seat_of_scope(&w.id, &governors).is_some() {
-        return Some(w.id.clone());
-    }
+    the_chain(store, w).into_iter().find(|s| crate::cmd_govern::seat_of_scope(s, &governors).is_some())
+}
+
+/// The scope whose seat is *meant* to answer for this run — the first in the
+/// same chain with a post at all, whether it is filled, vacated, or has never
+/// been filled.
+///
+/// **A different question from [`governing_scope`], and the reconciler needs
+/// this one.** "Who answers for this run" and "whose seat is supposed to" come
+/// apart in exactly the case `wsp-148` is about: a governor whose pane died is
+/// *vacated* by `reconcile` before the reconciler's next pass, so the filled
+/// answer is `None` and filling it would put a seat on the list — changing the
+/// shape of a run that was governed from its project's seat, and giving a
+/// project two governors for one question.
+///
+/// So the chain is walked once and read two ways, and the scope this names is
+/// the one whose record the repair will look at. It is [`governing_scope`] with
+/// the fill test replaced by *is there a post here at all*, which is what
+/// `Slot`'s own docs argue a vacant record is.
+pub(crate) fn governing_post(store: &Store, w: &Worklist) -> Option<String> {
+    let governors = store.governors();
+    the_chain(store, w)
+        .into_iter()
+        .find(|s| governors.contains_key(s) || crate::cmd_govern::last_seat(&governors, s).is_some())
+}
+
+/// `list, then the project of its first member that has one, then that project's
+/// ancestors` — the walk [`crate::cmd_govern::seat_for`] documents and this
+/// file has now asked for twice.
+///
+/// One walk rather than two, because the two readers above have to agree about
+/// the order and a chain spelled twice is a chain that will be spelled
+/// differently one day. A list that stands nowhere and has no member with a
+/// project is one scope long, which is the ordinary case for a list nobody has
+/// filled.
+fn the_chain(store: &Store, w: &Worklist) -> Vec<String> {
+    let mut chain = vec![w.id.clone()];
     let index = crate::resolve::Index::new(store.projects());
-    let first = w.groups().iter().flat_map(|g| g.members.clone()).find_map(|m| store.find_task(&m))?;
-    let p = first.project?;
-    std::iter::once(p.clone())
-        .chain(index.ancestors(&p))
-        .find(|s| crate::cmd_govern::seat_of_scope(s, &governors).is_some())
+    if let Some(first) = w.groups().iter().flat_map(|g| g.members.clone()).find_map(|m| store.find_task(&m)) {
+        if let Some(project) = first.project {
+            chain.extend(std::iter::once(project.clone()).chain(index.ancestors(&project)));
+        }
+    }
+    chain
 }
 
 /// Tell whoever governs this run. With nobody seated, the sentence is raised
@@ -1634,6 +1678,10 @@ pub(crate) mod tests {
         /// Distinct from `TOLD`, which is the run's *governing* seat: a repair
         /// tells both and they are answers to different questions.
         pub(crate) static MEMBER_TOLD: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+        /// The scopes `wsp-148`'s repair filled a seat on this thread. A record
+        /// of what was *asked for*, like `ROTATED` beside it, because the verb it
+        /// launches is one process per fill and a test cannot run it.
+        pub(crate) static RESEATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
     fn spawned() -> Vec<(String, String)> {

@@ -46,10 +46,28 @@
 //! leaves a group its list runs by hand alone throughout: a governor reading
 //! its own reviews by eye is not a wedged run, and a tick that respawned its
 //! members would be a second governor nobody asked for.
+//!
+//! # The fifth, which is a seat rather than a member
+//!
+//! [`seat_kept`] is the one repair here that is not about a group's position, and
+//! it is in this module because everything that makes it safe is here: the
+//! [`Seats`] port, the [`EVERY`] clock, and the record-first discipline at the
+//! top of the file. It fills a governor seat that reads `Empty`/`Gone` for
+//! [`EMPTY_TICKS`] passes on a list that is running, and it seats one for a list
+//! that has none — "governors are wsp's to allocate, not an agent's to remember".
+//!
+//! **It says it in one place rather than two, and that is the exception.** The
+//! rule above is that a repair which logged without telling would be invisible
+//! for the hour between a governor's polls. Here there is no governor to tell:
+//! the whole finding is that nobody is in the seat. The second place is the
+//! successor's own work order — [`crate::cmd_spawn::unheld`] names the seat, why
+//! it was empty and how much was held for it — which is the moment somebody can
+//! read it, and reading it twice is the cost `skipped` argues about.
 
 use crate::model::{Status, Task, Worklist, WorklistStatus};
 use crate::cycle::Seats;
 use crate::place::State;
+use crate::cmd_govern;
 use crate::store::Store;
 use crate::util;
 use crate::worklist::{self, Position, Reading};
@@ -100,6 +118,23 @@ pub(crate) const READING: &str = "wsp: reading";
 /// slower than the thing it is repairing.
 const EVERY: i64 = 60;
 
+/// How many passes must read a governor seat `Empty` or `Gone` before wsp seats
+/// a successor into it. Two, and the second one is the whole of the delay.
+///
+/// **Not zero, and one is the tempting number.** A seat reads `Empty` for a
+/// moment every time its agent is cleared and restarted, and `Starting` covers
+/// only the window where a backend says so — `place_compound` reads a pane with
+/// a shell in it and no named agent as `Empty`, which is the ordinary state of a
+/// pane between two agents. Seating on that reading gives a run two governors
+/// for one question, which is `wsp-114`'s shape arrived at by a different road.
+///
+/// **Two ticks is two minutes and it is counted, not timed.** The count lives on
+/// the governor record ([`crate::cmd_govern::Vacancy`]) rather than in
+/// [`Pass`], because the daemon `exec`s itself when an install lands underneath
+/// it — which is exactly when a person is most likely to be installing, mid-run,
+/// with a governor dead.
+const EMPTY_TICKS: u64 = 2;
+
 /// The pass's own clock, held between ticks.
 ///
 /// **Separate from [`crate::attention::Pass`], and not a second reading of the
@@ -136,6 +171,10 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     say_frozen_screens(store, seats);
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         let _ = crate::cycle::step(store, &w, seats);
+        // Before every `continue` below, because a seat is not a group's: a run
+        // with no group at a barrier still has work in flight, and one that has
+        // passed its last barrier still has a slot to fill. See `seat_kept`.
+        seat_kept(store, seats, &w);
         let pos = worklist::position(store, &w, Reading::Landed);
         let Some(at) = pos.at else { continue };
         let groups = w.groups();
@@ -182,6 +221,35 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         ));
     }
     crate::cycle::end_all(store, verdicts);
+    seat_holding(store, seats);
+}
+
+/// **The half of `wsp-148`'s trigger that is not a running list, and it is here
+/// rather than inside the loop above for the same reason `seat_kept` is called
+/// before every `continue`.** A list that has finished, and a project that was
+/// never a list, still owe somebody an answer — `wsp ask` writes to it, and
+/// nothing clears it but a governor, and the only thing that puts a governor
+/// anywhere is the loop above. So a scope's backlog would sit held for ever on
+/// exactly the scopes where nobody is looking, and `wsp watch --status` would go
+/// on reading `unseated · 2 held · reseating` for them: which says a governor is
+/// on its way, and is `wsp-148`'s sentence about a governor nothing had been
+/// sent to seat.
+///
+/// **A scope with no governor record is not one of these.** `wake` reads it as
+/// `no seat on this scope`, which is true and is a person's decision — somebody
+/// addressed a project that has no governor, and answering that by spawning one
+/// for every scope anybody has ever sent a message to is not what this row is
+/// about. What is here is a post that exists and is empty, which is the same
+/// vacancy as a dead governor and is `wsp-148`'s to fill either way.
+///
+/// The scopes themselves are the register's own, so the trigger and the sentence
+/// are read from one place: [`crate::wake::scopes_holding`].
+fn seat_holding(store: &Store, seats: &dyn Seats) {
+    for scope in crate::wake::scopes_holding(store) {
+        if store.governors().contains_key(&scope) {
+            seat_vacant(store, seats, &scope);
+        }
+    }
 }
 
 /// One dated line in `cycle.log`, through the daemon's own file handle.
@@ -237,6 +305,125 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
             }
         }
     }
+}
+
+// ---- a governor seat nobody is in -----------------------------------------
+
+/// The scope a running list's seat belongs on, and the check itself.
+///
+/// [`crate::cycle::governing_post`] rather than `governing_scope`, and the
+/// difference is the whole of `wsp-148`'s second half — see [`seat_vacant`].
+fn seat_kept(store: &Store, seats: &dyn Seats, w: &Worklist) {
+    let scope = crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone());
+    seat_vacant(store, seats, &scope);
+}
+
+/// A run whose governor seat is standing empty, and whether it is time to fill
+/// it.
+///
+/// **The scope is the one the run's seat was *meant* to be on**, not the first
+/// scope that happens to answer — [`crate::cycle::governing_post`] rather than
+/// `governing_scope`, and the difference is the whole of `wsp-148`'s second
+/// half. A governor whose pane dies is vacated by `reconcile` before this pass
+/// runs, so the *filled* chain answers `None` and filling that would hand a run
+/// a brand-new seat on the list while the project's seat it was actually using
+/// sits empty one step up. Two governors, or one governor and a project nobody
+/// is watching; both are worse than the vacancy.
+///
+/// **Another machine's seat is left alone**, which is the one refusal here and
+/// the reason [`crate::cmd_govern::host_of`] is asked rather than
+/// `seat_of_scope`: a seat on another host reads as no seat to everything local,
+/// and a reconciler that filled those would seat a second governor for a run
+/// that has one — on the machine that cannot see it.
+///
+/// **A post nobody has ever filled is seated at once, and a seat that reads
+/// empty has to read it [`EMPTY_TICKS`] times.** The two cases have opposite
+/// urgencies and the same shape: the first has no pane that could be read empty
+/// and no agent that could still be coming up, so there is nothing to wait for
+/// and a run that starts tonight starts with somebody; the second has a pane,
+/// and a pane is `Empty` between agents.
+fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str) {
+    let governors = store.governors();
+    let scope = scope.to_string();
+    // Somebody else's machine is somebody else's seat. Absent record is ours.
+    if governors.contains_key(&scope) && cmd_govern::host_of(&governors, &scope) != util::hostname() {
+        return;
+    }
+    let never_filled = !governors.contains_key(&scope);
+    // `None` is every reading that means somebody is there, and the one that
+    // means nobody can be asked; see `how_it_reads`.
+    let Some(word) = how_it_reads(store, seats, &governors, &scope) else { return };
+    // This pass's own count, and the record's reading of it, from one write.
+    let here = cmd_govern::count_unseated(store, &scope);
+    if !never_filled && !here.overdue(EMPTY_TICKS) {
+        // Said once, on the way out — the pass that noticed is the interesting
+        // one, and the next one is already counting.
+        if here.unseated == 1 {
+            stamp(store, &format!("{}: the seat reads {word} and this list is running", scope));
+        }
+        return;
+    }
+    // The claim is the duplicate guard and it is taken *before* the process
+    // starts, because the process is where the seat is written and a tick that
+    // arrives in between would find an empty post and start a second one.
+    if !cmd_govern::claim_seat(store, &scope) {
+        return;
+    }
+    stamp(store, &format!(
+        "{scope}: the seat reads {word} and this list is running — seating a successor"
+    ));
+    if cfg!(test) {
+        #[cfg(test)]
+        crate::cycle::tests::RESEATED.with(|s| s.borrow_mut().push(scope.clone()));
+    }
+    crate::cycle::launch_out(store, &["govern", &scope, "--reseat"]);
+}
+
+/// How a seat reads, when the answer is one this pass acts on — `None` for every
+/// state that means somebody is there, and for the one reading that means nobody
+/// can ask.
+///
+/// **`None` is "leave it alone", and it is the reading this most needs to get
+/// right.** [`Seats::state`] answers `None` on a machine where no backend can be
+/// asked, and this is the repair that starts agents: a reconciler that read an
+/// absence as a death would seat a successor for every running list on a machine
+/// whose terminal server is restarting — the same reasoning as [`Fleet`]'s own
+/// docs, and the same failure it names. `Idle` is somebody at a prompt and is not
+/// this repair's business; only `Empty` and `Gone` are.
+///
+/// **A live seat clears the count and nothing else.** Not the claim — a claim is
+/// held by a reseat that is running, and the pass that finds the seat filled is
+/// the only evidence there will be that it worked. Clearing it would be clearing
+/// the receipt and would let a second successor into a slot that has just proved
+/// it can hold one.
+fn how_it_reads(
+    store: &Store,
+    seats: &dyn Seats,
+    governors: &std::collections::BTreeMap<String, serde_json::Value>,
+    scope: &str,
+) -> Option<&'static str> {
+    // `last_seat` rather than `seat_of_scope`: a vacated record has no pane at
+    // the top level, and the pane that died is the one whose reading would say
+    // the post is empty — which is the finding, and is what keeps a vacated seat
+    // from looking like a healthy one that simply has no agents to report.
+    let seat = cmd_govern::seat_of_scope(scope, governors)
+        .or_else(|| cmd_govern::last_seat(governors, scope));
+    let word = match &seat {
+        // Nothing to read: a post that was never filled, or one whose pane the
+        // backend that answered for it cannot name.
+        None => "unseated",
+        Some(s) if s.pane.is_empty() => "unseated",
+        Some(s) => match seats.state(&s.pane) {
+            None => return None,
+            Some(State::Empty) => "empty",
+            Some(State::Gone) => "gone",
+            Some(_) => {
+                cmd_govern::forget_unseated(store, scope);
+                return None;
+            }
+        },
+    };
+    Some(word)
 }
 
 // ---- a member whose agent is not working on it ----------------------------
@@ -628,7 +815,7 @@ fn told_once(store: &Store, id: &str, said: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::cycle::tests::{ENDED, MEMBER_TOLD, SPAWNED, TOLD};
+    use crate::cycle::tests::{ENDED, MEMBER_TOLD, RESEATED, SPAWNED, TOLD};
     use crate::model::{Group, WorklistStatus};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -806,6 +993,255 @@ pub(crate) mod tests {
         landed(&store.find_task(id)?)
     }
 
+    // ---- a governor seat nobody is in ---------------------------------------
+
+    /// One pass of the reconciler, which is the shape every test here takes.
+    fn a_pass(store: &Store, seats: &dyn Seats) {
+        tick(store, seats, &mut Pass::new());
+    }
+
+    /// What `wsp-148`'s repair filled a seat on, in order.
+    fn reseated() -> Vec<String> {
+        RESEATED.with(|s| s.borrow_mut().drain(..).collect())
+    }
+
+    /// `n` lines sitting in `scope`'s wake spool — somebody has written to it and
+    /// nobody has taken it, which is the fact the second trigger reads.
+    fn held_for(store: &Store, scope: &str, n: usize) {
+        store.update_watch(&crate::wake::key_for(scope), |rec| {
+            crate::cmd_watch::Spool::append(
+                rec,
+                (0..n)
+                    .map(|i| {
+                        crate::cmd_watch::Spooled::of(
+                            0,
+                            crate::cmd_watch::Line::Note(
+                                crate::cmd_watch::Class::Message,
+                                format!("owed {i}"),
+                            ),
+                        )
+                    })
+                    .collect(),
+            );
+        });
+    }
+
+    /// A governor seat on `scope`, occupying `room` as `pane`, at a tier.
+    fn seated(store: &Store, scope: &str, room: &str, pane: &str, model: &str, effort: &str) {
+        store.set_governor(
+            scope,
+            serde_json::json!({
+                "workspace": room,
+                "pane": pane,
+                "host": util::hostname(),
+                "since": "2026-10-04T00:00:00Z",
+                "kind": "claude",
+                "model": model,
+                "effort": effort,
+            }),
+        );
+    }
+
+    /// A run with a live governor: the state every seat repair here starts from,
+    /// and the one where the answer is *do nothing*.
+    #[test]
+    fn a_run_whose_governor_is_working_is_left_alone() {
+        let (_env, store) = in_flight("seat-live");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]));
+
+        let fills = reseated();
+        assert!(fills.is_empty(), "a governor at a prompt is not a vacancy: {fills:?}");
+        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 0);
+    }
+
+    /// **The two ticks are the whole delay, and a test that skipped them would
+    /// pass against a repair that seated a successor into a pane between
+    /// agents.** A pane with a shell in it and no named agent reads `Empty`, and
+    /// that is the ordinary state of a seat whose agent was just cleared — so the
+    /// first pass records and says so, and starts nobody.
+    #[test]
+    fn a_seat_that_reads_empty_once_is_counted_and_nobody_is_seated() {
+        let (_env, store) = in_flight("seat-one-tick");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Empty))]));
+
+        let fills = reseated();
+        assert!(fills.is_empty(), "one tick is not two: {fills:?}");
+        assert_eq!(
+            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            1,
+            "and the count is on the record, where a daemon that execs on install cannot lose it"
+        );
+        let log = stamped();
+        assert!(
+            log.iter().any(|l| l.contains("the seat reads empty")),
+            "and the pass that noticed says so: {log:?}"
+        );
+    }
+
+    /// The second tick seats exactly one successor, and **the third does not.**
+    /// The claim is written on the record before the process starts, so a tick
+    /// that arrives while the spawn is still running finds a scope that is
+    /// neither empty nor unseated-and-counted — it is claimed.
+    #[test]
+    fn the_second_tick_seats_one_successor_and_a_third_ticks_nobody() {
+        let (_env, store) = in_flight("seat-two-ticks");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+
+        let mut fills = Vec::new();
+        a_pass(&store, &gone);
+        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 1, "one so far");
+        a_pass(&store, &gone);
+        fills.extend(reseated());
+        a_pass(&store, &gone);
+        a_pass(&store, &gone);
+        fills.extend(reseated());
+        assert_eq!(fills, vec!["run".to_string()], "two ticks seat one successor and no more: {fills:?}");
+        assert!(
+            cmd_govern::vacancy(&store.governors(), "run").reseating.is_some(),
+            "the claim is what stopped the second, and it is on the record for the process that took it"
+        );
+    }
+
+    /// **A seat nobody can be asked about is not a seat that is empty.**
+    /// `Seats::state` answers `None` on a machine with no backend answering, and
+    /// this is the repair that starts agents: reading an absence as a death would
+    /// seat a successor for every running list at the moment the terminal server
+    /// is restarting, which is the same failure [`Fleet`]'s docs warn about and
+    /// it is the one place the warning applies.
+    #[test]
+    fn a_seat_nobody_can_be_asked_about_is_never_reseated() {
+        let (_env, store) = in_flight("seat-unaskable");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        a_pass(&store, &Fake::new(&[("cpd-1", None)]));
+        a_pass(&store, &Fake::new(&[("cpd-1", None)]));
+
+        let fills = reseated();
+        assert!(fills.is_empty(), "an absence is not a death: {fills:?}");
+        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 0);
+    }
+
+    /// The other half of `wsp-148`: a list that starts with no seat on its scope
+    /// gets one, and does not wait two ticks for it — there is no pane to misread
+    /// and no agent that could still be coming up.
+    #[test]
+    fn a_running_list_with_no_seat_at_all_is_seated_on_the_first_pass() {
+        let (_env, store) = in_flight("seat-none");
+        a_pass(&store, &Fake::empty());
+
+        assert_eq!(reseated(), vec!["run".to_string()], "governors are wsp's to allocate");
+    }
+
+    /// **And it is the *list's* seat, not a project's.** `governing_post` walks
+    /// the chain for a post that exists at all rather than for a filled one, so a
+    /// run governed from its project's seat is reseated *there* — filling the list
+    /// instead would give a run two governors and leave the project's empty.
+    #[test]
+    fn a_run_governed_from_its_project_is_reseated_on_the_project() {
+        let (_env, store) = in_flight("seat-project");
+        member(&store, "m-1", Status::Doing);
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+        seated(&store, "p", "w1", "cpd-1", "", "");
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]));
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]));
+
+        assert_eq!(reseated(), vec!["p".to_string()], "the project's seat, not a new one on the list");
+    }
+
+    /// **A seat on another machine is somebody else's seat.** It reads as no seat
+    /// to everything local, and filling those would put a second governor on a run
+    /// that already has one — on the machine that cannot see it.
+    #[test]
+    fn a_seat_held_on_another_host_is_left_to_that_host() {
+        let (_env, store) = in_flight("seat-remote");
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "workspace": "w9", "pane": "w9:p1", "host": "somebody-elses-machine",
+                "since": "2026-10-04T00:00:00Z", "kind": "claude",
+            }),
+        );
+        a_pass(&store, &Fake::empty());
+        a_pass(&store, &Fake::empty());
+
+        let fills = reseated();
+        assert!(fills.is_empty(), "another host's governor is not ours to replace");
+    }
+
+    /// A seat that comes back stops the count, so a seat that dies again starts
+    /// from one tick rather than from whatever it reached before. **Without this
+    /// a seat that was once empty is empty enough forever**, and the two-tick
+    /// delay `EMPTY_TICKS` exists to buy is not bought at all.
+    #[test]
+    fn a_seat_that_comes_back_to_life_starts_counting_again_from_one() {
+        let (_env, store) = in_flight("seat-recovers");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Empty))]));
+        assert_eq!(cmd_govern::vacancy(&store.governors(), "run").unseated, 1);
+
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Working))]));
+        assert_eq!(
+            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            0,
+            "a seat with somebody in it is the receipt, and the receipt clears the count"
+        );
+
+        a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Empty))]));
+        let fills = reseated();
+        assert!(fills.is_empty(), "and the delay is paid again, not skipped: {fills:?}");
+    }
+
+    /// **The other half of `wsp-148`'s trigger: held items, not a running
+    /// list.** A finished list and a project that was never a list both still owe
+    /// somebody an answer, and the loop over running lists is the only thing that
+    /// puts a governor anywhere — so without this the backlog on exactly those
+    /// scopes sits held for ever while `wsp watch --status` reads `reseating`.
+    /// This scope has no worklist at all, which is the stronger version.
+    #[test]
+    fn a_scope_owing_an_answer_with_a_vacant_seat_is_reseated_though_no_list_runs() {
+        let (_env, store) = in_flight("seat-held");
+        // A finished list would do; this one is absent, so nothing in the pass
+        // above can reach this scope at all.
+        store.set_governor(
+            "quiet",
+            serde_json::json!({
+                "host": util::hostname(), "since": "2026-10-04T00:00:00Z", "kind": "claude",
+            }),
+        );
+        held_for(&store, "quiet", 2);
+
+        let gone = Fake::empty();
+        a_pass(&store, &gone);
+        assert_eq!(cmd_govern::vacancy(&store.governors(), "quiet").unseated, 1, "counted first");
+        a_pass(&store, &gone);
+
+        assert!(reseated().contains(&"quiet".to_string()), "nothing else would ever seat this");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **And a scope nobody ever made a seat for is left to the person who wrote
+    /// to it.** `wake` reads it as `no seat on this scope`, which is true; seating
+    /// a governor for every scope anybody has ever sent a message to is a
+    /// different feature and one nobody asked for.
+    #[test]
+    fn a_scope_owing_an_answer_with_no_seat_record_is_left_alone() {
+        let (_env, store) = in_flight("seat-held-none");
+        held_for(&store, "quiet", 2);
+        a_pass(&store, &Fake::empty());
+        a_pass(&store, &Fake::empty());
+
+        assert!(
+            !reseated().contains(&"quiet".to_string()),
+            "a post nobody created is not a vacancy: {:?}",
+            reseated()
+        );
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     // ---- 1. a member that is gone ----------------------------------------
 
     /// A member whose agent has exited: the claim is held, the row is at
@@ -910,6 +1346,13 @@ pub(crate) mod tests {
     /// A group its list runs by hand has a governor reading its own reviews.
     /// Respawning its members would be a second governor nobody asked for, so
     /// the pass steps over the whole group.
+    ///
+    /// **And this fixture has no governor at all**, which is why the log line the
+    /// seat repair leaves is not asserted empty here: seating a governor for a
+    /// hand-run list is `wsp-148`'s other half and it is the right answer — a list
+    /// nobody is running is not a list being run by eye — so the line below is
+    /// about this pass's *group* repairs, and the seat is somebody else's test
+    /// (`a_running_list_with_no_seat_at_all_is_seated_on_the_first_pass`).
     #[test]
     fn a_hand_run_group_is_left_entirely_alone() {
         let (_env, store) = scratch("hand");
@@ -920,7 +1363,11 @@ pub(crate) mod tests {
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]), &mut Pass::new());
         assert!(member_told().is_empty(), "a governor is reading this group by eye");
         assert!(ended().is_empty());
-        assert!(stamped().is_empty(), "{:?}", stamped());
+        assert!(
+            !stamped().iter().any(|l| l.contains("m-1")),
+            "and nothing is said about the member itself: {:?}",
+            stamped()
+        );
     }
 
     /// The tick takes the run's own steps, so a member no verb ever started is
