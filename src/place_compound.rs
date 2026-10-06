@@ -306,6 +306,31 @@ fn compound_render_binary() -> Option<PathBuf> {
     compound_sup_binary()?.parent().map(|d| d.join("compound-render")).filter(|p| p.is_file())
 }
 
+/// How long after a start [`Compound::at_trust_prompt`] looks: the prompt is the
+/// first thing Claude Code draws, and the work order follows within seconds.
+const TRUST_PROMPT_WINDOW: i64 = 120;
+
+/// The folder-trust prompt, read off a screen, as the reason not to type.
+/// Matched on the option a person would choose, which is the line least
+/// likely to be reworded into something else.
+fn trust_prompt(seat: &Seat, screen: &str) -> Option<String> {
+    if !screen.contains("Yes, I trust this folder") {
+        return None;
+    }
+    let dir = screen
+        .lines()
+        .skip_while(|l| !l.contains("Accessing workspace:"))
+        .skip(1)
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|d| format!(" for {d}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{seat} is at Claude Code's folder-trust prompt{dir} - nothing was typed, because the prompt's \
+         default is \"No, exit\" and the order's Enter would end the agent; start it in a project"
+    ))
+}
+
 impl Compound<'_> {
     pub(crate) fn dir_of(&self, seat: &Seat) -> Result<PathBuf> {
         let id = seat.as_str();
@@ -582,6 +607,30 @@ impl Compound<'_> {
     /// `osc_title <title>` line; all three sidecar lines are stripped here
     /// down to bare text so `wsp peek` prints the same shape whichever
     /// backend answered.
+    /// Why a seat that has just started must not be typed at: Claude Code is
+    /// showing its folder-trust prompt, whose default is "No, exit".
+    ///
+    /// **Looked for, because the symptom names the wrong thing** (`wsp-219`).
+    /// The detector reads that prompt as idle, so the order went in, its Enter
+    /// chose "No, exit", the session ended and took the renderer with it, and
+    /// the spawn failed on a `.rsock` that "never appeared". That was 57 list
+    /// reseats in `cycle.log`. [`crate::cmd_spawn`] now refuses to start an
+    /// agent outside a project, which is the cause. This is so that the next
+    /// way in says what it is, and leaves the prompt up for a person to answer.
+    ///
+    /// Only within [`TRUST_PROMPT_WINDOW`] of the start, so a seat being told
+    /// its hundredth sentence does not pay a `compound-render` process to look.
+    /// A screen that cannot be read is no answer, and the tell goes ahead as
+    /// it always has.
+    fn at_trust_prompt(&self, seat: &Seat) -> Option<String> {
+        let rec = self.record(seat).ok()?;
+        let started = rec.get("started_at").and_then(|s| s.as_str()).map(util::epoch_of)?;
+        if util::epoch_secs() - started > TRUST_PROMPT_WINDOW {
+            return None;
+        }
+        trust_prompt(seat, &self.read_screen(seat).ok()?)
+    }
+
     pub(crate) fn read_screen(&self, seat: &Seat) -> Result<String> {
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         let render = compound_render_binary().ok_or_else(|| {
@@ -1220,6 +1269,9 @@ impl Place for Compound<'_> {
         // `insist` is a person saying they have looked; see its own doc.
         if !self.insist && !state.will_take_a_prompt() {
             return Err(Refusal::NotReady(state));
+        }
+        if let Some(why) = self.at_trust_prompt(seat) {
+            return Err(Refusal::Backend(why));
         }
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
         type_and_submit(&socket, text)?;
@@ -2309,5 +2361,28 @@ mod tests {
         wire_health_of(&sup, &mut problems, &mut notes);
         assert!(problems.is_empty(), "{problems:?}");
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// The screen a `claude` started in `/` showed on 2026-10-06, as
+    /// `compound-render screen` printed it (`wsp-219`). Seen, it is the reason
+    /// the order is not typed, and the reason names the prompt and the folder
+    /// rather than the renderer socket the agent's exit would have removed.
+    #[test]
+    fn a_seat_at_the_folder_trust_prompt_is_not_typed_at_and_says_why() {
+        let screen = "\
+ Accessing workspace:
+
+ /
+
+ Quick safety check: Is this a project you created or one you trust?
+
+ \u{276f} No, exit
+   Yes, I trust this folder
+
+ Enter to confirm \u{b7} Esc to cancel";
+        let why = trust_prompt(&Seat::new("cpd-420"), screen).expect("the trust prompt was not seen");
+        assert!(why.contains("cpd-420") && why.contains("folder-trust prompt for /"), "{why}");
+        assert!(why.contains("No, exit") && !why.contains("rsock"), "{why}");
+        assert_eq!(trust_prompt(&Seat::new("cpd-1"), "> \n? for shortcuts"), None, "a composer is not a prompt");
     }
 }

@@ -814,15 +814,71 @@ fn seat_env_over(
     env
 }
 
-/// Where a custodian stands when its scope has no root: a worklist, which
-/// spans projects and owns no tree.
+/// Where a worklist's custodian stands: where its project's governor stands,
+/// the root of the project its members are in. Where they span projects, the
+/// one holding most rows, the first-seen on a tie.
 ///
-/// **Stated rather than left to the backend** (`wsp-203`). An order with no
-/// cwd means the backend's default, and compound and the supervisor start the
-/// agent as a child of this process, so their default is the caller's own
-/// directory. A governor spawned from a member's pane stood in that member's
-/// tree. Home is the one place that is nobody's tree on every backend.
-const UNROOTED: &str = "~";
+/// **Not home, which `wsp-203` chose and `wsp-219` reversed.** `wsp-203`
+/// stated a cwd rather than leave it to the backend, because compound starts
+/// the agent as a child of the caller and so in the caller's directory, and a
+/// governor spawned from a member's pane stood in that member's tree. That
+/// half holds. But it chose `~`, and Claude Code opens `~` (and `/`, the
+/// daemon's directory under launchd) behind its folder-trust prompt with
+/// "No, exit" selected: the Enter that submits the work order exits the agent,
+/// and the reseat reads as a renderer socket that never appeared. That was 57
+/// failed list reseats, while project seats, which stand in their root,
+/// reseated fine. A trunk is nobody's tree as much as home is, since a member
+/// works in `.worktrees/<id>` beneath it.
+///
+/// `None` when no member has a project with a root, which [`grounded`] refuses.
+fn list_root(store: &Store, index: &Index, list: &str) -> Option<String> {
+    let mut tally: Vec<(String, usize)> = Vec::new();
+    let members = store.worklist(list).map(|l| l.groups()).unwrap_or_default();
+    for id in members.iter().flat_map(|g| g.members.iter()) {
+        let Some(task) = store.find_task(id) else { continue };
+        let Some(root) = task.project.as_deref().and_then(|p| index.root_for(p, &task.refs)) else { continue };
+        match tally.iter_mut().find(|(r, _)| *r == root) {
+            Some((_, n)) => *n += 1,
+            None => tally.push((root, 1)),
+        }
+    }
+    // `max_by_key` keeps the last of equals; reversed, it keeps the first.
+    tally.into_iter().rev().max_by_key(|(_, n)| *n).map(|(r, _)| r)
+}
+
+/// An agent's directory, or why it may not start: one is required, and it
+/// must be a project's root or a tree beneath one (`<trunk>/.worktrees/<id>`).
+///
+/// **Refused rather than inherited** (`wsp-219`). With no directory, compound
+/// starts the agent where wsp was called from, which for the daemon's tick is
+/// `/`. Anywhere outside a project is a folder Claude Code may never have been
+/// told to trust, and its prompt's default exits the agent on the Enter that
+/// submits the order. Saying so here costs one line. Letting it through cost a
+/// seat that opened, took nothing and closed, reported as a missing socket.
+fn grounded(index: &Index, cwd: Option<&str>) -> Result<String, String> {
+    let why = "an agent started outside a project lands behind Claude Code's folder-trust prompt, \
+               whose default is \"No, exit\"";
+    let Some(cwd) = cwd else {
+        return Err(format!(
+            "no directory to start the agent in, so it would inherit the caller's - {why}. \
+             Give the project a root, or name a project for the list's rows"
+        ));
+    };
+    let here = util::real(cwd);
+    let inside = index.projects.iter().flat_map(|p| p.roots.iter()).any(|root| {
+        let root = util::real(root);
+        here.starts_with(&root)
+            || here
+                .ancestors()
+                .find(|a| a.file_name().is_some_and(|n| n == cmd_checkout::WORKTREES))
+                .and_then(|w| w.parent())
+                .is_some_and(|trunk| root.starts_with(trunk))
+    });
+    match inside {
+        true => Ok(cwd.to_string()),
+        false => Err(format!("{cwd} is not a project root or a tree of one - {why}")),
+    }
+}
 
 /// Where a spawn is going: this machine unless `--on` says otherwise.
 ///
@@ -1994,7 +2050,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let cwd = args
         .get("cwd")
         .or_else(|| work.project.as_deref().and_then(|p| index.root_for(p, &refs)))
-        .or_else(|| args.has("govern").then(|| UNROOTED.to_string()));
+        .or_else(|| work.list.as_deref().and_then(|l| list_root(store, &index, l)));
 
     // One tree per agent, which is the whole of robustness-010 and is done here
     // rather than asked of the agent. Every softer version of it has been tried
@@ -2026,6 +2082,13 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
         _ => cwd,
     };
+    // A bare terminal may stand anywhere; an agent may not, see [`grounded`].
+    if args.has("agent") || args.has("govern") {
+        if let Err(e) = grounded(&index, cwd.as_deref()) {
+            eprintln!("wsp: {e}");
+            return 2;
+        }
+    }
 
     // Focus is asked for, never assumed. This line used to read
     // `!args.has("no-focus")`, so every spawn dragged the screen onto the new
@@ -2896,9 +2959,25 @@ fn rotate_as(
         eprintln!("wsp: rotate with a kind wsp can hear from - --kind claude");
         return 2;
     }
-    // A project root, inherited; a worklist scope stands at [`UNROOTED`],
-    // exactly as a first custodian's seat does.
-    let cwd = work.project.as_deref().and_then(|proj| index.root_of(proj)).or_else(|| Some(UNROOTED.into()));
+    // A project root, inherited; a worklist scope stands at its members'
+    // root, exactly as a first custodian's seat does — and with neither, the
+    // successor is refused before anything is opened, not started in the
+    // caller's directory (`wsp-219`).
+    let cwd = work
+        .project
+        .as_deref()
+        .and_then(|proj| index.root_of(proj))
+        .or_else(|| work.list.as_deref().and_then(|l| list_root(store, &index, l)));
+    let cwd = match grounded(&index, cwd.as_deref()) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            if vacant {
+                cmd_govern::reseat_failed(store, &scope, &e);
+            }
+            return 2;
+        }
+    };
     let subject = work.list.clone().or_else(|| work.project.clone()).unwrap_or_default();
 
     let how = agent_commands::of(&kind);
@@ -4754,21 +4833,94 @@ mod tests {
         }
     }
 
-    /// A custodian on a list has no root, and stands at home rather than in
-    /// whatever tree its spawner was in — which under compound is where an
-    /// order with no cwd puts it (`wsp-203`).
+    /// A list's rows, as one group: enough for the spawn to read its members.
+    fn list_of(store: &Store, id: &str, rows: &[(&str, &str)]) {
+        use crate::model::{Group, Task, Worklist};
+        for (task, project) in rows {
+            let mut t = Task::new("a row", task);
+            t.project = Some(project.to_string());
+            store.save_task(&t).unwrap();
+        }
+        let mut w = Worklist::new(id, "Overnight batch");
+        w.set_groups(&[Group {
+            members: rows.iter().map(|(t, _)| t.to_string()).collect(),
+            cap: None,
+            stop: String::new(),
+            verdict: String::new(),
+            landed: Vec::new(),
+            agent: String::new(),
+            member_agents: Default::default(),
+        }]);
+        store.save_worklist(&w).unwrap();
+    }
+
+    fn rooted(store: &Store, project: &str) -> String {
+        let root = store.root.join(format!("root-{project}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut p = Project::new(project);
+        p.roots = vec![root.display().to_string()];
+        store.save_project(&p).unwrap();
+        root.display().to_string()
+    }
+
+    /// A custodian on a list stands where its project's governor would: the
+    /// root most of its rows are in. Not in whatever tree its spawner stood in
+    /// (`wsp-203`), and not at home, where Claude Code's folder-trust prompt
+    /// exits the agent on the Enter that submits its order (`wsp-219`).
     #[test]
-    fn a_list_governor_stands_in_nobodys_tree() {
+    fn a_list_governor_stands_at_the_root_its_members_are_in() {
         let _guard = no_backend();
         std::env::remove_var("HERDR_PANE_ID");
         std::env::remove_var("HERDR_WORKSPACE_ID");
         let store = seat("govern-list-cwd");
-        store.save_worklist(&crate::model::Worklist::new("batch", "Overnight batch")).unwrap();
+        let (few, most) = (rooted(&store, "few"), rooted(&store, "most"));
+        list_of(&store, "batch", &[("t-1", "few"), ("t-2", "most"), ("t-3", "most")]);
         let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
         let flags = [("project", "batch"), ("govern", "true"), ("kind", "opencode")];
         place_work(&place, &store, &Args::synth("spawn", &[], &flags));
-        let cwd = place.1.borrow().first().map(|o| o.cwd.clone());
-        assert_eq!(cwd, Some(Some(UNROOTED.to_string())), "left to the backend, which is the caller's directory");
+        let cwd = place.1.borrow().first().and_then(|o| o.cwd.clone());
+        assert_eq!(cwd.as_deref(), Some(most.as_str()), "the root holding most rows, not {few} and not home");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// With no root to stand in, the custodian is refused before a seat is
+    /// opened, rather than started wherever wsp was called from — `/`, from
+    /// the daemon's tick, which is how 57 list reseats opened and closed.
+    #[test]
+    fn a_list_with_no_rooted_member_is_refused_before_a_seat_is_opened() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("govern-list-unrooted");
+        store.save_project(&Project::new("bare")).unwrap();
+        list_of(&store, "batch", &[("t-1", "bare")]);
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("project", "batch"), ("govern", "true"), ("kind", "opencode")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &[], &flags)), 2);
+        assert!(place.1.borrow().is_empty(), "a seat was opened for an agent with nowhere to stand");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// The rule itself: a root or a tree of one passes; nothing, or a
+    /// directory outside every project, is refused and the reason names the
+    /// trust prompt rather than the socket it eventually shows up as.
+    #[test]
+    fn an_agent_starts_only_in_a_project_root_or_a_tree_of_one() {
+        let store = seat("grounded");
+        let root = rooted(&store, "core");
+        let tree = format!("{root}/.worktrees/core-001");
+        let sub = format!("{root}/crates/x");
+        for dir in [&tree, &sub] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let index = Index::new(store.projects());
+        assert_eq!(grounded(&index, Some(&root)), Ok(root.clone()));
+        assert_eq!(grounded(&index, Some(&tree)), Ok(tree.clone()), "a member's tree is beneath its trunk");
+        assert_eq!(grounded(&index, Some(&sub)), Ok(sub.clone()));
+        for refused in [None, Some("/"), Some("~")] {
+            let why = grounded(&index, refused).expect_err("an agent was allowed to start outside every project");
+            assert!(why.contains("No, exit"), "{why}");
+        }
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
@@ -5828,6 +5980,7 @@ mod tests {
         std::env::remove_var("HERDR_WORKSPACE_ID");
         let store = seat("brief");
         let mut proj = Project::new("core");
+        proj.roots = vec![rooted(&store, "core")];
         proj.body = "## Handbook\nread the source map first\n".into();
         store.save_project(&proj).unwrap();
         for (id, title, overview) in [
@@ -5898,7 +6051,7 @@ mod tests {
         std::env::remove_var("HERDR_PANE_ID");
         std::env::remove_var("HERDR_WORKSPACE_ID");
         let store = seat("claim-where");
-        let tree = store.root.join("elsewhere");
+        let tree = std::path::Path::new(&rooted(&store, "core")).join("elsewhere");
         std::fs::create_dir_all(&tree).unwrap();
         let mut t = crate::model::Task::new("a member", "t-1");
         t.project = Some("core".into());
@@ -5928,6 +6081,7 @@ mod tests {
         std::env::remove_var("HERDR_PANE_ID");
         std::env::remove_var("HERDR_WORKSPACE_ID");
         let store = seat("verify");
+        rooted(&store, "core");
         let mut m = crate::model::Task::new("a member", "t-1");
         m.project = Some("core".into());
         m.status_raw = crate::model::Status::Review.as_str().into();
@@ -6578,7 +6732,7 @@ mod tests {
         herdr_stand_in(&sock, 24, successor_pane());
         std::env::set_var("HERDR_SOCKET_PATH", &sock);
 
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
 
         let dial = util::Dial::new();
@@ -6631,7 +6785,7 @@ mod tests {
     /// a re-opened decision.
     fn vacated_seat(tag: &str, model: &str, effort: &str) -> (util::Isolated, Store) {
         let (env, store) = rotating_as(tag, "w1", "w1:p9");
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
         cmd_govern::note_started(&store, "core", "claude", Some(model), Some(effort));
         cmd_govern::vacate(&store, "core");
@@ -6671,7 +6825,7 @@ mod tests {
             std::env::remove_var("HERDR_PANE_ID");
             std::env::remove_var("HERDR_WORKSPACE_ID");
             let store = seat(&format!("govern-verifier-{tag}"));
-            store.save_project(&Project::new("core")).unwrap();
+            rooted(&store, "core");
             if let Some(finished) = pass {
                 crate::cmd_govern::tests::verified_by(&store, "t-1", "w9:p1", finished);
             }
@@ -6746,7 +6900,7 @@ mod tests {
             let sock = env.path("herdr.sock");
             herdr_stand_in(&sock, 24, successor_pane());
             std::env::set_var("HERDR_SOCKET_PATH", &sock);
-            store.save_project(&Project::new("core")).unwrap();
+            rooted(&store, "core");
             cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
             crate::cmd_govern::tests::verified_by(&store, "t-1", "w9:p2", finished);
             let before = governors_bytes(&store);
@@ -6877,7 +7031,7 @@ mod tests {
         let sock = env.path("herdr.sock");
         herdr_stand_in(&sock, 24, successor_pane());
         std::env::set_var("HERDR_SOCKET_PATH", &sock);
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         cmd_govern::vacate(&store, "core");
         stop_being_a_seat();
 
@@ -7023,7 +7177,7 @@ mod tests {
         std::env::remove_var("HERDR_PANE_ID");
         std::env::remove_var("HERDR_WORKSPACE_ID");
         let store = seat("govern-tier");
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         // The rotation's fake, because a claude seat is told its order and
         // `Started` is for a kind that takes it in argv.
         let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
@@ -7049,7 +7203,7 @@ mod tests {
         let sock = _env.path("herdr.sock");
         herdr_stand_in(&sock, 24, successor_pane());
         std::env::set_var("HERDR_SOCKET_PATH", &sock);
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
         cmd_govern::note_started(&store, "core", "claude", Some("opus"), Some("high"));
 
@@ -7112,7 +7266,7 @@ mod tests {
     #[test]
     fn a_rotation_that_never_starts_a_turn_ends_nothing_and_leaves_the_caller_seated() {
         let (_env, store) = rotating_as("rotate-stall", "w1", "w1:p9");
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
 
         let dial = util::Dial::new();
@@ -7157,7 +7311,7 @@ mod tests {
             std::env::remove_var("HERDR_PANE_ID");
             let store = Store::at(env.home(), env.state());
             store.ensure_dirs().unwrap();
-            store.save_project(&Project::new("core")).unwrap();
+            rooted(&store, "core");
             cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
@@ -7171,7 +7325,7 @@ mod tests {
         // A caller that holds a different scope than the one named.
         {
             let (_env, store) = rotating_as("rotate-wrong-scope", "w2", "w2:p2");
-            store.save_project(&Project::new("core")).unwrap();
+            rooted(&store, "core");
             store.save_project(&Project::new("other")).unwrap();
             cmd_govern::take(&store, "other", "w2", "w2:p2").unwrap();
             let dial = util::Dial::new();
@@ -7189,7 +7343,7 @@ mod tests {
         // make.
         {
             let (_env, store) = rotating_as("rotate-unseated", "w3", "w3:p1");
-            store.save_project(&Project::new("core")).unwrap();
+            rooted(&store, "core");
             cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
@@ -7208,7 +7362,7 @@ mod tests {
         // order in argv today.
         {
             let (_env, store) = rotating_as("rotate-argv-kind", "w1", "w1:p9");
-            store.save_project(&Project::new("core")).unwrap();
+            rooted(&store, "core");
             cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
@@ -7225,7 +7379,7 @@ mod tests {
         // left to sequence.
         {
             let (_env, store) = rotating_as("rotate-finished", "w1", "w1:p9");
-            store.save_project(&Project::new("core")).unwrap();
+            rooted(&store, "core");
             let mut t = Task::new("landed", "t-1");
             t.project = Some("core".into());
             t.set_status(Status::Done);
@@ -7271,7 +7425,11 @@ mod tests {
         herdr_stand_in(&sock, 24, successor_pane());
         std::env::set_var("HERDR_SOCKET_PATH", &sock);
 
-        store.save_project(&Project::new("core")).unwrap();
+        let root = store.root.join("core");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut core = Project::new("core");
+        core.roots = vec![root.display().to_string()];
+        store.save_project(&core).unwrap();
         let mut landed = Task::new("landed", "t-1");
         landed.project = Some("core".into());
         landed.set_status(crate::model::Status::Done);
@@ -7319,8 +7477,8 @@ mod tests {
         assert_eq!(store.handovers()["batch"]["to"], "w9:p2");
         assert_eq!(
             place.opened.borrow().first().and_then(|o| o.cwd.clone()).as_deref(),
-            Some(UNROOTED),
-            "a list's successor stood wherever its predecessor was"
+            Some(root.display().to_string().as_str()),
+            "a list's successor stands where its members' project governor would, not at home (wsp-219)"
         );
 
         let _ = std::fs::remove_dir_all(&store.root);
@@ -7477,7 +7635,7 @@ mod tests {
     fn a_rotation_onto_a_seat_herdr_cannot_see_still_moves_the_seat() {
         let (_env, store) = rotating_as("rotate-roomless", "cpd-1", "cpd-1");
         std::env::set_var("HERDR_SOCKET_PATH", _env.path("no-herdr-here.sock"));
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         cmd_govern::take(&store, "core", "cpd-1", "cpd-1").unwrap();
 
         let dial = util::Dial::new();
@@ -7515,7 +7673,7 @@ mod tests {
     fn the_ending_a_rotation_owes_is_carried_out_once_the_seat_has_moved_or_says_why_not() {
         let _env = no_backend();
         let store = seat("rotate-ending");
-        store.save_project(&Project::new("core")).unwrap();
+        rooted(&store, "core");
         working(&store, "t-260816-095", "w1:p1");
         cmd_govern::take(&store, "core", "w1", "w1:p1").unwrap();
         store.set_handover("core", json!({ "from": "w1:p1", "to": "w9:p2", "since": "2026-09-30T00:00:00Z" }));
