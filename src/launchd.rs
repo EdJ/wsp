@@ -435,6 +435,78 @@ mod tests {
         dir
     }
 
+    /// A test job booted into the person's real `gui/<uid>` domain, booted out
+    /// again however the test ends.
+    ///
+    /// The bootout used to be the test's last lines, so every assert above it
+    /// that failed left `com.wsp.test-<pid>` loaded for good: wsp-149 found
+    /// three in `launchctl list` on 2026-10-06, each pointing at a `fake-wsp`
+    /// in a temp dir that no longer existed. Drop runs on an unwinding panic,
+    /// which is what a failed assert is. It does not run on a run that is
+    /// killed, and [`sweep`] is for that.
+    #[cfg(target_os = "macos")]
+    struct Job {
+        target: String,
+        dir: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // Fails when the test already booted it out, which is the passing case.
+            let _ = Command::new("launchctl")
+                .args(["bootout", &self.target])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Boot out every `com.wsp.test-<pid>` whose test process is gone, and
+    /// remove every `wsp-launchd-agent-<pid>` scratch dir of the same.
+    ///
+    /// A `cargo test` stopped by a signal, or a Ctrl-C, never runs [`Job`]'s
+    /// Drop, so the next run tidies up after it. Only the dead are touched: a
+    /// label whose pid is running belongs to another tree's test run on this
+    /// shared machine, mid-test, and booting it out would fail that run for
+    /// no fault of its own.
+    #[cfg(target_os = "macos")]
+    fn sweep(domain: &str) {
+        let Ok(out) = Command::new("launchctl").arg("list").output() else { return };
+        let stale: Vec<(u32, String)> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(2))
+            .filter_map(|label| Some((label.strip_prefix("com.wsp.test-")?.parse().ok()?, label.to_string())))
+            .collect();
+        let tmp = std::env::temp_dir();
+        let dirs: Vec<(u32, PathBuf)> = std::fs::read_dir(&tmp)
+            .map(|rd| {
+                rd.filter_map(|e| {
+                    let name = e.ok()?.file_name().into_string().ok()?;
+                    Some((name.strip_prefix("wsp-launchd-agent-")?.parse().ok()?, tmp.join(&name)))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        let pids: Vec<u32> = stale.iter().map(|(pid, _)| *pid).chain(dirs.iter().map(|(pid, _)| *pid)).collect();
+        let running = crate::place_super::alive(&pids);
+        for (pid, label) in stale {
+            if !running.contains(&pid) {
+                let _ = Command::new("launchctl")
+                    .args(["bootout", &format!("{domain}/{label}")])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        for (pid, dir) in dirs {
+            if !running.contains(&pid) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
     /// The `launchctl` calls, against a real launchd.
     ///
     /// Everything else in this file is a function over text, and the two calls
@@ -454,9 +526,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_job_is_written_loaded_and_the_second_install_leaves_it_alone() {
+        let domain = domain().unwrap();
+        sweep(&domain);
         let dir = scratch("agent");
         let label = format!("com.wsp.test-{}", std::process::id());
         let path = dir.join(format!("{label}.plist"));
+        let _job = Job { target: format!("{domain}/{label}"), dir: dir.clone() };
 
         // Stands in for the daemon: a program that records what it was given and
         // exits cleanly — which is also the case the `KeepAlive` policy is
@@ -473,7 +548,7 @@ mod tests {
         let first = ensure_as(&label, &path, &bin, &dir, "/usr/bin:/bin").expect("the first install");
         assert!(first.wrote, "nothing was written on the first run");
         assert!(first.loaded, "a job that was not loaded was not bootstrapped");
-        assert!(loaded(&format!("{}/{label}", domain().unwrap())), "the job did not survive being written");
+        assert!(loaded(&format!("{domain}/{label}")), "the job did not survive being written");
 
         // `RunAtLoad`, and the `daemon` argument, actually reaching the program.
         for _ in 0..100 {
@@ -492,7 +567,7 @@ mod tests {
         let second = ensure_as(&label, &path, &bin, &dir, "/usr/bin:/bin").expect("the second install");
         assert!(!second.wrote, "an identical plist was rewritten");
         assert!(!second.loaded, "a job that was already loaded was booted out for nothing");
-        assert!(loaded(&format!("{}/{label}", domain().unwrap())), "and the job did not survive that either");
+        assert!(loaded(&format!("{domain}/{label}")), "and the job did not survive that either");
 
         // A plist that *did* change is reloaded, because `bootstrap` on a
         // loaded label fails outright and nothing else would ever read the new
@@ -503,12 +578,11 @@ mod tests {
         assert!(third.loaded, "and the job was never told about it");
 
         let out = Command::new("launchctl")
-            .args(["bootout", &format!("{}/{}", domain().unwrap(), label)])
+            .args(["bootout", &format!("{domain}/{label}")])
             .output()
             .unwrap();
         assert!(out.status.success(), "bootout failed: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(!loaded(&format!("{}/{label}", domain().unwrap())), "the job outlived its bootout");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!loaded(&format!("{domain}/{label}")), "the job outlived its bootout");
     }
 
     /// The three things the plist is for, asserted as the plist rather than as
