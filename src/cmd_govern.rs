@@ -718,7 +718,7 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
             // The tier, for the same reason and one step further: a seat is the
             // most expensive agent in a run, and a successor handed "whatever
             // the settings say now" is a rotation that quietly changes cost.
-            // `wsp-117`, and `note_tier` is what puts the real answer here — a
+            // `wsp-117`, and `note_started` is what puts the real answer here — a
             // `wsp govern` typed by a person takes over an agent that is already
             // running and must not restate its tier, which is why these are kept
             // rather than cleared here.
@@ -1147,7 +1147,13 @@ pub fn tier_of(governors: &BTreeMap<String, Value>, scope: &str) -> (Option<Stri
     (read("model"), read("effort"))
 }
 
-/// Put the tier a seat was actually started at on its record.
+/// Put the kind and tier a seat was actually started at on its record.
+///
+/// **The kind as well, because nothing else writes it on compound.** It was
+/// learned off herdr's census by `learn_seats`, so every compound governor
+/// `wsp-148` reseated on 2026-10-06 — cpd-338, -339 and -340 — went on record
+/// with `kind: ""`, and the next reseat of an opencode seat would have read the
+/// default and moved it onto claude.
 ///
 /// **Written by the two callers that start an agent, after they have resolved
 /// it, and by nobody else.** `wsp spawn --govern` knows what it passed;
@@ -1155,9 +1161,10 @@ pub fn tier_of(governors: &BTreeMap<String, Value>, scope: &str) -> (Option<Stri
 /// the field there instead would throw away the tier of a seat a person is
 /// taking over — which is the case where the agent in the room is not being
 /// replaced and its cost is not being changed.
-pub fn note_tier(store: &Store, scope: &str, model: Option<&str>, effort: Option<&str>) -> bool {
+pub fn note_started(store: &Store, scope: &str, kind: &str, model: Option<&str>, effort: Option<&str>) -> bool {
     store.edit_governor(scope, |rec| {
         let Some(o) = rec.as_object_mut() else { return false };
+        o.insert("kind".into(), json!(kind));
         o.insert("model".into(), json!(model.unwrap_or_default()));
         o.insert("effort".into(), json!(effort.unwrap_or_default()));
         true

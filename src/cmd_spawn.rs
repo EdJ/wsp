@@ -2745,7 +2745,7 @@ fn rotate_as(
             return 1;
         };
         cmd_govern::take(store, &scope, &ws_new, seat.as_str());
-        cmd_govern::note_tier(store, &scope, model.as_deref(), effort.as_deref());
+        cmd_govern::note_started(store, &scope, &kind, model.as_deref(), effort.as_deref());
     } else {
         // The record goes down before the agent starts, because the successor's
         // brief is composed at start and the ending has to already be in it. Taken
@@ -2847,7 +2847,7 @@ fn rotate_as(
             return 1;
         };
         cmd_govern::take(store, &scope, &ws_new, seat.as_str());
-        cmd_govern::note_tier(store, &scope, model.as_deref(), effort.as_deref());
+        cmd_govern::note_started(store, &scope, &kind, model.as_deref(), effort.as_deref());
     }
 
     // Step 4. This pane's own ending, now that somebody else holds the seat.
@@ -6186,7 +6186,7 @@ mod tests {
         let (env, store) = rotating_as(tag, "w1", "w1:p9");
         store.save_project(&Project::new("core")).unwrap();
         cmd_govern::take(&store, "core", "w1", "w1:p9");
-        cmd_govern::note_tier(&store, "core", Some(model), Some(effort));
+        cmd_govern::note_started(&store, "core", "claude", Some(model), Some(effort));
         cmd_govern::vacate(&store, "core");
         stop_being_a_seat();
         (env, store)
@@ -6267,6 +6267,11 @@ mod tests {
             "the slot named the successor before its agent was started"
         );
         assert!(store.handovers().is_empty(), "there is no predecessor to end: {:?}", store.handovers());
+        assert_eq!(
+            store.governors()["core"]["kind"],
+            "claude",
+            "and the successor's kind is on its record, for the reseat after this one"
+        );
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
