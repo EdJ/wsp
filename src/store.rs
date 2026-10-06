@@ -774,6 +774,18 @@ impl Store {
             _ => return Found::Ambiguous(by_suffix),
         }
 
+        // **A whole id that names an archived task is that task**, before any
+        // title that happens to mention it. `wsp-188` archived the Verify rows
+        // and `wsp show wsp-174` printed wsp-176 — whose title is about "ending
+        // wsp-174" — so every log and handover citing the old id was pointed at
+        // the row that discussed it. Asked only of a needle shaped like an id,
+        // so a title search does not read the archive on the way.
+        if looks_like_id(needle) {
+            if let Some((t, path)) = self.archived_task(needle) {
+                return Found::Archived(Box::new(t), path);
+            }
+        }
+
         let lower = needle.to_ascii_lowercase();
         let by_title: Vec<Task> = open
             .iter()
@@ -790,6 +802,17 @@ impl Store {
         }
     }
 
+}
+
+/// `<code>-<digits>`: the shape every id has had, the dated `t-YYMMDD-NNN`
+/// included, and one a phrase from a title almost never has.
+fn looks_like_id(needle: &str) -> bool {
+    needle.rsplit_once('-').is_some_and(|(code, n)| {
+        !code.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !code.contains(' ')
+    })
+}
+
+impl Store {
     /// The task a needle names, or the message saying why it named none.
     ///
     /// What every command a person types at should use. The `Err` is a ready
@@ -3323,6 +3346,22 @@ mod tests {
     /// be able to tell "this never existed" from "this was swept last Tuesday",
     /// so the path is asserted and not just the word: it is the half that turns
     /// the answer into somewhere to go.
+    #[test]
+    fn an_archived_id_cited_in_an_open_rows_title_still_resolves_to_the_archive() {
+        let store = scratch("archived-cited");
+        let mut gone = Task::new("Verify wsp-148: the seat", "wsp-174");
+        gone.updated = "2026-10-05T00:00:00Z".into();
+        store.save_task(&gone).unwrap();
+        store.archive_task(&gone).unwrap();
+        store.save_task(&Task::new("the cycle retried ending wsp-174 every minute", "wsp-176")).unwrap();
+        match store.resolve_task("wsp-174") {
+            Found::Archived(t, _) => assert_eq!(t.id, "wsp-174"),
+            other => panic!("a citation of wsp-174 resolved to {:?}", other.why("wsp-174")),
+        }
+        assert!(store.find_task("wsp-174").is_none(), "and archived is not live");
+        assert_eq!(store.find_task("ending wsp").map(|t| t.id), Some("wsp-176".into()), "a phrase is still a title search");
+    }
+
     #[test]
     fn an_archived_task_says_where_it_went_instead_of_saying_it_never_existed() {
         let store = scratch("archived-resolve");
