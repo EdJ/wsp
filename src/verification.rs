@@ -583,11 +583,13 @@ pub(crate) fn plan(store: &Store) -> Plan {
 }
 
 /// A row somebody wrote to review or verify something, which the migration
-/// names so a reader can see it was considered and left.
+/// names so a reader can see it was considered and left. The title's opening
+/// words and not a word anywhere in it: a row *about* verification — this one,
+/// `wsp-193` — is not a review of anything.
 fn made_by_hand(t: &Task) -> bool {
     let title = t.title.to_ascii_lowercase();
-    t.tags.iter().any(|g| g == VERIFY_TAG) || title.starts_with("verify") || title.starts_with("re-verify") || title.contains("verification")
-        || (title.contains("barrier") && title.contains("review"))
+    let barrier = title.starts_with("barrier") && (title.contains("review") || title.contains("re-check"));
+    t.tags.iter().any(|g| g == VERIFY_TAG) || title.starts_with("verify ") || title.starts_with("re-verify ") || barrier
 }
 
 fn apply(store: &Store, plan: &Plan) -> Result<usize, String> {
@@ -709,6 +711,8 @@ mod tests {
         let mut recheck = Task::new("Barrier re-check: round-2 group 3, after the hold", "compound-330");
         recheck.tags = vec![VERIFY_TAG.into()];
         store.save_task(&recheck).unwrap();
+        // And a row *about* verification, which reviews nothing.
+        store.save_task(&Task::new("A verification is a pass on the member's own row", "wsp-188")).unwrap();
         // Still running: claimed, its verdict not in.
         row(&store, "wsp-200", "wsp-148", "2026-10-06T09:00:00Z", Status::Doing, "note: reading");
         store.set_claim("wsp-200", serde_json::json!({ "workspace": "w" }));
