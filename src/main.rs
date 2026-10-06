@@ -38,6 +38,7 @@ mod daemon;
 mod detail;
 mod detect_override;
 mod draw;
+mod ending;
 mod fake;
 mod fm;
 mod guard;

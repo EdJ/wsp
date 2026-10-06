@@ -151,6 +151,26 @@ pub(crate) trait Seats {
     fn absent(&self, _seat: &str) -> bool {
         false
     }
+
+    /// Whether a turn began at this seat at or after `since` —
+    /// [`crate::place::Place::turn_began_since`] over every backend here.
+    /// `None` is nobody can say, and the default, for the reason
+    /// [`Seats::absent`] gives: a caller holds on `None`.
+    fn turn_began_since(&self, _seat: &str, _since: i64) -> Option<bool> {
+        None
+    }
+
+    /// The processes that are this seat's agent, read now —
+    /// [`crate::place::Place::pids`]. `None` is no backend can name one.
+    fn pids(&self, _seat: &str) -> Option<Vec<u32>> {
+        None
+    }
+
+    /// Which of these are still running. A parameter for the same reason
+    /// [`Seats::state`] is: a test names pids that were never processes.
+    fn running(&self, pids: &[u32]) -> Vec<u32> {
+        crate::place_super::alive(pids).into_iter().collect()
+    }
 }
 
 /// The real reading, over the backends on this machine — with opencode's own
@@ -209,6 +229,16 @@ impl Seats for Fleet {
     fn absent(&self, seat: &str) -> bool {
         let seat_id = Seat::new(seat);
         Fleet::here(seat).all(|b| matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_))))
+    }
+
+    fn turn_began_since(&self, seat: &str, since: i64) -> Option<bool> {
+        let seat_id = Seat::new(seat);
+        Fleet::here(seat).find_map(|b| b.turn_began_since(&seat_id, since))
+    }
+
+    fn pids(&self, seat: &str) -> Option<Vec<u32>> {
+        let seat_id = Seat::new(seat);
+        Fleet::here(seat).find_map(|b| b.pids(&seat_id))
     }
 }
 
@@ -1757,18 +1787,32 @@ fn despawn_seat(seat: &str) -> Result<(), String> {
 /// the ending is a verb's whole behaviour and reimplementing it here would be a
 /// second answer that could disagree with it.
 pub(crate) fn despawn(store: &Store, id: &str) {
+    let _ = despawned(store, id);
+}
+
+/// [`despawn`], answering whether `wsp despawn` succeeded — `Err` carries what
+/// it said. For the caller that has to record an ending exactly once and a
+/// failure exactly once, which a fire-and-forget cannot tell apart.
+pub(crate) fn despawned(store: &Store, id: &str) -> Result<(), String> {
     say_uncommitted(store, id);
     if cfg!(test) {
         #[cfg(test)]
+        if let Some(why) = tests::DESPAWN_FAILS.with(|f| f.borrow().clone()) {
+            return Err(why);
+        }
+        #[cfg(test)]
         tests::ENDED.with(|s| s.borrow_mut().push(id.to_string()));
-        return;
+        return Ok(());
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else { return Err("could not find wsp itself".into()) };
     let out = Command::new(exe).args(["despawn", id]).stdin(Stdio::null()).output();
-    let said = match out {
-        Ok(o) if o.status.success() => "ended".to_string(),
-        Ok(o) => format!("not ended: {}", String::from_utf8_lossy(&o.stderr).trim()),
-        Err(e) => format!("not ended: {e}"),
+    let (said, result) = match out {
+        Ok(o) if o.status.success() => ("ended".to_string(), Ok(())),
+        Ok(o) => {
+            let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            (format!("not ended: {why}"), Err(why))
+        }
+        Err(e) => (format!("not ended: {e}"), Err(e.to_string())),
     };
     // **`wsp despawn` says whether it kept a tree, and so do we.** Ending is the
     // whole of `despawn` — agent, claim, tree — and the tree is kept whenever it
@@ -1779,6 +1823,7 @@ pub(crate) fn despawn(store: &Store, id: &str) {
     let kept = said.contains("kept") || said.contains("uncommitted");
     stamp(&format!("despawn {id}: {said}"));
     kept.then(|| stamp(&format!("despawn {id}: its tree was kept — `wsp wip` shows what is standing in it")));
+    result
 }
 
 /// Before an agent is ended, whatever ended it: the uncommitted work its tree
@@ -2058,6 +2103,8 @@ pub(crate) mod tests {
         /// of what was *asked for*, like `ROTATED` beside it, because the verb it
         /// launches is one process per fill and a test cannot run it.
         pub(crate) static RESEATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// Set, and every despawn in this thread is refused with it.
+        pub(crate) static DESPAWN_FAILS: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     fn spawned() -> Vec<(String, String)> {

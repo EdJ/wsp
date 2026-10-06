@@ -119,6 +119,10 @@ pub(crate) struct Pass {
     /// The Verify row this pass was migrated from, or is being read from.
     pub was: Option<String>,
     pub ending: Ending,
+    /// When the verdict was recorded, as `util::now_iso` writes it. `wsp-193`
+    /// measures "somebody typed to the member since" from here: a turn after
+    /// `at` and before the verdict is the member answering its own verifier.
+    pub decided: Option<String>,
     /// The verdict, in the verifier's words.
     pub text: String,
 }
@@ -134,6 +138,7 @@ impl Pass {
             on,
             was: None,
             ending: Ending::Standing,
+            decided: None,
             text: String::new(),
         }
     }
@@ -154,6 +159,7 @@ impl Pass {
         clause("pane", &self.pane);
         clause("on", &self.on);
         clause("was", &self.was);
+        clause("decided", &self.decided);
         match &self.ending {
             Ending::Standing => {}
             Ending::Ended => out.push_str(" · ended"),
@@ -181,6 +187,7 @@ impl Pass {
             on: None,
             was: None,
             ending: Ending::Standing,
+            decided: None,
             text: String::new(),
         };
         for c in clauses {
@@ -196,6 +203,7 @@ impl Pass {
                     "pane" => p.pane = v,
                     "on" => p.on = v,
                     "was" => p.was = v,
+                    "decided" => p.decided = v,
                     _ => {}
                 }
             }
@@ -283,6 +291,8 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         on,
         was: Some(row.id.clone()),
         ending: Ending::Ended,
+        // The row's last touch: for a row at its verdict, the verdict.
+        decided: (state != State::Running).then(|| row.updated.clone()),
         text: verdict_of(row),
     }
 }
@@ -475,6 +485,7 @@ pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: 
             }
         };
         ps[at].state = state;
+        ps[at].decided = Some(util::now_iso());
         ps[at].text = text.trim().to_string();
         let pass = ps[at].clone();
         write(&mut t, &ps);
@@ -642,6 +653,7 @@ mod tests {
             on: Some("claude opus/high".into()),
             was: Some("wsp-174".into()),
             ending: Ending::Failed("cpd-12 is still standing".into()),
+            decided: Some("2026-10-06T10:20:00Z".into()),
             text: "the second half does not hold\n1. spool first\n2. then deliver".into(),
         };
         let bare = Pass { at: "2026-10-06T11:00:00Z".into(), ..Pass::opened(None, None) };

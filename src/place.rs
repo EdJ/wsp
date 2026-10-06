@@ -1194,6 +1194,19 @@ pub trait Place {
         None
     }
 
+    /// Every process that is this seat's agent: the one the backend started and
+    /// everything under it, read now. `None` is *this backend cannot name one*.
+    ///
+    /// **The tree and not the one pid, because a closed seat is not an ended
+    /// agent.** An agent was found alive at `ppid=1` after its seat had been
+    /// despawned, still holding a conversation a person was in. A caller that
+    /// means to say "ended" reads this *before* [`Place::stop`] and asks after
+    /// it whether any of them are still running; the pid the backend recorded is
+    /// only the root, and the root is the one most likely to have gone.
+    fn pids(&self, _seat: &Seat) -> Option<Vec<u32>> {
+        None
+    }
+
     /// Every seat this backend has, and what is in it.
     ///
     /// The one read that stays on this side of the line: what a backend is

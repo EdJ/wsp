@@ -1287,6 +1287,13 @@ impl Place for Compound<'_> {
         crate::place_super::last_written(&self.dir_of(seat).ok()?)
     }
 
+    /// `compound-sup` leads the group and the agent is its pty's child, so the
+    /// tree under the recorded pid is the agent and its work.
+    fn pids(&self, seat: &Seat) -> Option<Vec<u32>> {
+        let pid = self.record(seat).ok()?.get("pid").and_then(|p| p.as_u64())? as u32;
+        Some(crate::place_super::tree_of(pid))
+    }
+
     fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {
         let dir = self.dir_of(seat).ok()?;
         // No log is *cannot say*, not *no turn*: a seat that predates the file.

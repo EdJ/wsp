@@ -4328,6 +4328,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
 | `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat |
 | `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, or its own open `wsp ask` — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
+| `src/ending.rs` | a member whose newest pass holds has its agent ended, after `verification`'s tick has ended the verifier: never one in a turn, waiting, typed to since the verdict, or holding a governor seat; confirmed gone by pid, recorded once, and a failure told once |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |

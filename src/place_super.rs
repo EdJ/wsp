@@ -640,6 +640,48 @@ pub(crate) fn alive(pids: &[u32]) -> BTreeSet<u32> {
         .collect()
 }
 
+/// `root`, everything descended from it, and everything in the process group
+/// it leads — read in one `ps`.
+///
+/// **Both relations, because each misses a case the other catches.** A child
+/// that called `setsid` has left the group and is still a descendant until its
+/// parent dies; a process whose parent died is reparented to launchd and is
+/// still in the group [`signal_group`] signals. An agent found at `ppid=1`
+/// after its seat was closed is the second case, and it is the reason a caller
+/// takes this *before* ending anything: afterwards the parent link is gone.
+///
+/// `ps` failing to run answers the root alone — not empty, so a caller asking
+/// "is any of it still running?" still has the one pid it can certainly name.
+pub(crate) fn tree_of(root: u32) -> Vec<u32> {
+    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid=,pgid="]).output() else {
+        return vec![root];
+    };
+    let rows: Vec<(u32, u32, u32)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());
+            Some((it.next()??, it.next()??, it.next()??))
+        })
+        .collect();
+    let mut tree = vec![root];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        for &(pid, ppid, _) in &rows {
+            if ppid == parent && !tree.contains(&pid) {
+                tree.push(pid);
+            }
+        }
+        i += 1;
+    }
+    for &(pid, _, pgid) in &rows {
+        if pgid == root && !tree.contains(&pid) {
+            tree.push(pid);
+        }
+    }
+    tree
+}
+
 /// Signal a whole process group, by the id of the group's leader.
 ///
 /// The group rather than the pid, because an agent's children are its work: a
@@ -1259,6 +1301,17 @@ impl Place for Supervisor<'_> {
 
     fn quiet_since(&self, seat: &Seat) -> Option<i64> {
         last_written(&self.dir_of(seat).ok()?)
+    }
+
+    fn pids(&self, seat: &Seat) -> Option<Vec<u32>> {
+        let rec = self.record(seat).ok()?;
+        let pid = rec.get("pid").and_then(|p| p.as_u64())? as u32;
+        let mut pids = tree_of(pid);
+        // The group this backend signals is recorded apart from the agent's pid.
+        if let Some(group) = rec.get("group").and_then(|g| g.as_u64()).map(|g| g as u32) {
+            pids.extend(tree_of(group).into_iter().filter(|p| !pids.contains(p)).collect::<Vec<_>>());
+        }
+        Some(pids)
     }
 
     /// Every seat this supervisor has, and what is in it.
