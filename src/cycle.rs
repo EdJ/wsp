@@ -1589,8 +1589,17 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
     match at {
         // Every barrier of the list, and every verifier under a member of it:
         // nothing the run opened is still doing what it was opened for.
+        //
+        // **Barriers of *this* list, by title, as the `Some` arm reads them.**
+        // This used to take every row tagged `barrier` in the store, so `wsp
+        // worklist done wsp-unattended` tried to end wsp-process's group 7
+        // check mid-run (`wsp-207`) — saved only because no seat was bound to
+        // its claim. The tag says what a row is; only its title and its
+        // `OWNED` record say whose.
         None => {
-            ids.extend(tasks.iter().filter(|t| t.tags.iter().any(|g| g == BARRIER_TAG)).map(|t| t.id.clone()));
+            for at in 1..=w.groups().len() {
+                ids.extend(tasks.iter().filter(|t| is_barrier(t, list, at)).map(|t| t.id.clone()));
+            }
             ids.extend(
                 tasks
                     .iter()
@@ -2881,6 +2890,39 @@ fn only_a_working_screen_is_ever_overruled() {
             drained(&TOLD).iter().any(|t| t.contains("had nothing left to do")),
             "and the seat is told, because ending an agent on work somebody may return to is not done quietly"
         );
+    }
+
+    /// `wsp-207`. Closing a whole list — `done` with no group — ended every
+    /// barrier check in the store, so `wsp worklist done wsp-unattended` went
+    /// for wsp-process's group 7 check while that run was still going. What
+    /// a run opened is its own barriers and its own `OWNED` records, and
+    /// nothing another run started.
+    #[test]
+    fn closing_one_list_leaves_another_runs_barrier_and_helper_standing() {
+        let (_env, store) = scratch("two-runs");
+        task(&store, "m-1", Status::Review);
+        list(&store, &[(&["m-1"], "claude")]);
+        let _ = spawned();
+        let mut ours = Task::new(&barrier_title("run", 1), "b-1");
+        ours.tags = vec![BARRIER_TAG.into()];
+        ours.log(&format!("{} run group 1", OWNED));
+        store.save_task(&ours).unwrap();
+        // The other run's check, and a helper of the same group number: the
+        // first was what got ended, the second shares every word but the list.
+        let mut theirs = Task::new(&barrier_title("other", 7), "b-2");
+        theirs.tags = vec![BARRIER_TAG.into()];
+        theirs.log(&format!("{} other group 7", OWNED));
+        store.save_task(&theirs).unwrap();
+        let mut helper = Task::new("Install master", "h-2");
+        helper.log(&format!("{} other group 1", OWNED));
+        store.save_task(&helper).unwrap();
+        for id in ["b-1", "b-2", "h-2"] {
+            store.set_claim(id, serde_json::json!({ "workspace": "w" }));
+        }
+
+        end_what_the_run_opened(&store, &Exits, "run", None);
+        let was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(was, vec!["b-1".to_string()], "this run's barrier, and nothing the other run started");
     }
 
     /// `wsp-136` item 1. A note on a member is somebody **saying** something
