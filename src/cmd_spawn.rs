@@ -1839,16 +1839,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // it out here to save a directory listing would be two places to change it.
     let governors = store.governors();
     let running = crate::worklist::Running::read(store);
+    // `list_for` and not `list_of`: a barrier or verifier row is spawned by a
+    // list without being a member (`wsp-165`), and the seat it starts under
+    // is the list's.
+    let row_list = work
+        .task
+        .as_deref()
+        .and_then(|t| store.find_task(t))
+        .and_then(|t| running.list_for(&t).map(str::to_string));
     let scope = Scope {
         governors: &governors,
         index: &index,
         // A `--govern` spawn names its own list; a task spawn is a member of
         // whatever is running over it. Either way this is the front of the
         // walk — see `cmd_govern::seat_for`.
-        list: work
-            .list
-            .as_deref()
-            .or_else(|| work.task.as_deref().and_then(|t| running.list_of(t))),
+        list: work.list.as_deref().or(row_list.as_deref()),
         project: work.project.as_deref(),
     };
 
