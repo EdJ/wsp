@@ -2408,6 +2408,8 @@ impl Source for Poll<'_> {
             asks: crate::waiting::Asks::read(self.store),
             // Nothing here draws a governor's count.
             answered_by: Default::default(),
+            // Nor a direction: rows here are read for state, never published.
+            mandates: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -4503,6 +4505,8 @@ mod tests {
             said: None,
             waiting: None,
             members_waiting: 0,
+            held: None,
+            direction: None,
         }
     }
 
@@ -5520,6 +5524,8 @@ mod tests {
             said: None,
             waiting: None,
             members_waiting: 0,
+            held: None,
+            direction: None,
         }
     }
 

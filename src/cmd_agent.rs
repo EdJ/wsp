@@ -3747,6 +3747,9 @@ pub(crate) struct Wip {
     /// agent holds. Read here, where the store is, so a governor's line can
     /// count the members waiting under it whatever they are waiting on.
     pub answered_by: std::collections::BTreeMap<String, String>,
+    /// `mandates.json`, read once — the standing direction each row publishes
+    /// as `direction`.
+    pub mandates: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Wip {
@@ -3796,6 +3799,7 @@ impl Wip {
             said: store.said(),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
             asks: crate::waiting::Asks::read(store),
+            mandates: store.mandates(),
         }
     }
 }
@@ -3932,6 +3936,17 @@ pub(crate) struct WipRow {
     /// For a governor's row, how many seats under it are waiting: the members
     /// whose work it answers for, whatever they are waiting on.
     pub(crate) members_waiting: usize,
+    /// How long the work it holds has been held, as `claim_line` phrases it
+    /// (`3h12m`) — off the CLAIM, not the binding, which is remade whenever a
+    /// pane is and would reset the clock on work nobody had put down. `None`
+    /// when it holds no claim or the claim predates the clock. Published as
+    /// `held`.
+    pub(crate) held: Option<String>,
+    /// The project its mandate points it at — what a verb would send it to
+    /// work on, as against `project`, where it stands. The two are separate
+    /// facts and both are published; a reader that wants "only when they
+    /// differ" compares them. Published as `direction`.
+    pub(crate) direction: Option<String>,
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
@@ -3999,6 +4014,18 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             said: sentence(&w.said, seat, bound.map(|t| t.id.as_str())),
             waiting: crate::waiting::reading(Some(a.state), &w.asks, seat, bound.map(|t| t.id.as_str()).unwrap_or("")),
             members_waiting: 0,
+            held: bound
+                .and_then(|t| w.claims.get(&t.id))
+                .and_then(|c| c.get("claimed_at"))
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+                .map(|c| util::since(c))
+                .filter(|&secs| secs > 0)
+                .map(util::duration_human),
+            // Only a project the index knows, as the panel reads it: a
+            // mandate on one that has since been removed points nowhere.
+            direction: crate::cmd_mandate::from_map(&w.mandates, agent.as_deref(), Some(workspace_id))
+                .filter(|p| w.index.get(p).is_some()),
         });
     }
     // A governor's count, once every row has its own reading.
@@ -4035,6 +4062,8 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "pane": r.pane, "workspace": r.workspace, "state": r.state,
             "turning": r.turning, "needs_you": r.needs_you, "seat": r.seat,
             "said": r.said,
+            "held": r.held,
+            "direction": r.direction,
             "waiting": r.waiting.as_ref().map(|w| w.json()),
             "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
         })).collect::<Vec<_>>(),
@@ -7237,6 +7266,7 @@ mod tests {
             daemon: None,
             asks: Default::default(),
             answered_by: Default::default(),
+            mandates: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -7422,6 +7452,7 @@ mod tests {
             daemon: None,
             asks: Default::default(),
             answered_by: Default::default(),
+            mandates: Default::default(),
         }
     }
 
@@ -7786,6 +7817,33 @@ mod tests {
             locate_seat(&backends, "cpd-does-not-exist").is_none(),
             "a seat nothing opened answers for nothing"
         );
+    }
+
+    /// `wsp-103`. Two facts compound's agents view draws and could not read:
+    /// how long the claim has been held, and where the mandate points — which
+    /// is a different question from `project`, where the pane stands.
+    #[test]
+    fn wip_json_publishes_how_long_a_claim_has_been_held_and_where_the_mandate_points() {
+        let mut w = wip_world();
+        w.index = Index::new(vec![crate::model::Project::new("wsp"), crate::model::Project::new("data")]);
+        w.claims.insert(
+            "t-001".into(),
+            json!({ "claimed_at": util::iso_at(util::epoch_secs() - (3 * 3600 + 12 * 60 + 5)) }),
+        );
+        // A mandate on `data` while the pane stands in `wsp`: both true at once.
+        w.mandates.insert("w1".into(), json!({ "project": "data" }));
+        // One on a project that no longer exists points nowhere.
+        w.mandates.insert("w2".into(), json!({ "project": "gone" }));
+
+        let v = wip_json(&w);
+        let row = |pane: &str| v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == pane).unwrap().clone();
+        assert_eq!(row("w1:p1")["held"], "3h12m", "the claim's clock, phrased as `claim_line` phrases it");
+        assert_eq!(row("w1:p1")["project"], "wsp", "where it stands keeps its meaning");
+        assert_eq!(row("w1:p1")["direction"], "data", "and where it is pointed is its own key");
+        assert_eq!(row("w2:p1")["held"], serde_json::Value::Null, "no claim, no duration");
+        assert_eq!(row("w2:p1")["direction"], serde_json::Value::Null, "an unknown project is no direction");
+        assert_eq!(row("w3:p1")["direction"], serde_json::Value::Null, "no mandate, no direction");
+        assert!(row("w3:p1").get("held").is_some(), "the keys are always present");
     }
 
     /// `wsp-172`. Both kinds of waiting are drawn where `idle` used to be: a
