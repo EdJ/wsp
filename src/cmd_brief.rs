@@ -1127,6 +1127,12 @@ fn session_lines(r: &Brief, p: &Paint) -> Vec<String> {
     out
 }
 
+/// What a seat line tells the governor its job is. `wsp-149`: it said "yours
+/// to sequence, direct, review" from before `wsp-134`, beside a work order
+/// that says not to review, and the brief is the one of the two re-read on
+/// every request. Sequencing and review are wsp's and the verifier's now.
+const SEAT_JOB: &str = "yours to decide and direct; wsp runs the steps · wsp flag --seat is your inbox";
+
 /// The brief as text, one line per element and nothing printed.
 fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
     let terse = depth == Depth::Terse;
@@ -1219,13 +1225,13 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                     "{}  {}  {}{}",
                     p.bold(&format!("governor of {scope}")),
                     p.dim(at),
-                    p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
+                    p.dim(SEAT_JOB),
                     awake.clone().unwrap_or_default(),
                 ),
                 None => format!(
                     "{}  {}{}",
                     p.bold(&format!("governor of {scope}")),
-                    p.dim("yours to sequence, direct, review · wsp flag --seat is your inbox"),
+                    p.dim(SEAT_JOB),
                     awake.clone().unwrap_or_default(),
                 ),
             },
@@ -1742,7 +1748,7 @@ mod tests {
         let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
         assert!(text.contains("no wsp daemon"), "the custodian's seat line lost it: {text}");
         assert!(
-            text.contains("yours to sequence, direct, review"),
+            text.contains("yours to decide and direct; wsp runs the steps"),
             "the clause was put on instead of beside: {text}"
         );
 
