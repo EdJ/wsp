@@ -181,10 +181,13 @@ for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
 | an agent died, a start never claimed, a landing was made with git | repairs it on the tick, writes `cycle.log`, tells the governor | — |
 | the run's seat reads empty for two ticks, or no seat in its chain has ever been filled | seats a governor | — |
 
-The run's seat is the list's own when it has one. Otherwise it is the seat of
-its first member's project, then that project's ancestors (`wsp-148`). So a
-list started with no seat of its own is governed from its project's seat, and
-wsp does not add a second one beside it.
+A list wsp runs, meaning any group whose `agent:` line is not `manual`, is
+governed from its own seat and nothing above it (`wsp-202`). wsp seats it on the
+first tick after `go`. A pass rotates that seat, and a dead one is refilled
+there. The project's seat is never rotated, refilled or ended for a run. A list
+run by hand keeps the walk: its own seat, then its first member's project, then
+that project's ancestors (`wsp-148`). There a run governed from its project's
+seat stays governed from it.
 
 What is left to agents is decisions. A governor answers what somebody is
 blocked on and writes direction on the rows; its work order says so, and that

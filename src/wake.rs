@@ -2136,6 +2136,38 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         );
     }
 
+    /// **A list wsp runs is told on its own scope, with its project's seat
+    /// filled and its own still empty** — `wsp-202`, and the wsp seat's second
+    /// edge: what was already held for the project stays there, and only what is
+    /// said from now on goes to the list. The list's post is about to be seated
+    /// by the reconciler's next tick, so empty is later and not nowhere. A list
+    /// somebody stood down is nowhere, and falls back to a hand as before.
+    #[test]
+    fn a_list_wsp_runs_is_told_on_its_own_scope_and_not_on_its_projects_seat() {
+        use crate::place::State;
+
+        let (_env, store, _fake) = a_governor("wake-own-post", State::Working);
+        say(&store, "demo", "a question already held for the project", None);
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group {
+            members: vec!["wsp-146".into()],
+            agent: "claude".into(),
+            ..crate::model::Group::default()
+        }]);
+        store.save_worklist(&w).unwrap();
+
+        assert!(crate::cycle::hand_it_to_the_governor(&store, &w, "group 1 is at its barrier"));
+        assert_eq!(spool_of(&store, "run").depth(), 1, "the verdict waits for the list's own governor");
+        assert_eq!(spool_of(&store, "demo").depth(), 1, "and what the project already held stays where it was");
+
+        store.set_governor("run", json!({ "host": util::hostname(), cmd_govern::STOOD_DOWN: util::now_iso() }));
+        assert!(
+            !crate::cycle::hand_it_to_the_governor(&store, &w, "group 1 is at its barrier"),
+            "a stood-down list has nobody coming, and the project is not its answer either"
+        );
+    }
+
     /// **What a verb is told, and what `wsp-146` made it say.**
     ///
     /// Two things a receipt has never had to carry. *Where it went* — a verb

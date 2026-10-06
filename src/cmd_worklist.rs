@@ -3254,11 +3254,18 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     match &list_seat {
         SeatOn::Held => {}
         rest => {
-            println!(
-                "{}  {}",
-                p.bold("no seat"),
-                p.dim(&format!("hands raised on its members reach their projects' seats · wsp govern {} --take", w.id))
-            );
+            // `wsp-202`: a list wsp runs is seated by the daemon's next tick, as
+            // a post nobody has filled, and until then what it is told waits on
+            // its own scope. The project chain is a list run by hand's answer.
+            // Not where somebody stood it down, or where it is held from another
+            // machine: the reconciler leaves both alone, and so must the sentence.
+            let stood = crate::cmd_govern::stood_at(&store.governors(), &w.id).is_some();
+            let until = match (w.runs_itself(), rest) {
+                (true, SeatOn::Nobody) if !stood => "wsp seats its own governor on the daemon's next tick".to_string(),
+                (true, _) => format!("nothing is seated for it · wsp govern {} --take", w.id),
+                (false, _) => format!("hands raised on its members reach their projects' seats · wsp govern {} --take", w.id),
+            };
+            println!("{}  {}", p.bold("no seat"), p.dim(&until));
             if let SeatOn::Elsewhere(host) = rest {
                 println!(
                     "{}  {}",

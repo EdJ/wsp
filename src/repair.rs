@@ -430,6 +430,10 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
 /// sits empty one step up. Two governors, or one governor and a project nobody
 /// is watching; both are worse than the vacancy.
 ///
+/// **That is a list run by hand's case.** A list wsp runs is its own post
+/// (`wsp-202`), so `governing_post` names the list and never the project above
+/// it, and the project's seat is not this repair's to fill for a run.
+///
 /// **Another machine's seat is left alone**, which is the one refusal here and
 /// the reason [`crate::cmd_govern::host_of`] is asked rather than
 /// `seat_of_scope`: a seat on another host reads as no seat to everything local,
@@ -1482,17 +1486,56 @@ impl Seats for Absent {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// **And it is the *list's* seat, not a project's.** `governing_post` walks
-    /// the chain for a post that exists at all rather than for a filled one, so a
-    /// run governed from its project's seat is reseated *there* — filling the list
+    /// **A run wsp runs is seated on its own list, though its project has a
+    /// governor** — `wsp-202`. wsp-149's acceptance run was governed from the
+    /// `wsp` project's seat because the chain stopped at the first post it found,
+    /// so nothing was seated for it and its pass rotated the project's governor.
+    /// The project's seat here is alive, and the list is seated anyway, on the
+    /// first pass, as a post nobody has filled.
+    #[test]
+    fn a_run_wsp_runs_is_seated_on_its_own_list_though_its_project_has_a_governor() {
+        let (_env, store) = in_flight("seat-own");
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+        seated(&store, "p", "w1", "cpd-9", "", "");
+        a_pass(&store, &Fake::new(&[("cpd-9", Some(State::Working))]));
+
+        assert_eq!(reseated(), vec!["run".to_string()], "the run's own post, not the project's");
+    }
+
+    /// **And the project's seat is never refilled for it.** A dead project
+    /// governor is the project's business — a person's stand-down, or the
+    /// backlog trigger if something is owed there — and not this run's, which
+    /// has its own post. The line between the two posts, as the wsp seat drew it.
+    #[test]
+    fn a_dead_project_seat_is_not_refilled_for_a_run_wsp_runs() {
+        let (_env, store) = in_flight("seat-not-project");
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+        seated(&store, "p", "w1", "cpd-9", "", "");
+        seated(&store, "run", "w2", "cpd-2", "", "");
+        let both = Fake::new(&[("cpd-9", Some(State::Gone)), ("cpd-2", Some(State::Working))]);
+        a_pass(&store, &both);
+        a_pass(&store, &both);
+
+        assert!(reseated().is_empty(), "the run has its governor, and the project is not its to fill: {:?}", reseated());
+    }
+
+    /// **A list run by hand keeps the walk.** `governing_post` looks along the
+    /// chain for a post that exists at all rather than for a filled one, so a run
+    /// governed from its project's seat is reseated *there* — filling the list
     /// instead would give a run two governors and leave the project's empty.
     #[test]
-    fn a_run_governed_from_its_project_is_reseated_on_the_project() {
-        let (_env, store) = in_flight("seat-project");
+    fn a_run_by_hand_governed_from_its_project_is_reseated_on_the_project() {
+        let (_env, store) = scratch("seat-project");
         member(&store, "m-1", Status::Doing);
         let mut t = store.find_task("m-1").unwrap();
         t.project = Some("p".into());
         store.save_task(&t).unwrap();
+        list(&store, &["m-1"], "");
+        claim(&store, "m-1", "cpd-1");
         seated(&store, "p", "w1", "cpd-1", "", "");
         a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]));
         a_pass(&store, &Fake::new(&[("cpd-1", Some(State::Gone))]));

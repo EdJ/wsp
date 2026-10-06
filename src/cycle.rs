@@ -1939,7 +1939,8 @@ fn say_uncommitted(store: &Store, id: &str) {
 }
 
 /// The seat that answers for a run: the list's own, when somebody holds it,
-/// and otherwise the seat routing reaches for its first member.
+/// and otherwise — for a list run by hand — the seat routing reaches for its
+/// first member. A list wsp runs has only its own; see [`the_chain`].
 fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
     let governors = store.governors();
     the_chain(store, w).into_iter().find(|s| crate::cmd_govern::seat_of_scope(s, &governors).is_some())
@@ -1955,7 +1956,8 @@ fn governing_scope(store: &Store, w: &Worklist) -> Option<String> {
 /// *vacated* by `reconcile` before the reconciler's next pass, so the filled
 /// answer is `None` and filling it would put a seat on the list — changing the
 /// shape of a run that was governed from its project's seat, and giving a
-/// project two governors for one question.
+/// project two governors for one question. Since `wsp-202` that shape is only a
+/// list run by hand's: a list wsp runs is its own post and nothing above it.
 ///
 /// So the chain is walked once and read two ways, and the scope this names is
 /// the one whose record the repair will look at. It is [`governing_scope`] with
@@ -1977,8 +1979,22 @@ pub(crate) fn governing_post(store: &Store, w: &Worklist) -> Option<String> {
 /// differently one day. A list that stands nowhere and has no member with a
 /// project is one scope long, which is the ordinary case for a list nobody has
 /// filled.
+///
+/// **A list wsp runs is one scope long, whatever its members stand in** —
+/// `wsp-202`, decided by the wsp seat on 2026-10-06. Walking on to the project
+/// had the run governed by a seat that answers for the whole project: the
+/// reconciler saw a post and seated nothing, a pass rotated the *project's*
+/// governor, and a dead project seat was the one refilled for the run. wsp-149's
+/// acceptance run needed one hand `spawn --govern` to get a governor of its
+/// own. So the post is the list's, the reconciler fills it as a post nobody has
+/// ever filled, and the project seat is never rotated, refilled or ended for a
+/// run. A list run by hand keeps the walk, because its governor is whoever is
+/// running it and that is often the project's.
 fn the_chain(store: &Store, w: &Worklist) -> Vec<String> {
     let mut chain = vec![w.id.clone()];
+    if w.runs_itself() {
+        return chain;
+    }
     let index = crate::resolve::Index::new(store.projects());
     if let Some(first) = w.groups().iter().flat_map(|g| g.members.clone()).find_map(|m| store.find_task(&m)) {
         if let Some(project) = first.project {
@@ -2042,7 +2058,12 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
 /// it is the older one: a scope a person stood down has none, and a hand on a
 /// member is exactly right there.
 pub(crate) fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -> bool {
-    let Some(scope) = governing_scope(store, w) else { return false };
+    // **A list wsp runs has a post the reconciler is about to fill**, so with
+    // nobody in it yet the verdict waits there — the first tick after `go`
+    // seats it, and a hand on a member would route to the project's seat this
+    // list no longer answers to. Stood down is still nowhere, as above.
+    let own = || (w.runs_itself() && crate::cmd_govern::stood_at(&store.governors(), &w.id).is_none()).then(|| w.id.clone());
+    let Some(scope) = governing_scope(store, w).or_else(own) else { return false };
     let report = crate::wake::say(store, &scope, text, None);
     // Said as well as returned, because `cycle.log` is how a governor reads what
     // the run has been doing, and *the seat is mid-turn* is the answer to "why

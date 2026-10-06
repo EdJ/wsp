@@ -1979,6 +1979,13 @@ impl Worklist {
         parse_groups(&self.section("Groups").unwrap_or_default())
     }
 
+    /// Whether wsp runs any of this list: a group with an `agent:` line that
+    /// is not [`MANUAL`]. Such a list answers for itself, from a post of its
+    /// own, and never from its project's — see `crate::cycle::the_chain`.
+    pub fn runs_itself(&self) -> bool {
+        self.groups().iter().any(|g| g.policy().is_some())
+    }
+
     /// Write the queue back, renumbering it. Whether an edit is *allowed* is
     /// not asked here: the edit window falls out of the derived position — a
     /// group at or behind it is frozen — and that is the verbs' question, at
