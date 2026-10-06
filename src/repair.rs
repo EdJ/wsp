@@ -283,6 +283,17 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
     out
 }
 
+/// Whether the reconciler looks at this scope's seat at all — on a running list,
+/// or owed something.
+///
+/// **The sentence asks this and not a copy of it**, which is the shape `wsp-148`
+/// has been sent back for: `compound-parity`, vacated a month and holding eight
+/// lines none of which is owed, read `unseated · 8 held · counting` on
+/// 2026-10-06 while this walk never counted it.
+pub(crate) fn will_seat(store: &Store, scope: &str) -> bool {
+    seat_scopes(store).iter().any(|(s, _)| s == scope)
+}
+
 /// **Why this pass is looking at this seat — two words, not a new field.** The
 /// same sentence served both triggers, and `wsp-174` caught it on the trunk:
 /// `tokenhub-spec-sync` is a `done` list and `cycle.log` said *this list is

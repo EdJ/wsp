@@ -678,9 +678,12 @@ fn unseated(store: &Store, scope: &str) -> String {
     // A kind compound cannot run is a seat nothing will fill, and the one of
     // these a person has to answer: `counting` there would be a promise.
     let kind = crate::cmd_spawn::seat_kind(&store.governors(), scope);
-    let tail = match crate::place_compound::reads_kind(&kind) {
-        true => tail,
-        false => format!("a {kind} seat compound cannot run"),
+    let tail = match (crate::place_compound::reads_kind(&kind), crate::repair::will_seat(store, scope)) {
+        (false, _) => format!("a {kind} seat compound cannot run"),
+        // Nothing owed and no running list: nothing will fill it, and nothing
+        // needs to until something is owed.
+        (true, false) => "nothing owed, so nobody is coming".to_string(),
+        (true, true) => tail,
     };
     let tail = match cmd_govern::stood_at(&store.governors(), scope) {
         Some(at) => format!("stood down at {}", util::local_hm(at)),
@@ -1354,6 +1357,19 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         store.set_governor("core", rec);
         let said = unseated(&store, "core");
         assert!(said.ends_with("a codex seat compound cannot run"), "{said}");
+    }
+
+    /// **A vacant seat that owes nothing and is on no running list is never
+    /// counted, so it must not say `counting`.** `compound-parity`, live on
+    /// 2026-10-06: vacated a month, eight lines held and none owed, reading
+    /// `counting` while the reconciler never looked at it.
+    #[test]
+    fn a_vacant_seat_that_owes_nothing_says_nobody_is_coming() {
+        let (_env, store, _key) = withheld("wakes-unowed");
+        vacated(&store);
+        assert!(!crate::repair::will_seat(&store, "core"), "the fixture is the case: nothing owed, no list");
+        let said = unseated(&store, "core");
+        assert!(said.ends_with("nothing owed, so nobody is coming"), "{said}");
     }
 
     /// **`wsp-179`'s third item: a whole spool withheld *and* an empty seat,
