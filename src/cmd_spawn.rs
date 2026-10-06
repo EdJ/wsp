@@ -574,6 +574,35 @@ pub fn work_order(subject: &str, how: Handover) -> String {
     }
 }
 
+/// What a task's work order adds when the tree it starts in already holds
+/// uncommitted work — empty otherwise. `wsp-171`'s second half.
+///
+/// **Read off the tree at the moment of the start, not off a record of the
+/// ending**, so it is true whatever ended the last agent: the reconciler, a
+/// `despawn` by hand, a crash. `cpd-254`'s eight hours were in its tree
+/// uncommitted when the run started its successor, and nothing told the
+/// successor they were there. One line with a leading space and no newline:
+/// some kinds take the order in argv, where a control character is refused.
+///
+/// **Only the task's own tree.** `--no-tree`, or a tree that could not be made,
+/// starts the agent at the project root, and what is uncommitted there is
+/// whoever else is standing in it — not a predecessor's.
+fn inherited(task: &str, cwd: Option<&str>) -> String {
+    let Some(cwd) = cwd.map(util::expand) else { return String::new() };
+    let dir = std::path::Path::new(&cwd);
+    if dir.file_name().and_then(|n| n.to_str()) != Some(task) {
+        return String::new();
+    }
+    match crate::cmd_checkout::uncommitted(std::path::Path::new(&cwd)) {
+        0 => String::new(),
+        n => format!(
+            " The tree you start in already holds {n} uncommitted path(s): the work of the agent before \
+             you, never committed. Read `git status` and `git diff` there before changing anything, and \
+             carry it forward rather than starting over."
+        ),
+    }
+}
+
 /// The sentence an agent is handed, and it is one sentence per job rather than
 /// one per kind.
 ///
@@ -2108,7 +2137,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             _ => Laid::Elsewhere,
         };
         let order = match (&work.task, &governing) {
-            (Some(t), _) => Some(handover(t, Handover::Spawned, route(how, laid))),
+            (Some(t), _) => Some(format!(
+                "{}{}",
+                handover(t, Handover::Spawned, route(how, laid)),
+                inherited(t, cwd.as_deref())
+            )),
             (None, Some(p)) => Some(handover(p, Handover::Custodian, route(how, laid))),
             (None, None) => None,
         };
@@ -4761,6 +4794,33 @@ mod tests {
     /// Asserted over both cases and over the whole string rather than the one
     /// character, because the next well-meant curly quote or ellipsis costs
     /// another unattended spawn to find. Ed's call, 2026-08-17: do not use them.
+    /// `wsp-171`'s second half. The restart's work order says when its tree
+    /// already holds a predecessor's uncommitted work — read off the tree, so it
+    /// is true whatever ended the last agent — and in ASCII on one line, since
+    /// some kinds take the order in argv. The project root, where a `--no-tree`
+    /// spawn starts, is somebody else's dirt and is not reported.
+    #[test]
+    fn a_restart_into_a_tree_holding_uncommitted_work_is_told_so_in_its_order() {
+        let env = util::isolated("spawn-inherited");
+        let tree = env.path("wsp-148");
+        std::fs::create_dir_all(&tree).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git").arg("-C").arg(dir).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
+            assert!(ok.success(), "git {args:?}");
+        };
+        git(&tree, &["init", "--quiet"]);
+        let path = tree.display().to_string();
+        assert_eq!(inherited("wsp-148", Some(&path)), "", "a clean tree says nothing");
+
+        std::fs::write(tree.join("eight-hours.rs"), "fn work() {}\n").unwrap();
+        std::fs::write(tree.join("notes.md"), "half way\n").unwrap();
+        let said = inherited("wsp-148", Some(&path));
+        assert!(said.contains("2 uncommitted path(s)") && said.contains("git status"), "{said}");
+        assert!(said.is_ascii() && !said.contains('\n'), "{said:?}");
+        assert_eq!(inherited("wsp-149", Some(&path)), "", "not this task's tree, not its predecessor's work");
+        assert_eq!(inherited("wsp-148", None), "");
+    }
+
     #[test]
     fn the_work_order_is_ascii_because_a_spawn_once_hung_on_one_character() {
         for how in [Handover::Spawned, Handover::Running, Handover::Custodian] {

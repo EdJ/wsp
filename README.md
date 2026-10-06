@@ -4299,6 +4299,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor |
 | `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat |
+| `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, or its own open `wsp ask` — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |
 | `src/tunnel.rs` | one ssh per executor, forwarding its herdr socket |
 | `executor/wsp` | the shim that stands in for wsp on a machine that has none |

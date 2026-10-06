@@ -1159,9 +1159,15 @@ pub(crate) fn discard(
 
 /// Whether a tree has anything uncommitted, tracked or not.
 fn dirty(dir: &Path) -> bool {
+    uncommitted(dir) > 0
+}
+
+/// How many paths in a tree are uncommitted, tracked or not — `0` for a tree
+/// git cannot read, which is the same answer [`dirty`] has always given it.
+pub(crate) fn uncommitted(dir: &Path) -> usize {
     git(dir, &["status", "--porcelain", "--untracked-files=all"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
 }
 
 /// Whether a tree's whole quarrel with HEAD is in its **index**, with every

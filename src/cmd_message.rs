@@ -103,7 +103,6 @@ use serde_json::json;
 
 use crate::herdr;
 use crate::message::{self, About, Kind, Landed, Message, Party, Shape, Waiting};
-use crate::place::State;
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
@@ -639,10 +638,10 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // sentence about what to do next can select an answer nobody chose. Asked
     // of the port's own `State` rather than herdr's screen-scraped one, so the
     // guard holds for whichever backend answered.
-    if found.state == State::Blocked {
+    if let Some(wait) = crate::waiting::on_screen(found.state) {
         receipt(
             false,
-            &format!("{pane} is stopped on a prompt only a person can answer — the answer is written; `wsp peek {pane}` shows what it is asking"),
+            &format!("{pane} is {} — the answer is written; `wsp peek {pane}` shows what it is asking", wait.sentence()),
         );
         return 0;
     }

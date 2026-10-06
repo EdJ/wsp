@@ -94,6 +94,16 @@ const STALLED_AFTER: i64 = 10 * 60;
 /// both tell.
 const NOTICED: &str = "wsp: this member's seat reads";
 
+/// The marker in a member's `## Log` saying its seat is waiting on somebody,
+/// and on whom — [`crate::waiting`]'s sentence after it.
+///
+/// Written through [`told_once`], so a seat waiting all night is said once and
+/// not once a minute, and a seat that moves from a prompt to an open question
+/// is said again because the sentence changed. It also clears [`NOTICED`]: a
+/// seat that was waiting was not stalled, so whatever it was told before the
+/// wait is not a reason to end it after.
+const WAITING: &str = "wsp: held while waiting —";
+
 /// The marker in a member's `## Log` saying its work is on the trunk, and the
 /// commit it is on.
 ///
@@ -580,6 +590,7 @@ fn how_it_reads(store: &Store, seats: &dyn Seats, scope: &str) -> Option<&'stati
 /// tree, with the tree kept when it has uncommitted work in it, which is said
 /// in `cycle.log` and never left silent.
 fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &Position) {
+    let asks = crate::waiting::Asks::read(store);
     for s in pos.members.iter().filter(|s| !s.finished()) {
         let Some(t) = store.find_task(&s.id) else { continue };
         if t.status() != Status::Doing {
@@ -605,11 +616,39 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             Some(s) => s,
             None => continue,
         };
+        // **Waiting is not idle, and it is asked of the one reading every other
+        // reader asks** (`wsp-172`). `cpd-254` was ended here on 2026-10-05 at a
+        // seat the attention pass had been calling `needs-a-person` for seven
+        // hours. A seat on a prompt, or behind its own open `wsp ask`, is held
+        // with no ceiling: telling it types at a dialog or talks over the answer
+        // it is waiting for, and ending it throws away the turn the question was
+        // asked from. Said once per spell — the row's marker is what makes it
+        // once — and the spell itself clears the told-mark (see [`noticed`]), so
+        // a seat that stops waiting is told before it can be ended.
+        if let Some(wait) = crate::waiting::reading(Some(state), &asks, &seat, &t.id) {
+            let said = format!("{WAITING} {} — the run will not tell it or end it while it waits", wait.sentence());
+            if told_once(store, &t.id, &said) {
+                stamp(store, &format!(
+                    "{} group {at}: {} ({seat}) is {} — not told and not ended, and held for as long as it waits",
+                    w.id, t.id, wait.sentence()
+                ));
+                crate::cycle::tell(store, w, &format!(
+                    "{} in the {} run is {} ({}). The run holds it with no ceiling: it is not told \
+                     to finish and it is not ended. `wsp peek {}` shows its screen.",
+                    t.id, w.id, wait.sentence(), wait.word(), t.id
+                ));
+            }
+            continue;
+        }
         let gone = match state {
             State::Gone => true,
             State::Idle => match noticed(&t) {
-                // Never told: at a prompt, on the clock, nothing said yet.
-                None => true,
+                // Never told: at a prompt, on the clock, nothing said yet — unless
+                // the run started it within the threshold. A seat comes up
+                // reading `idle` before its agent has drawn a thing (a blank
+                // screen matches no detection rule), and on 2026-10-05 a member
+                // started at 07:55:37 was told and ended inside a minute.
+                None => started_at(&t).is_none_or(|at| at + STALLED_AFTER <= util::epoch_secs()),
                 Some(since) => since + STALLED_AFTER <= util::epoch_secs(),
             },
             // Working is a turn in flight and `Starting` is an agent still
@@ -639,7 +678,7 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
                 w.id, t.id
             ));
             put_back(store, &t.id);
-            crate::cycle::despawn(&t.id);
+            crate::cycle::despawn(store, &t.id);
             return;
         }
 
@@ -701,14 +740,35 @@ fn put_back(store: &Store, id: &str) {
 /// date is the log line's own stamp — `- <iso> wsp: …` — and `split_whitespace`
 /// on a body written by [`crate::model::append_dated`] is reading a format this
 /// module also writes through.
+///
+/// **Only since the member's last start or its last spell of waiting**
+/// (`wsp-171`'s second and third shapes). The mark was read from anywhere in
+/// the log, so the run started `wsp-148` again at 07:55:37 on 2026-10-05 and
+/// the mark its predecessor earned at 23:35 the night before ended the fresh
+/// agent a second later — every minute, for six minutes, until a hand `hold`
+/// and `go`. A start is a new agent that has been told nothing, and a seat that
+/// was waiting was not stalled while it waited.
 fn noticed(t: &Task) -> Option<i64> {
-    t.section("Log")?
-        .lines()
-        .filter(|l| l.contains(NOTICED))
-        .last()
-        .and_then(|l| l.trim_start_matches("- ").split_whitespace().next())
-        .map(util::epoch_of)
-        .filter(|at| *at > 0)
+    let log = t.section("Log")?;
+    let mut since = None;
+    for l in log.lines() {
+        if l.contains(crate::cycle::STARTED_BY) || l.contains(WAITING) {
+            since = None;
+        } else if l.contains(NOTICED) {
+            since = stamp_of(l);
+        }
+    }
+    since
+}
+
+/// When the run last started this member, off its `started by wsp:` line.
+fn started_at(t: &Task) -> Option<i64> {
+    t.section("Log")?.lines().filter(|l| l.contains(crate::cycle::STARTED_BY)).last().and_then(stamp_of)
+}
+
+/// A `## Log` line's own date — `- <iso> …` — as seconds.
+fn stamp_of(line: &str) -> Option<i64> {
+    line.trim_start_matches("- ").split_whitespace().next().map(util::epoch_of).filter(|at| *at > 0)
 }
 
 /// `wsp tell <id> -`, run as its own process so the seat's own delivery path is
@@ -2084,6 +2144,148 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             assert!(ended().is_empty(), "`{tag}`: nobody is ended");
             assert!(governed().is_empty(), "`{tag}`: and nothing is invented about the run");
         }
+    }
+
+    // ---- a seat waiting on somebody: wsp-172 -------------------------------
+
+    /// An open question from `pane` about `task`, as `wsp ask` writes one.
+    fn ask(store: &Store, pane: &str, task: &str) -> String {
+        let q = crate::message::Message::question(
+            crate::message::Party::pane(pane, ""),
+            crate::message::Kind::Note,
+            "which way?",
+            crate::message::Waiting::new(pane, task),
+        )
+        .about(crate::message::About::Task(task.into()));
+        store.save_message(&q).unwrap();
+        q.id
+    }
+
+    /// `cpd-254`, 2026-10-05, as a test. An opencode member was told at 23:35
+    /// while it read idle, then stopped on opencode's permission prompt; at
+    /// 07:54 the reconciler read the told-mark as past its threshold and ended
+    /// it. A seat on a prompt is waiting on a person, and **one tick neither
+    /// tells it nor ends it, and says why** — once, however long it waits.
+    #[test]
+    fn an_opencode_member_on_its_permission_prompt_past_the_threshold_is_neither_told_nor_ended() {
+        let (_env, store) = scratch("prompt-night");
+        member(&store, "m-1", Status::Doing);
+        list(&store, &["m-1"], "opencode");
+        claim(&store, "m-1", "cpd-1");
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "told once while it read idle");
+        let _ = governed();
+        age_the_notice(&store, "m-1");
+
+        let prompt = Fake::new(&[("cpd-1", Some(State::Blocked))]);
+        for _ in 0..3 {
+            tick(&store, &prompt, &mut Pass::new());
+        }
+        assert!(member_told().is_empty(), "a sentence typed at the dialog selects an answer nobody chose");
+        assert!(ended().is_empty(), "the turn the person was asked about is not thrown away");
+        let said = stamped();
+        let why: Vec<&String> = said.iter().filter(|l| l.contains("not told and not ended")).collect();
+        assert_eq!(why.len(), 1, "said once, not once a minute all night: {said:?}");
+        assert!(why[0].contains("prompt only a person can answer"), "{}", why[0]);
+        assert_eq!(governed().len(), 1, "and the governor hears it once");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "the row is not put back either");
+    }
+
+    /// The other kind of waiting: an agent that ran `wsp ask` and is sitting at
+    /// its prompt for the answer. Its screen says `idle`, and it is not.
+    #[test]
+    fn a_member_waiting_on_its_own_question_past_the_threshold_is_neither_told_nor_ended() {
+        let (_env, store) = in_flight("asked");
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+        tick(&store, &idle, &mut Pass::new());
+        assert_eq!(member_told().len(), 1);
+        age_the_notice(&store, "m-1");
+        let q = ask(&store, "cpd-1", "m-1");
+
+        tick(&store, &idle, &mut Pass::new());
+        tick(&store, &idle, &mut Pass::new());
+        assert!(member_told().is_empty(), "telling it would talk over the answer it is waiting for");
+        assert!(ended().is_empty());
+        let said = stamped();
+        assert!(
+            said.iter().any(|l| l.contains("not told and not ended") && l.contains(&q)),
+            "the log names the question it is waiting on: {said:?}"
+        );
+    }
+
+    /// A seat that *was* waiting and is idle again — the prompt answered — is
+    /// told before it can be ended. Whatever it was told before it waited is not
+    /// a reason to end it after, because it was not stalled while it waited.
+    #[test]
+    fn a_member_whose_prompt_is_answered_is_told_again_before_it_can_be_ended() {
+        let (_env, store) = in_flight("answered");
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+        tick(&store, &idle, &mut Pass::new());
+        age_the_notice(&store, "m-1");
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Blocked))]), &mut Pass::new());
+        let _ = member_told();
+
+        tick(&store, &idle, &mut Pass::new());
+        assert!(ended().is_empty(), "the told-mark from before the prompt is spent");
+        assert_eq!(member_told().len(), 1, "told afresh, and the threshold starts again");
+    }
+
+    /// `wsp-171`'s second and third shapes, live on 2026-10-05 and 06: the
+    /// member was ended and started again, and the told-mark its predecessor
+    /// earned ended each fresh agent within a minute — for six minutes, until a
+    /// hand `hold` and `go`. **An ended member is started again by the tick, and
+    /// the repair does not repeat on what it already ended.**
+    #[test]
+    fn an_ended_member_is_started_again_and_its_fresh_agent_is_not_ended_by_the_old_mark() {
+        let (_env, store) = in_flight("restart");
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+        tick(&store, &idle, &mut Pass::new());
+        age_the_notice(&store, "m-1");
+        tick(&store, &idle, &mut Pass::new());
+        assert_eq!(ended(), vec!["m-1".to_string()]);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo, "put back where a start can take it");
+        let _ = stamped();
+        // What `wsp despawn` does for real: the claim and the binding go.
+        store.clear_claim("m-1");
+        store.clear_binding("cpd-1");
+        let _ = spawned();
+
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert!(spawned().iter().any(|(id, _)| id == "m-1"), "the tick starts it again");
+        // The fresh agent claims a new seat, and reads `idle` before it has drawn
+        // a thing — a blank screen matches no detection rule.
+        claim(&store, "m-1", "cpd-2");
+        let _ = member_told();
+        for _ in 0..3 {
+            tick(&store, &Fake::new(&[("cpd-2", Some(State::Idle))]), &mut Pass::new());
+        }
+        assert!(ended().is_empty(), "the predecessor's mark does not end the successor");
+        assert!(member_told().is_empty(), "nor is a start minutes old told to finish");
+        let endings = stamped().iter().filter(|l| l.contains("ending it, and the run starts it again")).count();
+        assert_eq!(endings, 0, "and nothing repeats the ending it already did");
+    }
+
+    /// `wsp-171`'s second half: before an agent is ended, for whatever reason,
+    /// the uncommitted work in its tree is said — in `cycle.log` and on the row
+    /// the restart is briefed from.
+    #[test]
+    fn ending_a_member_with_uncommitted_work_says_so_in_cycle_log_and_on_its_row() {
+        let (env, store) = scratch("dirty");
+        let tree = env.path("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        git_in(&tree, &["init", "--quiet", "-b", "m-1"]);
+        std::fs::write(tree.join("eight-hours.rs"), "fn work() {}\n").unwrap();
+        member(&store, "m-1", Status::Doing);
+        store.set_claim("m-1", serde_json::json!({ "workspace": "cpd-1", "cwd": tree.display().to_string() }));
+
+        crate::cycle::despawn(&store, "m-1");
+        assert!(
+            stamped().iter().any(|l| l.contains("ending m-1 with 1 uncommitted path")),
+            "{:?}",
+            stamped()
+        );
+        assert!(row_log(&store, "m-1").contains("ended with 1 uncommitted path"), "{}", row_log(&store, "m-1"));
+        assert_eq!(ended(), vec!["m-1".to_string()], "and it is still ended — saying is not refusing");
     }
 
     /// A claim whose pane is gone with nothing to rebuild the binding from: said,

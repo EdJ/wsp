@@ -1424,8 +1424,8 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // next can select an answer nobody chose. Asked of the port's own `State`
     // now rather than herdr's screen-scraped one, so this guard holds for
     // whichever backend answered.
-    if row.state == State::Blocked {
-        eprintln!("wsp: {what} is stopped on a prompt only a person can answer — answer that first");
+    if let Some(wait) = crate::waiting::on_screen(row.state) {
+        eprintln!("wsp: {what} is {} — answer that first", wait.sentence());
         eprintln!("     `wsp peek {needle}` shows what it is asking");
         return 1;
     }
@@ -3729,6 +3729,13 @@ pub(crate) struct Wip {
     /// unattended pass is not running is the machine where the *wake* spools
     /// are all holding — six days of it, read as busy the whole time.
     pub daemon: Option<String>,
+    /// The open questions, read once — the store half of [`crate::waiting`]'s
+    /// reading, asked for every row.
+    pub asks: crate::waiting::Asks,
+    /// task id -> the scope whose governor answers for it, for each task an
+    /// agent holds. Read here, where the store is, so a governor's line can
+    /// count the members waiting under it whatever they are waiting on.
+    pub answered_by: std::collections::BTreeMap<String, String>,
 }
 
 impl Wip {
@@ -3766,6 +3773,7 @@ impl Wip {
         Wip {
             tasks,
             index: Index::new(store.projects()),
+            answered_by: answered_by(store, &bindings),
             bindings,
             claims,
             pins: store.pins(),
@@ -3774,6 +3782,7 @@ impl Wip {
             agents_held,
             said: store.said(),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
+            asks: crate::waiting::Asks::read(store),
         }
     }
 }
@@ -3840,6 +3849,27 @@ fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
     cmd_govern::governs(governors, &cmd_govern::seat_query(workspace, Some(seat))).is_some()
 }
 
+/// For each task a seat holds, the scope whose governor answers for it.
+///
+/// The walk [`cmd_govern::answering_seat`] makes, with the index, the lists and
+/// the governors read once rather than once per row.
+pub(crate) fn answered_by(
+    store: &Store,
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, String> {
+    let index = Index::new(store.projects());
+    let lists = crate::worklist::Running::read(store);
+    let governors = store.governors();
+    bindings
+        .values()
+        .filter_map(|b| b.get("task_id").and_then(|t| t.as_str()))
+        .filter_map(|id| store.task(id))
+        .filter_map(|t| {
+            cmd_govern::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref()).map(|s| (t.id.clone(), s.scope))
+        })
+        .collect()
+}
+
 /// One agent, as `wip` wants it.
 ///
 /// `pub(crate)` for `cmd_watch`, and that is not a convenience. `needs_you` is
@@ -3862,6 +3892,11 @@ pub(crate) struct WipRow {
     /// herdr's table, which is exactly the mistake `compound-064` refused. A
     /// caller that wants to branch on the state reads this field and does no
     /// parsing at all.
+    ///
+    /// Unread outside the tests since `wsp-172`: the watch, its one caller,
+    /// branches on [`WipRow::waiting`] now, which is read from this same value
+    /// and is the question it was asking.
+    #[allow(dead_code)]
     pub(crate) state_typed: crate::place::State,
     /// Whether a turn is actually running in it. Beside `state` rather than
     /// derived from it at the point of drawing, because it is the answer to the
@@ -3876,6 +3911,14 @@ pub(crate) struct WipRow {
     /// work its seat holds. Published as `said` for a reader that draws it —
     /// compound's pane header reads exactly this key.
     pub(crate) said: Option<String>,
+    /// Whether the seat is waiting on somebody, and on whom — [`crate::waiting`]'s
+    /// one reading, which the reconciler, the barrier and the watch also ask.
+    /// Published as `waiting`, and drawn in the STATE column in place of the
+    /// bare word, because `idle` is exactly what a waiting seat must not read.
+    pub(crate) waiting: Option<crate::waiting::Wait>,
+    /// For a governor's row, how many seats under it are waiting: the members
+    /// whose work it answers for, whatever they are waiting on.
+    pub(crate) members_waiting: usize,
 }
 
 /// The agents, resolved and in reading order: by project, then by pane.
@@ -3935,7 +3978,20 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             needs_you,
             seat: seat_of_project,
             said: sentence(&w.said, seat, bound.map(|t| t.id.as_str())),
+            waiting: crate::waiting::reading(Some(a.state), &w.asks, seat, bound.map(|t| t.id.as_str()).unwrap_or("")),
+            members_waiting: 0,
         });
+    }
+    // A governor's count, once every row has its own reading.
+    let waiting_under: Vec<String> = rows
+        .iter()
+        .filter(|r| r.waiting.is_some())
+        .filter_map(|r| w.answered_by.get(&r.task_id).cloned())
+        .collect();
+    for r in rows.iter_mut() {
+        if let Some(scope) = &r.seat {
+            r.members_waiting = waiting_under.iter().filter(|s| *s == scope).count();
+        }
     }
     rows.sort_by(|a, b| a.project.cmp(&b.project).then(a.pane.cmp(&b.pane)));
     rows
@@ -3960,9 +4016,12 @@ fn wip_json(w: &Wip) -> serde_json::Value {
             "pane": r.pane, "workspace": r.workspace, "state": r.state,
             "turning": r.turning, "needs_you": r.needs_you, "seat": r.seat,
             "said": r.said,
+            "waiting": r.waiting.as_ref().map(|w| w.json()),
+            "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
         })).collect::<Vec<_>>(),
         "turning": rows.iter().filter(|r| r.turning).count(),
         "needs_you": rows.iter().filter(|r| r.needs_you).count(),
+        "waiting": rows.iter().filter(|r| r.waiting.is_some()).count(),
         // The sentence, not a boolean: `doctor`'s is the only other place it is
         // said, and a caller that has to ask "no daemon, or a daemon whose `ps`
         // would not answer?" cannot tell those apart from a flag either.
@@ -4007,6 +4066,10 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
         if needs > 0 {
             head.push_str(&format!("  ·  {}", p.yellow(&format!("{needs} need you"))));
         }
+        let waiting = rows.iter().filter(|r| r.waiting.is_some()).count();
+        if waiting > 0 {
+            head.push_str(&format!("  ·  {}", p.yellow(&format!("{waiting} waiting"))));
+        }
         out.push(head);
         // The machine's daemon, and what its absence costs. `wsp-145`: a heading
         // saying six agents, five running, is a true sentence about work and
@@ -4031,16 +4094,32 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             p.dim(&util::pad("PANE", 7)),
             p.dim("STATE")
         ));
+        // Wide enough for the longest word drawn, so a `waiting · wsp-process`
+        // does not push the flag after it out of line with everybody else's.
+        let sw = rows
+            .iter()
+            .map(|r| r.waiting.as_ref().map(|w| w.word().chars().count()).unwrap_or(0))
+            .max()
+            .unwrap_or(0)
+            .max(8);
         for r in &rows {
-            let state = match r.state.as_str() {
-                "working" => p.green(&util::pad("working", 8)),
-                "idle" => p.dim(&util::pad("idle", 8)),
-                other => p.dim(&util::pad(other, 8)),
+            let state = match (&r.waiting, r.state.as_str()) {
+                // Before the word, and in place of it: a waiting seat reads
+                // `idle` on its screen, and `idle` is what got one ended.
+                (Some(w), _) => p.yellow(&util::pad(&w.word(), sw)),
+                (None, "working") => p.green(&util::pad("working", sw)),
+                (None, "idle") => p.dim(&util::pad("idle", sw)),
+                (None, other) => p.dim(&util::pad(other, sw)),
             };
             // A seat says so instead of saying it needs you. The two can never
             // both be true — [`cmd_govern::needs_a_person`] is what makes them
             // exclusive — and the column is the same width either way.
             let flag = match (&r.seat, r.needs_you) {
+                (Some(proj), _) if r.members_waiting > 0 => format!(
+                    "{} {}",
+                    p.cyan(&format!("{} {}", glyph_seat(), cmd_govern::governor_of(proj))),
+                    p.yellow(&format!("· {} waiting", r.members_waiting))
+                ),
                 (Some(proj), _) => p.cyan(&format!("{} {}", glyph_seat(), cmd_govern::governor_of(proj))),
                 (None, true) => p.yellow("← needs you"),
                 // A gone seat that is still drawn is drawn because it holds
@@ -7137,6 +7216,8 @@ mod tests {
             agents_held: std::collections::BTreeMap::new(),
             said,
             daemon: None,
+            asks: Default::default(),
+            answered_by: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -7320,6 +7401,8 @@ mod tests {
             agents_held: std::collections::BTreeMap::new(),
             said: std::collections::BTreeMap::new(),
             daemon: None,
+            asks: Default::default(),
+            answered_by: Default::default(),
         }
     }
 
@@ -7665,6 +7748,39 @@ mod tests {
             locate_seat(&backends, "cpd-does-not-exist").is_none(),
             "a seat nothing opened answers for nothing"
         );
+    }
+
+    /// `wsp-172`. Both kinds of waiting are drawn where `idle` used to be: a
+    /// prompt as `waiting · person`, and an open `wsp ask` as `waiting · <the
+    /// scope whose governor it went to>`. The governor's own line counts the
+    /// members waiting under it, and `--json` carries the reading for
+    /// compound's chrome.
+    #[test]
+    fn wip_shows_a_seat_on_a_prompt_and_a_seat_behind_its_question_as_waiting_and_on_whom() {
+        let mut w = wip_world();
+        w.agents[0].state = State::Blocked;
+        w.asks = crate::waiting::Asks::one("w2:p1", "t-002", "q-1", crate::waiting::On::Seat("wsp".into()));
+        w.governors.insert("wsp".into(), json!({ "workspace": "w3", "host": util::hostname() }));
+        w.answered_by = [("t-001".to_string(), "wsp".to_string()), ("t-002".to_string(), "wsp".to_string())].into();
+
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        let line = |pane: &str| text.lines().find(|l| l.contains(pane)).unwrap_or_default().to_string();
+        assert!(line("w1:p1").contains("waiting · person"), "a prompt waits on a person: {text}");
+        assert!(line("w2:p1").contains("waiting · wsp"), "a question waits on the seat it went to: {text}");
+        assert!(!line("w2:p1").contains("idle"), "and neither reads idle: {text}");
+        assert!(line("w3:p1").contains("2 waiting"), "the governor counts its waiting members: {text}");
+        assert!(text.lines().next().unwrap().contains("2 waiting"), "and the heading says so: {text}");
+
+        let v = wip_json(&w);
+        let row = |pane: &str| v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == pane).unwrap().clone();
+        assert_eq!(row("w1:p1")["waiting"]["why"], "prompt");
+        assert_eq!(row("w1:p1")["waiting"]["on"], "person");
+        assert_eq!(row("w2:p1")["waiting"]["why"], "answer");
+        assert_eq!(row("w2:p1")["waiting"]["on"], "wsp");
+        assert_eq!(row("w2:p1")["waiting"]["question"], "q-1");
+        assert_eq!(row("w3:p1")["waiting"], serde_json::Value::Null, "a working seat is not waiting");
+        assert_eq!(row("w3:p1")["members_waiting"], 2);
+        assert_eq!(v["waiting"], 2);
     }
 
     /// The row that was wrong for a whole night. `w2:p1` is idle on a task that

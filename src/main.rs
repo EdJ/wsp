@@ -61,6 +61,7 @@ mod store;
 mod sync;
 mod tunnel;
 mod util;
+mod waiting;
 mod worklist;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -770,9 +770,21 @@ fn holding_barrier(
 ) -> Option<Vec<String>> {
     let mut waiting = Vec::new();
     let mut long = Vec::new();
+    let asks = crate::waiting::Asks::read(store);
     for s in &pos.members {
         let Some(seat) = bound_seat(store, &s.id) else { continue };
-        match seats.state(&seat) {
+        let state = seats.state(&seat);
+        // **Waiting is neither idle nor gone** (`wsp-172`), so it holds the
+        // barrier exactly as working does — and with no bound, unlike working:
+        // a member on a prompt or behind its own open question has not finished
+        // anything, it has stopped in the middle, and the half-hour report below
+        // is for a turn that might be stuck, not for a question somebody owes.
+        // Asked only of a seat that answered: `None` still never holds.
+        if let Some(wait) = state.and_then(|st| crate::waiting::reading(Some(st), &asks, &seat, &s.id)) {
+            waiting.push(format!("{seat} ({}) is {}", s.id, wait.sentence()));
+            continue;
+        }
+        match state {
             Some(State::Working) => {
                 let said = format!("{seat} reads working");
                 let over = store
@@ -848,7 +860,7 @@ fn wedged(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Valu
 }
 
 /// The line `take_member` writes, and how it recognises its own record.
-const STARTED_BY: &str = "started by wsp:";
+pub(crate) const STARTED_BY: &str = "started by wsp:";
 
 /// Move a member to `doing` under the store lock, if it may start now, and
 /// say why it may and what it starts on. `None` is "leave it".
@@ -1333,7 +1345,7 @@ fn owned_by<'a>(tasks: impl Iterator<Item = &'a Task>, list: &str, group: usize)
 pub(crate) fn end_all(store: &Store, ids: Vec<String>) {
     let claims = store.claims();
     for id in ids.iter().filter(|id| claims.contains_key(*id)) {
-        despawn(id);
+        despawn(store, id);
     }
 }
 
@@ -1529,7 +1541,8 @@ pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
 /// `wsp despawn <id>`, as a process, for the same reason every other spawn is:
 /// the ending is a verb's whole behaviour and reimplementing it here would be a
 /// second answer that could disagree with it.
-pub(crate) fn despawn(id: &str) {
+pub(crate) fn despawn(store: &Store, id: &str) {
+    say_uncommitted(store, id);
     if cfg!(test) {
         #[cfg(test)]
         tests::ENDED.with(|s| s.borrow_mut().push(id.to_string()));
@@ -1551,6 +1564,38 @@ pub(crate) fn despawn(id: &str) {
     let kept = said.contains("kept") || said.contains("uncommitted");
     stamp(&format!("despawn {id}: {said}"));
     kept.then(|| stamp(&format!("despawn {id}: its tree was kept — `wsp wip` shows what is standing in it")));
+}
+
+/// Before an agent is ended, whatever ended it: the uncommitted work its tree
+/// holds, said in `cycle.log` and on the row. `wsp-171`'s second half.
+///
+/// **Before, and not only after**, because the line after is `despawn`'s own
+/// "its tree was kept", which says the tree survived and not that eight hours of
+/// somebody's work is in it — the shape `cpd-254` left on 2026-10-05, found by
+/// a person reading the tree. **On the row as well**, because the row is what
+/// the restart is briefed from; [`crate::cmd_spawn`] says it again in the
+/// work order itself, read off the tree at the moment the next agent starts.
+fn say_uncommitted(store: &Store, id: &str) {
+    let Some(cwd) = store.claims().get(id).and_then(|c| c.get("cwd")).and_then(|c| c.as_str()).map(util::expand) else {
+        return;
+    };
+    let n = crate::cmd_checkout::uncommitted(std::path::Path::new(&cwd));
+    if n == 0 {
+        return;
+    }
+    let tree = util::contract(std::path::Path::new(&cwd));
+    log_line(store, &format!(
+        "ending {id} with {n} uncommitted path(s) in {tree} — the tree is kept, and whoever starts it next inherits them"
+    ));
+    let id = id.to_string();
+    store.locked(|| {
+        let Some(mut t) = store.find_task(&id) else { return false };
+        t.log(&format!(
+            "wsp: ended with {n} uncommitted path(s) in {tree} — the last agent's work, not committed; read `git status` there before changing anything"
+        ));
+        t.touch();
+        store.save_task(&t).is_ok()
+    });
 }
 
 /// The seat that answers for a run: the list's own, when somebody holds it,
@@ -2031,6 +2076,49 @@ fn only_a_working_screen_is_ever_overruled() {
         let idle = Fixed::new(&[("cpd-1", State::Idle), ("cpd-2", State::Idle)]);
         step(&store, &w, &idle);
         assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "a tick later, and it opens");
+    }
+
+    /// `wsp-172`. A barrier opens only when every member is idle or gone, and a
+    /// member that is **waiting** is neither: on a prompt, or behind its own
+    /// open `wsp ask`, it stopped in the middle of something. Held with no
+    /// ceiling, said every pass, and the seat is not told — the half-hour report
+    /// is for a turn that may be stuck, and nothing here is stuck.
+    #[test]
+    fn a_barrier_holds_on_a_member_waiting_on_a_prompt_or_its_own_question() {
+        let (_env, store) = scratch("waitbarrier");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        for v in tagged(&store, VERIFY_TAG) {
+            set(&store, &v.id, Status::Review);
+        }
+        let _ = spawned();
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Blocked)]));
+        assert!(tagged(&store, BARRIER_TAG).is_empty(), "no barrier over a member on a prompt");
+        assert!(tests::SAID.with(|s| s.borrow().iter().any(|l: &String| l.contains("prompt only a person can answer"))));
+
+        let q = crate::message::Message::question(
+            crate::message::Party::pane("cpd-1", ""),
+            crate::message::Kind::Note,
+            "which file?",
+            crate::message::Waiting::new("cpd-1", "m-1"),
+        )
+        .about(crate::message::About::Task("m-1".into()));
+        store.save_message(&q).unwrap();
+        tests::TOLD.with(|t| t.borrow_mut().clear());
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Idle)]));
+        assert!(tagged(&store, BARRIER_TAG).is_empty(), "nor over one idle behind its own open question");
+        let told = tests::TOLD.with(|t| t.borrow().clone());
+        assert!(told.iter().all(|t| !t.contains("m-1")), "and nobody is told to hurry it: {told:?}");
+
+        let mut answered = store.message(&q.id).unwrap();
+        answered.state_raw = crate::message::State::Answered.as_str().into();
+        store.save_message(&answered).unwrap();
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Idle)]));
+        assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "answered and idle: it opens");
     }
 
     /// **The dependency `wsp-164` names**, and the reason `wsp-160` had to land

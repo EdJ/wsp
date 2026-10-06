@@ -2403,6 +2403,11 @@ impl Source for Poll<'_> {
             // cost a `ps -E` on every tick of every watch to fill a field
             // nobody in this function looks at.
             daemon: None,
+            // (c) asks every row whether it is waiting — the one reading the
+            // reconciler and the barrier ask too.
+            asks: crate::waiting::Asks::read(self.store),
+            // Nothing here draws a governor's count.
+            answered_by: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any
@@ -2527,8 +2532,8 @@ impl Source for Poll<'_> {
             // keypress, and waiting five minutes to mention it would be
             // waiting five minutes to say a word — `quiet_note` makes the same
             // exception for the same reason.
-            let s = match r.state_typed {
-                State::Blocked => Signal::new(
+            let s = match &r.waiting {
+                Some(w) if w.why == crate::waiting::Why::Prompt => Signal::new(
                     Kind::NeedsAPerson,
                     &t.id,
                     &format!("{} · stopped on a prompt only a person can answer — wsp peek <id>", r.pane),
@@ -2546,6 +2551,11 @@ impl Source for Poll<'_> {
                 // Only this arm. A modal holding the keyboard is a different
                 // repair — one keypress, not a sentence — and an agent can be
                 // in one while a question of its own is standing.
+                //
+                // `wsp-172`: asked of the row's own [`crate::waiting`] reading
+                // rather than of a set this pass built for itself, so the seat
+                // the watch leaves alone is the seat the reconciler holds.
+                Some(_) => continue,
                 _ if spoken_for.contains(&r.pane) => continue,
                 _ => Signal::new(
                     Kind::NeedsAPerson,
@@ -4491,6 +4501,8 @@ mod tests {
             needs_you: false,
             seat: None,
             said: None,
+            waiting: None,
+            members_waiting: 0,
         }
     }
 
@@ -5506,6 +5518,8 @@ mod tests {
             needs_you: false,
             seat: seat.map(str::to_string),
             said: None,
+            waiting: None,
+            members_waiting: 0,
         }
     }
 
