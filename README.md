@@ -1352,7 +1352,11 @@ wsp verified wsp-148 --blocks --from verdict.md   # back to doing, verdict owed,
 
 The barrier, `wsp worklist show --verdicts` and `wsp wip` (`wsp-148 ·
 verifying`) all read the newest entry. A new landing supersedes a pass that is
-still reading: its seat is ended and its late verdict refused. The tick ends a
+still reading: its seat is ended and its late verdict refused. A blocked member
+is verified again when it lands something new or when it returns to review with
+`wsp review`, because what a block owes need not be a commit. A barrier still
+waiting on a block that nothing is coming to change is told to the list's
+governor once per verdict. The tick ends a
 verifier's seat once, writes `ended` or `end failed: …` on the entry, and never
 retries a failure. A governor who thinks a block was wrong records `--holds` in
 their own name. Verify rows filed before this were moved by `wsp migrate

@@ -1041,12 +1041,27 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         }
         for m in blocked {
             let Some(v) = crate::cycle::blocked_verifier(&tasks, m) else { continue };
+            let read = v.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default();
             stamp(store, &format!(
-                "{} group {at}: the barrier still waits on {m} — its verifier blocked{}: sent back or answered? \
+                "{} group {at}: the barrier still waits on {m} — its verifier blocked{read}: sent back or answered? \
                  `wsp show {m}` has the verdict under ## Verification.",
                 w.id,
-                v.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default()
             ));
+            // `wsp-212`: said only to `cycle.log`, this stood a run still with
+            // its governor waiting to be told something needed it. Once per
+            // verdict, keyed by the instant it was recorded.
+            let decided = v.decided.as_deref().unwrap_or(v.at.as_str());
+            let said = format!("{WHY_NOT} its verifier blocked{read} ({decided}) and nothing has answered it.");
+            if told_of_verdict(store, m, &said) {
+                crate::cycle::tell(store, w, &format!(
+                    "The {} run's barrier waits on {m}: its verifier blocked{read}, and {m} is at {} with nothing \
+                     coming to change that verdict — no new landing, and no return to review since it was sent \
+                     back. Send it back (`wsp reopen {m}`) or answer the verdict; `wsp show {m}` has it under \
+                     ## Verification.",
+                    w.id,
+                    store.find_task(m).map(|t| t.status().as_str().to_string()).unwrap_or_default(),
+                ));
+            }
         }
     }
 }
@@ -1084,6 +1099,27 @@ fn told_once(store: &Store, id: &str, said: &str) -> bool {
         }
         t.log(said);
         t.touch();
+        store.save_task(&t).is_ok()
+    })
+}
+
+/// Whether the seat still has to be told about this verdict, and records that
+/// it has: anywhere in the member's `## Log`, because the sentence carries the
+/// verdict's own instant and so cannot recur for a different one.
+///
+/// **Not [`told_once`]**, for two reasons. That one asks about the *last* line,
+/// so a governor's note on a stalled member would buy a second tell of the same
+/// stall. And it touches the member — which for one with no landing *is* the
+/// re-verify key ([`crate::cycle::open_verifier`] falls back to `updated`), so
+/// wsp's own bookkeeping about a block would start a verifier over it.
+fn told_of_verdict(store: &Store, id: &str, said: &str) -> bool {
+    store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return false };
+        let log = t.section("Log").unwrap_or_default();
+        if log.lines().any(|l| undated(l.trim()) == said) {
+            return false;
+        }
+        t.log(said);
         store.save_task(&t).is_ok()
     })
 }
@@ -2717,6 +2753,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         // the verdict: the answer must come from the commits, not the clock.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         set_status(&store, "m-1", Status::Review);
+        let moved = store.find_task("m-1").unwrap().updated;
 
         tick(&store, &Fake::empty(), &mut Pass::new());
         let said = stamped();
@@ -2725,6 +2762,21 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             "{said:?}"
         );
         assert!(!said.iter().any(|l| l.contains("no verifier has recorded a verdict")), "{said:?}");
+
+        // `wsp-212`: and the seat is told, once, not only `cycle.log` — and
+        // the record of having told it does not move the member, which for a
+        // member with no landing would itself buy a verifier.
+        let heard = governed();
+        assert_eq!(heard.iter().filter(|t| t.contains("barrier waits on m-1") && t.contains("blocked")).count(), 1, "{heard:?}");
+        assert_eq!(store.find_task("m-1").unwrap().updated, moved, "telling the seat is not the member moving");
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("Governor: looking at it");
+        t.touch();
+        store.save_task(&t).unwrap();
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let heard = governed();
+        assert!(!heard.iter().any(|t| t.contains("barrier waits on m-1")), "one verdict is told once, a note in between or not: {heard:?}");
+        assert!(stamped().iter().any(|l| l.contains("sent back or answered?")), "while cycle.log goes on saying it");
     }
 
     /// **The reconciler's lines go in `cycle.log`, and that is not the same as

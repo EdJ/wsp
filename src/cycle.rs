@@ -1045,7 +1045,9 @@ pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
 /// Owed when there is none; when the newest **blocked** and the member's work
 /// has moved since it was read ([`moved_since`]) — that is the member coming
 /// back with a fix, verified again by a fresh agent rather than by the one that
-/// already made up its mind; and when the newest **held** and the member has
+/// already made up its mind — or when it has gone back to review since it was
+/// sent back, at the same commit or not ([`reviewed_since_sent_back`]); and
+/// when the newest **held** and the member has
 /// landed again since — new code on the trunk that nobody has read.
 ///
 /// # A new landing supersedes a pass still reading (`wsp-188`, wsp-176 item 2)
@@ -1108,7 +1110,7 @@ fn open_verifier(store: &Store, member: &Task, on: &Policy) -> Option<Opened> {
                 }
             }
             Some(p) if p.state == State::Blocks => {
-                if !moved_since(&now_landing, &member.updated, p) {
+                if !moved_since(&now_landing, &member.updated, p) && !reviewed_since_sent_back(&m) {
                     return None;
                 }
             }
@@ -1158,6 +1160,38 @@ fn moved_since(now_landing: &Option<String>, member_updated: &str, pass: &crate:
         // own write carries the same one.
         _ => member_updated > pass.decided.as_deref().unwrap_or(pass.at.as_str()),
     }
+}
+
+/// Whether the member went back to review after it was last sent back — a
+/// `review:` entry in its `## Log` below the newest [`SENT_BACK`] one.
+///
+/// **What a block owes need not be a commit (`wsp-212`).** wsp-209 and wsp-217
+/// were each blocked for an install and a few stuck rows, did them, and
+/// returned to review at the commit the verifier had read. [`moved_since`]
+/// asks only whether the work moved, so no verifier came, and the barrier
+/// waited for ever on a verdict about a state of the row that no longer held.
+/// The verdict is about the row, so a return to review is a return to be
+/// verified.
+///
+/// **Order in the log, not instants.** `## Log` is dated by day, and the
+/// order is the one thing it records exactly. And it is one verifier per
+/// return: the pass this opens is the newest until its verdict, and a block
+/// writes a fresh `sent back:` below the `review:` it answered.
+///
+/// A member put at review by hand, with no account, has not *returned* — it
+/// has been moved — and stays what the barrier names and the seat is told.
+fn reviewed_since_sent_back(t: &Task) -> bool {
+    let log = t.section("Log").unwrap_or_default();
+    let heads: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|l| match l.split_once(' ') {
+            Some((stamp, said)) if util::is_stamp(stamp) => said,
+            _ => l,
+        })
+        .collect();
+    let Some(back) = heads.iter().rposition(|h| h.starts_with(SENT_BACK)) else { return false };
+    heads[back + 1..].iter().any(|h| h.starts_with("review:") || *h == "→ review")
 }
 
 /// A row wsp made whose agent never arrived, taken again: touched, so a
@@ -2632,6 +2666,48 @@ pub(crate) mod tests {
 
     /// A verifier that found a problem blocks, the member comes back with a
     /// fix, and it is read again by a fresh agent.
+    /// **`wsp-212`: what a block owed was not a commit.** wsp-217 was blocked
+    /// for one `wsp install`, did it, and went back to review at the commit
+    /// its verifier had read. Keyed on the landing alone, nothing came, and the
+    /// barrier waited for ever on a verdict about a row that had since moved.
+    #[test]
+    fn a_member_back_at_review_at_the_same_commit_gets_a_fresh_verifier_once() {
+        let (_env, store) = scratch("samecommit");
+        task(&store, "m-1", Status::Review);
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{} 323faba83e4ce0ea6ae7253674a1e919cee27f78", crate::repair::LANDED));
+        store.save_task(&t).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        verdict_all(&store, crate::verification::State::Blocks);
+        assert_eq!(passes_on(&store, "m-1")[0].read.as_deref(), Some("323faba83e4c"), "read at the landing");
+
+        // Put back by hand, with no account: moved, not returned. Past a
+        // second, so the clock would say it moved if the clock were asked.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        set(&store, "m-1", Status::Review);
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 1, "a hand move at the same commit is not a return to be verified");
+
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Doing);
+        t.log("review: installed it; no code change");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.len(), 2, "back at review after the block, at the same commit: verified again");
+        assert_eq!(ps[1].read, ps[0].read, "on the commit it was already blocked at");
+
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 2, "one verifier per return to review, not one per tick");
+        verdict_all(&store, crate::verification::State::Blocks);
+        set(&store, "m-1", Status::Review);
+        step(&store, &w, &Blind);
+        assert_eq!(passes_on(&store, "m-1").len(), 2, "blocked again: the return it answered is above the new send-back");
+        let _ = spawned();
+    }
+
     #[test]
     fn a_member_fixed_after_a_failed_verdict_gets_a_fresh_verifier() {
         let (_env, store) = scratch("again");
