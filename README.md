@@ -2424,7 +2424,8 @@ means.
 
 ```sh
 wsp spawn -p robustness --govern   # open a workspace, seat an agent, tell it the job
-wsp govern robustness              # or take the seat from where you are
+wsp govern robustness --take       # or take the seat from where you are
+wsp govern robustness              # who is in that seat; changes nothing
 wsp govern                         # every seat, filled and empty
 wsp govern wsp --tell "hold 060"   # say something to whoever is in it
 wsp govern --clear                 # stand down, and leave the seat open
@@ -2510,6 +2511,16 @@ both. Taking a second slot hands the first back, the way claiming a second task
 hands off the first, and the slot it leaves stays on its project, empty. Who
 covers `wsp` while the `robustness` governor is busy is the chain's question,
 and its answer is a different agent.
+
+**Taking a seat is spelled `--take`, and a pane that has verified never holds
+one** (`wsp-197`). A bare `wsp govern <scope>` used to take the seat. It reads
+exactly like the bare `wsp govern` that only reports, so a verifier that asked
+who held a seat was put into it: cpd-332 was written into two seats that way on
+2026-10-05. Now the named form reports, and only `--take` writes. Every way of
+filling a seat (`--take`, `spawn --govern`, `--rotate`, `--reseat`, `resume`)
+goes through one function, and that function refuses any pane with a pass under
+`## Verification` on any member, live or archived, finished or not. The
+refusal names the pane and the pass, and leaves `governors.json` as it was.
 
 **It has a place.** The slot draws in the tree directly under the project it
 belongs to, above that project's work, and its occupant is drawn there *instead

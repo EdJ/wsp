@@ -2044,7 +2044,7 @@ fn list_and_words(store: &Store, args: &Args) -> Result<(Worklist, String, bool)
         None => {
             if first.is_empty() {
                 eprintln!("wsp: no worklist named, and this workspace is the seat for none");
-                eprintln!("     wsp worklist ls names them · wsp govern <slug> takes the seat");
+                eprintln!("     wsp worklist ls names them · wsp govern <slug> --take takes the seat");
             } else {
                 eprintln!("{}", worklist_or_why(store, &first).err().unwrap_or_default());
             }
@@ -2130,7 +2130,7 @@ fn words(args: &Args, from: usize) -> Result<String, i32> {
 
 /// The worklist this workspace is the seat for, if it is the seat for one.
 ///
-/// This is what makes the governor's loop three words. `wsp govern <slug>` is
+/// This is what makes the governor's loop three words. `wsp govern <slug> --take` is
 /// how a workspace comes to hold a worklist seat, and one key space means the
 /// scope it holds is either a project or a list with no ambiguity to settle.
 fn seated(store: &Store, args: &Args) -> Option<Worklist> {
@@ -2384,7 +2384,7 @@ fn named_list(store: &Store, args: &Args) -> Result<(Worklist, bool), i32> {
             Some(w) => Ok((w, true)),
             None => {
                 eprintln!("wsp: no worklist named, and this workspace is the seat for none");
-                eprintln!("     wsp worklist ls names them · wsp govern <slug> takes the seat");
+                eprintln!("     wsp worklist ls names them · wsp govern <slug> --take takes the seat");
                 Err(1)
             }
         },
@@ -3081,7 +3081,7 @@ pub fn go(store: &Store, args: &Args) -> i32 {
             println!(
                 "{}  {}",
                 p.bold("no seat"),
-                p.dim(&format!("hands raised on its members reach their projects' seats · wsp govern {}", w.id))
+                p.dim(&format!("hands raised on its members reach their projects' seats · wsp govern {} --take", w.id))
             );
             if let SeatOn::Elsewhere(host) = rest {
                 println!(

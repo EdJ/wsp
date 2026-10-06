@@ -3632,7 +3632,7 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
     match cmd_govern::governs(&governors, &crate::place::Seat::new(&here)) {
         Some(name) => Ok(Scope { name, seated: true, workspace: here.clone(), pane: here, all: false }),
         None => Err("wsp: this seat is nobody's, so there is no scope to watch.\n\
-                     \x20    `wsp watch <project>` watches one, `wsp govern <project>` takes the seat"
+                     \x20    `wsp watch <project>` watches one, `wsp govern <project> --take` takes the seat"
             .into()),
     }
 }

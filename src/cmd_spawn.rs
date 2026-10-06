@@ -2114,11 +2114,18 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     };
     if let Some(project) = &governing {
         match place.room(&seat) {
-            Some(ws) => {
-                if let Some((_, room)) = cmd_govern::take(store, project, &ws, seat.as_str()) {
-                    println!("  {}", p.dim(&format!("{project} seat taken from {room}")));
+            Some(ws) => match cmd_govern::take(store, project, &ws, seat.as_str()) {
+                Ok(Some((_, room))) => println!("  {}", p.dim(&format!("{project} seat taken from {room}"))),
+                Ok(None) => {}
+                // Before any agent is started, so nothing is told it is a
+                // custodian of a seat it does not hold. The workspace stays, as
+                // it does for a refused claim above.
+                Err(v) => {
+                    eprintln!("{}", v.refusal(project));
+                    eprintln!("wsp: opened {seat}, but no agent was started");
+                    return 1;
                 }
-            }
+            },
             // The workspace id is herdr's word and the port has none for it, so
             // this is the one fact `spawn` cannot get through `place`. Spoken
             // rather than fatal: the terminal is open and the agent is about to
@@ -2126,7 +2133,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             // inside it.
             None => eprintln!(
                 "wsp: opened {seat} but could not record the {project} seat — \
-                 run `wsp govern {project}` in it"
+                 run `wsp govern {project} --take` in it"
             ),
         }
     }
@@ -2837,9 +2844,29 @@ fn rotate_as(
             eprintln!("wsp: {} opened but its workspace could not be read - nothing was recorded", seat.as_str());
             return 1;
         };
-        cmd_govern::take(store, &scope, &ws_new, seat.as_str());
+        // Not `put_back`: a refusal writes nothing to governors.json, so there
+        // is no record to restore, and the pane is the one thing to undo. The
+        // reconciler's claim runs out on its own, and the next attempt opens a
+        // seat that has never verified anything.
+        if let Err(v) = cmd_govern::take(store, &scope, &ws_new, seat.as_str()) {
+            eprintln!("{}", v.refusal(&scope));
+            let _ = place.stop(&seat);
+            eprintln!("wsp: the {scope} seat is standing empty again");
+            return 1;
+        }
         cmd_govern::note_started(store, &scope, &kind, model.as_deref(), effort.as_deref());
     } else {
+        // A rotation moves the seat only at step 3, after the successor has been
+        // told it is the custodian and has started on that. So the refusal
+        // `take` would make there is asked here too, before anything is told:
+        // a successor refused after its first turn is an agent running a
+        // custodian's order for a seat it will never hold.
+        if let Some(v) = cmd_govern::ever_verified(store, "", seat.as_str()) {
+            eprintln!("{}", v.refusal(&scope));
+            let _ = place.stop(&seat);
+            eprintln!("wsp: nothing moved - the {scope} seat is still yours");
+            return 1;
+        }
         // The record goes down before the agent starts, because the successor's
         // brief is composed at start and the ending has to already be in it. Taken
         // back on every failure below: between this line and a confirmed turn, the
@@ -2935,11 +2962,16 @@ fn rotate_as(
                  the seat has not moved and this pane is still it",
                 seat.as_str()
             );
-            eprintln!("wsp: run `wsp govern {scope}` from {} to finish the move", seat.as_str());
+            eprintln!("wsp: run `wsp govern {scope} --take` from {} to finish the move", seat.as_str());
             eprintln!("wsp: then `wsp govern {scope} --ending` here ends this pane");
             return 1;
         };
-        cmd_govern::take(store, &scope, &ws_new, seat.as_str());
+        if let Err(v) = cmd_govern::take(store, &scope, &ws_new, seat.as_str()) {
+            store.clear_handover(&scope);
+            eprintln!("{}", v.refusal(&scope));
+            eprintln!("wsp: nothing moved - the {scope} seat is still yours, and {} should be ended", seat.as_str());
+            return 1;
+        }
         cmd_govern::note_started(store, &scope, &kind, model.as_deref(), effort.as_deref());
     }
 
@@ -3561,7 +3593,7 @@ fn end_work(
     // forcing *this* one destroys the rotation in progress, and the message an
     // agent reads here must not name the door that does the damage. It cannot
     // wedge: the slot moving clears it, and where `rotate` could not move the
-    // slot itself it already prints the manual `wsp govern <scope>` that does.
+    // slot itself it already prints the manual `wsp govern <scope> --take` that does.
     let incoming = cmd_govern::incoming(&store.handovers(), me.pane);
     if cmd_govern::rotation_pending(me.governs, incoming.as_ref()) {
         // Only the pane the record actually names. A successor mid-rotation may
@@ -6334,7 +6366,7 @@ mod tests {
         std::env::set_var("HERDR_SOCKET_PATH", &sock);
 
         store.save_project(&Project::new("core")).unwrap();
-        cmd_govern::take(&store, "core", "w1", "w1:p9");
+        cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
 
         let dial = util::Dial::new();
         let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
@@ -6387,7 +6419,7 @@ mod tests {
     fn vacated_seat(tag: &str, model: &str, effort: &str) -> (util::Isolated, Store) {
         let (env, store) = rotating_as(tag, "w1", "w1:p9");
         store.save_project(&Project::new("core")).unwrap();
-        cmd_govern::take(&store, "core", "w1", "w1:p9");
+        cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
         cmd_govern::note_started(&store, "core", "claude", Some(model), Some(effort));
         cmd_govern::vacate(&store, "core");
         stop_being_a_seat();
@@ -6406,6 +6438,106 @@ mod tests {
         store.set_governor("core", rec);
         let args = reseat_args(&store.governors(), "core");
         assert_eq!(args.get("kind").as_deref(), Some("opencode"), "the kind went under `last` with the rest of the seat");
+    }
+
+    // ---- wsp-197: a pane that has verified is never seated ------------------
+
+    fn governors_bytes(store: &Store) -> Vec<u8> {
+        std::fs::read(store.state_file("governors.json")).unwrap_or_default()
+    }
+
+    /// `spawn --govern` reaches the slot through `cmd_govern::take`, so a seat
+    /// that has verified is refused there — verifying now, or verified and
+    /// ended — before any agent is told it is a custodian, and governors.json
+    /// is not touched. The third case is the control: the same spawn with no
+    /// pass in that seat is seated, so the refusal is the pass and not the fake.
+    #[test]
+    fn a_govern_spawn_into_a_seat_that_has_verified_is_refused_before_an_agent_starts() {
+        for (tag, pass) in [("now", Some(false)), ("earlier", Some(true)), ("never", None)] {
+            let _guard = no_backend();
+            std::env::remove_var("HERDR_PANE_ID");
+            std::env::remove_var("HERDR_WORKSPACE_ID");
+            let store = seat(&format!("govern-verifier-{tag}"));
+            store.save_project(&Project::new("core")).unwrap();
+            if let Some(finished) = pass {
+                crate::cmd_govern::tests::verified_by(&store, "t-1", "w9:p1", finished);
+            }
+            store.set_governor("wsp", json!({ "workspace": "w1", "pane": "w1:p1" }));
+            let before = governors_bytes(&store);
+
+            let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+            let flags = [("project", "core"), ("govern", "true"), ("kind", "opencode")];
+            let code = place_work(&place, &store, &Args::synth("spawn", &[], &flags));
+            match pass {
+                Some(_) => {
+                    assert_eq!(code, 1, "{tag}");
+                    assert!(place.0.borrow().is_empty(), "{tag}: an agent was started for a seat it was refused");
+                    assert_eq!(governors_bytes(&store), before, "{tag}: governors.json moved");
+                }
+                None => {
+                    assert_eq!(code, 0, "{tag}");
+                    assert_eq!(store.governors()["core"]["pane"], "w9:p1", "{tag}: seated");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
+    }
+
+    /// The reconciler's reseat: the successor's seat has verified, so it is
+    /// refused when the slot would be written — before its agent starts — the
+    /// pane it opened is closed, and the vacated record is left as it was.
+    #[test]
+    fn a_reseat_into_a_seat_that_has_verified_is_refused_and_writes_nothing() {
+        for (tag, finished) in [("now", false), ("earlier", true)] {
+            let (env, store) = vacated_seat(&format!("reseat-verifier-{tag}"), "opus", "high");
+            let sock = env.path("herdr.sock");
+            herdr_stand_in(&sock, 24, successor_pane());
+            std::env::set_var("HERDR_SOCKET_PATH", &sock);
+            crate::cmd_govern::tests::verified_by(&store, "t-1", "w9:p2", finished);
+            let before = governors_bytes(&store);
+
+            let dial = util::Dial::new();
+            let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+            let args = reseat_args(&store.governors(), "core");
+            let code = reseat_on(&place, &store, &args, &handover_wait(&dial));
+            stop_being_a_seat();
+
+            assert_eq!(code, 1, "{tag}");
+            assert_eq!(place.started.get(), 0, "{tag}: no successor started");
+            assert_eq!(place.stopped.get(), 1, "{tag}: the pane it opened is closed again");
+            assert_eq!(governors_bytes(&store), before, "{tag}: governors.json moved");
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
+    }
+
+    /// A rotation moves the slot only after its successor's first turn, so a
+    /// successor that has verified is refused before it is told anything: the
+    /// caller stays seated and no handover is recorded.
+    #[test]
+    fn a_rotation_onto_a_seat_that_has_verified_is_refused_before_it_is_told() {
+        for (tag, finished) in [("now", false), ("earlier", true)] {
+            let (env, store) = rotating_as(&format!("rotate-verifier-{tag}"), "w1", "w1:p9");
+            let sock = env.path("herdr.sock");
+            herdr_stand_in(&sock, 24, successor_pane());
+            std::env::set_var("HERDR_SOCKET_PATH", &sock);
+            store.save_project(&Project::new("core")).unwrap();
+            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
+            crate::cmd_govern::tests::verified_by(&store, "t-1", "w9:p2", finished);
+            let before = governors_bytes(&store);
+
+            let dial = util::Dial::new();
+            let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
+            let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody);
+            stop_being_a_seat();
+
+            assert_eq!(code, 1, "{tag}");
+            assert_eq!(place.started.get(), 0, "{tag}: no successor started");
+            assert!(place.told.borrow().is_empty(), "{tag}: nobody was told they are the custodian");
+            assert!(store.handovers().is_empty(), "{tag}: {:?}", store.handovers());
+            assert_eq!(governors_bytes(&store), before, "{tag}: governors.json moved");
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
     }
 
     /// **And a kind compound cannot run is refused before anything is opened**,
@@ -6642,7 +6774,7 @@ mod tests {
     fn a_rotation_that_never_starts_a_turn_ends_nothing_and_leaves_the_caller_seated() {
         let (_env, store) = rotating_as("rotate-stall", "w1", "w1:p9");
         store.save_project(&Project::new("core")).unwrap();
-        cmd_govern::take(&store, "core", "w1", "w1:p9");
+        cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
 
         let dial = util::Dial::new();
         // Idle for ever: ready to be told, never taking.
@@ -6687,7 +6819,7 @@ mod tests {
             let store = Store::at(env.home(), env.state());
             store.ensure_dirs().unwrap();
             store.save_project(&Project::new("core")).unwrap();
-            cmd_govern::take(&store, "core", "w1", "w1:p9");
+            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
@@ -6702,7 +6834,7 @@ mod tests {
             let (_env, store) = rotating_as("rotate-wrong-scope", "w2", "w2:p2");
             store.save_project(&Project::new("core")).unwrap();
             store.save_project(&Project::new("other")).unwrap();
-            cmd_govern::take(&store, "other", "w2", "w2:p2");
+            cmd_govern::take(&store, "other", "w2", "w2:p2").unwrap();
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
@@ -6719,7 +6851,7 @@ mod tests {
         {
             let (_env, store) = rotating_as("rotate-unseated", "w3", "w3:p1");
             store.save_project(&Project::new("core")).unwrap();
-            cmd_govern::take(&store, "core", "w1", "w1:p9");
+            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
@@ -6738,7 +6870,7 @@ mod tests {
         {
             let (_env, store) = rotating_as("rotate-argv-kind", "w1", "w1:p9");
             store.save_project(&Project::new("core")).unwrap();
-            cmd_govern::take(&store, "core", "w1", "w1:p9");
+            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
             let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "opencode")]);
@@ -6771,7 +6903,7 @@ mod tests {
                 member_agents: Default::default(),
             }]);
             store.save_worklist(&w).unwrap();
-            cmd_govern::take(&store, "batch", "w1", "w1:p9");
+            cmd_govern::take(&store, "batch", "w1", "w1:p9").unwrap();
 
             let dial = util::Dial::new();
             let place = Seats::of(vec![Ok(State::Idle)]);
@@ -6832,7 +6964,7 @@ mod tests {
             },
         ]);
         store.save_worklist(&w).unwrap();
-        cmd_govern::take(&store, "batch", "w1", "w1:p9");
+        cmd_govern::take(&store, "batch", "w1", "w1:p9").unwrap();
 
         let dial = util::Dial::new();
         let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
@@ -6959,7 +7091,7 @@ mod tests {
         let _env = no_backend();
         let store = seat("rotate-early");
         working(&store, "t-260816-095", "w1:p1");
-        cmd_govern::take(&store, "core", "w1", "w1:p1");
+        cmd_govern::take(&store, "core", "w1", "w1:p1").unwrap();
         store.set_handover("core", json!({ "from": "w1:p1", "to": "w9:p2" }));
 
         let place = Ends::ok();
@@ -6979,7 +7111,7 @@ mod tests {
 
         // Once the slot has moved the guard stands aside. That is the state
         // `--ending` runs in, and a person's despawn after it goes through too.
-        cmd_govern::take(&store, "core", "w9", "w9:p2");
+        cmd_govern::take(&store, "core", "w9", "w9:p2").unwrap();
         let now = Caller { pane: Some("w9:p2"), governs: Some("core") };
         assert_eq!(end_work(&place, &store, &ending, now, &tidied.f()), 0);
         assert_eq!(place.asked.borrow().len(), 1, "the predecessor was ended");
@@ -7002,7 +7134,7 @@ mod tests {
         let (_env, store) = rotating_as("rotate-roomless", "cpd-1", "cpd-1");
         std::env::set_var("HERDR_SOCKET_PATH", _env.path("no-herdr-here.sock"));
         store.save_project(&Project::new("core")).unwrap();
-        cmd_govern::take(&store, "core", "cpd-1", "cpd-1");
+        cmd_govern::take(&store, "core", "cpd-1", "cpd-1").unwrap();
 
         let dial = util::Dial::new();
         let place = Seats::roomless(vec![Ok(State::Idle), Ok(State::Working)]);
@@ -7041,7 +7173,7 @@ mod tests {
         let store = seat("rotate-ending");
         store.save_project(&Project::new("core")).unwrap();
         working(&store, "t-260816-095", "w1:p1");
-        cmd_govern::take(&store, "core", "w1", "w1:p1");
+        cmd_govern::take(&store, "core", "w1", "w1:p1").unwrap();
         store.set_handover("core", json!({ "from": "w1:p1", "to": "w9:p2", "since": "2026-09-30T00:00:00Z" }));
         let tidied = Tidied::default();
 
@@ -7053,7 +7185,7 @@ mod tests {
         assert!(why.contains("never moved"), "{why}");
 
         // The slot moves. The backend refuses to stop the pane.
-        cmd_govern::take(&store, "core", "w9", "w9:p2");
+        cmd_govern::take(&store, "core", "w9", "w9:p2").unwrap();
         let stuck = Ends::refusing(Refusal::Backend("the pty would not close".into()));
         assert_eq!(end_owed(&stuck, &store, "core", &tidied.f()), 1);
         assert_eq!(stuck.asked.borrow().len(), 1);

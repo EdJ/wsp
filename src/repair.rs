@@ -1917,7 +1917,7 @@ fn taking_a_stood_down_seat_lifts_the_decision_so_the_next_death_is_ordinary() {
     assert!(cmd_govern::stood_at(&store.governors(), "run").is_some());
 
     // A person filling it by hand, which is `wsp govern` in the seat's own pane.
-    cmd_govern::take(&store, "run", "w1", "cpd-1");
+    cmd_govern::take(&store, "run", "w1", "cpd-1").unwrap();
     assert!(
         cmd_govern::stood_at(&store.governors(), "run").is_none(),
         "a seat somebody is in is not a stood-down seat: {:?}",

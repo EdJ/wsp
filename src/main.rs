@@ -166,8 +166,9 @@ const BOOL_FLAGS: &[&str] = &[
     // and `wsp govern wsp --remove` both put the flag last, where anything not
     // known here swallows the argument after it. `--rotate` is the same shape:
     // `wsp govern core --rotate` names the scope after the verb, and so does
-    // the `--ending` a rotation starts behind itself.
-    "govern", "remove", "rotate", "ending",
+    // the `--ending` a rotation starts behind itself, and `--take`, which
+    // `wsp govern core --take` puts after the scope it takes.
+    "govern", "remove", "rotate", "ending", "take",
     // And `wsp watch <signal>…`, whose positionals are signal names.
     "now", "once", "status",
     // And `worklist add <slug> <parent> --sub`, whose positionals are the list
@@ -1679,12 +1680,15 @@ fn help_text() -> String {
                                     which may reach further back than the last
                                     census. --print says how to do it by hand
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
-  wsp govern [<proj>] [--clear]     take the custodial seat on a project: raised
+  wsp govern [<proj>]               who is in every seat, or in the one named.
+                                    Reports only: it never takes a seat
+  wsp govern <proj> --take          take the custodial seat on a project: raised
                                     hands under it arrive here instead of on a
                                     person's panel, and this pane stops reading
-                                    as an agent that has stalled; --clear stands
-                                    down and leaves the seat open, --remove takes
-                                    the seat off the project altogether
+                                    as an agent that has stalled. Refused to a
+                                    pane that has ever verified
+  wsp govern [<proj>] --clear       stand down and leave the seat open; --remove
+                                    takes the seat off the project altogether
   wsp govern <proj> --tell "…" | -  say something to whoever is in that seat —
                                     the panel's T, from a shell. Direction is
                                     long prose full of identifiers, so reach for

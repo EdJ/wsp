@@ -1209,7 +1209,7 @@ mod tests {
             let mut spot = Spot::agent(&pane, "claude", scope, *state);
             spot.space = space.clone();
             stage.put(spot);
-            cmd_govern::take(&store, scope, &space, &pane);
+            cmd_govern::take(&store, scope, &space, &pane).unwrap();
         }
         let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
         let (k, v) = fake.socket_env();
@@ -1714,7 +1714,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         spot.space = "w1".into();
         let mut stage = Stage::new();
         stage.put(spot);
-        cmd_govern::take(&store, "demo", "w1", "w1:p1");
+        cmd_govern::take(&store, "demo", "w1", "w1:p1").unwrap();
         let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
         let (k, v) = fake.socket_env();
         std::env::set_var(k, v);
@@ -2062,7 +2062,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let mut stage = fake.stage();
         stage.put(other);
         fake.restage(stage);
-        cmd_govern::take(&store, "other", "w2", "w2:p1");
+        cmd_govern::take(&store, "other", "w2", "w2:p1").unwrap();
 
         let asked = Args::parse(vec!["wsp".into(), "wsp-146".into(), "which one?".into()]);
         assert_eq!(crate::cmd_message::ask(&store, &asked), 0);

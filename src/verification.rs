@@ -357,6 +357,38 @@ pub(crate) fn seats(tasks: &[Task]) -> BTreeMap<String, String> {
     out
 }
 
+/// The member a seat has ever verified, and the pass it did it in: the newest
+/// one, of any state and any ending. `wsp-197`.
+///
+/// **Ever, not now, because the seat that broke this was finished.** cpd-332
+/// had given its verdict on wsp-179 and was idle when it ran a bare `wsp
+/// govern` and was written into two seats; [`seats`] is what is still standing
+/// and would have let it through. So every pass is asked, and every Verify row
+/// wsp filed before `wsp-188` — by each pane that ever held a claim on it, not
+/// only the last one [`legacy`] reads, because a released claim was still a
+/// verifier's.
+///
+/// Archived members are passed in too: a member archived after its verdict
+/// does not make the pane that verified it fit to govern.
+pub(crate) fn verified_in(tasks: &[Task], seat: &str) -> Option<(String, Pass)> {
+    if seat.is_empty() {
+        return None;
+    }
+    let mut found: Vec<(String, Pass)> = Vec::new();
+    for t in tasks {
+        if t.body.contains("## Verification") {
+            found.extend(passes(t).into_iter().filter(|p| p.pane.as_deref() == Some(seat)).map(|p| (t.id.clone(), p)));
+        }
+        if filed_by_wsp(t) {
+            if crate::cmd_attempts::attempts_of(t).iter().any(|a| a.pane == seat) {
+                let member = t.parent.clone().unwrap_or_default();
+                found.push((member, Pass { pane: Some(seat.to_string()), ..legacy(t) }));
+            }
+        }
+    }
+    found.into_iter().max_by(|a, b| a.1.at.cmp(&b.1.at))
+}
+
 /// What a verifier's seat is called, wherever a seat is named.
 pub(crate) fn seat_label(member: &str) -> String {
     format!("{member} · verifying")

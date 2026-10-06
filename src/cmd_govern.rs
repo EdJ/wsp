@@ -117,7 +117,7 @@
 //! list composed out of one backlog was being answered for anyway.
 //!
 //! One key space, both ways — `Store::scope_taken` is where that is enforced,
-//! and it is what buys `wsp govern <slug>` with no new flag. Only the *routing*
+//! and it is what buys `wsp govern <slug> --take` with no flag of its own. Only the *routing*
 //! asks whether a list is running: a seat is taken on a list before it starts,
 //! because that is how somebody comes to be there to start it.
 //!
@@ -649,7 +649,69 @@ fn rename_seat(store: &Store, workspace: &str) {
     }
 }
 
-pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option<(Seat, String)> {
+/// A seat refused to a pane because it has verified somebody's work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verifier {
+    /// The pane, or the room, that verified.
+    pub seat: String,
+    /// The member it verified.
+    pub member: String,
+    /// When that pass was opened.
+    pub at: String,
+}
+
+impl Verifier {
+    /// The refusal, naming the pane and the pass, for whoever asked.
+    pub fn refusal(&self, scope: &str) -> String {
+        format!(
+            "wsp: {} verified {} (the pass opened {}) - a pane that has verified never holds a governor seat; \
+             nothing was written to the {scope} seat",
+            self.seat, self.member, self.at
+        )
+    }
+}
+
+/// The pass this room or pane verified in, if it ever verified anything.
+///
+/// Both ids are asked because a compound seat is its own room and either may be
+/// the one the record is about to carry; a herdr room named with `-w` and no
+/// pane is asked as itself, which a herdr pane id never equals — verifiers are
+/// compound seats, so that gap is one nothing falls through today.
+pub fn ever_verified(store: &Store, workspace: &str, pane: &str) -> Option<Verifier> {
+    let mut tasks = store.tasks();
+    tasks.extend(store.archived_tasks());
+    [pane, workspace].into_iter().filter(|s| !s.is_empty()).find_map(|seat| {
+        crate::verification::verified_in(&tasks, seat).map(|(member, pass)| Verifier {
+            seat: seat.to_string(),
+            member,
+            at: pass.at,
+        })
+    })
+}
+
+/// Put a workspace in a seat, and say whose seat it took — or refuse, because
+/// the pane in it has verified.
+///
+/// **The refusal is here, in the one function that writes an occupant, and not
+/// at the doors.** `wsp-197`: cpd-332, wsp-179's verifier, ran a bare `wsp
+/// govern <scope>` and was written into two seats. `wsp-176` had already shut
+/// `spawn --verify --govern`, and that door being shut did nothing for the one
+/// beside it. `--take`, `spawn --govern`, a rotation, the reconciler's reseat
+/// and `resume` all arrive here, so a door added tomorrow is covered by not
+/// being able to write a seat any other way. A verifier reads the work it is
+/// judging; a governor directs it. One pane holding both is a judge of its own
+/// direction, and a finished verifier is still that pane.
+///
+/// Refused before anything is written: the seat this workspace holds is not
+/// handed back, and governors.json is not touched.
+pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Result<Option<(Seat, String)>, Verifier> {
+    if let Some(v) = ever_verified(store, workspace, pane) {
+        store.log_event(
+            "governor-refused",
+            json!({ "project": project, "workspace": workspace, "pane": pane, "verified": v.member, "pass": v.at }),
+        );
+        return Err(v);
+    }
     // Taking a seat somebody else is in is allowed and is said out loud. The
     // alternative is a refusal on a record whose whole content is "an agent is
     // sitting here", which goes stale every time a session ends without
@@ -728,7 +790,7 @@ pub fn take(store: &Store, project: &str, workspace: &str, pane: &str) -> Option
     );
     store.log_event("governor-set", json!({ "project": project, "workspace": workspace }));
     rename_seat(store, workspace);
-    displaced
+    Ok(displaced)
 }
 
 /// Empty a slot without taking it off the project.
@@ -830,14 +892,14 @@ pub fn health(probe: &crate::cmd_agent::Probe, store: &Store, problems: &mut Vec
         let (state, fill) = match panes.iter().any(|p| p.workspace_id == room) {
             true => (
                 format!("its pane {} is gone and {room} is still open", seat.pane),
-                format!("`wsp govern {} -w {room}` puts somebody back in it", slot.scope),
+                format!("`wsp govern {} --take -w {room}` puts somebody back in it", slot.scope),
             ),
             false => (
                 format!("its pane {} and its workspace {room} are both gone", seat.pane),
                 // Not `wsp spawn --govern`, which takes a project: a scope here
                 // is a project *or* a worklist slug, and half the hints would
                 // have named a verb that cannot take it.
-                format!("`wsp govern {}` from a workspace that has one seats it there", slot.scope),
+                format!("`wsp govern {} --take` from a workspace that has one seats it there", slot.scope),
             ),
         };
         problems.push(format!(
@@ -1665,6 +1727,18 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         return tell(store, &governors, &scope, &text, args);
     }
 
+    // **A named scope with no verb reports it, and taking it is `--take`.**
+    // `wsp-197`: until this, `wsp govern <scope>` was the write, and it read
+    // exactly like the bare `wsp govern` beside it that only reports — so an
+    // agent asking who holds a seat was put in it. cpd-332, a verifier, asked
+    // twice and was written into tokenhub-spec-sync and then ux-revamp; the
+    // `tooling` seat went to cpd-276 the same way. A command an agent can run
+    // without having decided must not be one that moves a position, so the
+    // write is the one that has to be spelled.
+    if !args.has("take") {
+        return report_scope(store, args, &governors, &scope);
+    }
+
     let Some(ws) = workspace else {
         eprintln!("wsp: no workspace — pass -w, or run inside herdr");
         return 2;
@@ -1679,7 +1753,13 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     // being handed back is a *write*, and a write leaves the coarse reading
     // alone deliberately.
     let handed_back = governs(&governors, &seat_query(&ws, None)).filter(|p| p != &scope);
-    let displaced = take(store, &scope, &ws, pane.as_deref().unwrap_or_default());
+    let displaced = match take(store, &scope, &ws, pane.as_deref().unwrap_or_default()) {
+        Ok(d) => d,
+        Err(v) => {
+            eprintln!("{}", v.refusal(&scope));
+            return 1;
+        }
+    };
 
     if args.json() {
         println!(
@@ -1802,7 +1882,7 @@ fn tell(store: &Store, governors: &BTreeMap<String, Value>, scope: &str, text: &
     // affected; the first two reach this through `wake::say` and this is the
     // third.
     let Some(seat) = seat_held(scope, governors) else {
-        eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} fills it");
+        eprintln!("wsp: no seat on `{scope}` — wsp govern {scope} --take fills it");
         return 1;
     };
     // The retry refusal, and it stays. **This is a person at a keyboard, and
@@ -1940,6 +2020,83 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
     0
 }
 
+/// What a roster line says about who is in a slot: the room and pane, the host
+/// it is held from, or why it is empty and what fills it.
+fn who_is_in(store: &Store, governors: &BTreeMap<String, Value>, s: &Slot) -> String {
+    match (&s.occupant, s.elsewhere()) {
+        (Some(o), _) if o.pane.is_empty() => room_of(governors, &s.scope),
+        (Some(o), _) => format!("{} · {}", room_of(governors, &s.scope), o.pane),
+        (None, true) => format!("on {}", s.host),
+        (None, false) => {
+            // **Both the door and the fact that wsp opens it by itself.**
+            // `wsp-148` gave the daemon the job of filling a vacancy on a
+            // running list, and a roster that still says only `wsp spawn ...
+            // --govern fills it` would be teaching a reader to do by hand
+            // what the machine now does on its own — and would say nothing
+            // about the case that matters, which is whether the daemon is the
+            // thing that is going to fill it.
+            let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
+            // **A stand-down outranks every other sentence here**, including
+            // the one the daemon is about to make true. `wsp-148` gave the
+            // reconciler the job of filling a vacancy on a running list, and
+            // until this branch existed a seat Ed had closed by hand still
+            // read `the daemon seats this one` — so the roster instructed the
+            // reader to wait for exactly the thing the person had just
+            // refused. The date is on it because *which* is the question: a
+            // governor that died is worth chasing, a position somebody left
+            // empty is not.
+            let down = stood_at(governors, &s.scope).map(util::local_hm).unwrap_or_default();
+            if !down.is_empty() {
+                format!(
+                    "stood down at {down} · wsp will not fill it — \
+                     `wsp spawn -p <project> --govern` if that changes"
+                )
+            } else if vacancy(governors, &s.scope).reseating.is_some() {
+                // **A claim in flight outranks the daemon's own sentence**,
+                // because it changes what a reader should do: a claim means
+                // wsp has already opened the successor, so a person running
+                // `wsp govern <scope> --reseat` here would be opening a
+                // second one — which is `wsp-114`'s three governors for one
+                // run. It says so rather than reporting an emptiness that is
+                // already being dealt with.
+                "empty · a successor is being seated - do not reseat by hand".to_string()
+            } else if auto {
+                "empty · the daemon seats this one".to_string()
+            } else {
+                "empty · wsp spawn -p <project> --govern fills it".to_string()
+            }
+        }
+    }
+}
+
+/// `wsp govern <scope>`: who is in that one seat, and how to take it. Writes
+/// nothing — `wsp-197`, and the reason is on the branch in [`govern`] that
+/// sends a named scope here.
+fn report_scope(store: &Store, args: &Args, governors: &BTreeMap<String, Value>, scope: &str) -> i32 {
+    let p = Paint::new();
+    let slot = slots(governors).into_iter().find(|s| s.scope == scope);
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "project": scope,
+                "workspace": slot.as_ref().and_then(|s| s.occupant.as_ref()).map(|_| room_of(governors, scope)),
+                "pane": slot.as_ref().and_then(|s| s.occupant.as_ref()).map(|o| o.pane.clone()),
+                "filled": slot.as_ref().is_some_and(Slot::filled),
+                "taken": false,
+            })
+        );
+        return 0;
+    }
+    let who = match &slot {
+        Some(s) => who_is_in(store, governors, s),
+        None => "no seat".to_string(),
+    };
+    println!("{} {}  {}", p.dim("·"), p.bold(scope), p.dim(&who));
+    println!("  {}", p.dim(&format!("nothing changed · `wsp govern {scope} --take` puts this workspace in it")));
+    0
+}
+
 /// What is seated: this workspace's own, the seat above it, or the whole roster.
 fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pane: Option<&str>) -> i32 {
     let p = Paint::new();
@@ -1972,7 +2129,7 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
     }
 
     if slots.is_empty() {
-        println!("{}", p.dim("no seats — wsp govern <scope> takes one"));
+        println!("{}", p.dim("no seats — wsp govern <scope> --take takes one"));
         return 0;
     }
     // Vacant slots draw too, and that is the point of the list: a position
@@ -1980,50 +2137,7 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
     for s in &slots {
         let here = mine.as_deref() == Some(s.scope.as_str());
         let mark = if here { p.cyan("▣") } else { p.dim("·") };
-        let who = match (&s.occupant, s.elsewhere()) {
-            (Some(o), _) if o.pane.is_empty() => room_of(&governors, &s.scope),
-            (Some(o), _) => format!("{} · {}", room_of(&governors, &s.scope), o.pane),
-            (None, true) => format!("on {}", s.host),
-            (None, false) => {
-                // **Both the door and the fact that wsp opens it by itself.**
-                // `wsp-148` gave the daemon the job of filling a vacancy on a
-                // running list, and a roster that still says only `wsp spawn ...
-                // --govern fills it` would be teaching a reader to do by hand
-                // what the machine now does on its own — and would say nothing
-                // about the case that matters, which is whether the daemon is the
-                // thing that is going to fill it.
-let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
-                // **A stand-down outranks every other sentence here**, including
-                // the one the daemon is about to make true. `wsp-148` gave the
-                // reconciler the job of filling a vacancy on a running list, and
-                // until this branch existed a seat Ed had closed by hand still
-                // read `the daemon seats this one` — so the roster instructed the
-                // reader to wait for exactly the thing the person had just
-                // refused. The date is on it because *which* is the question: a
-                // governor that died is worth chasing, a position somebody left
-                // empty is not.
-                let down = stood_at(&governors, &s.scope).map(util::local_hm).unwrap_or_default();
-                if !down.is_empty() {
-                    format!(
-                        "stood down at {down} · wsp will not fill it — \
-                         `wsp spawn -p <project> --govern` if that changes"
-                    )
-                } else if vacancy(&governors, &s.scope).reseating.is_some() {
-                    // **A claim in flight outranks the daemon's own sentence**,
-                    // because it changes what a reader should do: a claim means
-                    // wsp has already opened the successor, so a person running
-                    // `wsp govern <scope> --reseat` here would be opening a
-                    // second one — which is `wsp-114`'s three governors for one
-                    // run. It says so rather than reporting an emptiness that is
-                    // already being dealt with.
-                    "empty · a successor is being seated - do not reseat by hand".to_string()
-                } else if auto {
-                    "empty · the daemon seats this one".to_string()
-                } else {
-                    "empty · wsp spawn -p <project> --govern fills it".to_string()
-                }
-            }
-        };
+        let who = who_is_in(store, &governors, s);
         println!("{} {}  {}", mark, p.bold(&s.scope), p.dim(&who));
     }
     if mine.is_none() {
@@ -2053,7 +2167,7 @@ let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::Project;
 
@@ -2187,8 +2301,8 @@ mod tests {
         assert_eq!(s.scope, "robustness", "past a list with no seat, and past data");
 
         let (_env, store) = store("fallthrough");
-        take(&store, "batch", "w7", "w7:p1");
-        take(&store, "robustness", "w1", "w1:p1");
+        take(&store, "batch", "w7", "w7:p1").unwrap();
+        take(&store, "robustness", "w1", "w1:p1").unwrap();
         assert!(vacate(&store, "batch"), "the governor stood down mid-run");
         let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data")).unwrap();
         assert_eq!(s.scope, "robustness", "an empty list seat routes nothing, as an empty project one does");
@@ -2240,15 +2354,15 @@ mod tests {
 
     /// A seat is taken on a list the same way it is taken on a project, because
     /// it is the same record under the same key — which is what "the key is a
-    /// scope" buys and what makes `wsp govern <slug>` need no new flag.
+    /// scope" buys and what makes `wsp govern <slug> --take` need no flag of its own.
     ///
     /// Including the rule that outlasts the change: one agent holds one of
     /// them, so a workspace that takes the list's seat hands back the project's.
     #[test]
     fn a_seat_on_a_list_is_a_seat_like_any_other() {
         let (_env, store) = store("list-seat");
-        take(&store, "robustness", "w1", "w1:p1");
-        take(&store, "batch", "w1", "w1:p1");
+        take(&store, "robustness", "w1", "w1:p1").unwrap();
+        take(&store, "batch", "w1", "w1:p1").unwrap();
 
         assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("batch"));
         let slots = slots(&store.governors());
@@ -2267,8 +2381,8 @@ mod tests {
     #[test]
     fn a_barrier_seats_ask_reaches_the_governor_of_its_own_list() {
         let (_env, store) = store("barrier-ask");
-        take(&store, "wsp", "w2", "w2:p1");
-        take(&store, "batch", "w1", "w1:p1");
+        take(&store, "wsp", "w2", "w2:p1").unwrap();
+        take(&store, "batch", "w1", "w1:p1").unwrap();
         let mut w = crate::model::Worklist::new("batch", "Overnight batch");
         w.body = "## Groups\n- 1  wsp-1\n".into();
         w.set_status(crate::model::WorklistStatus::Running);
@@ -2300,7 +2414,7 @@ mod tests {
     #[test]
     fn a_second_agent_in_the_seats_workspace_is_a_worker_and_not_a_co_custodian() {
         let (_env, store) = store("two-in-a-room");
-        take(&store, "acc", "w1", "w1:p2");
+        take(&store, "acc", "w1", "w1:p2").unwrap();
         let g = store.governors();
 
         assert_eq!(governs(&g, &seat_query("w1", Some("w1:p2"))).as_deref(), Some("acc"), "the seat itself");
@@ -2444,7 +2558,7 @@ mod tests {
         use crate::place::State;
 
         let (env, store) = store("tell-busy");
-        take(&store, "wsp", "w1", "w1:p1");
+        take(&store, "wsp", "w1", "w1:p1").unwrap();
         let mut stage = Stage::new();
         stage.put(Spot::agent("w1:p1", "claude", "wsp", State::Working));
         let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
@@ -2580,7 +2694,7 @@ mod tests {
     #[test]
     fn a_room_is_asked_about_as_a_room_and_a_record_with_no_pane_answers_for_one() {
         let (_env, store) = store("room");
-        take(&store, "wsp", "w1", "w1:p6");
+        take(&store, "wsp", "w1", "w1:p6").unwrap();
         assert_eq!(
             governs(&store.governors(), &seat_query("w1", None)).as_deref(),
             Some("wsp"),
@@ -2603,8 +2717,8 @@ mod tests {
     #[test]
     fn governs_answers_a_bare_seat_with_no_workspace_beside_it() {
         let (_env, store) = store("bare-seat");
-        take(&store, "robustness", "w1", "w1:p1");
-        take(&store, "wsp", "w2", "w2:p1");
+        take(&store, "robustness", "w1", "w1:p1").unwrap();
+        take(&store, "wsp", "w2", "w2:p1").unwrap();
 
         assert_eq!(
             governs(&store.governors(), &crate::place::Seat::new("w1:p1")).as_deref(),
@@ -2669,17 +2783,17 @@ mod tests {
     #[test]
     fn one_agent_holds_one_governorship_and_taking_another_hands_it_back() {
         let (_env, store) = store("one");
-        take(&store, "robustness", "w1", "w1:p1");
+        take(&store, "robustness", "w1", "w1:p1").unwrap();
         assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("robustness"));
 
-        take(&store, "wsp", "w1", "w1:p1");
+        take(&store, "wsp", "w1", "w1:p1").unwrap();
         assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("wsp"), "it moved");
         let slots = slots(&store.governors());
         let robustness = slots.iter().find(|s| s.scope == "robustness").expect("the post stayed");
         assert!(!robustness.filled(), "and it is empty rather than gone");
 
         // Another workspace's seat is untouched by either.
-        take(&store, "data", "w2", "w2:p1");
+        take(&store, "data", "w2", "w2:p1").unwrap();
         assert_eq!(governs(&store.governors(), &seat_query("w2", Some("w2:p1"))).as_deref(), Some("data"));
         assert_eq!(governs(&store.governors(), &seat_query("w1", Some("w1:p1"))).as_deref(), Some("wsp"));
         assert_eq!(governs(&store.governors(), &seat_query("w3", Some("w3:p1"))), None);
@@ -2698,7 +2812,7 @@ mod tests {
     #[test]
     fn doctor_says_which_seat_nobody_is_sitting_in() {
         let (_env, store) = store("health");
-        take(&store, "acc", "w1", "w1:p2");
+        take(&store, "acc", "w1", "w1:p2").unwrap();
 
         let pane = |id: &str, ws: &str| herdr::Pane {
             pane_id: id.to_string(),
@@ -2722,7 +2836,7 @@ mod tests {
         assert_eq!(ps.len(), 1, "{ps:?}");
         assert!(ps[0].contains("the seat for `acc` is empty"), "{ps:?}");
         assert!(ps[0].contains("w1:p2"), "and which pane it was waiting on: {ps:?}");
-        assert!(ps[0].contains("wsp govern acc -w w1"), "{ps:?}");
+        assert!(ps[0].contains("wsp govern acc --take -w w1"), "{ps:?}");
 
         // Room and pane both gone: the same fault, and a repair that has to
         // find somewhere to sit first.
@@ -2766,7 +2880,7 @@ mod tests {
     #[test]
     fn standing_down_empties_the_seat_and_leaves_it_standing() {
         let (_env, store) = store("vacate");
-        take(&store, "wsp", "w1", "w1:p1");
+        take(&store, "wsp", "w1", "w1:p1").unwrap();
         assert!(seat_for(&store.governors(), &tree(), None, Some("wsp")).is_some());
 
         assert!(vacate(&store, "wsp"), "there was somebody in it");
@@ -2782,7 +2896,7 @@ mod tests {
         // Filled again by the next agent, which is the whole point of keeping
         // it, and vacating twice changes nothing the second time.
         assert!(!vacate(&store, "wsp"), "already empty");
-        take(&store, "wsp", "w2", "w2:p1");
+        take(&store, "wsp", "w2", "w2:p1").unwrap();
         assert_eq!(
             seat_for(&store.governors(), &tree(), None, Some("wsp")).map(|s| room_of(&store.governors(), &s.scope)),
             Some("w2".to_string())
@@ -2796,7 +2910,7 @@ mod tests {
     #[test]
     fn removing_a_seat_takes_the_position_off_the_project() {
         let (_env, store) = store("remove");
-        take(&store, "wsp", "w1", "w1:p1");
+        take(&store, "wsp", "w1", "w1:p1").unwrap();
         assert!(store.clear_governor("wsp"));
         assert!(slots(&store.governors()).is_empty(), "no position, not an empty one");
     }
@@ -2828,5 +2942,120 @@ mod tests {
         assert!(is_governor_label(&label));
         assert!(!is_governor_label("robustness/078 · build a design artefact"));
         assert!(!is_governor_label(""));
+    }
+
+    // ---- wsp-197: a bare govern reports, and a verifier never governs ------
+
+    /// A member with one pass on it, verified in `pane`. `finished` is a pass
+    /// that gave its verdict and whose seat was ended — the claim released, in
+    /// the old vocabulary — rather than one still reading.
+    pub(crate) fn verified_by(store: &Store, member: &str, pane: &str, finished: bool) {
+        use crate::verification::{Ending, Pass, State};
+        let mut m = crate::model::Task::new("a member", member);
+        m.project = Some("core".into());
+        let mut pass = Pass::opened(Some("abc1234".into()), Some("opencode".into()));
+        pass.pane = Some(pane.to_string());
+        if finished {
+            pass.state = State::Holds;
+            pass.ending = Ending::Ended;
+            pass.decided = Some(util::now_iso());
+            pass.text = "held".into();
+        }
+        crate::verification::write(&mut m, &[pass]);
+        store.save_task(&m).unwrap();
+    }
+
+    fn governors_bytes(store: &Store) -> Option<Vec<u8>> {
+        std::fs::read(store.state_file("governors.json")).ok()
+    }
+
+    fn govern_as(store: &Store, scope: &str, flags: &[(&str, &str)]) -> i32 {
+        govern(store, &Args::synth("govern", &[scope], flags))
+    }
+
+    /// cpd-332 asked who held a seat and was put in it. Asking is a read, so it
+    /// must leave the file exactly as it found it — for a seat somebody else
+    /// holds, for one standing empty, and for a scope with no record at all.
+    #[test]
+    fn a_bare_govern_on_a_scope_reports_and_leaves_governors_json_byte_for_byte() {
+        let (_env, store) = store("bare");
+        store.save_project(&Project::new("core")).unwrap();
+        store.save_project(&Project::new("data")).unwrap();
+        store.save_project(&Project::new("verb")).unwrap();
+        take(&store, "core", "w1", "w1:p1").unwrap();
+        take(&store, "data", "w3", "w3:p1").unwrap();
+        vacate(&store, "data");
+        let before = governors_bytes(&store);
+
+        for scope in ["core", "data", "verb"] {
+            assert_eq!(govern_as(&store, scope, &[("workspace", "w2")]), 0, "{scope}");
+            assert_eq!(governors_bytes(&store), before, "a bare govern on {scope} wrote to governors.json");
+        }
+        assert_eq!(governs(&store.governors(), &seat_query("w2", None)), None, "and w2 holds nothing");
+    }
+
+    /// The write is the one that has to be spelled, and spelled it works.
+    #[test]
+    fn take_seats_a_pane_that_has_never_verified() {
+        let (_env, store) = store("take");
+        store.save_project(&Project::new("core")).unwrap();
+        // Another pane's pass is no bar to this one.
+        verified_by(&store, "t-1", "cpd-7", true);
+
+        assert_eq!(govern_as(&store, "core", &[("workspace", "cpd-3"), ("take", "true")]), 0);
+        assert_eq!(governs(&store.governors(), &seat_query("cpd-3", Some("cpd-3"))).as_deref(), Some("core"));
+    }
+
+    /// The refusal is in `take`, so it is asked of the pane however it got
+    /// there: verifying now, and verified earlier with the seat since ended.
+    /// Each names the pane and the pass, and writes nothing — not the seat it
+    /// asked for, and not the hand-back of a seat it held already.
+    #[test]
+    fn a_pane_that_is_verifying_or_ever_verified_is_refused_every_seat() {
+        let (_env, store) = store("refused");
+        store.save_project(&Project::new("core")).unwrap();
+        verified_by(&store, "t-1", "cpd-7", false);
+        verified_by(&store, "t-2", "cpd-8", true);
+        take(&store, "wsp", "w1", "w1:p1").unwrap();
+        let before = governors_bytes(&store);
+
+        for (pane, member) in [("cpd-7", "t-1"), ("cpd-8", "t-2")] {
+            let v = take(&store, "core", pane, pane).expect_err(pane);
+            assert_eq!((v.seat.as_str(), v.member.as_str()), (pane, member));
+            let said = v.refusal("core");
+            assert!(said.contains(pane) && said.contains(member) && said.contains(&v.at), "{said}");
+            assert_eq!(governors_bytes(&store), before, "{pane} was refused and governors.json moved");
+
+            assert_eq!(govern_as(&store, "core", &[("workspace", pane), ("take", "true")]), 1, "{pane}");
+            assert_eq!(governors_bytes(&store), before, "--take from {pane} moved governors.json");
+        }
+    }
+
+    /// "Ever" reaches past the live rows: a member archived after its verdict,
+    /// and a Verify row from before `wsp-188` whose claim was released.
+    #[test]
+    fn an_archived_member_and_a_released_verify_row_still_bar_their_panes() {
+        let (_env, store) = store("ever");
+        verified_by(&store, "t-1", "cpd-9", true);
+        let archived = store.find_task("t-1").unwrap();
+        store.archive_task(&archived).unwrap();
+
+        let mut row = crate::model::Task::new("Verify t-2", "t-3");
+        row.parent = Some("t-2".into());
+        row.tags = vec![crate::verification::VERIFY_TAG.into()];
+        crate::model::set_section_in(&mut row.body, "Overview", "wsp spawned you when t-2 landed");
+        crate::model::set_section_in(
+            &mut row.body,
+            "Log",
+            "- 2026-10-01T10:00:00Z claimed by pane cpd-10 · spawned at opus/high\n\
+             - 2026-10-01T10:20:00Z released after 20m\n\
+             - 2026-10-01T10:30:00Z claimed by pane cpd-11 · spawned at opus/high",
+        );
+        store.save_task(&row).unwrap();
+
+        assert_eq!(take(&store, "core", "cpd-9", "cpd-9").expect_err("archived").member, "t-1");
+        assert_eq!(take(&store, "core", "cpd-10", "cpd-10").expect_err("released").member, "t-2");
+        assert_eq!(take(&store, "core", "cpd-11", "cpd-11").expect_err("last").member, "t-2");
+        assert!(store.governors().is_empty());
     }
 }

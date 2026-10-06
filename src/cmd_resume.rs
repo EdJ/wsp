@@ -874,11 +874,13 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
         }
         (None, Some(project)) => match place.room(&seat) {
             Some(ws) => {
-                cmd_govern::take(store, project, &ws, seat.as_str());
+                if let Err(v) = cmd_govern::take(store, project, &ws, seat.as_str()) {
+                    return Err(v.refusal(project).trim_start_matches("wsp: ").to_string());
+                }
             }
             None => eprintln!(
                 "wsp: opened {seat} but could not record the {project} seat — \
-                 run `wsp govern {project}` in it"
+                 run `wsp govern {project} --take` in it"
             ),
         },
         (None, None) => {}
@@ -1577,7 +1579,7 @@ mod tests {
             &store,
             [("w1", "w1:p6", "ses_fdaf7f65", "/tmp/tree", "opencode")].into_iter(),
         );
-        cmd_govern::take(&store, "wsp", "w1", "w1:p9");
+        cmd_govern::take(&store, "wsp", "w1", "w1:p9").unwrap();
         assert_eq!(
             thread_for_seat(&store, "wsp").map(|t| t.kind),
             Some("opencode".to_string()),
@@ -1680,10 +1682,10 @@ mod tests {
             &store,
             [("w1", "w1:p1", "sess", "/tmp/tree", "claude")].into_iter(),
         );
-        cmd_govern::take(&store, "wsp", "w1", "w1:p9");
+        cmd_govern::take(&store, "wsp", "w1", "w1:p9").unwrap();
         assert_eq!(thread_for_seat(&store, "wsp").map(|t| t.session), Some("sess".to_string()));
 
-        cmd_govern::take(&store, "wsp", "w2", "w2:p1");
+        cmd_govern::take(&store, "wsp", "w2", "w2:p1").unwrap();
         assert_eq!(
             cmd_govern::last_seat(&store.governors(), "wsp").map(|s| s.session),
             Some(String::new()),
