@@ -1033,6 +1033,19 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
                 s.settlement.word(),
                 s.id
             ));
+            // `wsp-226`: the seat alone was told, and by its order a governor
+            // does not relay — so a member that ran `wsp review` without
+            // `wsp land` sat at its prompt while the run stood behind it. The
+            // member is the one who can act, and it is still claimed; one
+            // marker keys both, so it hears this as often as the seat does.
+            tell_member(store, &s.id, &format!(
+                "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
+                 waits on you. Run `wsp land {}`: it puts your commits on the trunk, and the verifier starts on that.",
+                s.id,
+                s.settlement.word(),
+                w.id,
+                s.id
+            ));
         }
     }
     // The barrier's own no-op, one level up and the same silence: every member
@@ -2717,6 +2730,12 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         let gov = governed();
         assert_eq!(gov.len(), 1, "and told: {gov:?}");
         assert!(gov[0].contains("wsp land m-1"), "{}", gov[0]);
+        // `wsp-226`: and the member, on its own pane, because a governor does
+        // not relay and the member is the one who can land.
+        let told = member_told();
+        assert_eq!(told.len(), 1, "the member is told too: {told:?}");
+        assert_eq!(told[0].0, "m-1", "on its own pane: {told:?}");
+        assert!(told[0].1.contains("wsp land m-1"), "with the line that moves it: {}", told[0].1);
 
         // Every pass stamps it; the seat hears it once, because the spool is a
         // queue an agent reads with a whole context behind it.
@@ -2726,6 +2745,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             "the log says it on every pass: a member still waiting has not stopped waiting"
         );
         assert!(governed().is_empty(), "and the seat is not handed the same sentence twice");
+        assert!(member_told().is_empty(), "nor the member: once per reason, like the seat");
     }
 
     /// The barrier's own silence, one level up: every member settled, the run
