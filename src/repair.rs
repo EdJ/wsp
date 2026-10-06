@@ -741,7 +741,8 @@ fn put_back(store: &Store, id: &str) {
 /// on a body written by [`crate::model::append_dated`] is reading a format this
 /// module also writes through.
 ///
-/// **Only since the member's last start or its last spell of waiting**
+/// **Only since the member's last start — the run's, or any claim — or its
+/// last spell of waiting**
 /// (`wsp-171`'s second and third shapes). The mark was read from anywhere in
 /// the log, so the run started `wsp-148` again at 07:55:37 on 2026-10-05 and
 /// the mark its predecessor earned at 23:35 the night before ended the fresh
@@ -752,7 +753,7 @@ fn noticed(t: &Task) -> Option<i64> {
     let log = t.section("Log")?;
     let mut since = None;
     for l in log.lines() {
-        if l.contains(crate::cycle::STARTED_BY) || l.contains(WAITING) {
+        if fresh_start(l) || l.contains(WAITING) {
             since = None;
         } else if l.contains(NOTICED) {
             since = stamp_of(l);
@@ -761,10 +762,25 @@ fn noticed(t: &Task) -> Option<i64> {
     since
 }
 
-/// When the run last started this member, off its `started by wsp:` line.
+/// When this member last had a new agent put on it, off the line that says so.
 fn started_at(t: &Task) -> Option<i64> {
-    t.section("Log")?.lines().filter(|l| l.contains(crate::cycle::STARTED_BY)).last().and_then(stamp_of)
+    t.section("Log")?.lines().filter(|l| fresh_start(l)).last().and_then(stamp_of)
 }
+
+/// The line that marks a new agent on this row: the run's own start, or a
+/// claim from any seat.
+///
+/// **A claim as well as the run's start** (`wsp-194`, the `cpd-333` case of
+/// `wsp-171`'s third item). An agent placed by hand writes only
+/// `claimed by pane …`, never `started by wsp:`, so it was ended on its
+/// predecessor's told-mark the first time it read idle. Whoever put it there,
+/// it is a new agent that has been told nothing.
+fn fresh_start(line: &str) -> bool {
+    line.contains(crate::cycle::STARTED_BY) || line.contains(CLAIMED)
+}
+
+/// The line [`crate::cmd_agent`]'s claim writes on the row, whoever claims.
+const CLAIMED: &str = "claimed by pane ";
 
 /// A `## Log` line's own date — `- <iso> …` — as seconds.
 fn stamp_of(line: &str) -> Option<i64> {
@@ -2263,6 +2279,48 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         assert!(member_told().is_empty(), "nor is a start minutes old told to finish");
         let endings = stamped().iter().filter(|l| l.contains("ending it, and the run starts it again")).count();
         assert_eq!(endings, 0, "and nothing repeats the ending it already did");
+    }
+
+    /// `wsp-194`, the `cpd-333` case: an agent put on the row **by hand** writes
+    /// `claimed by pane …` and never `started by wsp:`, and it was ended on its
+    /// predecessor's told-mark the first time it read idle. A claim is a fresh
+    /// start: no tell and no ending inside the threshold, and past it the new
+    /// agent is told first, not ended.
+    #[test]
+    fn a_hand_claim_on_a_new_seat_is_a_fresh_start_and_not_ended_on_the_old_mark() {
+        let (_env, store) = in_flight("handclaim");
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "the first agent is told");
+        age_the_notice(&store, "m-1");
+
+        // A person places a new agent on the row, in a new seat.
+        store.clear_binding("cpd-1");
+        claim(&store, "m-1", "cpd-2");
+        let mut t = store.find_task("m-1").unwrap();
+        t.log("claimed by pane cpd-2");
+        store.save_task(&t).unwrap();
+        let _ = stamped();
+
+        let fresh = Fake::new(&[("cpd-2", Some(State::Idle))]);
+        for _ in 0..3 {
+            tick(&store, &fresh, &mut Pass::new());
+        }
+        assert!(ended().is_empty(), "the predecessor's mark does not end the agent a person placed");
+        assert!(member_told().is_empty(), "and a claim minutes old is not told to finish");
+        assert!(!stamped().iter().any(|l| l.contains("ending it")));
+
+        // Past the threshold the new agent is told, once, and not ended.
+        let mut t = store.find_task("m-1").unwrap();
+        let log = t.section("Log").unwrap_or_default();
+        let aged: Vec<String> = log
+            .lines()
+            .map(|l| if l.contains("claimed by pane cpd-2") { format!("- 2026-01-01T00:00:00Z{}", &l[10..]) } else { l.to_string() })
+            .collect();
+        crate::model::set_section_in(&mut t.body, "Log", &format!("## Log\n\n{}\n", aged.join("\n")));
+        store.save_task(&t).unwrap();
+        tick(&store, &fresh, &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "told afresh once its own threshold has passed");
+        assert!(ended().is_empty(), "and told before it can be ended");
     }
 
     /// `wsp-171`'s second half: before an agent is ended, for whatever reason,
