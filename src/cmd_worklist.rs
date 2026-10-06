@@ -4831,6 +4831,9 @@ mod tests {
     /// and the check is told it still ends with `go` or `hold`.
     #[test]
     fn a_follow_up_groups_barrier_is_refused_more_and_its_findings_reach_the_governor() {
+        // `--next` goes on to `go_with`, whose sweep asks herdr who is standing
+        // in each tree, so this one needs a herdr of its own.
+        let _env = util::isolated("followup-round");
         let store = scratch("followup-round");
         task(&store, "wl-001", "review");
         task(&store, "wl-002", "todo");
