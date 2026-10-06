@@ -18,7 +18,10 @@
 //! record, and nowhere else. The verifier's pane is `wsp-188`'s too:
 //! [`crate::cycle::passes_finished`] ends every pass with its verdict in, once,
 //! and runs before [`tick`] in the same repair pass — so this module ends the
-//! member and only the member.
+//! member and only the member. What it lends the verifier's ending is the
+//! confirmation: [`verifier_pids`] before the despawn and [`confirm_gone`]
+//! after it, read through the same [`Seats`], so a pass is `ended` on the same
+//! evidence a member is.
 //!
 //! # What is never ended, and how each is read
 //!
@@ -71,6 +74,9 @@ const NOT_ENDED: &str = "wsp: could not end";
 /// The line on a member's row saying its agent is being left running for a
 /// reason that will not pass by itself.
 const LEFT: &str = "wsp: verification holds and the agent is left running —";
+
+/// The line on a member's row saying its verifier's pane is left running.
+const VERIFIER_LEFT: &str = "wsp: the verifier is left running —";
 
 /// How long a despawned agent's processes are given to exit before the ending
 /// is called failed. `compound`'s own `stop` already waits out `TERM` and sends
@@ -272,7 +278,8 @@ fn end_one(store: &Store, seats: &dyn Seats, w: &Worklist, member: &str, h: &Hol
 }
 
 /// `Ok` once none of `pids` is running, waiting [`GONE_WITHIN_MS`] at most.
-fn confirm_gone(seats: &dyn Seats, pids: &[u32]) -> Result<(), String> {
+/// The member's check, and the verifier's in [`crate::cycle::end_passes`].
+pub(crate) fn confirm_gone(seats: &dyn Seats, pids: &[u32]) -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(GONE_WITHIN_MS);
     loop {
         let running = seats.running(pids);
@@ -284,6 +291,48 @@ fn confirm_gone(seats: &dyn Seats, pids: &[u32]) -> Result<(), String> {
             return Err(format!("despawned, and pid {list} is still running"));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// A verifier's seat, read before [`crate::cycle::end_passes`] closes it: the
+/// pids its ending is confirmed by, or why it is left.
+///
+/// **The member's rule, less what does not apply to a verifier.** A seat that
+/// reads `Gone` or `Empty` has nothing in it to confirm; one nobody can read is
+/// left silently and asked again next tick; one with no pid is [`Left::NoPid`],
+/// left and said, because closing a pane that nothing confirms is how the
+/// `ppid=1` survivor became invisible. No turn, prompt or typed check: a
+/// verifier is ended on its own verdict, or because a later landing made its
+/// reading worthless, and both stand whatever its screen shows.
+pub(crate) fn verifier_pids(seats: &dyn Seats, seat: &str) -> Result<Vec<u32>, Left> {
+    if let Some(pids) = seats.pids(seat).filter(|p| !p.is_empty()) {
+        return Ok(pids);
+    }
+    match seats.state(seat) {
+        Some(State::Gone | State::Empty) => Ok(Vec::new()),
+        None => Err(Left::Unreadable),
+        Some(_) => Err(Left::NoPid),
+    }
+}
+
+/// A verifier left running for a reason that will not pass: said once per
+/// pass, on the member's row, in `cycle.log`, and to the run's governor.
+pub(crate) fn say_verifier_left(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, opened: &str, why: &Left) {
+    if why.passes() {
+        return;
+    }
+    let line = format!("{VERIFIER_LEFT} {member} ({seat}, opened {opened}): {}", why.sentence());
+    if !once(store, member, &line) {
+        return;
+    }
+    let by = w.map_or(member, |w| w.id.as_str());
+    crate::cycle::log_line(store, &format!("{by} {member}: {}", line.trim_start_matches("wsp: ")));
+    if let Some(w) = w {
+        crate::cycle::tell(store, w, &format!(
+            "The verifier of {member} in {seat} is left running: {}. \
+             `wsp despawn --pane {seat}` is the hand version.",
+            why.sentence()
+        ));
     }
 }
 
@@ -349,6 +398,7 @@ mod tests {
     use super::*;
     use crate::cycle::tests::{DESPAWN_FAILS, ENDED as DESPAWNED, SAID, TOLD};
     use crate::model::Group;
+    use crate::verification::Ending;
     use std::collections::BTreeMap;
 
     /// Seats scripted per seat: what each reads, whether a turn began since the
@@ -440,7 +490,7 @@ mod tests {
     /// One repair pass, in its order: `wsp-188` ends the verifier seats whose
     /// verdict is in, and then this module ends the members.
     fn pass(store: &Store, seats: &Fake) {
-        crate::cycle::passes_finished(store);
+        crate::cycle::passes_finished(store, seats);
         tick(store, seats);
     }
 
@@ -458,6 +508,7 @@ mod tests {
         let seats = Fake::at_rest();
         pass(&store, &seats);
         assert_eq!(drain(&DESPAWNED), vec!["cpd-2".to_string(), "m-1".to_string()], "the verifier's pane and the member's agent");
+        assert_eq!(verifier_ending(&store), Ending::Ended, "pids 202 and 203 read before, and neither running after");
         let log = log_of(&store, "m-1");
         assert_eq!(log.matches("ended: verification holds at abc1234").count(), 1, "{log}");
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Review, "ending its agent is not done, which is Ed's");
@@ -601,6 +652,46 @@ mod tests {
         assert!(!log.contains("ended: verification holds"), "the seat closed and pid 102 did not: {log}");
         assert!(log.contains("pid 102 is still running"), "{log}");
         assert_eq!(drain(&TOLD).iter().filter(|t| t.contains("102")).count(), 1);
+    }
+
+    fn verifier_ending(store: &Store) -> Ending {
+        crate::verification::passes(&store.find_task("m-1").unwrap())[0].ending.clone()
+    }
+
+    #[test]
+    fn a_verifier_whose_pid_outlives_its_pane_is_a_failed_ending_told_once() {
+        let (_env, store) = verified("vpid");
+        let mut seats = Fake::at_rest();
+        seats.survives = vec![203];
+        pass(&store, &seats);
+        assert!(
+            matches!(verifier_ending(&store), Ending::Failed(why) if why.contains("pid 203 is still running")),
+            "the pane closed and 203 did not: that is not an ending"
+        );
+        assert_eq!(drain(&TOLD).iter().filter(|t| t.contains("verifier of m-1") && t.contains("203")).count(), 1);
+        drain(&DESPAWNED);
+        pass(&store, &seats);
+        assert!(!drain(&DESPAWNED).contains(&"cpd-2".to_string()), "a failure is not tried again every tick");
+        assert!(drain(&TOLD).iter().all(|t| !t.contains("verifier of m-1")), "nor told again");
+    }
+
+    #[test]
+    fn a_verifier_with_no_pid_to_confirm_by_is_left_and_said_once() {
+        let (_env, store) = verified("vnopid");
+        let mut seats = Fake::at_rest();
+        seats.pids.remove("cpd-2");
+        pass(&store, &seats);
+        assert!(!drain(&DESPAWNED).contains(&"cpd-2".to_string()), "nothing could confirm it, so it is not closed");
+        assert_eq!(verifier_ending(&store), Ending::Standing, "and stays standing to be asked again");
+        assert_eq!(drain(&TOLD).iter().filter(|t| t.contains("verifier of m-1") && t.contains("left running")).count(), 1);
+        pass(&store, &seats);
+        assert!(drain(&TOLD).iter().all(|t| !t.contains("verifier of m-1")), "said once, not every tick");
+        assert_eq!(log_of(&store, "m-1").matches("the verifier is left running").count(), 1);
+
+        seats.state.insert("cpd-2".into(), State::Gone);
+        pass(&store, &seats);
+        assert!(drain(&DESPAWNED).contains(&"cpd-2".to_string()), "a seat with nobody left in it has nothing to confirm");
+        assert_eq!(verifier_ending(&store), Ending::Ended);
     }
 
     #[test]

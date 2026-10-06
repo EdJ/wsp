@@ -241,7 +241,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And every pass on a member whose verdict is in, or that a newer landing
     // superseded — `wsp-188`'s verifiers hold no claim, so the line above
     // never sees them. Each is ended once, with the outcome on the pass.
-    let ended = crate::cycle::passes_finished(store);
+    let ended = crate::cycle::passes_finished(store, seats);
     if !ended.is_empty() {
         stamp(store, &format!("verifier seat(s) with nothing left to do, ended: {}", ended.join(" ")));
     }
@@ -2744,7 +2744,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         claim(&store, "m-1", "cpd-1");
         claim(&store, "m-2", "cpd-2");
         let _ = crate::cycle::tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
-        crate::cycle::end_group(&store, &w, 1);
+        crate::cycle::end_group(&store, &crate::cycle::tests::Exits, &w, 1);
         let standing = crate::cycle::tests::ENDED.with(|e| e.borrow().clone());
         assert!(
             standing.contains(&"m-1".to_string()) && standing.contains(&"m-2".to_string()),

@@ -3333,7 +3333,7 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     // a verifier that has recorded its verdict, a barrier check that has run its
     // `hold`. `wsp release` is refused for a seat, so the honest ending is the
     // whole one, and it is the seat that is told what happened.
-    crate::cycle::end_what_the_run_opened(store, &w.id, pos.at);
+    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at);
 
     if args.json() {
         println!(
@@ -3624,7 +3624,7 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     // be typed on a list with work still open — that is its documented meaning —
     // and ending a member's agent on a list somebody meant to come back to is
     // not something to do without saying.
-    crate::cycle::end_what_the_run_opened(store, &w.id, pos.at);
+    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at);
 
     if args.json() {
         println!(

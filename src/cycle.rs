@@ -419,7 +419,7 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
                     // rather than a seat that is about to be ended. Not on the
                     // last pass: there is nothing left to govern.
                     if let Some(n) = passed {
-                        end_behind(store, &w, n);
+                        end_behind(store, &Fleet, &w, n);
                         if n < w.groups().len() {
                             rotate(store, &w);
                         }
@@ -633,7 +633,7 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
         if let Some(opened) = open_verifier(store, &member, &on) {
             if let Some(seat) = &opened.superseded {
                 stamp(&format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id));
-                end_passes(store, &member.id, |p| p.state == crate::verification::State::Superseded);
+                end_passes(store, seats, &member.id, |p| p.state == crate::verification::State::Superseded);
             }
             if spawn(store, &member.id, &on, Undo::Verifier, (&w.id, &at.to_string())) {
                 started.push(crate::verification::seat_label(&member.id));
@@ -1401,8 +1401,8 @@ fn failed(store: &Store, w: &Worklist, id: &str) {
 /// own row; it is ended at the next pass instead, when it has long been idle.
 /// The governor used to do all of this by hand, and a run wsp starts has to be
 /// a run wsp tidies, or every group leaves its agents standing.
-fn end_behind(store: &Store, w: &Worklist, passed: usize) {
-    end_group(store, w, passed);
+fn end_behind(store: &Store, seats: &dyn Seats, w: &Worklist, passed: usize) {
+    end_group(store, seats, w, passed);
 }
 
 /// Every row a passed group opened, ended. `wsp-158`.
@@ -1430,7 +1430,7 @@ fn end_behind(store: &Store, w: &Worklist, passed: usize) {
 /// Every row of the previous barrier, not the one with the bare title: a group
 /// that held twice has two rows (`wsp-136` item 2), and a re-check is an agent
 /// like any other.
-pub(crate) fn end_group(store: &Store, w: &Worklist, passed: usize) {
+pub(crate) fn end_group(store: &Store, seats: &dyn Seats, w: &Worklist, passed: usize) {
     let groups = w.groups();
     let Some(g) = groups.get(passed - 1) else { return };
     let tasks = store.tasks();
@@ -1451,7 +1451,7 @@ pub(crate) fn end_group(store: &Store, w: &Worklist, passed: usize) {
     // The verifiers first: each stands in its member's tree, and a member
     // ended while its verifier is still in there keeps a tree nobody needs.
     for m in &g.members {
-        end_passes(store, m, |_| true);
+        end_passes(store, seats, m, |_| true);
     }
     end_all(store, ids);
 }
@@ -1571,7 +1571,7 @@ fn group_of(t: &Task, list: &str) -> Option<usize> {
 /// **Said, not done quietly.** The seat is told, because ending an agent on work
 /// somebody may have meant to return to is not a thing to do without a record,
 /// and `cycle.log` is where the record of a run is read.
-pub(crate) fn end_what_the_run_opened(store: &Store, list: &str, at: Option<usize>) {
+pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &str, at: Option<usize>) {
     let Some(w) = store.worklist(list) else { return };
     let tasks = store.tasks();
     let mut ids: Vec<String> = Vec::new();
@@ -1620,7 +1620,7 @@ pub(crate) fn end_what_the_run_opened(store: &Store, list: &str, at: Option<usiz
     };
     let mut passes_ended: Vec<String> = Vec::new();
     for m in &members {
-        passes_ended.extend(end_passes(store, m, |_| true));
+        passes_ended.extend(end_passes(store, seats, m, |_| true));
     }
     let claims = store.claims();
     let standing: Vec<String> = ids.iter().filter(|id| claims.contains_key(*id)).cloned().collect();
@@ -1703,13 +1703,13 @@ pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
 /// reason: `wsp verified` is the agent's own last turn, and ending it inside
 /// that turn cuts it short. A tick later it has long been idle, and the entry
 /// is the record that it has not been ended yet.
-pub(crate) fn passes_finished(store: &Store) -> Vec<String> {
+pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     use crate::verification::{passes, State};
     let mut out = Vec::new();
     for t in store.tasks().iter().filter(|t| t.body.contains("## Verification")) {
         let done = passes(t).iter().any(|p| p.standing() && p.state != State::Running);
         if done {
-            out.extend(end_passes(store, &t.id, |p| p.state != State::Running));
+            out.extend(end_passes(store, seats, &t.id, |p| p.state != State::Running));
         }
     }
     out
@@ -1724,15 +1724,29 @@ pub(crate) fn passes_finished(store: &Store) -> Vec<String> {
 /// none of them a different answer. A seat that will not end is a person's to
 /// look at, and the entry is where they find which one.
 ///
+/// **Ended means gone, as for the member** (`wsp-193`): the seat's process
+/// tree is read before the despawn, and the pass is `ended` only once none of
+/// it is running. A pid still running after it is `end failed`, on the same
+/// once-only terms. A seat with no pid to confirm by is not ended at all —
+/// see [`crate::ending::verifier_pids`] — and stays standing to be asked again.
+///
 /// Returns the seats it ended.
-pub(crate) fn end_passes(store: &Store, member: &str, which: impl Fn(&crate::verification::Pass) -> bool) -> Vec<String> {
+pub(crate) fn end_passes(store: &Store, seats: &dyn Seats, member: &str, which: impl Fn(&crate::verification::Pass) -> bool) -> Vec<String> {
     use crate::verification::{passes, write, Ending};
     let Some(t) = store.find_task(member) else { return Vec::new() };
     let due: Vec<_> = passes(&t).into_iter().filter(|p| p.standing() && which(p)).collect();
     let mut ended = Vec::new();
     for p in due {
         let Some(seat) = p.pane.clone() else { continue };
-        let outcome = despawn_seat(&seat);
+        let pids = match crate::ending::verifier_pids(seats, &seat) {
+            Ok(pids) => pids,
+            Err(why) => {
+                let w = store.find_task(member).and_then(|t| list_of(store, &t));
+                crate::ending::say_verifier_left(store, w.as_ref(), member, &seat, &p.at, &why);
+                continue;
+            }
+        };
+        let outcome = despawn_seat(&seat).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
             Ok(()) => Ending::Ended,
             Err(why) => Ending::Failed(why.clone()),
@@ -1759,7 +1773,7 @@ pub(crate) fn end_passes(store: &Store, member: &str, which: impl Fn(&crate::ver
                 if let Some(w) = list {
                     tell(store, &w, &format!(
                         "wsp could not end the verifier of {member} in {seat}: {}. It is not tried again — \
-                         `wsp despawn --pane {seat}` if it is still standing.",
+                         `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
                         util::truncate(&why, 200)
                     ));
                 }
@@ -2070,6 +2084,22 @@ pub(crate) mod tests {
     impl Seats for Blind {
         fn state(&self, _seat: &str) -> Option<State> {
             None
+        }
+    }
+
+    /// Every seat names a process, and every process has exited by the time
+    /// anyone looks — what a verifier's ending is confirmed by (`wsp-193`).
+    pub(crate) struct Exits;
+
+    impl Seats for Exits {
+        fn state(&self, _seat: &str) -> Option<State> {
+            None
+        }
+        fn pids(&self, _seat: &str) -> Option<Vec<u32>> {
+            Some(vec![1])
+        }
+        fn running(&self, _pids: &[u32]) -> Vec<u32> {
+            Vec::new()
         }
     }
 
@@ -2704,15 +2734,15 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
         assert!(crate::verification::name_seat(&store, "m-1", "cpd-9"), "what `spawn --verify` writes");
 
-        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
         assert!(drained(&ENDED).is_empty(), "a verifier still reading is not ended by a tick");
 
         crate::verification::record(&store, "m-1", V::Holds, "it holds", Some("cpd-9")).unwrap();
-        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
         assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "a verdict is the last thing a verifier is asked for");
         assert_eq!(passes_on(&store, "m-1")[0].ending, Ending::Ended, "and the pass says so");
 
-        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
         assert!(drained(&ENDED).is_empty(), "ended once: the next tick finds nothing standing");
     }
 
@@ -2735,13 +2765,13 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = drained(&TOLD);
 
         END_FAIL.with(|f| *f.borrow_mut() = Some("cpd-9 is still standing: no answer".into()));
-        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
         assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "having said what has to change is the end of its job");
         assert!(matches!(&passes_on(&store, "m-1")[0].ending, Ending::Failed(why) if why.contains("no answer")));
         let told = drained(&TOLD);
         assert_eq!(told.iter().filter(|t| t.contains("could not end the verifier of m-1")).count(), 1, "{told:?}");
 
-        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
         END_FAIL.with(|f| *f.borrow_mut() = None);
         assert!(drained(&ENDED).is_empty(), "a failed ending is not tried again every tick");
         assert!(!drained(&TOLD).iter().any(|t| t.contains("could not end")), "nor told again");
@@ -2775,7 +2805,7 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&other).unwrap();
         store.set_claim("h-2", serde_json::json!({ "workspace": "w2" }));
 
-        end_group(&store, &w, 1);
+        end_group(&store, &Exits, &w, 1);
         let mut was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
         was.sort();
         assert_eq!(
@@ -2809,7 +2839,7 @@ fn only_a_working_screen_is_ever_overruled() {
         }
         let _ = drained(&TOLD);
 
-        end_what_the_run_opened(&store, "run", Some(1));
+        end_what_the_run_opened(&store, &Exits, "run", Some(1));
         let mut was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
         was.sort();
         let mut expected = vec!["b-1".to_string(), "h-1".to_string(), "m-1".to_string(), "cpd-9".to_string()];
@@ -2890,7 +2920,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let mut m = store.find_task("m-1").unwrap();
         m.log(&format!("{} def5678 on master", crate::repair::LANDED));
         store.save_task(&m).unwrap();
-        step(&store, &w, &Blind);
+        step(&store, &w, &Exits);
         assert_eq!(drained(&ENDED), vec!["cpd-1".to_string()], "the verifier reading the old commit is ended at once");
         assert_eq!(drained(&SPAWNED), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and a fresh one starts");
         let ps = passes_on(&store, "m-1");
@@ -3090,7 +3120,7 @@ fn only_a_working_screen_is_ever_overruled() {
         for id in ["m-1", "m-2", "v-1", "b-1", "b-2"] {
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
-        end_behind(&store, &w, 2);
+        end_behind(&store, &Exits, &w, 2);
         let mut ended = ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
         // Sorted, because the list is built from several walks and the order it
         // comes out in is not a fact anybody should be asserting.
