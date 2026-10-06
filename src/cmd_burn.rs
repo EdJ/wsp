@@ -47,8 +47,9 @@ struct Price {
 
 /// When [`PRICES`] was last checked against the first-party price reference.
 /// Printed under the report, so the reader sees the age of the quote beside
-/// the money it produced.
-const PRICES_READ: &str = "2026-08-26";
+/// the money it produced. Move it only when the page has actually been
+/// re-read: the date is a claim about what the table was checked against.
+const PRICES_READ: &str = "2026-10-06";
 
 /// **List prices, first-party Anthropic API, read on [`PRICES_READ`].** This is
 /// the thing in wsp that goes stale without saying so, which is why it is a
@@ -56,13 +57,19 @@ const PRICES_READ: &str = "2026-08-26";
 /// same bargain the cache multipliers below make, and the reason `core-049`'s
 /// `CACHE_DISCOUNT` was written down instead of inlined.
 ///
-/// **A reading date does not protect an introductory price.** A list price
-/// goes stale unpredictably; an introductory one goes stale on a date that is
-/// known the day the row is typed. `core-056`: Sonnet 5 was entered at its
-/// introductory $2/$10, which ended 2026-08-31, and every sonnet seat was
-/// under-billed by a third from the next day. A row priced on a promotion says
-/// so and carries its end date beside it; a row with no such note is a
-/// standing rate.
+/// **A reading date does not protect a promotional price, and a known end date
+/// is not a known outcome.** A list price goes stale unpredictably; an
+/// introductory one is due to change on a date known the day the row is typed.
+/// `core-056`: Sonnet 5 was entered at its introductory $2/$10, due to end
+/// 2026-08-31 with a step to $3/$15, and that step was then cancelled — $2/$10
+/// is the standard price. The row was right all along, and a first fix made
+/// from the brief's account rather than the page over-billed sonnet by half.
+/// So a row priced on a promotion carries its end date beside it, and the date
+/// is a prompt to re-read the page, not a number to apply.
+///
+/// The page lists models whose cache-read multiplier differs from the tenth
+/// below (Opus 5.5 at $4/$20 with reads at 0.05x, Fable 5.1 and Mythos 5.1 at
+/// 0.025x); this table does not model them.
 ///
 /// Matched as a prefix, longest-specific first, because a model id carries a
 /// date or a variant wsp has no business parsing (`claude-opus-5`,
@@ -74,13 +81,13 @@ const PRICES: &[(&str, Price)] = &[
     ("claude-fable", Price { input: 10_000_000, output: 50_000_000 }),
     ("claude-mythos", Price { input: 10_000_000, output: 50_000_000 }),
     ("claude-opus", Price { input: 5_000_000, output: 25_000_000 }),
-    // Sonnet 4.x and Sonnet 5 were once not the same price, and the fleet runs
-    // both: `d5f0956` starts work under a seat on sonnet while seats stay on
-    // the settings tier, so this is the row most likely to be read. Sonnet 5's
-    // introductory $2/$10 ended 2026-08-31; the standing rate is $3/$15, the
-    // same as 4.x, and the 4.x row stays so the two can diverge again.
+    // Sonnet 4.x and Sonnet 5 are not the same price, and the fleet runs both:
+    // `d5f0956` starts work under a seat on sonnet while seats stay on the
+    // settings tier, so this is the row most likely to be read. Sonnet 5's
+    // $2/$10 was introductory through 2026-08-31; the step to $3/$15 that was
+    // to follow was cancelled and $2/$10 is now the standard price.
     ("claude-sonnet-4", Price { input: 3_000_000, output: 15_000_000 }),
-    ("claude-sonnet", Price { input: 3_000_000, output: 15_000_000 }),
+    ("claude-sonnet", Price { input: 2_000_000, output: 10_000_000 }),
     ("claude-haiku", Price { input: 1_000_000, output: 5_000_000 }),
 ];
 
@@ -323,11 +330,15 @@ mod tests {
         .unwrap();
     }
 
-    /// `core-056`: Sonnet 5's introductory rate ended 2026-08-31. The standing
-    /// rate is $3/$15, and a sonnet request must not price below it.
+    /// `core-056`: Sonnet 5's $3/$15 step was cancelled, so $2/$10 is its
+    /// standard price, and Sonnet 4.x is a separate $3/$15. Pinned apart, so
+    /// neither can be moved to the other's number without a test saying so.
     #[test]
-    fn sonnet_five_is_priced_at_its_standing_rate() {
-        for model in ["claude-sonnet-5", "claude-sonnet-5-5", "claude-sonnet-4-5"] {
+    fn sonnet_five_and_sonnet_four_are_priced_apart() {
+        for model in ["claude-sonnet-5", "claude-sonnet-5-5"] {
+            assert_eq!(cost(model, 1_000_000, 1_000_000, 0, 0), 12_000_000, "{model}");
+        }
+        for model in ["claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6"] {
             assert_eq!(cost(model, 1_000_000, 1_000_000, 0, 0), 18_000_000, "{model}");
         }
     }
