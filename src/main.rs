@@ -1712,6 +1712,9 @@ fn help_text() -> String {
                                     does this by itself for a list that is
                                     running; by hand is for a post nobody has
                                     started yet
+  wsp govern <proj> --model M [--effort E]
+                                    the tier this seat's successors start on,
+                                    recorded without touching the pane in it
   wsp spawn -p <proj> --govern      fill an empty seat directly: a workspace on
                                     the project, an agent in it, the seat taken,
                                     and a custodial work order rather than a

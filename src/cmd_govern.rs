@@ -1442,6 +1442,64 @@ pub fn reseat_why(governors: &BTreeMap<String, Value>, scope: &str) -> Option<St
         .map(str::to_string)
 }
 
+/// `wsp govern <scope> --model M --effort E`: the tier this seat's successors
+/// start on, recorded on a seat that is already standing.
+///
+/// **The pane is not touched** (`wsp-177`). A rotation or a reseat reads the
+/// tier off the record, and before `wsp-177` `spawn --govern` never wrote it.
+/// So a seat a person started at opus/high had lost that tier by its first
+/// rotation, and the only ways to put it back were to end a working governor
+/// or to edit `governors.json` by hand. The agent in the seat keeps running as
+/// it was started. What changes is what its successor is started on, which is
+/// what the line printed says.
+///
+/// A filled seat only. An empty one is filled at a tier by `wsp spawn -p
+/// <scope> --govern --model … --effort …`, which now records it.
+fn set_tier(store: &Store, args: &Args) -> i32 {
+    let index = Index::new(store.projects());
+    let Some(needle) = args.rest.first() else {
+        eprintln!("usage: wsp govern <project|worklist> --model M --effort E");
+        return 2;
+    };
+    let Some(scope) = scope_of(store, &index, needle) else {
+        eprintln!("wsp: no such project or worklist `{needle}`");
+        return 1;
+    };
+    let governors = store.governors();
+    let Some(seat) = seat_of_scope(&scope, &governors) else {
+        eprintln!("wsp: nobody holds the {scope} seat - `wsp spawn -p {scope} --govern --model M --effort E` fills it at a tier");
+        return 1;
+    };
+    let kind = crate::cmd_spawn::seat_kind(&governors, &scope);
+    // A flag left off keeps what the seat had, so `--effort high` alone does not
+    // drop a recorded model.
+    let (was_model, was_effort) = tier_of(&governors, &scope);
+    let model = args.get("model").filter(|m| !m.is_empty()).or(was_model);
+    let effort = args.get("effort").filter(|e| !e.is_empty()).or(was_effort);
+    // The checks `wsp spawn` makes, because this is the tier a spawn will be
+    // handed later, with nobody watching it come up.
+    let how = crate::agent_commands::of(&kind);
+    if let Err(e) = how.tier(model.as_deref(), effort.as_deref()) {
+        eprintln!("wsp: {e}");
+        return 2;
+    }
+    if let Some(why) = how.unattended(model.as_deref()) {
+        eprintln!("wsp: a governor's successor starts with nobody watching, and {why}");
+        return 2;
+    }
+    note_started(store, &scope, &kind, model.as_deref(), effort.as_deref());
+    let tier = format!(
+        "{}, {} effort",
+        model.as_deref().unwrap_or("the settings model"),
+        effort.as_deref().unwrap_or("the settings")
+    );
+    store.log_event("governor-tier", json!({ "project": scope, "model": model, "effort": effort }));
+    crate::cycle::log_line(store, &format!("{scope}: the seat's successors start at {tier} (set by hand; {} runs as it was started)", seat.pane));
+    println!("{scope}: successors of this seat start at {tier}");
+    println!("  {} itself keeps running as it was started", seat.pane);
+    0
+}
+
 /// When a person stood this seat down, if they did.
 ///
 /// **The marker that makes `--clear` mean something to the reconciler, and it is
@@ -1691,6 +1749,11 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             return 1;
         }
         return crate::cmd_spawn::reseat(store, &scope);
+    }
+    // After `--rotate` and `--reseat`, which take the same two flags as the
+    // tier to start their successor on.
+    if args.has("model") || args.has("effort") {
+        return set_tier(store, args);
     }
     // The other half of a rotation, run by the pane being ended. `--rotate`
     // starts it detached; see [`crate::cmd_spawn::carry_out_ending`].
@@ -2892,6 +2955,32 @@ pub(crate) mod tests {
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         (env, store)
+    }
+
+    /// **`wsp-177`: a tier can be put on a standing seat without ending it**,
+    /// and a rotation or reseat then reads it. A flag left off keeps what was
+    /// there, a typo is refused before anything is written, and an empty seat
+    /// is sent to `spawn --govern`, which records a tier itself.
+    #[test]
+    fn a_tier_is_recorded_on_a_standing_seat_and_the_pane_is_left_alone() {
+        let (_env, store) = store("set-tier");
+        store.save_project(&Project::new("core")).unwrap();
+        let synth = |flags: &[(&str, &str)]| Args::synth("govern", &["core"], flags);
+
+        assert_eq!(govern(&store, &synth(&[("model", "opus"), ("effort", "high")])), 1, "nobody in the seat");
+        assert!(store.governors().get("core").is_none(), "and nothing written");
+
+        take(&store, "core", "w1", "w1:p9").unwrap();
+        assert_eq!(govern(&store, &synth(&[("model", "opus"), ("effort", "high")])), 0);
+        let rec = store.governors()["core"].clone();
+        assert_eq!((rec["model"].as_str(), rec["effort"].as_str()), (Some("opus"), Some("high")), "{rec}");
+        assert_eq!(rec["pane"], "w1:p9", "the seat is the same seat");
+
+        assert_eq!(govern(&store, &synth(&[("effort", "medium")])), 0);
+        assert_eq!(tier_of(&store.governors(), "core"), (Some("opus".into()), Some("medium".into())), "the model was kept");
+
+        assert_eq!(govern(&store, &synth(&[("model", "opsu")])), 2, "a typo is refused");
+        assert_eq!(tier_of(&store.governors(), "core").0.as_deref(), Some("opus"), "and wrote nothing");
     }
 
     /// The property this task turns on, as an assertion: **the slot outlives
