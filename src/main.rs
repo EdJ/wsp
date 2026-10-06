@@ -1844,9 +1844,18 @@ fn help_text() -> String {
                                     trees of the groups behind it, and says
                                     which members of the group that just landed
                                     touched one file
-  wsp worklist hold [<slug>] "why"|-|--from FILE   start nothing more. What is
-                                    already running is left to finish — work in
-                                    flight cannot be unwound
+  wsp worklist hold [<slug>] "why"|-|--from FILE   the barrier's "does not
+                                    pass": start nothing more. What is already
+                                    running is left to finish — work in flight
+                                    cannot be unwound. `go` is its way back, and
+                                    `go` passes the barrier
+  wsp worklist park [<slug>] "why"|-|--from FILE   a person's pause: nothing
+                                    starts, no barrier is checked, its seat is
+                                    not refilled, nothing is ended. `go` and
+                                    `hold` refuse it
+  wsp worklist resume [<slug>] ["…"]  back to where it was parked, at the same
+                                    group or barrier and with the same check
+                                    owed. Records no verdict and passes nothing
   wsp worklist done <slug>          nothing left to want from it
   wsp worklist advance [<slug>]     take the steps a run owes now: spawn its
                                     members, a read-only verifier on each that

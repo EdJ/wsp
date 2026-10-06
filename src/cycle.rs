@@ -290,7 +290,7 @@ pub(crate) fn poke_task(store: &Store, id: &str, verb: &str) {
     launch(store, &["worklist", "advance", "--task", &t.id, "--verb", verb]);
 }
 
-/// After `go` or `hold` on a list: tell whoever governs it, and take the steps
+/// After `go`, `hold`, `park` or `resume` on a list: tell whoever governs it, and take the steps
 /// the new position owes. `passed` is the barrier crossed, if one was.
 pub(crate) fn poke_list(store: &Store, list: &str, event: &str, passed: Option<usize>) {
     let n = passed.map(|n| n.to_string()).unwrap_or_default();
@@ -355,6 +355,20 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
                     "The {} run was held at its barrier: `wsp worklist show {}` has the reason. \
                      wsp starts nothing more until somebody runs `wsp worklist go {}`.",
                     w.id, w.id, w.id
+                )),
+                // `wsp-173`: a person's pause, said as one, and said as not a
+                // barrier — the sentence `hold` sent here told native-window's
+                // seat its barrier had been checked when nobody had.
+                "park" => tell(store, &w, &format!(
+                    "The {} run was parked by somebody: `wsp worklist show {}` has the reason. \
+                     Nothing starts and no barrier is checked, and no verdict was recorded. \
+                     `wsp worklist resume {}` takes it back to where it stood; `go` is refused on it.",
+                    w.id, w.id, w.id
+                )),
+                "resume" => tell(store, &w, &format!(
+                    "The {} run was resumed and stands where it was parked: `wsp worklist next {}` \
+                     says where. A barrier it stood at is still owed and was not passed.",
+                    w.id, w.id
                 )),
                 "go" => {
                     // Whose `go` this was decides what follows it. A group
@@ -1340,11 +1354,16 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
     //
     // A check behind the position has run and been passed. A check in front of
     // it has not, and ending that one would cut the turn it is in.
-    if !pos.finished() && !(w.status() == WorklistStatus::Held) {
+    //
+    // A parked list is the same case as a held one: stopped short of the end,
+    // with checks behind it that have been passed and one in front that has
+    // not. `wsp-173`.
+    let stopped = matches!(w.status(), WorklistStatus::Held | WorklistStatus::Parked);
+    if !pos.finished() && !stopped {
         return Vec::new();
     }
     let behind = pos.at.unwrap_or(usize::MAX);
-    let settled = w.status() == WorklistStatus::Held && !pos.finished();
+    let settled = stopped && !pos.finished();
     let tasks = store.tasks();
     let claims = store.claims();
     let standing: Vec<String> = tasks
@@ -1493,7 +1512,7 @@ pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
     let lists = store.worklists();
     let open = |id: &str| {
         lists.iter().any(|w| {
-            matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held)
+            matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked)
                 && w.groups().iter().any(|g| g.members.contains(&id.to_string()))
         })
     };

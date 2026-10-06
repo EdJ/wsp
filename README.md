@@ -157,7 +157,11 @@ wsp worklist next           # …or `next <slug>` where the workspace holds no s
 wsp worklist go "…"         # pass the barrier: the verdict, the sweep behind it,
                             #   and what may start on the far side — no poll needed
 wsp worklist go --from FILE # …the verdict out of the file it was composed in
-wsp worklist hold "…"       # start nothing more; what is running is left to finish
+wsp worklist hold "…"       # the barrier's "does not pass": start nothing more;
+                            #   what is running is left to finish. `go` passes it
+wsp worklist park "…"       # a person's pause: nothing starts, no barrier is
+                            #   checked, its seat is not refilled. `go` refuses it
+wsp worklist resume         # back to where it was parked, any barrier still owed
 ```
 
 ### The seat is reset per batch

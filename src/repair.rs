@@ -200,7 +200,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     for w in store
         .worklists()
         .into_iter()
-        .filter(|w| matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held))
+        .filter(|w| matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked))
     {
         crate::cycle::end_all(store, crate::cycle::last_barrier_left_behind(store, &w));
     }
@@ -268,13 +268,26 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
         );
     }
     let governors = store.governors();
+    // **A parked list's post is not seated for what it owes either**, and this
+    // is the half of `wsp-173` the status alone does not reach. A parked list
+    // already contributes nothing above, because it is not running; but a seat
+    // with a backlog is seated by the loop below whatever the list under it is
+    // doing, so a person's pause would be undone by the first hand raised on a
+    // member still in flight. Read as the list's post, so a project seat that
+    // also governs a *running* list is already in `out` and keeps its reason.
+    let paused: Vec<String> = store
+        .worklists()
+        .into_iter()
+        .filter(|w| w.status() == WorklistStatus::Parked)
+        .map(|w| crate::cycle::governing_post(store, &w).unwrap_or_else(|| w.id.clone()))
+        .collect();
     // **`scopes_owed`, which is `wsp-178`'s question** — held is not owed:
     // `wsp-166` withholds a governor's non-decisions from its seat, and a scope
     // whose whole spool is withheld owes nothing while `depth() > 0` says it is
     // holding something. `tokenhub-spec-sync` is the live case — three entries,
     // all `edge: left`, reseated every twenty minutes for hours.
     for (scope, owed) in crate::wake::scopes_owed(store) {
-        if governors.contains_key(&scope) {
+        if governors.contains_key(&scope) && !paused.contains(&scope) {
             // The count in the sentence is the count this walk counted, so the
             // line cannot claim a scope owes an answer without a number behind it.
             add(scope, format!("it owes {owed} and nothing is answering it"), &mut out);
@@ -1317,6 +1330,50 @@ impl Seats for Absent {
         a_pass(&store, &Fake::empty());
 
         assert_eq!(reseated(), vec!["run".to_string()], "governors are wsp's to allocate");
+    }
+
+    /// **A person's pause leaves the post empty, and nothing reaches it to
+    /// count.** `wsp-173`: native-window read `running` on 2026-10-05 after Ed
+    /// paused it, so this pass counted `tooling` unseated and was one tick from
+    /// spawning a governor there. Both triggers are tried here — a list whose
+    /// post nobody ever filled, which a running list seats on the first pass,
+    /// and a vacant post with lines owed to it, which the backlog seats
+    /// whatever the list is doing — and neither seats or counts while it is
+    /// parked. Resumed, it is an ordinary vacancy again.
+    #[test]
+    fn a_parked_lists_post_is_never_seated_or_counted_and_a_resume_seats_it() {
+        let (_env, store) = in_flight("seat-parked");
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Parked);
+        store.save_worklist(&w).unwrap();
+        a_pass(&store, &Fake::empty());
+        assert!(reseated().is_empty(), "a post never filled, on a parked list, is left empty");
+
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "host": util::hostname(), "since": "2026-10-04T00:00:00Z", "kind": "claude",
+            }),
+        );
+        held_for(&store, "run", 2);
+        for _ in 0..3 {
+            a_pass(&store, &Fake::empty());
+        }
+        assert!(reseated().is_empty(), "and lines owed to it do not undo the pause");
+        assert_eq!(
+            cmd_govern::vacancy(&store.governors(), "run").unseated,
+            0,
+            "not counted either: a count is a governor on its way"
+        );
+        assert!(!will_seat(&store, "run"), "and the sentence about the seat agrees");
+
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        a_pass(&store, &Fake::empty());
+        a_pass(&store, &Fake::empty());
+        assert_eq!(reseated(), vec!["run".to_string()], "resumed, it is a vacancy like any other");
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 
     /// **And it is the *list's* seat, not a project's.** `governing_post` walks

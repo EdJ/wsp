@@ -98,6 +98,10 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "next" => next(store, args),
         "go" | "start" => go(store, args),
         "hold" | "stop" => hold(store, args),
+        // A person's pause, and its way back. Not `hold`/`go`: those are the
+        // barrier's "does not pass" and its pass — see [`park`].
+        "park" | "pause" => park(store, args),
+        "resume" | "unpark" => resume(store, args),
         "done" | "finish" => done(store, args),
         // `wsp-134`: the steps wsp takes itself. Started by the verbs that
         // make one due, and by hand to repair a trigger that was lost.
@@ -1308,6 +1312,7 @@ fn list_lines(p: &Paint, listed: &[worklist::Listed], all: bool) -> Vec<String> 
 fn heading(s: Segment) -> &'static str {
     match s {
         Segment::Unjudged => "unjudged — the run is over, the rows are not",
+        Segment::Parked => "parked — paused by somebody, and only `resume` moves it",
         other => other.word(),
     }
 }
@@ -1706,6 +1711,10 @@ enum Gate {
     /// Somebody said stop. Nothing more starts until a `go` reopens it, and the
     /// prose is the sentence they wrote.
     Held,
+    /// A person paused the list. Nothing starts, no barrier is checked, and
+    /// the only way past it is `resume`, which lands on whatever gate the
+    /// position stands at — never through it. The prose is their reason.
+    Parked,
 }
 
 /// The front of the run: what may be started now, and what is already going.
@@ -1759,6 +1768,10 @@ enum State {
 /// sentence already goes, one function writes the mark, and a line nobody can
 /// parse costs the reason and nothing else.
 const HELD: &str = "held —";
+
+/// The same, for a pause. Its own mark, so a hold written before a park reads
+/// back as the hold and not as the reason somebody paused.
+const PARKED: &str = "parked —";
 
 fn last_logged(w: &Worklist, mark: &str) -> Option<String> {
     let log = w.section("Log").unwrap_or_default();
@@ -2115,6 +2128,14 @@ fn seated(store: &Store, args: &Args) -> Option<Worklist> {
 /// verdict is written on the group behind it.
 fn state(store: &Store, w: &Worklist, p: &Position) -> State {
     let groups = w.groups();
+    if w.status() == WorklistStatus::Parked {
+        let flight = front(store, groups.get(p.at.unwrap_or(1) - 1), &p.members).waiting.len();
+        return State::Shut {
+            gate: Gate::Parked,
+            prose: last_logged(w, PARKED).unwrap_or_default(),
+            flight,
+        };
+    }
     if w.status() == WorklistStatus::Held {
         let flight = front(store, groups.get(p.at.unwrap_or(1) - 1), &p.members).waiting.len();
         return State::Shut {
@@ -2451,6 +2472,13 @@ fn report(
                     },
                     format!("{} \"…\"  starts it again", how("go", w, seat)),
                 ),
+                Gate::Parked => (
+                    match flight {
+                        0 => "parked — nothing starts and no barrier is checked".to_string(),
+                        n => format!("parked — nothing starts and no barrier is checked · {n} still in flight"),
+                    },
+                    format!("{}  {}", how("resume", w, seat), resumes_to(pos)),
+                ),
                 Gate::After(n) if prose.trim().is_empty() => (
                     // No prose is no judgement asked for, and it is still a
                     // barrier: the sweep behind it and the same-file report are
@@ -2566,7 +2594,9 @@ fn barrier_evidence(store: &Store, w: &Worklist, pos: &Position, st: &State) -> 
     // Held mid-group shuts no barrier over finished work; a draft has none
     // behind any group. What is left is a gate standing in front of a group
     // whose work is over — the one state the walk has an answer for.
-    if w.status() == WorklistStatus::Draft || !pos.at_barrier() {
+    // Nor on a parked one: nobody is deciding that barrier while it is paused,
+    // and `next` polled on a pause would walk git for a reader who is not there.
+    if matches!(w.status(), WorklistStatus::Draft | WorklistStatus::Parked) || !pos.at_barrier() {
         return None;
     }
     let members = w.groups().get(pos.at? - 1)?.members.clone();
@@ -2607,6 +2637,7 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
             v["gate"] = json!(match gate {
                 Gate::Start => "start".to_string(),
                 Gate::Held => "held".to_string(),
+                Gate::Parked => "parked".to_string(),
                 Gate::After(n) => format!("after {n}"),
             });
             v["prose"] = json!(prose);
@@ -2689,6 +2720,15 @@ pub fn go(store: &Store, args: &Args) -> i32 {
     };
     if w.status() == WorklistStatus::Done {
         eprintln!("wsp: `{}` is done — nothing in it is waiting to start", w.id);
+        return 1;
+    }
+    // `wsp-173`: before anything else reads the list, because this is the
+    // refusal the status exists for. A `go` here would be read as "carry on",
+    // and at a barrier `go` is the pass — wsp-process group 3 was passed
+    // unchecked on 2026-10-05 by a governor who meant to resume.
+    if w.status() == WorklistStatus::Parked {
+        eprintln!("wsp: `{}` is parked — `go` passes barriers, and a pause is not one", w.id);
+        eprintln!("     {}  returns it to where it stood, with any barrier there still owed", how("resume", &w, seat));
         return 1;
     }
     let pos = worklist::position(store, &w, Reading::Landed);
@@ -3072,7 +3112,10 @@ fn only_one_running(store: &Store, w: &Worklist, pos: &Position) -> Option<i32> 
     if clash.len() > 6 {
         eprintln!("     …and {} more", clash.len() - 6);
     }
-    eprintln!("     take them out of one of the two, or hold the other — wsp worklist hold <slug> \"why\"");
+    // `park` and not `hold`: setting one list aside for another is a person's
+    // pause, and a hold's way back is `go`, which passes whatever barrier the
+    // held list was standing at. `wsp-173`.
+    eprintln!("     take them out of one of the two, or park the other — wsp worklist park <slug> \"why\"");
     Some(1)
 }
 
@@ -3234,6 +3277,15 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         println!("{} {}", w.id, Paint::new().dim("is already held"));
         return 0;
     }
+    // A paused run has no barrier being decided, so there is no "does not
+    // pass" to record — and taking it would turn a person's pause into a
+    // barrier's hold, whose way back is `go`, the pass. A barrier check still
+    // in flight from before the pause is told this and can say so on its row.
+    if w.status() == WorklistStatus::Parked {
+        eprintln!("wsp: `{}` is parked — no barrier is being decided while it is paused", w.id);
+        eprintln!("     {}  first, and the barrier it stands at is owed again", how("resume", &w, seat));
+        return 1;
+    }
 
     let pos = worklist::position(store, &w, Reading::Landed);
     let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members);
@@ -3284,6 +3336,185 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
         }
     }
     println!("{}", p.dim(&format!("{} \"…\"  starts it again", how("go", &w, seat))));
+    0
+}
+
+// ---- park -------------------------------------------------------------
+
+/// `wsp worklist park [<slug>] "why"` — a person's pause. `wsp-173`.
+///
+/// **Not `hold`, and the difference is the way back.** `hold` is a barrier's
+/// "does not pass", and the verb that answers it is `go` — the pass. A pause
+/// written as a hold can only be resumed by passing whatever barrier the list
+/// was standing at, and on 2026-10-05 that is how wsp-process group 3 was
+/// passed unchecked by a governor who meant to resume. So this has its own
+/// status, its own reason in the log under its own mark, and its own way back
+/// in [`resume`]; and `go` and `hold` both refuse a parked list.
+///
+/// **It records nothing on a group.** The position is derived from verdicts
+/// and tasks, so a pause leaves the run standing exactly where it stood, and a
+/// barrier owed before it is owed after it.
+///
+/// **It ends nothing**, which is where it parts from `hold` the second time.
+/// `hold` ends what the run opened because the run is over at that barrier;
+/// a pause is a run somebody means to come back to, and a member's agent ended
+/// here is work its resume has to start again. What is in flight is said, and
+/// left to land.
+///
+/// **A held list may be parked, and parking takes the hold back.** Every hold
+/// written before this verb existed is a pause that could only be typed as a
+/// verdict — native-window's own log says "a pause of the list, not a verdict
+/// on its group 4 barrier" — so the honest reading is the one that errs toward
+/// checking: resumed, it stands at its barrier with the check owed, and a
+/// barrier that really did not pass is simply checked again.
+pub fn park(store: &Store, args: &Args) -> i32 {
+    let (mut w, said, seat) = match list_and_words(store, args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    if said.trim().is_empty() {
+        eprintln!("wsp: {} \"why\" — a pause with no reason on it is a list nobody knows when to resume", how("park", &w, seat));
+        eprintln!("     `--from FILE` reads the sentence out of a file and `-` off a stream, where a shell never sees it");
+        return 2;
+    }
+    match w.status() {
+        WorklistStatus::Done => {
+            eprintln!("wsp: `{}` is done — there is nothing left in it to pause", w.id);
+            return 1;
+        }
+        WorklistStatus::Draft => {
+            eprintln!("wsp: `{}` has not started — a draft starts nothing until `go`, so there is nothing to pause", w.id);
+            return 1;
+        }
+        WorklistStatus::Parked => {
+            println!("{} {}", w.id, Paint::new().dim("is already parked"));
+            return 0;
+        }
+        WorklistStatus::Running | WorklistStatus::Held => {}
+    }
+    let was_held = w.status() == WorklistStatus::Held;
+    let pos = worklist::position(store, &w, Reading::Landed);
+    let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members);
+
+    w.set_status(WorklistStatus::Parked);
+    w.log(&format!("{PARKED} {}", said.trim()));
+    if was_held {
+        w.log(&format!("the hold before this is taken back — {}", resumes_to(&pos)));
+    }
+    let groups = w.groups();
+    let msg = format!("park {}", w.id);
+    let code = save(store, &mut w, &groups, "park", &msg);
+    if code != 0 {
+        return code;
+    }
+    store.log_event("worklist-parked", json!({ "id": w.id, "why": said, "was": if was_held { "held" } else { "running" } }));
+    crate::cycle::poke_list(store, &w.id, "park", None);
+
+    if args.json() {
+        println!(
+            "{}",
+            json!({
+                "worklist": w.id,
+                "status": w.status().as_str(),
+                "why": said,
+                "at": pos.at,
+                "barrier_owed": pos.at.is_some() && pos.at_barrier(),
+                "took_back_hold": was_held,
+                "in_flight": flight.waiting.iter().map(|(s, _)| s.id.clone()).collect::<Vec<_>>(),
+            })
+        );
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.bold(&w.id), p.dim("parked — nothing starts, and no barrier is checked"));
+    if was_held {
+        println!("{}", p.dim("it was held: the hold is taken back, and no verdict was recorded either way"));
+    }
+    if !flight.waiting.is_empty() {
+        println!("{}", p.dim(&format!("{} still in flight and left to land — a pause ends nothing", flight.waiting.len())));
+        for (s, note) in &flight.waiting {
+            println!("  {}  {}  {}", s.id, util::pad(s.settlement.word(), 7), p.dim(note));
+        }
+    }
+    println!("{}", p.dim(&format!("{}  {}", how("resume", &w, seat), resumes_to(&pos))));
+    0
+}
+
+/// Where a resume lands, said before anybody runs it — on the pause, on `next`,
+/// and in the log — because the one thing a resume must not look like is a pass.
+fn resumes_to(pos: &Position) -> String {
+    match pos.at {
+        None => "returns it with every group finished".to_string(),
+        Some(at) if pos.at_barrier() => format!("returns it to group {at}'s barrier, still owed"),
+        Some(at) => format!("returns it to group {at}"),
+    }
+}
+
+/// `wsp worklist resume [<slug>] ["…"]` — the pause taken back, and nothing else.
+///
+/// **`running` again, and that is the whole of the write.** No verdict, no
+/// sweep, no barrier crossed: the position was never moved, so the gate the
+/// list stood at before the pause is the gate it stands at now, and if it was
+/// a barrier the check is owed exactly as it was. The step that follows is the
+/// cycle's ordinary one, which opens that check if nothing has. A sentence is
+/// optional — the reason worth having was written at the pause.
+pub fn resume(store: &Store, args: &Args) -> i32 {
+    let (mut w, said, seat) = match list_and_words(store, args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    match w.status() {
+        WorklistStatus::Parked => {}
+        WorklistStatus::Running => {
+            println!("{} {}", w.id, Paint::new().dim("is not parked — it is running"));
+            return 0;
+        }
+        // Refused by name, because this is the confusion the verb exists to
+        // end from the other side: a hold is a barrier's, and only `go` — the
+        // pass — answers it.
+        WorklistStatus::Held => {
+            eprintln!("wsp: `{}` is held at a barrier, not parked — `go` passes it, `done` closes it", w.id);
+            return 1;
+        }
+        WorklistStatus::Draft => {
+            eprintln!("wsp: `{}` has not started — {} \"…\" starts it", w.id, how("go", &w, seat));
+            return 1;
+        }
+        WorklistStatus::Done => {
+            eprintln!("wsp: `{}` is done — nothing in it is waiting to start", w.id);
+            return 1;
+        }
+    }
+    let pos = worklist::position(store, &w, Reading::Landed);
+    // Asked again here because a parked list is not running, so while it was
+    // paused another list could have started with one of its members in it.
+    if let Some(code) = only_one_running(store, &w, &pos) {
+        return code;
+    }
+
+    w.set_status(WorklistStatus::Running);
+    let entry = format!("resumed · {}", said.trim());
+    w.log(entry.trim_end_matches(" · ").trim_end());
+    let groups = w.groups();
+    let msg = format!("resume {}", w.id);
+    let code = save(store, &mut w, &groups, "resume", &msg);
+    if code != 0 {
+        return code;
+    }
+    store.log_event("worklist-resumed", json!({ "id": w.id, "at": pos.at, "said": said }));
+    crate::cycle::poke_list(store, &w.id, "resume", None);
+
+    let st = state(store, &w, &pos);
+    let gone = worklist::dangling(store, &w);
+    if args.json() {
+        let mut out = json!({ "worklist": w.id, "status": w.status().as_str(), "at": pos.at });
+        out["next"] = next_json(&w, &pos, &st, &gone, None);
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.bold(&w.id), p.dim(&format!("resumed — {}", resumes_to(&pos).trim_start_matches("returns it "))));
+    report(&w, &pos, &st, &gone, seat, None);
     0
 }
 
@@ -4169,6 +4400,7 @@ mod tests {
             State::Waiting(f) => format!("waiting {}", f.waiting.len()),
             State::Shut { gate: Gate::Start, prose, .. } => format!("start {prose}"),
             State::Shut { gate: Gate::Held, prose, .. } => format!("held {prose}"),
+            State::Shut { gate: Gate::Parked, prose, .. } => format!("parked {prose}"),
             State::Shut { gate: Gate::After(n), prose, .. } => format!("after {n} {prose}"),
             State::Nothing => "nothing".to_string(),
         }
@@ -4705,6 +4937,99 @@ mod tests {
 
         assert_eq!(run(&store, &["go", "batch", "settled", "again"]), 0);
         assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
+    }
+
+    /// `wsp-173`'s done-when: a person's pause at a barrier, and the way back
+    /// from it, leave that barrier exactly as owed as they found it.
+    ///
+    /// The failure it is written against is a resume that passes: on
+    /// 2026-10-05 the only pause was `hold`, the only way back was `go`, and
+    /// `go` at a barrier is the pass — wsp-process group 3 was passed
+    /// unchecked by a governor who meant to carry on. So the verbs that could
+    /// pass it are refused while it is parked, and the resume is checked for
+    /// what it did *not* write as much as for what it did.
+    #[test]
+    fn a_list_parked_at_a_barrier_resumes_with_the_barrier_still_owed_and_no_verdict() {
+        let (_env, store) = running("park");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        flagged(&store, &["group", "batch", "1"], &[("stop", "it has to land clean")]);
+        started(&store, "batch");
+        assert_eq!(gate_of(&store, "batch"), "after 1 it has to land clean", "standing at the barrier");
+
+        assert_eq!(run(&store, &["park", "batch"]), 2, "a pause with no reason on it");
+        assert_eq!(run(&store, &["park", "batch", "Ed", "is", "away"]), 0);
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Parked);
+        assert_eq!(gate_of(&store, "batch"), "parked Ed is away", "and the reason reads back");
+
+        // The two verbs that would decide the barrier, both refused, and
+        // neither leaves a mark.
+        assert_eq!(run(&store, &["go", "batch", "carry", "on"]), 1, "go passes barriers; a pause is not one");
+        assert_eq!(run(&store, &["hold", "batch", "not", "yet"]), 1, "nobody is deciding a barrier while it is paused");
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Parked);
+        assert_eq!(verdicts(&store, "batch")[0], "", "neither wrote at the barrier");
+
+        assert_eq!(run(&store, &["resume", "batch"]), 0);
+        let w = store.worklist("batch").unwrap();
+        assert_eq!(w.status(), WorklistStatus::Running);
+        assert_eq!(verdicts(&store, "batch")[0], "", "a resume records no verdict");
+        assert_eq!(
+            gate_of(&store, "batch"),
+            "after 1 it has to land clean",
+            "the same barrier, still owed and still asking its question"
+        );
+        let log = w.section("Log").unwrap_or_default();
+        assert!(!log.contains("passed"), "nothing was passed: {log}");
+        assert!(log.contains("resumed"), "and the resume is on the record: {log}");
+
+        // Resuming what is not parked does nothing.
+        assert_eq!(run(&store, &["resume", "batch"]), 0, "running already");
+        assert_eq!(verdicts(&store, "batch")[0], "");
+    }
+
+    /// The stand-in case `wsp-173` names: native-window was *held* by a
+    /// governor because `hold` was the only pause there was. Parking a held
+    /// list takes the hold back, and resuming it lands on the barrier with the
+    /// check owed — never on `go`'s side of it. And `resume` refuses a hold,
+    /// whose way back is a verdict.
+    #[test]
+    fn a_held_list_parked_and_resumed_owes_its_barrier_rather_than_passing_it() {
+        let (_env, store) = running("parkheld");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        flagged(&store, &["group", "batch", "1"], &[("stop", "it has to land clean")]);
+        started(&store, "batch");
+
+        assert_eq!(run(&store, &["hold", "batch", "a", "pause", "really"]), 0);
+        assert_eq!(run(&store, &["resume", "batch"]), 1, "a hold is a barrier's, and `go` answers it");
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Held);
+
+        assert_eq!(run(&store, &["park", "batch", "Ed", "said", "so"]), 0);
+        assert_eq!(gate_of(&store, "batch"), "parked Ed said so", "the pause's reason, not the hold's");
+        assert_eq!(run(&store, &["resume", "batch"]), 0);
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
+        assert_eq!(verdicts(&store, "batch")[0], "");
+        assert_eq!(gate_of(&store, "batch"), "after 1 it has to land clean");
+    }
+
+    /// A draft has nothing running to pause, and a done list nothing left.
+    #[test]
+    fn only_a_list_that_has_started_and_not_finished_can_be_parked() {
+        let (_env, store) = running("parkdraft");
+        task(&store, "wl-001", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        assert_eq!(run(&store, &["park", "batch", "not", "yet"]), 1, "a draft starts nothing until go");
+        assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Draft);
+        assert_eq!(run(&store, &["done", "batch"]), 0);
+        assert_eq!(run(&store, &["park", "batch", "too", "late"]), 1);
+        assert_eq!(run(&store, &["resume", "batch"]), 1);
     }
 
     /// Passing a barrier sweeps the trees behind it, and sweeping a tree

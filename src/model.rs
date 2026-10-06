@@ -1326,11 +1326,23 @@ impl Machine {
 /// groups still ahead of it; `done` is somebody saying there is nothing left
 /// to want from it. Collapsing them would lose the only distinction a reader
 /// looking at a stalled list actually needs.
+///
+/// **`parked` is a third stop, and it is a person's rather than a barrier's.**
+/// `wsp-173`: native-window was paused by Ed's word on 2026-10-05 and the only
+/// verb there was `hold`, which told its seat the run "was held at its
+/// barrier" — nobody had checked that barrier — and whose only way back is
+/// `go`, which on a list standing at a barrier *passes* it. That is what
+/// happened to wsp-process group 3 the same day: a governor meant to resume and
+/// passed the group unchecked. So a pause has its own word and its own way
+/// back, `resume`, which returns the list to `running` and records nothing on
+/// any group; the position is derived, so the barrier it stood at is still the
+/// one standing there, still owed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorklistStatus {
     Draft,
     Running,
     Held,
+    Parked,
     Done,
 }
 
@@ -1340,6 +1352,9 @@ impl WorklistStatus {
             "draft" => Some(WorklistStatus::Draft),
             "running" => Some(WorklistStatus::Running),
             "held" | "hold" => Some(WorklistStatus::Held),
+            // The task vocabulary's spellings, because `parked` is the task
+            // status this one matches and somebody will type either.
+            "parked" | "park" | "paused" | "pause" => Some(WorklistStatus::Parked),
             "done" | "closed" => Some(WorklistStatus::Done),
             _ => None,
         }
@@ -1350,6 +1365,7 @@ impl WorklistStatus {
             WorklistStatus::Draft => "draft",
             WorklistStatus::Running => "running",
             WorklistStatus::Held => "held",
+            WorklistStatus::Parked => "parked",
             WorklistStatus::Done => "done",
         }
     }
@@ -1910,8 +1926,8 @@ impl Worklist {
         WorklistStatus::parse(&self.status_raw).unwrap_or(WorklistStatus::Draft)
     }
 
-    /// Still waiting for its caller, which is `go`, `hold` and `done` — the
-    /// three verbs that take the decision this field records. Composing a list
+    /// Still waiting for its caller, which is `go`, `hold`, `park`, `resume`
+    /// and `done` — the verbs that take the decision this field records. Composing a list
     /// never moves it: `new` writes `draft` and every editing verb leaves it
     /// alone, which is the point of the status holding only what somebody
     /// decided.
@@ -2647,6 +2663,10 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
     fn a_worklists_status_is_a_decision_and_nothing_about_where_it_is_up_to() {
         assert!(WorklistStatus::parse("running").unwrap().is_running());
         assert!(!WorklistStatus::parse("held").unwrap().is_running());
+        assert!(!WorklistStatus::parse("paused").unwrap().is_running(), "a pause starts nothing");
+        assert_eq!(WorklistStatus::parse("paused"), Some(WorklistStatus::Parked));
+        assert_ne!(WorklistStatus::Parked, WorklistStatus::Held, "a person's pause is not a barrier's no");
+        assert_eq!(WorklistStatus::Parked.as_str(), "parked", "the on-disk word, matching tasks");
         assert_eq!(WorklistStatus::parse("draft"), Some(WorklistStatus::Draft));
         assert_eq!(WorklistStatus::parse("finished"), None);
 

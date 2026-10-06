@@ -493,6 +493,7 @@ fn listed(
         WorklistStatus::Draft | WorklistStatus::Running | WorklistStatus::Held => {
             worklist::Segment::Running
         }
+        WorklistStatus::Parked => worklist::Segment::Parked,
         _ => worklist::Segment::Unjudged,
     };
     crate::worklist::Listed {

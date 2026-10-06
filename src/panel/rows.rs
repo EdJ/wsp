@@ -3223,7 +3223,7 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             let ink = match segment {
                 crate::worklist::Segment::Running => Style::Accent,
                 crate::worklist::Segment::Unjudged => Style::Warn,
-                crate::worklist::Segment::Closed => Style::Dim,
+                crate::worklist::Segment::Parked | crate::worklist::Segment::Closed => Style::Dim,
             };
             let mut slug = util::truncate(id, WORKLIST_NAME_W);
             for _ in slug.chars().count()..WORKLIST_NAME_W {
@@ -3234,8 +3234,16 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             debug_assert_eq!(l.width(), WL_MARKS_AT);
 
             let mut right = Line::default();
+            // `wsp-173`: a person's pause, drawn with the glyph a parked task
+            // carries. Dimmed alone, it is a running list in a quieter colour,
+            // which is the misreading the status exists to end.
+            let parked = *segment == crate::worklist::Segment::Parked;
+            if parked {
+                right.push(Style::Dim, glyph::PARKED);
+            }
             right.push(
                 match at {
+                    _ if parked => Style::Dim,
                     crate::worklist::AtMark::Group(_) => Style::Accent,
                     crate::worklist::AtMark::Flagged => Style::Warn,
                     crate::worklist::AtMark::Passed | crate::worklist::AtMark::Empty => Style::Dim,
@@ -3308,7 +3316,7 @@ pub(super) fn render_row(row: &Row, w: usize, num: Option<u8>) -> Line {
             let ink = match segment {
                 crate::worklist::Segment::Running => Style::Accent,
                 crate::worklist::Segment::Unjudged => Style::Warn,
-                crate::worklist::Segment::Closed => Style::Dim,
+                crate::worklist::Segment::Parked | crate::worklist::Segment::Closed => Style::Dim,
             };
             let mut slug = util::truncate(list, WL_TASKS_AT - 8);
             for _ in slug.chars().count()..(WL_TASKS_AT - 8) {

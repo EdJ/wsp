@@ -693,6 +693,11 @@ pub enum Segment {
     /// reason in the log. Whether its rows have been judged is not the
     /// question yet.
     Running,
+    /// `parked`: a person paused it, and nothing is going to move it until
+    /// somebody resumes it. A segment of its own because `wsp-173`'s whole
+    /// complaint is a paused list that read `running` — drawn under that
+    /// heading it would go on reading as a run something is advancing.
+    Parked,
     /// The run is over and something on it is still somebody's: a member at
     /// `review`, a barrier nobody wrote a verdict at, or a member that has
     /// gone. Every finished worklist in the store is here.
@@ -715,6 +720,7 @@ impl Segment {
     pub fn word(&self) -> &'static str {
         match self {
             Segment::Running => "running",
+            Segment::Parked => "parked",
             Segment::Unjudged => "unjudged",
             Segment::Closed => "closed",
         }
@@ -888,6 +894,7 @@ fn listed(store: &Store, w: Worklist) -> Listed {
 
     let segment = match w.status() {
         WorklistStatus::Draft | WorklistStatus::Running | WorklistStatus::Held => Segment::Running,
+        WorklistStatus::Parked => Segment::Parked,
         // Every member done, every barrier answered, nothing dangling — and
         // `at.finished()` is the second half of "every barrier answered": it
         // says the walk found no barrier still shut, where `at.unwritten` says
