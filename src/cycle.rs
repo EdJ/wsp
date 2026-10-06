@@ -67,7 +67,6 @@
 //! ending signals its group — with its output in `cycle.log` in the state
 //! directory, since nobody is reading the pane it started from.
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::model::{Group, Policy, Status, Task, Worklist, WorklistStatus};
@@ -2253,15 +2252,20 @@ fn rotate(store: &Store, w: &Worklist) {
 /// a step whose contract is "says why" cannot be tested by reading a file the
 /// code deliberately does not write with no terminal to write it to.
 pub(crate) fn stamp(line: &str) {
-    if cfg!(test) {
-        #[cfg(test)]
+    // Under test nothing is printed, but what *would* have been is kept in
+    // `STDOUT`, so a test can say a function did not echo (`wsp-217`): the
+    // record in `SAID` is written by `log_line` itself and cannot tell.
+    #[cfg(test)]
+    {
         tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
+        tests::STDOUT.with(|s| s.borrow_mut().push(line.to_string()));
     }
-    if cfg!(test) {
-        return;
+    #[cfg(not(test))]
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{} {line}", util::now_iso());
     }
-    let mut out = std::io::stdout();
-    let _ = writeln!(out, "{} {line}", util::now_iso());
 }
 
 /// One dated line in `cycle.log`, **appended to the file**.
@@ -2365,6 +2369,9 @@ pub(crate) mod tests {
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
         pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// What this thread would have printed to stdout — which, in a process
+        /// this module launches, is `cycle.log` itself. Only [`stamp`] writes it.
+        pub(super) static STDOUT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `cycle.log` was told this thread, in order.
         pub(crate) static SAID: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).
@@ -3896,18 +3903,21 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
     }
 
-    /// **One call is one line in `cycle.log`** (`wsp-217`). It was two for any
-    /// process this module launched: `log_line` echoed to stdout, and that
-    /// child's stdout *is* the file. The echo cannot be observed from here — a
-    /// test has no terminal, and `stamp` writes nothing under `cfg(test)` — so
-    /// this holds the other half: the function appends exactly once itself, and
-    /// the doc on it says why it must not also print.
+    /// **One call is one line in `cycle.log`, and none on stdout** (`wsp-217`).
+    /// It was two for any process this module launched: `log_line` echoed
+    /// through [`stamp`], and that child's stdout *is* the file. `stamp` records
+    /// under `cfg(test)` what it would have printed, so an echo that comes back
+    /// puts a line in `STDOUT` and this goes red; the file half is asserted
+    /// against the file itself.
     #[test]
-    fn a_line_said_through_log_line_is_in_cycle_log_once() {
+    fn a_line_said_through_log_line_is_in_cycle_log_once_and_not_echoed_to_stdout() {
         let (_env, store) = scratch("logonce");
+        tests::STDOUT.with(|s| s.borrow_mut().clear());
         log_line(&store, "core: the reseat failed — the agent never came up");
 
         let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
         assert_eq!(log.matches("the reseat failed").count(), 1, "{log:?}");
+        let echoed = tests::STDOUT.with(|s| s.borrow().clone());
+        assert!(echoed.is_empty(), "a launched child's stdout is cycle.log, so this is a second copy: {echoed:?}");
     }
 }
