@@ -171,6 +171,15 @@ impl Pass {
 }
 
 
+/// Whether the tick's last-barrier loop has anything to find in this list.
+///
+/// A list that is not done is always read: its position can move. A done list
+/// cannot, so the one thing left in it is a barrier check still holding a claim
+/// (`wsp-218`).
+fn a_finished_checks_list_is_read(w: &Worklist, with_a_claim: &std::collections::BTreeSet<String>) -> bool {
+    w.status() != WorklistStatus::Done || with_a_claim.contains(&w.id)
+}
+
 /// One tick: the run's own steps, then these repairs, for every running list.
 ///
 /// Idempotent by the property at the top of the module, which is what lets this
@@ -229,13 +238,20 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // **And done**, since `wsp-208`: a run wsp closes past its last barrier is
     // closed inside that barrier check's `go`, so the check is left standing
     // to review its row, and this is the only thing that reaches it after.
-    for w in store
-        .worklists()
-        .into_iter()
-        .filter(|w| {
-            matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked | WorklistStatus::Done)
-        })
-    {
+    //
+    // **But a done list is only read while a check of its own still holds a
+    // claim** (`wsp-218`). Every list that ever finished is `done` for good, and
+    // reading one is `position` plus every task in the store, so the cost of this
+    // loop was growing by a list per run, every tick, to find nothing. The
+    // claims are read once for the whole loop.
+    let mut claimed = None;
+    for w in store.worklists().into_iter().filter(|w| {
+        matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked | WorklistStatus::Done)
+    }) {
+        let claimed = claimed.get_or_insert_with(|| crate::cycle::lists_with_a_barrier_claim(store));
+        if !a_finished_checks_list_is_read(&w, claimed) {
+            continue;
+        }
         crate::cycle::end_all(store, crate::cycle::last_barrier_left_behind(store, &w));
     }
     // And every verifier whose verdict is recorded, whichever group it read.
@@ -2804,6 +2820,37 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             log.contains("nothing working on it"),
             "the file a governor reads for a run's history has to carry it: {log:?}"
         );
+    }
+
+    /// `wsp-218`: every list that ever finished stays `done`, and the tick read
+    /// each one in full — `position` and every task — to find no check. A done
+    /// list is skipped unless a barrier row of its own still holds a claim, and
+    /// a list that can still move is read whatever the claims say.
+    #[test]
+    fn the_tick_skips_a_done_list_with_no_check_standing_and_still_reads_a_running_one() {
+        let (_env, store) = scratch("doneskip");
+        member(&store, "m-1", Status::Review);
+        let mut w = list(&store, &["m-1"], "claude");
+        let none = crate::cycle::lists_with_a_barrier_claim(&store);
+        assert!(none.is_empty(), "no claim, no list to name");
+
+        assert!(a_finished_checks_list_is_read(&w, &none), "a running list is read with no claim at all");
+        w.set_status(WorklistStatus::Held);
+        assert!(a_finished_checks_list_is_read(&w, &none), "and so is a held one");
+        w.set_status(WorklistStatus::Done);
+        assert!(!a_finished_checks_list_is_read(&w, &none), "a done list with nothing standing is not");
+
+        let mut check = Task::new("Barrier: run group 1", "b-1");
+        check.tags = vec![crate::cycle::BARRIER_TAG.into()];
+        check.set_status(Status::Review);
+        store.save_task(&check).unwrap();
+        // A claim on an ordinary member names no list: only a barrier row does.
+        store.set_claim("m-1", serde_json::json!({ "workspace": "w0" }));
+        assert!(!a_finished_checks_list_is_read(&w, &crate::cycle::lists_with_a_barrier_claim(&store)));
+        store.set_claim("b-1", serde_json::json!({ "workspace": "w" }));
+        let claimed = crate::cycle::lists_with_a_barrier_claim(&store);
+        assert!(a_finished_checks_list_is_read(&w, &claimed), "the closing pass's own check is still found and ended");
+        assert!(!claimed.contains("other"), "and only its own list is named");
     }
 
     /// The reconciler's second loop reaches a **held** list. This is the shape

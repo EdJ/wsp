@@ -1603,6 +1603,24 @@ pub(crate) fn end_all(store: &Store, ids: Vec<String>) {
     }
 }
 
+/// The lists that have a barrier check holding a claim right now.
+///
+/// **Read off the claims, and each claimed row alone**, because the question the
+/// tick asks of a done list ("is a check still standing?") is answered by the
+/// handful of rows that hold a claim, and asking it of the list means
+/// [`worklist::position`] plus every task in the store. A done list only has
+/// that to find for the one tick after it closed: [`Closing::Passed`] leaves
+/// the last check standing and nothing else does, so the other lists, which
+/// grow in number for ever, are skipped on the answer here. `wsp-218`.
+pub(crate) fn lists_with_a_barrier_claim(store: &Store) -> std::collections::BTreeSet<String> {
+    store
+        .claims()
+        .keys()
+        .filter_map(|id| store.task(id))
+        .filter_map(|t| barrier_list(&t).map(str::to_string))
+        .collect()
+}
+
 /// The barrier checks of a run that has nothing left in it, whose agents are
 /// still holding claims.
 ///
