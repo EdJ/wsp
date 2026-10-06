@@ -637,6 +637,20 @@ pub trait Kind {
     fn clear_replaces_session(&self) -> bool {
         true
     }
+
+    /// The model words this kind accepts, when it has a fixed list of them.
+    ///
+    /// Empty for a kind whose models are not a list wsp can hold: `opencode`
+    /// names `provider/model` and the set differs per machine, so the list lives
+    /// in `opencode models` and not here — see [`Kind::tier`].
+    fn models(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The effort levels this kind accepts. Empty where it has no such knob.
+    fn efforts(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// What is about to be started, as much of it as a kind is allowed to know.
@@ -743,11 +757,47 @@ pub fn mint(name: &str, seat: &Seat) -> Option<String> {
 /// `cmd_spawn` had before the layer existed, and adding the layer changed
 /// nothing for `codex` or `gemini`.
 pub fn of(kind: &str) -> &'static dyn Kind {
-    match kind.trim() {
-        "claude" => &Claude,
-        "opencode" => &OpenCode,
-        _ => &Plain,
-    }
+    let kind = kind.trim();
+    KNOWN.iter().find(|(n, _)| *n == kind).map_or(&Plain, |(_, k)| *k)
+}
+
+/// The kinds wsp has behaviour for, in the order a menu should show them, and
+/// the one place [`of`] looks. [`kinds`] reads this same table, so a chrome that
+/// offers "New agent ▸" never keeps a second list that [`of`] could disagree
+/// with.
+///
+/// This is the kinds wsp has *measured*, not the kinds herdr can start: any
+/// other name `--kind` is given is still passed through to herdr, which owns
+/// that catalogue (see [`of`]).
+const KNOWN: &[(&str, &'static dyn Kind)] = &[("claude", &Claude), ("opencode", &OpenCode)];
+
+/// What a menu needs to know about one kind. Read off [`Kind`], never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Info {
+    pub name: &'static str,
+    /// The kind a spawn that names none gets — [`crate::cmd_spawn::DEFAULT_KIND`].
+    pub default: bool,
+    /// Whether `wsp resume` can pick its session back up.
+    pub resume: bool,
+    /// What typed into its pane empties its context, if anything does.
+    pub clear: Option<&'static str>,
+    pub models: &'static [&'static str],
+    pub efforts: &'static [&'static str],
+}
+
+/// Every kind wsp has behaviour for. See [`KNOWN`].
+pub fn kinds() -> Vec<Info> {
+    KNOWN
+        .iter()
+        .map(|(name, k)| Info {
+            name,
+            default: *name == crate::cmd_spawn::DEFAULT_KIND,
+            resume: k.resume_flag().is_some(),
+            clear: k.clear_command(),
+            models: k.models(),
+            efforts: k.efforts(),
+        })
+        .collect()
 }
 
 /// What a clear of one pane is: the word to type, and whether to wait for the
@@ -1833,6 +1883,14 @@ impl Kind for Claude {
     /// `--resume`.
     fn resume_flag(&self) -> Option<&'static str> {
         Some("--resume")
+    }
+
+    fn models(&self) -> &'static [&'static str] {
+        MODELS
+    }
+
+    fn efforts(&self) -> &'static [&'static str] {
+        EFFORTS
     }
 
     /// `/clear`. The spelling the panel carried for a kind before there was a
@@ -4102,6 +4160,24 @@ mod tests {
         assert!(Spend::of_clause("ran opus-5/high").is_none());
         assert!(Spend::of_clause("").is_none());
         assert!(Spend::of_clause("12k cache and a note about it").is_none());
+    }
+
+    /// The read a menu takes and `of` agree because they are one table: every
+    /// kind `kinds` names is one `of` answers with something other than `Plain`
+    /// (a `Plain` has no resume flag, and these two both do), and exactly one is
+    /// the default.
+    #[test]
+    fn the_kinds_a_menu_reads_are_the_kinds_of_answers_to() {
+        let all = kinds();
+        let names: Vec<_> = all.iter().map(|k| k.name).collect();
+        assert_eq!(names, ["claude", "opencode"]);
+        for k in &all {
+            assert!(of(k.name).resume_flag().is_some(), "{} fell through to Plain", k.name);
+            assert_eq!(k.resume, of(k.name).resume_flag().is_some());
+        }
+        assert_eq!(all.iter().filter(|k| k.default).count(), 1);
+        assert_eq!(all[0].models, MODELS);
+        assert!(all[1].models.is_empty() && all[1].efforts.is_empty());
     }
 
     /// A kind spells its clear once, and every caller reads the same answer —

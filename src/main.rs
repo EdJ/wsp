@@ -805,6 +805,7 @@ fn dry_run(args: &Args) -> (bool, String) {
         // silently nowhere.
         "verify" => (args.given("rm"), args.cmd.clone()),
         "machine" | "machines" => named(false),
+        "agent" => named(true),
         _ => (false, args.cmd.clone()),
     }
 }
@@ -1003,6 +1004,9 @@ fn needs_store(args: &Args) -> bool {
     if matches!(args.cmd.as_str(), "init" | "doctor") {
         return false;
     }
+    if args.cmd == "agent" && args.rest.first().map(String::as_str) == Some("kinds") {
+        return false;
+    }
     !(args.cmd == "panel" && args.rest.first().map(String::as_str) == Some("storyboard"))
 }
 
@@ -1106,6 +1110,7 @@ fn main() {
         "pin" => cmd_agent::pin(&store, &args),
         "unpin" => cmd_agent::unpin(&store, &args),
         "where" => cmd_agent::where_am_i(&store, &args),
+        "agent" => cmd_agent::agent(&store, &args),
         "wip" | "status" => cmd_agent::wip(&store, &args),
         "watch" => cmd_watch::watch(&store, &args),
         "overlap" => cmd_agent::overlap(&store, &args),
@@ -1726,6 +1731,10 @@ fn help_text() -> String {
   wsp pin --top [-w ws]             pin it outside the tree entirely
   wsp unpin [-w ws]                 take the pin off again
   wsp where                         what project am I in, and why
+  wsp agent kinds [--json]          the agent kinds wsp has behaviour for — name,
+                                    default, resume, models, efforts — for a menu
+                                    that should not keep its own list. Any other
+                                    kind herdr can start is passed by --kind
   wsp wip                           everything in flight, with agents
   wsp stamp [--headless] [--json]   has anything changed? Three opaque tokens
                                     for a separate process polling on an

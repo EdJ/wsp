@@ -3680,6 +3680,62 @@ fn where_lines(at: &Located, p: &Paint) -> Vec<String> {
     out
 }
 
+/// `wsp agent kinds [--json]` — the agent kinds wsp has behaviour for, read out
+/// of [`crate::agent_commands::kinds`] so a chrome offering "New agent ▸" holds
+/// no list of its own. Needs no store.
+///
+/// Any other name `--kind` is given is still passed to herdr, which owns the
+/// full catalogue; the text says so and the JSON carries it as `passthrough`.
+pub fn agent(_store: &Store, args: &Args) -> i32 {
+    match args.rest.first().map(String::as_str) {
+        Some("kinds") => kinds(args),
+        other => {
+            match other {
+                Some(w) => eprintln!("wsp agent: unknown subcommand `{w}`"),
+                None => eprintln!("wsp agent: usage: wsp agent kinds [--json]"),
+            }
+            2
+        }
+    }
+}
+
+fn kinds(args: &Args) -> i32 {
+    let all = crate::agent_commands::kinds();
+    if args.json() {
+        let rows: Vec<Value> = all
+            .iter()
+            .map(|k| {
+                json!({
+                    "name": k.name, "default": k.default, "resume": k.resume,
+                    "clear": k.clear, "models": k.models, "efforts": k.efforts,
+                })
+            })
+            .collect();
+        let default = all.iter().find(|k| k.default).map(|k| k.name);
+        println!("{}", json!({ "kinds": rows, "default": default, "passthrough": true }));
+        return 0;
+    }
+    let w = all.iter().map(|k| k.name.len()).max().unwrap_or(0);
+    for k in &all {
+        let mut facts = Vec::new();
+        if k.default {
+            facts.push("default".to_string());
+        }
+        if k.resume {
+            facts.push("resumable".into());
+        }
+        if !k.models.is_empty() {
+            facts.push(format!("models {}", k.models.join("|")));
+        }
+        if !k.efforts.is_empty() {
+            facts.push(format!("efforts {}", k.efforts.join("|")));
+        }
+        println!("{:w$}  {}", k.name, facts.join(" · "));
+    }
+    println!("any other kind herdr can start is passed through by --kind");
+    0
+}
+
 pub fn where_am_i(store: &Store, args: &Args) -> i32 {
     let w = Whereabouts::live(store);
     let at = locate(&w);
