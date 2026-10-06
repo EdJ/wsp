@@ -150,12 +150,23 @@ pub(crate) trait Seats {
     }
 }
 
-/// The real reading, over the backends wsp can spawn onto — with opencode's
-/// own database overruling a screen that has stopped repainting. `wsp-160`.
+/// The real reading, over the backends on this machine — with opencode's own
+/// database overruling a screen that has stopped repainting. `wsp-160`.
 ///
-/// Herdr first because it watches a pty and can answer about *now*;
-/// `Refusal::NoSeat` is its "not mine", so a compound seat falls through to the
-/// second. One list, from [`crate::cmd_spawn`], rather than a second copy here.
+/// **A backend that is not running here is not asked** (`wsp-148`, live on
+/// 2026-10-06). herdr is out of the picture (Ed, 2026-10-06), and while the
+/// fleet still asked it, its `Unreachable` with no server was read as "cannot
+/// say" — so every dead governor seat was `Unreadable` for as long as herdr
+/// stayed down, which is always now, and the reconciler refilled none of them:
+/// compound, jolt-app and wsp. herdr owns its panes, so no server here means no
+/// herdr pane here to be in, and a seat recorded on one is a seat compound has
+/// no record of: nobody is in it, and a reseat fills it on compound. Only a
+/// bare id — one qualified `@machine` is that machine's herdr's to answer.
+///
+/// [`crate::herdr::available_now`] rather than the cached answer, because the
+/// daemon lives for days: a cache latched `false` would go on skipping herdr
+/// after it came back, and skipping is the direction that seats a successor
+/// beside a live pane. One connect, once a minute, per seat asked about.
 ///
 /// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
 /// and the argument is the cost: that function is called from `survey`, from
@@ -177,11 +188,11 @@ impl Seats for Fleet {
     fn state(&self, seat: &str) -> Option<State> {
         let seat_id = Seat::new(seat);
         let compound = crate::place_compound::Compound::new();
-        let raw = crate::cmd_spawn::local_backends().iter().find_map(|b| b.state(&seat_id).ok())?;
+        let raw = Fleet::here(seat).find_map(|b| b.state(&seat_id).ok())?;
         Some(self.overrule_frozen_opencode(&compound, seat, raw))
     }
 
-    /// **`false` the moment any backend answers with anything but
+    /// **`false` the moment any backend asked answers with anything but
     /// [`crate::place::Refusal::NoSeat`]**, which is the whole of it: a fan-out
     /// that ends in `NoSeat` on every backend is a fact about the seat, and one
     /// that ends in an error on any backend is a fact about a machine.
@@ -194,13 +205,22 @@ impl Seats for Fleet {
     /// what [`Seats::state`]'s `None` was.
     fn absent(&self, seat: &str) -> bool {
         let seat_id = Seat::new(seat);
-        crate::cmd_spawn::local_backends()
-            .iter()
-            .all(|b| matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_))))
+        Fleet::here(seat).all(|b| matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_))))
     }
 }
 
 impl Fleet {
+    /// The backends that could hold this seat: every local one, less herdr when
+    /// no herdr is running here to hold it. See [`Fleet`].
+    fn here(seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
+        let herdr_here = crate::herdr::split_host(seat).1.is_some() || crate::herdr::available_now();
+        crate::cmd_spawn::local_backends()
+            .into_iter()
+            .zip(crate::cmd_spawn::LOCAL_BACKEND_NAMES)
+            .filter(move |(_, name)| *name != "herdr" || herdr_here)
+            .map(|(b, _)| b)
+    }
+
     /// A compound opencode seat reading `Working` that opencode's own database
     /// says finished with, more than a minute ago.
     ///

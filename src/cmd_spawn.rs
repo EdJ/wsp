@@ -2493,8 +2493,26 @@ enum Hand {
 /// tell them from its own work order, and the whole of `wsp-146` is that they
 /// clear on a turn rather than on a read.
 pub(crate) fn reseat(store: &Store, scope: &str) -> i32 {
-    let args = reseat_args(&store.governors(), scope);
+    let governors = store.governors();
+    let kind = seat_kind(&governors, scope);
+    if !crate::place_compound::reads_kind(&kind) {
+        eprintln!("wsp: the {scope} seat was a {kind} governor, and compound cannot run one - nothing seated");
+        return 1;
+    }
+    let args = reseat_args(&governors, scope);
     reseat_on(backend(&args).as_ref(), store, &args, &Patience::default())
+}
+
+/// The kind a reseat of this scope starts — the seat's own, read live or from
+/// under `last`, or [`DEFAULT_KIND`].
+///
+/// **Under `last` as well, through [`cmd_govern::last_seat`]**, for
+/// [`cmd_govern::tier_of`]'s reason: a governor whose pane died is vacated
+/// before the reconciler looks, so the kind is nearly always there and a reader
+/// of the top level alone defaulted it — right by luck for `claude`, and an
+/// opencode run moved onto claude for everyone else.
+pub(crate) fn seat_kind(governors: &BTreeMap<String, Value>, scope: &str) -> String {
+    kind_or_default(&cmd_govern::last_seat(governors, scope).map(|s| s.kind).unwrap_or_default())
 }
 
 /// What the reseat is asked for, read off the seat's own record.
@@ -2505,13 +2523,7 @@ pub(crate) fn reseat(store: &Store, scope: &str) -> i32 {
 /// at `None` is a successor started exactly as the spawn that filled the seat
 /// was — so an absent field is the old behaviour, not a lost one.
 fn reseat_args(governors: &BTreeMap<String, Value>, scope: &str) -> Args {
-    let kind = governors
-        .get(scope)
-        .and_then(|r| r.get("kind"))
-        .and_then(Value::as_str)
-        .filter(|k| !k.is_empty())
-        .unwrap_or(DEFAULT_KIND)
-        .to_string();
+    let kind = seat_kind(governors, scope);
     let (model, effort) = cmd_govern::tier_of(governors, scope);
     Args::synth(
         "govern",
@@ -6178,6 +6190,38 @@ mod tests {
         cmd_govern::vacate(&store, "core");
         stop_being_a_seat();
         (env, store)
+    }
+
+    /// **The kind is the seat's own, read from under `last`.** A dead governor
+    /// is vacated before the reconciler looks, so its kind is nearly always
+    /// there; reading the top level alone defaulted every reseat to `claude`,
+    /// which moved an opencode run onto another agent without saying so.
+    #[test]
+    fn a_vacated_opencode_seat_is_reseated_as_opencode() {
+        let (_env, store) = vacated_seat("reseat-kind", "", "");
+        let mut rec = store.governors()["core"].clone();
+        rec["last"]["kind"] = json!("opencode");
+        store.set_governor("core", rec);
+        let args = reseat_args(&store.governors(), "core");
+        assert_eq!(args.get("kind").as_deref(), Some("opencode"), "the kind went under `last` with the rest of the seat");
+    }
+
+    /// **And a kind compound cannot run is refused before anything is opened**,
+    /// rather than started, read `Unknown` for ever and never confirmed — the
+    /// `tokenhub-spec-sync` shape, paid for every twenty minutes.
+    #[test]
+    fn a_reseat_of_a_kind_compound_cannot_run_seats_nobody() {
+        let (_env, store) = vacated_seat("reseat-codex", "", "");
+        let mut rec = store.governors()["core"].clone();
+        rec["last"]["kind"] = json!("codex");
+        store.set_governor("core", rec);
+        let before = store.governors()["core"].clone();
+        assert_eq!(reseat(&store, "core"), 1, "refused, and said");
+        assert_eq!(
+            store.governors()["core"],
+            before,
+            "and the record is untouched rather than claimed by a pane that will never come up"
+        );
     }
 
     /// **The ordering inverts, and this is what it buys.** A rotation writes the

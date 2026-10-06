@@ -572,7 +572,7 @@ const UNREAD: &str = "typed at the seat — no turn seen yet, and still owed";
 /// want four different repairs and a reader who cannot tell them apart goes
 /// looking in the wrong place: mid-turn clears itself and is not a fault at
 /// all, `Blocked` needs a person at a keyboard, `Starting` clears itself in
-/// seconds, and `Unknown` means herdr could not be asked — which is a fault
+/// seconds, and `Unknown` means the seat could not be read — which is a fault
 /// about the *reporter* and not about the seat.
 ///
 /// No wildcard, for [`crate::cmd_watch::Line::disposition`]'s reason: a state
@@ -590,7 +590,7 @@ pub(crate) fn held_because(state: crate::place::State) -> Option<&'static str> {
         State::Blocked => Some("the seat is stopped on a prompt only a person can answer"),
         State::Starting => Some("the agent is still coming up"),
         State::Empty | State::Gone => Some("the seat is empty"),
-        State::Unknown => Some("herdr cannot say what the seat is doing"),
+        State::Unknown => Some("wsp cannot say what the seat is doing"),
     }
 }
 
@@ -674,6 +674,13 @@ fn unseated(store: &Store, scope: &str) -> String {
         (Some(_), None, _) => "reseating".to_string(),
         (None, _, false) => "daemon down".to_string(),
         (None, _, true) => "counting".to_string(),
+    };
+    // A kind compound cannot run is a seat nothing will fill, and the one of
+    // these a person has to answer: `counting` there would be a promise.
+    let kind = crate::cmd_spawn::seat_kind(&store.governors(), scope);
+    let tail = match crate::place_compound::reads_kind(&kind) {
+        true => tail,
+        false => format!("a {kind} seat compound cannot run"),
     };
     let tail = match cmd_govern::stood_at(&store.governors(), scope) {
         Some(at) => format!("stood down at {}", util::local_hm(at)),
@@ -1333,6 +1340,20 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
 
     fn written(store: &Store, key: &str) -> bool {
         store.watches()[key]["tick"] != "unwritten"
+    }
+
+    /// **A seat nothing will fill says so, rather than `counting`.** A kind
+    /// compound cannot run is never reseated, so the sentence that promises a
+    /// count is the one thing it must not say.
+    #[test]
+    fn a_vacant_seat_of_a_kind_compound_cannot_run_says_so() {
+        let (_env, store, _key) = withheld("wakes-codex");
+        vacated(&store);
+        let mut rec = store.governors()["core"].clone();
+        rec["last"]["kind"] = json!("codex");
+        store.set_governor("core", rec);
+        let said = unseated(&store, "core");
+        assert!(said.ends_with("a codex seat compound cannot run"), "{said}");
     }
 
     /// **`wsp-179`'s third item: a whole spool withheld *and* an empty seat,

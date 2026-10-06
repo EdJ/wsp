@@ -417,6 +417,18 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
         }
         return;
     }
+    // **A kind compound cannot run is not reseated, and said once rather than
+    // retried.** The successor would start, read `Unknown` for ever and never be
+    // confirmed — `tokenhub-spec-sync` paid for exactly that every twenty
+    // minutes. Said on the pass that crosses the threshold; `wake::unseated`
+    // says it on the seat for as long as it stays true.
+    let kind = crate::cmd_spawn::seat_kind(&governors, &scope);
+    if !crate::place_compound::reads_kind(&kind) {
+        if here.unseated == EMPTY_TICKS {
+            stamp(store, &format!("{scope}: the seat reads {word} and {trigger}, but it was a {kind} governor and compound cannot run one — nothing seated"));
+        }
+        return;
+    }
     // The claim is the duplicate guard and it is taken *before* the process
     // starts, because the process is where the seat is written and a tick that
     // arrives in between would find an empty post and start a second one.
@@ -1471,6 +1483,57 @@ impl Seats for Absent {
         a_pass(&store, &closed);
 
         assert_eq!(reseated(), vec!["run".to_string()], "{:?}", reseated());
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **A seat on a herdr pane, read by the real fleet** (`wsp-148`, live on
+    /// 2026-10-06). herdr is out of the picture, and while the fleet still asked
+    /// it, its `Unreachable` made every such seat `Unreadable` — so compound,
+    /// jolt-app and wsp sat dead with nothing coming to fill them. Compound has
+    /// no record of the pane, which is a fact, and the seat reads `gone`.
+    #[test]
+    fn a_seat_on_a_herdr_pane_reads_gone_to_the_real_fleet() {
+        let (_env, store) = in_flight("seat-herdr-pane");
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "last": {
+                    "pane": "w8K:p1", "workspace": "w8K", "kind": "claude",
+                    "host": util::hostname(), "since": "2026-08-25T22:31:09Z",
+                },
+                "vacated": "2026-08-29T11:51:45Z",
+            }),
+        );
+        assert_eq!(reading(&store, &crate::cycle::Fleet, "run"), Occupancy::Vacant("gone"));
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **A kind compound cannot run is never reseated, and said once.** The
+    /// successor would start, read `Unknown` for ever and never be confirmed;
+    /// a line per pass would bury `cycle.log` in a decision only a person can
+    /// make.
+    #[test]
+    fn a_seat_whose_kind_compound_cannot_run_is_never_reseated_and_says_so_once() {
+        let (_env, store) = in_flight("seat-codex");
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "last": {
+                    "pane": "cpd-5", "workspace": "cpd-5", "kind": "codex",
+                    "host": util::hostname(), "since": "2026-10-05T08:52:47Z",
+                },
+                "vacated": "2026-10-05T08:54:12Z",
+            }),
+        );
+        let closed = Absent(vec!["cpd-5".to_string()]);
+        for _ in 0..4 {
+            a_pass(&store, &closed);
+        }
+
+        assert!(reseated().is_empty(), "{:?}", reseated());
+        assert!(cmd_govern::vacancy(&store.governors(), "run").reseating.is_none(), "nothing claimed");
+        let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("compound cannot run")).collect();
+        assert_eq!(said.len(), 1, "once, not once a pass: {said:?}");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

@@ -630,7 +630,7 @@ impl Compound<'_> {
     fn detected_state(&self, seat: &Seat, rec: &Value) -> Option<State> {
         let agent = rec.get("agent")?;
         let kind = str_of(agent, "kind");
-        if !matches!(kind.as_str(), "claude" | "opencode") {
+        if !reads_kind(&kind) {
             return None;
         }
         if let Some(state) = self.screen_state(seat, &kind) {
@@ -1111,6 +1111,18 @@ impl Compound<'_> {
             }
         }
     }
+}
+
+/// Whether compound can tell what an agent of this kind is doing — the kinds
+/// the ported engine has a manifest for (`compound-109`).
+///
+/// **A function and not the `matches!` it was, because a second reader needs
+/// it.** A governor reseated on a kind compound cannot read would start, read
+/// `Unknown` for ever, and never be confirmed as seated — the
+/// `tokenhub-spec-sync` shape, a pane that never comes up paid for every
+/// twenty minutes. [`crate::repair`] asks this before it spends anything.
+pub(crate) fn reads_kind(kind: &str) -> bool {
+    matches!(kind, "claude" | "opencode")
 }
 
 impl Place for Compound<'_> {

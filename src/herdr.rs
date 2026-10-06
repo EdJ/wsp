@@ -73,7 +73,9 @@ fn probe() -> bool {
 
 /// The same test as [`available`], without the process-wide cache.
 ///
-/// One caller: `cmd_checkout::who_is_standing`, asked once per `checkout
+/// Two callers. `cycle::Fleet`, once a minute per seat, so the daemon sees
+/// herdr come and go rather than latching its first answer for days. And
+/// `cmd_checkout::who_is_standing`, asked once per `checkout
 /// --sweep`/`--rm` or `despawn` rather than in a hot loop, so the syscall
 /// [`available`]'s doc comment caches against is not the cost here. The cache
 /// is the wrong tool for it regardless of frequency: `available`'s answer is
