@@ -838,9 +838,15 @@ pub(crate) fn tally_burn(dir: &PathBuf, payload: &Value) {
         // billed at both tiers and neither total is a lie about the other. The
         // stored `model` is therefore what the seat is on now, and the cost is
         // not derivable from it — see [`crate::cmd_burn::cost`].
+        //
+        // A request that carried no tokens did not run on anything, so it has
+        // no tier to report, whatever it called itself: Claude Code writes
+        // zero-usage `<synthetic>` records (a cancelled turn, a refusal it composed) and
+        // one at the tail of a transcript would otherwise rename a seat that
+        // spent every dollar on a real tier.
         let ran_on = str_of(message, "model");
         cost += crate::cmd_burn::cost(&ran_on, i, o, cr, cw);
-        if !ran_on.is_empty() {
+        if !ran_on.is_empty() && i + o + cr + cw > 0 {
             model = ran_on;
         }
     }
@@ -2201,6 +2207,36 @@ mod tests {
             1_000_000 + 5_000_000,
             "a dollar of haiku and five of opus, not six of either"
         );
+    }
+
+    /// The MODEL column is the tier the seat is on now, and a request that
+    /// carried no tokens is on no tier. A zero-usage `<synthetic>` record at
+    /// the tail of a transcript used to overwrite the model of a seat that had
+    /// spent every dollar on opus (`wsp-118`).
+    #[test]
+    fn a_zero_usage_request_does_not_set_the_model() {
+        let scratch = Scratch::new("burn-synthetic");
+        let place = scratch.place();
+        let seat = place.open(&Order::default()).unwrap();
+        let transcript = scratch.root.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                usage_line(1_000_000, 0, 0, 0, "claude-opus-5"),
+                usage_line(0, 0, 0, 0, "<synthetic>")
+            ),
+        )
+        .unwrap();
+        let payload = json!({
+            "session_id": "s1",
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        place.heard(&seat, "Stop", State::Idle, &payload);
+        let b = read_json(&scratch.root.join(seat.as_str()).join(BURN_FILE));
+        assert_eq!(str_of(&b, "model"), "claude-opus-5", "not the empty record's name");
+        assert_eq!(u_at(&b, "turns"), 2, "it is still a request");
+        assert_eq!(u_at(&b, "cost"), 5_000_000, "and still priced, at nothing");
     }
 
     /// A settings dir of its own, so the check can be pointed somewhere real
