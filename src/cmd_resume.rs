@@ -759,7 +759,11 @@ fn somewhere_to_stand(t: &Thread) -> Option<Seat> {
 /// *before* the agent starts, because a `SessionStart` hook runs `wsp brief`
 /// and an agent whose first sight of itself is a brief about holding nothing
 /// has been told something false. A resumed agent runs that hook too.
-fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, String> {
+///
+/// `via` is which backend `place` is, because the claim at the end reads the
+/// seat off a census of its own and has to be told — see
+/// [`cmd_spawn::backend_flag`].
+fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thread) -> Result<Seat, String> {
     let kind = t.kind.clone();
     // Refused before a workspace is opened, because the alternative is silent
     // and worse. A kind with no resume spelling passes `Spawn::resume` to an
@@ -863,6 +867,7 @@ fn bring_back(store: &Store, place: &dyn Place, t: &Thread) -> Result<Seat, Stri
             if opened && !t.cwd.is_empty() {
                 flags.push(("cwd", &t.cwd));
             }
+            flags.extend(cmd_spawn::backend_flag(via));
             if cmd_spawn::cmd_agent_claim(store, task, &flags) != 0 {
                 return Err(format!("opened {seat}, but the claim on {task} was refused"));
             }
@@ -1226,7 +1231,7 @@ pub fn resume(store: &Store, args: &Args) -> i32 {
             Some(s) => println!("{} — {}, resuming anyway", p.bold(&t.row()), p.dim(&s.why())),
             None => {}
         }
-        match bring_back(store, cmd_spawn::backend(args).as_ref(), t) {
+        match bring_back(store, cmd_spawn::backend(args).as_ref(), cmd_spawn::chosen(args), t) {
             Ok(seat) => {
                 // Off the offer, exactly. See `Store::forget_held`: the agent
                 // is known to be back because this line put it back, which is a
@@ -1832,7 +1837,7 @@ mod tests {
         assert!(t.workspace.is_empty(), "no herdr workspace was ever recorded for it");
 
         let place = Opens(std::cell::RefCell::new(Vec::new()));
-        let seat = bring_back(&store, &place, &t).expect("it starts on whatever place it is given");
+        let seat = bring_back(&store, &place, cmd_spawn::Chosen::Compound, &t).expect("it starts on whatever place it is given");
         assert_eq!(seat.as_str(), "w9:p1");
     }
 
@@ -1882,7 +1887,7 @@ mod tests {
         };
         assert_eq!(t.by_hand(), None);
         assert!(t.by_hand_says().contains("codex"), "{}", t.by_hand_says());
-        let e = bring_back(&store, &crate::place_herdr::Herdr::new(), &t).unwrap_err();
+        let e = bring_back(&store, &crate::place_herdr::Herdr::new(), cmd_spawn::Chosen::Herdr, &t).unwrap_err();
         assert!(e.contains("codex"), "{e}");
         assert!(
             store.claims().get("t-1").is_none(),
@@ -2078,7 +2083,7 @@ mod tests {
         t.workspace = String::new();
 
         let place = Opens(std::cell::RefCell::new(Vec::new()));
-        bring_back(&store, &place, &t).expect("the resume was refused");
+        bring_back(&store, &place, cmd_spawn::Chosen::Compound, &t).expect("the resume was refused");
         let opened = place.0.borrow();
         let env = &opened.first().expect("no seat was opened").env;
         let cfg = env.get("OPENCODE_CONFIG_CONTENT").expect("resumed with no configuration at all");

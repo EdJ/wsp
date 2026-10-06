@@ -546,8 +546,8 @@ fn pane_rename(pane_label: &str, full: Option<&str>, task: &Task) -> Option<Stri
 
 /// Take the task's name back off the pane and the workspace that held it.
 ///
-/// The other half of [`name_after_task`], and the reason it is needed: a claim
-/// writes the task's title over both, and until now nothing ever wrote it back.
+/// The other half of [`name_bound`], and the reason it is needed: that writes
+/// the task's title over both, and until now nothing ever wrote it back.
 /// An agent that handed its work in went on reading as that work — in the
 /// sidebar, in the panel's rows, in `workspace.list` — so the one place you look
 /// to find somebody free said the opposite.
@@ -3203,11 +3203,10 @@ pub fn reconcile(store: &Store, reap: bool) -> Reconciled {
 /// Give every bound pane, and the workspace it stands in, the name of the task
 /// it is holding.
 ///
-/// `claim` does this at the moment it happens, which covers everything claimed
-/// since — but only that. A pane that took its task up before any of this
-/// existed keeps whatever herdr called it, and a claim whose rename was
-/// dropped on a slow socket keeps it too, silently, because the rename is not
-/// worth failing a claim over. This is where both are put right.
+/// `claim` no longer renames — it reads the seat through wsp's own port, and a
+/// seat wsp opens is named by wsp (`wsp-142`). So on herdr this is the only
+/// writer: a pane that took its task up before any of this existed keeps
+/// whatever herdr called it until the next reconcile puts it right.
 ///
 /// Deliberately not in `sync`: that runs every tick, and a name reasserted
 /// every tick is a name you cannot change by hand. Here it runs when the
@@ -3248,9 +3247,9 @@ fn name_bound(
         // A workspace nobody named reads back as the agent or the folder, so
         // the comparison can never say "already right" — it says "not the task
         // title", which is the same answer and the one that matters. A seat's
-        // own name is the exception, for the reason [`name_after_task`] gives:
-        // the room belongs to the position, and reconcile runs on every daemon
-        // start, so this is where a nightly custodian would silently lose it.
+        // own name is the exception: the room belongs to the position, and
+        // reconcile runs on every daemon start, so this is where a nightly
+        // custodian would silently lose it.
         if workspaces
             .iter()
             .any(|w| w.id == pane.workspace_id && w.label != label && !cmd_govern::is_governor_label(&w.label))
@@ -7901,6 +7900,70 @@ mod tests {
         let gone = note_about(&notes, "no longer lists");
         assert!(gone.starts_with("1 binding(s)"), "mb2 was never heard from: {gone}");
         assert!(!gone.contains("mb2"), "{gone}");
+    }
+
+    /// **A claim reads who holds the task off the census of the backend it was
+    /// asked about, and on compound that is a refusal** (`wsp-142` moved the
+    /// read; nothing drove it).
+    ///
+    /// The holder list was herdr's `pane.list`, on which no compound seat
+    /// appears, so under compound the guard against two agents on one task
+    /// never refused — the second took the work over silently and the first
+    /// went on editing the same tree. Driven through the real compound census
+    /// rather than a hand-built row, for the reason the test below gives: the
+    /// fault was in which seats got read, and a row built by hand skips that.
+    #[test]
+    fn a_claim_on_compound_is_refused_while_another_seat_runs_an_agent_on_the_task() {
+        let env = util::isolated("claim-held-compound");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let t = Task::new("held by a running agent", "cpd-71");
+        store.save_task(&t).unwrap();
+
+        let compound = crate::place_compound::Compound::new();
+        // Both seats are opened for real and then rewritten, the way
+        // `place_compound`'s own tests stand a seat up without a pty: this
+        // process's pid is the one thing certain to be alive, and the kill on
+        // drop is for the supervisor the open started, read before the record
+        // stops naming it.
+        let holder = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let claimant = compound.open(&crate::place::Order::default()).expect("a second seat");
+        let _ends: Vec<_> = [&holder, &claimant]
+            .iter()
+            .map(|s| {
+                let rec = std::fs::read_to_string(compound.dir_of(s).unwrap().join("seat.json")).unwrap();
+                crate::place_compound::EndsOnDrop(
+                    serde_json::from_str::<Value>(&rec).unwrap()["pid"].as_u64().expect("a live pid") as u32,
+                )
+            })
+            .collect();
+        let dir = compound.dir_of(&holder).unwrap();
+        std::fs::write(
+            dir.join("seat.json"),
+            json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
+                .to_string(),
+        )
+        .unwrap();
+        // Fresh, because a hook's word expires and an expired one reads as
+        // unknown, which is not running.
+        std::fs::write(
+            dir.join("said.json"),
+            json!({ "state": "idle", "hook": "SessionStart", "at": util::now_iso() }).to_string(),
+        )
+        .unwrap();
+        store.set_binding(holder.as_str(), json!({ "task_id": "cpd-71" }));
+        let seen: Vec<_> = compound.census().unwrap().seats().map(|r| (r.seat.clone(), r.state)).collect();
+        assert!(
+            seen.iter().any(|(s, st)| *s == holder && st.is_running()),
+            "the holder has to read as running or this proves nothing: {seen:?}"
+        );
+
+        let args = Args::synth("claim", &["cpd-71"], &[("pane", claimant.as_str())]);
+        assert_ne!(claim(&store, &args), 0, "a task a running agent holds is not taken");
+        assert!(
+            store.bindings().get(claimant.as_str()).is_none(),
+            "a refused claim writes nothing: the claimant was never bound"
+        );
     }
 
     /// **`doctor` on the machine `compound-112`'s flip leaves** (`wsp-119`): no

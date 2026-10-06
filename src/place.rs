@@ -121,7 +121,7 @@
 //! herdr owns the label the sidebar draws, so the sentence was put where it
 //! would be seen. It writes nothing to the store, and is read back out of
 //! `pane.list`. Three things that look like three different herdr calls
-//! (`report_metadata`, `name_after_task`, `say`) are one thing: a projection of
+//! (`report_metadata`, `name_bound`, `say`) are one thing: a projection of
 //! wsp state onto whatever surface is drawing.
 //!
 //! What this port owes `say` is narrower and real: **a durable key to hang it

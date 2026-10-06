@@ -1721,6 +1721,25 @@ pub(crate) fn chosen(args: &Args) -> Chosen {
     }
 }
 
+/// The flag that makes `claim` read the same port the caller just opened the
+/// seat on, or `None` for the default, which needs none.
+///
+/// `claim` asks [`backend`] which census to read a seat off, and a claim run
+/// by `spawn` is a synthesised command line that carried none of the caller's
+/// flags — so `spawn --herdr` put the seat on herdr and the claim then looked
+/// for it on compound, found nothing, and recorded no session and no tree; for
+/// `--headless` the supervisor's seat was read off compound the same way. The
+/// seat and the claim are two halves of one act, and the second has to ask the
+/// party the first used. One copy of the mapping, so the two callers that open
+/// a seat and then claim it (`spawn`, `resume`) cannot drift from [`chosen`].
+pub(crate) fn backend_flag(c: Chosen) -> Option<(&'static str, &'static str)> {
+    match c {
+        Chosen::Headless => Some(("headless", "true")),
+        Chosen::Herdr => Some(("herdr", "true")),
+        Chosen::Compound => None,
+    }
+}
+
 pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
     // Through [`chosen`] rather than re-matching the flags, which is the same
     // "one copy" rule this module argues everywhere else and which this
@@ -2007,6 +2026,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             if args.json() {
                 flags.push(("json", "true"));
             }
+            flags.extend(backend_flag(chosen(args)));
             cmd_agent_claim(store, t, &flags) == 0
         }
         None => false,
@@ -3681,6 +3701,25 @@ mod tests {
             Chosen::Headless,
             "a seat with no terminal cannot also be a pane in one"
         );
+    }
+
+    /// `spawn --herdr` opened the seat on herdr and its claim then read compound's
+    /// census, because the claim is a synthesised command line that carried none
+    /// of the caller's flags — no session, no tree, and the held-by guard asked
+    /// the wrong backend. Asserted as a round trip through [`chosen`], the one
+    /// reader of the flags, so the mapping cannot drift from it: whatever
+    /// backend a spawn chose, the claim it makes chooses the same.
+    #[test]
+    fn the_claim_a_spawn_makes_reads_the_backend_the_spawn_opened_the_seat_on() {
+        for c in [Chosen::Headless, Chosen::Herdr, Chosen::Compound] {
+            let flags: Vec<(&str, &str)> = backend_flag(c).into_iter().collect();
+            assert_eq!(
+                chosen(&Args::synth("claim", &["t-1"], &flags)),
+                c,
+                "{c:?} must survive being handed to claim"
+            );
+        }
+        assert_eq!(backend_flag(Chosen::Compound), None, "the default is said by saying nothing");
     }
 
     fn seat(tag: &str) -> Store {
