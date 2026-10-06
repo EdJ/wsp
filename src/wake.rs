@@ -315,6 +315,9 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
     // withheld stays in the record, so `wsp watch --drain` still reads it and
     // the logs still say it, and it is neither typed nor counted as owed.
     spool.withhold_for_a_seat(store);
+    // What a typing stamps: this, and not the withheld entries beside it, which
+    // were not at the seat and are never settled — see [`Tell::deliver`].
+    let typed_batch: Vec<u64> = spool.held.iter().map(|h| h.seq).collect();
 
     // Nothing is offered as *hot*: everything this pass produced is already in
     // the spool by the line above, so the only question left is whether that
@@ -343,7 +346,7 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
         if written > 0 {
             Spool::settle_these(rec, &sent);
         } else if tell.typed {
-            Spool::stamp_typed(rec, at);
+            Spool::stamp_typed(rec, at, &typed_batch);
         }
         let now = Spool::of_json(rec.get("spool").unwrap_or(&serde_json::Value::Null));
 stamp(rec, scope, delivered + written, &tell.why, &now);
@@ -817,16 +820,32 @@ impl Sink for Tell<'_> {
         // again — reporting a governor that has read the message as one that has
         // not. `wsp-146` d2, and the reason `delivered, no turn seen` is no
         // longer a place a sentence comes to rest.
-        if let Some(at) = load(self.store, &key_for(&self.scope)).typed_at() {
-// **Or a turn that began and ended since the type**, which a sample
+        //
+        // **Only what a seat is owed has a stamp that counts (`wsp-180`).** This
+        // read the whole record, and a withheld entry carries the stamp of a
+        // batch it rode in on and is never settled — so one stamp from 14:50 on
+        // a flag that went down outlived every batch after it, each later
+        // sentence read *a turn began since*, was cleared as delivered without
+        // being typed, and three verifier blocks were answered `nothing worth a
+        // wake yet · 0 held`.
+        let mut owed = load(self.store, &key_for(&self.scope));
+        owed.withhold_for_a_seat(self.store);
+        if let Some(at) = owed.typed_at() {
+            // **Or a turn that began and ended since the type**, which a sample
             // cannot see: `wsp-166` measured cpd-250's replies at one to two
             // seconds against a twenty-second tick, so most were never seen
             // and the batch was typed again every [`RETYPED`] all night.
-            if state.turn_in_flight() || place.turn_began_since(&addressee, at) == Some(true) {
+            let read = state.turn_in_flight() || place.turn_began_since(&addressee, at) == Some(true);
+            // **A turn confirms what was typed and nothing raised after it.** An
+            // entry with no stamp has never been at the seat, so clearing the
+            // batch on a turn would report it read; it falls through to the gate
+            // and is typed with what is owed beside it.
+            let unsent = owed.held.iter().any(|h| h.typed == 0);
+            if read && !unsent {
                 self.why = NOT_YET.into();
                 return true;
             }
-            if util::epoch_secs() - at < RETYPED {
+            if !read && util::epoch_secs() - at < RETYPED {
                 self.why = UNREAD.into();
                 self.typed_at = Some(at);
                 return false;
@@ -1918,6 +1937,73 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert_eq!(told_count(&fake), 1, "a turn is not a second sentence");
         assert_eq!(spool_of(&store, "demo").depth(), 0, "and the governor has it");
         assert_eq!(delivered_to(&store, "demo"), 1, "delivered, on the turn and not on the type");
+    }
+
+    /// **A withheld entry's stale stamp must not swallow the next sentence
+    /// (`wsp-180`).** A batch typed with no turn is stamped — every entry in the
+    /// spool, withheld ones included — and a withheld entry is never settled, so
+    /// its stamp outlived the batch for good. Every later message then read
+    /// *a turn began since the last type*, was reported delivered, and was never
+    /// typed: three verifier blocks in two days, each answered `nothing worth a
+    /// wake yet · 0 held`, and a governor that was never told.
+    #[test]
+    fn a_stamp_on_something_withheld_does_not_stand_for_a_sentence_never_typed() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-stale-stamp", State::Idle);
+        let mut next = fake.stage();
+        next.takes = false;
+        fake.restage(next);
+
+        // Something the seat is not to be typed, held in the spool.
+        let mut answered = emit(Kind::Unanswered, "demo", "wsp-146");
+        answered.edge = Edge::Down;
+        wake(&store, &[answered], util::epoch_secs());
+        assert_eq!(told_count(&fake), 0, "withheld, so not typed");
+
+        // A sentence is typed and no turn comes of it, which stamps the batch.
+        say(&store, "demo", "the first block", None);
+        assert_eq!(told_count(&fake), 1);
+        // The governor reads it: a turn, which clears what was typed.
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
+        wake(&store, &[], util::epoch_secs() + 5);
+        assert_eq!(spool_of(&store, "demo").depth(), 1, "only the withheld one is left");
+        assert_eq!(told_count(&fake), 1);
+
+        // A later block, to a seat that is free again.
+        let mut next = fake.stage();
+        next.takes = true;
+        fake.restage(next);
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
+        let report = say(&store, "demo", "a verifier found a problem: wsp-179 is blocked", None);
+
+        let said = told_to(&fake);
+        assert_eq!(said.len(), 2, "the second sentence was typed and not counted as read: {said:?} {report:?}");
+        assert!(said[1].contains("wsp-179 is blocked"), "{}", said[1]);
+    }
+
+    /// **A turn confirms what was typed, and not a sentence raised after it
+    /// (`wsp-180`).** The acknowledgement cleared the whole batch, so a message
+    /// that arrived while the seat was mid-turn on the last one was counted as
+    /// read without ever being at the seat.
+    #[test]
+    fn a_turn_confirms_what_was_typed_and_not_what_arrived_after_it() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-ack-fresh", State::Idle);
+        let mut next = fake.stage();
+        next.takes = false;
+        fake.restage(next);
+
+        say(&store, "demo", "the first block", None);
+        assert_eq!(told_count(&fake), 1);
+        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
+
+        let report = say(&store, "demo", "the second block", None);
+        assert_eq!(delivered_to(&store, "demo"), 0, "the second was never at the seat: {report:?}");
+        assert_eq!(spool_of(&store, "demo").depth(), 2, "so both are still owed, held for a seat that is mid-turn");
+
+        assert_eq!(told_count(&fake), 1, "and nothing was typed into a seat that is mid-turn");
     }
 
     /// **The daemon may die between the type and the turn, and the sentence goes

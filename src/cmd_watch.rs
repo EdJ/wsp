@@ -979,17 +979,21 @@ impl Spool {
         self.held.iter().filter(|h| h.typed > 0).map(|h| h.typed).max()
     }
 
-    /// Say that everything held has now been at the seat, whatever came of it.
+    /// Say that these entries have now been at the seat, whatever came of it.
+    ///
+    /// **Those entries and no others (`wsp-180`).** This stamped everything held,
+    /// and what a seat is not typed is held and never settled: its stamp stayed
+    /// for ever and was read as the last typing of every batch after it.
     ///
     /// Inside the caller's lock and it writes back only this field, for
     /// [`Spool::append`]'s reason: the two writers are a flush and a `--drain`,
     /// and neither may write back a list it did not read.
-    pub(crate) fn stamp_typed(rec: &mut Value, at: i64) {
+    pub(crate) fn stamp_typed(rec: &mut Value, at: i64, seqs: &[u64]) {
         if !rec.is_object() {
             *rec = json!({});
         }
         let mut spool = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
-        for h in spool.held.iter_mut() {
+        for h in spool.held.iter_mut().filter(|h| seqs.contains(&h.seq)) {
             h.typed = at;
         }
         if let Some(o) = rec.as_object_mut() {

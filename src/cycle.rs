@@ -893,6 +893,19 @@ fn latest_verifier<'a>(tasks: &'a [Task], member: &str) -> Option<&'a Task> {
         .max_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)))
 }
 
+/// The member's latest verifier, when it stopped on a problem rather than
+/// recording a verdict.
+///
+/// **A block is a verdict somebody has to answer, and the barrier does not open
+/// on it** — [`verified`] is `false` for it on purpose, because the governor
+/// decides whether the member goes back for a fix or the finding was answered.
+/// What this adds is the name of it: the line that said *no verifier has
+/// recorded a verdict* over a block was true of [`verified`] and false of the
+/// run, and sat for four and nine hours with nobody told which.
+pub(crate) fn blocked_verifier<'a>(tasks: &'a [Task], member: &str) -> Option<&'a Task> {
+    latest_verifier(tasks, member).filter(|v| v.status() == Status::Blocked)
+}
+
 /// Whether a member's latest verifier has recorded a verdict.
 ///
 /// The predicate the barrier is gated on, and `wsp-147`'s third repair reads it

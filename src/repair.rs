@@ -880,17 +880,26 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     // missing. The list rather than the count, because the count is the
     // question a reader has.
     if pos.at_barrier() {
-        let waiting: Vec<&str> = pos
+        // A verifier that blocked is a verdict somebody owes an answer to, and
+        // is said as that: *no verdict* over a block is what hid two of them.
+        let (blocked, waiting): (Vec<&str>, Vec<&str>) = pos
             .members
             .iter()
             .filter(|s| !crate::cycle::verified(&tasks, &s.id))
             .map(|s| s.id.as_str())
-            .collect();
+            .partition(|m| crate::cycle::blocked_verifier(&tasks, m).is_some());
         if !waiting.is_empty() {
             stamp(store, &format!(
                 "{} group {at}: every member has landed and the barrier still waits on {} — no verifier has recorded a verdict.",
                 w.id,
                 waiting.join(" ")
+            ));
+        }
+        for m in blocked {
+            let Some(v) = crate::cycle::blocked_verifier(&tasks, m) else { continue };
+            stamp(store, &format!(
+                "{} group {at}: the barrier still waits on {m} — {} blocked: sent back or answered? `wsp show {}` says on what.",
+                w.id, v.id, v.id
             ));
         }
     }
@@ -2213,6 +2222,30 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             "{:?}",
             stamped()
         );
+    }
+
+    /// **A verifier that blocked is named as the block, not as a missing
+    /// verdict (`wsp-180`).** The reconciler went on logging *no verifier has
+    /// recorded a verdict* every minute over a verifier that had recorded one —
+    /// a block — because [`crate::cycle::verified`] counts only a review or a
+    /// done. The barrier does wait on it; what was wrong was what it said.
+    #[test]
+    fn a_barrier_held_by_a_blocked_verifier_names_the_block() {
+        let (env, store) = scratch("barrierblocked");
+        landed_member(&env, &store, false);
+        let mut v = Task::new("Verify m-1", "v-1");
+        v.parent = Some("m-1".into());
+        v.tags = vec![crate::cycle::VERIFY_TAG.into()];
+        v.set_status(Status::Blocked);
+        store.save_task(&v).unwrap();
+
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let said = stamped();
+        assert!(
+            said.iter().any(|l| l.contains("waits on m-1") && l.contains("v-1 blocked: sent back or answered?")),
+            "{said:?}"
+        );
+        assert!(!said.iter().any(|l| l.contains("no verifier has recorded a verdict")), "{said:?}");
     }
 
     /// **The reconciler's lines go in `cycle.log`, and that is not the same as
