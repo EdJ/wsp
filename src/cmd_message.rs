@@ -134,6 +134,13 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         return open(store, args);
     };
+    // A message id and nothing to say is the verb a long question points at:
+    // `for_a_governor` and the `unanswered` line both end `wsp ask <id>` when
+    // they had to cut, so a seat never has to read the asker's screen or its
+    // `--from` file to learn what it is being asked.
+    if args.text(1).trim().is_empty() && args.get("from").is_none() && needle.starts_with("m-") {
+        return whole(store, &needle, args);
+    }
     let subject = match store.task_or_why(&needle) {
         Ok(t) => t,
         Err(why) => {
@@ -249,7 +256,7 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
 /// row's third requirement — one verb, chosen out of what exists because it is
 /// the one with a return path. Every other spelling still works and lands in the
 /// same spool; this line is what a governor reads to learn which one to reach for.
-fn for_a_governor(q: &Message) -> String {
+pub(crate) fn for_a_governor(q: &Message) -> String {
     let about = q.about.task().unwrap_or("this work");
     format!(
         "{by} asked about {about}:\n\n{body}\n\n\
@@ -257,9 +264,70 @@ fn for_a_governor(q: &Message) -> String {
          `wsp ask` with no id lists every question still open · `wsp watch --drain` shows what \
          this seat is owed",
         by = q.from.byline(),
-        body = q.title(),
+        body = as_typed(q),
         id = q.id,
     )
+}
+
+/// How much of a question is typed at a seat before it is cut.
+///
+/// **A question arrives whole, or says it did not.** The cut used to be
+/// [`Message::title`] — the first line — so a three-paragraph `wsp ask` whose
+/// choice was in the last paragraph reached the governor as its opening and a
+/// `wsp answer` hint, and the governor went to the asker's pane or `--from`
+/// file to learn what it was being asked (`wsp-170`). Past this length a
+/// governor's composer is better served by the verb that prints it, but the
+/// question line is never what is lost.
+const TYPED_WHOLE: usize = 1500;
+
+/// Of each end of a cut question, how much is kept. A question's choice is
+/// nearly always in its last paragraph and its subject in its first.
+const KEPT: usize = 400;
+
+/// The question as it is typed: whole when it is short, and otherwise its first
+/// and last paragraphs with the verb that prints the rest. Never silently cut.
+fn as_typed(q: &Message) -> String {
+    let text = q.text.trim();
+    if text.chars().count() <= TYPED_WHOLE {
+        return text.to_string();
+    }
+    let paras: Vec<&str> = text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()).collect();
+    let (first, last) = (paras.first().copied().unwrap_or(text), paras.last().copied().unwrap_or(text));
+    let kept = |p: &str, from_end: bool| -> String {
+        let n = p.chars().count();
+        match (n <= KEPT, from_end) {
+            (true, _) => p.to_string(),
+            (false, false) => util::truncate(p, KEPT),
+            (false, true) => format!("…{}", p.chars().skip(n - KEPT + 1).collect::<String>()),
+        }
+    };
+    let verb = format!("`wsp ask {}` prints the whole question", q.id);
+    match paras.len() {
+        0 | 1 => format!("{}\n[{verb}]", kept(first, false)),
+        _ => format!("{}\n\n[… {verb} …]\n\n{}", kept(first, false), kept(last, true)),
+    }
+}
+
+/// `wsp ask <message-id>` — one question, whole.
+fn whole(store: &Store, needle: &str, args: &Args) -> i32 {
+    let q = match find(store, needle) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    if args.json() {
+        println!("{}", q.to_json());
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.red("?"), p.bold(&q.id));
+    println!("  {}", p.dim(&waiting_line(&q)));
+    println!();
+    println!("{}", q.text.trim());
+    if q.is_open() {
+        println!();
+        println!("{}", p.dim(&format!("wsp answer {} \"…\" closes it and reaches whoever asked", q.id)));
+    }
+    0
 }
 
 /// `wsp answer <message-id> "the sentence"` — close a question, on the record
@@ -422,6 +490,11 @@ fn open(store: &Store, args: &Args) -> i32 {
     }
     for m in &questions {
         println!("{} {}  {}", p.red("?"), p.bold(&m.id), m.title());
+        // The rest of it, because a list that shows a question's first line is
+        // a list that hides the choice it asks (`wsp-170`).
+        for line in m.body().lines() {
+            println!("  {line}");
+        }
         println!("  {}", p.dim(&waiting_line(m)));
     }
     // Every reply, and not only the ones addressed to this caller. The level
@@ -785,6 +858,27 @@ mod tests {
             text.contains("wsp-095's log"),
             "and it says the words survive this pane, which is the property Ed was supplying by hand",
         );
+    }
+
+    /// `wsp-170`: the verb a cut question points at exists, takes the id the
+    /// line printed, and a short question is never cut at all.
+    #[test]
+    fn a_question_is_typed_whole_when_short_and_a_message_id_prints_it_whole() {
+        let store = scratch("whole");
+        task(&store, "wsp-095");
+        let text = "first paragraph\n\nsecond paragraph\n\nA or B?";
+        let q = Message::question(Party::seat("worklist"), Kind::Note, text, Waiting::new("", "wsp-095"))
+            .about(About::Task("wsp-095".into()));
+        message::raise(&store, &q).unwrap();
+
+        let typed = for_a_governor(&q);
+        assert!(typed.contains(text), "a short question is typed as asked: {typed}");
+        assert!(!typed.contains("prints the whole question"), "and says nothing was cut: {typed}");
+
+        let args = crate::Args::parse(["ask", q.id.as_str()].iter().map(|s| s.to_string()).collect());
+        assert_eq!(ask(&store, &args), 0, "a message id and nothing to say shows the question");
+        let args = crate::Args::parse(["ask", "m-nothing"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(ask(&store, &args), 1, "an id that names nothing says so");
     }
 
     /// A question needs a subject **because the subject is what gives the

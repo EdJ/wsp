@@ -2041,9 +2041,16 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
                     m.id
                 ),
                 _ => format!(
-                    "{who} · {} — wsp answer {} \"…\"",
+                    "{who} · {} — wsp answer {} \"…\"{}",
                     util::truncate(m.title(), 60),
-                    m.id
+                    m.id,
+                    // A line that cut the question says so and names the verb
+                    // that prints it (`wsp-170`): the choice is often in a
+                    // paragraph this one never had room for.
+                    match m.body().is_empty() && m.title().chars().count() <= 60 {
+                        true => String::new(),
+                        false => format!(" · cut — wsp ask {} prints it whole", m.id),
+                    },
                 ),
             },
         )

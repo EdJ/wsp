@@ -1793,6 +1793,41 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert_eq!(delivered_to(&store, "demo"), 2, "and the count says what the seat did, not what wsp sent");
     }
 
+    /// **`wsp-170`: a question arrives whole, or says how to read it whole.**
+    ///
+    /// Two multi-paragraph `wsp ask`s reached the governor seat as their first
+    /// paragraph and a `wsp answer` hint; the choice they asked about stayed in
+    /// the asker's `--from` file. The cut was `Message::title` in the line typed
+    /// at the seat, and a seat must never have to read the asker's screen to
+    /// learn what it is being asked.
+    #[test]
+    fn a_three_paragraph_question_reaches_the_seat_with_its_choice_or_the_verb_that_shows_it() {
+        use crate::place::State;
+
+        let (_env, store, fake) = a_governor("wake-whole", State::Idle);
+        let question = "cpd-251 wants to widen the scope of wsp-146 to the cycle verb.\n\n\
+             The change touches cycle.rs and wake.rs, and a second lane is already in wake.rs.\n\n\
+             Same change or separate claims? Reply A for one claim, B for two.";
+        let asked = Args::parse(vec!["wsp".into(), "wsp-146".into(), question.into()]);
+        assert_eq!(crate::cmd_message::ask(&store, &asked), 0, "the question is raised");
+
+        let said = told_to(&fake);
+        assert_eq!(said.len(), 1, "and typed at the idle seat once: {said:?}");
+        assert!(said[0].contains("Same change or separate claims? Reply A for one claim, B for two."),
+            "the choice, which is in the last paragraph, is what the seat reads: {}", said[0]);
+
+        // And past the length where it is cut, the choice is still the end the
+        // seat reads, and the verb that prints the middle is named.
+        let long = format!("{}\n\n{}\n\nA or B: one claim or two?", "opening ".repeat(40), "middle ".repeat(400));
+        use crate::message::{About, Message, Party, Waiting};
+        let q = Message::question(Party::seat("cpd-251"), crate::message::Kind::Note, &long, Waiting::new("", "wsp-146"))
+            .about(About::Task("wsp-146".into()));
+        let typed = crate::cmd_message::for_a_governor(&q);
+        assert!(typed.contains("A or B: one claim or two?"), "the question line survives the cut: {typed}");
+        assert!(typed.contains(&format!("wsp ask {}", q.id)), "and so does the verb that shows it whole: {typed}");
+        assert!(!typed.contains(&"middle ".repeat(100)), "the middle is what was cut");
+    }
+
     /// **`wsp-166` point 2: a governor is typed decisions and nothing else.**
     ///
     /// A member at review inside a running list, a question that was answered, a
