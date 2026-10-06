@@ -1579,7 +1579,14 @@ fn say_uncommitted(store: &Store, id: &str) {
     let Some(cwd) = store.claims().get(id).and_then(|c| c.get("cwd")).and_then(|c| c.as_str()).map(util::expand) else {
         return;
     };
-    let n = crate::cmd_checkout::uncommitted(std::path::Path::new(&cwd));
+    // Only the agent's own tree, named after its task. A verifier, or a member
+    // started with `--no-tree`, stands in the trunk, and what is uncommitted
+    // there is whoever else is standing in it — not this agent's to leave.
+    let dir = std::path::Path::new(&cwd);
+    if dir.file_name().and_then(|n| n.to_str()) != Some(id) {
+        return;
+    }
+    let n = crate::cmd_checkout::uncommitted(dir);
     if n == 0 {
         return;
     }

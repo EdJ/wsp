@@ -122,18 +122,30 @@ impl Asks {
     /// one those surfaces show. It includes a record this build cannot read,
     /// and here that errs the right way: a seat wrongly held as waiting is
     /// left alone, and a seat wrongly read as idle is ended.
+    ///
+    /// The routing is [`crate::cmd_govern::answering_seat`]'s walk with its
+    /// three reads taken once here: compound polls `wsp wip --json`, and a
+    /// read of every project per open question is a cost paid on every poll.
     pub(crate) fn read(store: &Store) -> Asks {
         let mut asks = Asks::default();
-        for m in store.messages().into_values() {
-            if !m.wants_answering() || m.is_reply() {
-                continue;
-            }
+        let open: Vec<_> = store
+            .messages()
+            .into_values()
+            .filter(|m| m.wants_answering() && !m.is_reply() && m.waiting.is_some())
+            .collect();
+        if open.is_empty() {
+            return asks;
+        }
+        let index = crate::resolve::Index::new(store.projects());
+        let lists = crate::worklist::Running::read(store);
+        let governors = store.governors();
+        for m in &open {
             let Some(w) = &m.waiting else { continue };
             let on = m
                 .about
                 .task()
                 .and_then(|id| store.find_task(id))
-                .and_then(|t| crate::cmd_govern::answering_seat(store, &t))
+                .and_then(|t| crate::cmd_govern::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref()))
                 .map(|s| On::Seat(s.scope))
                 .unwrap_or(On::Person);
             // Oldest first and the later one wins, so the question a seat names

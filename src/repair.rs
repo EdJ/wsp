@@ -2271,7 +2271,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     #[test]
     fn ending_a_member_with_uncommitted_work_says_so_in_cycle_log_and_on_its_row() {
         let (env, store) = scratch("dirty");
-        let tree = env.path("tree");
+        let tree = env.path("m-1");
         std::fs::create_dir_all(&tree).unwrap();
         git_in(&tree, &["init", "--quiet", "-b", "m-1"]);
         std::fs::write(tree.join("eight-hours.rs"), "fn work() {}\n").unwrap();
