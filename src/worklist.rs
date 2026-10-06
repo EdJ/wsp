@@ -537,10 +537,20 @@ impl Position {
 /// begin. `wsp worklist go` stamps everything before that as having been
 /// finished before the list existed, and from the moment it does, this is the
 /// barrier walk for the rest of the run.
+/// How many groups a started run has crossed: the group after the last one
+/// carrying a verdict, 0-based — so the run stands at ordinal `floor + 1`, and
+/// is finished when that is past the last group. See [`position`] for why the
+/// last verdict and not the first unfinished group. A function of its own
+/// because [`Running`] asks it too, and has to get the answer `position` gets
+/// without the git half `position` may be asked to pay for.
+fn floor(groups: &[Group]) -> usize {
+    groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1)
+}
+
 pub fn position(store: &Store, w: &Worklist, reading: Reading) -> Position {
     let groups = w.groups();
     let draft = w.status() == crate::model::WorklistStatus::Draft;
-    let floor = groups.iter().rposition(|g| !g.verdict.trim().is_empty()).map_or(0, |i| i + 1);
+    let floor = floor(&groups);
     let mut repos = Repos::new(store);
     let mut passed: Vec<Behind> = Vec::new();
     let mut slipped: Vec<Standing> = Vec::new();
@@ -1332,15 +1342,24 @@ pub struct Running {
     /// The slugs of the running lists, for a row that is spawned by a list
     /// without being a member of it ([`Running::list_for`]).
     lists: std::collections::BTreeSet<String>,
+    /// The group each running list stands at, 1-based, and absent for a list
+    /// every barrier of which has been crossed. [`position`]'s `at`, read off
+    /// the verdicts alone — see [`Running::in_front`].
+    fronts: BTreeMap<String, usize>,
 }
 
 impl Running {
     pub fn read(store: &Store) -> Running {
         let mut at: BTreeMap<String, Placing> = BTreeMap::new();
         let mut lists = std::collections::BTreeSet::new();
+        let mut fronts: BTreeMap<String, usize> = BTreeMap::new();
         for w in store.worklists().iter().filter(|w| w.status().is_running()) {
             lists.insert(w.id.clone());
             let groups = w.groups();
+            let crossed = floor(&groups);
+            if crossed < groups.len() {
+                fronts.insert(w.id.clone(), crossed + 1);
+            }
             for (i, g) in groups.iter().enumerate() {
                 for m in &g.members {
                     at.entry(m.clone()).or_insert(Placing {
@@ -1351,11 +1370,33 @@ impl Running {
                 }
             }
         }
-        Running { at, lists }
+        Running { at, lists, fronts }
     }
 
     pub fn of(&self, task: &str) -> Option<&Placing> {
         self.at.get(task)
+    }
+
+    /// Whether a task is a member of the group its run stands at — the group
+    /// whose barrier is the next one to be crossed.
+    ///
+    /// **Membership is not obligation, and this is the difference.** A member
+    /// of group 2 is in the list from the moment it is written, but nobody
+    /// owes it anything until barrier 1 is passed: it cannot be started, and
+    /// a seat sitting still in front of it is a seat waiting on the barrier,
+    /// which is the cycle's to read. `wsp-224`: the watch counted wsp-218,
+    /// group 2 of wsp-unattended-2, as owed by the seat while group 1 was
+    /// still being verified, and paged everybody about a seat that was right
+    /// to be still.
+    ///
+    /// The verdict floor and not [`position`] itself, which reads every member
+    /// of every group behind it and, under the landed reading, starts git per
+    /// member. The two agree on `at` for every running list by construction —
+    /// it is the same [`floor`] — and differ only in what they carry beside
+    /// it. A member of a group already crossed answers false: what is left
+    /// there is [`Position::slipped`]'s to name, not a debt the run owes.
+    pub fn in_front(&self, task: &str) -> bool {
+        self.at.get(task).is_some_and(|p| self.fronts.get(&p.list) == Some(&p.group))
     }
 
     /// The list a task is in, which is the only half routing needs.

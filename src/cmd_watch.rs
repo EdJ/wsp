@@ -2083,8 +2083,8 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 ///
 ///     the seat is running no turn
 ///  && nothing it answers for is running one either
-///  && it answers for an unsettled member of a running worklist
-///  && no agent is bound to any of them
+///  && it answers for an unsettled member of the group a running list stands at
+///  && no agent is bound to any of them, and none is on any member it answers for
 ///
 /// # The third clause is the whole of it, and the row as filed had another one
 ///
@@ -2111,6 +2111,15 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 /// and stays silent however long it sits — which is the exemption clause the row
 /// wanted `standing == 0` to be, in the one shape that survives this store.
 ///
+/// # The group the run stands at, and not the list
+///
+/// `wsp-224`, 2026-10-06: wsp-unattended-2 was verifying group 1 and the watch
+/// paged everybody that its seat owed wsp-218 — group 2, which nothing may
+/// start until barrier 1 is crossed. A seat in front of a later group is
+/// waiting on a barrier, and the barrier is the cycle's to read. So the
+/// obligation is the members of the group at [`worklist::position`]'s `at`,
+/// asked through [`worklist::Running::in_front`].
+///
 /// # The second clause, which is `robustness-083` read backwards
 ///
 /// Absence of movement is not evidence: a seat is *supposed* to be still. What
@@ -2131,7 +2140,15 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 /// governor is prompt-driven and does not poll, so five minutes of not having
 /// reacted to a member's stall is not a governor that has died.
 ///
-/// So the run has to be **unattended**: no agent bound to any unsettled member.
+/// So the run has to be **unattended**: no agent bound to any unsettled member,
+/// and no member of the run — **at any status** — with a live claim whose
+/// agent is turning or bound. The second half is `wsp-224`'s other shape:
+/// wsp-217 was sent back and its agent was mid-turn working the verdict, and
+/// the binding is not the record that says so — the claim is, joined through
+/// `agents.json` to the seat and the census row, which is
+/// [`cmd_agent::holding`]'s join. Status is not asked there because it is the
+/// fact that lags the agent: a member sent back is `review` until the verb
+/// writes and `doing` after, and the agent is on it across both.
 /// That is exactly `robustness-083`'s shape and it is the one stoppage with no
 /// agent to be its subject — the members landed cleanly and were despawned,
 /// the next group was never started, and there is nothing left in the fleet to
@@ -2163,10 +2180,12 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 /// predicate — `worklist-037` said so before either existed. Written out
 /// twice, they would be one install away from disagreeing about whether a
 /// governor may go home. **They agree here and diverge one step past it, on
-/// purpose**: settlement ends a *member's* obligation, and the stand-down side
-/// goes on to ask about the barrier the settled members leave standing, which
-/// is `worklist-052` — see [`Poll::owes_a_run`] for why that step belongs on
-/// one side only.
+/// purpose, in both directions**: settlement ends a *member's* obligation, and
+/// the stand-down side goes on to ask about the barrier the settled members
+/// leave standing, which is `worklist-052` — see [`Poll::owes_a_run`] for why
+/// that step belongs on one side only. And the stall side narrows it to the
+/// group the run stands at (`wsp-224`): a later group is a reason not to go
+/// home and is not yet anything a still seat is failing to do.
 ///
 /// `Settlement::of` and not a status test spelled out here, for the same reason
 /// one level up: `review` being the end of the line is `worklist.rs`'s sentence.
@@ -2178,6 +2197,8 @@ fn stalled_seats(
     tasks: &[Task],
     rows: &[cmd_agent::WipRow],
     bindings: &BTreeMap<String, Value>,
+    claims: &BTreeMap<String, Value>,
+    agents_held: &BTreeMap<String, Value>,
     to: &BTreeMap<String, String>,
     lists: &worklist::Running,
     governors: &BTreeMap<String, Value>,
@@ -2197,18 +2218,49 @@ fn stalled_seats(
         .values()
         .filter_map(|b| b.get("task_id").and_then(Value::as_str))
         .collect();
+    // Whose claim has an agent turning on it, joined claim → agent → seat →
+    // census row rather than through the binding. `wsp-224`: cpd-426 was
+    // mid-turn on wsp-217, sent back four minutes earlier, while this arm
+    // paged everybody that nothing was under the seat. The claim is the record
+    // that outlives the pane and the binding does not, so it is the one asked.
+    let turning: BTreeSet<&str> = rows.iter().filter(|r| r.turning).map(|r| r.pane.as_str()).collect();
+    let worked = |id: &str| {
+        claims
+            .get(id)
+            .and_then(|c| c.get("agent_id"))
+            .and_then(Value::as_str)
+            .and_then(|a| agents_held.get(a))
+            .and_then(|a| a.get("seat"))
+            .and_then(Value::as_str)
+            .is_some_and(|seat| turning.contains(seat))
+    };
     // What each seat still owes a run for. `Settlement::of` rather than a status
     // test written out here: `review` being the end of the line is
     // `worklist.rs`'s sentence, and this is its second reader.
     let mut owed: BTreeMap<&str, (BTreeSet<&str>, Vec<&str>)> = BTreeMap::new();
     let mut held: BTreeSet<&str> = BTreeSet::new();
     for t in tasks.iter() {
-        let Some(list) = outstanding(t, lists) else { continue };
+        let Some(list) = lists.list_of(&t.id) else { continue };
         // A member nobody answers for is nobody's stall. That a running list
         // with no seat anywhere above it is invisible here is `worklist-037`'s
         // question 3 and its documented no — absence of a decision to have a
         // seat is not a vacancy — and this arm reports occupants, not posts.
         let Some(seat) = to.get(&t.id).filter(|s| s.as_str() != EVERYONE) else { continue };
+        // Somebody is on it, **whatever its status**: a claim still held and
+        // an agent turning on it or bound to it. Before settlement is asked,
+        // because the status is the one fact that lags — a member sent back is
+        // `review` until the verb lands and `doing` after, and its agent was
+        // working the verdict on both sides of that write.
+        if claims.contains_key(&t.id) && (worked(&t.id) || attended.contains(t.id.as_str())) {
+            held.insert(seat.as_str());
+            continue;
+        }
+        // Only the group the run stands at is owed: a later group cannot start
+        // until the barrier in front of it is crossed, and that wait is the
+        // cycle's, not the seat's. See [`worklist::Running::in_front`].
+        if outstanding(t, lists).is_none() || !lists.in_front(&t.id) {
+            continue;
+        }
         if attended.contains(t.id.as_str()) {
             held.insert(seat.as_str());
             continue;
@@ -2642,6 +2694,8 @@ impl Source for Poll<'_> {
                 &wip.tasks,
                 &rows,
                 &wip.bindings,
+                &wip.claims,
+                &wip.agents_held,
                 &to,
                 &lists,
                 &wip.governors,
@@ -5406,6 +5460,8 @@ mod tests {
         store: Store,
         governors: BTreeMap<String, Value>,
         bindings: BTreeMap<String, Value>,
+        claims: BTreeMap<String, Value>,
+        agents: BTreeMap<String, Value>,
         index: Index,
         rows: Vec<cmd_agent::WipRow>,
     }
@@ -5420,6 +5476,8 @@ mod tests {
                 store,
                 governors: BTreeMap::new(),
                 bindings: BTreeMap::new(),
+                claims: BTreeMap::new(),
+                agents: BTreeMap::new(),
                 index: Index::new(Vec::new()),
                 rows: Vec::new(),
             }
@@ -5452,13 +5510,42 @@ mod tests {
         /// running one, which is the half of the obligation that is a decision
         /// somebody took rather than a state wsp inferred.
         fn running(self, slug: &str, members: &[&str]) -> Night {
+            self.groups(slug, &[members], 0)
+        }
+
+        /// A running list of several groups, the first `crossed` of them
+        /// carrying a verdict — so the run stands at group `crossed + 1`.
+        fn groups(self, slug: &str, groups: &[&[&str]], crossed: usize) -> Night {
             let mut w = Worklist::new(slug, slug);
             w.set_status(WorklistStatus::Running);
-            w.set_groups(&[Group {
-                members: members.iter().map(|m| m.to_string()).collect(),
-                ..Default::default()
-            }]);
+            let groups: Vec<Group> = groups
+                .iter()
+                .enumerate()
+                .map(|(i, members)| Group {
+                    members: members.iter().map(|m| m.to_string()).collect(),
+                    verdict: if i < crossed { "passes".into() } else { String::new() },
+                    ..Default::default()
+                })
+                .collect();
+            w.set_groups(&groups);
             self.store.save_worklist(&w).unwrap();
+            self
+        }
+
+        /// A claim on a task by an agent sitting in `pane` — the record that
+        /// outlives a binding. `claims.json` names an agent and `agents.json`
+        /// puts it in a seat, which is the join `cmd_agent::holding` reads.
+        fn claimed(mut self, pane: &str, task: &str) -> Night {
+            let agent = format!("a-{pane}");
+            self.claims.insert(task.to_string(), json!({ "agent_id": agent }));
+            self.agents.insert(agent, json!({ "seat": pane }));
+            self
+        }
+
+        /// An agent in a pane with no binding — what the census sees of a
+        /// member whose binding has gone and whose claim has not.
+        fn unbound(mut self, pane: &str, turning: bool) -> Night {
+            self.rows.push(row_for(pane, "", None, turning));
             self
         }
 
@@ -5501,6 +5588,8 @@ mod tests {
                 &tasks,
                 &self.rows,
                 &self.bindings,
+                &self.claims,
+                &self.agents,
                 &to,
                 &lists,
                 &self.governors,
@@ -5686,6 +5775,79 @@ mod tests {
 
         night.bindings.clear();
         assert_eq!(night.read().len(), 1, "and nothing else is left to be its subject");
+    }
+
+    /// `wsp-224`'s first shape, from the run that found it. wsp-unattended-2
+    /// was at group 1, both members at `review` and being verified, and the
+    /// watch paged everybody that the seat still owed wsp-218 — a member of
+    /// group 2, which nothing may start until barrier 1 is crossed. A seat in
+    /// front of a later group is waiting on a barrier, and that is the
+    /// cycle's. The obligation arrives with the verdict, and not before.
+    #[test]
+    fn a_member_of_a_later_group_is_not_owed_until_the_barrier_in_front_of_it_is_crossed() {
+        let groups: &[&[&str]] = &[&["wsp-217", "wsp-103"], &["wsp-218"]];
+        let night = Night::new("later")
+            .projects(&[("wsp", None)])
+            .task("wsp-217", "wsp", Status::Review)
+            .task("wsp-103", "wsp", Status::Review)
+            .task("wsp-218", "wsp", Status::Todo)
+            .groups("wsp-unattended-2", groups, 0)
+            .seat("wsp-unattended-2", "cpd-429", false);
+        assert!(night.read().is_empty(), "group 2 cannot start yet, so the seat owes it nothing");
+
+        let night = night.groups("wsp-unattended-2", groups, 1);
+        let up = night.read();
+        assert_eq!(up.len(), 1, "barrier 1 crossed: group 2 is the seat's now: {up:?}");
+        assert!(up[0].detail.contains("wsp-218"), "{}", up[0].detail);
+
+        // And the group in front still counts, without the one behind it.
+        let mut t = night.store.task("wsp-217").unwrap();
+        t.set_status(Status::Doing);
+        night.store.save_task(&t).unwrap();
+        let night = night.groups("wsp-unattended-2", groups, 0);
+        let up = night.read();
+        assert_eq!(up.len(), 1, "an unattended member of group 1 is owed: {up:?}");
+        assert!(up[0].detail.contains("wsp-217"), "{}", up[0].detail);
+        assert!(!up[0].detail.contains("wsp-218"), "and group 2 is not named: {}", up[0].detail);
+    }
+
+    /// `wsp-224`'s second shape. wsp-217 had been sent back, and its agent
+    /// cpd-426 was mid-turn working the verdict — on a claim, with no binding
+    /// for the census row to carry the task on — while the watch said nothing
+    /// was under the seat. A member with a live claim and an agent turning or
+    /// bound on it is somebody working for the seat, **whatever its status**:
+    /// the status is the fact that lags, `review` until the verb writes and
+    /// `doing` after it, with the agent on it across both.
+    #[test]
+    fn a_member_whose_claim_has_its_agent_turning_is_under_the_seat_whatever_its_status() {
+        let groups: &[&[&str]] = &[&["wsp-217", "wsp-103"], &["wsp-218"]];
+        let night = Night::new("claimed")
+            .projects(&[("wsp", None)])
+            .task("wsp-217", "wsp", Status::Doing)
+            .task("wsp-103", "wsp", Status::Doing)
+            .task("wsp-218", "wsp", Status::Todo)
+            .groups("wsp-unattended-2", groups, 0)
+            .seat("wsp-unattended-2", "cpd-429", false)
+            .claimed("cpd-426", "wsp-217");
+
+        let idle = night.unbound("cpd-426", false);
+        let up = idle.read();
+        assert_eq!(up.len(), 1, "a claim with its agent still is not somebody working: {up:?}");
+
+        let mut night = idle;
+        night.rows.retain(|r| r.pane != "cpd-426");
+        let night = night.unbound("cpd-426", true);
+        assert!(night.read().is_empty(), "sent back and mid-turn: the seat has work under it");
+
+        let mut t = night.store.task("wsp-217").unwrap();
+        t.set_status(Status::Review);
+        night.store.save_task(&t).unwrap();
+        assert!(night.read().is_empty(), "and at review, before the verb has written doing");
+
+        let mut night = night;
+        night.rows.retain(|r| r.pane != "cpd-426");
+        let night = night.unbound("cpd-426", false).bound("cpd-426", "wsp-217");
+        assert!(night.read().is_empty(), "bound and claimed is on it too, at any status");
     }
 
     /// And the seat turning is the first clause, said the obvious way round.
