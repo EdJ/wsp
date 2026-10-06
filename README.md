@@ -177,7 +177,12 @@ for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
 | every member landed and holding | opens a barrier row and spawns an agent to check it | the barrier agent ends with `go` or `hold` |
 | `go` | sweeps the group's trees, ends what the group opened, starts the next group, rotates the governor | — |
 | an agent died, a start never claimed, a landing was made with git | repairs it on the tick, writes `cycle.log`, tells the governor | — |
-| the governor's seat reads empty for two ticks, or a running list has none | seats a governor | — |
+| the run's seat reads empty for two ticks, or no seat in its chain has ever been filled | seats a governor | — |
+
+The run's seat is the list's own when it has one. Otherwise it is the seat of
+its first member's project, then that project's ancestors (`wsp-148`). So a
+list started with no seat of its own is governed from its project's seat, and
+wsp does not add a second one beside it.
 
 What is left to agents is decisions. A governor answers what somebody is
 blocked on and writes direction on the rows; its work order says so, and that
