@@ -245,6 +245,19 @@ impl Supervisor<'static> {
     }
 }
 
+/// The newest modification time among a seat directory and the files in it,
+/// in epoch seconds — [`crate::place::Place::quiet_since`] for both backends
+/// that keep a directory per seat. The directory counts too: a file replaced
+/// by rename moves the directory's time and not always the new file's.
+pub(crate) fn last_written(dir: &Path) -> Option<i64> {
+    let secs = |p: &Path| {
+        let m = std::fs::metadata(p).ok()?.modified().ok()?;
+        Some(m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64)
+    };
+    let files = std::fs::read_dir(dir).ok()?.flatten().filter_map(|e| secs(&e.path()));
+    files.chain(secs(dir)).max()
+}
+
 /// Every seat's burn record under one root, seat id attached.
 ///
 /// The reading half of [`tally_burn`] (`core-049`): the ranking is a question
@@ -1242,6 +1255,10 @@ impl Place for Supervisor<'_> {
         let pids: Vec<u32> =
             rec.get("pid").and_then(|p| p.as_u64()).map(|p| vec![p as u32]).unwrap_or_default();
         Ok(self.state_of(seat, &rec, &alive(&pids)))
+    }
+
+    fn quiet_since(&self, seat: &Seat) -> Option<i64> {
+        last_written(&self.dir_of(seat).ok()?)
     }
 
     /// Every seat this supervisor has, and what is in it.

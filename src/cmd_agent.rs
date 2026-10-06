@@ -3739,22 +3739,105 @@ impl Wip {
         for backend in &backends {
             if let Ok(census) = backend.census() {
                 heard = true;
-                agents.extend(census.seats().filter(|s| s.state != State::Empty).cloned());
+                // Each gone seat is dated by the backend that holds it: the
+                // clock lives in that backend's record of the seat, and
+                // nothing above the port may read it off a path.
+                agents.extend(census.seats().filter(|s| s.state != State::Empty).map(|s| {
+                    let quiet = (s.state == State::Gone).then(|| backend.quiet_since(&s.seat)).flatten();
+                    (s.clone(), quiet)
+                }));
             }
         }
+        let tasks = store.tasks();
+        let bindings = store.bindings();
+        let claims = store.claims();
+        let governors = store.governors();
+        let agents_held = store.agents_held();
+        let now = util::epoch_secs();
+        let agents = agents
+            .into_iter()
+            .filter(|(s, quiet)| {
+                let held = holding(&tasks, &bindings, &claims, &agents_held, s.seat.as_str()).is_some()
+                    || governs_seat(&governors, s.seat.as_str());
+                !forgotten(s.state, *quiet, now, held)
+            })
+            .map(|(s, _)| s)
+            .collect();
         Wip {
-            tasks: store.tasks(),
+            tasks,
             index: Index::new(store.projects()),
-            bindings: store.bindings(),
-            claims: store.claims(),
+            bindings,
+            claims,
             pins: store.pins(),
-            governors: store.governors(),
+            governors,
             agents,
-            agents_held: store.agents_held(),
+            agents_held,
             said: store.said(),
             daemon: crate::daemon::loud(crate::daemon::running(&store.state).as_deref(), heard),
         }
     }
+}
+
+/// How long a seat must have been gone, with nothing held, before `wip` stops
+/// drawing it. A day: a machine read at the start of the morning still shows
+/// what an agent was doing when it stopped last night.
+pub(crate) const GONE_FOR: i64 = 24 * 60 * 60;
+
+/// Whether a census row is a seat nobody has any use for: gone, dated, past
+/// [`GONE_FOR`], and holding nothing (`wsp-169`, wsp-158 item 5).
+///
+/// **Every refusal here leaves the row drawn, and that is the direction to
+/// fail in.** An undated seat (`None` — herdr keeps no record of a pane that
+/// has gone, and a compound seat whose directory cannot be read has none
+/// either) is not "long ago"; a seat that holds something is the
+/// reconciler's (`repair::gone_member`, `repair::seat_vacant`), which finds
+/// it *through* this census and would otherwise be told nothing. Only a seat
+/// with nothing left to resume is dropped, and only from the reading: its
+/// directory is untouched, so `quiet_since` keeps answering and the row
+/// returns the moment a claim or a binding does.
+pub(crate) fn forgotten(state: State, quiet_since: Option<i64>, now: i64, held: bool) -> bool {
+    state == State::Gone && !held && quiet_since.map(|at| now.saturating_sub(at) > GONE_FOR).unwrap_or(false)
+}
+
+/// The open task a seat still holds, by its binding or by a claim its agent
+/// made — what makes a gone seat somebody's to repair rather than nobody's.
+///
+/// A claim is keyed by task and names an *agent*, and an agent names a seat
+/// through `agents.json`, so the join runs through every agent that ever sat
+/// there and not only the latest: a seat a governor reseated holds the claims
+/// of the one before it too. A task that is `done`, or gone from the store,
+/// holds nothing — a binding to it is a record of work that ended.
+pub(crate) fn holding(
+    tasks: &[Task],
+    bindings: &BTreeMap<String, Value>,
+    claims: &BTreeMap<String, Value>,
+    agents_held: &BTreeMap<String, Value>,
+    seat: &str,
+) -> Option<String> {
+    let open = |id: &str| tasks.iter().any(|t| t.id == id && t.status().is_open());
+    let bound = bindings.get(seat).and_then(|b| b.get("task_id")).and_then(|t| t.as_str());
+    if let Some(id) = bound.filter(|id| open(id)) {
+        return Some(id.to_string());
+    }
+    claims
+        .iter()
+        .filter(|(id, _)| open(id))
+        .find(|(_, c)| {
+            c.get("agent_id")
+                .and_then(|a| a.as_str())
+                .and_then(|a| agents_held.get(a))
+                .and_then(|a| a.get("seat"))
+                .and_then(|s| s.as_str())
+                == Some(seat)
+        })
+        .map(|(id, _)| id.clone())
+}
+
+/// Whether `seat` is a project's governor seat, through the same query `wip`
+/// draws its `▣` from.
+fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
+    let workspace = seat.split(':').next().unwrap_or(seat);
+    cmd_govern::governs(governors, &cmd_govern::seat_query(workspace, Some(seat))).is_some()
 }
 
 /// One agent, as `wip` wants it.
@@ -3960,7 +4043,15 @@ fn wip_lines(w: &Wip, p: &Paint, terse: bool) -> Vec<String> {
             let flag = match (&r.seat, r.needs_you) {
                 (Some(proj), _) => p.cyan(&format!("{} {}", glyph_seat(), cmd_govern::governor_of(proj))),
                 (None, true) => p.yellow("← needs you"),
-                (None, false) => String::new(),
+                // A gone seat that is still drawn is drawn because it holds
+                // something, and says what: the reconciler's to repair, not a
+                // row nobody swept (`wsp-169`).
+                (None, false) => match r.state_typed == State::Gone {
+                    true => holding(&w.tasks, &w.bindings, &w.claims, &w.agents_held, &r.pane)
+                        .map(|t| p.dim(&format!("holds {t}")))
+                        .unwrap_or_default(),
+                    false => String::new(),
+                },
             };
             // What the agent said it is doing, in place of what the work is
             // called, when it has said something about this work — the trade a
@@ -7463,6 +7554,79 @@ mod tests {
         let panes: Vec<&str> = w.agents.iter().map(|s| s.seat.as_str()).collect();
         assert!(panes.contains(&"w1:p1"), "herdr's own row is still there: {panes:?}");
         assert!(panes.contains(&seat.as_str()), "and compound's, folded into the same census: {panes:?}");
+    }
+
+    /// A compound seat directory whose pid is dead, last written `ago` seconds
+    /// before now: the shape `wip` calls `gone`, dated by the only clock a dead
+    /// agent leaves.
+    fn gone_seat(env: &util::Isolated, name: &str, ago: i64) {
+        let _ = env;
+        let compound = crate::place_compound::Compound::new();
+        let dir = compound.root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pid no process holds: `i32::MAX` is past any pid macOS or Linux hands out.
+        let rec = json!({ "pid": i32::MAX, "agent": { "kind": "claude", "name": "t-1", "args": [] } });
+        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(ago as u64);
+        for f in [dir.join("seat.json"), dir.clone()] {
+            std::fs::File::open(&f).unwrap().set_modified(then).unwrap();
+        }
+    }
+
+    /// `wsp-169`, wsp-158 item 5. Twenty `gone` rows from runs that ended days
+    /// ago were drawn on every `wip`, and nothing removed them. Three seats, one
+    /// directory each: long gone with nothing, gone a moment ago, and long gone
+    /// but still holding a claim — and only the first stops being drawn.
+    #[test]
+    fn a_long_gone_seat_holding_nothing_is_not_drawn_and_the_rest_are() {
+        let env = util::isolated("wip-sweeps-the-long-gone");
+        let store = Store::open();
+        gone_seat(&env, "cpd-1", 3 * GONE_FOR);
+        gone_seat(&env, "cpd-2", 60);
+        gone_seat(&env, "cpd-3", 3 * GONE_FOR);
+        store.save_task(&wip_task("t-001", "work a gone agent left open", Some("wsp"), "doing")).unwrap();
+        store.set_agent("a-held", json!({ "seat": "cpd-3", "started": "2026-10-01T00:00:00Z" }));
+        store.set_claim("t-001", json!({ "agent_id": "a-held", "claimed_at": "2026-10-01T00:00:01Z" }));
+
+        let w = Wip::live(&store);
+        let panes: Vec<&str> = w.agents.iter().map(|s| s.seat.as_str()).collect();
+        assert!(!panes.contains(&"cpd-1"), "long gone and holding nothing is a record of nothing: {panes:?}");
+        assert!(panes.contains(&"cpd-2"), "gone a moment ago is still news: {panes:?}");
+        assert!(panes.contains(&"cpd-3"), "holding a claim is the reconciler's, not swept: {panes:?}");
+
+        // And it says why it is still there, rather than reading as a row nobody got to.
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        let held = text.lines().find(|l| l.contains("cpd-3")).expect("the held seat is drawn");
+        assert!(held.contains("holds t-001"), "{held}");
+        assert!(!text.lines().find(|l| l.contains("cpd-2")).unwrap().contains("holds"), "{text}");
+    }
+
+    /// The seat is dropped from the reading and not from the disk, so the same
+    /// seat is drawn again the moment something holds it.
+    #[test]
+    fn a_swept_seat_returns_when_a_binding_names_an_open_task_again() {
+        let env = util::isolated("wip-sweep-is-a-reading");
+        let store = Store::open();
+        gone_seat(&env, "cpd-1", 3 * GONE_FOR);
+        assert!(Wip::live(&store).agents.is_empty());
+
+        store.save_task(&wip_task("t-001", "work", Some("wsp"), "doing")).unwrap();
+        store.set_binding("cpd-1", json!({ "task_id": "t-001" }));
+        assert_eq!(Wip::live(&store).agents.len(), 1, "an open task bound to it holds it");
+
+        store.save_task(&wip_task("t-001", "work", Some("wsp"), "done")).unwrap();
+        assert!(Wip::live(&store).agents.is_empty(), "a binding to finished work holds nothing");
+    }
+
+    #[test]
+    fn only_a_dated_gone_seat_past_the_threshold_with_nothing_held_is_forgotten() {
+        let now = 1_000_000;
+        let old = Some(now - GONE_FOR - 1);
+        assert!(forgotten(State::Gone, old, now, false));
+        assert!(!forgotten(State::Gone, Some(now - GONE_FOR + 1), now, false), "not yet");
+        assert!(!forgotten(State::Gone, old, now, true), "held");
+        assert!(!forgotten(State::Gone, None, now, false), "an undated seat is not a long-gone one");
+        assert!(!forgotten(State::Idle, old, now, false), "only a gone seat is ever swept");
     }
 
     /// `compound-077`: `wsp tell` used to ask herdr alone whether a seat

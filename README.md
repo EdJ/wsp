@@ -3095,6 +3095,14 @@ in, the launch window ends when the agent says so rather than after three second
 of looking idle, and `start` returns when the agent exists with nothing to wait
 for. `src/place_super.rs` carries the measurements and the boundary.
 
+**A `gone` seat stops being drawn by `wsp wip` after a day, if it holds nothing**
+(`wsp-169`). The clock is [`Place::quiet_since`](src/place.rs) — the newest write
+in the seat's directory, which a dead agent no longer advances — and it is a
+reading, not a removal: nothing is deleted, and the row is back the moment a
+claim or a binding on an open task names the seat. A gone seat that holds one,
+or is a governor's, is the reconciler's and stays drawn with `holds <task>`.
+A backend with no clock to read answers `None`, and an undated seat is never swept.
+
 Two things it will not do. A seat on another machine is refused rather than
 faked — a hook cannot fire into a socket on a different host, so a remote Claude
 Code is a Claude Code this backend cannot see. And an unattended agent has

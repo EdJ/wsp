@@ -1283,6 +1283,10 @@ impl Place for Compound<'_> {
         Ok(self.state_of(seat, &rec, &alive(&pids)))
     }
 
+    fn quiet_since(&self, seat: &Seat) -> Option<i64> {
+        crate::place_super::last_written(&self.dir_of(seat).ok()?)
+    }
+
     fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {
         let dir = self.dir_of(seat).ok()?;
         // No log is *cannot say*, not *no turn*: a seat that predates the file.

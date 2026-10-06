@@ -1178,6 +1178,22 @@ pub trait Place {
         None
     }
 
+    /// The last moment anything was written about this seat, in epoch seconds
+    /// — the clock a census reads to say *how long* a seat has been gone, which
+    /// nothing else here keeps. `None` is *this backend has no record to read
+    /// it off*, and a caller must treat that as "unknown", never as "long ago":
+    /// a seat nobody can date is a seat nobody may sweep (`wsp-169`).
+    ///
+    /// **A lower bound on when the agent stopped, not the moment.** A pid that
+    /// dies is not stamped by anything, and a dead agent writes nothing, so the
+    /// last word it left is the nearest thing to a time of death a backend has.
+    /// For an agent that was working that is within a turn; for one that sat
+    /// idle for hours and was then killed it reads too old, which is why the
+    /// only caller sweeps nothing that still holds a claim.
+    fn quiet_since(&self, _seat: &Seat) -> Option<i64> {
+        None
+    }
+
     /// Every seat this backend has, and what is in it.
     ///
     /// The one read that stays on this side of the line: what a backend is
