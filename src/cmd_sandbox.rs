@@ -416,9 +416,7 @@ fn session_children(name: &str) -> Vec<u32> {
 }
 
 /// This process and everything above it, so nothing we are standing on can end
-/// up in a list of things to kill — or, for [`crate::daemon`], in a list of
-/// daemons we are about to say are running: the shell that typed `wsp doctor`
-/// has `wsp doctor` on its command line and its parent has whatever started it.
+/// up in a list of things to kill.
 pub(crate) fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
     let mut out: Vec<u32> = vec![std::process::id()];
     // Bounded by the list itself, so a cycle cannot spin.

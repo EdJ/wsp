@@ -406,16 +406,23 @@ pub(crate) fn running(state: &Path) -> Option<Vec<u32>> {
     if all.is_empty() {
         return None;
     }
-    // Never ourselves or anything we are standing on: `wsp doctor` run from a
-    // shell has that shell above it, and the shell's line carries our command.
-    let mine = crate::cmd_sandbox::ancestors(&all);
-    Some(
-        all.iter()
-            .filter(|(pid, _, _)| !mine.contains(pid))
-            .filter(|(_, _, rest)| is_daemon(rest) && for_store(rest, state))
-            .map(|(pid, _, _)| *pid)
-            .collect(),
-    )
+    Some(daemons(&all, std::process::id(), state))
+}
+
+/// The daemons in a process list, never counting `me`.
+///
+/// Our own pid only, and not our ancestors. Ancestors were excluded once,
+/// when a shell whose line carried `wsp daemon` could pass for one — and every
+/// agent the tick spawns is a descendant of the daemon, so its brief was told
+/// "no wsp daemon" by the one daemon on the machine (wsp-200). [`is_daemon`]
+/// reads argv alone now, so a shell cannot match; the daemon asking about
+/// others at its claim is the one case left, and `reload` keeps its pid.
+fn daemons(all: &[(u32, u32, String)], me: u32, state: &Path) -> Vec<u32> {
+    all.iter()
+        .filter(|(pid, _, _)| *pid != me)
+        .filter(|(_, _, rest)| is_daemon(rest) && for_store(rest, state))
+        .map(|(pid, _, _)| *pid)
+        .collect()
 }
 
 /// Is a `wsp surface` drawing this store's sidebar?
@@ -431,9 +438,9 @@ pub(crate) fn running(state: &Path) -> Option<Vec<u32>> {
 /// process that wrote it — through a herdr that was killed, a crash, or a fork
 /// somebody has stopped running. There is nothing to go stale here.
 ///
-/// Ancestors are **not** excluded, where [`running`] excludes them: the caller
-/// is usually a `wsp` the surface itself started — the plugin hook under a
-/// workspace the sidebar's `O` created — and the surface being our own parent
+/// Ancestors are **not** excluded, and [`running`] no longer excludes them
+/// either: the caller is usually a `wsp` the surface itself started — the
+/// plugin hook under a workspace the sidebar's `O` created — and the surface being our own parent
 /// is the case this exists to catch rather than the case to filter out.
 ///
 /// A `ps` that will not answer reads as "no surface", which is the same way
@@ -1139,6 +1146,23 @@ mod tests {
         assert!(!is_daemon("tail -f daemon.log PATH=/usr/bin"));
         // Something else called wsp: the name has to be the whole leaf.
         assert!(!is_daemon("/usr/bin/notwsp daemon"));
+    }
+
+    /// A spawn the tick makes runs beneath the daemon, and its brief asks
+    /// whether a daemon is running. Excluding ancestors answered "no" there,
+    /// on every agent a run started; only our own pid is ours to skip.
+    #[test]
+    fn an_agent_the_daemon_spawned_still_finds_the_daemon() {
+        let live = Store::default_state();
+        let all = vec![
+            (1, 0, "launchd".to_string()),
+            (500, 1, "/Users/e/.local/bin/wsp daemon PATH=/usr/bin".to_string()),
+            (600, 500, "/bin/zsh -c claude HOME=/Users/e".to_string()),
+            (700, 600, "/Users/e/.local/bin/wsp brief --session _=/Users/e/.local/bin/wsp".to_string()),
+        ];
+        assert_eq!(daemons(&all, 700, &live), vec![500], "the daemon above us was not counted");
+        // The daemon asking at its own claim does not find itself.
+        assert_eq!(daemons(&all, 500, &live), Vec::<u32>::new());
     }
 
     /// A sandbox runs a daemon of its own, deliberately, with `WSP_STATE` set —
