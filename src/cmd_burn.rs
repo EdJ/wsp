@@ -45,11 +45,24 @@ struct Price {
     output: u64,
 }
 
-/// **List prices, first-party Anthropic API, read on 2026-08-26.** This is the
-/// thing in wsp that goes stale without saying so, which is why it is a table
-/// with a date on it rather than a constant buried in an expression — the same
-/// bargain the cache multipliers below make, and the reason `core-049`'s
+/// When [`PRICES`] was last checked against the first-party price reference.
+/// Printed under the report, so the reader sees the age of the quote beside
+/// the money it produced.
+const PRICES_READ: &str = "2026-08-26";
+
+/// **List prices, first-party Anthropic API, read on [`PRICES_READ`].** This is
+/// the thing in wsp that goes stale without saying so, which is why it is a
+/// table with a date on it rather than a constant buried in an expression — the
+/// same bargain the cache multipliers below make, and the reason `core-049`'s
 /// `CACHE_DISCOUNT` was written down instead of inlined.
+///
+/// **A reading date does not protect an introductory price.** A list price
+/// goes stale unpredictably; an introductory one goes stale on a date that is
+/// known the day the row is typed. `core-056`: Sonnet 5 was entered at its
+/// introductory $2/$10, which ended 2026-08-31, and every sonnet seat was
+/// under-billed by a third from the next day. A row priced on a promotion says
+/// so and carries its end date beside it; a row with no such note is a
+/// standing rate.
 ///
 /// Matched as a prefix, longest-specific first, because a model id carries a
 /// date or a variant wsp has no business parsing (`claude-opus-5`,
@@ -61,11 +74,13 @@ const PRICES: &[(&str, Price)] = &[
     ("claude-fable", Price { input: 10_000_000, output: 50_000_000 }),
     ("claude-mythos", Price { input: 10_000_000, output: 50_000_000 }),
     ("claude-opus", Price { input: 5_000_000, output: 25_000_000 }),
-    // Sonnet 4.x and Sonnet 5 are not the same price, and the fleet runs both:
-    // `d5f0956` starts work under a seat on sonnet while seats stay on the
-    // settings tier, so this is the row most likely to be read.
+    // Sonnet 4.x and Sonnet 5 were once not the same price, and the fleet runs
+    // both: `d5f0956` starts work under a seat on sonnet while seats stay on
+    // the settings tier, so this is the row most likely to be read. Sonnet 5's
+    // introductory $2/$10 ended 2026-08-31; the standing rate is $3/$15, the
+    // same as 4.x, and the 4.x row stays so the two can diverge again.
     ("claude-sonnet-4", Price { input: 3_000_000, output: 15_000_000 }),
-    ("claude-sonnet", Price { input: 2_000_000, output: 10_000_000 }),
+    ("claude-sonnet", Price { input: 3_000_000, output: 15_000_000 }),
     ("claude-haiku", Price { input: 1_000_000, output: 5_000_000 }),
 ];
 
@@ -229,7 +244,9 @@ pub fn burn(_store: &crate::store::Store, args: &Args) -> i32 {
     // this one is a quote with a date on it.
     println!(
         "{}",
-        p.dim("cost at Anthropic list prices read 2026-08-26, per request on the model that served it")
+        p.dim(&format!(
+            "cost at Anthropic list prices read {PRICES_READ}, per request on the model that served it"
+        ))
     );
     println!(
         "{}",
@@ -304,6 +321,15 @@ mod tests {
             json!({ "turns": turns, "output": output, "cost": output * 100 }).to_string(),
         )
         .unwrap();
+    }
+
+    /// `core-056`: Sonnet 5's introductory rate ended 2026-08-31. The standing
+    /// rate is $3/$15, and a sonnet request must not price below it.
+    #[test]
+    fn sonnet_five_is_priced_at_its_standing_rate() {
+        for model in ["claude-sonnet-5", "claude-sonnet-5-5", "claude-sonnet-4-5"] {
+            assert_eq!(cost(model, 1_000_000, 1_000_000, 0, 0), 18_000_000, "{model}");
+        }
     }
 
     /// **The bug, as a sentence.** A machine whose seats are all compound seats
