@@ -672,8 +672,15 @@ fn unseated(store: &Store, scope: &str) -> String {
     // store while this sentence went on saying `counting` for 201 held items on
     // `tooling`. Found by reading this output after landing the marker, which is
     // the usual way: the fix and the sentence it made untrue were the same row.
+    //
+    // A failed reseat says why and when the next try is (`wsp-177`). Bare
+    // `retrying` was all a reader got while the reason sat in undated stderr.
     let tail = match (v.reseating, v.failed, up) {
-        (Some(_), Some(_), _) => "retrying".to_string(),
+        (Some(at), Some(_), _) => format!(
+            "reseat failed · {} · next try {}",
+            cmd_govern::reseat_why(&store.governors(), scope).unwrap_or_else(|| "no reason recorded".into()),
+            util::local_hm(at + cmd_govern::SEAT_CLAIMED_FOR)
+        ),
         (Some(_), None, _) => "reseating".to_string(),
         (None, _, false) => "daemon down".to_string(),
         (None, _, true) => "counting".to_string(),
@@ -683,9 +690,14 @@ fn unseated(store: &Store, scope: &str) -> String {
     let kind = crate::cmd_spawn::seat_kind(&store.governors(), scope);
     let tail = match (crate::place_compound::reads_kind(&kind), crate::repair::will_seat(store, scope)) {
         (false, _) => format!("a {kind} seat compound cannot run"),
-        // Nothing owed and no running list: nothing will fill it, and nothing
-        // needs to until something is owed.
-        (true, false) => "nothing owed, so nobody is coming".to_string(),
+        // A list that is not running is never reseated, owed or not
+        // (`wsp-177`), so its sentence names the status and not a count.
+        (true, false) => match store.worklist(scope).map(|w| w.status()).filter(|s| !s.is_running()) {
+            Some(status) => format!("the list is {}, so nobody is coming", status.as_str()),
+            // Nothing owed and no running list: nothing will fill it, and nothing
+            // needs to until something is owed.
+            None => "nothing owed, so nobody is coming".to_string(),
+        },
         (true, true) => tail,
     };
     let tail = match cmd_govern::stood_at(&store.governors(), scope) {
@@ -1549,8 +1561,12 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         // the next attempt is up to SEAT_CLAIMED_FOR away.
         crate::cmd_govern::claim_seat(&store, "core");
         assert!(why(&store).ends_with("reseating"), "{}", why(&store));
-        crate::cmd_govern::reseat_failed(&store, "core");
-        assert!(why(&store).ends_with("retrying"), "{}", why(&store));
+        crate::cmd_govern::reseat_failed(&store, "core", "the agent never came up");
+        assert!(
+            why(&store).contains("reseat failed · the agent never came up · next try "),
+            "the seat says it failed, why, and when it is tried again: {}",
+            why(&store)
+        );
 
         // **And a seat somebody closed is a decision, not a measurement.** The
         // marker made it true in the store while this sentence went on saying

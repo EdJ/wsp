@@ -2170,10 +2170,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         false => None,
     };
     if let Some(project) = &governing {
+        // What this spawn was given goes on the seat it took (`wsp-117`, closed
+        // by `wsp-177`). `take` keeps the old tier only for a pane re-taking its
+        // own seat. So a seat Ed filled with `--model opus --effort high` was
+        // recorded with neither, and every rotation and reseat after it read
+        // the record and started the successor at the settings file's tier.
+        let record_tier = || cmd_govern::note_started(store, project, &kind, model.as_deref(), effort.as_deref());
         match place.room(&seat) {
             Some(ws) => match cmd_govern::take(store, project, &ws, seat.as_str()) {
-                Ok(Some((_, room))) => println!("  {}", p.dim(&format!("{project} seat taken from {room}"))),
-                Ok(None) => {}
+                Ok(Some((_, room))) => {
+                    record_tier();
+                    println!("  {}", p.dim(&format!("{project} seat taken from {room}")))
+                }
+                Ok(None) => {
+                    record_tier();
+                }
                 // Before any agent is started, so nothing is told it is a
                 // custodian of a seat it does not hold. The workspace stays, as
                 // it does for a refused claim above.
@@ -2826,7 +2837,16 @@ fn rotate_as(
     // The successor, resolved through the same door any custodial spawn walks:
     // a scope is a project or a worklist, and `resolve` under `--govern`
     // already knows both without being told twice.
-    let asked_kind = args.get("kind");
+    //
+    // The kind and the tier fall back to the seat's own record when the caller
+    // named none. `wsp-177`: only the reconciler's and the run's callers passed
+    // them, so a person's `wsp govern <scope> --rotate` started the successor
+    // on the default kind at the settings file's tier. The seat is what is
+    // being continued, whoever asks for it.
+    let asked_kind = args
+        .get("kind")
+        .filter(|k| !k.is_empty())
+        .or_else(|| cmd_govern::last_seat(&governors, &scope).map(|s| s.kind).filter(|k| !k.is_empty()));
     let asked_on = args.get("on");
     let mut flags: Vec<(&str, &str)> = vec![("govern", "true")];
     if let Some(k) = &asked_kind {
@@ -2860,9 +2880,10 @@ fn rotate_as(
     // and a record written before this field existed answers `None`, which is
     // exactly what the spawn that filled it used — so the fallback is the
     // behaviour this has always had and not a new one.
+    let (was_model, was_effort) = cmd_govern::tier_of(&governors, &scope);
     let (model, effort) = (
-        args.get("model").filter(|m| !m.is_empty()),
-        args.get("effort").filter(|e| !e.is_empty()),
+        args.get("model").filter(|m| !m.is_empty()).or(was_model),
+        args.get("effort").filter(|e| !e.is_empty()).or(was_effort),
     );
     // Before anything is opened, like every other refusal here. The evidence
     // step two turns on is a turn wsp can see; a kind whose order goes out on
@@ -2897,6 +2918,12 @@ fn rotate_as(
         Ok(v) => v,
         Err(e) => {
             eprintln!("wsp: {e}");
+            // Nothing was opened, so there is nothing to end. The failure still
+            // goes on the seat: without it, `--status` said `reseating` for
+            // twenty minutes about an attempt that was already over.
+            if vacant {
+                cmd_govern::reseat_failed(store, &scope, &format!("no seat could be opened: {e}"));
+            }
             return 1;
         }
     };
@@ -2920,18 +2947,22 @@ fn rotate_as(
     // filled to every surface that cannot ask the backend.
     let vacated = vacant.then(|| store.governors().get(&scope).cloned());
     if vacant {
+        // Both refusals here write nothing to governors.json, so `put_back`
+        // restores the record it found. It is still the way out because it
+        // ends the pane and records the failure. This path used to return with
+        // the pane still open, a stray that only `wsp despawn` could find.
         let Some(ws_new) = place.room(&seat) else {
             eprintln!("wsp: {} opened but its workspace could not be read - nothing was recorded", seat.as_str());
+            let why = format!("{} opened but its workspace could not be read", seat.as_str());
+            put_back(store, place, &scope, &seat, vacated.as_ref(), &None, &why);
             return 1;
         };
-        // Not `put_back`: a refusal writes nothing to governors.json, so there
-        // is no record to restore, and the pane is the one thing to undo. The
-        // reconciler's claim runs out on its own, and the next attempt opens a
-        // seat that has never verified anything.
+        // The reconciler's claim runs out on its own, and the next attempt
+        // opens a seat that has never verified anything.
         if let Err(v) = cmd_govern::take(store, &scope, &ws_new, seat.as_str()) {
             eprintln!("{}", v.refusal(&scope));
-            let _ = place.stop(&seat);
-            eprintln!("wsp: the {scope} seat is standing empty again");
+            let why = format!("{} verified {} and may not hold a seat", seat.as_str(), v.member);
+            put_back(store, place, &scope, &seat, vacated.as_ref(), &None, &why);
             return 1;
         }
         cmd_govern::note_started(store, &scope, &kind, model.as_deref(), effort.as_deref());
@@ -2986,36 +3017,33 @@ fn rotate_as(
     // that the handover was taken, and everything after this point depends on
     // it having been.
     if let Err(e) = start_agent(place, how, &spawn, &agent, &kind, wait) {
+        eprintln!("wsp: {kind} did not start in {seat}: {e}");
         if vacant {
-            put_back(store, place, &scope, &seat, vacated.as_ref(), &brief_at);
+            // No `unreached` line: it says `wsp tell` will reach the agent if
+            // it comes up, and `put_back` has just ended the seat it would be
+            // in.
+            put_back(store, place, &scope, &seat, vacated.as_ref(), &brief_at, &format!("{kind} did not start in {seat}: {e}"));
         } else {
             store.clear_handover(&scope);
-        }
-        eprintln!("wsp: {kind} did not start in {seat}: {e}");
-        unreached(how, place, &spawn);
-        if vacant {
-            eprintln!("wsp: the {scope} seat is standing empty again");
-        } else {
+            unreached(how, place, &spawn);
             eprintln!("wsp: nothing moved - the {scope} seat is still yours");
         }
         return 1;
     }
     if !in_args {
         if let Err(e) = confirm_turn(place, how, &spawn, &text, wait) {
+            eprintln!("wsp: agent started but not working on it: {e}");
             if vacant {
-                put_back(store, place, &scope, &seat, vacated.as_ref(), &brief_at);
+                // **Not "send the order again", and not "has the order in its
+                // composer".** Both were printed here about a seat `put_back`
+                // had already ended. On 2026-10-05 that sent a governor to
+                // `wsp despawn` a cpd-313 that answered `already gone`, and
+                // the row that found it reported the reseat as leaving a stray.
+                put_back(store, place, &scope, &seat, vacated.as_ref(), &brief_at, &e);
             } else {
                 store.clear_handover(&scope);
-            }
-            eprintln!("wsp: agent started but not working on it: {e}");
-            eprintln!("wsp: send the order again with `wsp tell {} -`", seat.as_str());
-            unreached(how, place, &spawn);
-            if vacant {
-                eprintln!(
-                    "wsp: the {scope} seat is standing empty again, and {} has the order in its composer",
-                    seat.as_str()
-                );
-            } else {
+                eprintln!("wsp: send the order again with `wsp tell {} -`", seat.as_str());
+                unreached(how, place, &spawn);
                 eprintln!(
                     "wsp: nothing moved - the {scope} seat is still yours, and {} sits idle",
                     seat.as_str()
@@ -3144,10 +3172,10 @@ fn rotate_as(
 /// *is* still empty and the next pass counting from where this one got to is the
 /// point of keeping it.
 ///
-/// **Best effort on all three, and silent about the parts that fail.** The caller
-/// is already printing why the reseat failed and the reconciler will come back
-/// on the next tick; a half-completed tidy that turned into a refusal would stop
-/// the record being restored, which is the one part that has to happen.
+/// **Best effort on all three, and the record first.** A half-completed tidy that
+/// turned into a refusal would stop the record being restored, which is the one
+/// part that has to happen. Whether the pane was ended is said, and so is `why`,
+/// on the seat and in `cycle.log` through [`cmd_govern::reseat_failed`].
 fn put_back(
     store: &Store,
     place: &dyn Place,
@@ -3155,6 +3183,7 @@ fn put_back(
     seat: &Seat,
     was: Option<&Option<Value>>,
     brief_at: &Option<std::path::PathBuf>,
+    why: &str,
 ) {
     match was {
         // Verbatim, claim and all: the record goes back as it was found, which
@@ -3166,20 +3195,27 @@ fn put_back(
             store.clear_governor(scope);
         }
     }
-    // And then written onto whichever record survived — after the restore rather
-    // than inside it, because a scope with no record at all is not one the
-    // reconciler will ask about again until a running list or a backlog brings
-    // it back, and a claim nobody reads bounds nothing.
-    cmd_govern::reseat_failed(store, scope);
     // The port that opened it, and not a lookup for which one that was: this
     // function is only ever called on a seat `rotate_as` opened itself two lines
     // ago, so the backend is a value already in hand — and `end_work`'s fan-out
     // over `local_backends()` is for a person pointing `despawn` at an arbitrary
     // seat, which is a different question and costs a census per call.
-    let _ = place.stop(seat);
+    //
+    // **Said either way** (`wsp-177`). The pane is the one part a person may
+    // have to finish by hand, and they can only do that if they are told.
+    let ended = match place.stop(seat) {
+        Ok(()) => format!("{seat} was ended"),
+        Err(e) => format!("{seat} could not be ended ({e}): `wsp despawn --pane {seat}`"),
+    };
+    eprintln!("wsp: the {scope} seat is standing empty again - {ended}");
     if let Some(path) = brief_at {
         let _ = std::fs::remove_file(path);
     }
+    // And then written onto whichever record survived — after the restore rather
+    // than inside it, because a scope with no record at all is not one the
+    // reconciler will ask about again until a running list or a backlog brings
+    // it back, and a claim nobody reads bounds nothing.
+    cmd_govern::reseat_failed(store, scope, &format!("{why}; {ended}"));
 }
 
 /// What a successor seated into a vacancy is told about what it walked into.
@@ -6388,6 +6424,9 @@ mod tests {
         /// herdr-shaped, with the seat in room `w9`; or compound-shaped, with
         /// no room above the seat, which is the port's default answer.
         rooms: bool,
+        /// A backend that cannot say which room the seat is in at all —
+        /// herdr with its listing unanswered.
+        lost: bool,
     }
 
     impl Seats {
@@ -6402,6 +6441,7 @@ mod tests {
                 last: script.last().cloned().unwrap_or(Ok(State::Unknown)),
                 states: std::cell::RefCell::new(script.into()),
                 rooms: true,
+                lost: false,
             }
         }
         fn roomless(script: Vec<crate::place::Result<State>>) -> Seats {
@@ -6456,6 +6496,9 @@ mod tests {
             panic!("rotation opens a seat rather than asking which one it is in")
         }
         fn room(&self, seat: &Seat) -> Option<String> {
+            if self.lost {
+                return None;
+            }
             match self.rooms {
                 true => Some("w9".into()),
                 false => Some(seat.to_string()),
@@ -6675,7 +6718,20 @@ mod tests {
             assert_eq!(code, 1, "{tag}");
             assert_eq!(place.started.get(), 0, "{tag}: no successor started");
             assert_eq!(place.stopped.get(), 1, "{tag}: the pane it opened is closed again");
-            assert_eq!(governors_bytes(&store), before, "{tag}: governors.json moved");
+            // The seat is untouched; the only change is the failure written
+            // against the claim (`wsp-177`), so the next pass backs off and
+            // `--status` can say why.
+            let mut rec = store.governors()["core"].clone();
+            let why = rec.as_object_mut().and_then(|o| {
+                o.remove("reseating_failed");
+                o.remove("reseat_why")
+            });
+            assert!(
+                why.as_ref().and_then(Value::as_str).is_some_and(|w| w.contains("verified t-1")),
+                "{tag}: the refusal is the reason recorded: {why:?}"
+            );
+            let was: Value = serde_json::from_slice(&before).unwrap();
+            assert_eq!(rec, was["core"], "{tag}: and nothing else on the seat moved");
             let _ = std::fs::remove_dir_all(&store.root);
         }
     }
@@ -6900,6 +6956,119 @@ mod tests {
             !cmd_govern::claim_seat(&store, "core"),
             "which is the bound: the next attempt waits for SEAT_CLAIMED_FOR, not one tick"
         );
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **`wsp-177`: a failed reseat ends what it opened, and says so in three
+    /// places.** On 2026-10-05 the verb's last words about cpd-313 were "has the
+    /// order in its composer". That pane had already been ended, and a governor
+    /// went looking for a stray that `despawn` answered `already gone`. The seat
+    /// itself said only `retrying`, and `cycle.log` had no dated line.
+    #[test]
+    fn a_failed_reseat_ends_its_seat_and_records_why_on_the_seat_and_in_the_log() {
+        let (_env, store) = vacated_seat("reseat-why", "opus", "high");
+        assert!(cmd_govern::claim_seat(&store, "core"));
+        crate::cycle::tests::SAID.with(|s| s.borrow_mut().clear());
+        let dial = util::Dial::new();
+        let place = Seats::of(vec![Ok(State::Idle)]);
+        let args = reseat_args(&store.governors(), "core");
+        let code = reseat_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 1);
+        assert_eq!(place.stopped.get(), 1, "the seat it opened was ended");
+        let why = cmd_govern::reseat_why(&store.governors(), "core").unwrap_or_default();
+        assert!(why.contains("w9:p2 was ended"), "the seat says what became of the pane: {why}");
+        assert!(why.contains("work order"), "and why the attempt failed: {why}");
+        let said = crate::cycle::tests::SAID.with(|s| s.borrow().clone());
+        assert!(
+            said.iter().any(|l| l.starts_with("core: the reseat failed") && l.contains("the next attempt is after")),
+            "a dated line in cycle.log, with when it is tried again: {said:?}"
+        );
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// The way out that used to leave a stray: the seat opened and its room
+    /// could not be read, and the verb returned with the pane still open and
+    /// nothing on the record. Now it is ended, and the failure keeps the claim
+    /// as every other failure does, so the next pass backs off.
+    #[test]
+    fn a_reseat_whose_room_cannot_be_read_ends_the_seat_it_opened_and_backs_off() {
+        let (_env, store) = vacated_seat("reseat-roomless", "opus", "high");
+        assert!(cmd_govern::claim_seat(&store, "core"));
+        let dial = util::Dial::new();
+        let place = Seats { lost: true, ..Seats::of(vec![Ok(State::Idle), Ok(State::Working)]) };
+        let args = reseat_args(&store.governors(), "core");
+        let code = reseat_on(&place, &store, &args, &handover_wait(&dial));
+        stop_being_a_seat();
+
+        assert_eq!(code, 1);
+        assert_eq!(place.started.get(), 0, "no agent in a seat nobody can record");
+        assert_eq!(place.stopped.get(), 1, "and the pane is not left behind");
+        let v = cmd_govern::vacancy(&store.governors(), "core");
+        assert!(v.reseating.is_some() && v.failed.is_some(), "claim held, failure on it: {v:?}");
+        assert!(!cmd_govern::claim_seat(&store, "core"), "so the next pass backs off");
+        assert_eq!(store.governors()["core"]["last"]["model"], "opus", "and the tier is still there for it");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **`wsp-117`, closed by `wsp-177`: what `spawn --govern` was given is on
+    /// the seat.** Ed seated wsp-process at opus/high on 2026-10-05, and the
+    /// record said `model: ""`, so the next rotation started at the settings
+    /// file's tier. `take` keeps an old tier only for a pane re-taking its own
+    /// seat, so nothing else would have written it.
+    #[test]
+    fn a_govern_spawn_records_the_tier_it_was_given_on_the_seat() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("govern-tier");
+        store.save_project(&Project::new("core")).unwrap();
+        // The rotation's fake, because a claude seat is told its order and
+        // `Started` is for a kind that takes it in argv.
+        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+        let flags = [("project", "core"), ("govern", "true"), ("kind", "claude"), ("model", "opus"), ("effort", "high")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &[], &flags)), 0);
+        let started = place.agents.borrow()[0].clone();
+        assert!(started.contains("--model opus") && started.contains("--effort high"), "{started}");
+
+        let rec = &store.governors()["core"];
+        assert_eq!(rec["model"], "opus", "{rec}");
+        assert_eq!(rec["effort"], "high", "{rec}");
+        assert_eq!(rec["kind"], "claude", "{rec}");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **And a rotation nobody passed a tier to keeps the seat's.** The run's
+    /// own rotation and the reconciler's reseat pass the record's tier in. A
+    /// person's `wsp govern <scope> --rotate` passed nothing, and the successor
+    /// started on the default kind at the settings file's tier.
+    #[test]
+    fn a_rotation_typed_with_no_flags_keeps_the_seats_kind_model_and_effort() {
+        let (_env, store) = rotating_as("rotate-keeps-tier", "w1", "w1:p9");
+        let sock = _env.path("herdr.sock");
+        herdr_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+        store.save_project(&Project::new("core")).unwrap();
+        cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
+        cmd_govern::note_started(&store, "core", "claude", Some("opus"), Some("high"));
+
+        let dial = util::Dial::new();
+        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
+        let args = Args::synth("govern", &["core"], &[("rotate", "true")]);
+        let arranged = Arranged::default();
+        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &arranged.f());
+        stop_being_a_seat();
+
+        assert_eq!(code, 0);
+        let started = place.agents.borrow()[0].clone();
+        assert!(started.contains("--model opus"), "the successor runs at the seat's tier: {started}");
+        assert!(started.contains("--effort high"), "{started}");
+        let rec = &store.governors()["core"];
+        assert_eq!(rec["pane"], "w9:p2", "the seat moved");
+        assert_eq!(rec["model"], "opus", "and the next successor will read the same tier: {rec}");
+        assert_eq!(rec["effort"], "high", "{rec}");
+        assert_eq!(rec["kind"], "claude", "{rec}");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

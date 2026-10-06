@@ -1406,15 +1406,40 @@ pub fn claim_seat(store: &Store, scope: &str) -> bool {
 /// **Kept for a refusal as well as a broken agent**, and for the same reason: a
 /// refusal the reconciler keeps making is a refusal it will keep making, and a
 /// verb that released the claim on its way out turned one into a spawn a minute.
-pub fn reseat_failed(store: &Store, scope: &str) {
+///
+/// **With the reason, on the seat and in `cycle.log`, from this one call**
+/// (`wsp-177`). Before, the seat said `retrying` and the reason was only in the
+/// verb's undated stderr, which ended "cpd-313 has the order in its composer"
+/// about a pane `put_back` had already ended. A reader of `--status` could not
+/// tell a renderer that never came up from a refusal, and `cycle.log` had no
+/// dated line saying the attempt was over. One function writes both so neither
+/// can be forgotten by the next way out somebody adds.
+pub fn reseat_failed(store: &Store, scope: &str, why: &str) {
+    let mut claimed = None;
     store.edit_governor(scope, |rec| {
         let Some(o) = rec.as_object_mut() else { return false };
         o.insert("reseating_failed".into(), json!(util::now_iso()));
+        o.insert("reseat_why".into(), json!(why));
         // A claim that was never taken is not invented here: this records that
         // an attempt happened, and the reconciler is what decides whether a
         // *next* one may.
+        claimed = Vacancy::of(rec).reseating;
         true
     });
+    let next = claimed
+        .map(|at| format!("; the next attempt is after {}", util::local_hm(at + SEAT_CLAIMED_FOR)))
+        .unwrap_or_default();
+    crate::cycle::log_line(store, &format!("{scope}: the reseat failed — {why}{next}"));
+}
+
+/// Why the last reseat of this seat failed, as [`reseat_failed`] recorded it.
+pub fn reseat_why(governors: &BTreeMap<String, Value>, scope: &str) -> Option<String> {
+    governors
+        .get(scope)
+        .and_then(|r| r.get("reseat_why"))
+        .and_then(Value::as_str)
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
 }
 
 /// When a person stood this seat down, if they did.
@@ -1662,7 +1687,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             // reconciler takes it before it launches this process, so giving it
             // back here meant the very next pass tried again — and a refusal
             // this verb keeps making is one it will keep making.
-            reseat_failed(store, &scope);
+            reseat_failed(store, &scope, "the seat has somebody in it");
             return 1;
         }
         return crate::cmd_spawn::reseat(store, &scope);

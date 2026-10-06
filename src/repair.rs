@@ -304,9 +304,18 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
             out.push((scope, trigger));
         }
     };
-    for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
+    // **Running, and with a group still ahead of it.** `wsp-177`: a list whose
+    // every barrier is passed has no next step for a seat to take, whatever its
+    // status says for the moment before `done` is written. Read `Settled`,
+    // which is the store alone: `will_seat` asks this from `wsp watch --status`
+    // too, and a git process per member there would be paid on every read.
+    let lists = store.worklists();
+    for w in lists.iter().filter(|w| w.status().is_running()) {
+        if worklist::position(store, w, Reading::Settled).finished() {
+            continue;
+        }
         add(
-            crate::cycle::governing_post(store, &w).unwrap_or_else(|| w.id.clone()),
+            crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone()),
             RUNNING.to_string(),
             &mut out,
         );
@@ -319,12 +328,20 @@ fn seat_scopes(store: &Store) -> Vec<(String, String)> {
     // doing, so a person's pause would be undone by the first hand raised on a
     // member still in flight. Read as the list's post, so a project seat that
     // also governs a *running* list is already in `out` and keeps its reason.
-    let paused: Vec<String> = store
-        .worklists()
-        .into_iter()
+    let mut paused: Vec<String> = lists
+        .iter()
         .filter(|w| w.status() == WorklistStatus::Parked)
-        .map(|w| crate::cycle::governing_post(store, &w).unwrap_or_else(|| w.id.clone()))
+        .map(|w| crate::cycle::governing_post(store, w).unwrap_or_else(|| w.id.clone()))
         .collect();
+    // **And a list's own post is not seated for what it owes unless the list is
+    // running** (`wsp-177`). `tokenhub-spec-sync` was `done` at 10:27 on
+    // 2026-10-05. At 15:11 it was reseated anyway, and the line said "this
+    // list is running" because the backlog trigger reused that sentence. A
+    // finished or unstarted list has no next step for a governor to take.
+    // Held lines stay held, and `--status` says nobody is coming. Only the
+    // list's own id, not its post: a project seat over a finished list still
+    // answers for the project, which is the other half of this trigger.
+    paused.extend(lists.iter().filter(|w| !w.status().is_running()).map(|w| w.id.clone()));
     // **`scopes_owed`, which is `wsp-178`'s question** — held is not owed:
     // `wsp-166` withholds a governor's non-decisions from its seat, and a scope
     // whose whole spool is withheld owes nothing while `depth() > 0` says it is
@@ -1601,8 +1618,9 @@ impl Seats for Absent {
     #[test]
     fn a_scope_owing_an_answer_with_a_vacant_seat_is_reseated_though_no_list_runs() {
         let (_env, store) = in_flight("seat-held");
-        // A finished list would do; this one is absent, so nothing in the pass
-        // above can reach this scope at all.
+        // No list by this name at all, so nothing in the pass above can reach
+        // this scope. A *finished* list's own scope would not do since
+        // `wsp-177`; see the test below.
         store.set_governor(
             "quiet",
             serde_json::json!({
@@ -1617,6 +1635,65 @@ impl Seats for Absent {
         a_pass(&store, &gone);
 
         assert!(reseated().contains(&"quiet".to_string()), "nothing else would ever seat this");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// **`wsp-177`: a finished list is never reseated, whatever it owes.**
+    /// `tokenhub-spec-sync` was `done` at 10:27 on 2026-10-05 and was reseated
+    /// at 15:11, then every twenty minutes after, on its backlog. Its log line
+    /// said "this list is running". Nothing on a done list is a next step for a
+    /// governor. A draft is the same: it has not started, so it has no seat to
+    /// keep.
+    #[test]
+    fn a_done_list_is_never_reseated_though_its_seat_is_dead_and_it_owes_an_answer() {
+        for status in [WorklistStatus::Done, WorklistStatus::Draft] {
+            let (_env, store) = in_flight(&format!("seat-done-{}", status.as_str()));
+            let mut w = store.worklist("run").unwrap();
+            w.set_status(status);
+            store.save_worklist(&w).unwrap();
+            seated(&store, "run", "w1", "cpd-1", "", "");
+            held_for(&store, "run", 2);
+
+            let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+            for _ in 0..4 {
+                a_pass(&store, &gone);
+            }
+
+            assert!(reseated().is_empty(), "{}: nobody is seated for a list with no next step", status.as_str());
+            assert_eq!(
+                cmd_govern::vacancy(&store.governors(), "run").unseated,
+                0,
+                "{}: and it is not even counted towards one",
+                status.as_str()
+            );
+            assert!(!will_seat(&store, "run"), "so `--status` says nobody is coming");
+            let _ = std::fs::remove_dir_all(&store.root);
+        }
+    }
+
+    /// The same for a list still marked `running` whose every barrier has been
+    /// passed. That is the moment between the last verdict and `done` being
+    /// written, and a seat filled in it has nothing to sequence.
+    #[test]
+    fn a_running_list_whose_every_barrier_has_passed_is_not_reseated() {
+        let (_env, store) = in_flight("seat-finished");
+        member(&store, "m-1", Status::Review);
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        groups[0].verdict = "2026-10-05T10:27:00Z passes".into();
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        assert!(
+            worklist::position(&store, &w, Reading::Settled).finished(),
+            "the fixture is a run with nothing left ahead of it"
+        );
+        seated(&store, "run", "w1", "cpd-1", "", "");
+
+        let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+        for _ in 0..3 {
+            a_pass(&store, &gone);
+        }
+        assert!(reseated().is_empty(), "no next step, so no seat");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
