@@ -1322,12 +1322,17 @@ pub struct Placing {
 #[derive(Default)]
 pub struct Running {
     at: BTreeMap<String, Placing>,
+    /// The slugs of the running lists, for a row that is spawned by a list
+    /// without being a member of it ([`Running::list_for`]).
+    lists: std::collections::BTreeSet<String>,
 }
 
 impl Running {
     pub fn read(store: &Store) -> Running {
         let mut at: BTreeMap<String, Placing> = BTreeMap::new();
+        let mut lists = std::collections::BTreeSet::new();
         for w in store.worklists().iter().filter(|w| w.status().is_running()) {
+            lists.insert(w.id.clone());
             let groups = w.groups();
             for (i, g) in groups.iter().enumerate() {
                 for m in &g.members {
@@ -1339,7 +1344,7 @@ impl Running {
                 }
             }
         }
-        Running { at }
+        Running { at, lists }
     }
 
     pub fn of(&self, task: &str) -> Option<&Placing> {
@@ -1349,6 +1354,36 @@ impl Running {
     /// The list a task is in, which is the only half routing needs.
     pub fn list_of(&self, task: &str) -> Option<&str> {
         self.at.get(task).map(|p| p.list.as_str())
+    }
+
+    /// The running list a *row* answers to: a member, the verifier of a member,
+    /// or the barrier row a list spawned for one of its groups.
+    ///
+    /// **[`Running::list_of`] is the membership question and this is the
+    /// routing one, and the difference is the two rows a list spawns without
+    /// listing.** A barrier seat is not a member of the list that started it,
+    /// and neither is a verifier — it hangs under the member it checks — so a
+    /// walk keyed on membership started them at their project and stepped past
+    /// the group's governor to whoever sat above it (`wsp-165`: a barrier's
+    /// `wsp ask` reached `tooling`, whose seat was empty). They are spawned by
+    /// the list and are answered for by it, which is the sentence the walk
+    /// already says about a member.
+    ///
+    /// Every question *who answers for this row* asks this one; the callers
+    /// that mean membership — what the cap counts, what a list's own group
+    /// shows — keep asking [`Running::list_of`].
+    pub fn list_for(&self, task: &crate::model::Task) -> Option<&str> {
+        if let Some(l) = self.list_of(&task.id) {
+            return Some(l);
+        }
+        let under = match task.tags.iter().any(|g| g == crate::cycle::VERIFY_TAG) {
+            true => task.parent.as_deref().and_then(|p| self.list_of(p)),
+            false => None,
+        };
+        under.or_else(|| {
+            let slug = crate::cycle::barrier_list(task)?;
+            self.lists.get(slug).map(String::as_str)
+        })
     }
 }
 
@@ -2601,6 +2636,46 @@ mod tests {
         w.set_status(crate::model::WorklistStatus::Held);
         store.save_worklist(&w).unwrap();
         assert_eq!(Running::read(&store).of("wsp-1"), None, "a held run has stopped answering");
+    }
+
+    /// **A row a list spawns is answered for by the list, member or not.**
+    /// `wsp-165`: a barrier seat's `wsp ask` named `tooling`, the project's
+    /// ancestor, because the barrier row is spawned by the worklist and carries
+    /// no `list:` of its own — and a verifier hangs under the member it checks,
+    /// which is the same gap one row down.
+    #[test]
+    fn a_barrier_and_a_verifier_answer_to_the_list_that_spawned_them() {
+        let (_env, store, _repo) = scratch("list-for");
+        task(&store, "wsp-1", "doing");
+        task(&store, "wsp-9", "todo");
+        let mut barrier = Task::new("Barrier: batch group 1", "wsp-2");
+        barrier.tags = vec![crate::cycle::BARRIER_TAG.to_string()];
+        let mut verifier = Task::new("Verify wsp-1", "wsp-3");
+        verifier.tags = vec![crate::cycle::VERIFY_TAG.to_string()];
+        verifier.parent = Some("wsp-1".into());
+        let mut recheck = Task::new("Barrier: batch group 1 (recheck 2)", "wsp-4");
+        recheck.tags = barrier.tags.clone();
+        let mut elsewhere = Task::new("Barrier: other group 1", "wsp-5");
+        elsewhere.tags = barrier.tags.clone();
+        let mut untagged = Task::new("Barrier: batch group 1", "wsp-6");
+        untagged.tags.clear();
+
+        let mut w = list("- 1  wsp-1\n");
+        store.save_worklist(&w).unwrap();
+        let r = Running::read(&store);
+        assert_eq!(r.list_for(&barrier), Some("batch"));
+        assert_eq!(r.list_for(&recheck), Some("batch"), "a re-check is the same barrier");
+        assert_eq!(r.list_for(&verifier), Some("batch"), "through the member it verifies");
+        assert_eq!(r.list_for(&store.find_task("wsp-1").unwrap()), Some("batch"), "and a member is as before");
+        assert_eq!(r.list_for(&elsewhere), None, "a barrier of a list that is not running");
+        assert_eq!(r.list_for(&untagged), None, "a title alone is not a barrier");
+        assert_eq!(r.list_for(&store.find_task("wsp-9").unwrap()), None, "and an unlisted task");
+
+        w.set_status(crate::model::WorklistStatus::Held);
+        store.save_worklist(&w).unwrap();
+        let r = Running::read(&store);
+        assert_eq!(r.list_for(&barrier), None, "a held run has stopped answering for its barrier too");
+        assert_eq!(r.list_for(&verifier), None);
     }
 
     /// The ordinary state, which is the one that has to cost nothing: a store

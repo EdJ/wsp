@@ -826,7 +826,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         seat: cmd_govern::seat_for(
             &b.governors,
             index,
-            mine.and_then(|t| b.lists.list_of(&t.id)),
+            mine.and_then(|t| b.lists.list_for(t)),
             b.project.as_deref(),
         )
         .map(|s| {

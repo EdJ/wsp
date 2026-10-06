@@ -490,8 +490,17 @@ fn unlanded(id: &str, note: &str) -> String {
     )
 }
 
-/// The running list a row belongs to: itself a member, a verifier under one,
-/// or the barrier row named after the list.
+/// The list a barrier row is named after, read off its title.
+///
+/// Not a test that the list is running — the row's own title is all this reads.
+/// [`worklist::Running::list_for`] is the routing question and adds that.
+pub(crate) fn barrier_list(t: &Task) -> Option<&str> {
+    t.tags.iter().any(|g| g == BARRIER_TAG).then_some(())?;
+    t.title.strip_prefix(BARRIER_TITLE)?.split_whitespace().next()
+}
+
+/// The list a row belongs to: itself a member, a verifier under one, or the
+/// barrier row named after the list. Running or not, for the barrier.
 fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
     let running = worklist::Running::read(store);
     let id = match t.tags.iter().any(|g| g == VERIFY_TAG) {
@@ -501,8 +510,7 @@ fn list_of(store: &Store, t: &Task) -> Option<Worklist> {
     if let Some(l) = running.list_of(&id) {
         return store.worklist(l);
     }
-    let slug = t.title.strip_prefix(BARRIER_TITLE)?.split_whitespace().next()?.to_string();
-    store.worklist(&slug)
+    store.worklist(barrier_list(t)?)
 }
 
 /// Everything the current group owes, taken in order. Returns what it started,

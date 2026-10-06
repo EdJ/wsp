@@ -1269,7 +1269,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
         let id = m.about.task().unwrap_or_default();
         let task = store.task(id);
         let seat = task.as_ref().and_then(|t| {
-            cmd_govern::seat_for(&governors, &index, lists.list_of(&t.id), t.project.as_deref())
+            cmd_govern::seat_for(&governors, &index, lists.list_for(t), t.project.as_deref())
         });
         let held_here = seat.as_ref().map(|s| mine.as_deref() == Some(s.scope.as_str())).unwrap_or(false);
         if only_mine && !held_here {

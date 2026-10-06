@@ -377,7 +377,7 @@ pub fn answering_seat(store: &Store, task: &crate::model::Task) -> Option<Seat> 
     let index = Index::new(store.projects());
     let lists = crate::worklist::Running::read(store);
     let governors = store.governors();
-    seat_for(&governors, &index, lists.list_of(&task.id), task.project.as_deref())
+    seat_for(&governors, &index, lists.list_for(task), task.project.as_deref())
 }
 
 /// The same walk, started **one step past** a scope that cannot answer for
@@ -2042,7 +2042,8 @@ let auto = store.worklist(&s.scope).is_some_and(|w| w.status().is_running());
             workspace,
         );
         let lists = crate::worklist::Running::read(store);
-        let list = held.as_deref().and_then(|t| lists.list_of(t));
+        let list = held.as_deref().and_then(|t| store.find_task(t)).and_then(|t| lists.list_for(&t).map(str::to_string));
+        let list = list.as_deref();
         match seat_for(&governors, index, list, project.as_deref()) {
             Some(s) => println!("{}", p.dim(&format!("work here reaches the {} seat", s.scope))),
             None => println!("{}", p.dim("no seat above this pane — raised hands reach a person")),
@@ -2257,6 +2258,33 @@ mod tests {
             seat_for(&store.governors(), &tree(), Some("batch"), Some("robustness"))
                 .map(|s| room_of(&store.governors(), &s.scope)),
             Some("w1".to_string())
+        );
+    }
+
+    /// `wsp-165`, as the sentence the task gives: a barrier seat's `wsp ask`
+    /// names the group's governor and not the project's ancestor. The barrier
+    /// row is spawned by the list without being a member of it.
+    #[test]
+    fn a_barrier_seats_ask_reaches_the_governor_of_its_own_list() {
+        let (_env, store) = store("barrier-ask");
+        take(&store, "wsp", "w2", "w2:p1");
+        take(&store, "batch", "w1", "w1:p1");
+        let mut w = crate::model::Worklist::new("batch", "Overnight batch");
+        w.body = "## Groups\n- 1  wsp-1\n".into();
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+
+        let mut barrier = crate::model::Task::new("Barrier: batch group 1", "wsp-2");
+        barrier.project = Some("wsp".into());
+        barrier.tags = vec![crate::cycle::BARRIER_TAG.to_string()];
+        assert_eq!(answering_seat(&store, &barrier).map(|s| s.scope).as_deref(), Some("batch"));
+
+        let mut other = crate::model::Task::new("something else", "wsp-3");
+        other.project = Some("wsp".into());
+        assert_eq!(
+            answering_seat(&store, &other).map(|s| s.scope).as_deref(),
+            Some("wsp"),
+            "a task of nobody's list still walks the project chain"
         );
     }
 

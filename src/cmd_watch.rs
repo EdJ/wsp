@@ -1942,7 +1942,7 @@ pub(crate) fn addressed_to(
     lists: &worklist::Running,
     task: &Task,
 ) -> String {
-    cmd_govern::seat_for(governors, index, lists.list_of(&task.id), task.project.as_deref())
+    cmd_govern::seat_for(governors, index, lists.list_for(task), task.project.as_deref())
         .map(|s| s.scope)
         .unwrap_or_else(|| EVERYONE.to_string())
 }
@@ -1961,7 +1961,7 @@ pub(crate) fn in_scope(
     if scope.seated {
         return addressed_to(index, governors, lists, task) == scope.name;
     }
-    if lists.list_of(&task.id) == Some(scope.name.as_str()) {
+    if lists.list_for(task) == Some(scope.name.as_str()) {
         return true;
     }
     task.project.as_deref().is_some_and(|p| {
