@@ -320,6 +320,14 @@ impl Compound<'_> {
         }
     }
 
+    /// Whether compound minted this seat and still has its directory — the
+    /// one question a verb that is handed a bare id can ask of this backend
+    /// without a census. A stat, so `wsp peek` and `wsp tell` can ask it of
+    /// every needle they are given (`wsp-156`).
+    pub(crate) fn holds(&self, seat: &Seat) -> bool {
+        self.dir_of(seat).map(|d| d.is_dir()).unwrap_or(false)
+    }
+
     fn record(&self, seat: &Seat) -> Result<Value> {
         let dir = self.dir_of(seat)?;
         match dir.is_dir() {

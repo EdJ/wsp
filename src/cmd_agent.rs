@@ -1389,7 +1389,7 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     // right answer for "show me what this looks like" and a hazard for a verb
     // that types prose into whatever it lands on. This resolves the two things
     // that can hold an agent and nothing else.
-    let (seat, what) = match target(store, &needle) {
+    let (seat, what) = match target(store, &needle, &compound_holds) {
         Some(v) => v,
         None => {
             eprintln!("wsp: nothing holds `{needle}` — `wsp wip` says who holds what");
@@ -1677,8 +1677,22 @@ pub(crate) fn locate_seat<'a>(
     })
 }
 
-fn target(store: &Store, needle: &str) -> Option<(String, String)> {
-    if needle.contains(':') {
+/// Whether compound minted `needle` and still holds it — the seat id read by
+/// who made it rather than by how herdr spells one (`wsp-156`).
+///
+/// `target` and `peek_target` both used to take "has a colon" to mean "is a
+/// seat", which is herdr's spelling and nobody else's: a compound seat is
+/// `cpd-N`, so `wsp peek cpd-347` and `wsp tell cpd-347` fell through to the
+/// task search and answered "nothing holds" for a seat that was live and
+/// claimed. A backend's own record is the only thing that can say what it
+/// minted, and asking is one stat. Passed in rather than called, like the task
+/// lookup, so the resolvers stay provable without a compound directory.
+fn compound_holds(needle: &str) -> bool {
+    crate::place_compound::Compound::new().holds(&crate::place::Seat::new(needle))
+}
+
+fn target(store: &Store, needle: &str, seated: &dyn Fn(&str) -> bool) -> Option<(String, String)> {
+    if needle.contains(':') || seated(needle) {
         return Some((needle.to_string(), format!("pane {needle}")));
     }
     let t = store.find_task(needle)?;
@@ -4185,6 +4199,7 @@ pub(crate) fn peek_target(
     me: Option<&str>,
     surface: bool,
     needle: &str,
+    seated: impl Fn(&str) -> bool,
     holder: impl FnOnce(&str) -> Option<Holder>,
 ) -> Peeked {
     let mine = |label: &str| {
@@ -4230,6 +4245,10 @@ pub(crate) fn peek_target(
         n if n.contains(':') && panes.iter().any(|p| p.pane_id == n) => {
             Peeked::At(n.to_string(), format!("pane {n}"))
         }
+        // A seat a backend other than herdr minted (`cpd-N`), which no herdr
+        // pane list will ever contain and which has no colon to be taken for
+        // one by. Read by asking who holds it, not by its spelling (`wsp-156`).
+        n if seated(n) => Peeked::At(n.to_string(), format!("seat {n}")),
         // Otherwise a task: whichever pane holds it. This is how you look at
         // what another agent is doing without knowing where it is sitting.
         n => match holder(n) {
@@ -4260,6 +4279,7 @@ pub fn peek(store: &Store, args: &Args) -> i32 {
         env.pane_id.as_deref(),
         crate::daemon::surface_drawing(&store.state),
         &needle,
+        compound_holds,
         |n| {
             store.find_task(n).map(|t| Holder {
                 panes: store.panes_for_task(&t.id),
@@ -6392,13 +6412,23 @@ mod tests {
         store.save_task(&t).unwrap();
         store.set_binding("w1:p1", json!({ "task_id": t.id, "pane_id": "w1:p1" }));
 
-        let (pane, what) = target(&store, &t.id).expect("the task's pane");
+        let (pane, what) = target(&store, &t.id, &|_| false).expect("the task's pane");
         assert_eq!(pane, "w1:p1");
         assert!(what.starts_with(&t.id), "{what}");
 
-        assert_eq!(target(&store, "w1:p1").map(|(p, _)| p), Some("w1:p1".into()), "a pane id, as given");
-        assert_eq!(target(&store, "w1"), None, "a workspace may hold two agents and names neither");
-        assert_eq!(target(&store, "nothing-like-this"), None);
+        assert_eq!(target(&store, "w1:p1", &|_| false).map(|(p, _)| p), Some("w1:p1".into()), "a pane id, as given");
+        assert_eq!(target(&store, "w1", &|_| false), None, "a workspace may hold two agents and names neither");
+        assert_eq!(target(&store, "nothing-like-this", &|_| false), None);
+
+        // A seat a backend minted without a colon is a pane too, and is read
+        // by asking who holds it — not by herdr's spelling (`wsp-156`).
+        let compound = |n: &str| n == "cpd-347";
+        assert_eq!(
+            target(&store, "cpd-347", &compound).map(|(p, w)| (p, w)),
+            Some(("cpd-347".into(), "pane cpd-347".into())),
+            "a compound seat has no colon and is still the thing to type at"
+        );
+        assert_eq!(target(&store, "cpd-348", &compound), None, "a seat nobody holds is not one because of its shape");
     }
 
     /// **The retry is the harm, and this is what recognises one.**
@@ -7947,6 +7977,10 @@ mod tests {
         None
     }
 
+    fn none_seated(_: &str) -> bool {
+        false
+    }
+
     fn at(p: Peeked) -> (String, String) {
         match p {
             Peeked::At(pane, what) => (pane, what),
@@ -7966,18 +8000,18 @@ mod tests {
             labelled("w2:p9", "w2", crate::panel::PANEL_LABEL),
             labelled("w2:p8", "w2", crate::panel::VIEW_LABEL),
         ];
-        assert_eq!(at(peek_target(&panes, Some("w2"), None, false, "", no_task)).0, "w2:p9");
-        assert_eq!(at(peek_target(&panes, Some("w1"), None, false, "panel", no_task)).0, "w1:p9");
+        assert_eq!(at(peek_target(&panes, Some("w2"), None, false, "", none_seated, no_task)).0, "w2:p9");
+        assert_eq!(at(peek_target(&panes, Some("w1"), None, false, "panel", none_seated, no_task)).0, "w1:p9");
 
         // A workspace with no panel of its own falls through to one that has.
-        assert_eq!(at(peek_target(&panes, Some("w7"), None, false, "panel", no_task)).0, "w1:p9");
+        assert_eq!(at(peek_target(&panes, Some("w7"), None, false, "panel", none_seated, no_task)).0, "w1:p9");
         // …and so does a caller with no workspace at all, which is what a
         // shell outside herdr is.
-        assert_eq!(at(peek_target(&panes, None, None, false, "panel", no_task)).0, "w1:p9");
+        assert_eq!(at(peek_target(&panes, None, None, false, "panel", none_seated, no_task)).0, "w1:p9");
 
         // The view is a different surface with a different label, and asking
         // for it from a workspace that has none finds the one that exists.
-        assert_eq!(at(peek_target(&panes, Some("w1"), None, false, "view", no_task)).0, "w2:p8");
+        assert_eq!(at(peek_target(&panes, Some("w1"), None, false, "view", none_seated, no_task)).0, "w2:p8");
     }
 
     /// Missing is named as what is missing, not as what was asked for: "no view
@@ -7987,7 +8021,7 @@ mod tests {
     #[test]
     fn a_target_that_is_not_open_says_how_to_open_it() {
         let none: Vec<herdr::Pane> = Vec::new();
-        let hint = |needle: &str| match peek_target(&none, Some("w1"), None, false, needle, no_task) {
+        let hint = |needle: &str| match peek_target(&none, Some("w1"), None, false, needle, none_seated, no_task) {
             Peeked::Nothing(h) => h,
             _ => panic!("expected nothing for {needle}"),
         };
@@ -7998,7 +8032,7 @@ mod tests {
 
         // A needle nothing recognises is a different answer again: the target
         // does not exist, rather than existing and being empty.
-        assert!(matches!(peek_target(&none, None, None, false, "banana", no_task), Peeked::Unknown));
+        assert!(matches!(peek_target(&none, None, None, false, "banana", none_seated, no_task), Peeked::Unknown));
     }
 
     /// Under the fork the sidebar is not a pane, so `peek panel` has to mean
@@ -8008,7 +8042,7 @@ mod tests {
     #[test]
     fn a_running_surface_is_what_the_panel_means_and_a_pane_only_without_one() {
         let panes = vec![labelled("w1:p9", "w1", crate::panel::PANEL_LABEL)];
-        let panel = |surface| peek_target(&panes, Some("w1"), None, surface, "panel", no_task);
+        let panel = |surface| peek_target(&panes, Some("w1"), None, surface, "panel", none_seated, no_task);
         assert!(matches!(panel(true), Peeked::Surface));
         assert_eq!(at(panel(false)).0, "w1:p9");
 
@@ -8016,13 +8050,13 @@ mod tests {
         // the fork is that there is no panel pane to fall back to at all —
         // where the answer used to be advice to install one.
         let none: Vec<herdr::Pane> = Vec::new();
-        assert!(matches!(peek_target(&none, Some("w1"), None, true, "", no_task), Peeked::Surface));
+        assert!(matches!(peek_target(&none, Some("w1"), None, true, "", none_seated, no_task), Peeked::Surface));
 
         // Nothing else moves. A surface is one panel, not a new way to name
         // panes, and the view and the board are panes as they were.
-        assert_eq!(at(peek_target(&panes, None, None, true, "w1:p9", no_task)).1, "pane w1:p9");
+        assert_eq!(at(peek_target(&panes, None, None, true, "w1:p9", none_seated, no_task)).1, "pane w1:p9");
         assert!(matches!(
-            peek_target(&none, Some("w1"), None, true, "view", no_task),
+            peek_target(&none, Some("w1"), None, true, "view", none_seated, no_task),
             Peeked::Nothing(_)
         ));
     }
@@ -8033,13 +8067,30 @@ mod tests {
     #[test]
     fn a_pane_id_is_only_a_pane_id_if_a_pane_has_it() {
         let panes = vec![labelled("w1:p3", "w1", "")];
-        assert_eq!(at(peek_target(&panes, None, None, false, "w1:p3", no_task)).1, "pane w1:p3");
-        assert!(matches!(peek_target(&panes, None, None, false, "w9:p1", no_task), Peeked::Unknown));
+        assert_eq!(at(peek_target(&panes, None, None, false, "w1:p3", none_seated, no_task)).1, "pane w1:p3");
+        assert!(matches!(peek_target(&panes, None, None, false, "w9:p1", none_seated, no_task), Peeked::Unknown));
 
         // `me` is this pane, whatever herdr reported — and a caller herdr has
         // not told about itself has no `me` to look at.
-        assert_eq!(at(peek_target(&panes, None, Some("w1:p3"), false, "me", no_task)).0, "w1:p3");
-        assert!(matches!(peek_target(&panes, None, None, false, "me", no_task), Peeked::Nothing(_)));
+        assert_eq!(at(peek_target(&panes, None, Some("w1:p3"), false, "me", none_seated, no_task)).0, "w1:p3");
+        assert!(matches!(peek_target(&panes, None, None, false, "me", none_seated, no_task), Peeked::Nothing(_)));
+    }
+
+    /// `wsp-156`: a compound seat is `cpd-N` — no colon, and never in herdr's
+    /// pane list — so it was refused as "no pane, task or project matching" while
+    /// live and claimed. What makes it a seat is that its backend holds it.
+    #[test]
+    fn a_seat_is_a_seat_because_its_backend_holds_it_not_because_of_how_it_is_spelled() {
+        let panes = vec![labelled("w1:p3", "w1", "")];
+        let held = |n: &str| n == "cpd-347";
+        assert_eq!(at(peek_target(&panes, None, None, false, "cpd-347", held, no_task)).0, "cpd-347");
+        assert!(
+            matches!(peek_target(&panes, None, None, false, "cpd-348", held, no_task), Peeked::Unknown),
+            "a seat nothing holds falls through to the task search like any other needle"
+        );
+        // The keywords stay keywords: `me` and `panel` are not a seat a
+        // backend could be asked about.
+        assert!(matches!(peek_target(&panes, None, None, false, "me", |_| true, no_task), Peeked::Nothing(_)));
     }
 
     /// A task names whichever pane is holding it, which is how you look at what
@@ -8055,14 +8106,14 @@ mod tests {
                 panes: vec!["w4:p1".into()],
             })
         };
-        let (pane, what) = at(peek_target(&panes, None, None, false, "001", held));
+        let (pane, what) = at(peek_target(&panes, None, None, false, "001", none_seated, held));
         assert_eq!(pane, "w4:p1");
         assert!(what.starts_with("t-001 — the seam under the panel"), "{what}");
 
         let unheld = |_: &str| {
             Some(Holder { id: "t-002".into(), title: "nobody is on it".into(), panes: Vec::new() })
         };
-        assert!(matches!(peek_target(&panes, None, None, false, "002", unheld), Peeked::Nothing(_)));
+        assert!(matches!(peek_target(&panes, None, None, false, "002", none_seated, unheld), Peeked::Nothing(_)));
     }
 
 
