@@ -3299,7 +3299,9 @@ pub fn carry_out_ending(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp govern <project|worklist> --ending");
         return 2;
     };
-    if std::env::var_os(END_WHEN_IDLE).is_some() {
+    // Empty is unset: [`seat_env_over`] empties every `WSP_` name a seat was
+    // not handed, so a seat whose spawner carried this one arrives with `""`.
+    if std::env::var_os(END_WHEN_IDLE).is_some_and(|v| !v.is_empty()) {
         wait_until_idle(store, &scope);
     }
     if let Some(pid) = std::env::var(ROTATED_BY).ok().and_then(|v| v.parse::<u32>().ok()) {
