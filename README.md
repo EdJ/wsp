@@ -159,6 +159,10 @@ wsp worklist next <slug>     # where it is up to, and what is holding it
 wsp worklist go --from FILE  # the barrier agent's pass, which starts the next group
 wsp worklist hold --from FILE  # the barrier's "does not pass": start nothing more;
                              #   what is running is left to finish. `go` passes it
+wsp worklist followup <slug> <task>… --next --from FILE      # the barrier agent's
+                             #   pass with up to four rows run as the next group
+wsp worklist followup <slug> <task>… --blocking --from FILE  # its hold pending
+                             #   rows that join this group; checked again after
 wsp worklist park "…"        # a person's pause: nothing starts, no barrier is
                              #   checked, its seat is not refilled. `go` refuses it
 wsp worklist resume          # back to where it was parked, any barrier still owed
@@ -178,6 +182,8 @@ for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
 | a verdict blocks | puts the member back at `doing`, with the verdict as what is owed, and tells the governor | the member's agent carries on |
 | every member landed and holding | opens a barrier row and spawns an agent to check it | the barrier agent ends with `go` or `hold` |
 | `go` | sweeps the group's trees, ends what the group opened, starts the next group, rotates the governor | — |
+| `followup --next` | puts the rows in a new group straight after this one, on its line, with a stop built from their done-whens; then passes as `go` does | — |
+| `followup --blocking` | adds the rows to the group being run, spawns and verifies them, ends the check once it reviews, and opens a fresh check when they land | the recheck ends with `go` or `hold` |
 | an agent died, a start never claimed, a landing was made with git | repairs it on the tick, writes `cycle.log`, tells the governor | — |
 | the run's seat reads empty for two ticks, or no seat in its chain has ever been filled | seats a governor | — |
 
@@ -196,6 +202,21 @@ nudges an agent, carries a message between seats, or runs `advance` in a run.**
 A step that needed one of those is a defect, and it is filed under `wsp-144`
 with its evidence; it is not a routine to repeat. `wsp worklist advance` is
 still there, as the repair for a trigger that was lost.
+
+**A barrier can add its own tail** (`wsp-210`). A check that finds small work
+files the rows (`wsp add "…" --parent <member>`, with a **Done when:** line) and
+answers with `wsp worklist followup` in place of `go` or `hold`. `--next` is
+"passes, with follow-ups": the rows become the next group, ahead of any group
+already planned and never at the end. `--blocking` is "holds, pending
+follow-ups": the rows join the group being run, which is the one sanctioned
+exception to the write-ahead-only window. The limits keep it a tail and not a
+second plan. A call takes at most four rows. A group gets one round: a group
+made of follow-ups, or one that has had rows join it, cannot add more, and what
+its check finds goes to the governor as a decision. Only the open check of the
+group being run may use it, read off the caller's seat, so a member, a verifier
+or a person at the CLI is refused. Every follow-up is in the list's log under
+the check row that added it, and that log line is what the round is read from.
+Anything larger, or anything that needs a design call, is a `wsp ask`.
 
 What a run did is in four places: `cycle.log` in the state directory (each
 step and why), `wsp watch --status` (the daemon and every delivery register),

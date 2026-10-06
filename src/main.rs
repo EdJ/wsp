@@ -187,6 +187,9 @@ const BOOL_FLAGS: &[&str] = &[
     // and `wsp migrate --verify-rows -n`: none takes a value, and each is
     // followed by a positional or a stream it must not eat.
     "holds", "blocks", "verify", "verify-rows",
+    // `wsp worklist followup <slug> <task>… --blocking|--next`: the rows are
+    // positionals, and a flag between them must not eat the one after it.
+    "blocking", "next",
 ];
 
 /// Flags that keep their meaning inside a command's payload.
@@ -1876,6 +1879,12 @@ fn help_text() -> String {
                                     running is left to finish — work in flight
                                     cannot be unwound. `go` is its way back, and
                                     `go` passes the barrier
+  wsp worklist followup <slug> <task>… --blocking|--next --from FILE
+                                    the barrier check's verdict with up to four
+                                    rows attached: --blocking holds, and they
+                                    join the group; --next passes, and they are
+                                    the next group. One round, and only the
+                                    check's own seat may run it
   wsp worklist park [<slug>] "why"|-|--from FILE   a person's pause: nothing
                                     starts, no barrier is checked, its seat is
                                     not refilled, nothing is ended. `go` and

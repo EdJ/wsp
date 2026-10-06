@@ -737,9 +737,18 @@ fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
     else {
         return;
     };
+    // Rows this check attached itself (`wsp-210`, `followup --blocking`) are
+    // not sent back: the check knows they are outstanding, because it put them
+    // there, and telling it otherwise would read as a group moving under it.
+    let attached: Vec<String> = crate::cmd_worklist::followups(w)
+        .into_iter()
+        .filter(|(row, _)| *row == check.id)
+        .flat_map(|(_, ids)| ids)
+        .collect();
     let holding: Vec<Task> = tasks
         .iter()
         .filter(|t| g.members.contains(&t.id))
+        .filter(|t| !attached.contains(&t.id))
         .filter(|t| !matches!(t.status(), Status::Review | Status::Done))
         .cloned()
         .collect();
@@ -1248,9 +1257,10 @@ fn open_barrier(store: &Store, w: &Worklist, at: usize, g: &Group) -> Option<Str
         // (`cmd_worklist::amend_running_stop`, `wsp-206`). The amendment checks
         // for this row under this lock, so the two are ordered only if the
         // stop handed to the barrier is read here as well.
-        let fresh = store.worklist(&w.id).and_then(|f| f.groups().into_iter().nth(at - 1));
+        let list = store.worklist(&w.id);
+        let fresh = list.as_ref().and_then(|f| f.groups().into_iter().nth(at - 1));
         let g = fresh.as_ref().unwrap_or(g);
-        crate::model::set_section_in(&mut t.body, "Overview", &barrier_order(w, at, g, &id));
+        crate::model::set_section_in(&mut t.body, "Overview", &barrier_order(list.as_ref().unwrap_or(w), at, g, &id));
         store.save_task(&t).ok()?;
         Some((id, title))
     })?;
@@ -1308,10 +1318,32 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
 }
 
 /// The barrier agent's work order.
+///
+/// The third answer, `wsp worklist followup` (`wsp-210`), is offered only while
+/// the group still has its one round. A group that has spent it is told so, so
+/// the check knows that whatever more it finds goes to the governor.
 fn barrier_order(w: &Worklist, at: usize, g: &Group, me: &str) -> String {
     let stop = match g.stop.trim() {
         "" => "There is no stop condition written at this barrier.".to_string(),
         s => format!("The stop condition, which your verdict answers:\n\n> {s}"),
+    };
+    let tail = match crate::cmd_worklist::spent_by(w, &g.members) {
+        None => format!(
+            "\n\n**Small work found at this barrier can be attached, not just reported.** File each row with \
+             `wsp add \"…\" --parent <member>`, with a **Done when:** line in its overview, then run one of \
+             these in place of `go` or `hold`:\n\
+             - it passes, with follow-ups: `wsp worklist followup {list} <id>… --next --from FILE`. The rows \
+             become the next group, ahead of anything planned, on this group's agent line;\n\
+             - it holds, pending follow-ups: `wsp worklist followup {list} <id>… --blocking --from FILE`. The \
+             rows join this group, and a fresh check reads it again once they land.\n\
+             At most four rows, and one round: a follow-up group cannot add its own. Anything larger, or \
+             anything that needs a design call, is `wsp ask {me} -`, not a follow-up.",
+            list = w.id,
+        ),
+        Some(prior) => format!(
+            "\n\nThis group has had its one round of follow-ups ({prior}). If you find more, \
+             `wsp worklist followup` hands them to the governor as a decision; you still finish with `go` or `hold`."
+        ),
     };
     format!(
         "Check the barrier after group {at} of the `{list}` worklist. Every member has landed \
@@ -1327,7 +1359,7 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, me: &str) -> String {
          - it passes: `wsp worklist go {list} --from FILE`. wsp starts the next group and \
          rotates the governor;\n\
          - it does not: `wsp worklist hold {list} --from FILE`, saying what has to happen. \
-         The governor is told.\n\n\
+         The governor is told.{tail}\n\n\
          Either way, finish with `wsp review {me} -` and one line.",
         list = w.id,
         members = g.members.join(" "),
@@ -1566,9 +1598,19 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
     // A done list is over whatever its position says: [`Closing::Passed`]
     // leaves the last check standing for this to end, and a `done` typed early
     // has nothing in front of it that anybody will ask about again.
+    //
+    // A running list has one such check too (`wsp-210`): a check that answered
+    // `followup --blocking` and reviewed its row. Its barrier did not pass, so
+    // the position still stands at its group, and the recheck opens on a fresh
+    // row once the follow-ups land. Nothing else ends it until a pass two
+    // groups on. **Only that check**, named by the log: any other check at
+    // review in front of a running run may still be the one somebody passes
+    // the barrier from.
     let stopped = matches!(w.status(), WorklistStatus::Held | WorklistStatus::Parked);
     let over = pos.finished() || w.status() == WorklistStatus::Done;
-    if !over && !stopped {
+    let running = w.status() == WorklistStatus::Running && !over;
+    let held_for: Vec<String> = crate::cmd_worklist::followups(w).into_iter().map(|(row, _)| row).collect();
+    if !over && !stopped && !running {
         return Vec::new();
     }
     let behind = pos.at.unwrap_or(usize::MAX);
@@ -1583,13 +1625,14 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
         .filter(|t| claims.contains_key(&t.id))
         // Up to the position, or anywhere at all once the run is over.
         .filter(|t| !settled || group_of(t, &w.id).is_some_and(|at| at <= behind))
+        .filter(|t| !running || (group_of(t, &w.id) == Some(behind) && held_for.contains(&t.id)))
         .map(|t| t.id.clone())
         .collect();
     if !standing.is_empty() {
         stamp(&format!(
             "{}: {} and nothing left for them to decide — ending {}",
             w.id,
-            if settled { "has finished barrier checks still standing" } else { "has nothing left in it" },
+            if settled || running { "has finished barrier checks still standing" } else { "has nothing left in it" },
             standing.join(" ")
         ));
     }
@@ -2469,6 +2512,67 @@ pub(crate) mod tests {
         assert_eq!(spawned().len(), 1);
         step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "the barrier row is the key; nothing starts twice");
+    }
+
+    /// `wsp-210`, `followup --blocking`: the check finds the group's own
+    /// done-when unmet, files a row and attaches it. The row joins the group
+    /// being run, wsp starts and verifies it like any member, the check that
+    /// added it is not told its group moved under it, and once the row lands a
+    /// fresh check reads the group again — told it has had its round.
+    #[test]
+    fn a_blocking_follow_up_joins_the_running_group_is_run_and_verified_and_the_barrier_is_checked_again() {
+        let (env, store) = scratch("followup-blocking");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        let check = tagged(&store, BARRIER_TAG)[0].id.clone();
+        let order = store.find_task(&check).unwrap().section("Overview").unwrap_or_default();
+        assert!(
+            order.contains("wsp worklist followup run <id>… --next") && order.contains("--blocking"),
+            "the check is told it can attach what it finds: {order}"
+        );
+        set(&store, &check, Status::Doing);
+
+        let from = env.home().join("verdict");
+        std::fs::write(&from, "m-1 does not yet meet the done-when; m-2 closes it").unwrap();
+        let from = from.display().to_string();
+        let args = Args::synth("worklist", &["followup", "run", "m-2"], &[("blocking", "true"), ("from", &from)]);
+        assert_eq!(crate::cmd_worklist::followup_by(&store, &args, &[check.clone()]), 0);
+        let w = store.worklist("run").unwrap();
+        assert_eq!(w.groups()[0].members, vec!["m-1", "m-2"], "the row joins the group being run");
+        assert_eq!(w.status(), WorklistStatus::Running, "held pending follow-ups, and still running them");
+        assert!(w.groups()[0].verdict.is_empty(), "the barrier has not passed");
+        assert!(
+            TOLD.with(|t| t.borrow().iter().any(|s| s.contains("holds, pending follow-ups: m-2"))),
+            "the governor is told the barrier held and why"
+        );
+
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-2".into(), "claude".into())], "wsp starts it on the group's line");
+        assert!(MEMBER_TOLD.with(|t| t.borrow().is_empty()), "the check is not told its own follow-up moved the group");
+
+        // The check reviews its row, and a tick ends it: the barrier it
+        // answered stays where it is, and the recheck is a fresh row.
+        set(&store, &check, Status::Review);
+        store.set_claim(&check, serde_json::json!({ "workspace": "w" }));
+        assert_eq!(last_barrier_left_behind(&store, &w), vec![check.clone()], "a check that held pending follow-ups has finished");
+
+        set(&store, "m-2", Status::Review);
+        step(&store, &w, &Blind);
+        assert_eq!(reading(&store), vec!["m-2".to_string()], "the follow-up is verified like any member");
+        assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "and the barrier waits for its verdict");
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        let checks = tagged(&store, BARRIER_TAG);
+        assert_eq!(checks.len(), 2, "the barrier is checked again, by a fresh check");
+        let again = checks.iter().find(|t| t.id != check).unwrap();
+        assert!(again.title.ends_with("(recheck 1)"), "{}", again.title);
+        let order = again.section("Overview").unwrap_or_default();
+        assert!(order.contains("one round of follow-ups (") && order.contains(&check), "and told it has had its round: {order}");
     }
 
     /// `wsp-150`: one claude member beside an opencode one, in one group and

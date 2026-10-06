@@ -6,7 +6,7 @@
 //! `project` and `machine` — a subcommand, a slug, and `ls` when nothing else
 //! is said. Two halves, and the line between them is the barrier: **composing**
 //! is `new`, `add`, `rm`, `mv`, `group`, `edit` and the two reading verbs;
-//! **running** is `next`, `go`, `hold`, `done`.
+//! **running** is `next`, `go`, `hold`, `followup`, `done`.
 //!
 //! # The barrier, which is what the second half is
 //!
@@ -47,6 +47,11 @@
 //! a member's own line until that member starts ([`member`]), and the stop
 //! until its barrier row opens ([`amend_running_stop`], which takes a logged
 //! reason). Each one is read once, at a moment the run has not reached yet.
+//!
+//! One more edit reaches the running group, and it is not a person's. The
+//! group's own barrier check may add rows to it with `followup --blocking`
+//! ([`followup`], `wsp-210`). The window protects the barrier being waited on,
+//! and here the barrier is the one doing the adding.
 //!
 //! Read with [`Reading::Settled`], never with `Landed`. The window is decided
 //! on a path a person types at interactively, and the landed reading is a git
@@ -103,6 +108,9 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "next" => next(store, args),
         "go" | "start" => go(store, args),
         "hold" | "stop" => hold(store, args),
+        // A barrier check's third answer: go or hold, with a short tail of
+        // rows attached to the run. `wsp-210`.
+        "followup" | "follow-up" => followup(store, args),
         // A person's pause, and its way back. Not `hold`/`go`: those are the
         // barrier's "does not pass" and its pass — see [`park`].
         "park" | "pause" => park(store, args),
@@ -2918,10 +2926,16 @@ fn next_json(w: &Worklist, pos: &Position, st: &State, gone: &[String], touched:
 /// what it would record, what it would sweep, and what the group that landed
 /// touched, with nothing written and nothing removed.
 pub fn go(store: &Store, args: &Args) -> i32 {
-    let (mut w, said, seat) = match list_and_words(store, args) {
+    let (w, said, seat) = match list_and_words(store, args) {
         Ok(v) => v,
         Err(code) => return code,
     };
+    go_with(store, args, w, said, seat)
+}
+
+/// `go` once the list and the sentence are in hand. [`followup`]'s non-blocking
+/// form passes the barrier through here, with a verdict it composes itself.
+fn go_with(store: &Store, args: &Args, mut w: Worklist, said: String, seat: bool) -> i32 {
     if w.status() == WorklistStatus::Done {
         eprintln!("wsp: `{}` is done — nothing in it is waiting to start", w.id);
         return 1;
@@ -3549,6 +3563,431 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     }
     println!("{}", p.dim(&format!("{} \"…\"  starts it again", how("go", &w, seat))));
     0
+}
+
+// ---- followup ---------------------------------------------------------
+
+/// The mark a follow-up is logged under, and the one [`followups`] reads back.
+const FOLLOWUP: &str = "follow-up by";
+/// The mark a refused round is logged under. A different word on purpose:
+/// [`followups`] must not read rows that went to the governor as rows the run
+/// took.
+const FOLLOWUP_REFUSED: &str = "follow-ups refused to";
+/// How many rows one call may attach.
+const FOLLOWUP_MAX: usize = 4;
+
+/// `wsp worklist followup <slug> <task>… --blocking|--next --from FILE` — a
+/// barrier check's verdict, with a short tail of rows attached to the run.
+/// `wsp-210`.
+///
+/// **Why the barrier may extend its own run.** wsp-149's acceptance run turned
+/// up small fixes, and they needed a third worklist to get worked on. Running
+/// `wsp-process`, then `wsp-unattended`, then `wsp-acceptance-fixes` was one run
+/// with a tail, and the agent that found the tail was the barrier check. It
+/// could only write it into a verdict for a governor to compose by hand.
+///
+/// It files nothing. The rows already exist (`wsp add --parent`). This attaches
+/// them and records the verdict, in one of two senses:
+///
+/// - **`--blocking`: "holds, pending follow-ups".** The group's own done-when is
+///   not met. The rows join the group being run. This is the one exception to
+///   the write-ahead-only window, and it is sanctioned because the barrier is
+///   the reader the window protects. wsp spawns and verifies them like any
+///   member. The check reviews its row, and a fresh check opens once they land.
+///   The list stays `running`: a `hold` would stop the spawns the follow-ups
+///   need.
+/// - **`--next`: "passes, with follow-ups".** The rows become a group placed
+///   straight after this one, ahead of anything planned. It inherits this
+///   group's agent line, and its stop is built from the rows' done-whens. The
+///   barrier is then passed through [`go_with`], so the pass is the ordinary
+///   one: the sweep, the rotation, the next group started by the run.
+///
+/// **The limits keep it a tail and not a second plan.**
+///
+/// - **One round.** A group that already had follow-ups, either joined
+///   (`--blocking`) or as the group itself (`--next`), is refused. Its rows
+///   and verdict go to the governor as a decision, and the check still ends
+///   with `go` or `hold`. Read off the log by member id, see [`followups`], so
+///   renumbering cannot lose it.
+/// - **[`FOLLOWUP_MAX`] rows.** Anything larger, or anything needing a design
+///   call, is a `wsp ask` to the governor.
+/// - **Only the barrier check, during its own barrier.** The caller's seat must
+///   hold the open check row of the group being run. A member, a verifier and a
+///   person at the CLI hold none. The governor still edits the list with the
+///   composing verbs.
+/// - **Logged**, naming the check row that added them.
+pub fn followup(store: &Store, args: &Args) -> i32 {
+    followup_by(store, args, &rows_here(store))
+}
+
+/// The rows this process's seat holds: the binding on its pane, and every claim
+/// made by the agent sitting there. Two readings because a binding is derived
+/// and free to be lost (`store`'s claims doc), while the claim outlives it.
+fn rows_here(store: &Store) -> Vec<String> {
+    let Some(pane) = crate::cmd_agent::my_pane() else { return Vec::new() };
+    let mut out: Vec<String> = Vec::new();
+    if let Some(t) = store.bindings().get(&pane).and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
+        out.push(t.to_string());
+    }
+    if let Some(agent) = store.agent_in_seat(&pane) {
+        out.extend(
+            store
+                .claims()
+                .into_iter()
+                .filter(|(_, c)| c.get("agent_id").and_then(|a| a.as_str()) == Some(agent.as_str()))
+                .map(|(id, _)| id),
+        );
+    }
+    out
+}
+
+/// [`followup`] with the caller's rows given, which is what makes the "only
+/// the barrier check" rule testable without a seat.
+pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
+    const USAGE: &str = "usage: wsp worklist followup <slug> <task>… --blocking|--next --from FILE   (`--from -` reads stdin)";
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let blocking = match (args.has("blocking"), args.has("next")) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => {
+            eprintln!("{USAGE}");
+            eprintln!("       --blocking: the group holds until they land · --next: it passes, and they run next");
+            return 2;
+        }
+    };
+    let w = match worklist_or_why(store, &needle) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let typed: Vec<String> = args.rest.iter().skip(2).cloned().collect();
+    if typed.is_empty() {
+        eprintln!("{USAGE}");
+        return 2;
+    }
+
+    // Who is asking, first: whatever else is wrong with the call, a caller
+    // who is not this barrier's check is told that, and nothing about how a
+    // check would have done it.
+    let pos = worklist::position(store, &w, Reading::Landed);
+    let tasks = store.tasks();
+    let at = pos.at.filter(|_| w.status() == WorklistStatus::Running && pos.at_barrier());
+    let row = at.and_then(|at| {
+        tasks
+            .iter()
+            .filter(|t| crate::cycle::is_barrier(t, &w.id, at))
+            .filter(|t| matches!(t.status(), crate::model::Status::Doing | crate::model::Status::Blocked))
+            .find(|t| here.contains(&t.id))
+            .map(|t| t.id.clone())
+    });
+    let (Some(at), Some(row)) = (at, row) else {
+        match at {
+            Some(at) => eprintln!("wsp: only the agent checking group {at}'s barrier may add follow-ups to `{}`", w.id),
+            None => eprintln!("wsp: `{}` is not standing at a barrier being checked, so there is no verdict to attach follow-ups to", w.id),
+        }
+        eprintln!("     a governor composes the list with `wsp worklist add` and `group`; anybody else files the row with `wsp add --parent` and says so");
+        return 1;
+    };
+
+    if typed.len() > FOLLOWUP_MAX {
+        eprintln!("wsp: at most {FOLLOWUP_MAX} follow-ups in one call, and this names {}", typed.len());
+        eprintln!("     a tail that size, or one that needs a design call, is the governor's: `wsp ask {row} -`");
+        return 2;
+    }
+    let members = match resolve_members(store, &typed) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    let groups = w.groups();
+    if let Some(code) = already_in(&groups, &members, &w.id) {
+        return code;
+    }
+    // Rows wsp can start: `todo` and nobody's. A row somebody is already on
+    // would sit in the group with nothing spawning it, and the barrier behind
+    // it would wait on whoever that is.
+    let claims = store.claims();
+    let running = worklist::Running::read(store);
+    for m in &members {
+        let t = tasks.iter().find(|t| &t.id == m);
+        let status = t.map(|t| t.status());
+        if status != Some(crate::model::Status::Todo) || claims.contains_key(m) {
+            let word = t.map(|t| t.status().as_str().to_string()).unwrap_or_default();
+            eprintln!("wsp: {m} is {word}{} — a follow-up is a row wsp starts, so it has to be todo and unclaimed", if claims.contains_key(m) { " and claimed" } else { "" });
+            return 1;
+        }
+        if let Some(other) = running.list_of(m).filter(|l| *l != w.id) {
+            eprintln!("wsp: {m} is already in `{other}`, which is running — a task is in one running list");
+            return 1;
+        }
+    }
+
+    let verdict = match words(args, args.rest.len()) {
+        Ok(v) if !v.trim().is_empty() => v,
+        Ok(_) => {
+            eprintln!("wsp: a follow-up records this barrier's verdict — `--from FILE`, or `--from -` for stdin");
+            return 2;
+        }
+        Err(code) => return code,
+    };
+
+    // One round. Refused, but not dropped: the check found work, and what it
+    // found reaches the governor as a decision.
+    let g = &groups[at - 1];
+    if let Some(prior) = spent_by(&w, &g.members) {
+        return refuse_round(store, w, at, &row, &prior, &members, &verdict);
+    }
+
+    if blocking {
+        followup_blocking(store, args, &w.id, at, &row, &members, &verdict)
+    } else {
+        followup_next(store, args, &w.id, at, &row, &members, &verdict)
+    }
+}
+
+/// The rows join the group being run, and the barrier is checked again once
+/// they land.
+fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str, members: &[String], verdict: &str) -> i32 {
+    // Under the lock, re-read: a `go` from elsewhere, or a second call by
+    // this check, may have moved the list since it was first read.
+    let outcome = store.locked(|| -> Result<Worklist, i32> {
+        let mut w = store.worklist(id).ok_or(1)?;
+        let mut groups = w.groups();
+        if let Some(code) = still_this_barrier(store, &w, &groups, at, row) {
+            return Err(code);
+        }
+        if let Some(code) = already_in(&groups, members, &w.id) {
+            return Err(code);
+        }
+        groups[at - 1].members.extend(members.iter().cloned());
+        w.log(&format!("{FOLLOWUP} {row} holds: {} · join group {at} · {verdict}", members.join(" ")));
+        w.set_groups(&groups);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return Err(1);
+        }
+        Ok(w)
+    });
+    let w = match outcome {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
+    store.log_event(
+        "worklist-followup",
+        json!({ "id": w.id, "by": row, "blocking": true, "members": members, "verdict": verdict }),
+    );
+    store.git_commit(&format!("wsp: worklist {} group {at} holds pending follow-ups {}", w.id, members.join(" ")));
+    crate::cycle::tell(
+        store,
+        &w,
+        &format!(
+            "Group {at}'s barrier in the {list} run holds, pending follow-ups: {ids}. {row} added them to the \
+             group, and wsp starts and verifies them, then checks the barrier again once they land. Its verdict: {v}",
+            list = w.id,
+            ids = members.join(" "),
+            v = util::truncate(verdict, 400),
+        ),
+    );
+    crate::cycle::poke_list(store, &w.id, "followup", None);
+
+    if args.json() {
+        println!("{}", worklist_json(store, &w));
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.bold(&w.id), p.dim(&format!("group {at} holds, pending follow-ups {}", members.join(" "))));
+    println!(
+        "  {}",
+        p.dim(&format!(
+            "wsp starts and verifies them, and a fresh check reads the group once they land — finish with `wsp review {row} -`"
+        ))
+    );
+    0
+}
+
+/// The rows become the next group, and the barrier is passed.
+fn followup_next(store: &Store, args: &Args, id: &str, at: usize, row: &str, members: &[String], verdict: &str) -> i32 {
+    let stop = followup_stop(store, row, at, members);
+    let outcome = store.locked(|| -> Result<Worklist, i32> {
+        let mut w = store.worklist(id).ok_or(1)?;
+        let mut groups = w.groups();
+        if let Some(code) = still_this_barrier(store, &w, &groups, at, row) {
+            return Err(code);
+        }
+        if let Some(code) = already_in(&groups, members, &w.id) {
+            return Err(code);
+        }
+        // Straight after, never at the end: a tail found at barrier 2 is
+        // about group 2's work, and a planned group 3 may depend on it.
+        let planned = groups.len() - at;
+        let agent = groups[at - 1].agent.clone();
+        groups.insert(at, Group { members: members.to_vec(), agent, stop: stop.clone(), ..Group::default() });
+        w.log(&format!(
+            "{FOLLOWUP} {row} passes: {} · group {} (new), ahead of {planned} planned",
+            members.join(" "),
+            at + 1
+        ));
+        w.set_groups(&groups);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return Err(1);
+        }
+        Ok(w)
+    });
+    let w = match outcome {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
+    store.log_event(
+        "worklist-followup",
+        json!({ "id": w.id, "by": row, "blocking": false, "members": members, "verdict": verdict }),
+    );
+    store.git_commit(&format!("wsp: worklist {} follow-ups {} are group {}", w.id, members.join(" "), at + 1));
+
+    // The pass is `go`'s own, so it is the ordinary one in every respect, and
+    // the verdict on the group says the follow-ups were part of it.
+    let said = format!("passes, with follow-ups {} as group {} — {verdict}", members.join(" "), at + 1);
+    let code = go_with(store, args, w.clone(), said, false);
+    if code != 0 {
+        eprintln!(
+            "wsp: {} are group {} of `{}`, but its barrier was not passed — `wsp worklist go {} --from FILE` passes it",
+            members.join(" "),
+            at + 1,
+            w.id,
+            w.id
+        );
+    }
+    code
+}
+
+/// Whether the barrier a check is answering is still the one in front: its
+/// row open, and no verdict on the group. Asked inside the lock.
+fn still_this_barrier(store: &Store, w: &Worklist, groups: &[Group], at: usize, row: &str) -> Option<i32> {
+    let open = store
+        .find_task(row)
+        .is_some_and(|t| matches!(t.status(), crate::model::Status::Doing | crate::model::Status::Blocked));
+    let unpassed = groups.get(at - 1).is_some_and(|g| g.verdict.trim().is_empty());
+    if open && unpassed && w.status() == WorklistStatus::Running {
+        return None;
+    }
+    eprintln!("wsp: group {at}'s barrier in `{}` was settled while this was being read — nothing was attached", w.id);
+    Some(1)
+}
+
+/// A group past its one round: the rows and the verdict go to the governor as
+/// a decision, and the list's log says so.
+fn refuse_round(store: &Store, w: Worklist, at: usize, row: &str, prior: &str, members: &[String], verdict: &str) -> i32 {
+    let tasks = store.tasks();
+    let named: Vec<String> = members
+        .iter()
+        .map(|m| match tasks.iter().find(|t| &t.id == m) {
+            Some(t) => format!("{m} ({})", util::truncate(&t.title, 60)),
+            None => m.clone(),
+        })
+        .collect();
+    crate::cycle::tell(
+        store,
+        &w,
+        &format!(
+            "A decision for you in the {list} run: group {at} has had its one round of follow-ups ({prior} added \
+             them), so its barrier check {row} found more and could not attach them: {rows}. Its verdict: {v} \
+             Add them to the list yourself (`wsp worklist add {list} …`), or leave them in the backlog. The check \
+             still ends with `go` or `hold`.",
+            list = w.id,
+            rows = named.join(", "),
+            v = util::truncate(verdict, 400),
+        ),
+    );
+    // Re-read under the lock: the copy in hand was read before the tell, and
+    // writing it back whole would undo anything saved since.
+    let saved = store.locked(|| -> Result<(), i32> {
+        let mut fresh = store.worklist(&w.id).ok_or(1)?;
+        fresh.log(&format!("{FOLLOWUP_REFUSED} {row}: {} · one round, spent by {prior} · sent to the governor", members.join(" ")));
+        store.save_worklist(&fresh).map_err(|e| {
+            eprintln!("wsp: write failed: {e}");
+            1
+        })
+    });
+    if let Err(code) = saved {
+        return code;
+    }
+    store.git_commit(&format!("wsp: worklist {} follow-ups refused to {row}", w.id));
+    eprintln!("wsp: group {at} of `{}` has had its follow-ups ({prior}) — one round, so these went to the governor as a decision", w.id);
+    eprintln!("     finish the barrier with `wsp worklist go {} --from FILE` or `wsp worklist hold {} --from FILE`", w.id, w.id);
+    1
+}
+
+/// Every follow-up the list's log records: the check row that added it, and
+/// the rows it attached.
+///
+/// **The log and not a field on the group**, because the log is where the
+/// verb's record has to be anyway (naming the row that added it), and a
+/// second copy is a copy that can disagree. Read by member id rather than by
+/// ordinal, so a group renumbered by an edit ahead of it is still found.
+pub(crate) fn followups(w: &Worklist) -> Vec<(String, Vec<String>)> {
+    let log = w.section("Log").unwrap_or_default();
+    log.lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest.trim()))
+        .filter_map(|rest| rest.strip_prefix(FOLLOWUP))
+        .filter_map(|rest| {
+            let (head, tail) = rest.split_once(':')?;
+            let row = head.split_whitespace().next()?.to_string();
+            let ids = tail.split(" · ").next()?.split_whitespace().map(str::to_string).collect();
+            Some((row, ids))
+        })
+        .collect()
+}
+
+/// The check row whose follow-ups a group already holds, if any: the group's
+/// one round, spent. Either the rows joined it, or it is made of them.
+pub(crate) fn spent_by(w: &Worklist, members: &[String]) -> Option<String> {
+    followups(w).into_iter().find(|(_, ids)| ids.iter().any(|i| members.contains(i))).map(|(row, _)| row)
+}
+
+/// A follow-up group's stop, built from its rows' done-whens: the barrier
+/// after it reads each row against what that row said would finish it.
+fn followup_stop(store: &Store, row: &str, at: usize, members: &[String]) -> String {
+    let parts: Vec<String> = members
+        .iter()
+        .map(|m| {
+            let t = store.find_task(m);
+            let said = t.as_ref().and_then(done_when).or_else(|| t.map(|t| t.title)).unwrap_or_default();
+            format!("{m}: {}", util::truncate(&said, 400))
+        })
+        .collect();
+    format!("Follow-ups {row} added at group {at}'s barrier. Each is done when — {}", parts.join(" · "))
+}
+
+/// The paragraph of a task's overview that begins "Done when", without the
+/// label: the line it starts on and every line after it up to a blank one.
+/// `None` where the overview says no such thing, and the caller uses the title.
+pub(crate) fn done_when(t: &crate::model::Task) -> Option<String> {
+    let overview = t.section("Overview")?;
+    let mut out = String::new();
+    let mut on = false;
+    for line in overview.lines() {
+        let plain = line.trim().replace("**", "");
+        if !on {
+            // ASCII lowering keeps byte offsets, so the index is good on `plain`.
+            let lower = plain.to_ascii_lowercase();
+            let Some(i) = lower.find("done when").or_else(|| lower.find("done-when")) else { continue };
+            on = true;
+            let rest = plain[i + "done when".len()..].trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+            out.push_str(rest);
+            continue;
+        }
+        if plain.is_empty() || plain.starts_with('#') {
+            break;
+        }
+        out.push(' ');
+        out.push_str(plain.trim_start_matches("- ").trim());
+    }
+    Some(fold(&out)).filter(|s| !s.is_empty())
 }
 
 // ---- park -------------------------------------------------------------
@@ -4314,6 +4753,174 @@ mod tests {
         store.save_task(&row).unwrap();
         assert_eq!(flagged(&store, &["group", "batch", "2"], &amend), 0, "held: the recheck reads it afresh");
         assert_eq!(groups_of(&store, "batch")[1].stop, "corrected");
+    }
+
+    // ---- followup (`wsp-210`) ----
+
+    /// A run standing at group `at`'s barrier, with its check open on `row`.
+    fn checking(store: &Store, list: &str, at: usize, row: &str) {
+        let mut t = Task::new(&crate::cycle::barrier_title(list, at), row);
+        t.tags = vec![crate::cycle::BARRIER_TAG.to_string()];
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+    }
+
+    /// A verdict in a file, the way a check writes one.
+    fn verdict(tag: &str, text: &str) -> String {
+        let path = std::env::temp_dir().join(format!("wsp-wl-verdict-{tag}-{}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path.display().to_string()
+    }
+
+    fn follow(store: &Store, argv: &[&str], flags: &[(&str, &str)], here: &[&str]) -> i32 {
+        let here: Vec<String> = here.iter().map(|s| s.to_string()).collect();
+        followup_by(store, &Args::synth("worklist", argv, flags), &here)
+    }
+
+    fn told() -> Vec<String> {
+        crate::cycle::tests::TOLD.with(|t| t.borrow().clone())
+    }
+
+    /// A row with a done-when, as `wsp add --parent` files one.
+    fn row_with(store: &Store, id: &str, overview: &str) {
+        let mut t = Task::new(id, id);
+        t.status_raw = "todo".into();
+        crate::model::set_section_in(&mut t.body, "Overview", overview);
+        store.save_task(&t).unwrap();
+    }
+
+    /// `--next`: the check passes the barrier, and the rows it found are the
+    /// group straight after, **ahead of the group already planned**, never at
+    /// the end. The new group runs on the line of the group that found it, and
+    /// its barrier reads each row against that row's own done-when.
+    #[test]
+    fn a_non_blocking_follow_up_becomes_the_next_group_ahead_of_a_planned_one() {
+        let store = scratch("followup-next");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-003", "todo");
+        row_with(&store, "wl-002", "Fix the thing.\n\n**Done when:** it prints hello\n- and exits 0\n\nLater prose.");
+        run(&store, &["new", "run", "r"]);
+        flagged(&store, &["add", "run", "wl-001"], &[("agent", "claude opus high")]);
+        flagged(&store, &["add", "run", "wl-003"], &[("agent", "opencode m/x")]);
+        started(&store, "run");
+        checking(&store, "run", 1, "wl-900");
+
+        let from = verdict("next", "group 1 holds; one small fix is owed after it");
+        assert_eq!(follow(&store, &["followup", "run", "wl-002"], &[("next", "true"), ("from", &from)], &["wl-900"]), 0);
+
+        let g = groups_of(&store, "run");
+        assert_eq!(g.len(), 3);
+        assert_eq!(g[1].members, vec!["wl-002"], "straight after the group that found it");
+        assert_eq!(g[2].members, vec!["wl-003"], "and the planned group behind it");
+        assert_eq!(g[1].agent, "claude opus high", "on the line of the group that found it, not the planned one");
+        assert!(g[1].stop.contains("wl-002: it prints hello and exits 0"), "its stop is the row's done-when: {}", g[1].stop);
+        assert!(!g[1].stop.contains("Later prose"), "and only the done-when: {}", g[1].stop);
+        assert!(
+            g[0].verdict.contains("passes, with follow-ups wl-002") && g[0].verdict.contains("one small fix is owed"),
+            "the barrier is passed, and its verdict says how: {}",
+            g[0].verdict
+        );
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("follow-up by wl-900 passes: wl-002"), "the row that added it is on the record: {log}");
+        let pos = worklist::position(&store, &store.worklist("run").unwrap(), Reading::Settled);
+        assert_eq!(pos.at, Some(2), "and the run stands at the follow-up group");
+    }
+
+    /// One round. A follow-up group's own barrier finds more: nothing is
+    /// attached, the rows and the verdict reach the governor as a decision,
+    /// and the check is told it still ends with `go` or `hold`.
+    #[test]
+    fn a_follow_up_groups_barrier_is_refused_more_and_its_findings_reach_the_governor() {
+        let store = scratch("followup-round");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        task(&store, "wl-004", "todo");
+        run(&store, &["new", "run", "r"]);
+        run(&store, &["add", "run", "wl-001"]);
+        started(&store, "run");
+        checking(&store, "run", 1, "wl-900");
+        let from = verdict("round", "holds, with a tail");
+        assert_eq!(follow(&store, &["followup", "run", "wl-002"], &[("next", "true"), ("from", &from)], &["wl-900"]), 0);
+
+        let mut t = store.find_task("wl-002").unwrap();
+        t.status_raw = "review".into();
+        store.save_task(&t).unwrap();
+        checking(&store, "run", 2, "wl-901");
+        let from = verdict("round-2", "the follow-up holds, and found one more");
+        for mode in ["next", "blocking"] {
+            assert_eq!(
+                follow(&store, &["followup", "run", "wl-004"], &[(mode, "true"), ("from", &from)], &["wl-901"]),
+                1,
+                "--{mode}: a follow-up group's barrier adds none of its own"
+            );
+        }
+        let g = groups_of(&store, "run");
+        assert_eq!(g.len(), 2, "nothing was attached");
+        assert!(g.iter().all(|g| !g.members.contains(&"wl-004".to_string())));
+        assert!(g[1].verdict.is_empty(), "nor was the barrier passed: the check still owes go or hold");
+        let said = told();
+        assert!(
+            said.iter().any(|s| s.contains("A decision for you") && s.contains("wl-004") && s.contains("found one more")),
+            "the governor is handed the rows and the verdict: {said:?}"
+        );
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("follow-ups refused to wl-901: wl-004"), "{log}");
+        assert_eq!(followups(&store.worklist("run").unwrap()).len(), 1, "and a refused round is not read as a round taken");
+    }
+
+    #[test]
+    fn a_fifth_follow_up_is_refused() {
+        let store = scratch("followup-five");
+        task(&store, "wl-001", "review");
+        for id in ["wl-011", "wl-012", "wl-013", "wl-014", "wl-015"] {
+            task(&store, id, "todo");
+        }
+        run(&store, &["new", "run", "r"]);
+        run(&store, &["add", "run", "wl-001"]);
+        started(&store, "run");
+        checking(&store, "run", 1, "wl-900");
+        let from = verdict("five", "holds pending fixes");
+        let five = ["followup", "run", "wl-011", "wl-012", "wl-013", "wl-014", "wl-015"];
+        assert_eq!(follow(&store, &five, &[("blocking", "true"), ("from", &from)], &["wl-900"]), 2, "five is a plan, not a tail");
+        assert_eq!(groups_of(&store, "run")[0].members, vec!["wl-001"], "and nothing joined");
+        assert_eq!(follow(&store, &five[..6], &[("blocking", "true"), ("from", &from)], &["wl-900"]), 0, "four is a tail");
+        assert_eq!(groups_of(&store, "run")[0].members.len(), 5);
+    }
+
+    /// Only the check, during its own barrier. A member, a verifier and a
+    /// person at the CLI hold no open check row of the group being run, and a
+    /// check that has already reviewed its row has given its verdict.
+    #[test]
+    fn a_caller_that_is_not_the_barrier_check_is_refused() {
+        let store = scratch("followup-who");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        run(&store, &["new", "run", "r"]);
+        run(&store, &["add", "run", "wl-001"]);
+        started(&store, "run");
+        let from = verdict("who", "holds");
+        let argv = ["followup", "run", "wl-002"];
+        let flags = [("blocking", "true"), ("from", from.as_str())];
+
+        assert_eq!(follow(&store, &argv, &flags, &["wl-900"]), 1, "no barrier is being checked at all");
+        checking(&store, "run", 1, "wl-900");
+        assert_eq!(follow(&store, &argv, &flags, &[]), 1, "a person at the CLI holds no row");
+        assert_eq!(follow(&store, &argv, &flags, &["wl-001"]), 1, "a member, or its verifier, holds the member");
+        let mut t = store.find_task("wl-900").unwrap();
+        t.status_raw = "review".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(follow(&store, &argv, &flags, &["wl-900"]), 1, "a check that has reviewed has given its verdict");
+        assert_eq!(groups_of(&store, "run")[0].members, vec!["wl-001"], "and nothing joined");
+        assert!(told().is_empty(), "nor was anybody told anything");
+    }
+
+    #[test]
+    fn a_done_when_is_read_off_the_overview_and_a_row_without_one_has_none() {
+        let mut t = Task::new("t", "t-1");
+        crate::model::set_section_in(&mut t.body, "Overview", "Intro.\n\n**Done when:** tests cover:\n- one\n- two\n\nLand it.");
+        assert_eq!(done_when(&t).as_deref(), Some("tests cover: one two"));
+        crate::model::set_section_in(&mut t.body, "Overview", "Nothing said about it.");
+        assert_eq!(done_when(&t), None);
     }
 
     /// The window **at** a barrier, which is the moment the next group is
