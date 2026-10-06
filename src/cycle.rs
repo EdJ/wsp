@@ -1219,6 +1219,14 @@ fn open_barrier(store: &Store, w: &Worklist, at: usize, g: &Group) -> Option<Str
         t.project = project.clone();
         t.tags = vec![BARRIER_TAG.to_string()];
         t.status_raw = Status::Todo.as_str().to_string();
+        // The group read again, inside the lock. The caller's copy was read
+        // before a landed reading, the verifier starts and a herdr round trip,
+        // and a running group's stop may be amended in that time
+        // (`cmd_worklist::amend_running_stop`, `wsp-206`). The amendment checks
+        // for this row under this lock, so the two are ordered only if the
+        // stop handed to the barrier is read here as well.
+        let fresh = store.worklist(&w.id).and_then(|f| f.groups().into_iter().nth(at - 1));
+        let g = fresh.as_ref().unwrap_or(g);
         crate::model::set_section_in(&mut t.body, "Overview", &barrier_order(w, at, g, &id));
         store.save_task(&t).ok()?;
         Some((id, title))
@@ -2183,6 +2191,26 @@ pub(crate) mod tests {
         );
         store.save_worklist(&w).unwrap();
         w
+    }
+
+    /// `wsp-206`'s verifier: a pass reads the list, the running group's stop
+    /// is amended, and then the pass opens the barrier. The amendment saw no
+    /// row and said the barrier would be handed it, so the row has to carry
+    /// the stop as stored and not the one the pass read.
+    #[test]
+    fn a_stop_amended_while_a_pass_was_reading_is_the_one_the_barrier_is_handed() {
+        let (_env, store) = scratch("amend-mid-pass");
+        task(&store, "m-1", Status::Review);
+        let stale = list(&store, &[(&["m-1"], "claude")]);
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        groups[0].stop = "sonnet stays at 2/10".into();
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+
+        let id = open_barrier(&store, &stale, 1, &stale.groups()[0]).expect("a barrier row");
+        let order = store.find_task(&id).unwrap().section("Overview").unwrap_or_default();
+        assert!(order.contains("sonnet stays at 2/10"), "the barrier was handed a stop already corrected: {order}");
     }
 
     fn tagged(store: &Store, tag: &str) -> Vec<Task> {
