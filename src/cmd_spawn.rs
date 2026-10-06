@@ -2571,6 +2571,29 @@ pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
 const END_WHEN_IDLE: &str = "WSP_END_WHEN_IDLE";
 
 fn arrange_ending_when_idle(store: &Store, scope: &str) -> Result<(), String> {
+    when_idle(store, &["govern", scope, "--ending"])
+}
+
+/// End a seat that has nothing left to answer for, once it is not mid-turn:
+/// `wsp despawn --pane <seat> --keep-tree`, detached, under [`END_WHEN_IDLE`].
+///
+/// **For a seat with no successor**, which is what a rotation's ending cannot
+/// carry: that one is a handover record naming the pane replaced, and the
+/// record is keyed on the scope, so writing one for a closing would overwrite
+/// an ending a rotation still owes on the same scope. `wsp-208` — a finished
+/// list's own governor, whose turn is very likely the one that closed the list.
+///
+/// **`--keep-tree`**, because a governor has no tree of its own: the one it
+/// stands in is whatever its spawner stood in, a member's or a barrier's
+/// (`wsp-203`), and on 2026-10-06 ending cpd-390 by hand needed this flag
+/// for that reason.
+pub(crate) fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
+    when_idle(store, &["despawn", "--pane", seat, "--keep-tree"])
+}
+
+/// Run `wsp <argv>` detached, under [`END_WHEN_IDLE`], with its output in the
+/// handover log.
+fn when_idle(store: &Store, argv: &[&str]) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = std::fs::OpenOptions::new()
@@ -2580,7 +2603,7 @@ fn arrange_ending_when_idle(store: &Store, scope: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", util::contract(&store.handover_log())))?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["govern", scope, "--ending"])
+    cmd.args(argv)
         .env(END_WHEN_IDLE, "1")
         .env_remove(crate::place::SEAT_ENV)
         .env_remove("HERDR_PANE_ID")
@@ -3270,10 +3293,16 @@ fn wait_until_idle(store: &Store, scope: &str) {
     else {
         return;
     };
+    wait_for_pane(&from);
+}
+
+/// [`wait_until_idle`] on a pane named outright — [`end_seat_when_idle`]'s,
+/// which has no handover record to read it from.
+fn wait_for_pane(from: &str) {
     let deadline = Instant::now() + Duration::from_secs(20 * 60);
     let backends = local_backends();
     while Instant::now() < deadline {
-        let turning = crate::cmd_agent::locate_seat(&backends, &from)
+        let turning = crate::cmd_agent::locate_seat(&backends, from)
             .is_some_and(|(_, row)| row.state.turn_in_flight());
         if !turning {
             return;
@@ -3446,6 +3475,12 @@ fn end_owed(
 /// layer (the binds note on robustness-061), and is not decided here.
 pub fn despawn(store: &Store, args: &Args) -> i32 {
     let keep = args.has("keep-tree");
+    // [`end_seat_when_idle`]'s wait. Empty is unset, as in [`carry_out_ending`].
+    if std::env::var_os(END_WHEN_IDLE).is_some_and(|v| !v.is_empty()) {
+        if let Some(pane) = args.get("pane") {
+            wait_for_pane(&pane);
+        }
+    }
     let tidy = |seat: &Seat, task: Option<&str>, ws: Option<&str>| swept_up(store, seat, task, ws, keep);
     let pane = cmd_agent::my_pane();
     // What this pane holds the slot of *now*, read here for the same reason the

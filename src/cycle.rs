@@ -418,14 +418,8 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
                         let _ = step(store, &w, &Fleet);
                         return 0;
                     }
-                    // Rotate first, so what is told next reaches the successor
-                    // rather than a seat that is about to be ended. Not on the
-                    // last pass: there is nothing left to govern.
                     if let Some(n) = passed {
-                        end_behind(store, &Fleet, &w, n);
-                        if n < w.groups().len() {
-                            rotate(store, &w);
-                        }
+                        after_pass(store, &Fleet, &w, n);
                     }
                     let _ = step(store, &w, &Fleet);
                     tell(store, &w, &passed_sentence(store, &w, passed));
@@ -444,6 +438,32 @@ pub fn advance(store: &Store, args: &Args) -> i32 {
         let _ = step(store, w, &Fleet);
     }
     0
+}
+
+/// What a pass wsp runs leaves behind it: the group's agents ended, and then
+/// either a fresh governor or, past the last barrier, no run at all.
+///
+/// **Rotate first**, so what is told next reaches the successor rather than a
+/// seat that is about to be ended.
+///
+/// **Past the last barrier the list is closed, by wsp.** It used to stop at
+/// "`wsp worklist done` closes it", and on `wsp-unattended` the governor typed
+/// that by hand at 11:16:25Z — a hand verb at the end of an unattended run —
+/// and the seat wsp had rotated in for the run stayed open after it
+/// (`wsp-208`). The closing is [`Closing::Passed`]: everything `done` ends,
+/// the list's own seat included, except the check whose `go` this is.
+///
+/// The last group passed is the whole test, because the position is read from
+/// the last verdict on: anything still open behind it is slipped, which `done`
+/// writes down, and not a barrier the run stands at.
+fn after_pass(store: &Store, seats: &dyn Seats, w: &Worklist, n: usize) {
+    end_behind(store, seats, w, n);
+    if n < w.groups().len() {
+        rotate(store, w);
+        return;
+    }
+    let Some(now) = store.worklist(&w.id) else { return };
+    let _ = crate::cmd_worklist::close(store, &Args::synth("worklist", &["done", &w.id], &[]), now, Closing::Passed);
 }
 
 /// Whether the group a `go` concerns is one wsp runs: the group just passed,
@@ -470,6 +490,9 @@ fn passed_sentence(store: &Store, w: &Worklist, passed: Option<usize>) -> String
     };
     let pos = worklist::position(store, &w, Reading::Settled);
     let tail = match pos.at.and_then(|at| groups.get(at - 1).map(|g| (at, g))) {
+        None if w.status() == WorklistStatus::Done => {
+            " Nothing is left in the run, so wsp closed it, with its agents and its own seat.".to_string()
+        }
         None => format!(" Nothing is left in the run: `wsp worklist done {}` closes it.", w.id),
         Some((at, g)) if g.policy().is_some() => {
             format!(" wsp is running group {at}: {}. You are told if one of them needs a decision.", g.members.join(" "))
@@ -1539,12 +1562,17 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
     // A parked list is the same case as a held one: stopped short of the end,
     // with checks behind it that have been passed and one in front that has
     // not. `wsp-173`.
+    //
+    // A done list is over whatever its position says: [`Closing::Passed`]
+    // leaves the last check standing for this to end, and a `done` typed early
+    // has nothing in front of it that anybody will ask about again.
     let stopped = matches!(w.status(), WorklistStatus::Held | WorklistStatus::Parked);
-    if !pos.finished() && !stopped {
+    let over = pos.finished() || w.status() == WorklistStatus::Done;
+    if !over && !stopped {
         return Vec::new();
     }
     let behind = pos.at.unwrap_or(usize::MAX);
-    let settled = stopped && !pos.finished();
+    let settled = stopped && !over;
     let tasks = store.tasks();
     let claims = store.claims();
     let standing: Vec<String> = tasks
@@ -1588,10 +1616,20 @@ fn group_of(t: &Task, list: &str) -> Option<usize> {
 /// stands at `review`. A `done` ends the run outright, typed by whoever is
 /// over it, and a check still reading is one more thing it was opened for and
 /// will never be asked.
+///
+/// **`Passed` is `Done` taken by wsp past the last barrier** ([`after_pass`]),
+/// and differs from it only over that check: the `go` that closed the run is
+/// its turn, so it is left to review its row and [`last_barrier_left_behind`]
+/// ends it a tick later, as it does a held list's.
+///
+/// **`Done` and `Passed` stand the list's own seat down; `Held` does not**
+/// ([`stand_down_own_seat`]). A held list is waiting on a decision, and its
+/// seat is who makes it.
 #[derive(Clone, Copy)]
 pub(crate) enum Closing {
     Held,
     Done,
+    Passed,
 }
 
 /// Everything a run opened, ended at a closing that is not a pass: `hold` and
@@ -1616,6 +1654,11 @@ pub(crate) enum Closing {
 /// **A `hold` spares the check in front; a `done` does not** ([`Closing`]).
 pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &str, at: Option<usize>, how: Closing) {
     let Some(w) = store.worklist(list) else { return };
+    // First, so the sentences below reach whoever answers for the list now —
+    // the project's seat, or a hand on a member — and not a seat being ended.
+    if !matches!(how, Closing::Held) {
+        stand_down_own_seat(store, list);
+    }
     let tasks = store.tasks();
     let mut ids: Vec<String> = Vec::new();
     match at {
@@ -1629,7 +1672,11 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
         // its claim. The tag says what a row is; only its title and its
         // `OWNED` record say whose.
         None => {
-            for at in 1..=w.groups().len() {
+            let last = w.groups().len();
+            for at in 1..=last {
+                if matches!(how, Closing::Passed) && at == last {
+                    continue;
+                }
                 ids.extend(tasks.iter().filter(|t| is_barrier(t, list, at)).map(|t| t.id.clone()));
             }
             ids.extend(
@@ -1644,7 +1691,8 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
                     .map(|t| t.id.clone()),
             );
             for (i, _) in w.groups().iter().enumerate() {
-                ids.extend(owned_by(tasks.iter(), list, i + 1));
+                let spare = |id: &String| matches!(how, Closing::Passed) && front_check(&tasks, list, i + 1, id);
+                ids.extend(owned_by(tasks.iter(), list, i + 1).into_iter().filter(|id| !spare(id)));
             }
         }
         Some(at) => {
@@ -1659,7 +1707,7 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
                     .map(|t| t.id.clone()),
             );
             let spare = |id: &String| matches!(how, Closing::Held) && front_check(&tasks, list, at, id);
-            if matches!(how, Closing::Done) {
+            if matches!(how, Closing::Done | Closing::Passed) {
                 ids.extend(tasks.iter().filter(|t| is_barrier(t, list, at)).map(|t| t.id.clone()));
             }
             ids.extend(owned_by(tasks.iter(), list, at).into_iter().filter(|id| !spare(id)));
@@ -1698,6 +1746,71 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
         ));
     }
     end_all(store, standing);
+}
+
+/// A closed list's own governor, stood down and ended once it is not mid-turn.
+/// `wsp-208`.
+///
+/// **Ended, and not offered.** worklist-037 offers a person the stand-down of
+/// a seat with nothing standing under it, which fits a project's seat: it
+/// outlives every run. A list's own seat exists for the run, and a list that is
+/// done leaves it nothing to answer for. On `wsp-unattended` that seat, cpd-390,
+/// said "Nothing else needs this seat, so I'm stopping" and stayed open, named
+/// in `governors.json`, until a person ended it.
+///
+/// **The list's scope only.** A project's seat in the chain answers for more
+/// than this run and is left alone. Whoever seated the list's own seat, it is
+/// ended: every pass before the last rotates it on the same terms
+/// ([`rotate_on_behalf`](crate::cmd_spawn::rotate_on_behalf)), so after one
+/// group it is wsp's whatever it was before.
+///
+/// **Stood down, not only vacated**, so the reconciler reads a decision and
+/// not a governor that died, and does not fill it (`STOOD_DOWN`'s docs); and
+/// vacated before the ending, because `wsp despawn` refuses a pane that still
+/// holds a seat.
+///
+/// **When idle**, because the turn that closed the list is often this seat's
+/// own — `wsp worklist done`, typed by the governor, is how `wsp-unattended`
+/// ended.
+fn stand_down_own_seat(store: &Store, list: &str) {
+    let Some(seat) = crate::cmd_govern::seat_of_scope(list, &store.governors()) else { return };
+    // Read before the vacate: the room a compound seat is found by is on the
+    // record the vacate empties.
+    let sitting = occupied(store, &seat);
+    crate::cmd_govern::vacate(store, list);
+    crate::cmd_govern::mark_stood_down(store, list);
+    let Some(seat) = sitting else {
+        stamp(&format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
+        return;
+    };
+    match end_seat_when_idle(store, &seat) {
+        Ok(()) => stamp(&format!("{list} is closing — stood its own seat {seat} down; it is ended once it is not mid-turn")),
+        Err(why) => stamp(&format!(
+            "{list} is closing — stood its own seat {seat} down, but could not arrange its ending: {why}. \
+             `wsp despawn --pane {seat} --keep-tree` ends it"
+        )),
+    }
+}
+
+/// The pane a seat's agent is in now, through the port, as
+/// [`rotate_on_behalf`](crate::cmd_spawn::rotate_on_behalf) finds the one it
+/// replaces; under test, the recorded one.
+fn occupied(store: &Store, seat: &crate::cmd_govern::Seat) -> Option<String> {
+    if cfg!(test) {
+        return (!seat.pane.is_empty()).then(|| seat.pane.clone());
+    }
+    let backends = crate::cmd_spawn::local_backends();
+    crate::cmd_govern::occupant(store, &backends, seat).map(|(_, found)| found.seat.as_str().to_string())
+}
+
+/// [`crate::cmd_spawn::end_seat_when_idle`], recorded instead under test.
+fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::ENDED.with(|s| s.borrow_mut().push(seat.to_string()));
+        return Ok(());
+    }
+    crate::cmd_spawn::end_seat_when_idle(store, seat)
 }
 
 /// Every agent this run opened that has nothing left to do, and holds a claim.
@@ -3043,6 +3156,123 @@ fn only_a_working_screen_is_ever_overruled() {
 
         end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Held);
         assert_eq!(drained(&ENDED), vec!["h-1".to_string()], "the helper, and not the check holding the barrier");
+    }
+
+    /// A seat on `scope`, in the shape `wsp govern` writes one.
+    fn seated(store: &Store, scope: &str, pane: &str) {
+        store.set_governor(
+            scope,
+            serde_json::json!({ "workspace": pane, "pane": pane, "host": util::hostname(), "kind": "claude" }),
+        );
+    }
+
+    /// A run of one group under project `p`, its barrier passed, with the check
+    /// whose `go` it was still holding its claim at `doing`, and a seat on the
+    /// list and another on the project.
+    fn passed_with_seats(tag: &str) -> (util::Isolated, Store, Worklist) {
+        let (env, store) = scratch(tag);
+        let mut m = Task::new("m-1", "m-1");
+        m.status_raw = Status::Review.as_str().into();
+        m.project = Some("p".into());
+        store.save_task(&m).unwrap();
+        let mut w = list(&store, &[(&["m-1"], "claude")]);
+        let mut g = w.groups();
+        g[0].verdict = "passed".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        let mut check = Task::new(&barrier_title("run", 1), "b-1");
+        check.tags = vec![BARRIER_TAG.into()];
+        check.set_status(Status::Doing);
+        check.log(&format!("{} run group 1", OWNED));
+        store.save_task(&check).unwrap();
+        store.set_claim("b-1", serde_json::json!({ "workspace": "w" }));
+        seated(&store, "run", "cpd-7");
+        seated(&store, "p", "cpd-340");
+        let _ = drained(&ENDED);
+        let _ = drained(&ROTATED);
+        (env, store, w)
+    }
+
+    /// `wsp-208`. On `wsp-unattended` the last pass ended members, verifiers
+    /// and barriers, and left two things to a person: the `wsp worklist done`
+    /// its governor typed by hand, and that governor, cpd-390, open and named
+    /// in `governors.json` minutes after it said it was stopping.
+    ///
+    /// Past the last barrier wsp closes the list itself and stands the list's
+    /// own seat down, ending it. The project's seat answers for more than this
+    /// run and is not touched; the check whose `go` this is is left to review
+    /// its row; and nothing is rotated, because there is nothing left to govern.
+    #[test]
+    fn the_last_pass_closes_the_list_and_ends_its_own_seat_and_not_the_projects() {
+        let (_env, store, w) = passed_with_seats("lastpass");
+
+        after_pass(&store, &Exits, &w, 1);
+
+        assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Done, "closed by wsp, not by a hand verb");
+        let ended = drained(&ENDED);
+        assert!(ended.contains(&"cpd-7".to_string()), "the list's own seat is ended: {ended:?}");
+        assert!(!ended.contains(&"cpd-340".to_string()), "the project's seat is not the list's: {ended:?}");
+        assert!(!ended.contains(&"b-1".to_string()), "the check whose `go` this is reviews its row first: {ended:?}");
+        assert!(drained(&ROTATED).is_empty(), "no successor for a run that is over");
+        let governors = store.governors();
+        assert!(crate::cmd_govern::seat_of_scope("run", &governors).is_none(), "the list's seat is vacated");
+        assert!(
+            crate::cmd_govern::stood_at(&governors, "run").is_some(),
+            "and recorded as stood down, so the reconciler does not fill it again"
+        );
+        assert!(crate::cmd_govern::seat_of_scope("p", &governors).is_some(), "the project's seat is still held");
+    }
+
+    /// A pass that is not the last rotates the list's seat and closes nothing.
+    #[test]
+    fn a_pass_short_of_the_end_closes_nothing_and_stands_no_seat_down() {
+        let (_env, store, mut w) = passed_with_seats("notlast");
+        let mut g = w.groups();
+        g.push(Group { members: vec!["m-1".into()], agent: "claude".into(), ..Group::default() });
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+
+        after_pass(&store, &Exits, &w, 1);
+
+        assert_eq!(drained(&ROTATED), vec!["run".to_string()], "a fresh governor for the next group");
+        assert_eq!(store.worklist("run").unwrap().status(), WorklistStatus::Running);
+        assert!(!drained(&ENDED).contains(&"cpd-7".to_string()), "the seat still has a barrier to answer for");
+        assert!(crate::cmd_govern::seat_of_scope("run", &store.governors()).is_some());
+    }
+
+    /// A hold is waiting on a decision, and the list's seat is who makes it; a
+    /// `done` — typed by a person or by that governor itself, as
+    /// `wsp-unattended`'s was — leaves the seat nothing to answer for.
+    #[test]
+    fn a_hold_keeps_the_lists_own_seat_and_a_done_ends_it() {
+        let (_env, store, _w) = passed_with_seats("holdseat");
+
+        end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Held);
+        assert!(!drained(&ENDED).contains(&"cpd-7".to_string()), "a held run keeps its governor");
+        assert!(crate::cmd_govern::seat_of_scope("run", &store.governors()).is_some());
+
+        end_what_the_run_opened(&store, &Exits, "run", None, Closing::Done);
+        let ended = drained(&ENDED);
+        assert!(ended.contains(&"cpd-7".to_string()), "{ended:?}");
+        assert!(!ended.contains(&"cpd-340".to_string()), "{ended:?}");
+    }
+
+    /// The other half of [`Closing::Passed`]: the check it spared is ended by
+    /// a tick once it stands at `review`, on a list that is now `done` — which
+    /// the tick never used to read at all.
+    #[test]
+    fn a_closed_lists_last_check_is_ended_by_a_tick_once_it_has_reviewed_its_row() {
+        use crate::repair::Pass;
+        let (_env, store, w) = passed_with_seats("closedcheck");
+        after_pass(&store, &Exits, &w, 1);
+        let _ = drained(&ENDED);
+
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert!(!drained(&ENDED).contains(&"b-1".to_string()), "still at `doing`, still deciding");
+
+        set(&store, "b-1", Status::Review);
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert!(drained(&ENDED).contains(&"b-1".to_string()), "reviewed, and nothing left for it to decide");
     }
 
     /// `wsp-136` item 1. A note on a member is somebody **saying** something

@@ -225,10 +225,16 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // at `wsp wip` for twenty minutes afterwards: `wsp-process` is held, its
     // finished barrier check was still standing, and the reading that should
     // have found it was never asked about that list at all.
+    //
+    // **And done**, since `wsp-208`: a run wsp closes past its last barrier is
+    // closed inside that barrier check's `go`, so the check is left standing
+    // to review its row, and this is the only thing that reaches it after.
     for w in store
         .worklists()
         .into_iter()
-        .filter(|w| matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked))
+        .filter(|w| {
+            matches!(w.status(), WorklistStatus::Running | WorklistStatus::Held | WorklistStatus::Parked | WorklistStatus::Done)
+        })
     {
         crate::cycle::end_all(store, crate::cycle::last_barrier_left_behind(store, &w));
     }

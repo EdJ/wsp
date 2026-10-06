@@ -3750,13 +3750,25 @@ pub fn done(store: &Store, args: &Args) -> i32 {
         eprintln!("       (named rather than taken from the seat: this one is final)");
         return 2;
     };
-    let mut w = match worklist_or_why(store, &needle) {
+    let w = match worklist_or_why(store, &needle) {
         Ok(w) => w,
         Err(why) => {
             eprintln!("{why}");
             return 1;
         }
     };
+    close(store, args, w, crate::cycle::Closing::Done)
+}
+
+/// [`done`] once the list is found, and the whole of it: the record, and
+/// everything the run opened ended with it.
+///
+/// **Split out for `wsp-208`**: a run wsp takes past its last barrier is
+/// closed by wsp, with [`crate::cycle::Closing::Passed`] — the same closing a
+/// person types, except that the check whose `go` this is is left to finish.
+/// A hand verb at the end of an unattended run was the defect, and a second
+/// copy of what `done` writes would be one that drifts from it.
+pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cycle::Closing) -> i32 {
     if w.status() == WorklistStatus::Done {
         println!("{} {}", w.id, Paint::new().dim("is already done"));
         return 0;
@@ -3808,7 +3820,7 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     // be typed on a list with work still open — that is its documented meaning —
     // and ending a member's agent on a list somebody meant to come back to is
     // not something to do without saying.
-    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Done);
+    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, how);
 
     if args.json() {
         println!(
