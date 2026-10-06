@@ -227,6 +227,13 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         ));
     }
     crate::cycle::end_all(store, verdicts);
+    // And every pass on a member whose verdict is in, or that a newer landing
+    // superseded — `wsp-188`'s verifiers hold no claim, so the line above
+    // never sees them. Each is ended once, with the outcome on the pass.
+    let ended = crate::cycle::passes_finished(store);
+    if !ended.is_empty() {
+        stamp(store, &format!("verifier seat(s) with nothing left to do, ended: {}", ended.join(" ")));
+    }
     // **Collected first and then visited once each**, which is the whole of the
     // second trigger and the reason it is here rather than in the loop above.
     // A scope on a running list and a scope with a backlog are the same seat, and
@@ -987,8 +994,10 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         for m in blocked {
             let Some(v) = crate::cycle::blocked_verifier(&tasks, m) else { continue };
             stamp(store, &format!(
-                "{} group {at}: the barrier still waits on {m} — {} blocked: sent back or answered? `wsp show {}` says on what.",
-                w.id, v.id, v.id
+                "{} group {at}: the barrier still waits on {m} — its verifier blocked{}: sent back or answered? \
+                 `wsp show {m}` has the verdict under ## Verification.",
+                w.id,
+                v.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default()
             ));
         }
     }
@@ -2550,16 +2559,18 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     fn a_barrier_held_by_a_blocked_verifier_names_the_block() {
         let (env, store) = scratch("barrierblocked");
         landed_member(&env, &store, false);
-        let mut v = Task::new("Verify m-1", "v-1");
-        v.parent = Some("m-1".into());
-        v.tags = vec![crate::cycle::VERIFY_TAG.into()];
-        v.set_status(Status::Blocked);
-        store.save_task(&v).unwrap();
+        // The pass opens on the landing the tick records, and blocks; the
+        // member is then put back at review by hand with nothing new landed —
+        // a governor who has not yet decided whether the finding stands.
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let _ = stamped();
+        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "it does not hold", None).unwrap();
+        set_status(&store, "m-1", Status::Review);
 
         tick(&store, &Fake::empty(), &mut Pass::new());
         let said = stamped();
         assert!(
-            said.iter().any(|l| l.contains("waits on m-1") && l.contains("v-1 blocked: sent back or answered?")),
+            said.iter().any(|l| l.contains("waits on m-1") && l.contains("its verifier blocked") && l.contains("sent back or answered?")),
             "{said:?}"
         );
         assert!(!said.iter().any(|l| l.contains("no verifier has recorded a verdict")), "{said:?}");
@@ -2692,8 +2703,8 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         let _ = spawned();
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert_eq!(verifiers(&store).len(), 2, "each member gets its verifier, on the recorded landing");
-        for v in verifiers(&store) {
-            set_status(&store, &v, Status::Review);
+        for m in verifiers(&store) {
+            crate::verification::record(&store, &m, crate::verification::State::Holds, "holds", None).unwrap();
         }
         let _ = spawned();
 
@@ -2723,11 +2734,12 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         );
     }
 
+    /// The members with a pass still reading (`wsp-188`).
     fn verifiers(store: &Store) -> Vec<String> {
         store
             .tasks()
             .into_iter()
-            .filter(|t| t.tags.iter().any(|g| g == crate::cycle::VERIFY_TAG))
+            .filter(|t| crate::verification::passes(t).last().is_some_and(|p| p.state == crate::verification::State::Running))
             .map(|t| t.id)
             .collect()
     }

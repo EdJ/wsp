@@ -1573,6 +1573,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
     if !groups.is_empty() {
         println!();
+        let tasks_now = if args.has("verdicts") { store.tasks() } else { Vec::new() };
         let behind_at = flagged_in(&pos);
         let w_ord = groups.len().to_string().chars().count();
         // Where the ids begin: the mark, the ordinal and the cap column, each
@@ -1620,6 +1621,13 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             // rather than only at `next`.
             for line in verdict_lines(&p, g, &w.id, width, args.has("verdicts")) {
                 println!("{indent}{line}");
+            }
+            // And each member's own, under `--verdicts`: the newest pass on the
+            // member's row, which is what the barrier is gated on (`wsp-188`).
+            if args.has("verdicts") {
+                for line in pass_lines(&p, &tasks_now, g) {
+                    println!("{indent}{line}");
+                }
             }
             for line in landed_lines(&p, g) {
                 println!("{indent}{line}");
@@ -1861,6 +1869,26 @@ fn verdict_lines(p: &Paint, g: &Group, id: &str, width: usize, full: bool) -> Ve
         .map(|(n, line)| {
             let margin = " ".repeat(lead.chars().count());
             p.dim(&format!("{}{line}", if n == 0 { lead.as_str() } else { margin.as_str() }))
+        })
+        .collect()
+}
+
+/// Each member's newest verification, one line apiece: the state, the commit
+/// it read, and the first line of what it said. The whole of it is on the
+/// member under `## Verification`, which the line points at.
+fn pass_lines(p: &Paint, tasks: &[crate::model::Task], g: &Group) -> Vec<String> {
+    g.members
+        .iter()
+        .filter_map(|m| crate::verification::latest(tasks, m).map(|v| (m, v)))
+        .map(|(m, v)| {
+            let word = match v.state {
+                crate::verification::State::Holds => p.green(v.state.as_str()),
+                crate::verification::State::Blocks => p.red(v.state.as_str()),
+                _ => p.dim(v.state.as_str()),
+            };
+            let read = v.read.as_deref().map(|r| format!(" at {r}")).unwrap_or_default();
+            let said = v.text.lines().next().map(|l| format!(" · {}", util::truncate(l, 60))).unwrap_or_default();
+            format!("{m}  {word}{}", p.dim(&format!("{read}{said}")))
         })
         .collect()
 }

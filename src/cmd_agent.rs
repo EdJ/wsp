@@ -3761,11 +3761,13 @@ impl Wip {
         let governors = store.governors();
         let agents_held = store.agents_held();
         let now = util::epoch_secs();
+        let verifying = crate::verification::seats(&tasks);
         let agents = agents
             .into_iter()
             .filter(|(s, quiet)| {
                 let held = holding(&tasks, &bindings, &claims, &agents_held, s.seat.as_str()).is_some()
-                    || governs_seat(&governors, s.seat.as_str());
+                    || governs_seat(&governors, s.seat.as_str())
+                    || verifying.contains_key(s.seat.as_str());
                 !forgotten(s.state, *quiet, now, held)
             })
             .map(|(s, _)| s)
@@ -3924,6 +3926,9 @@ pub(crate) struct WipRow {
 /// The agents, resolved and in reading order: by project, then by pane.
 pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
     let mut rows: Vec<WipRow> = Vec::new();
+    // A verifier holds no claim and no binding (`wsp-188`): its seat is named
+    // on the member's open pass, and that is where this reads it from.
+    let verifying = crate::verification::seats(&w.tasks);
     for a in &w.agents {
         let seat = a.seat.as_str();
         let bound = w
@@ -3968,6 +3973,7 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             project: r.project.unwrap_or_else(|| "—".into()),
             task: bound
                 .map(|t| t.title.clone())
+                .or_else(|| verifying.get(seat).map(|m| crate::verification::seat_label(m)))
                 .unwrap_or_else(|| if a.label.is_empty() { "(unbound)".into() } else { format!("({})", a.label) }),
             task_id: bound.map(|t| t.id.clone()).unwrap_or_default(),
             pane: seat.to_string(),
@@ -7404,6 +7410,24 @@ mod tests {
             asks: Default::default(),
             answered_by: Default::default(),
         }
+    }
+
+    /// `wsp-188`. A verifier holds no claim and no binding, so `wip` would draw
+    /// its seat as one holding nothing. Its seat is on the member's open pass,
+    /// and that is where the row is named from: against the member.
+    #[test]
+    fn wip_names_a_verifier_seat_against_the_member_it_is_verifying() {
+        let mut w = wip_world();
+        let m = w.tasks.iter_mut().find(|t| t.id == "t-004").unwrap();
+        let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        p.pane = Some("w3:p1".into());
+        crate::verification::write(m, &[p]);
+        let rows = wip_rows(&w);
+        let row = rows.iter().find(|r| r.pane == "w3:p1").unwrap();
+        assert_eq!(row.task, "t-004 · verifying");
+        assert!(row.task_id.is_empty(), "it holds nothing: the member's own agent is who holds t-004");
+        let text = wip_lines(&w, &Paint::new(), false).join("\n");
+        assert!(text.contains("t-004 · verifying"), "{text}");
     }
 
     /// `wsp-145`. The heading counts agents and turns, which is a true

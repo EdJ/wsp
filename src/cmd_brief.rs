@@ -509,6 +509,10 @@ pub(crate) struct Brief {
     /// The task this pane is on, what it hangs under, and how much is open
     /// beneath it.
     pub mine: Option<Task>,
+    /// The member this seat is verifying, when it is a run's verifier — which
+    /// holds no claim, so `mine` is empty, and without this the brief would
+    /// tell it to go and claim something (`wsp-188`).
+    pub verifying: Option<Task>,
     pub parent: Option<Task>,
     pub under_mine: usize,
     /// The backlog, each with its own count of open sub-tasks. Whole, because
@@ -805,7 +809,16 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
     });
     let rotation_pending = cmd_govern::rotation_pending(governed.as_deref(), b.incoming.as_ref());
 
+    let verifying = match (mine, b.pane.as_deref()) {
+        (None, Some(pane)) => crate::verification::seats(tasks)
+            .get(pane)
+            .and_then(|m| tasks.iter().find(|t| &t.id == m))
+            .cloned(),
+        _ => None,
+    };
+
     Brief {
+        verifying,
         handbook,
         parent_decided,
         mine_log,
@@ -1316,6 +1329,24 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
             for (i, at) in r.mine.iter().flat_map(|t| t.refs.iter()).enumerate() {
                 row(if i == 0 { "files" } else { "" }, p.dim(at).to_string());
             }
+        }
+        // A verifier holds nothing either, and is not idle: its whole job is
+        // one member and one verb. Two lines, paid once per request, and only
+        // in a seat wsp started to verify.
+        None if r.verifying.is_some() => {
+            let m = r.verifying.as_ref().expect("matched");
+            row(
+                "you",
+                format!("verifying {}  {}  {}", p.bold(&m.id), p.dim(m.status().as_str()), util::truncate(&m.title, 44)),
+            );
+            row(
+                "",
+                p.dim(&format!(
+                    "read-only · finish with `wsp verified {} --holds|--blocks --from FILE` · the order you were handed is the whole job",
+                    m.id
+                ))
+                .to_string(),
+            );
         }
         // A custodian holding nothing is not an agent that has failed to claim
         // anything: it is an agent doing its job. The default line below tells

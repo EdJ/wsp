@@ -1248,6 +1248,7 @@ five on a project:
 | `## Details` | working material — criteria, links, whatever the work needs |
 | `## Handbook` | *projects only* — what an arriving agent is told; see below |
 | `## Decisions` | what was settled and now binds; `wsp decide` writes it |
+| `## Verification` | *members of a run* — one entry per verifier pass; `wsp verified` writes it |
 | `## Log` | dated, append-only, one entry per line; `wsp note` writes it, nothing edits it |
 
 Both dated sections store the *instant*, in UTC — `- 2026-08-16T23:15:00Z …` —
@@ -1262,6 +1263,32 @@ and `util::local_offset` says why that and not the three obvious alternatives.
 wsp decide 022 "parked rather than dropped — the mechanism is right, the moment is not"
 wsp decide wsp "the backlog is split into render and data, and here is what that means"
 ```
+
+`## Verification` is a run's verdicts on a member, kept on the member
+(`wsp-188`). A verifier used to be filed as a row of its own, which doubled the
+task count: wsp-148 alone had five. Now wsp writes a `running` entry on the
+member when it lands, starts a read-only agent with `wsp spawn <member> --agent
+--verify` that claims nothing, and the verifier finishes with one verb:
+
+```sh
+wsp verified wsp-148 --holds --from verdict.md    # stays at review
+wsp verified wsp-148 --blocks --from verdict.md   # back to doing, verdict owed, governor told once
+```
+
+```
+## Verification
+- 2026-10-06T10:00:00Z holds · read 55c4839abcde · pane cpd-12 · on claude opus/high · ended
+  what was checked, what held, what did not
+```
+
+The barrier, `wsp worklist show --verdicts` and `wsp wip` (`wsp-148 ·
+verifying`) all read the newest entry. A new landing supersedes a pass that is
+still reading: its seat is ended and its late verdict refused. The tick ends a
+verifier's seat once, writes `ended` or `end failed: …` on the entry, and never
+retries a failure. A governor who thinks a block was wrong records `--holds` in
+their own name. Verify rows filed before this were moved by `wsp migrate
+--verify-rows`; their old ids still resolve from the archive, and each entry
+names its row with `was`.
 
 A decision is not a task and not a note. A task is work that completes; a
 decision never does, so filing one as a task leaves it open in every list for
@@ -4298,6 +4325,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_machine.rs` | the machines agents can be run on |
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor |
+| `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
 | `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat |
 | `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, or its own open `wsp ask` — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
 | `src/sharing.rs` | what every build on this machine shares: a few warm build trees, and the cores |

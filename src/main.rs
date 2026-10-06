@@ -29,6 +29,7 @@ mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
 mod cmd_verify;
+mod verification;
 mod cmd_watch;
 mod wake;
 mod cmd_worklist;
@@ -180,6 +181,10 @@ const BOOL_FLAGS: &[&str] = &[
     // for the same reason: both are a person overriding a refusal that is
     // right in general.
     "abandon", "again", "anyway",
+    // `wsp verified <member> --holds|--blocks`, `wsp spawn <member> --verify`
+    // and `wsp migrate --verify-rows -n`: none takes a value, and each is
+    // followed by a positional or a stream it must not eat.
+    "holds", "blocks", "verify", "verify-rows",
 ];
 
 /// Flags that keep their meaning inside a command's payload.
@@ -222,6 +227,8 @@ const LITERAL_AFTER: &[Literal] = &[
     // for the reason `note` does, and `-` for the reason `edit --overview` does.
     Literal { cmd: "review", subject: 1, payload: "account", stream: true },
     Literal { cmd: "decide", subject: 1, payload: "decision", stream: true },
+    // A verdict is prose about code as reliably as an account is.
+    Literal { cmd: "verified", subject: 1, payload: "verdict", stream: true },
     // The only row with no subject: `say` speaks for the pane it is run in, so
     // its payload starts at the first word. It is here for the stream form
     // alone — `agent-018` was an agent that followed the handbook's "give a
@@ -280,6 +287,9 @@ fn literal(cmd: &str) -> Option<&'static Literal> {
 /// `--supersedes` — and `--` still ends flag parsing everywhere.
 const OWNED_AFTER: &[(&str, &str)] = &[
     ("decide", "supersedes"),
+    // The verdict's own two words, which come after the member as often as not.
+    ("verified", "holds"),
+    ("verified", "blocks"),
     // `say` is the first row with `subject: 0`, so the payload begins at the
     // word after the verb and *every* flag it reads falls inside it. These
     // three are the whole of what `say` reads — `--pane` names the seat when
@@ -1055,6 +1065,7 @@ fn main() {
         "park" | "pause" => cmd_task::park(&store, &args),
         "review" => cmd_task::review(&store, &args),
         "reopen" => cmd_task::reopen(&store, &args),
+        "verified" => verification::cmd_verified(&store, &args),
         "todo" => cmd_task::set_status(&store, &args, model::Status::Todo),
         "mv" | "move" => cmd_task::mv(&store, &args),
         "tag" => cmd_task::tag(&store, &args),
@@ -1521,6 +1532,12 @@ fn help_text() -> String {
                                 send work back: moves the row, tells
                                 its pane, and stops the run reading it as
                                 finished (`todo` sets the status and takes no prose)
+  wsp verified <member> --holds|--blocks --from FILE
+                                    a verifier's verdict, recorded on the member
+                                    under ## Verification. --blocks sends it back
+                                    with the verdict as what is owed, and its
+                                    governor is told; a governor answering a
+                                    block by hand writes --holds in their name
   wsp done <id> [--force]           complete; --force over open sub-tasks
   wsp block <id> "reason"           stop it: somebody owes you an answer
   wsp park <id> "reason"            not yet, deliberately — say what brings
@@ -1646,6 +1663,8 @@ fn help_text() -> String {
                                     your settings file, as before.
                                     haiku opens in manual mode, so it is refused
                                     unless --focus says you will be at the pane
+                                    --verify is a run's verifier on a member: no
+                                    claim, the seat written on its open pass
   wsp despawn <id> | --pane <seat>  the other end of it, and the whole ending:
                                     end the agent, release the claim, remove the
                                     worktree. A seat that will not close keeps
@@ -1931,6 +1950,9 @@ fn help_text() -> String {
                                     space, rewriting every reference; -n plans it
                                     and writes nothing. Old ids go on resolving
   wsp migrate --refs <path> [-n]    …and bring a source tree's comments forward
+  wsp migrate --verify-rows [-n]    every Verify row wsp filed, moved onto its
+                                    member's ## Verification and archived; rows
+                                    made by hand are named and left alone
 
 Ids are `<project>-NNN`, continuous within a project rather than within a day,
 and a task filed nowhere is `inbox-NNN` until `wsp mv -p` files it — the one

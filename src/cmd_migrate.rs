@@ -116,6 +116,11 @@ pub fn run(store: &Store, args: &Args) -> i32 {
     if let Some(dir) = args.get("refs") {
         return refs(store, &dir, args);
     }
+    // `wsp-188`'s one-off: Verify rows onto their members. See
+    // [`crate::verification::migrate`].
+    if args.has("verify-rows") {
+        return crate::verification::migrate(store, args);
+    }
 
     let p = Paint::new();
     let (map, tops) = plan(store);

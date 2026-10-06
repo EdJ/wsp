@@ -1109,6 +1109,13 @@ pub fn reopen(store: &Store, args: &Args) -> i32 {
 fn deliver_the_reason(store: &Store, args: &Args, reason: &str) {
     let Some(needle) = args.rest.first().cloned() else { return };
     let Some(id) = store.task(&needle).map(|t| t.id) else { return };
+    deliver_reason(store, &id, reason);
+}
+
+/// The delivery itself, by id: `wsp verified --blocks` sends a member back the
+/// way `reopen` does and says it through the same one path.
+pub(crate) fn deliver_reason(store: &Store, id: &str, reason: &str) {
+    let id = id.to_string();
     // Nothing to tell: a row nobody is holding has no pane, and saying so
     // would be noise on every reopen of finished work.
     if store.panes_for_task(&id).is_empty() {
@@ -1392,6 +1399,24 @@ fn prose_payload(args: &Args, usage: &str) -> Result<(String, Option<String>), i
 /// worded the same. The guards are the point of the split, not the reading: a
 /// verb that grows a `-` form and not these grows the silent failure with it.
 pub(crate) fn prose_from_source(src: &str) -> Result<(String, String), i32> {
+    prose_read(src, fold)
+}
+
+/// [`prose_payload`] for a payload filed under a heading of its own rather than
+/// appended to the log: a stream keeps its lines, because there a line break is
+/// structure and not a new entry. Typed text is folded as it always is.
+///
+/// `wsp verified` is the reader. A verdict that blocks is a list of what has to
+/// change, and folded into one line it is the paragraph wsp-174 left on its own
+/// log — read by the member that has to act on it.
+pub(crate) fn prose_kept(args: &Args, usage: &str) -> Result<String, i32> {
+    match payload_source(args.rest.get(1..).unwrap_or_default()) {
+        Some(src) => prose_read(&src, |raw| raw.trim().to_string()).map(|(t, _)| t),
+        None => prose_payload(args, usage).map(|(t, _)| t),
+    }
+}
+
+fn prose_read(src: &str, shape: fn(&str) -> String) -> Result<(String, String), i32> {
     // Named the way the rest of the CLI names a path — a receipt that says
     // `~/notes/survey.md` is one the reader recognises.
     let named = if src == "-" { "stdin".to_string() } else { util::contract(&util::expand(src)) };
@@ -1403,7 +1428,7 @@ pub(crate) fn prose_from_source(src: &str) -> Result<(String, String), i32> {
         return Err(2);
     }
     let text = match read_source(src) {
-        Ok(raw) => fold(&raw),
+        Ok(raw) => shape(&raw),
         Err(e) => {
             eprintln!("wsp: cannot read {named}: {e}");
             return Err(1);

@@ -16,7 +16,7 @@
 //! run without herdr" was the better question — *do we need one?* — and the
 //! answer is no. Every event a run advances on is a wsp verb run in some
 //! agent's own process: a member's `review` and `land`, a verifier's
-//! `review` or `block`, the barrier agent's `go` or `hold`. So the verb is
+//! `verified`, the barrier agent's `go` or `hold`. So the verb is
 //! the trigger. [`poke`] sits at the seam every status verb already shares
 //! (`cmd_task::mutate_saying`), and at `land`, `go` and `hold`.
 //!
@@ -32,10 +32,11 @@
 //!    own `agent <id>:` line where it has one and the group's otherwise
 //!    ([`Group::policy_for`], `wsp-150`).
 //! 2. A member that has reached `review` **and landed** gets a read-only
-//!    verifier, on the member's policy: a child row tagged [`VERIFY_TAG`]
-//!    whose overview is its work order. It notes its verdict on the member and
-//!    reviews its own row, or blocks it.
-//! 3. When every member is landed and every verifier is at `review`, one agent
+//!    verifier, on the member's policy. Since `wsp-188` it has no row: a
+//!    `running` pass is written on the member's `## Verification`, and the
+//!    agent finishes with `wsp verified <member> --holds|--blocks` — see
+//!    [`crate::verification`].
+//! 3. When every member is landed and every newest pass holds, one agent
 //!    checks the barrier — a row tagged [`BARRIER_TAG`] — on the group's own
 //!    line, since it reads the group as a whole, and ends it with
 //!    `wsp worklist go` or `hold`.
@@ -51,9 +52,9 @@
 //! idempotent, a second trigger while the first is running finds the work
 //! already done, and `wsp worklist advance` by hand repairs a trigger that was
 //! lost. Each thing it starts is keyed on a record written *before* the spawn,
-//! inside the store lock — the member moved to `doing`, the verifier or
-//! barrier row created — so two advances racing find the record and start
-//! nothing twice.
+//! inside the store lock — the member moved to `doing`, the pass written on
+//! it, the barrier row created — so two advances racing find the record and
+//! start nothing twice.
 //!
 //! # Detached, because the trigger is somebody else's command
 //!
@@ -96,8 +97,10 @@ pub(crate) const OWNED_GROUP: &str = "WSP_RUN_GROUP";
 /// owner of a helper months later.
 pub(crate) const OWNED: &str = "wsp: started by this run";
 
-/// The tag on a verifier's row. Its parent is the member it verifies.
-pub(crate) const VERIFY_TAG: &str = "verify";
+/// The tag on a Verify row, from before `wsp-188` put verdicts on the member.
+/// Nothing files one now; the rows already filed are read until they are
+/// migrated, and the readers that still find them use this.
+pub(crate) const VERIFY_TAG: &str = crate::verification::VERIFY_TAG;
 /// The tag on the row of the agent that checks a barrier.
 pub(crate) const BARRIER_TAG: &str = "barrier";
 
@@ -457,6 +460,9 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
     if verb == "review" {
         return told_unlanded(store, &w, &t);
     }
+    if verb == "verified" {
+        return told_verdict(store, &w, &t);
+    }
     if verb != "blocked" {
         return;
     }
@@ -471,6 +477,26 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
         "{what} in the {} run: {} ({}) is blocked. `wsp show {}` says on what. \
          The run waits here until it is unblocked.",
         w.id, t.id, util::truncate(&t.title, 60), t.id
+    ));
+}
+
+/// A verdict on a member, which is the governor's to hear only when it blocks:
+/// the member has been sent back, and whether that was right is the decision.
+/// Told here and nowhere else, so once — the verb triggers this one advance,
+/// and the tick that follows reads the block without saying it again.
+fn told_verdict(store: &Store, w: &Worklist, t: &Task) {
+    let tasks = store.tasks();
+    let Some(p) = crate::verification::blocked(&tasks, &t.id) else { return };
+    tell(store, w, &format!(
+        "A verifier found a problem in the {} run: {} ({}) was sent back to doing{}. \
+         `wsp show {}` has the verdict under ## Verification. The run waits for it to land again; \
+         if the finding is wrong, `wsp verified {} --holds --from FILE` records why, in your name.",
+        w.id,
+        t.id,
+        util::truncate(&t.title, 60),
+        p.read.as_deref().map(|r| format!(" — it read {r}")).unwrap_or_default(),
+        t.id,
+        t.id
     ));
 }
 
@@ -567,16 +593,22 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
     }
 
     // 2. A verifier for each member that is finished — reviewed and landed.
+    // No row: the pass is written on the member, and the agent is started on
+    // the member with `--verify` (`wsp-188`).
     for s in pos.members.iter().filter(|s| s.finished()) {
         let Some(member) = store.find_task(&s.id) else { continue };
-        if let Some(v) = open_verifier(store, &member, &w.id, at, g) {
-            // On the kind the work ran on — `wsp-134` d1 (C) — which in a
-            // mixed group is the member's own line and not the group's.
-            let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
-            if spawn(store, &v, &on, Undo::Row, (&w.id, &at.to_string())) {
-                started.push(v);
+        // On the kind the work ran on — `wsp-134` d1 (C) — which in a
+        // mixed group is the member's own line and not the group's.
+        let on = g.policy_for(&member.id).unwrap_or_else(|| policy.clone());
+        if let Some(opened) = open_verifier(store, &member, &on) {
+            if let Some(seat) = &opened.superseded {
+                stamp(&format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id));
+                end_passes(store, &member.id, |p| p.state == crate::verification::State::Superseded);
+            }
+            if spawn(store, &member.id, &on, Undo::Verifier, (&w.id, &at.to_string())) {
+                started.push(crate::verification::seat_label(&member.id));
             } else {
-                failed(store, &w, &v);
+                failed(store, &w, &member.id);
             }
         }
     }
@@ -919,93 +951,126 @@ fn take_member(
     Some(took)
 }
 
-/// The newest verifier row under a member.
-fn latest_verifier<'a>(tasks: &'a [Task], member: &str) -> Option<&'a Task> {
-    tasks
-        .iter()
-        .filter(|t| t.parent.as_deref() == Some(member) && t.tags.iter().any(|g| g == VERIFY_TAG))
-        .max_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)))
-}
-
-/// The member's latest verifier, when it stopped on a problem rather than
-/// recording a verdict.
+/// The member's newest pass, when it stopped on a problem rather than holding.
 ///
 /// **A block is a verdict somebody has to answer, and the barrier does not open
-/// on it** — [`verified`] is `false` for it on purpose, because the governor
-/// decides whether the member goes back for a fix or the finding was answered.
-/// What this adds is the name of it: the line that said *no verifier has
-/// recorded a verdict* over a block was true of [`verified`] and false of the
-/// run, and sat for four and nine hours with nobody told which.
-pub(crate) fn blocked_verifier<'a>(tasks: &'a [Task], member: &str) -> Option<&'a Task> {
-    latest_verifier(tasks, member).filter(|v| v.status() == Status::Blocked)
+/// on it** — [`verified`] is `false` for it on purpose. Since `wsp-188` a block
+/// also sends the member back, so the run normally waits on the member and not
+/// on this; it is still named, because a member whose block was answered by
+/// hand — reviewed again with nothing new landed — would otherwise read as one
+/// that was never verified at all, which is what hid two of them for hours
+/// before `wsp-180`.
+pub(crate) fn blocked_verifier(tasks: &[Task], member: &str) -> Option<crate::verification::Pass> {
+    crate::verification::blocked(tasks, member)
 }
 
-/// Whether a member's latest verifier has recorded a verdict.
+/// Whether a member's newest pass holds.
 ///
 /// The predicate the barrier is gated on, and `wsp-147`'s third repair reads it
 /// to say *which* members the barrier is waiting on — a count is the question a
-/// reader has and cannot act on, a list of ids is both.
+/// reader has and cannot act on, a list of ids is both. Read off the member's
+/// own `## Verification` since `wsp-188`, and off a Verify row under it until
+/// that row is migrated.
 pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
-    latest_verifier(tasks, member).is_some_and(|v| matches!(v.status(), Status::Review | Status::Done))
+    crate::verification::verified(tasks, member)
 }
 
-/// Create the verifier row for a member, if one is owed, and hand back its id.
+/// Open a pass on a member, if one is owed. `Some` is a pass written and
+/// waiting for its agent, and names the seat of any pass it superseded.
 ///
-/// Owed when there is none, or when the last one blocked — found a problem —
-/// and **the member's work has moved since it was read**: that is the member
-/// coming back with a fix, and it is verified again by a fresh agent rather
-/// than by the one that already made up its mind.
+/// Owed when there is none; when the newest **blocked** and the member's work
+/// has moved since it was read ([`moved_since`]) — that is the member coming
+/// back with a fix, verified again by a fresh agent rather than by the one that
+/// already made up its mind; and when the newest **held** and the member has
+/// landed again since — new code on the trunk that nobody has read.
+///
+/// # A new landing supersedes a pass still reading (`wsp-188`, wsp-176 item 2)
+///
+/// A pass that is still `running` when the member lands something new is
+/// reading a commit that is no longer the member's work. It is marked
+/// `superseded`, its seat is handed back to be ended, and a fresh pass opens on
+/// the new landing — so there is never more than one verifier on a member, and
+/// a late verdict from the old one is refused rather than read as the newest.
+///
+/// A `running` pass whose agent never arrived — no seat after
+/// [`WEDGED_AFTER`] — is taken again in place: its clock restarts so a second
+/// advance leaves it to this one. One whose seat was ended without a verdict
+/// (a run that closed over it, then resumed) is superseded like any other.
 ///
 /// # Keyed on the landing, not on `updated` (`wsp-136` item 1)
 ///
-/// This compared `member.updated > v.updated`, and **any write moves
-/// `updated`** — a governor's `wsp note`, an edit to the overview, a `wsp mv`.
-/// So saying one sentence about a member bought a whole new verifier agent: a
-/// fresh context, a fresh read of the tree, and a verdict about code nobody had
-/// touched. Three lines of note was enough, and nothing said so.
-///
-/// The key is [`crate::repair::landed`] — the commit the member's own `## Log`
-/// records its work as landed on — read off the member when the verifier row
-/// is created and off the verifier when the question is asked again. A fix
-/// changes it; a note does not.
-///
-/// **A member with no landing recorded falls back to `updated`**, and that is
-/// deliberate rather than a gap: design-only work has no repository and never
-/// will, so it has no commit to key on, and a member whose fix is prose has
-/// genuinely changed when it is touched. The landing exists wherever there is
-/// somewhere to put it.
-fn open_verifier(store: &Store, member: &Task, list: &str, at: usize, g: &Group) -> Option<String> {
+/// Any write moves `updated` — a governor's `wsp note`, an edit to the
+/// overview, a `wsp mv` — and keying on it bought a whole fresh verifier for one
+/// sentence about a member. The key is [`crate::repair::landed`], the commit the
+/// member's own `## Log` records its work as landed on, written on the pass as
+/// `read` when it opens. **A member with no landing falls back to `updated`**,
+/// deliberately: design-only work has no repository, and a member whose fix is
+/// prose has genuinely changed when it is touched. That is also why a pass's
+/// own bookkeeping never touches the member — see [`crate::verification`].
+fn open_verifier(store: &Store, member: &Task, on: &Policy) -> Option<Opened> {
+    use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::landed(member);
+    let landed_again = |read: &Option<String>| match (&now_landing, read) {
+        (Some(now), Some(then)) => !v::same_commit(now, then),
+        _ => false,
+    };
     let made = store.locked(|| {
         let tasks = store.tasks();
-        let owed = match latest_verifier(&tasks, &member.id) {
-            None => true,
-            Some(v) if v.status() == Status::Todo && wedged(v, &store.claims()) => {
-                return restart(store, v);
+        let mut m = store.find_task(&member.id)?;
+        let mut own = v::passes(&m);
+        let mut superseded = None;
+        match v::all(&tasks, &m).last() {
+            None => {}
+            // A Verify row still open is the old shape's own to finish.
+            Some(p) if p.state == State::Running && p.was.is_some() => return None,
+            Some(p) if p.state == State::Running => {
+                let i = own.len().checked_sub(1)?;
+                let gone = own[i].ending != Ending::Standing;
+                if own[i].pane.is_none() && util::epoch_secs() - util::epoch_of(&own[i].at) > WEDGED_AFTER {
+                    own[i].at = util::now_iso();
+                    v::write(&mut m, &own);
+                    store.save_task(&m).ok()?;
+                    return Some(Opened { superseded: None, again: true });
+                }
+                if !gone && !landed_again(&p.read) {
+                    return None;
+                }
+                own[i].state = State::Superseded;
+                superseded = own[i].pane.clone().filter(|_| !gone);
             }
-            Some(v) => v.status() == Status::Blocked && moved_since(&now_landing, &member.updated, v),
-        };
-        if !owed {
-            return None;
+            Some(p) if p.state == State::Holds => {
+                if !landed_again(&p.read) {
+                    return None;
+                }
+            }
+            Some(p) if p.state == State::Blocks => {
+                if !moved_since(&now_landing, &member.updated, p) {
+                    return None;
+                }
+            }
+            // The newest was superseded and nothing opened after it — a start
+            // that failed — so this is the fresh pass it was waiting for.
+            Some(_) => {}
         }
-        let id = store.alloc_task_id(member.project.as_deref()).ok()?;
-        let mut t = Task::new(&format!("Verify {}: {}", member.id, util::truncate(&member.title, 60)), &id);
-        t.project = member.project.clone();
-        t.parent = Some(member.id.clone());
-        t.tags = vec![VERIFY_TAG.to_string()];
-        t.status_raw = Status::Todo.as_str().to_string();
-        crate::model::set_section_in(&mut t.body, "Overview", &verifier_order(member, list, at, g, &id));
-        // The commit this verifier is being asked to read, on the verifier's
-        // own row: it is what the next comparison asks against, and it is what
-        // makes the key survive the member being edited.
-        if let Some(sha) = &now_landing {
-            t.log(&format!("{} {sha}", crate::repair::READING));
-        }
-        store.save_task(&t).ok()?;
-        Some(id)
+        own.push(v::Pass::opened(now_landing.clone(), Some(on.label())));
+        v::write(&mut m, &own);
+        store.save_task(&m).ok()?;
+        Some(Opened { superseded, again: false })
     })?;
-    store.git_commit(&format!("wsp: verify {} for {list} group {at}", member.id));
+    let why = match (&made.superseded, made.again) {
+        (_, true) => "again: the last start never arrived".to_string(),
+        (Some(seat), _) => format!("a new landing supersedes the pass in {seat}"),
+        (None, _) => "a pass opens".to_string(),
+    };
+    store.git_commit(&format!("wsp: verify {} — {why}", member.id));
     Some(made)
+}
+
+/// What [`open_verifier`] did: a fresh pass, or a wedged one taken again, and
+/// the seat of a pass it superseded, which is ended at once.
+struct Opened {
+    superseded: Option<String>,
+    again: bool,
 }
 
 /// Whether the member's work has moved since this verifier read it.
@@ -1020,10 +1085,10 @@ fn open_verifier(store: &Store, member: &Task, list: &str, at: usize, g: &Group)
 /// one records no commit, so there is nothing to compare against; the fallback
 /// is the old predicate rather than `true`, so the first landing after it does
 /// not itself buy a verifier for code that was never re-read.
-fn moved_since(now_landing: &Option<String>, member_updated: &str, verifier: &Task) -> bool {
-    match (now_landing, crate::repair::landed(verifier)) {
-        (Some(now), Some(then)) => now != &then,
-        _ => member_updated > verifier.updated.as_str(),
+fn moved_since(now_landing: &Option<String>, member_updated: &str, pass: &crate::verification::Pass) -> bool {
+    match (now_landing, &pass.read) {
+        (Some(now), Some(then)) => !crate::verification::same_commit(now, then),
+        _ => member_updated > pass.at.as_str(),
     }
 }
 
@@ -1126,27 +1191,49 @@ fn open_barrier(store: &Store, w: &Worklist, at: usize, g: &Group) -> Option<Str
     Some(id)
 }
 
-/// A verifier's work order, which is its row's overview: the brief every
-/// spawned agent reads already carries it, so no kind needs a second channel.
-fn verifier_order(member: &Task, list: &str, at: usize, g: &Group, me: &str) -> String {
-    let stop = match g.stop.trim() {
-        "" => String::new(),
-        s => format!("\n\nThe barrier after this group asks: {s}"),
+/// A verifier's work order: what `wsp spawn --verify` hands the agent, and
+/// what `wsp brief` shows in its seat. Composed from the member and the run it
+/// is in when it is asked, since a verifier has no row to keep it on.
+pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
+    let running = worklist::Running::read(store);
+    let list = running.list_of(&member.id).and_then(|l| store.worklist(l));
+    let placed = list.as_ref().and_then(|w| {
+        let groups = w.groups();
+        let at = groups.iter().position(|g| g.members.contains(&member.id))?;
+        Some((w.id.clone(), at + 1, groups[at].stop.trim().to_string()))
+    });
+    let (whose, stop) = match &placed {
+        Some((list, at, stop)) => (
+            format!(", a member of group {at} of the `{list}` worklist"),
+            match stop.as_str() {
+                "" => String::new(),
+                s => format!("\n\nThe barrier after this group asks: {s}"),
+            },
+        ),
+        None => (String::new(), String::new()),
     };
+    let read = crate::verification::passes(member)
+        .into_iter()
+        .rev()
+        .find(|p| p.state == crate::verification::State::Running)
+        .and_then(|p| p.read)
+        .map(|r| format!(" at {r}"))
+        .unwrap_or_default();
     format!(
-        "Verify **{m}** ({title}), a member of group {at} of the `{list}` worklist. wsp spawned \
-         you when {m} reached review and landed; nobody else is going to read this work before \
-         the barrier.\n\n\
+        "Verify **{m}** ({title}){whose}. wsp started you when {m} reached review and landed{read}; \
+         nobody else is going to read this work before the barrier.\n\n\
          **You are read-only.** Do not edit, commit, land, rebase, or change {m}'s status. \
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
          code on the trunk rather than against the report: the commits it landed, whether they \
-         do what the overview asked, and the tests that cover them where those are cheap to run.\
-         {stop}\n\n\
-         **Finish in two commands.** Write your verdict as a note on {m}, three lines — what \
-         you checked, what held, what did not — with `wsp note {m} --from FILE`. Then:\n\
-         - it holds: `wsp review {me} -` with one line saying so;\n\
-         - it does not: `wsp block {me} --from FILE`, saying what has to change.\n\n\
-         wsp takes the next step from either; there is nobody to tell.",
+         do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
+         debug for what it touched, never `wsp verify` or a release build.{stop}\n\n\
+         **Finish with one command.** Write your verdict to a file — what you checked, what held, \
+         what did not, and when it does not hold, what has to change — then:\n\
+         - it holds: `wsp verified {m} --holds --from FILE`;\n\
+         - it does not: `wsp verified {m} --blocks --from FILE`. {m} goes back to doing with \
+         your verdict as what is owed, and its governor is told.\n\n\
+         There is no row of your own: the verdict is recorded on {m} under `## Verification`, \
+         and wsp ends this seat once it is in.",
         m = member.id,
         title = util::truncate(&member.title, 80),
     )
@@ -1185,9 +1272,13 @@ enum Undo {
     /// A member wsp moved to `doing`: back to `todo`, so the next advance —
     /// or a governor's own `wsp spawn` — finds it as it was.
     Member,
-    /// A verifier or barrier row: left at `todo`, which the next advance
-    /// takes again once it is [`wedged`].
+    /// A barrier row: left at `todo`, which the next advance takes again
+    /// once it is [`wedged`].
     Row,
+    /// A pass on a member: left `running` with no seat, which the next
+    /// advance takes again once it is as old as [`WEDGED_AFTER`]. The member
+    /// is not moved — it is at `review`, and its work is finished.
+    Verifier,
 }
 
 /// Start an agent on a row, and wait for `wsp spawn` to say how it went.
@@ -1195,16 +1286,26 @@ enum Undo {
 /// tells the seat. Never silent: a run that cannot start its next agent is
 /// a run that has stopped.
 fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &str)) -> bool {
-    let failed = start(id, policy, owned);
+    let verify = matches!(undo, Undo::Verifier);
+    let failed = start(id, policy, owned, verify);
     let Some(why) = failed else { return true };
-    stamp(&format!("FAILED spawn {id}: {why}"));
+    stamp(&format!("FAILED spawn {}{id}: {why}", if verify { "a verifier on " } else { "" }));
     let saved = store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return false };
-        t.log(&format!("wsp could not spawn an agent on this: {}", util::truncate(&why, 300)));
-        if matches!(undo, Undo::Member) && t.status() == Status::Doing {
-            t.set_status(Status::Todo);
+        match undo {
+            // On the member's log and nothing else: its work is finished and
+            // its `updated` is what a landing-less re-verify is keyed on.
+            Undo::Verifier => {
+                t.log(&format!("wsp could not start a verifier on this: {}", util::truncate(&why, 300)));
+            }
+            _ => {
+                t.log(&format!("wsp could not spawn an agent on this: {}", util::truncate(&why, 300)));
+                if matches!(undo, Undo::Member) && t.status() == Status::Doing {
+                    t.set_status(Status::Todo);
+                }
+                t.touch();
+            }
         }
-        t.touch();
         store.save_task(&t).is_ok()
     });
     if saved {
@@ -1214,12 +1315,13 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
 }
 
 /// `wsp spawn <id> --agent …`, and its refusal if it refused.
-fn start(id: &str, policy: &Policy, owned: (&str, &str)) -> Option<String> {
+fn start(id: &str, policy: &Policy, owned: (&str, &str), verify: bool) -> Option<String> {
     // A test's binary is the harness: record what would have started instead.
     if cfg!(test) {
         #[cfg(test)]
         return tests::SPAWNED.with(|s| {
-            s.borrow_mut().push((id.to_string(), policy.kind.clone()));
+            let id = if verify { crate::verification::seat_label(id) } else { id.to_string() };
+            s.borrow_mut().push((id, policy.kind.clone()));
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
@@ -1228,6 +1330,9 @@ fn start(id: &str, policy: &Policy, owned: (&str, &str)) -> Option<String> {
         Err(e) => return Some(e.to_string()),
     };
     let mut argv: Vec<String> = vec!["spawn".into(), id.into(), "--agent".into()];
+    if verify {
+        argv.push("--verify".into());
+    }
     argv.extend(policy.spawn_flags());
     stamp(&format!("spawn {}", argv[1..].join(" ")));
     let child = Command::new(exe)
@@ -1310,6 +1415,9 @@ pub(crate) fn end_group(store: &Store, w: &Worklist, passed: usize) {
     ids.sort();
     ids.dedup();
     end_all(store, ids);
+    for m in &g.members {
+        end_passes(store, m, |_| true);
+    }
 }
 
 /// The rows the run opened that the group text does not name: a governor's
@@ -1468,8 +1576,21 @@ pub(crate) fn end_what_the_run_opened(store: &Store, list: &str, at: Option<usiz
     }
     ids.sort();
     ids.dedup();
+    // The passes on those members, whose seats are not claims and so are not
+    // in `standing` below — ended here, each once, verdict or not.
+    let members: Vec<String> = match at {
+        None => w.groups().iter().flat_map(|g| g.members.clone()).collect(),
+        Some(at) => w.groups().get(at - 1).map(|g| g.members.clone()).unwrap_or_default(),
+    };
+    let mut passes_ended: Vec<String> = Vec::new();
+    for m in &members {
+        passes_ended.extend(end_passes(store, m, |_| true));
+    }
     let claims = store.claims();
     let standing: Vec<String> = ids.iter().filter(|id| claims.contains_key(*id)).cloned().collect();
+    if !passes_ended.is_empty() {
+        stamp(&format!("{list} is closing — ended the verifier seat(s) {}", passes_ended.join(" ")));
+    }
     if standing.is_empty() {
         return;
     }
@@ -1536,6 +1657,98 @@ pub(crate) fn verdicts_recorded(store: &Store) -> Vec<String> {
         .filter(|t| t.parent.as_deref().and_then(|p| store.find_task(p)).is_some_and(|m| open(&m.id)))
         .map(|t| t.id.clone())
         .collect()
+}
+
+/// Every pass that has its verdict, or was superseded, and whose seat wsp has
+/// not ended — on any member, whatever its list is doing. The tick's half of
+/// [`end_passes`].
+///
+/// **Ended on a tick rather than on the verdict**, for [`verdicts_recorded`]'s
+/// reason: `wsp verified` is the agent's own last turn, and ending it inside
+/// that turn cuts it short. A tick later it has long been idle, and the entry
+/// is the record that it has not been ended yet.
+pub(crate) fn passes_finished(store: &Store) -> Vec<String> {
+    use crate::verification::{passes, State};
+    let mut out = Vec::new();
+    for t in store.tasks().iter().filter(|t| t.body.contains("## Verification")) {
+        let done = passes(t).iter().any(|p| p.standing() && p.state != State::Running);
+        if done {
+            out.extend(end_passes(store, &t.id, |p| p.state != State::Running));
+        }
+    }
+    out
+}
+
+/// End the seats of a member's passes that `which` picks, **once each**.
+///
+/// The outcome is written on the pass before anything else can ask again:
+/// `ended`, or `end failed: …`. A failure is said in `cycle.log` and told to
+/// the run's governor, and it is not retried — wsp-176 item 1, a verifier
+/// whose despawn failed was tried again every tick, each attempt a line and
+/// none of them a different answer. A seat that will not end is a person's to
+/// look at, and the entry is where they find which one.
+///
+/// Returns the seats it ended.
+pub(crate) fn end_passes(store: &Store, member: &str, which: impl Fn(&crate::verification::Pass) -> bool) -> Vec<String> {
+    use crate::verification::{passes, write, Ending};
+    let Some(t) = store.find_task(member) else { return Vec::new() };
+    let due: Vec<_> = passes(&t).into_iter().filter(|p| p.standing() && which(p)).collect();
+    let mut ended = Vec::new();
+    for p in due {
+        let Some(seat) = p.pane.clone() else { continue };
+        let outcome = despawn_seat(&seat);
+        let ending = match &outcome {
+            Ok(()) => Ending::Ended,
+            Err(why) => Ending::Failed(why.clone()),
+        };
+        let wrote = store.locked(|| {
+            let Some(mut t) = store.find_task(member) else { return false };
+            let mut ps = passes(&t);
+            let Some(q) = ps.iter_mut().find(|q| q.at == p.at && q.pane == p.pane) else { return false };
+            q.ending = ending.clone();
+            write(&mut t, &ps);
+            store.save_task(&t).is_ok()
+        });
+        if wrote {
+            store.git_commit(&format!("wsp: {member}'s verifier in {seat} {}", if outcome.is_ok() { "ended" } else { "would not end" }));
+        }
+        match outcome {
+            Ok(()) => {
+                stamp(&format!("ended {seat}, which verified {member} ({})", p.state.as_str()));
+                ended.push(seat);
+            }
+            Err(why) => {
+                stamp(&format!("could not end {seat}, which verified {member}: {why} — not tried again"));
+                let list = store.find_task(member).and_then(|t| list_of(store, &t));
+                if let Some(w) = list {
+                    tell(store, &w, &format!(
+                        "wsp could not end the verifier of {member} in {seat}: {}. It is not tried again — \
+                         `wsp despawn --pane {seat}` if it is still standing.",
+                        util::truncate(&why, 200)
+                    ));
+                }
+            }
+        }
+    }
+    ended
+}
+
+/// `wsp despawn --pane <seat>`, as a process — a verifier holds no claim, so
+/// its seat is the only handle there is.
+fn despawn_seat(seat: &str) -> Result<(), String> {
+    if cfg!(test) {
+        #[cfg(test)]
+        return tests::ENDED.with(|s| {
+            s.borrow_mut().push(seat.to_string());
+            tests::END_FAIL.with(|f| f.borrow().clone()).map_or(Ok(()), Err)
+        });
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out = Command::new(exe).args(["despawn", "--pane", seat]).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
 }
 
 /// `wsp despawn <id>`, as a process, for the same reason every other spawn is:
@@ -1831,6 +2044,8 @@ pub(crate) mod tests {
         pub(crate) static ROTATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// Set, and every verifier seat this thread ends fails with it.
+        pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// What `cycle.log` was told this thread, in order.
         pub(crate) static SAID: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).
@@ -1888,6 +2103,34 @@ pub(crate) mod tests {
         store.tasks().into_iter().filter(|t| t.tags.iter().any(|g| g == tag)).collect()
     }
 
+    /// The members with a pass still reading: what a Verify row in `todo` used
+    /// to be (`wsp-188`).
+    fn reading(store: &Store) -> Vec<String> {
+        store
+            .tasks()
+            .iter()
+            .filter(|t| crate::verification::passes(t).last().is_some_and(|p| p.state == crate::verification::State::Running))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    fn passes_on(store: &Store, id: &str) -> Vec<crate::verification::Pass> {
+        crate::verification::passes(&store.find_task(id).unwrap())
+    }
+
+    /// Every pass still reading gets its verdict, the way `wsp verified` writes
+    /// it from the verifier's own seat.
+    fn verdict_all(store: &Store, state: crate::verification::State) {
+        for m in reading(store) {
+            let pane = passes_on(store, &m).last().and_then(|p| p.pane.clone());
+            crate::verification::record(store, &m, state, "checked it on the trunk", pane.as_deref()).unwrap();
+        }
+    }
+
+    fn hold_all(store: &Store) {
+        verdict_all(store, crate::verification::State::Holds)
+    }
+
     /// The whole chain, one step at a time, and each step taken once however
     /// often it is asked: the run advances off the store, not off a memory of
     /// what was done.
@@ -1910,22 +2153,21 @@ pub(crate) mod tests {
 
         set(&store, "m-1", Status::Review);
         step(&store, &w, &Blind);
-        let v = tagged(&store, VERIFY_TAG);
-        assert_eq!(v.len(), 1, "one verifier, for the member that finished");
-        assert_eq!(v[0].parent.as_deref(), Some("m-1"));
-        assert!(v[0].section("Overview").unwrap().contains("read-only"), "its order is its overview");
-        assert_eq!(spawned(), vec![(v[0].id.clone(), "opencode".into())], "on the same policy: the floor holds");
+        assert_eq!(reading(&store), vec!["m-1".to_string()], "one pass, on the member that finished");
+        assert!(tagged(&store, VERIFY_TAG).is_empty(), "and no row for it: the pass is on the member (wsp-188)");
+        assert_eq!(passes_on(&store, "m-1")[0].on.as_deref(), Some("opencode some/model"), "what it runs on, recorded");
+        let order = verifier_order(&store, &store.find_task("m-1").unwrap());
+        assert!(order.contains("read-only") && order.contains("wsp verified m-1 --holds --from FILE"), "{order}");
+        assert_eq!(spawned(), vec![("m-1 · verifying".into(), "opencode".into())], "on the same policy: the floor holds");
         step(&store, &w, &Blind);
-        assert!(spawned().is_empty() && tagged(&store, VERIFY_TAG).len() == 1, "and only once");
+        assert!(spawned().is_empty() && passes_on(&store, "m-1").len() == 1, "and only once");
 
         set(&store, "m-2", Status::Review);
         step(&store, &w, &Blind);
         let _ = spawned();
         assert!(tagged(&store, BARRIER_TAG).is_empty(), "no barrier check while a verdict is outstanding");
 
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         step(&store, &w, &Blind);
         let b = tagged(&store, BARRIER_TAG);
         assert_eq!(b.len(), 1, "every member verified: one barrier check");
@@ -1962,7 +2204,7 @@ pub(crate) mod tests {
         step(&store, &w, &Blind);
         let by_parent: Vec<(String, String)> = spawned()
             .into_iter()
-            .map(|(id, kind)| (store.find_task(&id).unwrap().parent.unwrap(), kind))
+            .map(|(id, kind)| (id.strip_suffix(" · verifying").unwrap().to_string(), kind))
             .collect();
         assert_eq!(
             by_parent,
@@ -1970,9 +2212,7 @@ pub(crate) mod tests {
             "a verifier runs on the kind its member's work ran on"
         );
 
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         step(&store, &w, &Blind);
         assert_eq!(
             spawned(),
@@ -1989,15 +2229,17 @@ pub(crate) mod tests {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        let first = tagged(&store, VERIFY_TAG).remove(0);
-        set(&store, &first.id, Status::Blocked);
+        verdict_all(&store, crate::verification::State::Blocks);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "a block sends the member back");
         step(&store, &w, &Blind);
-        assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "blocked, and nothing new until the member moves");
+        assert_eq!(passes_on(&store, "m-1").len(), 1, "blocked, and nothing new until the member moves");
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         set(&store, "m-1", Status::Review);
         step(&store, &w, &Blind);
-        assert_eq!(tagged(&store, VERIFY_TAG).len(), 2, "the fix is verified again");
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.len(), 2, "the fix is verified again");
+        assert_eq!(ps[0].state, crate::verification::State::Blocks, "and the block stays on the record beneath it");
         let _ = spawned();
     }
 
@@ -2063,9 +2305,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-2", Status::Review);
         let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         let _ = spawned();
         for m in ["m-1", "m-2"] {
             store.set_claim(m, serde_json::json!({ "workspace": "w" }));
@@ -2096,9 +2336,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         let _ = spawned();
         store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
         store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
@@ -2138,9 +2376,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         let _ = spawned();
         store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
         store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
@@ -2167,9 +2403,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         let _ = spawned();
         store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
         store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
@@ -2198,9 +2432,7 @@ fn only_a_working_screen_is_ever_overruled() {
             task(&store, "m-1", Status::Review);
             let w = list(&store, &[(&["m-1"], "claude")]);
             step(&store, &w, &Blind);
-            for v in tagged(&store, VERIFY_TAG) {
-                set(&store, &v.id, Status::Review);
-            }
+            hold_all(&store);
             let _ = spawned();
             if claim {
                 store.set_claim("m-1", serde_json::json!({ "workspace": "w" }));
@@ -2244,9 +2476,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         let _ = spawned();
 
         // Sent back after its verdict was in, before the barrier opened.
@@ -2270,9 +2500,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         step(&store, &w, &Blind);
         let check = tagged(&store, BARRIER_TAG).remove(0);
         let _ = spawned();
@@ -2312,9 +2540,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         let _ = spawned();
         // Written by hand rather than by a step, because the reopen stops the
         // barrier from opening — which is the point being tested on the other
@@ -2405,57 +2631,67 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// `wsp-158` item 1, and the commonest of the four leaks. A verifier's turn
-    /// ends with its own verdict — a note on the member and then a review of its
-    /// own row — and it was then left sitting there holding a claim for the rest
-    /// of the night. Measured on `wsp-process`: wsp-157 idle at review in
+    /// ends with its own verdict, and it was then left sitting there for the
+    /// rest of the night. Measured on `wsp-process`: wsp-157 idle at review in
     /// cpd-246, hours after recording it.
     ///
     /// **Ended on a tick rather than on the verdict**, because the verb recording
     /// the verdict *is* the agent's last turn and ending it inside that turn cuts
-    /// it short. A re-verify is a fresh agent anyway, so nothing is lost.
+    /// it short. **And ended once** (`wsp-188`, wsp-176 item 1): the pass records
+    /// that it was, and the next tick finds nothing to do.
     #[test]
-    fn a_verifier_whose_verdict_is_recorded_is_ended_by_a_tick() {
+    fn a_verifier_whose_verdict_is_recorded_is_ended_by_a_tick_and_only_once() {
         use crate::repair::Pass;
+        use crate::verification::{Ending, State as V};
 
         let (_env, store) = scratch("verdicted");
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        let v = tagged(&store, VERIFY_TAG).remove(0);
         let _ = spawned();
+        assert!(crate::verification::name_seat(&store, "m-1", "cpd-9"), "what `spawn --verify` writes");
 
-        set(&store, &v.id, Status::Review);
-        store.set_claim(&v.id, serde_json::json!({ "workspace": "w" }));
         crate::repair::tick(&store, &Blind, &mut Pass::new());
-        assert_eq!(
-            tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
-            vec![v.id.clone()],
-            "a verdict is the last thing a verifier is asked for"
-        );
+        assert!(drained(&ENDED).is_empty(), "a verifier still reading is not ended by a tick");
 
+        crate::verification::record(&store, "m-1", V::Holds, "it holds", Some("cpd-9")).unwrap();
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "a verdict is the last thing a verifier is asked for");
+        assert_eq!(passes_on(&store, "m-1")[0].ending, Ending::Ended, "and the pass says so");
+
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        assert!(drained(&ENDED).is_empty(), "ended once: the next tick finds nothing standing");
     }
 
     /// The other verdict. A verifier that blocked has said what has to change;
     /// its job is finished either way, and it is the member's agent who does the
-    /// changing.
+    /// changing. **And a seat that will not end is said once and left**: the
+    /// failure is on the pass and with the governor, and no tick tries again.
     #[test]
-    fn a_verifier_that_blocked_is_ended_by_a_tick_too() {
+    fn a_verifier_that_blocked_is_ended_by_a_tick_and_a_failed_ending_is_told_once_and_not_retried() {
         use crate::repair::Pass;
+        use crate::verification::{Ending, State as V};
 
         let (_env, store) = scratch("verdictblocked");
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        let b = tagged(&store, VERIFY_TAG).remove(0);
         let _ = spawned();
-        set(&store, &b.id, Status::Blocked);
-        store.set_claim(&b.id, serde_json::json!({ "workspace": "w" }));
+        crate::verification::name_seat(&store, "m-1", "cpd-9");
+        crate::verification::record(&store, "m-1", V::Blocks, "the second half does not hold", Some("cpd-9")).unwrap();
+        let _ = drained(&TOLD);
+
+        END_FAIL.with(|f| *f.borrow_mut() = Some("cpd-9 is still standing: no answer".into()));
         crate::repair::tick(&store, &Blind, &mut Pass::new());
-        assert_eq!(
-            tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>()),
-            vec![b.id],
-            "having said what has to change is the end of its job"
-        );
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "having said what has to change is the end of its job");
+        assert!(matches!(&passes_on(&store, "m-1")[0].ending, Ending::Failed(why) if why.contains("no answer")));
+        let told = drained(&TOLD);
+        assert_eq!(told.iter().filter(|t| t.contains("could not end the verifier of m-1")).count(), 1, "{told:?}");
+
+        crate::repair::tick(&store, &Blind, &mut Pass::new());
+        END_FAIL.with(|f| *f.borrow_mut() = None);
+        assert!(drained(&ENDED).is_empty(), "a failed ending is not tried again every tick");
+        assert!(!drained(&TOLD).iter().any(|t| t.contains("could not end")), "nor told again");
     }
 
     /// `wsp-158` item 2, and the one nothing could find. A governor spawns a
@@ -2473,9 +2709,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        for v in tagged(&store, VERIFY_TAG) {
-            set(&store, &v.id, Status::Review);
-        }
+        hold_all(&store);
         let _ = spawned();
         // The helper, spawned while group 1 was going and never named by it.
         let mut helper = Task::new("Install master and drive delivery live", "h-1");
@@ -2508,7 +2742,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        let v = tagged(&store, VERIFY_TAG).remove(0);
+        crate::verification::name_seat(&store, "m-1", "cpd-9");
         let _ = spawned();
         let mut check = Task::new(&barrier_title("run", 1), "b-1");
         check.tags = vec![BARRIER_TAG.into()];
@@ -2517,7 +2751,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let mut helper = Task::new("Install master", "h-1");
         helper.log(&format!("{} run group 1", OWNED));
         store.save_task(&helper).unwrap();
-        for id in ["m-1", &v.id, &check.id, "h-1"] {
+        for id in ["m-1", &check.id, "h-1"] {
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
         let _ = drained(&TOLD);
@@ -2525,9 +2759,10 @@ fn only_a_working_screen_is_ever_overruled() {
         end_what_the_run_opened(&store, "run", Some(1));
         let mut was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
         was.sort();
-        let mut expected = vec!["b-1".to_string(), "h-1".to_string(), "m-1".to_string(), v.id];
+        let mut expected = vec!["b-1".to_string(), "h-1".to_string(), "m-1".to_string(), "cpd-9".to_string()];
         expected.sort();
-        assert_eq!(was, expected, "a member, a verifier, the barrier check and a helper: nothing the group opened");
+        assert_eq!(was, expected, "a member, a verifier's seat, the barrier check and a helper: nothing the group opened");
+        assert_eq!(passes_on(&store, "m-1")[0].ending, crate::verification::Ending::Ended, "and the pass records it");
         assert!(
             drained(&TOLD).iter().any(|t| t.contains("had nothing left to do")),
             "and the seat is told, because ending an agent on work somebody may return to is not done quietly"
@@ -2543,6 +2778,7 @@ fn only_a_working_screen_is_ever_overruled() {
     /// test runs both halves: a note changes nothing, a new landing does.
     #[test]
     fn a_note_on_a_member_does_not_buy_a_fresh_verifier_and_a_new_landing_does() {
+        use crate::verification::State as V;
         let (_env, store) = scratch("note");
         task(&store, "m-1", Status::Review);
         let mut m = store.find_task("m-1").unwrap();
@@ -2550,9 +2786,9 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&m).unwrap();
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        let first = tagged(&store, VERIFY_TAG).remove(0);
-        assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "the first verifier, which read abc1234");
-        set(&store, &first.id, Status::Blocked);
+        assert_eq!(passes_on(&store, "m-1")[0].read.as_deref(), Some("abc1234"), "the first pass, which read abc1234");
+        verdict_all(&store, V::Blocks);
+        set(&store, "m-1", Status::Review);
 
         step(&store, &w, &Blind);
         let mut m = store.find_task("m-1").unwrap();
@@ -2561,23 +2797,59 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&m).unwrap();
         step(&store, &w, &Blind);
         assert_eq!(
-            tagged(&store, VERIFY_TAG).len(),
+            passes_on(&store, "m-1").len(),
             1,
-            "a note moved `updated` and nothing else: still the same work, still one verifier"
+            "a note moved `updated` and nothing else: still the same work, still one pass"
         );
 
         // The member comes back with a fix, which is a new commit on the trunk.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         let mut m = store.find_task("m-1").unwrap();
         m.log(&format!("{} def5678 on master", crate::repair::LANDED));
         store.save_task(&m).unwrap();
         step(&store, &w, &Blind);
-        assert_eq!(
-            tagged(&store, VERIFY_TAG).len(),
-            2,
-            "a new landing is new work, and a fresh agent reads it"
-        );
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.len(), 2, "a new landing is new work, and a fresh agent reads it");
+        assert_eq!(ps[1].read.as_deref(), Some("def5678"));
         let _ = spawned();
+    }
+
+    /// `wsp-188`, and wsp-176 item 2. **A second landing supersedes the verifier
+    /// still reading the first**: its seat is ended at once, its pass stays on
+    /// the record marked superseded, a fresh pass reads the new commit — and a
+    /// verdict the old one sends afterwards is refused rather than read as the
+    /// newest.
+    #[test]
+    fn a_second_landing_supersedes_the_verifier_still_reading_the_first() {
+        use crate::verification::State as V;
+        let (_env, store) = scratch("supersede");
+        task(&store, "m-1", Status::Review);
+        let mut m = store.find_task("m-1").unwrap();
+        m.log(&format!("{} abc1234 on master", crate::repair::LANDED));
+        store.save_task(&m).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        crate::verification::name_seat(&store, "m-1", "cpd-1");
+        assert_eq!(drained(&SPAWNED).len(), 1);
+
+        step(&store, &w, &Blind);
+        assert!(drained(&SPAWNED).is_empty() && drained(&ENDED).is_empty(), "the same landing: one pass, left reading");
+
+        let mut m = store.find_task("m-1").unwrap();
+        m.log(&format!("{} def5678 on master", crate::repair::LANDED));
+        store.save_task(&m).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(drained(&ENDED), vec!["cpd-1".to_string()], "the verifier reading the old commit is ended at once");
+        assert_eq!(drained(&SPAWNED), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and a fresh one starts");
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
+        assert_eq!(ps[1].read.as_deref(), Some("def5678"));
+
+        let late = crate::verification::record(&store, "m-1", V::Holds, "abc1234 holds", Some("cpd-1"));
+        assert!(late.unwrap_err().contains("superseded"), "a verdict on the old commit is refused");
+        assert!(!verified(&store.tasks(), "m-1"), "and the barrier still waits on the fresh pass");
+        crate::verification::name_seat(&store, "m-1", "cpd-2");
+        crate::verification::record(&store, "m-1", V::Holds, "def5678 holds", Some("cpd-2")).unwrap();
+        assert!(verified(&store.tasks(), "m-1"), "the newest pass is what the barrier reads");
     }
 
     /// `wsp-136` item 2. A `hold` leaves the barrier row **settled** — the
@@ -2597,7 +2869,7 @@ fn only_a_working_screen_is_ever_overruled() {
         // A barrier opens on every member's *verdict*, so settle this one first
         // — the group is otherwise still waiting on the verifier, not on the
         // barrier, and this test is about the barrier.
-        set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
+        hold_all(&store);
         step(&store, &w, &Blind);
         assert_eq!(tagged(&store, BARRIER_TAG).len(), 1, "the first check");
         let first = tagged(&store, BARRIER_TAG).remove(0);
@@ -2637,7 +2909,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
+        hold_all(&store);
         step(&store, &w, &Blind);
         let only = tagged(&store, BARRIER_TAG).remove(0);
         let _ = spawned();
@@ -2669,7 +2941,7 @@ fn only_a_working_screen_is_ever_overruled() {
         task(&store, "m-1", Status::Review);
         let mut w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        set(&store, &tagged(&store, VERIFY_TAG)[0].id, Status::Review);
+        hold_all(&store);
         step(&store, &w, &Blind);
         let check = tagged(&store, BARRIER_TAG).remove(0);
         let _ = spawned();
@@ -2877,33 +3149,82 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert_eq!(spawned().len(), 1, "a start that never claimed it is taken again");
 
-        // And a verifier row whose agent never came.
+        // And a pass whose agent never came: no seat on it, ten minutes on.
         set(&store, "m-1", Status::Review);
         step(&store, &w, &Blind);
         let _ = spawned();
-        let mut v = tagged(&store, VERIFY_TAG).remove(0);
         step(&store, &w, &Blind);
         assert!(spawned().is_empty());
-        v.updated = "2026-01-01T00:00:00Z".into();
-        store.save_task(&v).unwrap();
+        let mut m = store.find_task("m-1").unwrap();
+        let mut ps = crate::verification::passes(&m);
+        ps[0].at = "2026-01-01T00:00:00Z".into();
+        crate::verification::write(&mut m, &ps);
+        store.save_task(&m).unwrap();
         step(&store, &w, &Blind);
-        assert_eq!(spawned(), vec![(v.id.clone(), "claude".into())], "the same row, started again");
-        assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "and not a second one");
+        assert_eq!(spawned(), vec![("m-1 · verifying".into(), "claude".into())], "the same pass, started again");
+        assert_eq!(passes_on(&store, "m-1").len(), 1, "and not a second one");
     }
 
     #[test]
-    fn a_verifier_and_a_barrier_row_find_the_run_they_belong_to() {
+    fn a_barrier_row_finds_the_run_it_belongs_to() {
         let (_env, store) = scratch("belong");
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
         step(&store, &w, &Blind);
-        let v = tagged(&store, VERIFY_TAG).remove(0);
-        assert_eq!(list_of(&store, &v).map(|w| w.id), Some("run".into()));
-        set(&store, &v.id, Status::Review);
+        hold_all(&store);
         step(&store, &w, &Blind);
         let b = tagged(&store, BARRIER_TAG).remove(0);
         assert_eq!(list_of(&store, &b).map(|w| w.id), Some("run".into()));
         let _ = spawned();
+    }
+
+    /// `wsp-188`. A verdict that holds leaves the member at `review` and tells
+    /// nobody; one that blocks sends the member back the way `wsp reopen` does —
+    /// its pane told, the reason on its log — and is typed to the governor
+    /// **once**, as the decision it is. The verb triggers one advance, and the
+    /// steps and ticks after it read the block without saying it again.
+    #[test]
+    fn a_holds_verdict_stays_at_review_and_a_block_sends_the_member_back_and_reaches_the_governor_once() {
+        use crate::verification::State as V;
+        let (_env, store) = scratch("verdicts");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Review);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-2" }));
+        let _ = drained(&TOLD);
+
+        crate::verification::record(&store, "m-1", V::Holds, "both halves hold", None).unwrap();
+        told_about_task(&store, "m-1", "verified");
+        let m1 = store.find_task("m-1").unwrap();
+        assert_eq!(m1.status(), Status::Review, "a holds verdict leaves the member where it is");
+        assert!(m1.section("Verification").unwrap().contains("holds"), "{}", m1.body);
+        assert!(m1.section("Verification").unwrap().contains("both halves hold"), "and in the verifier's words");
+        assert!(drained(&TOLD).is_empty(), "and is nobody's news");
+
+        let verdict = "the second half does not hold\n1. wake::say must spool first";
+        crate::verification::record(&store, "m-2", V::Blocks, verdict, None).unwrap();
+        crate::cmd_task::deliver_reason(&store, "m-2", verdict);
+        told_about_task(&store, "m-2", "verified");
+        let m2 = store.find_task("m-2").unwrap();
+        assert_eq!(m2.status(), Status::Doing, "a block sends the member back");
+        assert!(m2.section("Log").unwrap().contains(SENT_BACK), "with what is owed on its log, as reopen writes it");
+        assert!(
+            m2.section("Verification").unwrap().contains("  1. wake::say must spool first"),
+            "and the whole verdict, with its structure, on the row: {}",
+            m2.body
+        );
+        let member_told = drained(&MEMBER_TOLD);
+        assert!(member_told.iter().any(|(id, t)| id == "m-2" && t.contains("does not hold")), "{member_told:?}");
+        let told = drained(&TOLD);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("m-2") && told[0].contains("sent back"), "{}", told[0]);
+
+        step(&store, &w, &Blind);
+        crate::repair::tick(&store, &Blind, &mut crate::repair::Pass::new());
+        assert!(!drained(&TOLD).iter().any(|t| t.contains("sent back")), "told once, not on every pass after");
+        assert!(tagged(&store, VERIFY_TAG).is_empty(), "and no row was filed for either verdict");
     }
 
     /// `wsp-142`: tokenhub-003 went to review with its commit on its branch,
@@ -2945,7 +3266,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
         told_about_task(&store, "m-1", "review");
         step(&store, &w, &Blind);
-        assert!(spawned().is_empty() && tagged(&store, VERIFY_TAG).is_empty(), "no verifier on unlanded work");
+        assert!(spawned().is_empty() && reading(&store).is_empty(), "no verifier on unlanded work");
         let told = drained(&TOLD);
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(told[0].contains("m-1 is at review with 1 commit not on master"), "{}", told[0]);
@@ -2954,7 +3275,7 @@ fn only_a_working_screen_is_ever_overruled() {
         git(&["merge", "--ff-only", "--quiet", "m-1"]);
         told_about_task(&store, "m-1", "review");
         step(&store, &w, &Blind);
-        assert_eq!(tagged(&store, VERIFY_TAG).len(), 1, "landed: the verifier starts");
+        assert_eq!(reading(&store), vec!["m-1".to_string()], "landed: the verifier starts");
         assert!(drained(&TOLD).is_empty(), "and a landed review is the next step, not news");
         let _ = spawned();
     }

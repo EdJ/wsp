@@ -554,7 +554,8 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              of a worklist group that has an `agent:` line: it spawns the members, a read-only \
              verifier on each as it lands, and an agent that checks the barrier and passes or \
              holds it; then it starts the next group and seats your successor. You are told \
-             when something needs a decision: a member or a verifier blocked, a barrier held, a \
+             when something needs a decision: a member blocked, a member its verifier sent back \
+             (the verdict is on the member under ## Verification), a barrier held, a \
              barrier passed. Your job is those decisions and the record: answer what somebody \
              is blocked on, write the direction an arriving agent needs and no more, and keep \
              decisions and corrections on the rows rather than in this conversation. Do not \
@@ -1898,6 +1899,21 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
     };
 
+    // A verifier (`wsp-188`): an agent on a member that holds no claim and
+    // has no row, recorded on the member's open pass instead. Never with
+    // `--govern` — a verifier spawn must not come near governors.json, and the
+    // two together would be an agent told it is the custodian of the work it
+    // is checking.
+    let verifying = args.has("verify");
+    if verifying && (args.has("govern") || work.task.is_none() || !args.has("agent")) {
+        eprintln!("wsp: --verify starts a verifier on a member: `wsp spawn <member> --agent --verify`, never with --govern");
+        return 2;
+    }
+    let work = match verifying {
+        true => Work { label: crate::verification::seat_label(work.task.as_deref().unwrap_or_default()), ..work },
+        false => work,
+    };
+
     // A slot is on a project, so `--govern` on a task is a sentence with no
     // meaning rather than a near miss — and the near miss it would otherwise
     // become is the expensive one: an agent claimed onto a task and told it is
@@ -1986,6 +2002,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let subject = work
         .task
         .clone()
+        .map(|t| if verifying { format!("{t}-verify") } else { t })
         .or_else(|| work.list.clone())
         .or_else(|| work.project.clone())
         .unwrap_or_default();
@@ -2024,6 +2041,11 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // what you would have opened by hand, and closing something that already
     // has a shell in it to tidy up after a refusal is a worse trade.
     let claimed = match &work.task {
+        // No claim: the member's own claim is its agent's, and a verifier is
+        // somebody else. The pass is the record, and it gets the seat now —
+        // before the agent starts, because the brief it reads at start-up
+        // finds it by this seat.
+        Some(t) if verifying => crate::verification::name_seat(store, t, seat.as_str()),
         Some(t) => {
             // The seat, under the name the claim still calls it. `claim --pane`
             // is `cmd_agent`'s vocabulary and migrating it is its own task; the
@@ -2066,7 +2088,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         None => false,
     };
     if work.task.is_some() && !claimed {
-        eprintln!("wsp: opened {seat} — but the claim was refused, so no agent was started");
+        match verifying {
+            true => eprintln!(
+                "wsp: opened {seat} — but no pass is open on {} to verify, so no agent was started; \
+                 `wsp worklist advance` opens one when it is owed",
+                work.task.as_deref().unwrap_or_default()
+            ),
+            false => eprintln!("wsp: opened {seat} — but the claim was refused, so no agent was started"),
+        }
         return 1;
     }
 
@@ -2137,6 +2166,12 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             _ => Laid::Elsewhere,
         };
         let order = match (&work.task, &governing) {
+            // The whole order, folded to one line: it is self-contained, so a
+            // kind with an empty context needs no second fetch, and one line is
+            // what a kind taking its order in argv can carry at all.
+            (Some(t), _) if verifying => {
+                store.find_task(t).map(|m| crate::cmd_task::fold(&crate::cycle::verifier_order(store, &m)))
+            }
             (Some(t), _) => Some(format!(
                 "{}{}",
                 handover(t, Handover::Spawned, route(how, laid)),
@@ -3631,6 +3666,11 @@ fn end_work(
     // benefit of none.
     for subject in task.iter().map(String::as_str).chain(held.iter().map(String::as_str)) {
         let _ = std::fs::remove_file(brief_path(store, subject));
+    }
+    // A verifier's, named after the member it verified (`wsp-188`): the seat
+    // holds no task, so the line above never names it.
+    if let Some(member) = crate::verification::seats(&store.tasks()).get(seat.as_str()) {
+        let _ = std::fs::remove_file(brief_path(store, &format!("{member}-verify")));
     }
 
     // Last, and only now: the tree is the one step a person can still do by
@@ -5636,6 +5676,64 @@ mod tests {
         assert_eq!(claim["workspace_id"], json!("w9:p1"), "no room, so `worklist next` says it did not record");
         assert_eq!(claim["agent_kind"], json!("opencode"), "the kind waited on a census that never comes");
         assert_eq!(store.bindings()["w9:p1"]["agent_kind"], json!("opencode"));
+    }
+
+    /// `wsp-188`. A run's verifier is started on the member with `--verify`
+    /// and holds nothing: no claim — the member's claim is its own agent's —
+    /// and no slot, so governors.json is exactly what it was. Its seat goes on
+    /// the member's open pass before the agent starts, which is how its brief
+    /// and `wsp wip` know what it is; its order names the one verb it finishes
+    /// with, on one line, because an argv kind can carry nothing longer.
+    #[test]
+    fn a_verifier_spawn_claims_nothing_writes_its_seat_on_the_pass_and_leaves_the_seats_alone() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("verify");
+        let mut m = crate::model::Task::new("a member", "t-1");
+        m.project = Some("core".into());
+        m.status_raw = crate::model::Status::Review.as_str().into();
+        crate::verification::write(&mut m, &[crate::verification::Pass::opened(Some("abc1234".into()), Some("opencode".into()))]);
+        store.save_task(&m).unwrap();
+        store.set_governor("core", json!({ "workspace": "w1", "pane": "w1:p1" }));
+        let governors = std::fs::read_to_string(store.state.join("governors.json")).unwrap();
+
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("verify", "true"), ("kind", "opencode"), ("no-tree", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags)), 0);
+
+        assert!(store.claims().is_empty(), "a verifier claims nothing");
+        assert!(store.bindings().is_empty(), "and binds nothing: the pass is the record");
+        let ps = crate::verification::passes(&store.find_task("t-1").unwrap());
+        assert_eq!(ps[0].pane.as_deref(), Some("w9:p1"), "its seat is on the pass");
+        assert_eq!(store.find_task("t-1").unwrap().status(), crate::model::Status::Review, "the member is not moved");
+        assert_eq!(
+            std::fs::read_to_string(store.state.join("governors.json")).unwrap(),
+            governors,
+            "governors.json untouched by a verifier spawn"
+        );
+        let opened = place.1.borrow().first().cloned().expect("no seat was opened");
+        assert_eq!(opened.label, "t-1 · verifying", "named against its member");
+        let order = place.0.borrow().first().cloned().expect("nothing was started")
+            .args
+            .windows(2)
+            .find(|w| w[0] == "--prompt")
+            .map(|w| w[1].clone())
+            .expect("no work order in the argv");
+        assert!(order.contains("wsp verified t-1 --holds --from FILE") && order.contains("read-only"), "{order}");
+        assert!(order.contains("at abc1234"), "and the commit it is to read: {order}");
+        assert!(!order.contains('\n'), "{order:?}");
+
+        // And it refuses the one combination that would touch a seat.
+        let govern = [("agent", "true"), ("verify", "true"), ("govern", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &govern)), 2);
+        // With no pass open there is nothing to verify, and no agent is started.
+        let mut m = store.find_task("t-1").unwrap();
+        crate::verification::write(&mut m, &[]);
+        store.save_task(&m).unwrap();
+        let started = place.0.borrow().len();
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags)), 1);
+        assert_eq!(place.0.borrow().len(), started, "no pass, no agent");
     }
 
     /// The whole of robustness-010, at the one line where it happens.

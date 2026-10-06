@@ -1554,6 +1554,21 @@ impl Policy {
     }
 
     /// The flags `wsp spawn` takes for this policy, after `--agent`.
+    /// The policy as a verification entry records what a pass ran on:
+    /// `claude`, `claude opus`, `claude opus/high`.
+    pub fn label(&self) -> String {
+        let mut out = self.kind.clone();
+        if let Some(m) = &self.model {
+            out.push(' ');
+            out.push_str(m);
+        }
+        if let Some(e) = &self.effort {
+            out.push_str(if self.model.is_some() { "/" } else { " " });
+            out.push_str(e);
+        }
+        out
+    }
+
     pub fn spawn_flags(&self) -> Vec<String> {
         let mut out = vec!["--kind".to_string(), self.kind.clone()];
         if let Some(m) = &self.model {
