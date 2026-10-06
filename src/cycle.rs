@@ -1414,10 +1414,12 @@ pub(crate) fn end_group(store: &Store, w: &Worklist, passed: usize) {
     ids.extend(owned_by(tasks.iter(), &w.id, passed));
     ids.sort();
     ids.dedup();
-    end_all(store, ids);
+    // The verifiers first: each stands in its member's tree, and a member
+    // ended while its verifier is still in there keeps a tree nobody needs.
     for m in &g.members {
         end_passes(store, m, |_| true);
     }
+    end_all(store, ids);
 }
 
 /// The rows the run opened that the group text does not name: a governor's

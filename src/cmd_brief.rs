@@ -817,6 +817,7 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         _ => None,
     };
 
+    let is_verifier = verifying.is_some();
     Brief {
         verifying,
         handbook,
@@ -861,10 +862,13 @@ pub(crate) fn compose(b: &Briefing) -> Brief {
         rotation_pending,
         ending_failed: b.ending_failed.clone(),
         // A path rule rather than a question for git, so this stays free in the
-        // one command a session-start hook runs.
+        // one command a session-start hook runs. Not for a verifier: it stands
+        // in its member's tree, read-only, and "commit freely" is the one line
+        // that would undo that.
         own_tree: b
             .cwd
             .as_deref()
+            .filter(|_| !is_verifier)
             .and_then(|c| crate::cmd_checkout::worktree_of(&util::expand(c)))
             .and_then(|d| d.file_name().and_then(|s| s.to_str()).map(str::to_string)),
         under_mine: mine.map(|t| resolve::counts_under(tasks, &t.id).open).unwrap_or(0),
@@ -2056,6 +2060,32 @@ mod tests {
         assert!(text.contains("nothing claimed"), "{text}");
         assert!(text.contains("wsp claim"), "and what to do about it:\n{text}");
         assert!(r.looking.is_none(), "no mandate, so this pane is not going looking");
+    }
+
+    /// `wsp-188`. A verifier holds no claim, so the brief used to read it as an
+    /// agent with nothing claimed and told it to go and claim something. Its
+    /// seat is on its member's open pass, and the brief says what it is
+    /// verifying and the one verb it finishes with — and not that the member's
+    /// tree it stands in is its own to commit in.
+    #[test]
+    fn a_verifier_seat_is_told_what_it_verifies_and_not_that_the_tree_is_its_own() {
+        let mut b = briefing();
+        b.pane = Some("w9:p2".into());
+        b.workspace = Some("w9".into());
+        b.cwd = Some("/home/ed/claude/wsp/.worktrees/t-004".into());
+        let m = b.world.tasks.iter_mut().find(|t| t.id == "t-004").unwrap();
+        let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        p.pane = Some("w9:p2".into());
+        crate::verification::write(m, &[p]);
+        let r = compose(&b);
+        assert!(r.mine.is_none(), "it holds nothing");
+        assert_eq!(r.verifying.as_ref().map(|t| t.id.as_str()), Some("t-004"));
+        assert!(r.own_tree.is_none(), "the member's tree is not its own to commit in");
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("verifying t-004"), "{text}");
+        assert!(text.contains("wsp verified t-004 --holds|--blocks"), "{text}");
+        assert!(!text.contains("nothing claimed"), "a verifier is not an agent that forgot to claim:\n{text}");
+        assert!(!text.contains("wsp land"), "{text}");
     }
 
     /// One line, and only for the pane it is true of.
