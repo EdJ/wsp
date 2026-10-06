@@ -559,8 +559,9 @@ pub fn work_order(subject: &str, how: Handover) -> String {
              barrier passed. Your job is those decisions and the record: answer what somebody \
              is blocked on, write the direction an arriving agent needs and no more, and keep \
              decisions and corrections on the rows rather than in this conversation. Do not \
-             review, rebase, test or land yourself; if that is needed, `wsp spawn` an agent for \
-             it. Sending work back is `wsp reopen <id> \"what is owed\"`, which moves the row, \
+             review, rebase, test or land yourself, and never spawn, verify, nudge or relay a \
+             step of the run: wsp verifies each member as it lands, and an agent you `wsp spawn` \
+             is for work no row owns yet. Sending work back is `wsp reopen <id> \"what is owed\"`, which moves the row, \
              tells that agent's pane and stops the run reading the group as finished; a plain \
              `wsp tell <id>` is a conversation and moves nothing, so use it for a question or a \
              correction and `wsp reopen` when the answer is more work. \
@@ -4702,6 +4703,10 @@ mod tests {
         // told who does it now, and that it may stop.
         assert!(text.contains("wsp runs the steps"), "who sequences now: {text}");
         assert!(text.contains("Do not review, rebase, test or land"), "no active work: {text}");
+        // `wsp-149`: the order used to answer "if that is needed" with a hand
+        // spawn, which is a governor starting its own reviewer beside the
+        // verifier wsp already started. A spawn is for work outside the run.
+        assert!(text.contains("never spawn, verify, nudge or relay a step of the run"), "{text}");
         assert!(text.contains("you are told when it does"), "and that it may stop: {text}");
         // No fetch. `--govern` records the slot before the agent starts, so its
         // `SessionStart` hook has already run `wsp brief` with the slot in

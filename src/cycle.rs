@@ -22,7 +22,10 @@
 //!
 //! What that gives up is anything with no verb behind it: an agent that dies,
 //! or stalls on a prompt, before it runs `wsp review` never triggers the next
-//! step. That stays the person's to see, on the panel, as it always was.
+//! step. That stayed the person's to see until `wsp-144` d1 reversed it (Ed,
+//! 2026-10-04): the daemon now runs [`step`] for every running list on every
+//! tick as well, and [`crate::repair`] takes the states no verb reaches. The
+//! verbs are still the fast path; the tick is what makes a lost one a delay.
 //!
 //! # The chain
 //!

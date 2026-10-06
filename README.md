@@ -143,36 +143,71 @@ wsp spawn 003 --agent       # open a workspace on it and put an agent in it
 wsp despawn 003             # end it: the agent, the claim and the worktree
 ```
 
-Running a worklist is three words on repeat, and each answer names the command
-after it:
+Running a worklist is mostly not yours to do. Compose it, give each group an
+`agent:` line, start it once, and wsp runs the rest. See
+[A run with nobody in the middle](#a-run-with-nobody-in-the-middle).
 
 ```sh
-wsp worklist next           # …or `next <slug>` where the workspace holds no seat
-                            #   group 2 of 4 — 4 may start now      → wsp spawn each
-                            #   group 2 of 4 — waiting on 2         → wait
-                            #   group 1 of 4 finished — read this…  → go, or hold
-                            #     (and what that group's lands touched, before you judge)
-                            #     then rotate — see the seat, below
-                            #   nothing left — 4 groups, all …      → done
-wsp worklist go "…"         # pass the barrier: the verdict, the sweep behind it,
-                            #   and what may start on the far side — no poll needed
-wsp worklist go --from FILE # …the verdict out of the file it was composed in
-wsp worklist hold "…"       # the barrier's "does not pass": start nothing more;
-                            #   what is running is left to finish. `go` passes it
-wsp worklist park "…"       # a person's pause: nothing starts, no barrier is
-                            #   checked, its seat is not refilled. `go` refuses it
-wsp worklist resume         # back to where it was parked, any barrier still owed
+wsp worklist new <slug> "…"  # compose: one `add` per group
+wsp worklist add <slug> 012 014 --agent "claude sonnet high"
+wsp worklist group <slug> 1 --stop -   # what the barrier after group 1 answers
+wsp worklist go <slug>       # start it. From here wsp spawns, verifies, checks
+                             #   each barrier and reseats the governor
+wsp worklist next <slug>     # where it is up to, and what is holding it
+wsp worklist go --from FILE  # the barrier agent's pass, which starts the next group
+wsp worklist hold --from FILE  # the barrier's "does not pass": start nothing more;
+                             #   what is running is left to finish. `go` passes it
+wsp worklist park "…"        # a person's pause: nothing starts, no barrier is
+                             #   checked, its seat is not refilled. `go` refuses it
+wsp worklist resume          # back to where it was parked, any barrier still owed
 ```
+
+### A run with nobody in the middle
+
+Ed, 2026-09-30 and 2026-10-04 (`wsp-134`, and `wsp-144` d1): **the process is
+fixed, so wsp runs it.** For a group with an `agent:` line, wsp takes every
+step. It takes a step on the verb that makes it due, and on the daemon's tick
+for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
+
+| when | wsp | the agent |
+|---|---|---|
+| the list starts, or a barrier passes | spawns the group's members, each on its own `agent` line or the group's | a member works, lands, and ends with `wsp review` |
+| a member is at `review` and landed | starts a read-only verifier on the member's line | the verifier ends with `wsp verified <m> --holds` or `--blocks` |
+| a verdict blocks | puts the member back at `doing`, with the verdict as what is owed, and tells the governor | the member's agent carries on |
+| every member landed and holding | opens a barrier row and spawns an agent to check it | the barrier agent ends with `go` or `hold` |
+| `go` | sweeps the group's trees, ends what the group opened, starts the next group, rotates the governor | — |
+| an agent died, a start never claimed, a landing was made with git | repairs it on the tick, writes `cycle.log`, tells the governor | — |
+| the governor's seat reads empty for two ticks, or a running list has none | seats a governor | — |
+
+What is left to agents is decisions. A governor answers what somebody is
+blocked on and writes direction on the rows; its work order says so, and that
+it may stop when nothing needs it. **Nobody spawns a member or a verifier,
+nudges an agent, carries a message between seats, or runs `advance` in a run.**
+A step that needed one of those is a defect, and it is filed under `wsp-144`
+with its evidence; it is not a routine to repeat. `wsp worklist advance` is
+still there, as the repair for a trigger that was lost.
+
+What a run did is in four places: `cycle.log` in the state directory (each
+step and why), `wsp watch --status` (the daemon and every delivery register),
+the member's `## Verification`, and the barrier row.
+
+A group with `--agent manual`, or a list from before groups had a line, is run
+by hand. `wsp worklist next` names what may start; the governor spawns it,
+passes the barrier with `go`, and makes `wsp govern <slug> --rotate` its last
+act.
 
 ### The seat is reset per batch
 
 A custodian's context only grows, and a token in it is re-billed on every
 request of every session for the rest of the run — so the one thread that runs
 all night is also the most expensive thing on the machine. Since `core-049` the
-default answer is that **it does not run all night**: at each barrier the seat
-writes its verdict with `go` (the store now holds everything a successor needs —
-run position behind `next`, raised hands behind `flag --seat`, direction in task
-logs and decisions), seats a fresh custodian, and ends:
+default answer is that **it does not run all night**: at each barrier pass a
+fresh custodian is seated and the old one ends. The store holds everything a
+successor needs: run position behind `next`, raised hands behind `flag --seat`,
+direction in task logs and decisions. On a group wsp runs, the pass is the
+barrier agent's `go`, and wsp rotates the seat itself (`cycle::rotate`, through
+`rotate_on_behalf`, which waits for the old seat's turn to finish before ending
+it). On a group run by hand, the custodian rotates itself:
 
 ```sh
 wsp govern <slug> --rotate      # one verb, and the custodian's last act:
@@ -2546,8 +2581,8 @@ through the workspace rather than through the pane the agent started in, and it
 arrives with no `/clear` in front of it, because emptying a governor's context
 to speak to it would destroy the thread the position exists to hold.
 
-**And it is queued, not immediate — say what you know.** A governor is mid-turn
-most of the time, because sequencing is what the position does. A sentence given
+**And it is queued, not immediate — say what you know.** A governor may be
+mid-turn on a decision when a sentence reaches it. A sentence given
 to an agent in the middle of a turn is delivered and queued behind it, so nothing
 about that agent changes and there is nothing for a watch to see: `--tell` prints
 `delivered, no turn seen` and means exactly that. For a day it printed `the wsp
@@ -2582,18 +2617,20 @@ somebody who typed it is asking for exactly that.
 **And a custodian is told a different job.** `wsp spawn -p <proj> --govern`
 takes the slot before it starts the agent — so the agent's `SessionStart` hook
 runs `wsp brief` with the slot already in place — and then hands over the
-custodial work order rather than a claim: sequence what runs next and what
-waits, write the direction an arriving agent needs and no more, review finished
-work against the code rather than against the agent's report, hold the record.
-The brief agrees with it: a custodian is told what it is answerable for, and it
-is *not* told to go and claim something, which is the move that turns a governor
-back into an agent working somebody else's task. Since `core-049` it is also
-told to **rotate at each barrier** rather than hold the thread all night, and
-since `core-050` rotation is one verb — `wsp govern <scope> --rotate`, which
-moves the slot only after the successor's first turn is confirmed; see
-[The seat is reset per batch](#the-seat-is-reset-per-batch) — because the
-position exists to hold the *record*, and the record is in the store; a thread
-that held it too was paying rent on both.
+custodial work order rather than a claim. Since `wsp-134` that order says wsp
+runs the steps of a group with an `agent:` line, and names the decisions that
+reach the seat: a member blocked, a verdict that sent a member back, a barrier
+held or passed. The custodian answers those, writes the direction an arriving
+agent needs and no more, and holds the record. It does not review, test or
+land, and it never spawns, verifies, nudges or relays a step of the run. When
+nothing needs it, it stops, because it is told when something does. The brief
+agrees with it: a custodian is told what it is answerable for, and it is *not*
+told to go and claim something, which is the move that turns a governor back
+into an agent working somebody else's task. It does not hold the thread all
+night either (`core-049`): a pass seats its successor. See
+[The seat is reset per batch](#the-seat-is-reset-per-batch). The position
+exists to hold the *record*, and the record is in the store; a thread that held
+it too was paying rent on both.
 
 The record is keyed on the **project**, which is the one place this differs
 from the pins, mandates and claims beside it. Those are facts about a workspace
