@@ -594,7 +594,7 @@ fn landed_line(landed: &Landed) -> String {
 fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     let p = Paint::new();
     let pane = route(store, closed.reply.waiting.as_ref());
-    let receipt = |told: bool, why: &str| {
+    let receipt = |told: bool, held: bool, why: &str| {
         if args.json() {
             println!(
                 "{}",
@@ -604,6 +604,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
                     "reply": closed.reply.id,
                     "landed": landed_line(&closed.landed),
                     "told": told,
+                    "held": held,
                     "why": why,
                 })
             );
@@ -613,7 +614,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     };
 
     if pane.is_empty() {
-        receipt(false, "nobody to tell — the answer is on the record and in the log");
+        receipt(false, false, "nobody to tell — the answer is on the record and in the log");
         return 0;
     }
     // Asked of every backend wsp can spawn onto (`compound-091`), not herdr
@@ -625,36 +626,46 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // socket" and never delivered, on a machine where the agent was running.
     let backends = crate::cmd_spawn::local_backends();
     let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
-        receipt(false, &format!("nothing answers for {pane} any more — the answer is written"));
+        receipt(false, false, &format!("nothing answers for {pane} any more — the answer is written"));
         return 0;
     };
     if found.agent.kind.trim().is_empty() {
-        receipt(false, &format!("{pane} holds no agent — the answer is written"));
+        receipt(false, false, &format!("{pane} holds no agent — the answer is written"));
         return 0;
     }
-    // The one state a message must not be sent into, checked here for the same
-    // reason `wsp tell` checks it: a blocked agent has a permission dialog
-    // holding the keyboard, so the text is typed *at the dialog*, where a
-    // sentence about what to do next can select an answer nobody chose. Asked
-    // of the port's own `State` rather than herdr's screen-scraped one, so the
-    // guard holds for whichever backend answered.
-    if let Some(wait) = crate::waiting::on_screen(found.state) {
-        receipt(
-            false,
-            &format!("{pane} is {} — the answer is written; `wsp peek {pane}` shows what it is asking", wait.sentence()),
-        );
-        return 0;
+    // **Busy is later, not never — `wsp-204`.** The one state a message must
+    // not be sent into is a permission dialog, where the text is typed *at the
+    // dialog* and can select an answer nobody chose; and a seat mid-turn or
+    // still coming up refuses the keystrokes outright (`not ready — working`).
+    // All three used to end here with the answer on the log alone, and an asker
+    // that goes idle on an answered question is sitting still for nothing until
+    // a person relays it by hand. So the reply is held on its own record and
+    // the daemon's repair tick types it at the first idle — [`deliver_held`].
+    // Asked of the port's own `State` rather than herdr's screen-scraped one,
+    // so the gate holds for whichever backend answered.
+    if !found.state.will_take_a_prompt() {
+        let why = match crate::waiting::on_screen(found.state) {
+            Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
+            None => crate::wake::held_because(found.state).unwrap_or("not taking a prompt").to_string(),
+        };
+        return hold(store, closed, &pane, &why, &receipt);
     }
 
     let text = wire(closed);
     let how = crate::agent_commands::of(&found.agent.kind);
-    let sent = crate::cmd_agent::Sent::new(&pane, &whose(closed), &pane, &pane, &text, args);
+    let sent = crate::cmd_agent::Sent::new(&pane, &asker(closed), &pane, &pane, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
             return crate::cmd_agent::twice(&sent, ago, &p);
         }
     }
     let out = how.tell(place.as_ref(), &crate::place::Seat::new(&pane), &text);
+    // The census row said idle and the backend said busy: the turn started in
+    // between. The same hold, for the same reason, rather than a refusal.
+    if let Err(crate::place::Refusal::NotReady(state)) = out {
+        let why = crate::wake::held_because(state).unwrap_or("not taking a prompt");
+        return hold(store, closed, &pane, why, &receipt);
+    }
     // `delivered` owns the honest-reporting rule and the `agent-told` event, so
     // this reuses it whole rather than reimplementing either. Its non-zero exit
     // on `NotTaken` is right for `wsp tell`, where the sentence is the only
@@ -667,6 +678,112 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
             0
         }
     }
+}
+
+/// Hold the reply for `pane` and say so. The exit is 0: the answer is written,
+/// and it is owed rather than lost.
+fn hold(
+    store: &Store,
+    closed: &message::Closed,
+    pane: &str,
+    why: &str,
+    receipt: &dyn Fn(bool, bool, &str),
+) -> i32 {
+    match message::held(store, &closed.reply.id, pane, why) {
+        Ok(_) => receipt(false, true, &format!("{pane} is {why} — held, and typed there when it is next idle")),
+        Err(e) => receipt(false, false, &format!("{pane} is {why}, and the answer could not be held: {e}")),
+    }
+    0
+}
+
+/// Every answer held for a busy asker, typed now where the asker is idle — the
+/// daemon's half of `wsp-204`, on [`crate::repair::tick`]'s timer.
+///
+/// Returns what it did, a sentence each, for `cycle.log`. **A reply still
+/// waiting says nothing**: this runs every minute, and a line per minute per
+/// busy asker would bury the log it is written to.
+pub(crate) fn deliver_held(store: &Store, seats: &dyn crate::cycle::Seats) -> Vec<String> {
+    deliver_held_through(store, seats, &type_at)
+}
+
+/// The typing, over every backend here: `None` where nothing answers for the
+/// pane or nothing in it is an agent, which a later tick asks again.
+fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+    let backends = crate::cmd_spawn::local_backends();
+    let (place, found) = crate::cmd_agent::locate_seat(&backends, pane)?;
+    if found.agent.kind.trim().is_empty() {
+        return None;
+    }
+    let how = crate::agent_commands::of(&found.agent.kind);
+    Some(how.tell(place.as_ref(), &crate::place::Seat::new(pane), text))
+}
+
+type TypeAt<'a> = dyn Fn(&str, &str) -> Option<crate::place::Result<crate::place::Delivery>> + 'a;
+
+/// [`deliver_held`] with the typing passed in, so a test can be the pane.
+///
+/// **The gate is [`crate::cycle::Seats::state`] reading `Idle`, and nothing
+/// wider**, for the reason the verb holds at all: a permission dialog takes the
+/// text into the dialog, and a seat mid-turn or starting refuses it. A pane
+/// that is positively gone ends the hold with a note, because no idle is ever
+/// coming; one that cannot be read is asked again next tick, because an
+/// absence is not a fact.
+///
+/// **Typed once.** `Started` and `Unconfirmed` alike end the hold with an
+/// [`message::Act::Sent`] hop: the verb has never retyped an unconfirmed
+/// answer, and a second typing into a composer still holding the first appends
+/// to it. The answer is on the asker's task log either way.
+fn deliver_held_through(store: &Store, seats: &dyn crate::cycle::Seats, type_at: &TypeAt) -> Vec<String> {
+    let mut said = Vec::new();
+    for reply in message::held_replies(store) {
+        let Some(question) = reply.reply_to.as_deref().and_then(|id| store.message(id)) else {
+            continue;
+        };
+        let since = reply.via.last().map(|h| util::local_hm(util::epoch_of(&h.at))).unwrap_or_default();
+        let pane = route(store, reply.waiting.as_ref());
+        let end = |act: message::Act, note: &str| {
+            let _ = message::unheld(store, &reply.id, &pane, act, note);
+        };
+        if pane.is_empty() {
+            end(message::Act::Noted, "nobody to tell — the answer is on the record and in the log");
+            said.push(format!("answer to {} held since {since}: nobody to tell, so it stays on the log", question.id));
+            continue;
+        }
+        if seats.absent(&pane) {
+            end(message::Act::Noted, &format!("{pane} is gone — the answer is on the record and in the log"));
+            said.push(format!("answer to {} held for {pane} since {since}: the pane is gone, so it stays on the log", question.id));
+            continue;
+        }
+        if seats.state(&pane) != Some(crate::place::State::Idle) {
+            continue;
+        }
+        let landed = match message::homes_to(store, &question) {
+            Some(task) => Landed::Task(task),
+            None => Landed::RecordOnly(String::new()),
+        };
+        let closed = message::Closed { question: question.clone(), reply: reply.clone(), landed };
+        match type_at(&pane, &wire(&closed)) {
+            // Nothing there to type at, or it turned busy between the reading
+            // and the type: the hold stands, and the next tick asks again.
+            None | Some(Err(crate::place::Refusal::NotReady(_))) => {}
+            Some(Ok(how)) => {
+                let turn = match how {
+                    crate::place::Delivery::Started => "a turn started on it",
+                    crate::place::Delivery::Unconfirmed => "no turn seen yet",
+                };
+                end(message::Act::Sent, &format!("typed at {pane} — {turn}"));
+                said.push(format!(
+                    "answer to {} held for {pane} since {since}, typed now it is idle — {turn}",
+                    question.id
+                ));
+            }
+            Some(Err(e)) => {
+                end(message::Act::Noted, &format!("{pane} was not told: {e}"));
+                said.push(format!("answer to {} held for {pane} since {since}: not told — {e}", question.id));
+            }
+        }
+    }
+    said
 }
 
 /// How the asker sees it, and the first line is the byline.
@@ -687,6 +804,14 @@ fn wire(closed: &message::Closed) -> String {
 
 fn whose(closed: &message::Closed) -> String {
     closed.reply.from.byline()
+}
+
+/// Who the answer is for, as a receipt names it — the asker, by the byline it
+/// asked under, and never [`whose`]. `wsp-204`: the receipt was handed the
+/// answerer, so a refusal read `wsp-process seat was not told` about cpd-380,
+/// and pointed its reader at the one seat that had done its part.
+fn asker(closed: &message::Closed) -> String {
+    closed.question.from.byline()
 }
 
 /// Who a question is addressed to, in one line of receipt.
@@ -924,5 +1049,101 @@ mod tests {
             "a task nothing is bound to falls back rather than answering nobody",
         );
         assert_eq!(route(&store, None), "", "and nothing named is nobody to tell");
+    }
+
+    /// A pane whose state a test sets, and which says whether it is gone.
+    struct Pane {
+        state: std::cell::Cell<Option<crate::place::State>>,
+        gone: bool,
+    }
+
+    impl crate::cycle::Seats for Pane {
+        fn state(&self, _: &str) -> Option<crate::place::State> {
+            self.state.get()
+        }
+        fn absent(&self, _: &str) -> bool {
+            self.gone
+        }
+    }
+
+    /// cpd-380's question, answered by the wsp-process seat while cpd-380 was
+    /// mid-turn — the verb's half: the reply held on its record.
+    fn answered_mid_turn(store: &Store) -> message::Closed {
+        task(store, "wsp-149");
+        let q = Message::question(
+            Party::pane("cpd-380", ""),
+            Kind::Note,
+            "does the barrier hold?",
+            Waiting::new("cpd-380", ""),
+        )
+        .about(About::Task("wsp-149".into()));
+        message::raise(store, &q).unwrap();
+        let closed = message::answer(store, &q.id, &Party::seat("wsp-process"), "it holds").unwrap();
+        message::held(store, &closed.reply.id, "cpd-380", "the seat is mid-turn").unwrap();
+        closed
+    }
+
+    /// **`wsp-204`, the row itself.** An answer to an asker that is mid-turn
+    /// used to reach the log and not the pane, and the asker went idle on a
+    /// question that had been answered until a person relayed it by `wsp tell`.
+    /// Held, it waits out the turn without a keystroke at the pane, is typed
+    /// once at the first idle, and is not typed again.
+    #[test]
+    fn an_answer_to_a_working_asker_is_typed_at_its_next_idle_and_only_once() {
+        let store = scratch("held");
+        let closed = answered_mid_turn(&store);
+        let typed = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let type_at = |pane: &str, text: &str| {
+            typed.borrow_mut().push((pane.to_string(), text.to_string()));
+            Some(Ok(crate::place::Delivery::Started))
+        };
+        let pane = Pane { state: std::cell::Cell::new(Some(crate::place::State::Working)), gone: false };
+
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty(), "a turn in flight says nothing");
+        assert!(typed.borrow().is_empty(), "and nothing is typed into it");
+        assert_eq!(message::held_replies(&store).len(), 1, "the answer is still owed");
+
+        pane.state.set(Some(crate::place::State::Idle));
+        let said = deliver_held_through(&store, &pane, &type_at);
+        assert_eq!(typed.borrow().len(), 1, "the first idle is the delivery");
+        let (at, text) = typed.borrow()[0].clone();
+        assert_eq!(at, "cpd-380", "typed at the asker, not at whoever answered");
+        assert!(text.contains("wsp-process seat") && text.contains(&closed.question.id), "the byline rides it: {text}");
+        assert!(said[0].contains("typed now it is idle"), "and cycle.log is told: {said:?}");
+        assert!(message::held_replies(&store).is_empty(), "the hold ends with the typing");
+
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty());
+        assert_eq!(typed.borrow().len(), 1, "a delivered answer is never typed twice");
+    }
+
+    /// No idle is ever coming to a pane that is gone, so the hold ends with a
+    /// sentence rather than being asked about every minute for ever — and a
+    /// pane nobody can read is *not* gone, so that one keeps it.
+    #[test]
+    fn a_held_answer_whose_asker_is_gone_stays_on_the_log_and_is_not_typed() {
+        let store = scratch("held-gone");
+        answered_mid_turn(&store);
+        let type_at = |_: &str, _: &str| -> Option<crate::place::Result<crate::place::Delivery>> {
+            panic!("nothing is typed at a pane that is not there")
+        };
+
+        let unreadable = Pane { state: std::cell::Cell::new(None), gone: false };
+        assert!(deliver_held_through(&store, &unreadable, &type_at).is_empty());
+        assert_eq!(message::held_replies(&store).len(), 1, "an absence is not a fact, so it is still owed");
+
+        let gone = Pane { state: std::cell::Cell::new(None), gone: true };
+        let said = deliver_held_through(&store, &gone, &type_at);
+        assert!(said[0].contains("the pane is gone"), "{said:?}");
+        assert!(message::held_replies(&store).is_empty(), "and the hold is over");
+    }
+
+    /// The receipt names the party the answer is *for*. It named the answerer,
+    /// and `wsp-process seat was not told` sent a reader to the wrong pane.
+    #[test]
+    fn a_receipt_about_an_answer_names_the_asker_and_not_the_answerer() {
+        let store = scratch("asker");
+        let closed = answered_mid_turn(&store);
+        assert_eq!(asker(&closed), "cpd-380");
+        assert_eq!(whose(&closed), "wsp-process seat", "the byline is still the answerer's");
     }
 }

@@ -1256,7 +1256,10 @@ abandoned — both of which take a sentence and both of which reach the asker.
 `worklist-004` is why: a seat answered a flagged agent down another channel and
 then lowered the hand, so *clearing looked like answering* while the asker sat
 waiting. `wsp answer <message-id> "…"` and `wsp answer <message-id> --abandon
-"…"` are the two endings.
+"…"` are the two endings. An asker that is mid-turn, starting or on a prompt
+when the answer comes is not typed at and not dropped: the reply is held on its
+own record (a `held` hop), and the daemon's repair tick types it at the asker's
+next idle and says so in `cycle.log` (`wsp-204`).
 
 Something louder is a hook away, the same seam `review` uses:
 

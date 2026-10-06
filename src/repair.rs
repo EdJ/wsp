@@ -179,6 +179,13 @@ impl Pass {
 pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     pass.last = Some(util::epoch_secs());
     say_frozen_screens(store, seats);
+    // **Not about a running list at all**, and first for that reason: an answer
+    // held for an asker that was mid-turn (`wsp-204`) is owed whatever any list
+    // is doing, and an asker sitting idle on an answered question is the hand
+    // relay `wsp-144` exists to remove. See [`crate::cmd_message::deliver_held`].
+    for line in crate::cmd_message::deliver_held(store, seats) {
+        stamp(store, &line);
+    }
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         // **A landing nobody recorded is written down before the step**, so
         // the pass the step opens on that member reads the commit. After it,

@@ -179,7 +179,7 @@ impl Shape {
     pub fn may(&self, act: Act) -> bool {
         match (self, act) {
             (Shape::Signal, _) => false,
-            (Shape::Notification, Act::Acknowledged | Act::Noted | Act::Escalated | Act::Sent) => true,
+            (Shape::Notification, Act::Acknowledged | Act::Noted | Act::Escalated | Act::Sent | Act::Held) => true,
             (Shape::Notification, _) => false,
             (Shape::Question, Act::Answered | Act::Abandoned | Act::Noted | Act::Escalated | Act::Sent) => true,
             (Shape::Question, _) => false,
@@ -377,6 +377,23 @@ pub enum Act {
     /// hooks, panels, and *a different seat*, which is the case that matters when
     /// this one stands down and the routing walks up a level.
     Sent,
+    /// **An answer the asker was too busy to be typed**, owed to its pane on its
+    /// next idle.
+    ///
+    /// `wsp-204`. A reply is typed at the asker's pane, and a pane mid-turn
+    /// refuses the keystrokes — so the answer reached the log and not the pane,
+    /// and the asker went idle on a question that had been answered: a person
+    /// relayed it by `wsp tell`, which is the hand step `wsp-144` exists to
+    /// remove. This hop is the hold. It is the *last* hop on a reply that is
+    /// still owed, and any hop after it — the [`Act::Sent`] of the delivery, or
+    /// a [`Act::Noted`] saying why it never will be — ends the owing. See
+    /// [`held_replies`].
+    ///
+    /// Its own word rather than a `noted` with a sentence, because a reader
+    /// that keys on a sentence is a reader that breaks when the sentence is
+    /// reworded. An older build reads it as `noted`, which ends the hold — the
+    /// behaviour before this row, and never a second typing.
+    Held,
     Acknowledged,
     Answered,
     Abandoned,
@@ -388,6 +405,7 @@ impl Act {
             "noted" | "note" => Some(Act::Noted),
             "escalated" => Some(Act::Escalated),
             "sent" => Some(Act::Sent),
+            "held" => Some(Act::Held),
             "acknowledged" | "ack" => Some(Act::Acknowledged),
             "answered" => Some(Act::Answered),
             "abandoned" => Some(Act::Abandoned),
@@ -399,6 +417,7 @@ impl Act {
             Act::Noted => "noted",
             Act::Escalated => "escalated",
             Act::Sent => "sent",
+            Act::Held => "held",
             Act::Acknowledged => "acknowledged",
             Act::Answered => "answered",
             Act::Abandoned => "abandoned",
@@ -407,7 +426,7 @@ impl Act {
     /// Does this end the record, or leave it open at the next level?
     pub fn closes(&self) -> Option<State> {
         match self {
-            Act::Noted | Act::Escalated | Act::Sent => None,
+            Act::Noted | Act::Escalated | Act::Sent | Act::Held => None,
             Act::Acknowledged => Some(State::Acknowledged),
             Act::Answered => Some(State::Answered),
             Act::Abandoned => Some(State::Abandoned),
@@ -1175,6 +1194,19 @@ pub fn sent(store: &Store, id: &str, scope: &str) -> Result<Message, Refused> {
     )
 }
 
+/// A reply held for `pane`, because the asker in it could not be typed at now —
+/// `why` is the state, said as a sentence. See [`Act::Held`].
+pub fn held(store: &Store, id: &str, pane: &str, why: &str) -> Result<Message, Refused> {
+    hop(store, id, &Party::pane(pane, ""), Act::Held, why)
+}
+
+/// A held reply that reached its asker's pane, or one that never will — the
+/// hop after the hold, which is what ends it. `act` is [`Act::Sent`] for the
+/// first and [`Act::Noted`] for the second.
+pub fn unheld(store: &Store, id: &str, pane: &str, act: Act, note: &str) -> Result<Message, Refused> {
+    hop(store, id, &Party::pane(pane, ""), act, note)
+}
+
 /// *I have this and I am not passing it on.* A notification's disposition, and
 /// a real act: it is what makes the chain auditable, it costs one keystroke,
 /// and it is not an answer.
@@ -1434,6 +1466,23 @@ pub fn replies_for(store: &Store, task: &str) -> Vec<Message> {
         .into_values()
         .filter(|m| m.reply_to.is_some())
         .filter(|m| m.waiting.as_ref().is_some_and(|w| w.task == task))
+        .collect();
+    out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// Every reply still owed to a busy asker, oldest first — open, and with
+/// [`Act::Held`] as its last hop.
+///
+/// **The last hop and not any hop**, because the hold is a state of the
+/// delivery and the hops are its history: a reply held at 12:25 and typed at
+/// 12:31 carries both, and is owed nothing.
+pub fn held_replies(store: &Store) -> Vec<Message> {
+    let mut out: Vec<Message> = store
+        .messages()
+        .into_values()
+        .filter(|m| m.is_reply() && m.is_open())
+        .filter(|m| m.via.last().is_some_and(|h| h.act == Act::Held))
         .collect();
     out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
     out
