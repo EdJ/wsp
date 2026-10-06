@@ -744,9 +744,54 @@ pub(crate) fn seat_env(
     task: Option<&str>,
     custodian: bool,
 ) -> BTreeMap<String, String> {
+    let caller: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
+    seat_env_over(&caller, agent, project, task, custodian)
+}
+
+/// The `WSP_` names a seat takes from whoever spawned it: which store, and two
+/// switches a person sets on a shell for everything run under it.
+/// [`seat_env`]'s docs say why everything else is shed.
+const WSP_KEPT: &[&str] = &["WSP_HOME", "WSP_STATE", "WSP_NO_COMMIT", "WSP_BIN", "WSP_NO_CYCLE"];
+
+/// A `WSP_` name in the caller's environment that describes the caller rather
+/// than the store — see [`seat_env`].
+fn unowned(key: &str) -> bool {
+    key.starts_with("WSP_") && !WSP_KEPT.contains(&key)
+}
+
+/// [`seat_env`] against the names `caller` carries, so the rule about what a
+/// seat inherits can be asserted without setting the process's environment.
+///
+/// **Every `WSP_` name the caller carries is emptied, and then the seat sets
+/// the ones it owns** (`wsp-203`). compound and the supervisor start the agent
+/// as a child of this process, so whatever this process carries the agent
+/// carries, and an override is the only strip. `WSP_TASK` and `WSP_PROJECT`
+/// were overridden only when this seat had one, and nothing was said about the
+/// rest. Measured with `ps -E` on 2026-10-06: a governor spawned from wsp-149's
+/// pane started with `WSP_TASK=wsp-149`, `WSP_PROJECT=wsp`, `WSP_RUN_LIST` and
+/// `WSP_RUN_GROUP` all the member's. So any verb that defaults to `WSP_TASK`
+/// acted on the member's row. Everything the governor spawned was also stamped
+/// as opened by the member's group (`cycle::OWNED_LIST`), and so was ended
+/// when that group passed.
+///
+/// Shed by prefix with a kept list rather than by name, for
+/// [`crate::place::shed`]'s reason: the leak is the name nobody thought to
+/// list. `WSP_TERSE` is a custodian's, `WSP_SEAT_ID` is the backend's to set,
+/// and `WSP_ROTATED_BY` belongs to one handover's helper. None of them is this
+/// seat's unless set again below. Run ownership is not lost by this: `wsp
+/// spawn` stamps it on the claim it makes itself, from its own environment,
+/// before any seat sees it.
+fn seat_env_over(
+    caller: &[String],
+    agent: Option<Occupant<'_>>,
+    project: Option<&str>,
+    task: Option<&str>,
+    custodian: bool,
+) -> BTreeMap<String, String> {
     // Shed first: everything below is something this seat is *for*, and none of
     // it collides with a name the caller's Claude Code set.
     let mut env = crate::place::shed_env();
+    env.extend(caller.iter().filter(|k| unowned(k)).map(|k| (k.clone(), String::new())));
     // The store next, then what this seat is for — the latter wins if someone
     // has both, which is right: it is more specific.
     env.extend(
@@ -768,6 +813,16 @@ pub(crate) fn seat_env(
     }
     env
 }
+
+/// Where a custodian stands when its scope has no root: a worklist, which
+/// spans projects and owns no tree.
+///
+/// **Stated rather than left to the backend** (`wsp-203`). An order with no
+/// cwd means the backend's default, and compound and the supervisor start the
+/// agent as a child of this process, so their default is the caller's own
+/// directory. A governor spawned from a member's pane stood in that member's
+/// tree. Home is the one place that is nobody's tree on every backend.
+const UNROOTED: &str = "~";
 
 /// Where a spawn is going: this machine unless `--on` says otherwise.
 ///
@@ -1938,7 +1993,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     let refs = work.task.as_deref().and_then(|t| store.task(t)).map(|t| t.refs).unwrap_or_default();
     let cwd = args
         .get("cwd")
-        .or_else(|| work.project.as_deref().and_then(|p| index.root_for(p, &refs)));
+        .or_else(|| work.project.as_deref().and_then(|p| index.root_for(p, &refs)))
+        .or_else(|| args.has("govern").then(|| UNROOTED.to_string()));
 
     // One tree per agent, which is the whole of robustness-010 and is done here
     // rather than asked of the agent. Every softer version of it has been tried
@@ -2796,9 +2852,9 @@ fn rotate_as(
         eprintln!("wsp: rotate with a kind wsp can hear from - --kind claude");
         return 2;
     }
-    // A project root, inherited; a worklist scope stands nowhere, exactly as a
-    // first custodian's seat does.
-    let cwd = work.project.as_deref().and_then(|proj| index.root_of(proj));
+    // A project root, inherited; a worklist scope stands at [`UNROOTED`],
+    // exactly as a first custodian's seat does.
+    let cwd = work.project.as_deref().and_then(|proj| index.root_of(proj)).or_else(|| Some(UNROOTED.into()));
     let subject = work.list.clone().or_else(|| work.project.clone()).unwrap_or_default();
 
     let how = agent_commands::of(&kind);
@@ -4477,12 +4533,12 @@ mod tests {
         assert_eq!(o.env.get("WSP_TASK").map(String::as_str), Some("t-260817-004"));
         assert_eq!(o.env.get("WSP_PROJECT").map(String::as_str), Some("robustness"));
 
-        // A project spawn has no task, and says so by absence rather than by an
-        // empty string somebody downstream has to test for.
+        // A project spawn has no task: absent, or emptied when the caller
+        // carried one of its own (`wsp-203`), which is the only strip there is.
         let proj =
             Work { task: None, project: Some("robustness".into()), label: "robustness".into(), list: None };
         let o = order(&proj, None, None, true, None, false);
-        assert!(o.env.get("WSP_TASK").is_none());
+        assert!(unset(&o.env, "WSP_TASK"));
         assert!(o.on.is_none());
         assert!(o.show);
     }
@@ -4571,6 +4627,76 @@ mod tests {
                 "{k}={v} is the caller's session, handed to the seat"
             );
         }
+    }
+
+    /// A seat's variable that carries no value: never set, or emptied over the
+    /// caller's — which every backend delivers as unset or as empty, and every
+    /// reader takes as absent.
+    fn unset(env: &BTreeMap<String, String>, key: &str) -> bool {
+        env.get(key).map_or(true, |v| v.is_empty())
+    }
+
+    /// A seat is told who it is, and is nobody it was not told. `wsp-203`: a
+    /// governor spawned from wsp-149's pane started as wsp-149, in wsp-149's
+    /// run group, because compound's agent is this process's child and every
+    /// `WSP_` name it was not handed again came through.
+    ///
+    /// Asserted against a caller's names rather than the live environment, so
+    /// it needs nobody else's test to hold still.
+    #[test]
+    fn a_seat_spawned_from_a_members_pane_is_not_that_member() {
+        let caller: Vec<String> = [
+            "WSP_TASK",
+            "WSP_PROJECT",
+            crate::cycle::OWNED_LIST,
+            crate::cycle::OWNED_GROUP,
+            "WSP_TERSE",
+            crate::place::SEAT_ENV,
+            "WSP_SOMETHING_ADDED_LATER",
+            "WSP_HOME",
+            "WSP_STATE",
+            "WSP_NO_CYCLE",
+            "PATH",
+        ]
+        .map(String::from)
+        .to_vec();
+        let get = |env: &BTreeMap<String, String>, k: &str| env.get(k).cloned();
+
+        // A custodian on a list owns neither a task nor a project.
+        let governor = seat_env_over(&caller, None, None, None, true);
+        for k in ["WSP_TASK", "WSP_PROJECT", crate::cycle::OWNED_LIST, crate::cycle::OWNED_GROUP, "WSP_SOMETHING_ADDED_LATER"] {
+            assert_eq!(get(&governor, k).as_deref(), Some(""), "{k} is the member's, handed to its governor");
+        }
+        assert_eq!(get(&governor, "WSP_TERSE").as_deref(), Some("1"), "and it is still a custodian");
+
+        // A member a governor spawns gets its own task, and not its spawner's terseness.
+        let member = seat_env_over(&caller, None, Some("wsp"), Some("wsp-9"), false);
+        assert_eq!(get(&member, "WSP_TASK").as_deref(), Some("wsp-9"));
+        assert_eq!(get(&member, "WSP_PROJECT").as_deref(), Some("wsp"));
+        assert_eq!(get(&member, "WSP_TERSE").as_deref(), Some(""), "a governor's terseness reached a member");
+
+        // Which store, and the switches a person set on the shell, are kept.
+        for k in ["WSP_HOME", "WSP_STATE", "WSP_NO_CYCLE", "PATH"] {
+            assert_ne!(get(&governor, k).as_deref(), Some(""), "{k} is not an identity and was emptied");
+        }
+    }
+
+    /// A custodian on a list has no root, and stands at home rather than in
+    /// whatever tree its spawner was in — which under compound is where an
+    /// order with no cwd puts it (`wsp-203`).
+    #[test]
+    fn a_list_governor_stands_in_nobodys_tree() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("govern-list-cwd");
+        store.save_worklist(&crate::model::Worklist::new("batch", "Overnight batch")).unwrap();
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("project", "batch"), ("govern", "true"), ("kind", "opencode")];
+        place_work(&place, &store, &Args::synth("spawn", &[], &flags));
+        let cwd = place.1.borrow().first().map(|o| o.cwd.clone());
+        assert_eq!(cwd, Some(Some(UNROOTED.to_string())), "left to the backend, which is the caller's directory");
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 
     /// The two sub-projects the backlog is split into have no checkout of
@@ -4740,13 +4866,15 @@ mod tests {
             label: "robustness".into(),
             list: None,
         };
+        // Unset, or emptied when the caller carried one — an empty value is
+        // the only strip on the wire, and `Args::terse` reads it as off.
         let plain = order(&proj, None, None, false, None, false);
         assert!(
-            plain.env.get("WSP_TERSE").is_none(),
+            unset(&plain.env, "WSP_TERSE"),
             "a bare project seat is not terse: {plain:?}"
         );
         assert!(
-            plain.env.get("WSP_TASK").is_none() && !plain.env.contains_key("WSP_TERSE"),
+            unset(&plain.env, "WSP_TASK"),
             "nothing but the custodial half may turn it on"
         );
 
@@ -4772,7 +4900,7 @@ mod tests {
             Some("1")
         );
         assert!(
-            on_list.env.get("WSP_PROJECT").is_none(),
+            unset(&on_list.env, "WSP_PROJECT"),
             "a worklist is not a place to stand"
         );
     }
@@ -6983,6 +7111,11 @@ mod tests {
         let rec = &store.governors()["batch"];
         assert_eq!(rec["workspace"], "w9");
         assert_eq!(store.handovers()["batch"]["to"], "w9:p2");
+        assert_eq!(
+            place.opened.borrow().first().and_then(|o| o.cwd.clone()).as_deref(),
+            Some(UNROOTED),
+            "a list's successor stood wherever its predecessor was"
+        );
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
