@@ -151,6 +151,8 @@ Running a worklist is mostly not yours to do. Compose it, give each group an
 wsp worklist new <slug> "…"  # compose: one `add` per group
 wsp worklist add <slug> 012 014 --agent "claude sonnet high"
 wsp worklist group <slug> 1 --stop -   # what the barrier after group 1 answers
+wsp worklist group <slug> 1 --stop --from FILE --why -   # correct the running
+                             #   group's stop, logged, until its barrier opens
 wsp worklist go <slug>       # start it. From here wsp spawns, verifies, checks
                              #   each barrier and reseats the governor
 wsp worklist next <slug>     # where it is up to, and what is holding it

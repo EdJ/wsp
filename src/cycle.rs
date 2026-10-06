@@ -1142,7 +1142,7 @@ fn restart(store: &Store, t: &Task) -> Option<String> {
 /// How a barrier row's title starts; the list's slug follows it.
 const BARRIER_TITLE: &str = "Barrier: ";
 
-fn barrier_title(list: &str, at: usize) -> String {
+pub(crate) fn barrier_title(list: &str, at: usize) -> String {
     format!("{BARRIER_TITLE}{list} group {at}")
 }
 

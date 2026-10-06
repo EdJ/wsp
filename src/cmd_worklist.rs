@@ -43,6 +43,11 @@
 //! *ordinal at or behind the position*, and it moves on its own as the run
 //! advances. Every one of `add`, `rm`, `mv` and `group` asks [`Window`] first.
 //!
+//! Two fields of the group being run are not yet in flight, and stay open:
+//! a member's own line until that member starts ([`member`]), and the stop
+//! until its barrier row opens ([`amend_running_stop`], which takes a logged
+//! reason). Each one is read once, at a moment the run has not reached yet.
+//!
 //! Read with [`Reading::Settled`], never with `Landed`. The window is decided
 //! on a path a person types at interactively, and the landed reading is a git
 //! process per member; the settled reading is free, and being one group out at
@@ -830,7 +835,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
 
 pub fn group(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
-        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE]";
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--why \"…\"|-]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -867,9 +872,35 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         return 2;
     }
 
+    // The reason is settled before any prose is read, since both may want the
+    // stream and only one of them can have it.
+    let why = match reason(args) {
+        Ok(why) => why,
+        Err(code) => return code,
+    };
+
     let win = window(store, &w);
     if !win.allows(ordinal) {
-        return win.refuse(ordinal, "will not change");
+        // The one edit the group being run still takes: its stop, which
+        // nothing has read as a barrier yet. See [`amend_running_stop`].
+        let only_stop = args.has("stop") && !args.has("parallel") && !args.has("agent");
+        let live = win.started && win.at == Some(ordinal);
+        if live && only_stop {
+            let Some(why) = why else {
+                eprintln!("wsp: group {ordinal} of `{}` is being run, so its stop is corrected with a reason, which is logged", w.id);
+                eprintln!("     `wsp worklist group {} {ordinal} --stop --from FILE --why -` — the reason on stdin, the stop from the file", w.id);
+                return 2;
+            };
+            return match stop_prose(args) {
+                Ok(text) => amend_running_stop(store, args, &w.id, ordinal, text, &why),
+                Err(code) => code,
+            };
+        }
+        let code = win.refuse(ordinal, "will not change");
+        if live {
+            eprintln!("     its stop alone may still be corrected, with a reason: `--stop --from FILE --why -`");
+        }
+        return code;
     }
 
     let mut said: Vec<String> = Vec::new();
@@ -925,7 +956,8 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         }
     }
 
-    w.log(&format!("group {ordinal} — {} · {}", groups[ordinal - 1].members.join(" "), said.join(", ")));
+    let because = why.map(|y| format!(" — why: {y}")).unwrap_or_default();
+    w.log(&format!("group {ordinal} — {} · {}{because}", groups[ordinal - 1].members.join(" "), said.join(", ")));
     save(store, &mut w, &groups, "group", &format!("group {ordinal} {}", said.join(", ")));
 
     if args.json() {
@@ -934,6 +966,150 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         println!("{} group {ordinal}: {}", w.id, said.join(" · "));
     }
     0
+}
+
+/// Correct the stop of the group being run, before its barrier is checked.
+/// `wsp-206`.
+///
+/// **The stop is the one field of a live group nothing has read as a barrier
+/// yet.** Membership, cap and line are what is in flight — members started on
+/// them — so they stay frozen. The stop is read once, as a barrier, by the agent
+/// [`crate::cycle`] starts when every member holds; until then it is a sentence
+/// about the future. In `wsp-unattended` a verifier found that group 2's stop
+/// asserted a price the vendor had cancelled. Refused here, the correction went
+/// on the member as a decision. The barrier agent was then handed the false stop
+/// whole and trusted to read past it, and the governor sent a hand `tell` to make
+/// sure, which a run is not allowed.
+///
+/// So the window opens for the stop alone, on two terms:
+///
+/// - **A reason, logged.** The stop is still the plan, and an edit to it after
+///   the run has started is a decision about the run. The list's log is where
+///   such a decision is recorded, beside `go`'s and `hold`'s.
+/// - **Only until the barrier row is open.** [`crate::cycle`] composes the
+///   barrier agent's work order with the stop in it when it opens the row. After
+///   that the stop has been read, and changing the record would make it disagree
+///   with what the agent was given. A `hold` settles that row, and the recheck
+///   is composed again from the list, so it reads the corrected stop.
+///
+/// The check and the write happen under the store lock, which is also where
+/// `open_barrier` creates the row. The two are ordered, so an accepted amendment
+/// is the stop the barrier is handed.
+fn amend_running_stop(store: &Store, args: &Args, id: &str, ordinal: usize, text: String, why: &str) -> i32 {
+    let outcome = store.locked(|| -> Result<(Worklist, bool), i32> {
+        // Read again inside the lock: a `go` in another process may have
+        // passed this barrier since the window was first read.
+        let mut w = store.worklist(id).ok_or(1)?;
+        let mut groups = w.groups();
+        let win = window(store, &w);
+        if win.at != Some(ordinal) {
+            return Err(win.refuse(ordinal, "will not amend the stop of"));
+        }
+        let open = store.tasks().into_iter().find(|t| {
+            crate::cycle::is_barrier(t, &w.id, ordinal)
+                && !matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done)
+        });
+        if let Some(b) = open {
+            eprintln!(
+                "wsp: will not amend group {ordinal}'s stop — its barrier is open on {} ({}), which was handed the stop as it stands",
+                b.id,
+                b.status().as_str()
+            );
+            eprintln!("     if that stop is wrong, the barrier holds; its recheck is handed the stop as amended then");
+            return Err(1);
+        }
+        let g = &mut groups[ordinal - 1];
+        if g.stop == text {
+            return Ok((w, false));
+        }
+        g.stop = text;
+        w.log(&format!(
+            "group {ordinal} stop amended while it runs — why: {why} · now: {}",
+            if g.stop.is_empty() { "none" } else { &g.stop }
+        ));
+        w.set_groups(&groups);
+        if let Err(e) = store.save_worklist(&w) {
+            eprintln!("wsp: write failed: {e}");
+            return Err(1);
+        }
+        Ok((w, true))
+    });
+    let (w, changed) = match outcome {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    // Committed outside the lock, as `member` does: the lock orders the edit
+    // against the barrier opening, and a commit is seconds nobody should wait
+    // behind.
+    if changed {
+        store.log_event("worklist-edited", json!({ "id": w.id, "what": "stop", "why": why }));
+        store.git_commit(&format!("wsp: worklist {} group {ordinal} stop amended while it runs", w.id));
+    }
+
+    if args.json() {
+        println!("{}", worklist_json(store, &w));
+    } else {
+        let stop = &w.groups()[ordinal - 1].stop;
+        let said = if stop.is_empty() { "no stop condition".to_string() } else { util::truncate(stop, 60) };
+        if !changed {
+            println!("{} group {ordinal}: the stop already reads that, so nothing was amended · {said}", w.id);
+            return 0;
+        }
+        println!("{} group {ordinal}: stop amended while it runs · {said}", w.id);
+        println!(
+            "  {}",
+            Paint::new().dim(&format!(
+                "why: {} · the barrier is handed this one; an agent already started was handed the one before",
+                util::truncate(why, 60)
+            ))
+        );
+    }
+    0
+}
+
+/// `--why`, the reason an edit is logged with. Optional ahead of the run, and
+/// required by [`amend_running_stop`].
+///
+/// It takes a typed sentence or the stream. It does not take `--from`, which on
+/// this verb is already the stop's source. So the stop comes from a file and
+/// the reason from stdin, or one of them is typed, and both on stdin is refused
+/// before either is read. The typed sentence gets the check [`typed_stop`] makes,
+/// since a reason for a corrected stop is written in the same vocabulary.
+fn reason(args: &Args) -> Result<Option<String>, i32> {
+    let Some(raw) = args.get("why") else { return Ok(None) };
+    if !matches!(raw.trim(), "-" | "true") {
+        if let Some(bad) = util::terminal_output(&raw) {
+            eprintln!("wsp: {bad}");
+            eprintln!("     a backtick inside double quotes runs a command. `--why -` reads the reason from stdin, where a shell never sees it");
+            return Err(2);
+        }
+        return Ok(Some(fold(&raw)).filter(|s| !s.is_empty()));
+    }
+    let stop_streams = match args.get("from") {
+        Some(f) => matches!(f.trim(), "-" | "true"),
+        None => matches!(args.get("stop").as_deref().map(str::trim), Some("-" | "true")),
+    };
+    if stop_streams {
+        eprintln!("wsp: the stop and its reason cannot both come from stdin — `--stop --from FILE --why -`");
+        return Err(2);
+    }
+    if util::stdin_is_tty() {
+        eprintln!("wsp: nothing is piped in — `--why -` reads the reason from a stream");
+        return Err(2);
+    }
+    match crate::cmd_task::read_source("-") {
+        Ok(text) => match fold(&text) {
+            t if t.is_empty() => {
+                eprintln!("wsp: nothing on stdin — `--why -` wants the reason there");
+                Err(2)
+            }
+            t => Ok(Some(t)),
+        },
+        Err(e) => {
+            eprintln!("wsp: cannot read stdin: {e}");
+            Err(1)
+        }
+    }
 }
 
 // ---- member -----------------------------------------------------------
@@ -4039,6 +4215,85 @@ mod tests {
             0,
             "and a new group at the end can never disagree with anything"
         );
+    }
+
+    /// `wsp-206`: a verifier found the live group's stop asserting something
+    /// false, and the only place a correction could go was a decision on one
+    /// member that the barrier agent was trusted to find. The stop is the
+    /// one field of the running group nothing has read as a barrier yet, so it
+    /// may be corrected. The reason is required, because the edit changes a
+    /// running plan, and it goes in the list's log.
+    #[test]
+    fn the_running_groups_stop_is_corrected_with_a_logged_reason_and_nothing_else_of_it_is() {
+        let store = scratch("amend-stop");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "doing");
+        task(&store, "wl-003", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        run(&store, &["add", "batch", "wl-003"]);
+        flagged(&store, &["group", "batch", "2"], &[("stop", "sonnet is priced 3/15")]);
+        started(&store, "batch");
+        crossed(&store, "batch", 1);
+
+        assert_eq!(
+            flagged(&store, &["group", "batch", "2"], &[("stop", "sonnet stays at 2/10")]),
+            2,
+            "a running plan is not changed without saying why"
+        );
+        assert_eq!(groups_of(&store, "batch")[1].stop, "sonnet is priced 3/15");
+
+        let why = "the vendor cancelled the step";
+        assert_eq!(
+            flagged(&store, &["group", "batch", "2"], &[("stop", "sonnet stays at 2/10"), ("why", why)]),
+            0
+        );
+        let w = store.worklist("batch").unwrap();
+        assert_eq!(w.groups()[1].stop, "sonnet stays at 2/10", "the barrier is handed the correction");
+        let log = w.section("Log").unwrap_or_default();
+        assert!(log.contains(why) && log.contains("amended while it runs"), "and the reason is on the record: {log}");
+
+        assert_eq!(
+            flagged(&store, &["group", "batch", "2"], &[("parallel", "2"), ("why", why)]),
+            1,
+            "a cap is still what is in flight, reason or none"
+        );
+        assert_eq!(
+            flagged(&store, &["group", "batch", "1"], &[("stop", "rewritten"), ("why", why)]),
+            1,
+            "a barrier already passed is history"
+        );
+    }
+
+    /// The window closes when the barrier row opens, because the barrier
+    /// agent's work order is composed with the stop at that moment. A `hold`
+    /// settles the row, and the recheck is composed afresh, so the window
+    /// opens again for it.
+    #[test]
+    fn the_running_groups_stop_is_refused_once_its_barrier_is_being_checked() {
+        let store = scratch("amend-at-barrier");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "review");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002"]);
+        started(&store, "batch");
+        crossed(&store, "batch", 1);
+
+        let mut row = Task::new(&crate::cycle::barrier_title("batch", 2), "wl-900");
+        row.tags = vec![crate::cycle::BARRIER_TAG.to_string()];
+        row.status_raw = "doing".into();
+        store.save_task(&row).unwrap();
+
+        let amend = [("stop", "corrected"), ("why", "it was wrong")];
+        assert_eq!(flagged(&store, &["group", "batch", "2"], &amend), 1, "its agent was handed the stop as it was");
+        assert_eq!(groups_of(&store, "batch")[1].stop, "");
+
+        row.status_raw = "review".into();
+        store.save_task(&row).unwrap();
+        assert_eq!(flagged(&store, &["group", "batch", "2"], &amend), 0, "held: the recheck reads it afresh");
+        assert_eq!(groups_of(&store, "batch")[1].stop, "corrected");
     }
 
     /// The window **at** a barrier, which is the moment the next group is

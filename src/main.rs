@@ -1827,11 +1827,12 @@ fn help_text() -> String {
                                     and -n says which before anything moves
   wsp worklist mv <slug> <task> --group N   between groups, or --after N for a
                                     new one between two that exist
-  wsp worklist group <slug> N [--parallel N|none] [--agent "kind [model] [effort]"|manual] [--stop "…"|-]
+  wsp worklist group <slug> N [--parallel N|none] [--agent "kind [model] [effort]"|manual] [--stop "…"|-] [--why "…"|-]
                                     a cap on the work, and the prose read at
                                     the barrier after that group — `-` reads it
                                     from a stream and --stop --from FILE out of
-                                    a file, where a shell never sees it
+                                    a file, where a shell never sees it. --why
+                                    is logged with the edit
   wsp worklist member <slug> <task> --agent "kind [model] [effort]"|none
                                     one member on its own line beside the
                                     group's — its spawn and its verifier run
@@ -1855,9 +1856,10 @@ fn help_text() -> String {
                                     barrier always reads whole; --stops draws
                                     every block back
   Editing is write-ahead-only: a group at or behind where the list is up to has
-  either run or is running, and is refused with what may be edited instead. A
-  member's own agent line is the exception: it may change until that member
-  starts.
+  either run or is running, and is refused with what may be edited instead. Two
+  exceptions: a member's own agent line may change until that member starts,
+  and the running group's stop may be corrected with a --why until its barrier
+  row opens.
 
   wsp worklist next [<slug>]        what may start now, what is holding it, or
                                     the prose to read at a barrier — with what
