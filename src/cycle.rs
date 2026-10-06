@@ -1654,8 +1654,9 @@ pub(crate) enum Closing {
 /// **A `hold` spares the check in front; a `done` does not** ([`Closing`]).
 pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &str, at: Option<usize>, how: Closing) {
     let Some(w) = store.worklist(list) else { return };
-    // First, so the sentences below reach whoever answers for the list now —
-    // the project's seat, or a hand on a member — and not a seat being ended.
+    // First, so the sentences below reach whoever answers for the list now and
+    // not a seat being ended: a hand on a member, for a list wsp runs and whose
+    // own seat is stood down (`wsp-202`); its project's seat, for one run by hand.
     if !matches!(how, Closing::Held) {
         stand_down_own_seat(store, list);
     }
