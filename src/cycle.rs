@@ -1456,7 +1456,12 @@ pub(crate) fn end_group(store: &Store, seats: &dyn Seats, w: &Worklist, passed: 
     if passed > 1 {
         ids.extend(tasks.iter().filter(|t| is_barrier(t, &w.id, passed - 1)).map(|t| t.id.clone()));
     }
-    ids.extend(owned_by(tasks.iter(), &w.id, passed));
+    // **Owned, but not the check in front.** `wsp spawn` stamps every row a
+    // run starts, the barrier check included, so ownership alone named the
+    // agent whose `go` this is — and the `advance` that `go` pokes ended it in
+    // the second its verdict landed, before its `wsp review`. Every
+    // agent-checked barrier from `wsp-158` on was left at `doing` (`wsp-209`).
+    ids.extend(owned_by(tasks.iter(), &w.id, passed).into_iter().filter(|id| !front_check(&tasks, &w.id, passed, id)));
     ids.sort();
     ids.dedup();
     // The verifiers first: each stands in its member's tree, and a member
@@ -1465,6 +1470,12 @@ pub(crate) fn end_group(store: &Store, seats: &dyn Seats, w: &Worklist, passed: 
         end_passes(store, seats, m, |_| true);
     }
     end_all(store, ids);
+}
+
+/// Whether `id` is a check on the barrier after group `at` — the agent a
+/// closing at that barrier is being run by, or may be.
+fn front_check(tasks: &[Task], list: &str, at: usize, id: &str) -> bool {
+    tasks.iter().any(|t| t.id == id && is_barrier(t, list, at))
 }
 
 /// The rows the run opened that the group text does not name: a governor's
@@ -1519,8 +1530,11 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
     // finished checks behind it and `pos.finished()` is false, so neither was
     // ended — which is what installing and looking found.
     //
-    // A check behind the position has run and been passed. A check in front of
-    // it has not, and ending that one would cut the turn it is in.
+    // A check behind the position has run and been passed. The check in front
+    // of a stopped list is ended here too once it stands at `review`, because
+    // nothing else will: a `hold` is that check's own turn as often as not, and
+    // ending it there cut the turn before its `wsp review` (`wsp-209`). A check
+    // still at `doing` is still deciding, and is left alone by the status read.
     //
     // A parked list is the same case as a held one: stopped short of the end,
     // with checks behind it that have been passed and one in front that has
@@ -1539,15 +1553,15 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
         .filter(|t| matches!(t.status(), Status::Review | Status::Done))
         .filter(|t| list_of(store, t).map(|l| l.id == w.id).unwrap_or(false))
         .filter(|t| claims.contains_key(&t.id))
-        // Behind the position, or anywhere at all once the run is over.
-        .filter(|t| !settled || group_of(t, &w.id).is_some_and(|at| at < behind))
+        // Up to the position, or anywhere at all once the run is over.
+        .filter(|t| !settled || group_of(t, &w.id).is_some_and(|at| at <= behind))
         .map(|t| t.id.clone())
         .collect();
     if !standing.is_empty() {
         stamp(&format!(
             "{}: {} and nothing left for them to decide — ending {}",
             w.id,
-            if settled { "has finished barriers behind it" } else { "has nothing left in it" },
+            if settled { "has finished barrier checks still standing" } else { "has nothing left in it" },
             standing.join(" ")
         ));
     }
@@ -1562,6 +1576,22 @@ pub(crate) fn last_barrier_left_behind(store: &Store, w: &Worklist) -> Vec<Strin
 fn group_of(t: &Task, list: &str) -> Option<usize> {
     let after = t.title.strip_prefix(&format!("{BARRIER_TITLE}{list} group "))?;
     after.split(['(', ' ']).next()?.parse().ok()
+}
+
+/// Which closing [`end_what_the_run_opened`] is ending a run's agents at.
+///
+/// **They differ over the check in front.** A `hold` is the barrier check's own
+/// verdict as often as anybody's, and ending that agent inside the verb cuts the
+/// turn in which it reviews its own row — `wsp-158` did, and every held check
+/// was left at `doing` (`wsp-209`). A hold stops nothing in flight anyway, so
+/// the check is left to finish and [`last_barrier_left_behind`] ends it once it
+/// stands at `review`. A `done` ends the run outright, typed by whoever is
+/// over it, and a check still reading is one more thing it was opened for and
+/// will never be asked.
+#[derive(Clone, Copy)]
+pub(crate) enum Closing {
+    Held,
+    Done,
 }
 
 /// Everything a run opened, ended at a closing that is not a pass: `hold` and
@@ -1582,7 +1612,9 @@ fn group_of(t: &Task, list: &str) -> Option<usize> {
 /// **Said, not done quietly.** The seat is told, because ending an agent on work
 /// somebody may have meant to return to is not a thing to do without a record,
 /// and `cycle.log` is where the record of a run is read.
-pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &str, at: Option<usize>) {
+///
+/// **A `hold` spares the check in front; a `done` does not** ([`Closing`]).
+pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &str, at: Option<usize>, how: Closing) {
     let Some(w) = store.worklist(list) else { return };
     let tasks = store.tasks();
     let mut ids: Vec<String> = Vec::new();
@@ -1626,8 +1658,11 @@ pub(crate) fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &s
                     .filter(|t| t.parent.as_ref().is_some_and(|p| g.members.contains(p)))
                     .map(|t| t.id.clone()),
             );
-            ids.extend(tasks.iter().filter(|t| is_barrier(t, list, at)).map(|t| t.id.clone()));
-            ids.extend(owned_by(tasks.iter(), list, at));
+            let spare = |id: &String| matches!(how, Closing::Held) && front_check(&tasks, list, at, id);
+            if matches!(how, Closing::Done) {
+                ids.extend(tasks.iter().filter(|t| is_barrier(t, list, at)).map(|t| t.id.clone()));
+            }
+            ids.extend(owned_by(tasks.iter(), list, at).into_iter().filter(|id| !spare(id)));
         }
     }
     ids.sort();
@@ -2748,9 +2783,15 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_worklist(&w).unwrap();
 
         let checks = last_barrier_left_behind(&store, &w);
-        assert_eq!(checks, vec!["b-1".to_string()], "the check behind the position, and not the one in front");
+        assert_eq!(checks, vec!["b-1".to_string()], "the check behind the position, and not the one still reading");
         let verdicts = verdicts_recorded(&store);
         assert_eq!(verdicts, vec!["v-1".to_string()], "and the verifier that has nothing left to do");
+
+        // `wsp-209`: the check in front ran the `hold` and then reviewed its own
+        // row. Nothing else ends it — the hold spared it — so the tick does.
+        set(&store, "b-2", Status::Review);
+        let checks = last_barrier_left_behind(&store, &w);
+        assert_eq!(checks, vec!["b-1".to_string(), "b-2".to_string()], "a check at review has finished deciding");
     }
 
     /// `wsp-158` item 1, and the commonest of the four leaks. A verifier's turn
@@ -2879,7 +2920,7 @@ fn only_a_working_screen_is_ever_overruled() {
         }
         let _ = drained(&TOLD);
 
-        end_what_the_run_opened(&store, &Exits, "run", Some(1));
+        end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Done);
         let mut was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
         was.sort();
         let mut expected = vec!["b-1".to_string(), "h-1".to_string(), "m-1".to_string(), "cpd-9".to_string()];
@@ -2920,9 +2961,67 @@ fn only_a_working_screen_is_ever_overruled() {
             store.set_claim(id, serde_json::json!({ "workspace": "w" }));
         }
 
-        end_what_the_run_opened(&store, &Exits, "run", None);
+        end_what_the_run_opened(&store, &Exits, "run", None, Closing::Done);
         let was = tests::ENDED.with(|e| e.borrow_mut().drain(..).collect::<Vec<_>>());
         assert_eq!(was, vec!["b-1".to_string()], "this run's barrier, and nothing the other run started");
+    }
+
+    /// `wsp-209`. **A pass does not end the agent whose `go` it is.** `wsp spawn`
+    /// stamps the barrier check as opened by the run, like any row the run
+    /// starts, so reading ownership named it — and the `advance` its own `go`
+    /// pokes ended it in the same second, before the `wsp review` its order
+    /// ends on. Every agent-checked barrier from `wsp-158` on stood at `doing`.
+    ///
+    /// The check behind is still ended: that is the next pass's to do.
+    #[test]
+    fn a_pass_leaves_its_own_barrier_check_to_review_its_row_and_ends_the_one_behind() {
+        let (_env, store) = scratch("ownfront");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude"), (&["m-2"], "claude")]);
+        for (at, id) in [(1, "b-1"), (2, "b-2")] {
+            let mut check = Task::new(&barrier_title("run", at), id);
+            check.tags = vec![BARRIER_TAG.into()];
+            check.set_status(Status::Doing);
+            // What the claim writes, from the environment `start` gave it.
+            check.log(&format!("{} run group {at}", OWNED));
+            store.save_task(&check).unwrap();
+            store.set_claim(id, serde_json::json!({ "workspace": "w" }));
+        }
+        set(&store, "b-1", Status::Review);
+        let _ = drained(&ENDED);
+
+        end_group(&store, &Exits, &w, 1);
+        assert!(drained(&ENDED).is_empty(), "group 1's check is running the `go` that passed group 1");
+
+        end_group(&store, &Exits, &w, 2);
+        assert_eq!(drained(&ENDED), vec!["b-1".to_string()], "the next pass ends it, and spares its own check in turn");
+    }
+
+    /// `wsp-209`, the other verdict. A `hold` is the barrier check's own turn as
+    /// often as a governor's, and `wsp-158` ended that check from inside it — so
+    /// a held barrier's row stayed at `doing` too. A hold stops nothing in
+    /// flight; the check finishes, reviews its row, and a tick ends it.
+    #[test]
+    fn a_hold_ends_what_the_run_opened_but_not_the_check_whose_verdict_it_is() {
+        let (_env, store) = scratch("holdfront");
+        task(&store, "m-1", Status::Review);
+        let _w = list(&store, &[(&["m-1"], "claude")]);
+        let mut check = Task::new(&barrier_title("run", 1), "b-1");
+        check.tags = vec![BARRIER_TAG.into()];
+        check.set_status(Status::Doing);
+        check.log(&format!("{} run group 1", OWNED));
+        store.save_task(&check).unwrap();
+        let mut helper = Task::new("Install master", "h-1");
+        helper.log(&format!("{} run group 1", OWNED));
+        store.save_task(&helper).unwrap();
+        for id in ["b-1", "h-1"] {
+            store.set_claim(id, serde_json::json!({ "workspace": "w" }));
+        }
+        let _ = drained(&ENDED);
+
+        end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Held);
+        assert_eq!(drained(&ENDED), vec!["h-1".to_string()], "the helper, and not the check holding the barrier");
     }
 
     /// `wsp-136` item 1. A note on a member is somebody **saying** something

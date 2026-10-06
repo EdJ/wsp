@@ -3506,10 +3506,11 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     crate::cycle::poke_list(store, &w.id, "hold", None);
     // `wsp-158`: a `hold` stops nothing that is already in flight, and says so
     // above. What it must not leave behind is an agent with nothing left to do —
-    // a verifier that has recorded its verdict, a barrier check that has run its
-    // `hold`. `wsp release` is refused for a seat, so the honest ending is the
-    // whole one, and it is the seat that is told what happened.
-    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at);
+    // a verifier that has recorded its verdict, a member, a helper. `wsp
+    // release` is refused for a seat, so the honest ending is the whole one, and
+    // it is the seat that is told what happened. Not the barrier check: this is
+    // usually its turn, and it ends at `review` on a tick (`wsp-209`).
+    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Held);
 
     if args.json() {
         println!(
@@ -3800,7 +3801,7 @@ pub fn done(store: &Store, args: &Args) -> i32 {
     // be typed on a list with work still open — that is its documented meaning —
     // and ending a member's agent on a list somebody meant to come back to is
     // not something to do without saying.
-    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at);
+    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Done);
 
     if args.json() {
         println!(
