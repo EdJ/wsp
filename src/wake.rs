@@ -128,6 +128,7 @@
 
 use crate::agent_commands;
 use crate::cmd_govern;
+use crate::cycle::Seats;
 use crate::cmd_watch::{Emit, Line, Sink, Spec, Spool, Spooled, Stream, EVERYONE};
 use crate::place::Seat as Pane;
 use crate::store::Store;
@@ -246,7 +247,7 @@ pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
         mine.entry(e.to.clone()).or_default().push(e);
     }
     for (scope, theirs) in mine {
-        deliver_to(store, &scope, &theirs, at);
+        deliver_to(store, &crate::cycle::Fleet, &scope, &theirs, at);
     }
 }
 
@@ -277,14 +278,23 @@ fn already_handed(store: &Store, e: &Emit) -> bool {
 ///
 /// Returns what happened, because [`say`] has to tell a caller where its
 /// sentence went and this is the only place that knows. The pass throws it away.
-fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
+fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at: i64) -> Report {
     let key = key_for(scope);
     let spec = Spec::for_wake(scope);
     let delivered = record(store, &key).0;
-    // Nothing new and nothing held is nothing to do. Said here rather than at
+    // Nothing new and nothing owed is nothing to type. Said here rather than at
     // the caller because the caller visits every seat with a record, and a seat
     // at rest must not cost a store write every twenty seconds for ever.
+    //
+    // **The gate on typing, and not on the sentence.** It used to be both: the
+    // only writer of `holding` is below it, so a scope whose whole spool is
+    // withheld kept whatever it last said — `tokenhub-spec-sync` reading *nothing
+    // worth a wake yet* about a seat with nobody in it, and `compound-parity`
+    // reading *no seat on this scope*, a sentence from a reader `4719681` deleted,
+    // for twenty-one hours. `wsp-166` made owed and held two questions on purpose,
+    // and "is anybody in this seat" is a third. See [`restate`].
     if emits.is_empty() && owed_to_a_seat(store, &key) == 0 {
+        restate(store, seats, scope, &key);
         return Report::at_rest();
     }
 
@@ -313,7 +323,7 @@ fn deliver_to(store: &Store, scope: &str, emits: &[&Emit], at: i64) -> Report {
     // which is empty unless the sink took it.
     // Taken before the flush, because a flush empties the copy in hand and the
     // number is what says *everything up to here has gone*.
-    let mut tell = Tell::new(store, scope);
+    let mut tell = Tell::new(store, seats, scope);
     let sent: Vec<u64> =
         Stream::new(&spec, &mut tell).tick(at, &mut spool).iter().map(|h| h.seq).collect();
     let written = sent.len();
@@ -468,6 +478,12 @@ impl Report {
 /// [`Tell::deliver`] — the same question the reconciler asks, which is the sixth
 /// instance of this row's own lesson about two readers of one record.
 pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) -> Report {
+    say_through(store, &crate::cycle::Fleet, scope, text, record)
+}
+
+/// [`say`], with the port that reads the seat named — so a test can say what the
+/// seat is doing rather than inherit whatever a machine with no backend says.
+fn say_through(store: &Store, seats: &dyn Seats, scope: &str, text: &str, record: Option<&str>) -> Report {
     let at = util::epoch_secs();
     let key = key_for(scope);
     // Written before anything is attempted, and the durability is the reason
@@ -481,7 +497,7 @@ pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) 
         // either way, and the only thing this hop suppresses is the duplicate.
         let _ = crate::message::sent(store, id, scope);
     }
-    deliver_to(store, scope, &[], at)
+    deliver_to(store, seats, scope, &[], at)
 }
 
 /// A wake, told.
@@ -496,6 +512,9 @@ pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) 
 /// not the send — is the record that a fact was delivered.**
 pub(crate) struct Tell<'a> {
     store: &'a Store,
+    /// What answers [`nobody_there`] — the reconciler's port, so the seat this
+    /// path will not type at is the seat the reconciler is filling.
+    seats: &'a dyn Seats,
     scope: String,
     /// Why the last attempt did not land, in the words `--status` prints.
     ///
@@ -519,14 +538,22 @@ pub(crate) struct Tell<'a> {
 }
 
 impl<'a> Tell<'a> {
-    fn new(store: &'a Store, scope: &str) -> Tell<'a> {
-        Tell { store, scope: scope.to_string(), why: NOT_YET.into(), typed: false, typed_at: None }
+    fn new(store: &'a Store, seats: &'a dyn Seats, scope: &str) -> Tell<'a> {
+        Tell { store, seats, scope: scope.to_string(), why: NOT_YET.into(), typed: false, typed_at: None }
     }
 }
 
 /// Nothing here is worth a context read on its own. The ordinary state, and
 /// not a fault: it is what `core-017`'s table is for.
 const NOT_YET: &str = "nothing worth a wake yet";
+
+/// A scope nobody has ever governed: no record, so nothing to fill and nobody
+/// filling it. The one case with genuinely no addressee — see [`nobody_there`].
+const NO_SEAT: &str = "no seat on this scope";
+
+/// The seat reads occupied and the agent in it could not be found to type at.
+/// Not a vacancy, and deliberately not worded as one: see [`Tell::deliver`].
+const NOT_FOUND: &str = "somebody is in the seat and wsp could not find them to type at";
 
 /// The text is at the seat and no turn has started on it.
 ///
@@ -564,6 +591,40 @@ pub(crate) fn held_because(state: crate::place::State) -> Option<&'static str> {
         State::Starting => Some("the agent is still coming up"),
         State::Empty | State::Gone => Some("the seat is empty"),
         State::Unknown => Some("herdr cannot say what the seat is doing"),
+    }
+}
+
+/// Whether anybody is in this scope's seat, said as `--status` prints it —
+/// `None` where somebody is, and the sentence a wake is held under where nobody
+/// is.
+///
+/// **The one place a sentence about occupancy is decided, and it is
+/// [`crate::repair::reading`] rather than a question of its own.** `wsp-148` was
+/// sent back four times for the same shape: two readers of one record, or one
+/// gate asking a different question from the sentence it writes. Here there were
+/// three — `Tell::deliver` asked `seat_held` and then `occupant`, its own pane
+/// state asked a third time, and the reconciler asked `reading`. They parted on
+/// a backend that could not be reached (the locator said `unseated`, the
+/// reconciler said it could not tell and would not act) and on a slot with an
+/// empty pane (one said *no seat on this scope*, the other was filling it). Every
+/// writer of `holding` that is about a seat now comes through here: the typing
+/// path in [`Tell::deliver`] and the at-rest one in [`restate`].
+///
+/// **No record at all is the one reading `reading` does not name**, because the
+/// reconciler does not need to: a scope nobody has ever governed is not filled
+/// unless a list is running on it, and *no seat on this scope* is the sentence
+/// that does not promise a governor is on its way.
+fn nobody_there(store: &Store, seats: &dyn Seats, scope: &str) -> Option<String> {
+    use crate::repair::Occupancy;
+    if !store.governors().contains_key(scope) {
+        return Some(NO_SEAT.into());
+    }
+    match crate::repair::reading(store, seats, scope) {
+        Occupancy::Occupied => None,
+        Occupancy::Vacant(_) => Some(unseated(store, scope)),
+        // An absence is not a vacancy: the reconciler will not act on it, so
+        // this must not say a governor is on its way.
+        Occupancy::Unreadable => held_because(crate::place::State::Unknown).map(String::from),
     }
 }
 
@@ -671,26 +732,24 @@ impl Sink for Tell<'_> {
         if said.is_empty() {
             return true;
         }
-        let governors = self.store.governors();
-        // **`seat_held`, not `seat_of_scope`, and this is the reader the
-        // reconciler uses.** The difference is a record `reconcile` vacated: its
-        // pane is under `last`, so `seat_of_scope` says there is no post here and
-        // the sentence was held as *nowhere*, while `seat_vacant` on the same
-        // record counted the emptiness and went looking for a successor. Two
-        // readers, one record, opposite answers — and the one that said "nowhere"
-        // was the one that loses sentences.
-        let Some(seat) = cmd_govern::seat_held(&self.scope, &governors) else {
-            // No post has ever existed on this scope. Not a failure and not a
-            // drop: the spool keeps it, and a seat created tomorrow morning is
-            // told what it missed. This is now the one case where there is
-            // genuinely no addressee, because a record nobody has written is a
-            // thing the reconciler will not fill either.
-            self.why = "no seat on this scope".into();
+        // Whether anybody is there is [`nobody_there`]'s, and is not asked again
+        // below. Not a failure and not a drop either way: the spool keeps it, and
+        // a seat filled tomorrow morning is told what it missed.
+        if let Some(why) = nobody_there(self.store, self.seats, &self.scope) {
+            self.why = why;
+            return false;
+        }
+        // Somebody is there, and this is only *where* — the agent to type at,
+        // which for a compound seat may be the room rather than the pane. A
+        // locator that cannot find what the reading saw is not a vacancy, and
+        // saying `unseated` here was the second reader this row kept finding.
+        let Some(seat) = cmd_govern::seat_held(&self.scope, &self.store.governors()) else {
+            self.why = NOT_FOUND.into();
             return false;
         };
         let backends = crate::cmd_spawn::local_backends();
         let Some((place, found)) = cmd_govern::occupant(self.store, &backends, &seat) else {
-            self.why = unseated(self.store, &self.scope);
+            self.why = NOT_FOUND.into();
             return false;
         };
         let how = agent_commands::of(&found.agent.kind);
@@ -797,14 +856,12 @@ impl Sink for Tell<'_> {
             // `State::Unknown` when herdr could not be asked, which
             // [`held_because`] refuses — an absence is not a fact, least of all
             // the fact that somebody is there to read this.
-            // `Empty` and `Gone` are one sentence and it is not the state's
-            // name: a seat nobody is in is a seat wsp is replacing, and `wsp-148`
-            // asks the holding to say so rather than leave `empty` reading as a
-            // fact about a pane. See `unseated`.
-            if matches!(state, crate::place::State::Empty | crate::place::State::Gone) {
-                self.why = unseated(self.store, &self.scope);
-                return false;
-            }
+            //
+            // `Empty` and `Gone` here are the pane emptying between
+            // [`nobody_there`]'s reading and this one, and they are said as a
+            // state, not as `unseated`: the next pass reads the vacancy where
+            // vacancies are read, and a second place deciding it is the thing
+            // this row has been sent back for four times.
             if let Some(why) = held_because(state) {
                 self.why = why.into();
                 return false;
@@ -859,6 +916,40 @@ fn owed_to_a_seat(store: &Store, key: &str) -> usize {
     let mut spool = load(store, key);
     spool.withhold_for_a_seat(store);
     spool.depth()
+}
+
+/// A seat owed nothing, re-read for the sentence it is holding under — and the
+/// record written only when that sentence has changed.
+///
+/// **Compare, then write: `repair::told_once`'s bound, and the reason the gate
+/// above exists.** An at-rest seat must not cost a store write every twenty
+/// seconds for ever, so this pays a read — one seat's state, which the reconciler
+/// already spends on the same scopes — and writes on a change of sentence, which
+/// is a change of seat.
+///
+/// **Against what it would say now, not on a transition into vacancy**, and that
+/// is what makes an old sentence correctable: `compound-parity`'s *no seat on
+/// this scope* was written by a reader that no longer exists, and a writer that
+/// fired only on the way into a vacancy would have left it there for ever. It
+/// also runs the other way — a seat refilled while its spool is all withheld
+/// goes back to *nothing worth a wake yet* rather than reading `unseated` about a
+/// governor that is sitting in it.
+///
+/// An empty spool is left alone: `stamp` writes no reason for holding nothing,
+/// and comparing that `""` against a sentence would rewrite it every pass.
+fn restate(store: &Store, seats: &dyn Seats, scope: &str, key: &str) {
+    let (delivered, rec) = record(store, key);
+    if Spool::of_json(rec.get("spool").unwrap_or(&Value::Null)).depth() == 0 {
+        return;
+    }
+    let why = nobody_there(store, seats, scope).unwrap_or_else(|| NOT_YET.into());
+    if rec.get("holding").and_then(Value::as_str) == Some(why.as_str()) {
+        return;
+    }
+    store.update_watch(key, |rec| {
+        let spool = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        stamp(rec, scope, delivered, &why, &spool);
+    });
 }
 
 fn load(store: &Store, key: &str) -> Spool {
@@ -1175,7 +1266,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         "the record really is only `last`: {rec}"
     );
 
-    let report = say(&store, "core", "somebody needs an answer", None);
+    let report = say_through(&store, &Gone, "core", "somebody needs an answer", None);
     assert_eq!(
         spool_of(&store, "core").depth(),
         1,
@@ -1194,6 +1285,172 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
 
     let _ = std::fs::remove_dir_all(&env.state());
 }
+
+    /// A store with `core`'s spool holding three lines nobody is owed — `edge:
+    /// left`, a level that moved on — and nothing else.
+    ///
+    /// **Built from the emit, not from `held_for` or a message**, and that is the
+    /// whole of it: a message always counts as owed, so every fixture that used
+    /// one went through the typing path and passed against a defect that lived
+    /// only on the path that types nothing. `tokenhub-spec-sync`'s live shape.
+    fn withheld(name: &str) -> (util::Isolated, Store, String) {
+        let env = util::isolated(name);
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let key = key_for("core");
+        for i in 0..3 {
+            let e = Emit {
+                edge: Edge::Left,
+                signal: Signal::new(Kind::Review, "m-1", "the level moved on").to("core"),
+                held: i,
+                to: "core".into(),
+            };
+            store.update_watch(&key, |rec| {
+                Spool::append(rec, vec![Spooled::of(0, Line::News(e))]);
+            });
+        }
+        assert_eq!(owed_to_a_seat(&store, &key), 0, "withheld, so nothing is owed and the gate fires");
+        assert_eq!(load(&store, &key).depth(), 3, "though three are held");
+        (env, store, key)
+    }
+
+    /// A seat somebody was in and has left — vacated by `cmd_govern::vacate`
+    /// rather than written by hand, so the pane is under `last` the way a real
+    /// vacate leaves it.
+    fn vacated(store: &Store) {
+        store.set_governor(
+            "core",
+            json!({ "workspace": "w9", "pane": "cpd-9", "host": util::hostname(), "kind": "claude" }),
+        );
+        assert!(cmd_govern::vacate(store, "core"));
+    }
+
+    /// Marks the record so a test can tell whether the next pass wrote it — the
+    /// stamp's `tick` is whole seconds and a pass is faster than that.
+    fn mark(store: &Store, key: &str) {
+        store.update_watch(key, |rec| rec["tick"] = json!("unwritten"));
+    }
+
+    fn written(store: &Store, key: &str) -> bool {
+        store.watches()[key]["tick"] != "unwritten"
+    }
+
+    /// **`wsp-179`'s third item: a whole spool withheld *and* an empty seat,
+    /// asserting the sentence.** The at-rest gate returned before the only writer
+    /// of `holding`, so this scope kept whatever it last said for ever — and the
+    /// defect hid behind every fixture that appended a message, because a message
+    /// is owed and goes the other way. Through `deliver_to` with no emits, which
+    /// is the pass's own call for a scope with nothing new.
+    #[test]
+    fn a_scope_whose_whole_spool_is_withheld_and_whose_seat_is_empty_says_unseated() {
+        let (env, store, key) = withheld("wakes-withheld");
+        vacated(&store);
+        mark(&store, &key);
+
+        deliver_to(&store, &Gone, "core", &[], 0);
+        let said = holding(&store, "core");
+        assert!(said.starts_with("unseated · 3 held"), "empty is not quiet: {said}");
+
+        // **Bounded, which is the reason the gate exists.** The same sentence on
+        // the next pass is no write at all.
+        mark(&store, &key);
+        deliver_to(&store, &Gone, "core", &[], 20);
+        assert!(!written(&store, &key), "an at-rest seat must not cost a store write every twenty seconds for ever");
+        assert_eq!(holding(&store, "core"), said);
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **`wsp-179`'s second item: a stale sentence is overwritten, not only an
+    /// absent one filled.** `compound-parity` held *no seat on this scope* for
+    /// twenty-one hours — a sentence from the `seat_of_scope` reader `4719681`
+    /// replaced, false because its record remembers a pane. And the same writer
+    /// has to run the other way: a seat refilled while everything it holds is
+    /// withheld must stop reading `unseated` about the governor sitting in it.
+    #[test]
+    fn a_withheld_scope_corrects_a_sentence_that_is_no_longer_true_in_either_direction() {
+        let (env, store, key) = withheld("wakes-withheld-stale");
+        vacated(&store);
+        store.update_watch(&key, |rec| rec["holding"] = json!("no seat on this scope"));
+
+        deliver_to(&store, &Gone, "core", &[], 0);
+        let said = holding(&store, "core");
+        assert!(said.starts_with("unseated"), "a retired sentence is corrected rather than kept: {said}");
+
+        // Refilled. Nothing is owed, so nothing is typed — and the seat is not
+        // empty, so it must not go on saying it is.
+        deliver_to(&store, &Working, "core", &[], 20);
+        assert_eq!(holding(&store, "core"), NOT_YET, "a seat with somebody in it is not a vacancy");
+        mark(&store, &key);
+        deliver_to(&store, &Working, "core", &[], 40);
+        assert!(!written(&store, &key), "and saying so once is enough");
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **A seat nobody can be asked about is not reported empty, on either
+    /// path.** The reconciler refuses to act on an unreadable seat, so a holding
+    /// that said `unseated · … · counting` there would promise a governor nothing
+    /// is sending. The typing path used to say exactly that: its locator found no
+    /// agent when the backend was down and called the seat unseated, while
+    /// `repair::reading` called it unreadable. One decider now, so both paths
+    /// read the same.
+    #[test]
+    fn a_seat_nobody_can_ask_about_is_never_called_unseated() {
+        let (env, store, key) = withheld("wakes-withheld-silent");
+        vacated(&store);
+
+        deliver_to(&store, &Silent, "core", &[], 0);
+        let at_rest = holding(&store, "core");
+        assert_eq!(at_rest, held_because(crate::place::State::Unknown).unwrap(), "at rest");
+
+        // And with something owed, which is `Tell::deliver`'s path.
+        store.update_watch(&key, |rec| {
+            Spool::append(rec, vec![Spooled::of(0, Line::Note(crate::cmd_watch::Class::Message, "an answer".into()))]);
+        });
+        let report = deliver_to(&store, &Silent, "core", &[], 20);
+        assert_eq!(report.why, at_rest, "typing path and at-rest path are one reading");
+        assert_eq!(holding(&store, "core"), at_rest);
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **A slot with no pane in it is a vacancy, not *no seat*.** `tooling`'s live
+    /// record is `workspace: compound, pane: ""`, which the reconciler reads as
+    /// unseated and fills; the typing path read it as no post at all. And a scope
+    /// with no record is the one that genuinely has no seat, at rest as well.
+    #[test]
+    fn a_slot_with_no_pane_reads_unseated_and_a_scope_with_no_record_reads_no_seat() {
+        let (env, store, key) = withheld("wakes-withheld-slot");
+        deliver_to(&store, &Gone, "core", &[], 0);
+        assert_eq!(holding(&store, "core"), NO_SEAT, "nobody has ever governed this scope");
+
+        store.set_governor("core", json!({ "workspace": "compound", "pane": "", "host": util::hostname() }));
+        store.update_watch(&key, |rec| {
+            Spool::append(rec, vec![Spooled::of(0, Line::Note(crate::cmd_watch::Class::Message, "an answer".into()))]);
+        });
+        let report = deliver_to(&store, &Working, "core", &[], 20);
+        assert!(report.why.starts_with("unseated"), "an empty slot is a vacancy: {}", report.why);
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// The three readings a seat can give [`crate::repair::reading`], as fakes.
+    struct Gone;
+    struct Working;
+    struct Silent;
+
+    impl crate::cycle::Seats for Gone {
+        fn state(&self, _: &str) -> Option<crate::place::State> {
+            Some(crate::place::State::Gone)
+        }
+    }
+    impl crate::cycle::Seats for Working {
+        fn state(&self, _: &str) -> Option<crate::place::State> {
+            Some(crate::place::State::Working)
+        }
+    }
+    impl crate::cycle::Seats for Silent {
+        fn state(&self, _: &str) -> Option<crate::place::State> {
+            None
+        }
+    }
 
     /// **The two readings `wsp-148` did not ask for and `wsp-148` caused.**
     /// `reseating` and `daemon down` were true of the two states its first
@@ -1219,7 +1476,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         // Said through the real path rather than by stamping the field, because
         // what is under test is the sentence a reader gets.
         let why = |store: &Store| {
-            say(store, "core", "owed", None).why
+            say_through(store, &Gone, "core", "owed", None).why
         };
         assert_eq!(
             crate::cmd_govern::vacancy(&store.governors(), "core").reseating,
@@ -1335,7 +1592,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     fn a_wake_is_never_painted_for_a_terminal_that_is_not_there() {
         let env = util::isolated("wake-paint");
         let store = Store::at(env.home(), env.state());
-        let tell = Tell::new(&store, "core");
+        let tell = Tell::new(&store, &Gone, "core");
 
         assert!(!Sink::paint(&tell).on(), "a composer cannot read escape codes");
     }
