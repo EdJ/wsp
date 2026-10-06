@@ -2279,15 +2279,20 @@ pub(crate) fn stamp(line: &str) {
 /// readable file in the order they happened rather than needing a reader to know
 /// which process wrote which.
 pub(crate) fn log_line(store: &Store, line: &str) {
-    // The in-memory record goes through `stamp` so the tests can read what was
-    // said; the file is written whatever that says, because a test asserting on
-    // a record the same function produced proves nothing about the file. The
-    // isolated store a test uses is a throwaway directory, so writing it costs
-    // nothing and keeps this assertion honest.
+    // **Never echoed to stdout as well** (`wsp-217`). It was, through `stamp`,
+    // and a process this module launches has `cycle.log` *as* its stdout — so
+    // every line said from a reseat or run-step child, `the reseat failed`
+    // among them, landed in the file twice: once through the descriptor, once
+    // through the append below. The daemon's stdout copy went to `daemon.log`,
+    // which nothing reads for a run. The file is the one place this writes.
+    //
+    // The in-memory record is for the tests to read what was said; the file is
+    // written whatever that says, because a test asserting on a record the same
+    // function produced proves nothing about the file. The isolated store a
+    // test uses is a throwaway directory, so writing it costs nothing and keeps
+    // this assertion honest.
     #[cfg(test)]
     tests::SAID.with(|s| s.borrow_mut().push(line.to_string()));
-    #[cfg(not(test))]
-    stamp(line);
     let at = util::now_iso();
     let Ok(mut out) = std::fs::OpenOptions::new()
         .create(true)
@@ -3889,5 +3894,20 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(reading(&store), vec!["m-1".to_string()], "landed: the verifier starts");
         assert!(drained(&TOLD).is_empty(), "and a landed review is the next step, not news");
         let _ = spawned();
+    }
+
+    /// **One call is one line in `cycle.log`** (`wsp-217`). It was two for any
+    /// process this module launched: `log_line` echoed to stdout, and that
+    /// child's stdout *is* the file. The echo cannot be observed from here — a
+    /// test has no terminal, and `stamp` writes nothing under `cfg(test)` — so
+    /// this holds the other half: the function appends exactly once itself, and
+    /// the doc on it says why it must not also print.
+    #[test]
+    fn a_line_said_through_log_line_is_in_cycle_log_once() {
+        let (_env, store) = scratch("logonce");
+        log_line(&store, "core: the reseat failed — the agent never came up");
+
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
+        assert_eq!(log.matches("the reseat failed").count(), 1, "{log:?}");
     }
 }
