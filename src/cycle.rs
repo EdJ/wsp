@@ -1118,7 +1118,11 @@ struct Opened {
 fn moved_since(now_landing: &Option<String>, member_updated: &str, pass: &crate::verification::Pass) -> bool {
     match (now_landing, &pass.read) {
         (Some(now), Some(then)) => !crate::verification::same_commit(now, then),
-        _ => member_updated > pass.at.as_str(),
+        // Against the verdict and not the opening: the block itself moves the
+        // member to `doing`, and that is not the member moving. `decided` is
+        // the instant the verdict was recorded (`wsp-193`), and the block's
+        // own write carries the same one.
+        _ => member_updated > pass.decided.as_deref().unwrap_or(pass.at.as_str()),
     }
 }
 

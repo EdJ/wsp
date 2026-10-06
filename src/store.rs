@@ -3339,13 +3339,9 @@ mod tests {
         assert!(store.task_or_why("22").is_err(), "not a boundary");
     }
 
-    /// The reason this row exists. This project reads by citation — source
-    /// comments and task prose name ids by the dozen — and `no such task` is a
-    /// true statement about the live set and a false one about the world,
-    /// delivered with total confidence. A reader who follows a reference has to
-    /// be able to tell "this never existed" from "this was swept last Tuesday",
-    /// so the path is asserted and not just the word: it is the half that turns
-    /// the answer into somewhere to go.
+    /// `wsp-188`: a citation of an archived id resolves to that row, before
+    /// any open title that happens to mention it — `wsp show wsp-174` printed
+    /// wsp-176, whose title is about "ending wsp-174".
     #[test]
     fn an_archived_id_cited_in_an_open_rows_title_still_resolves_to_the_archive() {
         let store = scratch("archived-cited");
@@ -3362,6 +3358,13 @@ mod tests {
         assert_eq!(store.find_task("ending wsp").map(|t| t.id), Some("wsp-176".into()), "a phrase is still a title search");
     }
 
+    /// The reason this row exists. This project reads by citation — source
+    /// comments and task prose name ids by the dozen — and `no such task` is a
+    /// true statement about the live set and a false one about the world,
+    /// delivered with total confidence. A reader who follows a reference has to
+    /// be able to tell "this never existed" from "this was swept last Tuesday",
+    /// so the path is asserted and not just the word: it is the half that turns
+    /// the answer into somewhere to go.
     #[test]
     fn an_archived_task_says_where_it_went_instead_of_saying_it_never_existed() {
         let store = scratch("archived-resolve");

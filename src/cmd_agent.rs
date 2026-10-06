@@ -106,6 +106,12 @@ impl Here {
 }
 
 /// Walk the chain. Pure: everything it reads is in `h`.
+/// The project of the member whose open pass names this seat.
+fn verifying_project(tasks: &[Task], seat: &str) -> Option<String> {
+    let member = crate::verification::seats(tasks).remove(seat)?;
+    tasks.iter().find(|t| t.id == member).and_then(|t| t.project.clone())
+}
+
 pub(crate) fn standing_in(h: &Here) -> Option<String> {
     let bound_project = h.pane.as_ref().and_then(|pane| {
         h.bindings
@@ -114,6 +120,11 @@ pub(crate) fn standing_in(h: &Here) -> Option<String> {
             .and_then(|t| t.as_str())
             .and_then(|id| h.tasks.iter().find(|t| t.id == id))
             .and_then(|t| t.project.clone())
+            // A verifier's seat is bound to nothing, and is named on its
+            // member's open pass instead (`wsp-188`). Read as a binding, so
+            // its brief and `wip` place it where the member is — it read as
+            // `compound` while verifying a wsp member.
+            .or_else(|| verifying_project(&h.tasks, pane))
     });
 
     // A mandate is a statement about what this workspace is *for*, so it beats
@@ -3951,7 +3962,9 @@ pub(crate) fn wip_rows(w: &Wip) -> Vec<WipRow> {
             &w.index,
             &w.pins,
             resolve::Held {
-                binding: bound.and_then(|t| t.project.clone()),
+                binding: bound.and_then(|t| t.project.clone()).or_else(|| {
+                    verifying.get(seat).and_then(|m| w.tasks.iter().find(|t| &t.id == m)).and_then(|t| t.project.clone())
+                }),
                 claim: resolve::claimed_project(&w.claims, &w.tasks, agent.as_deref(), Some(workspace_id), None),
             },
             agent.as_deref(),
@@ -7425,6 +7438,7 @@ mod tests {
         let rows = wip_rows(&w);
         let row = rows.iter().find(|r| r.pane == "w3:p1").unwrap();
         assert_eq!(row.task, "t-004 · verifying");
+        assert_eq!(row.project, "wsp", "placed where its member is, not wherever the seat happens to stand");
         assert!(row.task_id.is_empty(), "it holds nothing: the member's own agent is who holds t-004");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         assert!(text.contains("t-004 · verifying"), "{text}");

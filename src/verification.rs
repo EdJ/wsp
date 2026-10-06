@@ -484,13 +484,19 @@ pub(crate) fn record(store: &Store, member: &str, state: State, text: &str, me: 
                 ps.len() - 1
             }
         };
+        // One instant for the verdict and for the block's own move of the
+        // member: a re-verify of work with no landing asks whether the member
+        // moved *after* the verdict, and two clock reads a second apart would
+        // count the block itself as the member moving.
+        let now = util::now_iso();
         ps[at].state = state;
-        ps[at].decided = Some(util::now_iso());
+        ps[at].decided = Some(now.clone());
         ps[at].text = text.trim().to_string();
         let pass = ps[at].clone();
         write(&mut t, &ps);
         if state == State::Blocks {
             t.set_status(Status::Doing);
+            t.updated = now;
             t.log(&format!(
                 "{} the verifier blocked{}: {} — the whole verdict is under ## Verification",
                 crate::cycle::SENT_BACK,

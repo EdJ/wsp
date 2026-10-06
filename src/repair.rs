@@ -180,6 +180,18 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     pass.last = Some(util::epoch_secs());
     say_frozen_screens(store, seats);
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
+        // **A landing nobody recorded is written down before the step**, so
+        // the pass the step opens on that member reads the commit. After it,
+        // the pass carried no `read`, a re-verify fell back to comparing
+        // instants a second apart, and whether a member put back at review
+        // bought a fresh verifier depended on the clock — the wsp-188 verifier
+        // found it as a test that failed one run in three.
+        let before = worklist::position(store, &w, Reading::Landed);
+        if let Some(at) = before.at {
+            if w.groups().get(at - 1).is_some_and(|g| g.policy().is_some()) {
+                unrecorded_landing(store, &w, at, &before);
+            }
+        }
         let _ = crate::cycle::step(store, &w, seats);
         let pos = worklist::position(store, &w, Reading::Landed);
         let Some(at) = pos.at else { continue };
@@ -191,7 +203,6 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
             continue;
         }
         gone_member(store, seats, &w, at, &pos);
-        unrecorded_landing(store, &w, at, &pos);
         skipped(store, &w, at, &pos);
     }
     // **After** the loop, and for a different reason to every repair above: this
@@ -2567,7 +2578,11 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         // a governor who has not yet decided whether the finding stands.
         tick(&store, &Fake::empty(), &mut Pass::new());
         let _ = stamped();
-        crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "it does not hold", None).unwrap();
+        let blocked = crate::verification::record(&store, "m-1", crate::verification::State::Blocks, "it does not hold", None).unwrap();
+        assert!(blocked.read.is_some(), "the pass reads the landing the tick recorded before opening it");
+        // Past a second boundary, so the hand move is unambiguously later than
+        // the verdict: the answer must come from the commits, not the clock.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         set_status(&store, "m-1", Status::Review);
 
         tick(&store, &Fake::empty(), &mut Pass::new());
