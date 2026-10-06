@@ -690,8 +690,8 @@ fn hold(
     receipt: &dyn Fn(bool, bool, &str),
 ) -> i32 {
     match message::held(store, &closed.reply.id, pane, why) {
-        Ok(_) => receipt(false, true, &format!("{pane} is {why} — held, and typed there when it is next idle")),
-        Err(e) => receipt(false, false, &format!("{pane} is {why}, and the answer could not be held: {e}")),
+        Ok(_) => receipt(false, true, &format!("{pane}: {why} — held, and typed there when it is next idle")),
+        Err(e) => receipt(false, false, &format!("{pane}: {why}, and the answer could not be held: {e}")),
     }
     0
 }
