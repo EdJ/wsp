@@ -5594,6 +5594,56 @@ mod tests {
     /// asks for no judgement, but a named source that turned out to hold
     /// nothing is `worklist-036` exactly — the message lost inside the record,
     /// under a success receipt nobody reads at three in the morning.
+    /// `wsp-232`: group 10 of gpui-migration passed with a verdict that
+    /// quoted bullets and named two task ids, and the run then stood at a
+    /// group 11 made of the verdict's words, with those two ids as members.
+    /// The verdict is a sentence about the group it passes; nothing in it is
+    /// ever a member — not when `go` writes it, and not on the next write,
+    /// which is where the phantom became a line of its own in the file.
+    #[test]
+    fn a_verdict_from_a_file_naming_task_ids_passes_with_no_group_added() {
+        let (_env, store) = running("verdictids");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        task(&store, "wl-003", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-002", "wl-003"]);
+        started(&store, "batch");
+
+        // A word as long as it takes for the bullet after it to be wrapped to
+        // the start of a line: `go` stamps the verdict, and a stamp is always
+        // twenty characters, so the wrap can be worked out ahead of it.
+        let said = |n: usize| format!("PASSES. {}. - wl-002 is blocked; carry wl-003", "x".repeat(n));
+        let n = (1..60)
+            .find(|&n| {
+                util::wrap(&format!("2026-01-01T00:00:00Z {}", said(n)), 78 - "  verdict: ".len())
+                    .iter()
+                    .any(|l| l.starts_with("- "))
+            })
+            .expect("some length wraps the bullet");
+        let file = store.root.join("verdict.md");
+        let path = file.to_str().expect("a utf-8 temp dir").to_string();
+        std::fs::write(&file, format!("{}\n", said(n))).unwrap();
+        assert_eq!(flagged(&store, &["go", "batch"], &[("from", &path)]), 0);
+
+        let raw = std::fs::read_to_string(store.root.join("worklists/batch.md")).unwrap();
+        assert!(
+            raw.lines().any(|l| l.starts_with(' ') && l.trim_start().starts_with("- ")),
+            "the fixture has to wrap a bullet to a line start, or it proves nothing:\n{raw}"
+        );
+        let members = |store: &Store| -> Vec<Vec<String>> {
+            store.worklist("batch").unwrap().groups().into_iter().map(|g| g.members).collect()
+        };
+        assert_eq!(members(&store), [vec!["wl-001"], vec!["wl-002", "wl-003"]], "no group made of the verdict");
+        assert!(verdicts(&store, "batch")[0].ends_with("carry wl-003"), "and the verdict is whole");
+
+        // The next write is what put the phantom in the file as a group line.
+        flagged(&store, &["group", "batch", "2"], &[("stop", "both land")]);
+        assert_eq!(members(&store), [vec!["wl-001"], vec!["wl-002", "wl-003"]], "and a write after it adds none");
+        assert!(worklist::dangling(&store, &store.worklist("batch").unwrap()).is_empty(), "nothing is gone");
+    }
+
     #[test]
     fn a_verdict_and_a_hold_come_out_of_the_file_from_names() {
         let (_env, store) = running("verdictfile");
