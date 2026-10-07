@@ -144,7 +144,7 @@ pub fn mandate(store: &Store, args: &Args) -> i32 {
     };
 
     let Some(proj) = index.find(&needle) else {
-        eprintln!("wsp: no such project `{needle}`");
+        eprintln!("wsp: no such project `{needle}`{}", crate::util::dash_hint(&needle));
         return 1;
     };
 

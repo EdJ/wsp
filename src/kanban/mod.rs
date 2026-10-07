@@ -227,7 +227,7 @@ impl Scope {
             return match Scope::named(&name, index) {
                 Some(s) => Ok(s),
                 None => {
-                    eprintln!("wsp: no such project `{name}`");
+                    eprintln!("wsp: no such project `{name}`{}", crate::util::dash_hint(&name));
                     Err(1)
                 }
             };

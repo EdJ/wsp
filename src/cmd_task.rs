@@ -15,6 +15,11 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     let title = args.text(0);
     if title.trim().is_empty() {
         eprintln!("usage: wsp add \"title\" [-p project] [-t tag]… [--prio high]");
+        // A title that begins with a dash is read as a flag, and then there is
+        // no title — the usage line alone says nothing about why.
+        if !args.flag_names().is_empty() {
+            eprintln!("       a title that starts with a dash goes after `--`: wsp add -p proj -- \"-title\"");
+        }
         return 2;
     }
     // A title has no `-` form and does not need one — one line, and single
@@ -1635,7 +1640,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         Some(p) => match index.find(&p) {
             Some(found) => Some(Some(found.id.clone())),
             None => {
-                eprintln!("wsp: no such project `{p}`");
+                eprintln!("wsp: no such project `{p}`{}", util::dash_hint(&p));
                 return 1;
             }
         },

@@ -2809,6 +2809,20 @@ mod tests {
         assert_eq!(super::unknown_flags(&a).len(), 1, "the tally stopped seeing an unread -n");
     }
 
+    /// `wsp add "-p" -p demo` is ambiguous by construction — the first `-p` is
+    /// a flag whichever way the shell quoted it — so the line that works, and
+    /// the one a program building argv has to write, is the value behind `--`.
+    /// Pinned for the two verbs the row found missing, so the escape stays one.
+    #[test]
+    fn a_dash_led_title_or_slug_behind_double_dash_is_the_positional() {
+        let a = args(&["add", "-p", "demo", "--", "-p"]);
+        assert_eq!(a.get("project").as_deref(), Some("demo"));
+        assert_eq!(a.text(0), "-p");
+        let a = args(&["project", "add", "--name", "N", "--", "-x"]);
+        assert_eq!(a.rest, vec!["add", "-x"]);
+        assert_eq!(a.get("name").as_deref(), Some("N"));
+    }
+
     fn args(argv: &[&str]) -> super::Args {
         super::Args::parse(argv.iter().map(|s| (*s).to_string()).collect())
     }

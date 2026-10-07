@@ -212,7 +212,7 @@ pub fn current_project(
         return match index.find(&p) {
             Some(found) => Ok(Some(found.id.clone())),
             None => {
-                eprintln!("wsp: no such project `{p}`");
+                eprintln!("wsp: no such project `{p}`{}", crate::util::dash_hint(&p));
                 Err(1)
             }
         };
@@ -3486,7 +3486,7 @@ pub fn pin(store: &Store, args: &Args) -> i32 {
     };
     let index = Index::new(store.projects());
     let Some(proj) = index.find(&needle) else {
-        eprintln!("wsp: no such project `{needle}`");
+        eprintln!("wsp: no such project `{needle}`{}", crate::util::dash_hint(&needle));
         return 1;
     };
 

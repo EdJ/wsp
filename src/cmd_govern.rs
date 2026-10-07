@@ -1462,7 +1462,7 @@ fn set_tier(store: &Store, args: &Args) -> i32 {
         return 2;
     };
     let Some(scope) = scope_of(store, &index, needle) else {
-        eprintln!("wsp: no such project or worklist `{needle}`");
+        eprintln!("wsp: no such project or worklist `{needle}`{}", crate::util::dash_hint(&needle));
         return 1;
     };
     let governors = store.governors();
@@ -1713,7 +1713,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             return 2;
         };
         let Some(scope) = scope_of(store, &index, needle) else {
-            eprintln!("wsp: no such project or worklist `{needle}`");
+            eprintln!("wsp: no such project or worklist `{needle}`{}", crate::util::dash_hint(&needle));
             return 1;
         };
         // **Refuses a stand-down as firmly as it refuses an occupied seat, and
@@ -1779,7 +1779,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
     };
 
     let Some(scope) = scope_of(store, &index, &needle) else {
-        eprintln!("wsp: no such project or worklist `{needle}`");
+        eprintln!("wsp: no such project or worklist `{needle}`{}", crate::util::dash_hint(&needle));
         return 1;
     };
 
@@ -2045,7 +2045,7 @@ fn stand_down(store: &Store, index: &Index, args: &Args, workspace: Option<&str>
         Some(needle) => match scope_of(store, index, needle) {
             Some(scope) => Some(scope),
             None => {
-                eprintln!("wsp: no such project or worklist `{needle}`");
+                eprintln!("wsp: no such project or worklist `{needle}`{}", crate::util::dash_hint(&needle));
                 return 1;
             }
         },

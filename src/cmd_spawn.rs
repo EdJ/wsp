@@ -1727,7 +1727,7 @@ fn resolve(store: &Store, args: &Args, index: &Index) -> Result<Work, String> {
             });
         }
     }
-    let proj = index.find(&p).ok_or_else(|| format!("no project matching `{p}`"))?;
+    let proj = index.find(&p).ok_or_else(|| format!("no project matching `{p}`{}", crate::util::dash_hint(&p)))?;
     Ok(Work {
         task: None,
         project: Some(proj.id.clone()),
@@ -1794,7 +1794,7 @@ fn agrees(
     };
     let named = index
         .find(&p)
-        .ok_or_else(|| format!("no project matching `{p}`"))?
+        .ok_or_else(|| format!("no project matching `{p}`{}", crate::util::dash_hint(&p)))?
         .id
         .clone();
     match project {
@@ -2816,7 +2816,7 @@ fn rotate_as(
     };
     let index = Index::new(store.projects());
     let Some(scope) = cmd_govern::scope_of(store, &index, &needle) else {
-        eprintln!("wsp: no such project or worklist `{needle}`");
+        eprintln!("wsp: no such project or worklist `{needle}`{}", crate::util::dash_hint(&needle));
         return 1;
     };
 

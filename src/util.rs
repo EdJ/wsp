@@ -289,6 +289,24 @@ impl Clock for Dial<'_> {
     }
 }
 
+/// What to add to "no such project `X`" when `X` starts with a dash.
+///
+/// A name that is not found is reported as a missing name, which is the one
+/// thing a caller can check — and for `wsp add "-p" -p demo` it is the wrong
+/// thing to check: the word was the *title*, the short flag read it as its own
+/// value, and the project that follows is the one argument that was right.
+/// Nobody names a project `-p`, so a dash-led needle is nearly always a value
+/// that a flag ate, and the sentence that fixes it is `--`. Empty for every
+/// other needle, so the message a real typo gets is unchanged. One line, because
+/// the panel shows only the first line of a refusal.
+pub fn dash_hint(needle: &str) -> &'static str {
+    if needle.starts_with('-') && needle.len() > 1 {
+        " — it starts with a dash, so it may be a value that a flag read as its own; a value like that goes after `--`"
+    } else {
+        ""
+    }
+}
+
 pub fn epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -968,6 +986,18 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    /// `wsp add "-p" -p demo` reported "no such project `-p`", which sent the
+    /// caller to their projects when the project was the one right word.
+    #[test]
+    fn a_dash_led_needle_says_it_may_be_a_value_and_names_the_escape() {
+        let said = dash_hint("-p");
+        assert!(said.contains("--"), "{said}");
+        assert!(said.contains("value"), "{said}");
+        assert!(!said.contains('\n'), "the panel shows only the first line");
+        assert_eq!(dash_hint("demo"), "", "an ordinary typo is told what it always was");
+        assert_eq!(dash_hint("-"), "", "a bare dash is the stream spelling, not a flag");
+    }
 
     /// What a paragraph is made of, against what a terminal emits.
     ///

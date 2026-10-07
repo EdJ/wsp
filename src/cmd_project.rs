@@ -70,6 +70,9 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
 pub fn add(store: &Store, args: &Args) -> i32 {
     let Some(slug_raw) = args.rest.get(1).cloned() else {
         eprintln!("usage: wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…");
+        if !args.flag_names().is_empty() {
+            eprintln!("       a slug that starts with a dash goes after `--`");
+        }
         return 2;
     };
     let slug = util::slugify(&slug_raw);
@@ -478,7 +481,7 @@ fn no_project(store: &Store, needle: &str) -> String {
     let archived = store.archived_projects();
     let index = Index::new(archived.iter().map(|(p, _)| p.clone()).collect());
     let Some(found) = index.find(needle) else {
-        return format!("wsp: no project matching `{needle}`");
+        return format!("wsp: no project matching `{needle}`{}", util::dash_hint(needle));
     };
     let path = archived
         .iter()
