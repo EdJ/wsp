@@ -48,6 +48,10 @@
 //! until its barrier row opens ([`amend_running_stop`], which takes a logged
 //! reason). Each one is read once, at a moment the run has not reached yet.
 //!
+//! And the group being run may be taken out whole, with a logged reason,
+//! until its barrier row opens ([`drop_group`], `wsp-232`): there is then no
+//! barrier left to disagree with, and the run stands at the group after it.
+//!
 //! One more edit reaches the running group, and it is not a person's. The
 //! group's own barrier check may add rows to it with `followup --blocking`
 //! ([`followup`], `wsp-210`). The window protects the barrier being waited on,
@@ -666,7 +670,13 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
             return 1;
         };
         if !win.allows(gi + 1) {
-            return win.refuse(gi + 1, "will not remove from");
+            let code = win.refuse(gi + 1, "will not remove from");
+            // `wsp-232`: the governor of a run standing at a group made in
+            // error asked this verb first, and was told no and nothing else.
+            if win.started && win.at == Some(gi + 1) {
+                eprintln!("     a group that should not be there at all is dropped whole: `wsp worklist group {} {} --drop --why -`", w.id, gi + 1);
+            }
+            return code;
         }
         groups[gi].members.retain(|m| m != &id);
         groups[gi].member_agents.remove(&id);
@@ -843,7 +853,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
 
 pub fn group(store: &Store, args: &Args) -> i32 {
     const USAGE: &str =
-        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--why \"…\"|-]";
+        "usage: wsp worklist group <slug> N [--parallel N|none] [--agent \"kind [model] [effort]\"|manual] [--stop \"…\"|-|--stop --from FILE] [--drop] [--why \"…\"|-]";
     let (Some(needle), Some(n)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
         eprintln!("{USAGE}");
         return 2;
@@ -874,9 +884,15 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: --from is where a stop condition is read from — `wsp worklist group <slug> N --stop --from FILE`");
         return 2;
     }
-    if !args.has("parallel") && !args.has("stop") && !args.has("agent") {
+    let drop = args.has("drop");
+    if !drop && !args.has("parallel") && !args.has("stop") && !args.has("agent") {
         eprintln!("{USAGE}");
         eprintln!("       --parallel caps the work; --agent says who runs it; --stop is the prose read at the barrier after it");
+        eprintln!("       --drop takes the group out whole");
+        return 2;
+    }
+    if drop && (args.has("parallel") || args.has("stop") || args.has("agent")) {
+        eprintln!("wsp: --drop takes the group out whole, so there is nothing of it left to set");
         return 2;
     }
 
@@ -886,6 +902,9 @@ pub fn group(store: &Store, args: &Args) -> i32 {
         Ok(why) => why,
         Err(code) => return code,
     };
+    if drop {
+        return drop_group(store, args, &w.id, ordinal, why);
+    }
 
     let win = window(store, &w);
     if !win.allows(ordinal) {
@@ -1071,6 +1090,137 @@ fn amend_running_stop(store: &Store, args: &Args, id: &str, ordinal: usize, text
                 util::truncate(why, 60)
             ))
         );
+    }
+    0
+}
+
+/// Take group `ordinal` out of the list whole. `wsp-232`.
+///
+/// **The way out of a group that should never have been there.** A parser bug
+/// made gpui-migration's group 11 out of a verdict's words, and the run stood
+/// at it: nothing ran it, it waited on a row only Ed may close, and `rm` of
+/// its members was refused because it was the group being run. The window is
+/// right to freeze a running group's membership *one member at a time* — that
+/// is a barrier being edited while it is waited on. Taking the group out whole
+/// is a different act: there is no barrier left to disagree with, and the run
+/// stands at the group after it, which is the one the plan said came next.
+///
+/// So the running group may go, on the terms [`amend_running_stop`] set for
+/// its stop, and one more:
+///
+/// - **A reason, logged.** Dropping the group being run is a decision about the
+///   run.
+/// - **Only until its barrier row opens.** After that an agent is checking
+///   this group, and it would be checking a group the list no longer has.
+/// - **No started member is left outside the list.** A member that is doing,
+///   in review, done or claimed, and in no other group, is work the run would
+///   stop accounting for. `mv` it first, and it is said so. A member in a later
+///   group as well — compound-357, in the phantom and in the group after it —
+///   is still the run's.
+///
+/// Behind the run is still history and still refused. Ahead of it this is the
+/// same edit as `rm` of every member, and wants no reason.
+fn drop_group(store: &Store, args: &Args, id: &str, ordinal: usize, why: Option<String>) -> i32 {
+    let dry = args.has("dry-run");
+    let outcome = store.locked(|| -> Result<(Worklist, Group, bool), i32> {
+        // Read again inside the lock, as the stop's amendment does: a `go`
+        // in another process may have passed this barrier since.
+        let mut w = store.worklist(id).ok_or(1)?;
+        let mut groups = w.groups();
+        if ordinal > groups.len() {
+            eprintln!("wsp: there is no group {ordinal} — the list reaches {}", groups.len());
+            return Err(2);
+        }
+        let win = window(store, &w);
+        let live = win.started && win.at == Some(ordinal);
+        if !live && !win.allows(ordinal) {
+            return Err(win.refuse(ordinal, "will not drop"));
+        }
+        if live {
+            if why.is_none() {
+                eprintln!("wsp: group {ordinal} of `{}` is being run, so it is dropped with a reason, which is logged", w.id);
+                eprintln!("     `wsp worklist group {} {ordinal} --drop --why -` — the reason on stdin", w.id);
+                return Err(2);
+            }
+            let tasks = store.tasks();
+            let open = tasks.iter().find(|t| {
+                crate::cycle::is_barrier(t, &w.id, ordinal)
+                    && !matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done)
+            });
+            if let Some(b) = open {
+                eprintln!(
+                    "wsp: will not drop group {ordinal} — its barrier is open on {} ({}), which is checking it",
+                    b.id,
+                    b.status().as_str()
+                );
+                eprintln!("     the barrier holds or passes it; a group that should not be there is a hold, then a drop");
+                return Err(1);
+            }
+            let claims = store.claims();
+            let started = |m: &String| {
+                claims.contains_key(m)
+                    || tasks.iter().find(|t| &t.id == m).is_some_and(|t| {
+                        use crate::model::Status::{Doing, Done, Review};
+                        matches!(t.status(), Doing | Review | Done)
+                    })
+            };
+            let elsewhere =
+                |m: &String| groups.iter().enumerate().any(|(i, g)| i != ordinal - 1 && g.members.contains(m));
+            let left: Vec<&String> =
+                groups[ordinal - 1].members.iter().filter(|m| started(m) && !elsewhere(m)).collect();
+            if let Some(first) = left.first() {
+                let names: Vec<&str> = left.iter().map(|m| m.as_str()).collect();
+                eprintln!(
+                    "wsp: will not drop group {ordinal} — {} started and in no other group, so the run would stop accounting for it",
+                    names.join(" ")
+                );
+                eprintln!("     wsp worklist mv {} {first} --group N, then drop", w.id);
+                return Err(1);
+            }
+        }
+        let g = groups.remove(ordinal - 1);
+        let because = why.as_deref().map(|y| format!(" — why: {y}")).unwrap_or_default();
+        let members = if g.members.is_empty() { "no members".to_string() } else { g.members.join(" ") };
+        w.log(&format!("group {ordinal} dropped{} — {members}{because}", if live { " while it runs" } else { "" }));
+        if !dry {
+            w.set_groups(&groups);
+            if let Err(e) = store.save_worklist(&w) {
+                eprintln!("wsp: write failed: {e}");
+                return Err(1);
+            }
+        }
+        Ok((w, g, live))
+    });
+    let (w, g, live) = match outcome {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    if !dry {
+        store.log_event("worklist-edited", json!({ "id": w.id, "what": "drop", "group": ordinal, "why": why }));
+        store.git_commit(&format!("wsp: worklist {} group {ordinal} dropped{}", w.id, if live { " while it runs" } else { "" }));
+        // The run stands at the group after it now, and whatever that group
+        // owes — its members started, or its barrier checked — is the cycle's
+        // to take, exactly as after a `go`.
+        if live {
+            crate::cycle::poke_list(store, &w.id, "drop", None);
+        }
+    }
+
+    let left = w.groups().len() - usize::from(dry);
+    if args.json() {
+        let mut out = worklist_json(store, &w);
+        if let Some(o) = out.as_object_mut() {
+            o.insert("dropped".into(), json!({ "group": ordinal, "members": g.members, "while_running": live }));
+            o.insert("dry_run".into(), json!(dry));
+        }
+        println!("{}", out);
+    } else {
+        let verb = if dry { "would drop" } else { "dropped" };
+        let members = if g.members.is_empty() { "no members".to_string() } else { g.members.join(" ") };
+        println!("{} group {ordinal} {verb} — {members} · {left} groups left", w.id);
+        if live && !dry {
+            println!("  {}", Paint::new().dim(&format!("the run stands at group {ordinal} now: wsp worklist next {}", w.id)));
+        }
     }
     0
 }
@@ -4753,6 +4903,87 @@ mod tests {
         store.save_task(&row).unwrap();
         assert_eq!(flagged(&store, &["group", "batch", "2"], &amend), 0, "held: the recheck reads it afresh");
         assert_eq!(groups_of(&store, "batch")[1].stop, "corrected");
+    }
+
+    // ---- group --drop (`wsp-232`) ----
+
+    /// gpui-migration's phantom group, rebuilt: group 1 passed, the run at a
+    /// group 2 made of a verdict's words with two real rows in it — one
+    /// blocked, one running and also in group 3, as compound-357 was. `rm`
+    /// cannot take it out; `--drop` can, with a reason, and the run then
+    /// stands at the group the plan said came next.
+    #[test]
+    fn a_group_made_in_error_is_dropped_while_it_runs_and_the_run_stands_at_the_next() {
+        let store = scratch("drop-phantom");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-196", "blocked");
+        task(&store, "wl-357", "doing");
+        task(&store, "wl-358", "todo");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["add", "batch", "wl-357", "wl-358"]);
+        let mut w = store.worklist("batch").unwrap();
+        let mut groups = w.groups();
+        let words = ["Keystrokes", "in", "a", "field", "wl-196", "(hand", "cursor):", "wl-357", "owns"];
+        groups.insert(1, Group { members: words.iter().map(|s| s.to_string()).collect(), ..Group::default() });
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        started(&store, "batch");
+        crossed(&store, "batch", 1);
+        let at = |store: &Store| worklist::position(store, &store.worklist("batch").unwrap(), Reading::Settled).at;
+        assert_eq!(at(&store), Some(2), "the run stands at the phantom");
+
+        assert_eq!(run(&store, &["rm", "batch", "wl-196"]), 1, "one member at a time is still the barrier being edited");
+        assert_eq!(flagged(&store, &["group", "batch", "2"], &[("drop", "true")]), 2, "not without saying why");
+        assert_eq!(groups_of(&store, "batch").len(), 3);
+
+        let why = "made by wsp-232 from group 1's verdict";
+        assert_eq!(flagged(&store, &["group", "batch", "2"], &[("drop", "true"), ("why", why)]), 0);
+        let members: Vec<Vec<String>> = groups_of(&store, "batch").into_iter().map(|g| g.members).collect();
+        assert_eq!(members, [vec!["wl-001"], vec!["wl-357", "wl-358"]], "the phantom is gone and nothing else moved");
+        assert_eq!(at(&store), Some(2), "and the run stands at what the plan had next");
+        let log = store.worklist("batch").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("dropped while it runs") && log.contains(why), "the reason is on the record: {log}");
+
+        assert_eq!(
+            flagged(&store, &["group", "batch", "1"], &[("drop", "true"), ("why", why)]),
+            1,
+            "a group already passed is history"
+        );
+    }
+
+    /// What `--drop` will not do to a running group: take one whose barrier
+    /// is being checked, or take a member that has started out of the run
+    /// altogether. Ahead of the run it is `rm` of every member, and wants no
+    /// reason.
+    #[test]
+    fn a_running_group_is_not_dropped_out_from_under_its_barrier_or_its_started_work() {
+        let store = scratch("drop-refused");
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "doing");
+        task(&store, "wl-003", "todo");
+        task(&store, "wl-004", "todo");
+        run(&store, &["new", "batch", "b"]);
+        for id in ["wl-001", "wl-002", "wl-003", "wl-004"] {
+            run(&store, &["add", "batch", id]);
+        }
+        started(&store, "batch");
+        crossed(&store, "batch", 1);
+        let drop = [("drop", "true"), ("why", "a mistake")];
+
+        assert_eq!(flagged(&store, &["group", "batch", "2"], &drop), 1, "wl-002 is doing and in no other group");
+        assert_eq!(groups_of(&store, "batch").len(), 4);
+
+        assert_eq!(flagged(&store, &["group", "batch", "4"], &[("drop", "true")]), 0, "ahead of the run, no reason owed");
+        assert_eq!(groups_of(&store, "batch").len(), 3);
+
+        let mut b = store.find_task("wl-002").unwrap();
+        b.status_raw = "review".into();
+        store.save_task(&b).unwrap();
+        crossed(&store, "batch", 2);
+        checking(&store, "batch", 3, "wl-900");
+        assert_eq!(flagged(&store, &["group", "batch", "3"], &drop), 1, "its barrier agent is reading it");
+        assert_eq!(groups_of(&store, "batch").len(), 3);
     }
 
     // ---- followup (`wsp-210`) ----
