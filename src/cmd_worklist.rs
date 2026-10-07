@@ -5130,6 +5130,84 @@ mod tests {
         assert!(store.claims().contains_key("wl-900"));
     }
 
+    /// A check with no row (`wsp-230`): an open entry on group `at`, seated.
+    fn check_in(store: &Store, list: &str, at: usize, seat: &str) {
+        let w = store.worklist(list).unwrap();
+        assert!(crate::barrier::open(store, &w, at, None, Some("claude".into()), &|_| false).is_some());
+        assert!(crate::barrier::name_seat(store, list, at, seat));
+    }
+
+    fn checks_on(store: &Store, at: usize) -> Vec<crate::barrier::Check> {
+        groups_of(store, "run")[at - 1].checks.clone()
+    }
+
+    /// A run of two groups at barrier 1, its check a seat with no row.
+    fn at_barrier_one_seated(tag: &str) -> Store {
+        let store = scratch(tag);
+        task(&store, "wl-001", "review");
+        task(&store, "wl-002", "todo");
+        task(&store, "wl-003", "todo");
+        run(&store, &["new", "run", "r"]);
+        run(&store, &["add", "run", "wl-001"]);
+        run(&store, &["add", "run", "wl-002"]);
+        started(&store, "run");
+        check_in(&store, "run", 1, "cpd-9");
+        checks_ending();
+        store
+    }
+
+    /// The verdict is on the group, where `--verdicts` reads it, and the seat
+    /// that gave it is ended once its turn is over: no row is filed, so none
+    /// is left at `review` for a `done` nobody owes it.
+    #[test]
+    fn a_go_records_the_pass_on_the_group_and_ends_the_check_seat() {
+        let _env = util::isolated("seat-go");
+        let store = at_barrier_one_seated("seat-go");
+        assert_eq!(run(&store, &["go", "run", "it", "holds"]), 0);
+        let c = checks_on(&store, 1);
+        assert_eq!((c.len(), c[0].state), (1, crate::barrier::State::Passes), "{c:?}");
+        assert_eq!(checks_ending(), vec!["cpd-9"], "its seat, once its turn is over");
+        assert!(store.tasks().iter().all(|t| !t.tags.iter().any(|g| g == crate::cycle::BARRIER_TAG)), "and no row anywhere");
+        let lines = crate::barrier::lines(&Paint::plain(), &groups_of(&store, "run")[0]).join("\n");
+        assert!(lines.contains("passed") && lines.contains("in cpd-9"), "{lines}");
+    }
+
+    /// Follow-ups from a seat: the seat is the check's name in the log, the
+    /// entry says what it decided, and both kinds end it.
+    #[test]
+    fn a_seated_check_files_follow_ups_under_its_seat_and_both_kinds_end_it() {
+        let _env = util::isolated("seat-followup");
+        let store = at_barrier_one_seated("seat-followup");
+        let from = verdict("seat-next", "holds, with a tail");
+        assert_eq!(
+            follow(&store, &["followup", "run", "wl-003"], &[("next", "true"), ("from", &from)], &["cpd-other"]),
+            1,
+            "only the seat checking the barrier may"
+        );
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("next", "true"), ("from", &from)], &["cpd-9"]), 0);
+        assert_eq!(checks_on(&store, 1)[0].state, crate::barrier::State::Next);
+        assert_eq!(checks_ending(), vec!["cpd-9"]);
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("follow-up by cpd-9 passes: wl-003"), "{log}");
+
+        let store = at_barrier_one_seated("seat-blocking");
+        let from = verdict("seat-blocking", "not yet: one fix first");
+        assert_eq!(follow(&store, &["followup", "run", "wl-003"], &[("blocking", "true"), ("from", &from)], &["cpd-9"]), 0);
+        assert_eq!(checks_on(&store, 1)[0].state, crate::barrier::State::Blocking);
+        assert_eq!(checks_ending(), vec!["cpd-9"]);
+    }
+
+    /// A hold is recorded on the group and leaves the seat to the tick.
+    #[test]
+    fn a_hold_records_the_check_as_holding_and_leaves_its_seat_to_the_tick() {
+        let store = at_barrier_one_seated("seat-hold");
+        assert_eq!(run(&store, &["hold", "run", "not", "yet"]), 0);
+        let c = checks_on(&store, 1);
+        assert_eq!(c[0].state, crate::barrier::State::Holds);
+        assert!(checks_ending().is_empty());
+        assert_eq!(c[0].standing(), Some("cpd-9"), "still seated until the tick finds it idle");
+    }
+
     // ---- followup (`wsp-210`) ----
 
     /// A run standing at group `at`'s barrier, with its check open on `row`.

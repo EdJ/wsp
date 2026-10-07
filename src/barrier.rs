@@ -574,3 +574,156 @@ fn apply(store: &Store, plan: &Plan) -> Result<usize, String> {
     }
     Ok(moved)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{parse_groups, render_groups};
+
+    fn scratch(tag: &str) -> (util::Isolated, Store) {
+        let env = util::isolated(&format!("barrier-{tag}"));
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        (env, store)
+    }
+
+    fn list(store: &Store, groups: &[&[&str]]) -> Worklist {
+        let mut w = Worklist::new("run", "r");
+        let gs: Vec<Group> =
+            groups.iter().map(|m| Group { members: m.iter().map(|s| s.to_string()).collect(), ..Group::default() }).collect();
+        w.set_groups(&gs);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        w
+    }
+
+    fn checks(store: &Store, at: usize) -> Vec<Check> {
+        store.worklist("run").unwrap().groups()[at - 1].checks.clone()
+    }
+
+    /// Every clause comes back as it was written, through the group's own file
+    /// and a wrap: the block is tokens, so where the writer breaks the line
+    /// cannot split an entry, and a verdict above it that wraps onto a line
+    /// beginning `- ` is not read as a group (`wsp-232`).
+    #[test]
+    fn a_check_reads_back_as_it_was_written_through_the_groups_file_and_a_wrap() {
+        let full = Check {
+            at: "2026-10-07T12:04:11Z".into(),
+            state: State::Next,
+            read: Some("55c4839abcdef0123456789abcdef0123456789a".into()),
+            pane: Some("cpd-484".into()),
+            on: Some("opencode openrouter/some-model high".into()),
+            ending: Ending::Failed,
+            was: Some("compound-369".into()),
+        };
+        let bare = Check::opened(None, None);
+        let g = Group {
+            members: vec!["m-1".into(), "m-2".into()],
+            verdict: "passes:\n- Keystrokes reach the pane\n- the goldens hold".into(),
+            checks: vec![full.clone(), bare.clone(), full.clone()],
+            ..Group::default()
+        };
+        let text = render_groups(&[g.clone(), Group { members: vec!["m-3".into()], ..Group::default() }]);
+        assert!(text.contains("  checks: 2026-10-07T12:04:11Z next"), "{text}");
+        assert!(text.lines().count() > 6, "and long enough to wrap: {text}");
+        let back = parse_groups(&text);
+        assert_eq!(back.len(), 2, "no group made of a check's words: {text}");
+        assert_eq!(back[0].checks, vec![full.clone(), bare, full], "{text}");
+        assert_eq!(back[0].checks[0].on.as_deref(), Some("opencode openrouter/some-model high"), "a model's own `/` survives");
+        assert_eq!(back[1].members, vec!["m-3"]);
+    }
+
+    /// The lifecycle the run walks: an entry opens before any agent exists,
+    /// is the key that stops a second (until it is wedged), takes its seat,
+    /// is settled by the verb that decides, and is ended — and only then is
+    /// its seat no longer one `wip` and the brief name as a check.
+    #[test]
+    fn a_check_opens_once_takes_its_seat_is_settled_and_is_ended() {
+        let (_env, store) = scratch("life");
+        let w = list(&store, &[&["m-1"], &["m-2"]]);
+        let never = |_: &str| false;
+
+        assert!(open(&store, &w, 1, Some("abc1234".into()), Some("claude opus high".into()), &never).is_some());
+        assert!(open(&store, &w, 1, None, None, &never).is_none(), "one open entry is the key");
+        assert!(seat_of(&store, "cpd-1").is_none(), "no seat yet");
+        assert!(name_seat(&store, "run", 1, "cpd-1"));
+        assert_eq!(seat_of(&store, "cpd-1"), Some(("run".into(), 1)));
+        assert_eq!(checks(&store, 1)[0].read.as_deref(), Some("abc1234"), "the commit it was opened against");
+
+        assert_eq!(settle(&store, "run", 1, State::Blocking), Some("cpd-1".into()), "the seat, for its ending");
+        assert_eq!(settle(&store, "run", 1, State::Passes), None, "nothing open is left to settle");
+        assert_eq!(seat_of(&store, "cpd-1"), Some(("run".into(), 1)), "settled, and still seated until it is ended");
+
+        assert!(open(&store, &w, 1, None, None, &never).is_some(), "a re-check is a fresh entry");
+        let c = checks(&store, 1);
+        assert_eq!(c.iter().map(|c| c.state).collect::<Vec<_>>(), [State::Blocking, State::Running], "beside the first");
+
+        assert!(mark_ended(&store, "cpd-1", true));
+        assert!(seat_of(&store, "cpd-1").is_none(), "an ended check is nobody's seat");
+        assert_eq!(checks(&store, 1)[0].ending, Ending::Ended);
+        assert!(checks(&store, 2).is_empty(), "and nothing touched the next group");
+    }
+
+    /// A Barrier row, filed the way wsp filed them.
+    fn row(store: &Store, id: &str, at: usize, created: &str, status: Status, log: &str) -> Task {
+        let mut t = Task::new(&crate::cycle::barrier_title("run", at), id);
+        t.tags = vec![crate::cycle::BARRIER_TAG.into()];
+        t.created = created.into();
+        t.status_raw = status.as_str().into();
+        t.body = format!(
+            "## Overview\n{ORDER_OPENS}{at} of the `run` worklist. Every member has landed.\n\n## Log\n{log}\n"
+        );
+        store.save_task(&t).unwrap();
+        t
+    }
+
+    /// `wsp-230`'s migration, shaped on gpui-migration: every settled row wsp
+    /// filed goes onto its group, oldest first, with what it decided read off
+    /// what the run recorded; the open one and every row a person wrote are
+    /// left alone and named; a dry run moves nothing; and the old ids still
+    /// resolve, from the archive.
+    #[test]
+    fn the_migration_moves_every_settled_row_wsp_filed_and_no_hand_made_one() {
+        let (_env, store) = scratch("migrate");
+        let mut w = list(&store, &[&["m-1"], &["m-2"], &["m-3"]]);
+        let mut gs = w.groups();
+        gs[0].verdict = "2026-10-07T09:37:36Z go".into();
+        gs[1].verdict = "2026-10-07T12:04:11Z passes, with follow-ups m-9 as group 3".into();
+        w.set_groups(&gs);
+        w.log("follow-up by c-2 passes: m-9 · group 3 (new), ahead of 1 planned");
+        store.save_worklist(&w).unwrap();
+
+        row(&store, "c-1", 1, "2026-10-07T09:00:00Z", Status::Review, "- 2026-10-07 claimed by pane cpd-480 · spawned at opus/high");
+        row(&store, "c-2", 2, "2026-10-07T11:51:51Z", Status::Review, "- 2026-10-07 claimed by pane cpd-481");
+        row(&store, "c-3", 3, "2026-10-07T12:33:20Z", Status::Doing, "");
+        store.set_claim("c-3", serde_json::json!({ "workspace": "w" }));
+        // Hand-made: tagged without wsp's order, and titled without the tag.
+        let mut by_hand = Task::new("Barrier review: run group 1, by a person", "c-8");
+        by_hand.tags = vec![crate::cycle::BARRIER_TAG.into()];
+        store.save_task(&by_hand).unwrap();
+        store.save_task(&Task::new("Barrier 4 re-check: read the goldens", "c-9")).unwrap();
+
+        let p = plan(&store);
+        let named: Vec<&str> = p.moves.values().flatten().map(|t| t.id.as_str()).collect();
+        assert_eq!(named, ["c-1", "c-2"], "every settled row wsp filed");
+        assert_eq!(p.open, ["c-3"], "the one still reading is left for later");
+        assert_eq!(p.by_hand, ["c-8", "c-9"], "and nothing a person wrote");
+
+        assert_eq!(migrate(&store, &Args::synth("migrate", &[], &[("barrier-rows", "true"), ("n", "true")])), 0);
+        assert!(store.find_task("c-1").is_some() && checks(&store, 1).is_empty(), "-n moves nothing");
+
+        assert_eq!(migrate(&store, &Args::synth("migrate", &[], &[("barrier-rows", "true")])), 0);
+        let one = checks(&store, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].state, one[0].was.as_deref()), (State::Passes, Some("c-1")), "a verdict and no follow-up: it passed");
+        assert_eq!(one[0].pane.as_deref(), Some("cpd-480"));
+        assert_eq!(one[0].on.as_deref(), Some("opus/high"));
+        assert_eq!(one[0].ending, Ending::Ended);
+        assert_eq!(checks(&store, 2)[0].state, State::Next, "the log names it as passing with follow-ups");
+        assert!(store.find_task("c-1").is_none() && store.archived_task("c-1").is_some(), "archived, and still resolvable");
+        assert!(store.find_task("c-3").is_some() && store.find_task("c-8").is_some(), "the rest untouched");
+
+        assert_eq!(migrate(&store, &Args::synth("migrate", &[], &[("barrier-rows", "true")])), 0);
+        assert_eq!(checks(&store, 1).len(), 1, "and a second run adds nothing");
+    }
+}

@@ -2093,6 +2093,27 @@ mod tests {
         assert!(r.looking.is_none(), "no mandate, so this pane is not going looking");
     }
 
+    /// `wsp-230`. A barrier check holds no claim and has no row, so the brief
+    /// would read it as an agent with nothing claimed and tell it to go and
+    /// claim something. It says which barrier it is checking and the verbs it
+    /// finishes with, and not that the tree it reads the trunk in is its own to
+    /// commit in.
+    #[test]
+    fn a_check_seat_is_told_which_barrier_it_checks_and_not_that_the_tree_is_its_own() {
+        let mut b = briefing();
+        b.pane = Some("w9:p3".into());
+        b.workspace = Some("w9".into());
+        b.cwd = Some("/home/ed/claude/wsp/.worktrees/run-check-4".into());
+        b.checking = Some(("run".into(), 4));
+        let r = compose(&b);
+        assert!(r.mine.is_none(), "it holds nothing");
+        assert!(r.own_tree.is_none(), "its tree is for reading the trunk, not for committing in");
+        let text = brief_lines(&r, &plain(), Depth::Normal).join("\n");
+        assert!(text.contains("checking run · barrier 4"), "{text}");
+        assert!(text.contains("wsp worklist go|hold|followup run"), "{text}");
+        assert!(!text.contains("nothing claimed"), "a check is not an agent that forgot to claim:\n{text}");
+    }
+
     /// `wsp-188`. A verifier holds no claim, so the brief used to read it as an
     /// agent with nothing claimed and told it to go and claim something. Its
     /// seat is on its member's open pass, and the brief says what it is

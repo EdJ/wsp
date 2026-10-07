@@ -1680,6 +1680,9 @@ fn help_text() -> String {
                                     unless --focus says you will be at the pane
                                     --verify is a run's verifier on a member: no
                                     claim, the seat written on its open pass
+  wsp spawn <list> --agent --check N  a run's barrier check on group N: no row
+                                    and no claim, the seat written on the
+                                    group's open check, the order the barrier's
   wsp despawn <id> | --pane <seat>  the other end of it, and the whole ending:
                                     end the agent, release the claim, remove the
                                     worktree. A seat that will not close keeps
@@ -1970,6 +1973,9 @@ fn help_text() -> String {
   wsp ask <id> ["…"|-|--from F]     a question about a task, with a return path:
                                     the answer comes back to you and lands on a
                                     task's log. `wsp tell` is still for prose
+  wsp ask <list> [--group N] "…"    …about a worklist, from a barrier check that
+                                    holds no task: its governor is asked, and
+                                    the answer lands on the list's log
   wsp ask                           what is open, who is waiting, and how long
   wsp answer <mid> "…"|-|--from F   close one: the log first, then whoever asked
   wsp answer <mid> --abandon "…"    the other ending, and it also goes home
@@ -1988,6 +1994,9 @@ fn help_text() -> String {
   wsp migrate --verify-rows [-n]    every Verify row wsp filed, moved onto its
                                     member's ## Verification and archived; rows
                                     made by hand are named and left alone
+  wsp migrate --barrier-rows [-n]   every settled Barrier row wsp filed, moved
+                                    onto its group's checks: and archived; open
+                                    rows and hand-made ones are named and left
 
 Ids are `<project>-NNN`, continuous within a project rather than within a day,
 and a task filed nowhere is `inbox-NNN` until `wsp mv -p` files it — the one

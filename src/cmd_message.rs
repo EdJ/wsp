@@ -1041,6 +1041,38 @@ mod tests {
         assert_eq!(ask(&store, &args), 1, "an id that names nothing says so");
     }
 
+    /// `wsp-230`. A barrier check holds no task, so it asks about the list it
+    /// is checking: the question reaches that list's governor, naming the
+    /// barrier, and the answer is written on the list's log — the one durable
+    /// home a seat with no row has — before it is taken back to the asker.
+    #[test]
+    fn a_check_asks_about_its_list_and_the_governor_is_asked_and_the_answer_lands_on_the_list() {
+        let _env = util::isolated("ask-list");
+        let store = scratch("ask-list");
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("run", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+
+        // The check's own seat, which is who is waiting: said here rather than
+        // inherited from whatever seat runs the suite.
+        std::env::set_var(crate::place::SEAT_ENV, "cpd-77");
+        let args = crate::Args::synth("ask", &["run", "does group 1 own the chrome?"], &[("group", "1")]);
+        let code = ask(&store, &args);
+        std::env::remove_var(crate::place::SEAT_ENV);
+        assert_eq!(code, 0, "a worklist is somewhere for the answer to live");
+        let q = message::open_questions(&store).pop().expect("the question");
+        assert_eq!(q.about, About::Group { scope: "run".into(), group: 1 });
+        let spooled = std::fs::read_to_string(store.state.join("watches.json")).unwrap_or_default();
+        assert!(spooled.contains("barrier 1 of run") && spooled.contains(&q.id), "held for the run's seat: {spooled}");
+
+        let closed = message::answer(&store, &q.id, &Party::seat("run"), "yes, all of it").unwrap();
+        assert_eq!(closed.landed, Landed::List("run".into()));
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("answered by") && log.contains("yes, all of it"), "{log}");
+        assert!(wire(&closed).contains("the run list's log"), "{}", wire(&closed));
+    }
+
     /// A question needs a subject **because the subject is what gives the
     /// answer somewhere to live**, and the refusal is at the point of asking
     /// rather than at the point of answering. Discovered late, this is an agent

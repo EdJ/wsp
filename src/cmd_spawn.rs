@@ -6176,6 +6176,58 @@ mod tests {
         assert_eq!(place.0.borrow().len(), started, "no pass, no agent");
     }
 
+    /// `wsp-230`. A barrier check is started on the list with `--check N`, and
+    /// holds nothing: no claim, no binding, no slot. Its seat goes on the
+    /// group's open check before the agent starts, it is named against its
+    /// list, and its order is the barrier's — on one line, ending in the verbs
+    /// that record it rather than in a `wsp review` of a row it does not have.
+    #[test]
+    fn a_check_spawn_claims_nothing_writes_its_seat_on_the_group_and_leaves_the_seats_alone() {
+        let _guard = no_backend();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_WORKSPACE_ID");
+        let store = seat("check");
+        let mut core = Project::new("core");
+        core.roots = vec![store.root.display().to_string()];
+        store.save_project(&core).unwrap();
+        let mut m = crate::model::Task::new("a member", "t-1");
+        m.project = Some("core".into());
+        m.status_raw = crate::model::Status::Review.as_str().into();
+        store.save_task(&m).unwrap();
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["t-1".into()], stop: "it builds".into(), ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("core", json!({ "workspace": "w1", "pane": "w1:p1" }));
+        let governors = std::fs::read_to_string(store.state.join("governors.json")).unwrap();
+
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("check", "1"), ("kind", "opencode"), ("no-tree", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["run"], &flags)), 1, "no check is open, so no agent");
+        assert!(place.0.borrow().is_empty());
+
+        assert!(crate::barrier::open(&store, &w, 1, None, None, &|_| false).is_some());
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["run"], &flags)), 0);
+        assert!(store.claims().is_empty() && store.bindings().is_empty(), "a check claims and binds nothing");
+        assert_eq!(crate::barrier::seat_of(&store, "w9:p1"), Some(("run".into(), 1)), "its seat is on the group's check");
+        assert_eq!(std::fs::read_to_string(store.state.join("governors.json")).unwrap(), governors, "governors.json untouched");
+        let opened = place.1.borrow().last().cloned().expect("no seat was opened");
+        assert_eq!(opened.label, "run · barrier 1", "named against its list");
+        let order = place.0.borrow().last().cloned().expect("nothing was started")
+            .args
+            .windows(2)
+            .find(|w| w[0] == "--prompt")
+            .map(|w| w[1].clone())
+            .expect("no work order in the argv");
+        assert!(order.contains("wsp worklist go run --from FILE") && order.contains("it builds"), "{order}");
+        assert!(order.contains("wsp ask run -") && !order.contains("wsp review"), "{order}");
+        assert!(!order.contains('\n'), "{order:?}");
+
+        for bad in [&[("agent", "true"), ("check", "1"), ("govern", "true")][..], &[("agent", "true"), ("check", "x")][..]] {
+            assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["run"], bad)), 2, "{bad:?}");
+        }
+    }
+
     /// The whole of robustness-010, at the one line where it happens.
     ///
     /// Every softer answer to two agents in one checkout has been tried in this

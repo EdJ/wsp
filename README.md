@@ -182,10 +182,11 @@ for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
 | the list starts, or a barrier passes | spawns the group's members, each on its own `agent` line or the group's | a member works, lands, and ends with `wsp review` |
 | a member is at `review` and landed | starts a read-only verifier on the member's line | the verifier ends with `wsp verified <m> --holds` or `--blocks` |
 | a verdict blocks | puts the member back at `doing`, with the verdict as what is owed, and tells the governor | the member's agent carries on |
-| every member landed and holding | opens a barrier row and spawns an agent to check it | the barrier agent ends with `go` or `hold` |
-| `go` | sweeps the group's trees, ends what the group opened, starts the next group, rotates the governor | — |
+| every member landed and holding | opens a check on the group (no row) and spawns `wsp spawn <list> --agent --check N` to read it | the check ends with `go`, `hold` or `followup` |
+| `go` | records the pass on the group's check, ends the check once its turn is over, sweeps the group's trees, ends what the group opened, starts the next group, rotates the governor | — |
 | `followup --next` | puts the rows in a new group straight after this one, on its line, with a stop built from their done-whens; then passes as `go` does | — |
-| `followup --blocking` | adds the rows to the group being run, spawns and verifies them, ends the check once it reviews, and opens a fresh check when they land | the recheck ends with `go` or `hold` |
+| `followup --blocking` | adds the rows to the group being run, spawns and verifies them, ends the check once its turn is over, and opens a fresh check when they land | the recheck ends with `go`, `hold` or `followup` |
+| `hold` | records the hold on the group's check, starts nothing more, tells the governor; the tick ends the check once it is idle | — |
 | an agent died, a start never claimed, a landing was made with git | repairs it on the tick, writes `cycle.log`, tells the governor | — |
 | the run's seat reads empty for two ticks, or no seat in its chain has ever been filled | seats a governor | — |
 
@@ -217,12 +218,44 @@ made of follow-ups, or one that has had rows join it, cannot add more, and what
 its check finds goes to the governor as a decision. Only the open check of the
 group being run may use it, read off the caller's seat, so a member, a verifier
 or a person at the CLI is refused. Every follow-up is in the list's log under
-the check row that added it, and that log line is what the round is read from.
-Anything larger, or anything that needs a design call, is a `wsp ask`.
+the seat of the check that added it, and that log line is what the round is
+read from. Anything larger, or anything that needs a design call, is a `wsp ask
+<list>`.
+
+**A barrier check files no row** (`wsp-230`), as a verifier files none since
+`wsp-188`. Every barrier used to be a row, "Barrier: <list> group N", which then
+sat at `review` waiting for a `done` nobody owed it: four on `gpui-migration`
+alone. Now the check is an entry on its group, under `checks:` beside the
+`verdict:` it writes, one per check and oldest first:
+
+```
+- 4  compound-370
+  verdict: 2026-10-07T12:32:58Z **Barrier 4 passes.** …
+  checks: 2026-10-07T12:04:24Z passes read:6ac0db226fda… pane:cpd-484
+          on:claude+opus/high ended
+```
+
+wsp writes the `running` entry before it starts the agent, with the trunk
+commit it is reading, and `wsp spawn <list> --agent --check N` names the seat on
+it; the agent claims nothing and stands in a tree of its own,
+`.worktrees/<list>-check-N`, read-only. `go`, `hold` and `followup` record what
+it decided on the entry — `passes`, `holds`, `next` or `blocking` — and a
+re-check after a blocking follow-up is a second entry beside the first. The
+verb that settles it arranges its ending: a process outside the pane waits for
+its turn to finish, then runs `wsp despawn --pane`, the whole ending, keeping a
+tree with uncommitted work and saying so in `cycle.log`. A hold is left to the
+tick, which ends a settled check once it is idle. A check whose seat has gone is
+marked `abandoned`, and a fresh one reads the group. `wsp wip` names the seat
+`<list> · barrier N`, `wsp worklist show --verdicts` reads every entry, and its
+`wsp ask <list> -` reaches the list's governor and is answered onto the list's
+log. Barrier rows filed before this are moved by `wsp migrate --barrier-rows`
+(`-n` first) once they have settled; their ids still resolve from the archive,
+and each entry names its row with `was:`. A row still open when this was
+installed is read as that barrier's check until it settles.
 
 What a run did is in four places: `cycle.log` in the state directory (each
 step and why), `wsp watch --status` (the daemon and every delivery register),
-the member's `## Verification`, and the barrier row.
+the member's `## Verification`, and the group's `verdict:` and `checks:`.
 
 A group with `--agent manual`, or a list from before groups had a line, is run
 by hand. `wsp worklist next` names what may start; the governor spawns it,
@@ -4414,6 +4447,7 @@ possible before the fact; saying it out loud is what makes it work.
 | `src/cmd_worklist.rs` | composing a queue of groups, running it, and the barrier between the two |
 | `src/cycle.rs` | the run's steps, taken by wsp: the verbs that make one due start `worklist advance`, which spawns a group's members, a read-only verifier on each that lands, the barrier check, and on a pass the next group and a fresh governor — or, past the last barrier, the list closed and its own seat stood down and ended |
 | `src/verification.rs` | a verifier's pass, on the member it verifies: the `## Verification` entries, the readers the barrier and `wip` ask, `wsp verified`, and the one-off migration off Verify rows |
+| `src/barrier.rs` | a barrier check, on the group it checks: the `checks:` entries, opened before its agent starts, settled by `go`/`hold`/`followup`, the seats `wip` and the brief name, and the one-off migration off Barrier rows |
 | `src/repair.rs` | the same steps on the daemon's tick, plus the states a verb never reaches — an agent that exited, a start that never claimed, a landing nobody recorded, a member `advance` skipped, and a governor seat standing empty on a running list. Each is keyed on a record the member's own `## Log` or the seat's own governor entry, and each says why in `cycle.log` and to the seat |
 | `src/waiting.rs` | whether a seat is waiting on somebody and on whom — a prompt on its screen, or its own open `wsp ask` — the one reading the reconciler, the barrier, the watch, `tell` and `wip` all ask, so nothing treats a waiting seat as idle |
 | `src/ending.rs` | a member whose newest pass holds has its agent ended, after `verification`'s tick has ended the verifier: never one in a turn, waiting, typed to since the verdict, or holding a governor seat; confirmed gone by pid, recorded once, and a failure told once; and the pid reading and check `cycle::end_passes` confirms every verifier's ending by |

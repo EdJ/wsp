@@ -7598,6 +7598,20 @@ mod tests {
         assert!(text.contains("t-004 · verifying"), "{text}");
     }
 
+    /// `wsp-230`. A barrier check holds no claim and no binding either, so it
+    /// is named against the list and group it is checking, in the project its
+    /// group's work is in, rather than drawn as a seat holding nothing.
+    #[test]
+    fn wip_names_a_check_seat_against_its_list_and_group() {
+        let mut w = wip_world();
+        w.checking.insert("w3:p1".into(), (crate::barrier::seat_label("gpui-migration", 4), Some("wsp".into())));
+        let rows = wip_rows(&w);
+        let row = rows.iter().find(|r| r.pane == "w3:p1").unwrap();
+        assert_eq!(row.task, "gpui-migration · barrier 4");
+        assert!(row.task_id.is_empty(), "it holds no row");
+        assert_eq!(row.project, "wsp");
+    }
+
     /// `wsp-145`. The heading counts agents and turns, which is a true
     /// sentence about *work* and says nothing about the pass that decides
     /// whether a seat is ever woken at all. Six days of a dead daemon on a
