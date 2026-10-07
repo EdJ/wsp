@@ -1696,10 +1696,38 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
 
     let mut out: Vec<Group> = Vec::new();
     let mut cont = Cont::Members;
+    // How far in the label of the prose block being read sits. A line indented
+    // past it is that block's continuation **whatever it starts with**, and
+    // that is checked before any first word is: `wsp-232`, where a verdict
+    // quoting a bullet list wrapped so a continuation began `- Keystrokes`,
+    // and the next read made group 11 of every word after it. A first word
+    // means structure only on a line at or left of the label. [`block`]
+    // writes every continuation at the leader's width, which is always past
+    // the label; a hand-wrapped stop at the label's own indent still joins
+    // through the `else` below, as it did before.
+    let mut label_indent = 0;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if let Some(last) = out.last_mut().filter(|_| indent > label_indent) {
+            match cont {
+                Cont::Stop => {
+                    join(&mut last.stop, trimmed);
+                    continue;
+                }
+                Cont::Verdict => {
+                    join(&mut last.verdict, trimmed);
+                    continue;
+                }
+                Cont::Landed => {
+                    landed_push(&mut last.landed, trimmed);
+                    continue;
+                }
+                Cont::Members => {}
+            }
         }
         if let Some(rest) = trimmed.strip_prefix("- ") {
             let mut g = Group::default();
@@ -1722,9 +1750,11 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
         if let Some(rest) = trimmed.strip_prefix("stop:") {
             last.stop = rest.trim().to_string();
             cont = Cont::Stop;
+            label_indent = indent;
         } else if let Some(rest) = trimmed.strip_prefix("verdict:") {
             last.verdict = rest.trim().to_string();
             cont = Cont::Verdict;
+            label_indent = indent;
         } else if let Some(rest) = trimmed.strip_prefix("agent:") {
             // One line, never wrapped: a policy is three words.
             last.agent = rest.trim().to_string();
@@ -1736,6 +1766,7 @@ pub fn parse_groups(text: &str) -> Vec<Group> {
             last.landed.clear();
             landed_push(&mut last.landed, rest);
             cont = Cont::Landed;
+            label_indent = indent;
         } else {
             match cont {
                 Cont::Stop => join(&mut last.stop, trimmed),
@@ -2546,6 +2577,65 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert!(g.member_agents.is_empty());
         assert_eq!(g.stop, "if the agent that ran a-9: stalls, flag it");
         assert_eq!(g.members, vec!["a-1"]);
+    }
+
+    /// `wsp-232`, the shape of the verdict that did it: a barrier's verdict
+    /// quoting a bullet list, wrapped by the renderer so a continuation line
+    /// began `- Keystrokes`. Read back, that line was a new group 11 whose
+    /// members were every word after it — two of them real task ids.
+    #[test]
+    fn a_verdict_whose_wrap_starts_a_line_with_a_bullet_is_still_one_verdict() {
+        let mut g = parse_groups("- 1  a-1\n- 2  a-2  a-3\n");
+        // Group 10's verdict on gpui-migration, verbatim up to the line that
+        // broke, so the wrap falls where it fell.
+        g[0].verdict = "2026-10-07T20:06:57Z PASSES. Checked at trunk tip 5b0a6d7 (all seven members, \
+                        no rebase pending). Ran once, at load 4-10: `scripts/lanes.sh gate` 110 tests, 0 \
+                        failed (includes gpui goldens and `host-gpui --test control`); `scripts/lanes.sh \
+                        slow` 73 tests, 0 failed (includes `host-gpui --test two_terminals`). Every \
+                        member's verifier holds; 346 and 347 were blocked once and fixed, and the re-reads \
+                        hold. No two members undid each other: the shared files (app.rs, chrome.rs, \
+                        door.rs, window.rs, gpui.md) all build and test together. Stop condition, clause \
+                        by clause: - Popups, fields, drag, tooltips, control socket on gpui: met (354, \
+                        346, 347, 356, 348). Every popup golden asserts its popup from the snapshot. - \
+                        Keystrokes in a field never reach an accelerator (compound-085): met. Imgui-era \
+                        rows: - a-196 (hand cursor): close or supersede it. Carry into group 2: a-3."
+            .into();
+        let written = render_groups(&g);
+        assert!(
+            written.lines().any(|l| l.trim_start().starts_with("- ") && l.starts_with(' ')),
+            "the fixture has to wrap a bullet to a line start, or it proves nothing: {written}"
+        );
+        let read = parse_groups(&written);
+        assert_eq!(read.len(), 2, "no group made of prose: {written}");
+        assert_eq!(read, g, "and the verdict comes back whole, its bullets in it");
+    }
+
+    /// The same failure, for every word that means structure at a line start:
+    /// in a stop or a verdict, a continuation is the block's whatever word it
+    /// begins with, so a sentence that wraps onto `stop:` does not replace the
+    /// stop and one that wraps onto `landed:` does not invent a landing.
+    #[test]
+    fn prose_that_wraps_onto_a_structural_word_round_trips_as_prose() {
+        for word in ["- 9 a-7", "stop:", "verdict:", "agent:", "agent a-1:", "landed: a-1@abc", "- a-2"] {
+            let head = word.split(' ').next().unwrap();
+            for block in ["stop", "verdict"] {
+                // However much filler it takes to wrap `word` onto a line of
+                // its own, so the fixture does not depend on the column.
+                let wrapped = (1..70).find_map(|n| {
+                    let mut g = parse_groups("- 1  a-1\n- 2  a-2\n");
+                    let prose = format!("{} {word} the rest", "x".repeat(n));
+                    match block {
+                        "stop" => g[0].stop = prose,
+                        _ => g[0].verdict = prose,
+                    }
+                    let written = render_groups(&g);
+                    let lands = written.lines().any(|l| l.starts_with("        ") && l.trim_start().starts_with(head));
+                    lands.then_some((g, written))
+                });
+                let (g, written) = wrapped.unwrap_or_else(|| panic!("`{word}` never wrapped to a line start in a {block}"));
+                assert_eq!(parse_groups(&written), g, "`{word}` wrapped to a line start of a {block}: {written}");
+            }
+        }
     }
 
     /// A removed member's line goes with it on the next write rather than
