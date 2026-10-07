@@ -2215,6 +2215,24 @@ mod tests {
         run(dir, &["commit", "--quiet", "-m", "first"]);
     }
 
+    /// `wsp-230`: what a barrier check is opened against is the trunk branch's
+    /// commit, read from the trunk wherever the caller stands — not a task
+    /// tree's HEAD, which is the work being checked rather than the trunk.
+    #[test]
+    fn the_trunk_tip_is_the_trunk_branch_whichever_tree_asks() {
+        let (_env, dir) = scratch("tip");
+        repo(&dir);
+        let wt = checkout_dir(&dir, "t-1");
+        ensure(&dir, &wt, "t-1", "master").unwrap();
+        std::fs::write(wt.join("mine.txt"), "mine\n").unwrap();
+        run(&wt, &["add", "mine.txt"]);
+        run(&wt, &["commit", "--quiet", "-m", "mine"]);
+        let master = git(&dir, &["rev-parse", "master"]).unwrap().trim().to_string();
+        assert_eq!(trunk_tip(&dir.display().to_string()).as_deref(), Some(master.as_str()));
+        assert_eq!(trunk_tip(&wt.display().to_string()).as_deref(), Some(master.as_str()), "not the tree's own commit");
+        assert!(trunk_tip("/nonexistent/wsp-230").is_none());
+    }
+
     /// The whole point, asserted end to end: work committed in one agent's tree
     /// reaches the trunk, and nothing else does.
     #[test]

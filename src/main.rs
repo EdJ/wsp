@@ -336,6 +336,9 @@ const VALUED_ON: &[(&str, &str)] = &[
     ("project", "status"),
     // `spawn --agent` stands alone; on a worklist it names who runs a group.
     ("worklist", "agent"),
+    // `verify --check` stands alone; on `spawn` it names the group a barrier
+    // check reads (`wsp-230`).
+    ("spawn", "check"),
 ];
 
 /// Whether this flag stands alone on this verb.
@@ -2413,6 +2416,21 @@ mod tests {
         // there is nothing on it to have been dropped.
         let a = Args::synth("flag", &["acc-005"], &[("from", "finding.txt")]);
         assert!(a.dropped().is_empty());
+    }
+
+    /// `wsp-230`. `check` stands alone on `verify`, so a barrier check's spawn
+    /// — the one line `cycle` writes for every barrier — had its group number
+    /// read as a second positional and was refused. A test built with
+    /// `Args::synth` never meets the parser, which is how it got past one.
+    #[test]
+    fn spawn_check_takes_the_group_and_verify_check_still_stands_alone() {
+        let parse = |line: &[&str]| crate::Args::parse(line.iter().map(|s| (*s).to_string()).collect());
+        let a = parse(&["spawn", "gpui-migration", "--agent", "--check", "4", "--kind", "claude"]);
+        assert_eq!(a.get("check").as_deref(), Some("4"));
+        assert_eq!(a.rest, vec!["gpui-migration"], "and the group is not a second positional");
+        let a = parse(&["verify", "--check", "src/cycle.rs"]);
+        assert!(a.has("check"));
+        assert_eq!(a.rest, vec!["src/cycle.rs"]);
     }
 
     /// A rule that names a command nobody dispatches is a rule that does

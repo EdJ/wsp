@@ -3980,7 +3980,7 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
 /// What a settling verb says about the checks it arranged the ending of —
 /// the caller's own, nearly always, so it is told its pane is not left open.
 fn ending_line(ids: &[String]) -> String {
-    format!("ending {} once its turn is over: wsp ends the pane, the claim and the tree", ids.join(" "))
+    format!("ending {} once its turn is over: wsp ends the agent and its tree", ids.join(" "))
 }
 
 /// The rows become the next group, and the barrier is passed.

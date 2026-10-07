@@ -694,7 +694,16 @@ pub(crate) fn step(store: &Store, w: &Worklist, seats: &dyn Seats) -> Vec<String
         match holding_barrier(store, seats, &w, &pos) {
             // A Barrier row filed before `wsp-230` and still open is that
             // barrier's check, whose agent may be mid-read: nothing is owed.
-            None if tasks.iter().any(|t| is_barrier(t, &w.id, at) && !matches!(t.status(), Status::Review | Status::Done)) => {}
+            // One at `todo` that nobody ever claimed is a start that never
+            // arrived, and a check entry takes its place.
+            None if tasks.iter().any(|t| {
+                is_barrier(t, &w.id, at)
+                    && match t.status() {
+                        Status::Review | Status::Done => false,
+                        Status::Todo => !wedged(t, &store.claims()),
+                        _ => true,
+                    }
+            }) => {}
             None => {
                 let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
                 let on = Some(policy.label());
@@ -3189,6 +3198,36 @@ fn only_a_working_screen_is_ever_overruled() {
             !MEMBER_TOLD.with(|t| t.borrow().iter().any(|(id, _)| *id == pending.id)),
             "a check that has not started reads the group as it stands"
         );
+    }
+
+    /// `wsp-230`, the rows installed over. A Barrier row still open when this
+    /// binary arrived is that barrier's check, mid-read, and no entry opens
+    /// beside it; one at `todo` that nobody ever claimed is a start that never
+    /// arrived, and an entry takes its place.
+    #[test]
+    fn a_barrier_row_from_before_is_the_check_while_open_and_a_wedged_one_is_replaced() {
+        for (tag, status, updated, opens) in [
+            ("legacy-doing", Status::Doing, "2026-01-01T00:00:00Z", false),
+            ("legacy-fresh", Status::Todo, "", false),
+            ("legacy-wedged", Status::Todo, "2026-01-01T00:00:00Z", true),
+        ] {
+            let (_env, store) = scratch(tag);
+            task(&store, "m-1", Status::Review);
+            let w = list(&store, &[(&["m-1"], "claude")]);
+            step(&store, &w, &Blind);
+            hold_all(&store);
+            let mut b = Task::new(&barrier_title("run", 1), "b-1");
+            b.tags = vec![BARRIER_TAG.into()];
+            b.set_status(status);
+            if !updated.is_empty() {
+                b.updated = updated.into();
+            }
+            store.save_task(&b).unwrap();
+            let _ = spawned();
+            step(&store, &w, &Blind);
+            assert_eq!(checks(&store, 1).len(), usize::from(opens), "`{tag}`");
+            assert_eq!(spawned().len(), usize::from(opens), "`{tag}`");
+        }
     }
 
     /// A barrier row of one group is not a barrier row of another, whatever the
