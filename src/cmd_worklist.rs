@@ -1112,11 +1112,13 @@ fn amend_running_stop(store: &Store, args: &Args, id: &str, ordinal: usize, text
 ///   run.
 /// - **Only until its barrier row opens.** After that an agent is checking
 ///   this group, and it would be checking a group the list no longer has.
-/// - **No started member is left outside the list.** A member that is doing,
-///   in review, done or claimed, and in no other group, is work the run would
-///   stop accounting for. `mv` it first, and it is said so. A member in a later
-///   group as well — compound-357, in the phantom and in the group after it —
-///   is still the run's.
+/// - **No member in flight is left outside the list.** A member that is
+///   doing, in review or claimed, and in no other group, is work the run would
+///   stop verifying and landing. `mv` it first, and it is said so. A member in
+///   a later group as well — compound-357, in the phantom and in the group
+///   after it — is still the run's. A `done` one is not in flight: the
+///   phantom's compound-196 was closed as superseded, and asked nothing more of
+///   the run.
 ///
 /// Behind the run is still history and still refused. Ahead of it this is the
 /// same edit as `rm` of every member, and wants no reason.
@@ -1157,21 +1159,20 @@ fn drop_group(store: &Store, args: &Args, id: &str, ordinal: usize, why: Option<
                 return Err(1);
             }
             let claims = store.claims();
-            let started = |m: &String| {
+            let in_flight = |m: &String| {
                 claims.contains_key(m)
                     || tasks.iter().find(|t| &t.id == m).is_some_and(|t| {
-                        use crate::model::Status::{Doing, Done, Review};
-                        matches!(t.status(), Doing | Review | Done)
+                        matches!(t.status(), crate::model::Status::Doing | crate::model::Status::Review)
                     })
             };
             let elsewhere =
                 |m: &String| groups.iter().enumerate().any(|(i, g)| i != ordinal - 1 && g.members.contains(m));
             let left: Vec<&String> =
-                groups[ordinal - 1].members.iter().filter(|m| started(m) && !elsewhere(m)).collect();
+                groups[ordinal - 1].members.iter().filter(|m| in_flight(m) && !elsewhere(m)).collect();
             if let Some(first) = left.first() {
                 let names: Vec<&str> = left.iter().map(|m| m.as_str()).collect();
                 eprintln!(
-                    "wsp: will not drop group {ordinal} — {} started and in no other group, so the run would stop accounting for it",
+                    "wsp: will not drop group {ordinal} — {} in flight and in no other group, so the run would stop accounting for it",
                     names.join(" ")
                 );
                 eprintln!("     wsp worklist mv {} {first} --group N, then drop", w.id);
@@ -4909,14 +4910,16 @@ mod tests {
 
     /// gpui-migration's phantom group, rebuilt: group 1 passed, the run at a
     /// group 2 made of a verdict's words with two real rows in it — one
-    /// blocked, one running and also in group 3, as compound-357 was. `rm`
+    /// done, one running and also in group 3, as compound-357 was. `rm`
     /// cannot take it out; `--drop` can, with a reason, and the run then
     /// stands at the group the plan said came next.
     #[test]
     fn a_group_made_in_error_is_dropped_while_it_runs_and_the_run_stands_at_the_next() {
         let store = scratch("drop-phantom");
         task(&store, "wl-001", "review");
-        task(&store, "wl-196", "blocked");
+        // Closed as superseded by the time anybody dropped it, as compound-196
+        // was: done, in no other group, and no reason to keep the phantom.
+        task(&store, "wl-196", "done");
         task(&store, "wl-357", "doing");
         task(&store, "wl-358", "todo");
         run(&store, &["new", "batch", "b"]);
